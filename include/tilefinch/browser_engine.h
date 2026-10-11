@@ -833,13 +833,17 @@ typedef enum {
 } BrowserYoutubeFeedState;
 BrowserYoutubeFeedState browser_engine_youtube_feed_state(const BrowserEngine *engine);
 BrowserYoutubeFeedState browser_engine_youtube_like_state(const BrowserEngine *engine);
+BrowserYoutubeFeedState browser_engine_youtube_account_state(const BrowserEngine *engine);
 /* Selected operation; authoritative only when state is CURRENT. */
 bool browser_engine_youtube_like_selected(const BrowserEngine *engine);
 #ifndef __PSP__
 struct YoutubeLiteRatingDiagnostics;
+struct YoutubeLiteAccountDiagnostics;
 unsigned browser_engine_youtube_history_metadata(const BrowserEngine *engine);
 bool browser_engine_youtube_rating_diagnostics(const BrowserEngine *engine,
     struct YoutubeLiteRatingDiagnostics *result);
+bool browser_engine_youtube_account_diagnostics(const BrowserEngine *engine,
+    struct YoutubeLiteAccountDiagnostics *result);
 #endif
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);

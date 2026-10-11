@@ -26,6 +26,44 @@ LAB = Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 else None
 
 
 class PrivateConsoleTests(unittest.TestCase):
+    def test_device_session_export_is_explicit_fixed_and_removed_on_close(self):
+        commands = []
+        class Session:
+            def send(self, command):
+                commands.append(command)
+                return [0, 1, 0, 0, 0, 0, 0, "https://www.youtube.com", 1]
+            def close(self):
+                pass
+        class Credentials:
+            def close(self):
+                pass
+        with tempfile.TemporaryDirectory() as directory:
+            keeper = KEEPER.SessionKeeper("mock", directory, Credentials(), service="youtube")
+            keeper.session = Session()
+            keeper.run("export-youtube-session")
+            self.assertEqual(commands, [b"private-export-youtube-login\n"])
+            self.assertTrue(keeper.status()["last_action_accepted"])
+            for name in ("youtube-device-session.bin", "youtube-device-session.bin.tmp"):
+                (Path(directory) / name).write_bytes(b"mock-session")
+            keeper.close()
+            self.assertFalse(list(Path(directory).iterdir()))
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_device_session_export_refuses_unsigned_session_and_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory) / "fixture.html"
+            fixture.write_text("<p>Local fixture with no account</p>")
+            session = PRIVATE.PrivateLab(LAB, directory, fixture=fixture)
+            try:
+                session.status(timeout=30)
+                for command in (b"private-export-youtube-login\n",
+                                b"private-export-youtube-login arbitrary.bin\n"):
+                    self.assertFalse(session.send(command)[8])
+                self.assertFalse((Path(directory) / "youtube-device-session.bin").exists())
+                self.assertFalse((Path(directory) / "arbitrary.bin").exists())
+            finally:
+                session.close()
+
     @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_synchronous_script_form_keeps_formdata_entry_list(self):
         for delayed in (False, True):

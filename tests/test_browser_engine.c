@@ -319,13 +319,17 @@ static bool backing_node_write(
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
 #include "suites/youtube_login_journey.inc"
+#include "suites/youtube_navigation_journey.inc"
 #include "suites/browser_engine_teardown.inc"
 
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
         return test_youtube_login_journey() || test_youtube_personalized_home()
-            || test_youtube_rating_status_confirmation() || test_youtube_like_action();
+            || test_youtube_rating_status_confirmation() || test_youtube_like_action()
+            || test_youtube_library_actions() || test_youtube_library_native_action();
+    if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
+        return test_youtube_filters_and_chapters();
     if ((argc == 4 || argc == 5)
         && (strcmp(argv[1], "--native-navigation-replay") == 0
             || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
@@ -376,7 +380,8 @@ int main(int argc, char **argv)
             || test_youtube_personalized_home();
     if (argc == 2 && strcmp(argv[1], "--youtube-account-actions-only") == 0)
         return test_youtube_resume_metadata() || test_youtube_recent_history()
-            || test_youtube_rating_status_confirmation() || test_youtube_like_action();
+            || test_youtube_rating_status_confirmation() || test_youtube_like_action()
+            || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
         return test_computed_paint_style_does_not_force_layout();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
@@ -498,6 +503,9 @@ int main(int argc, char **argv)
     CHECK(test_youtube_resume_metadata() == 0);
     CHECK(test_youtube_recent_history() == 0);
     CHECK(test_youtube_rating_status_confirmation() == 0);
+    CHECK(test_youtube_library_actions() == 0);
+    CHECK(test_youtube_library_native_action() == 0);
+    CHECK(test_youtube_filters_and_chapters() == 0);
     CHECK(test_youtube_like_action() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);

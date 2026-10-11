@@ -36,7 +36,7 @@
 #define YOUTUBE_LITE_CONTINUATION_LIMIT 1024
 #define YOUTUBE_LITE_LANGUAGE_LIMIT 8
 #define YOUTUBE_LITE_IDENTITY_CACHE_KEY "youtube-mweb-identity-v1"
-#define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 1u
+#define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 2u
 #define YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS \
     (UINT64_C(30) * 60u * UINT64_C(1000000000))
 #define YOUTUBE_LITE_DOCUMENT_CACHE_ADAPTER "youtube-lite"
@@ -55,7 +55,11 @@ typedef struct {
     char duration[YOUTUBE_LITE_METADATA_LIMIT];
     char views[YOUTUBE_LITE_METADATA_LIMIT];
     char published[YOUTUBE_LITE_METADATA_LIMIT];
-    char snippet[YOUTUBE_LITE_SNIPPET_LIMIT];
+    /* Playlist cards never have video snippets; reuse their bounded storage. */
+    union {
+        char snippet[YOUTUBE_LITE_SNIPPET_LIMIT];
+        char playlist_id[128];
+    };
     unsigned resume_seconds;
     bool has_resume;
     unsigned progress_percent;
@@ -68,12 +72,18 @@ typedef struct {
     char url[256];
 } YoutubeLiteTopic;
 
+#define YOUTUBE_LITE_MAXIMUM_CHAPTERS 24u
+typedef struct { unsigned seconds; char title[80]; } YoutubeLiteChapter;
+
 typedef struct {
     YoutubeLiteVideo video;
+    char channel_id[25];
     char description[YOUTUBE_LITE_DESCRIPTION_LIMIT];
     char published[YOUTUBE_LITE_METADATA_LIMIT];
     char category[YOUTUBE_LITE_METADATA_LIMIT];
     bool localized_views;
+    unsigned duration_seconds, chapter_count;
+    YoutubeLiteChapter chapters[YOUTUBE_LITE_MAXIMUM_CHAPTERS];
 } YoutubeLiteWatch;
 
 static const char *lite_preferred_language(void)
@@ -140,6 +150,10 @@ YoutubeLiteRoute youtube_lite_route(const char *url)
         return YOUTUBE_LITE_ROUTE_HOME;
     if (lite_path_is(&parsed, "/results"))
         return YOUTUBE_LITE_ROUTE_SEARCH;
+    if (lite_path_is(&parsed, "/feed/playlists"))
+        return YOUTUBE_LITE_ROUTE_PLAYLISTS;
+    if (lite_path_is(&parsed, "/playlist"))
+        return YOUTUBE_LITE_ROUTE_PLAYLIST;
     const char *path = parsed.value + parsed.path_offset;
     if ((parsed.path_length > 2u && path[0] == '/' && path[1] == '@')
         || (parsed.path_length > 9u
@@ -636,6 +650,20 @@ static bool lite_valid_video_id(const char *id)
     return true;
 }
 
+static bool lite_valid_account_id(const char *id, bool channel)
+{
+    if (id == NULL) return false;
+    size_t length = strnlen(id, 128u);
+    if (length == 0u || length >= 128u
+        || (channel && (length != 24u || id[0] != 'U' || id[1] != 'C')))
+        return false;
+    for (size_t i = 0; i < length; i++)
+        if (!((id[i] >= 'a' && id[i] <= 'z') || (id[i] >= 'A' && id[i] <= 'Z')
+            || (id[i] >= '0' && id[i] <= '9') || id[i] == '-' || id[i] == '_'))
+            return false;
+    return true;
+}
+
 static bool lite_video_duplicate(const YoutubeLiteVideo *videos,
                                  size_t count, const char *id)
 {
@@ -828,6 +856,7 @@ enum {
     YOUTUBE_LITE_RENDERER_GRID_VIDEO,
     YOUTUBE_LITE_RENDERER_COMPACT_VIDEO,
     YOUTUBE_LITE_RENDERER_LOCKUP,
+    YOUTUBE_LITE_RENDERER_PLAYLIST_VIDEO,
     YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER
 };
 
@@ -902,6 +931,7 @@ static bool lite_next_video_renderer(
         {"gridVideoRenderer", sizeof("gridVideoRenderer") - 1u},
         {"compactVideoRenderer", sizeof("compactVideoRenderer") - 1u},
         {"lockupViewModel", sizeof("lockupViewModel") - 1u},
+        {"playlistVideoRenderer", sizeof("playlistVideoRenderer") - 1u},
         {"videoDescriptionHeaderRenderer",
          sizeof("videoDescriptionHeaderRenderer") - 1u}
     };
@@ -1182,7 +1212,9 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".account{color:#ddd;text-decoration:none;font-size:12px;padding:5px}"
         ".account-menu{position:relative}.account-menu summary{list-style:none;font-weight:normal}"
         ".account-panel{position:fixed;left:10px;top:36px;width:calc(100% - 20px);max-width:460px;z-index:3;background:#222;border:1px solid #666;padding:10px}"
-        ".account-panel a{display:inline-block;color:#ddd;margin:4px 10px 4px 0}"
+        ".account-panel h2{font-size:16px;line-height:20px;margin:0 0 4px}"
+        ".account-panel p{font-size:12px;line-height:16px;margin:4px 0}"
+        ".account-panel a{display:inline-block;color:#ddd;font-size:13px;line-height:18px;margin:3px 10px 3px 0}"
         ".feed-status{font-size:11px;white-space:nowrap;height:16px;color:#aaa}"
         ".feed-refresh{color:#ddd;font-size:12px;display:inline-block;white-space:nowrap;margin:4px 0 10px}"
         ".feed-home{position:relative}.feed-home h1{padding-right:130px}"
@@ -1190,6 +1222,12 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".watch-progress{position:absolute;left:0;bottom:0;width:100%;height:3px;background:#666}"
         ".watch-progress-fill{display:block;height:3px;background:#f33}"
         "form{display:flex;gap:6px;width:100%}"
+        ".search-filters,.chapters{border:1px solid #555;border-radius:6px;margin:10px 0;padding:8px}"
+        ".search-filters summary,.chapters summary{color:#fff;line-height:24px}"
+        ".search-filters form{display:block}.search-filters label{display:block;margin:6px 0 3px}"
+        ".search-filters select{width:100%;height:28px;background:#222;color:#fff;border:1px solid #777}"
+        ".search-filters button{width:auto;min-width:110px;max-width:100%;margin-top:8px}"
+        ".chapter{display:block;color:#ddd;text-decoration:none;padding:6px 0;border-top:1px solid #444;line-height:20px}"
         "input{flex:none;width:calc(100% - 82px);min-width:0;"
         "background:#181818;color:#fff;"
         "border:1px solid #666;border-radius:16px;height:32px;"
@@ -1327,7 +1365,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
             || lite_html_text(html, " class=compact-results"))
         && lite_html_text(html, header)
         && lite_html_ui_markup(html, signed_in
-            ? "<details id=yt-account-menu class=account-menu><summary id=yt-account-action class=account>{{Account}}</summary><section id=yt-account-panel class=account-panel><h2>{{YouTube account}}</h2><p>{{Signed in on this device.}}</p><a href=\"https://www.youtube.com/feed/recommended\">{{Recommendations}}</a><a href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a><a href=\"https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Switch account}}</a><p>{{Select Account again to close.}}</p></section></details>"
+            ? "<details id=yt-account-menu class=account-menu><summary id=yt-account-action class=account>{{Account}}</summary><section id=yt-account-panel class=account-panel><h2>{{YouTube account}}</h2><p>{{Signed in on this device.}}</p><a href=\"https://www.youtube.com/feed/recommended\">{{Recommendations}}</a><a href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a><a href=\"https://www.youtube.com/playlist?list=WL\">{{Watch Later}}</a><a href=\"https://www.youtube.com/feed/playlists\">{{Playlists}}</a><a href=\"https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Switch account}}</a><p>{{Select Account again to close.}}</p></section></details>"
             : "<a id=yt-account-action class=account href=\"https://accounts.google.com/ServiceLogin?service=youtube&amp;continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Sign in}}</a>")
         && lite_html_ui_markup(html,
             "<a class=account href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a>")
@@ -1423,6 +1461,9 @@ static bool lite_html_video(YoutubeLiteHtml *html,
     return true;
 }
 
+#include "youtube_library.inc"
+#include "youtube_navigation.inc"
+
 static bool lite_html_multiline(YoutubeLiteHtml *html, const char *text)
 {
     const char *at = text;
@@ -1447,6 +1488,10 @@ static bool lite_html_multiline(YoutubeLiteHtml *html, const char *text)
 static void lite_watch_details(
     const YoutubeLiteSpan *details, YoutubeLiteWatch *watch)
 {
+    char channel[25] = {0};
+    if (lite_json_key_string(details, "channelId", channel, sizeof(channel))
+        && lite_valid_account_id(channel, true))
+        memcpy(watch->channel_id, channel, sizeof(channel));
     (void) lite_json_key_string(
         details, "title", watch->video.title, sizeof(watch->video.title));
     (void) lite_json_key_string(
@@ -1464,6 +1509,7 @@ static void lite_watch_details(
     if (lite_json_key_string(
             details, "lengthSeconds", seconds, sizeof(seconds))) {
         unsigned long total = strtoul(seconds, NULL, 10);
+        if (total <= 604800u) watch->duration_seconds = (unsigned) total;
         snprintf(watch->video.duration, sizeof(watch->video.duration),
                  "%lu:%02lu", total / 60u, total % 60u);
     }
@@ -1860,16 +1906,18 @@ static bool lite_html_search_intro(YoutubeLiteHtml *html, const char *query,
 }
 
 static bool lite_search_continuation_base(
-    const char *query, char *base, size_t base_size)
+    const char *url, const char *query, char *base, size_t base_size)
 {
     char encoded_query[YOUTUBE_LITE_QUERY_LIMIT * 3u] = {0};
-    if (!lite_url_encode(query, encoded_query, sizeof(encoded_query)))
+    char suffix[96];
+    if (!lite_url_encode(query, encoded_query, sizeof(encoded_query))
+        || !lite_filter_suffix(url, suffix))
         return false;
     int written = snprintf(
         base, base_size,
-        "https://www.youtube.com/results?search_query=%s"
+        "https://www.youtube.com/results?search_query=%s%s"
         "&tilefinch_token=",
-        encoded_query);
+        encoded_query, suffix);
     return written >= 0 && (size_t) written < base_size;
 }
 
@@ -1923,11 +1971,22 @@ static bool lite_html_watch_intro(
     if (ok && watch->category[0] != '\0')
         ok = lite_html_ui_markup(html, "<br>{{Category}}: ")
             && lite_html_escape(html, watch->category);
+    ok = ok && lite_html_text(html, "</p>")
+        && lite_html_subscribe(html, watch->channel_id);
     return ok
         && lite_html_ui_format(
             html,
-            "</p><p><a class=comments-link href=\"https://tilefinch.local/offline/youtube?id=%s\">{{Save video offline}}</a></p><p><a id=yt-like-action class=comments-link href=\"#tilefinch-like\">{{Like}}</a> <a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a></p></div></section><p id=yt-like-status class=feed-status>{{Select Like or Unlike.}}</p>",
-            watch->video.id);
+            "<p><a class=comments-link href=\"https://tilefinch.local/offline/youtube?id=%s\">{{Save video offline}}</a></p><p><a id=yt-like-action class=comments-link href=\"#tilefinch-like\">{{Like}}</a> <a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a></p><p>",
+            watch->video.id)
+        && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_ADD,
+            "WL", watch->video.id, "Watch Later", "yt-watch-later-add")
+        && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
+            "WL", watch->video.id, "Remove from Watch Later", "yt-watch-later-remove")
+        && lite_html_ui_format(html,
+            "</p><p><a class=comments-link href=\"https://www.youtube.com/feed/playlists?tilefinch_save=%s\">{{Save to playlist}}</a></p></div></section><p id=yt-like-status class=feed-status>{{Select Like or Unlike.}}</p>",
+            watch->video.id)
+        && lite_html_account_notice(html)
+        && lite_html_chapters(html, watch);
 }
 
 static void lite_resume_suffix(const char *url, char suffix[32])
@@ -1937,6 +1996,10 @@ static void lite_resume_suffix(const char *url, char suffix[32])
     if (seconds != 0)
         snprintf(suffix, 32, "&amp;t=%u", (unsigned) seconds);
 }
+
+static bool lite_build_library_sync(Budget *budget, const char *url,
+    const char *source, size_t length, const char *decoded, size_t decoded_length,
+    YoutubeLiteDocument *document);
 
 static bool lite_build_document_with_comments_decoded(
     Budget *budget, const char *url, const char *source,
@@ -1949,7 +2012,7 @@ static bool lite_build_document_with_comments_decoded(
     YoutubeLiteRoute route =
         url == NULL ? YOUTUBE_LITE_ROUTE_NONE : youtube_lite_route(url);
     bool direct_search_continuation =
-        route == YOUTUBE_LITE_ROUTE_SEARCH
+        route != YOUTUBE_LITE_ROUTE_WATCH && route != YOUTUBE_LITE_ROUTE_HOME
         && comments_source != NULL && comments_length != 0;
     if (budget == NULL || url == NULL || document == NULL
         || (source_length != 0 && source == NULL)
@@ -1966,13 +2029,17 @@ static bool lite_build_document_with_comments_decoded(
         return false;
     }
     *document = (YoutubeLiteDocument) {.budget = budget, .route = route};
+    if (route == YOUTUBE_LITE_ROUTE_PLAYLISTS || route == YOUTUBE_LITE_ROUTE_PLAYLIST)
+        return lite_build_library_sync(budget, url, source, source_length,
+            direct_search_continuation ? comments_source : prepared_decoded,
+            direct_search_continuation ? comments_length : prepared_decoded_length, document);
     YoutubeLiteVideo videos[YOUTUBE_LITE_MAXIMUM_RESULTS] = {0};
     size_t decoded_length = 0;
     char *decoded = NULL;
     bool decoded_borrowed = false;
     if (route != YOUTUBE_LITE_ROUTE_HOME || lite_topics_requested(url)) {
         bool search_continuation =
-            route == YOUTUBE_LITE_ROUTE_SEARCH
+            route != YOUTUBE_LITE_ROUTE_WATCH && route != YOUTUBE_LITE_ROUTE_HOME
             && comments_source != NULL && comments_length != 0;
         if (search_continuation) {
             decoded = budget_malloc_category(
@@ -2017,6 +2084,7 @@ static bool lite_build_document_with_comments_decoded(
         (void) youtube_watch_url_video_id(url, watch->video.id);
         (void) lite_watch_metadata(
             source, source_length, decoded, decoded_length, watch);
+        lite_chapters_parse(watch, decoded, decoded_length);
         if (watch->video.id[0] == '\0')
             (void) youtube_watch_url_video_id(url, watch->video.id);
         if (watch->video.title[0] == '\0')
@@ -2088,13 +2156,20 @@ static bool lite_build_document_with_comments_decoded(
             && (!lite_topics_requested(url)
                 || lite_html_topics(&html, topics, count));
     } else if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH) {
-        ok = lite_html_search_intro(&html, query, result_count);
+        ok = lite_html_search_intro(&html, query, result_count)
+            && lite_html_search_filters(&html, url, query);
     } else if (ok && route == YOUTUBE_LITE_ROUTE_CHANNEL) {
         ok = lite_html_ui_markup(
             &html, "<h1>{{Channel videos}}</h1><p class=hint>{{Recent public uploads from this channel.}}</p>");
         if (ok && result_count == 0)
             ok = lite_html_ui_markup(
                 &html, "<p class=empty>{{No public video entries were present in the bounded channel response.}}</p>");
+        char channel[25] = {0};
+        if (decoded != NULL) {
+            YoutubeLiteSpan all = {decoded, decoded + decoded_length};
+            lite_channel_metadata(&all, channel);
+        }
+        ok = ok && lite_html_subscribe(&html, channel) && lite_html_account_notice(&html);
     } else if (ok) {
         char resume[32];
         lite_resume_suffix(url, resume);
@@ -2165,7 +2240,7 @@ static bool lite_build_document_with_comments_decoded(
     if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH
         && next_continuation[0] != '\0') {
         char base[1024];
-        if (!lite_search_continuation_base(query, base, sizeof(base))) {
+        if (!lite_search_continuation_base(url, query, base, sizeof(base))) {
             ok = false;
         } else {
             ok = lite_html_continuation_link(
@@ -2222,9 +2297,11 @@ bool youtube_lite_build_document(
 
 typedef enum {
     YOUTUBE_LITE_BUILD_VIDEOS = 0,
+    YOUTUBE_LITE_BUILD_LIBRARY_METADATA,
     YOUTUBE_LITE_BUILD_WATCH_MARKER,
     YOUTUBE_LITE_BUILD_WATCH_DETAILS,
     YOUTUBE_LITE_BUILD_WATCH_MICROFORMAT,
+    YOUTUBE_LITE_BUILD_WATCH_CHAPTERS,
     YOUTUBE_LITE_BUILD_COMMENTS,
     YOUTUBE_LITE_BUILD_EMIT_HEADER,
     YOUTUBE_LITE_BUILD_EMIT_INTRO,
@@ -2270,6 +2347,7 @@ typedef struct {
     bool description_requested;
     bool compact_results;
     bool personalized_feed;
+    bool signed_in;
     bool recent_video;
     bool watch_details_found;
     bool watch_microformat_found;
@@ -2277,6 +2355,13 @@ typedef struct {
     char query[YOUTUBE_LITE_QUERY_LIMIT];
     char comments_count[YOUTUBE_LITE_METADATA_LIMIT];
     char next_continuation[YOUTUBE_LITE_CONTINUATION_LIMIT];
+    char playlist_id[128];
+    char save_video[YOUTUBE_VIDEO_ID_CAPACITY];
+    char channel_id[25];
+    bool playlist_editable;
+    unsigned library_depth;
+    unsigned library_owner_depth;
+    bool library_string, library_escape, library_matches, library_editable;
     YoutubeLiteHtml html;
 } YoutubeLiteBuildWork;
 
@@ -2328,7 +2413,9 @@ static void lite_build_begin_emission(YoutubeLiteBuildWork *work)
 static void lite_build_after_videos(YoutubeLiteBuildWork *work)
 {
     lite_build_seek(work, 0);
-    if (work->route == YOUTUBE_LITE_ROUTE_WATCH) {
+    if (work->route == YOUTUBE_LITE_ROUTE_CHANNEL || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
+        work->phase = YOUTUBE_LITE_BUILD_LIBRARY_METADATA;
+    } else if (work->route == YOUTUBE_LITE_ROUTE_WATCH) {
         work->phase = YOUTUBE_LITE_BUILD_WATCH_MARKER;
     } else if (work->comments_requested
                && work->supplemental != NULL
@@ -2339,7 +2426,68 @@ static void lite_build_after_videos(YoutubeLiteBuildWork *work)
     }
 }
 
-static void lite_build_after_watch(YoutubeLiteBuildWork *work)
+/* A playlist's contents can exceed the object window. Walk its immediate
+   metadata in slices instead of requiring the entire list to fit a span. */
+static void lite_build_library_metadata_pump(YoutubeLiteBuildWork *work)
+{
+    YoutubeLiteSpan window = lite_build_window(work->decoded, work->decoded_length, work->scan_offset);
+    if (work->route == YOUTUBE_LITE_ROUTE_CHANNEL) {
+        lite_channel_metadata(&window, work->channel_id);
+        if (work->channel_id[0] != '\0') { lite_build_begin_emission(work); return; }
+    }
+    size_t stop = work->decoded_length - work->scan_offset;
+    if (stop > YOUTUBE_LITE_BUILD_SCAN_BYTES) stop = YOUTUBE_LITE_BUILD_SCAN_BYTES;
+    stop += work->scan_offset;
+    for (size_t at = work->scan_offset; at < stop; at++) {
+        char byte = work->decoded[at];
+        if (work->library_string) {
+            if (work->library_escape) work->library_escape = false;
+            else if (byte == '\\') work->library_escape = true;
+            else if (byte == '"') work->library_string = false;
+            continue;
+        }
+        if (byte == '"') {
+            static const char owner[] = "\"playlistVideoListRenderer\"";
+            if (sizeof(owner) - 1u <= work->decoded_length - at
+                && memcmp(work->decoded + at, owner, sizeof(owner) - 1u) == 0) {
+                const char *value = work->decoded + at + sizeof(owner) - 1u;
+                const char *end = window.end;
+                while (value < end && isspace((unsigned char) *value)) value++;
+                if (value < end && *value++ == ':') {
+                    while (value < end && isspace((unsigned char) *value)) value++;
+                    if (value < end && *value == '{') {
+                        work->library_owner_depth = work->library_depth + 1u;
+                        work->library_matches = work->library_editable = false;
+                    }
+                }
+            } else if (work->library_owner_depth != 0u
+                && work->library_depth == work->library_owner_depth) {
+                char id[128];
+                if (lite_json_key_string_at(work->decoded, work->decoded_length, at + 1u,
+                    "playlistId", id, sizeof(id)))
+                    work->library_matches = strcmp(id, work->playlist_id) == 0;
+                YoutubeLiteSpan suffix = {work->decoded + at, window.end}, value;
+                if (window.end - suffix.start >= 12 && memcmp(suffix.start, "\"isEditable\"", 12) == 0
+                    && lite_json_key(&suffix, "isEditable", NULL, &value))
+                    work->library_editable = value.end - value.start == 4 && memcmp(value.start, "true", 4) == 0;
+            }
+            work->library_string = true;
+        } else if (byte == '{' || byte == '[') {
+            if (++work->library_depth > 48u) { lite_build_work_fail(work); return; }
+        } else if (byte == '}' || byte == ']') {
+            if (work->library_depth == work->library_owner_depth) {
+                work->playlist_editable = work->library_matches && work->library_editable;
+                work->library_owner_depth = 0u;
+                if (work->playlist_editable) { lite_build_begin_emission(work); return; }
+            }
+            if (work->library_depth != 0u) work->library_depth--;
+        }
+    }
+    lite_build_seek(work, stop);
+    if (stop == work->decoded_length) lite_build_begin_emission(work);
+}
+
+static void lite_build_after_chapters(YoutubeLiteBuildWork *work)
 {
     lite_build_seek(work, 0);
     if (work->comments_requested
@@ -2349,6 +2497,26 @@ static void lite_build_after_watch(YoutubeLiteBuildWork *work)
     } else {
         lite_build_begin_emission(work);
     }
+}
+
+static void lite_build_after_watch(YoutubeLiteBuildWork *work)
+{
+    lite_build_seek(work, 0);
+    work->phase = YOUTUBE_LITE_BUILD_WATCH_CHAPTERS;
+}
+
+static void lite_build_chapters_pump(YoutubeLiteBuildWork *work)
+{
+    if (work->decoded == NULL || work->scan_offset >= work->decoded_length
+        || work->watch.chapter_count >= YOUTUBE_LITE_MAXIMUM_CHAPTERS) {
+        lite_build_after_chapters(work);
+        return;
+    }
+    YoutubeLiteSpan scope = lite_build_window(work->decoded, work->decoded_length, work->scan_offset);
+    const char *after = lite_chapter_next(&work->watch, &scope);
+    if (after) lite_build_seek(work, (size_t) (after - work->decoded));
+    else if (scope.end == work->decoded + work->decoded_length) lite_build_after_chapters(work);
+    else lite_build_seek(work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
 }
 
 static YoutubeLiteBuildWork *lite_build_work_create(
@@ -2361,7 +2529,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     YoutubeLiteRoute route =
         url == NULL ? YOUTUBE_LITE_ROUTE_NONE : youtube_lite_route(url);
     bool direct_search_continuation =
-        route == YOUTUBE_LITE_ROUTE_SEARCH
+        route != YOUTUBE_LITE_ROUTE_WATCH && route != YOUTUBE_LITE_ROUTE_HOME
         && supplemental != NULL && supplemental_length != 0;
     bool raw_source_required = route == YOUTUBE_LITE_ROUTE_WATCH && !parsed_watch;
     if (budget == NULL || url == NULL || route == YOUTUBE_LITE_ROUTE_NONE
@@ -2395,6 +2563,14 @@ static YoutubeLiteBuildWork *lite_build_work_create(
         && lite_description_view_requested(url);
     work->compact_results = compact_results;
     work->personalized_feed = lite_feed_requested(url);
+    if (route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
+        if (!lite_query_value(url, "list", work->playlist_id, sizeof(work->playlist_id))
+            || !lite_valid_account_id(work->playlist_id, false)) {
+            budget_free(budget, work); return NULL;
+        }
+    }
+    if (lite_query_value(url, "tilefinch_save", work->save_video, sizeof(work->save_video))
+        && !lite_valid_video_id(work->save_video)) work->save_video[0] = '\0';
     (void) lite_query_value(
         url, "search_query", work->query, sizeof(work->query));
     if (route == YOUTUBE_LITE_ROUTE_WATCH)
@@ -2416,6 +2592,30 @@ static YoutubeLiteBuildWork *lite_build_work_create(
 
 static void lite_build_video_pump(YoutubeLiteBuildWork *work)
 {
+    if (work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS) {
+        if (work->scan_offset >= work->decoded_length) {
+            lite_build_after_videos(work); return;
+        }
+        YoutubeLiteSpan scope = lite_build_window(work->decoded,
+            work->decoded_length, work->scan_offset), renderer;
+        YoutubeLiteVideo record;
+        if (work->video_count < YOUTUBE_LITE_MAXIMUM_RESULTS
+            && lite_parse_playlist_card(&scope, &renderer, &record)) {
+            bool duplicate = false;
+            for (size_t i = 0; i < work->video_count; i++)
+                duplicate |= strcmp(work->videos[i].playlist_id, record.playlist_id) == 0;
+            if (record.playlist_id[0] != '\0' && !duplicate)
+                work->videos[work->video_count++] = record;
+            lite_build_seek(work, (size_t) (renderer.end - work->decoded));
+        } else {
+            (void) lite_next_continuation(scope.start, (size_t) (scope.end - scope.start),
+                                        work->next_continuation);
+            if (scope.end == work->decoded + work->decoded_length)
+                lite_build_after_videos(work);
+            else lite_build_seek(work, work->scan_offset + YOUTUBE_LITE_BUILD_SCAN_BYTES);
+        }
+        return;
+    }
     if (work->route == YOUTUBE_LITE_ROUTE_HOME && !work->personalized_feed) {
         if (work->scan_offset >= work->decoded_length
             || work->topic_count >= YOUTUBE_LITE_MAXIMUM_TOPICS) {
@@ -2439,13 +2639,15 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
     if (work->scan_offset >= work->decoded_length
         || (work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS
             && work->route != YOUTUBE_LITE_ROUTE_SEARCH
-            && work->route != YOUTUBE_LITE_ROUTE_CHANNEL)) {
+            && work->route != YOUTUBE_LITE_ROUTE_CHANNEL
+            && work->route != YOUTUBE_LITE_ROUTE_PLAYLIST)) {
         lite_build_after_videos(work);
         return;
     }
     if (work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS
         && (work->route == YOUTUBE_LITE_ROUTE_SEARCH
-            || work->route == YOUTUBE_LITE_ROUTE_CHANNEL)) {
+            || work->route == YOUTUBE_LITE_ROUTE_CHANNEL
+            || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST)) {
         /* Once the bounded result table is full, only the next-page token is
            useful. The object-window parser below deliberately overlaps each
            16 KiB advance by 32 KiB so a renderer cannot straddle a window;
@@ -2478,7 +2680,8 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
     YoutubeLiteSpan scope = lite_build_window(
         work->decoded, work->decoded_length, work->scan_offset);
     if (work->route == YOUTUBE_LITE_ROUTE_SEARCH
-        || work->route == YOUTUBE_LITE_ROUTE_CHANNEL) {
+        || work->route == YOUTUBE_LITE_ROUTE_CHANNEL
+        || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
         char token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
         if (lite_next_continuation(
                 scope.start, (size_t) (scope.end - scope.start), token)) {
@@ -2516,6 +2719,10 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
         }
         YoutubeLiteVideo parsed;
         if (!work->description_requested
+            /* A playlist response also carries unrelated recommendations.
+               Only playlist entries belong in its editable rows. */
+            && (work->route != YOUTUBE_LITE_ROUTE_PLAYLIST
+                || kind == YOUTUBE_LITE_RENDERER_PLAYLIST_VIDEO)
             && lite_parse_video_renderer(&renderer, kind, &parsed)
             && !lite_video_duplicate(
                 work->videos, work->video_count, parsed.id)) {
@@ -2649,6 +2856,9 @@ static bool lite_build_emit_header(YoutubeLiteBuildWork *work)
     char title[YOUTUBE_LITE_TITLE_LIMIT + 32];
     if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
         snprintf(title, sizeof(title), "YouTube");
+    } else if (work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS
+        || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
+        snprintf(title, sizeof(title), "%s", tilefinch_ui_logical_text("Playlists"));
     } else if (work->route == YOUTUBE_LITE_ROUTE_SEARCH) {
         snprintf(title, sizeof(title), "%s%s",
                  work->query[0] == '\0' ? "" : work->query,
@@ -2663,12 +2873,24 @@ static bool lite_build_emit_header(YoutubeLiteBuildWork *work)
     return lite_html_header(
         &work->html, work->query, title,
         work->route == YOUTUBE_LITE_ROUTE_HOME,
-        work->compact_results, work->personalized_feed);
+        work->compact_results, work->personalized_feed || work->signed_in);
 }
 
 static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
 {
     YoutubeLiteHtml *html = &work->html;
+    if (work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
+        bool okay = lite_html_ui_markup(html,
+            "<nav><a class=comments-link href=\"https://www.youtube.com/playlist?list=WL\">{{Watch Later}}</a> "
+            "<a class=comments-link href=\"https://www.youtube.com/feed/playlists\">{{Playlists}}</a></nav>")
+            && lite_html_ui_markup(html, work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS
+                ? "<h1>{{Your playlists}}</h1>" : strcmp(work->playlist_id, "WL") == 0
+                ? "<h1>{{Watch Later}}</h1>" : "<h1>{{Playlist}}</h1>")
+            && lite_html_account_notice(html);
+        if (work->video_count == 0u) okay = okay && lite_html_ui_markup(html,
+            "<p class=empty>{{No entries were returned. Sign in or try again.}}</p>");
+        return okay;
+    }
     if (work->route == YOUTUBE_LITE_ROUTE_HOME) {
         if (work->personalized_feed) {
             char feed[24] = {0};
@@ -2687,8 +2909,8 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
                 || lite_html_topics(html, work->topics, work->topic_count));
     }
     if (work->route == YOUTUBE_LITE_ROUTE_SEARCH) {
-        return lite_html_search_intro(
-            html, work->query, work->video_count);
+        return lite_html_search_intro(html, work->query, work->video_count)
+            && lite_html_search_filters(html, work->url, work->query);
     }
     if (work->route == YOUTUBE_LITE_ROUTE_CHANNEL) {
         bool ok = lite_html_ui_markup(
@@ -2696,7 +2918,8 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
         if (ok && work->video_count == 0)
             ok = lite_html_ui_markup(
                 html, "<p class=empty>{{No public video entries were present in the bounded channel response.}}</p>");
-        return ok;
+        return ok && lite_html_subscribe(html, work->channel_id)
+            && lite_html_account_notice(html);
     }
     YoutubeLiteWatch *watch = &work->watch;
     bool ok = lite_html_watch_intro(
@@ -2780,15 +3003,28 @@ static bool lite_build_emit_comments_end(YoutubeLiteBuildWork *work)
 static bool lite_build_emit_search_continuation(
     YoutubeLiteBuildWork *work)
 {
-    if (work->route != YOUTUBE_LITE_ROUTE_SEARCH
+    if ((work->route != YOUTUBE_LITE_ROUTE_SEARCH
+        && work->route != YOUTUBE_LITE_ROUTE_CHANNEL
+        && work->route != YOUTUBE_LITE_ROUTE_PLAYLIST
+        && work->route != YOUTUBE_LITE_ROUTE_PLAYLISTS)
         || work->next_continuation[0] == '\0') return true;
     char base[1024];
-    if (!lite_search_continuation_base(
-            work->query, base, sizeof(base)))
-        return false;
+    if (work->route == YOUTUBE_LITE_ROUTE_SEARCH) {
+        if (!lite_search_continuation_base(work->url, work->query, base, sizeof(base))) return false;
+    } else {
+        TilefinchUrl url;
+        if (!tilefinch_url_parse(work->url, &url)) return false;
+        int count = work->route == YOUTUBE_LITE_ROUTE_PLAYLIST
+            ? snprintf(base, sizeof(base), "https://www.youtube.com/playlist?list=%s&tilefinch_token=", work->playlist_id)
+            : work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS
+            ? snprintf(base, sizeof(base), "https://www.youtube.com/feed/playlists?tilefinch_save=%s&tilefinch_token=", work->save_video)
+            : snprintf(base, sizeof(base), "https://www.youtube.com%.*s?tilefinch_token=",
+                (int) url.path_length, url.value + url.path_offset);
+        if (count <= 0 || (size_t) count >= sizeof(base)) return false;
+    }
     return lite_html_continuation_link(
         &work->html, base, work->next_continuation,
-        "Load more results");
+        work->route == YOUTUBE_LITE_ROUTE_SEARCH ? "Load more results" : "Load more");
 }
 
 static void lite_build_work_pump(YoutubeLiteBuildWork *work)
@@ -2798,6 +3034,9 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
     switch (work->phase) {
     case YOUTUBE_LITE_BUILD_VIDEOS:
         lite_build_video_pump(work);
+        return;
+    case YOUTUBE_LITE_BUILD_LIBRARY_METADATA:
+        lite_build_library_metadata_pump(work);
         return;
     case YOUTUBE_LITE_BUILD_WATCH_MARKER:
         lite_build_watch_marker_pump(work);
@@ -2809,6 +3048,9 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
     case YOUTUBE_LITE_BUILD_WATCH_MICROFORMAT:
         lite_build_watch_key_pump(
             work, "playerMicroformatRenderer", false);
+        return;
+    case YOUTUBE_LITE_BUILD_WATCH_CHAPTERS:
+        lite_build_chapters_pump(work);
         return;
     case YOUTUBE_LITE_BUILD_COMMENTS:
         lite_build_comments_pump(work);
@@ -2877,11 +3119,18 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
             && !work->description_requested
             && work->emit_index < display) {
             size_t emit_index = work->emit_index++;
-            ok = lite_html_video(
-                &work->html, &work->videos[emit_index],
-                work->route == YOUTUBE_LITE_ROUTE_SEARCH
-                    && emit_index == 0,
-                work->query);
+            const YoutubeLiteVideo *video = &work->videos[emit_index];
+            if (work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS)
+                ok = lite_html_playlist_card(&work->html, video, work->save_video);
+            else {
+                ok = lite_html_video(&work->html, video,
+                    work->route == YOUTUBE_LITE_ROUTE_SEARCH && emit_index == 0, work->query);
+                if (ok && work->route == YOUTUBE_LITE_ROUTE_PLAYLIST && work->playlist_editable)
+                    ok = lite_html_text(&work->html, "<p>")
+                        && lite_html_account_action(&work->html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
+                            work->playlist_id, video->id, "Remove from playlist", "")
+                        && lite_html_text(&work->html, "</p>");
+            }
         } else {
             work->phase = YOUTUBE_LITE_BUILD_EMIT_CONTINUATION;
         }
@@ -2938,6 +3187,28 @@ static void lite_build_work_destroy(YoutubeLiteBuildWork *work)
     budget_free(budget, work);
 }
 
+static bool lite_build_library_sync(Budget *budget, const char *url,
+    const char *source, size_t length, const char *decoded, size_t decoded_length,
+    YoutubeLiteDocument *document)
+{
+    char *owned = NULL;
+    if (decoded == NULL && source != NULL) {
+        owned = lite_initial_data(budget, source, length, &decoded_length);
+        decoded = owned;
+    }
+    YoutubeLiteBuildWork *work = decoded == NULL ? NULL : lite_build_work_create(
+        budget, url, NULL, 0, length, NULL, 0, decoded, decoded_length, false, false, NULL, 0);
+    bool okay = false;
+    for (unsigned i = 0; work != NULL && i < 4096u; i++) {
+        lite_build_work_pump(work);
+        if (work->phase == YOUTUBE_LITE_BUILD_FAILED) break;
+        if (lite_build_work_take_document(work, document)) { okay = true; break; }
+    }
+    lite_build_work_destroy(work);
+    budget_free(budget, owned);
+    return okay;
+}
+
 static void lite_accept_cookies(
     BrowserSession *session, const TilefinchRequestContext *context,
     const FetchResult *fetch, const char *fallback_url)
@@ -2956,6 +3227,14 @@ static bool lite_fetch_url(const char *url, YoutubeLiteRoute route,
     if (route == YOUTUBE_LITE_ROUTE_HOME) {
         snprintf(output, 1024, "https://m.youtube.com/");
         return true;
+    }
+    if (route == YOUTUBE_LITE_ROUTE_PLAYLISTS) {
+        snprintf(output, 1024, "https://m.youtube.com/feed/playlists"); return true;
+    }
+    if (route == YOUTUBE_LITE_ROUTE_PLAYLIST) {
+        char id[128] = {0};
+        if (!lite_query_value(url, "list", id, sizeof(id)) || !lite_valid_account_id(id, false)) return false;
+        snprintf(output, 1024, "https://m.youtube.com/playlist?list=%s", id); return true;
     }
     if (route == YOUTUBE_LITE_ROUTE_WATCH) {
         char id[YOUTUBE_VIDEO_ID_CAPACITY];
@@ -2978,11 +3257,13 @@ static bool lite_fetch_url(const char *url, YoutubeLiteRoute route,
     }
     char query[YOUTUBE_LITE_QUERY_LIMIT] = {0};
     char encoded[YOUTUBE_LITE_QUERY_LIMIT * 3u] = {0};
+    char params[48];
     (void) lite_query_value(url, "search_query", query, sizeof(query));
-    if (!lite_url_encode(query, encoded, sizeof(encoded))) return false;
+    if (!lite_url_encode(query, encoded, sizeof(encoded)) || !lite_search_params(url, params)) return false;
     int length = snprintf(
         output, 1024,
-        "https://m.youtube.com/results?search_query=%s", encoded);
+        "https://m.youtube.com/results?search_query=%s%s%s", encoded,
+        params[0] ? "&sp=" : "", params);
     return length >= 0 && length < 1024;
 }
 
@@ -3020,7 +3301,33 @@ typedef struct {
     char api_key[128];
     char client_version[64];
     char visitor[1024];
+    unsigned auth_user;
+    bool auth_user_known;
 } YoutubeLiteIdentity;
+
+static bool lite_session_index_at(const char *data, size_t length, size_t at, unsigned *result)
+{
+    char index[8] = {0};
+    if (lite_json_key_string_at(data, length, at, "SESSION_INDEX", index, sizeof(index))) {
+        char *end; unsigned long value = strtoul(index, &end, 10);
+        if (end != index && *end == '\0' && value <= 99u) {
+            *result = (unsigned) value; return true;
+        }
+    }
+    if (at == 0 || at >= length || data[at - 1u] != '"'
+        || length - at <= 15u || memcmp(data + at, "SESSION_INDEX\"", 14u) != 0) return false;
+    const char *value = data + at + 14u, *end = data + length;
+    while (value < end && isspace((unsigned char) *value)) value++;
+    if (value == end || *value++ != ':') return false;
+    while (value < end && isspace((unsigned char) *value)) value++;
+    unsigned number = 0, digits = 0;
+    while (value < end && *value >= '0' && *value <= '9' && digits < 3u) {
+        number = number * 10u + (unsigned) (*value++ - '0'); digits++;
+    }
+    if (digits == 0 || number > 99u || value == end
+        || (*value != ',' && *value != '}' && !isspace((unsigned char) *value))) return false;
+    *result = number; return true;
+}
 
 static bool lite_identity_valid(const YoutubeLiteIdentity *identity)
 {
@@ -3118,7 +3425,7 @@ typedef struct {
 
 /* Parsed facts only, never a retained HTML/JSON response. Shares the existing
    two-entry, Budget-owned adapter cache and its cookie/portal/expiry rules. */
-#define YOUTUBE_LITE_WATCH_CACHE_ADAPTER "youtube-watch-facts-v1"
+#define YOUTUBE_LITE_WATCH_CACHE_ADAPTER "youtube-watch-facts-v3"
 typedef struct {
     YoutubeLiteWatch watch;
     YoutubeLiteVideo videos[6];
@@ -3129,8 +3436,8 @@ typedef struct {
     bool comments_ready;
     TilefinchDateFormat date_format;
 } YoutubeLiteWatchFacts;
-_Static_assert(sizeof(YoutubeLiteWatchFacts) <= 16u * 1024u,
-               "watch facts must stay within 16 KiB");
+_Static_assert(sizeof(YoutubeLiteWatchFacts) <= 20u * 1024u,
+               "watch facts including chapters must stay within 20 KiB");
 
 struct YoutubeLiteLoadJob {
     Budget *budget;
@@ -3251,6 +3558,8 @@ static TilefinchRequestContext lite_supplemental_context(
     };
 }
 
+#include "youtube_feed_authority.inc"
+
 static bool lite_prepare_supplemental_request(
     BrowserSession *session, const char *page_url,
     const YoutubeLiteIdentity *cached_identity,
@@ -3279,7 +3588,8 @@ static bool lite_prepare_supplemental_request(
     int endpoint_length = snprintf(
         prepared->endpoint, sizeof(prepared->endpoint),
         "https://m.youtube.com/youtubei/v1/%s?key=%s&prettyPrint=false",
-        comments ? "next" : "search", identity->api_key);
+        comments ? "next" : youtube_lite_route(page_url) == YOUTUBE_LITE_ROUTE_SEARCH
+            ? "search" : "browse", identity->api_key);
     char token_json[YOUTUBE_LITE_CONTINUATION_LIMIT * 2u];
     char visitor_json[2048] = "\"\"";
     if (endpoint_length < 0
@@ -3311,6 +3621,21 @@ static bool lite_prepare_supplemental_request(
     }
     prepared->context =
         lite_supplemental_context(page_url, prepared->endpoint);
+    if (!comments && youtube_lite_route(page_url) != YOUTUBE_LITE_ROUTE_SEARCH
+        && youtube_lite_session_signed_in(session)) {
+        char authorization[96] = {0};
+        prepared->context.initiator_url = "https://m.youtube.com/";
+        bool authorized = identity->auth_user_known && lite_feed_authorization(session,
+            &prepared->context, tilefinch_platform_wall_time_ns() / UINT64_C(1000000000),
+            authorization, sizeof(authorization));
+        int appended = authorized ? snprintf(prepared->extra_headers + extra_length,
+            sizeof(prepared->extra_headers) - (size_t) extra_length,
+            "\nAuthorization: %s\nX-Origin: https://m.youtube.com\nX-Goog-AuthUser: %u",
+            authorization, identity->auth_user) : -1;
+        lite_probe_wipe(authorization, sizeof(authorization));
+        if (appended < 0 || (size_t) appended >= sizeof(prepared->extra_headers) - (size_t) extra_length)
+            return false;
+    }
     (void) browser_session_cookie_header_context(
         session, &prepared->context, prepared->cookies,
         sizeof(prepared->cookies));
@@ -3358,7 +3683,7 @@ static void lite_load_after_identity(YoutubeLiteLoadJob *job)
         lite_resolver_identity_cache_put(job->session, &job->identity);
     }
     bool search_continuation =
-        job->route == YOUTUBE_LITE_ROUTE_SEARCH
+        job->route != YOUTUBE_LITE_ROUTE_WATCH
         && job->supplemental_requested;
     job->phase = (job->route != YOUTUBE_LITE_ROUTE_HOME
                    || lite_topics_requested(job->url))
@@ -3382,6 +3707,9 @@ static bool lite_load_identity_pump(YoutubeLiteLoadJob *job)
            multi-megabyte response this prefilter avoids three strlen/memcmp
            attempts at essentially every ordinary payload byte. */
         char byte = job->source.data[at];
+        if (byte == 'S' && !job->identity.auth_user_known)
+            job->identity.auth_user_known = lite_session_index_at(job->source.data,
+                job->source.length, at, &job->identity.auth_user);
         if (byte == 'I' && job->identity.api_key[0] == '\0') {
             (void) lite_json_key_string_at(
                 job->source.data, job->source.length, at,
@@ -3410,7 +3738,9 @@ static bool lite_load_identity_pump(YoutubeLiteLoadJob *job)
     if (stop == job->source.length
         || (job->identity.api_key[0] != '\0'
             && job->identity.client_version[0] != '\0'
-            && job->identity.visitor[0] != '\0')) lite_load_after_identity(job);
+            && job->identity.visitor[0] != '\0'
+            && (job->route == YOUTUBE_LITE_ROUTE_SEARCH || job->route == YOUTUBE_LITE_ROUTE_WATCH
+                || job->identity.auth_user_known))) lite_load_after_identity(job);
     return true;
 }
 
@@ -3771,6 +4101,7 @@ static bool lite_watch_facts_get(YoutubeLiteLoadJob *job)
         return false;
     }
     job->build->watch = facts->watch;
+    job->build->signed_in = youtube_lite_session_signed_in(job->session);
     if (!job->build->description_requested) {
         memcpy(job->build->videos, facts->videos, sizeof(facts->videos));
         job->build->video_count = facts->video_count;
@@ -3881,7 +4212,8 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     char search_token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
     job->supplemental_requested =
         job->supplemental_requested ||
-        (route == YOUTUBE_LITE_ROUTE_SEARCH
+        ((route == YOUTUBE_LITE_ROUTE_SEARCH || route == YOUTUBE_LITE_ROUTE_CHANNEL
+            || route == YOUTUBE_LITE_ROUTE_PLAYLIST || route == YOUTUBE_LITE_ROUTE_PLAYLISTS)
          && lite_query_value(
              url, "tilefinch_token", search_token, sizeof(search_token)));
     if (lite_document_cache_get(job)) return job;
@@ -3914,7 +4246,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         return job;
     }
     bool can_skip_primary =
-        route == YOUTUBE_LITE_ROUTE_SEARCH && search_token[0] != '\0'
+        route != YOUTUBE_LITE_ROUTE_WATCH && job->supplemental_requested
         && lite_identity_cache_get(session, &job->identity);
     if (can_skip_primary) {
         job->identity_available = true;
@@ -4141,6 +4473,8 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                 job->decoded, job->decoded_length,
                 job->compact_results, false,
                 job->error, sizeof(job->error));
+            if (job->build != NULL)
+                job->build->signed_in = youtube_lite_session_signed_in(job->session);
         } else {
             lite_build_work_pump(job->build);
         }
@@ -4549,7 +4883,6 @@ void youtube_lite_document_destroy(YoutubeLiteDocument *document)
     *document = (YoutubeLiteDocument) {0};
 }
 
-#include "youtube_feed_authority.inc"
 #include "youtube_feed.inc"
 #ifndef __PSP__
 #include "youtube_feed_probe.inc"

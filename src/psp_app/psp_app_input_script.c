@@ -511,7 +511,7 @@ probe_finished: ;
 }
 
 void psp_input_script_observe_page(
-    const PspEngineViews *views)
+    const PspEngineViews *views, const BrowserEngine *engine)
 {
     const NavigationSession *navigation = views == NULL ? NULL : views->navigation;
     if (navigation != NULL) psp_input_script_test_until(navigation);
@@ -519,6 +519,32 @@ void psp_input_script_observe_page(
     if (mark == NULL || navigation == NULL) return;
     const NavigationPage *page = &navigation->page;
     const BrowserController *controller = views->controller;
+    printf("tilefinch-input-provider: mark=%s feed=%d account=%d like=%d\n",
+        mark, (int) browser_engine_youtube_feed_state(engine),
+        (int) browser_engine_youtube_account_state(engine),
+        (int) browser_engine_youtube_like_state(engine));
+    /* Explicit diagnostic marks only. Expose bounded hit-test geometry, not
+       field values, link destinations or page text, so input journeys can
+       target the actual control rather than guessing from screenshots. */
+    if (strncmp(mark, "targets-", 8) == 0) {
+        for (size_t i = 0; i < page->layout.link_count && i < 64u; i++) {
+            const LinkRegion *link = &page->layout.links[i];
+            size_t length = 0;
+            const char *id = document_attribute(link->node, "id", &length);
+            printf("tilefinch-input-link-box: mark=%s index=%zu id=%.*s rect=%d,%d,%d,%d\n",
+                mark, i, (int) (length < 96u ? length : 96u), id == NULL ? "" : id,
+                link->x, link->y, link->width, link->height);
+        }
+        for (size_t i = 0; i < page->layout.control_count && i < 64u; i++) {
+            const ControlRegion *control = &page->layout.controls[i];
+            size_t length = 0;
+            const char *id = document_attribute(control->node, "id", &length);
+            printf("tilefinch-input-control-box: mark=%s index=%zu type=%d id=%.*s rect=%d,%d,%d,%d\n",
+                mark, i, (int) control->type,
+                (int) (length < 96u ? length : 96u), id == NULL ? "" : id,
+                control->x, control->y, control->width, control->height);
+        }
+    }
     lxb_dom_node_t *focus = NULL;
     if (controller != NULL && controller->focus_kind == CONTROLLER_FOCUS_LINK
         && controller->focus_index < page->layout.link_count)

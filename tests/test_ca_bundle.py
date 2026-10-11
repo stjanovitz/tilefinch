@@ -71,6 +71,31 @@ def main() -> int:
             "required release roots are missing or changed: "
             + ", ".join(sorted(missing))
         )
+
+    notices = (source_root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert f"stages the {len(bodies)} public CA root" in notices, (
+        "the redistribution notice must match the actual certificate count"
+    )
+    ca_notice_path = source_root / "third_party/notices/ca-bundle/NOTICE.md"
+    ca_notice = ca_notice_path.read_text(encoding="utf-8")
+    assert f"contains {len(bodies)}" in ca_notice
+    assert "https://curl.se/docs/caextract.html" in ca_notice
+    assert "NOTICES/public_suffix/LICENSE.MPL-2.0" in ca_notice
+    inventory = ca_notice.split("## Complete certificate inventory\n", 1)[1].split(
+        "## Issuer terms\n", 1
+    )[0]
+    inventory_fingerprints = re.findall(r"`([0-9a-f]{64})`", inventory)
+    assert sorted(inventory_fingerprints) == sorted(fingerprints), (
+        "every bundled certificate must have exactly one redistribution entry"
+    )
+    assert "32ae4cbc501bdabde2b20982bdfd3f53e25bc45f" in ca_notice
+    assert "Microsoft MPL" in inventory
+    assert (source_root / "third_party/public_suffix/LICENSE.MPL-2.0").is_file()
+    manifest = (source_root / "cmake/PspNoticesManifest.cmake").read_text(
+        encoding="utf-8"
+    )
+    assert "NOTICES/ca-bundle/NOTICE.md" in manifest
+    assert "NOTICES/public_suffix/LICENSE.MPL-2.0" in manifest
     return 0
 
 

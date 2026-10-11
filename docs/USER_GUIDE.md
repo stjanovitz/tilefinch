@@ -124,6 +124,22 @@ appear automatically. Feed responses are kept only in memory.
 
 In the signed-in header, **Account** opens a small local panel for feed
 navigation and switching accounts; select Account again to close it.
+The panel also opens **Watch Later** and **Playlists**. Video details offer
+Watch Later add/remove actions, **Save to playlist**, and channel
+**Subscribe/Unsubscribe** controls. Playlist pages load a bounded set of
+entries at a time with **Load more**; editable lists also offer **Remove**.
+Edits run in the background and show success only after YouTube confirms
+the selected video's or channel's state. A failed confirmation offers a
+manual retry. Navigating away cancels pending work, and these features add
+no local playlist or subscription files.
+
+Search results offer a collapsible **Filters** panel for upload date,
+duration and relevance/popularity ordering. Select a row to cycle its choices,
+then **Apply filters**. Choosing the default on every row clears the filters;
+**Load more results** keeps the current choices. Video details offer a
+collapsible **Chapters** list when the service declares chapters. Selecting a
+timestamp starts the same video at that point in the native player. Up to 24
+valid, ascending chapter timestamps are shown; no chapter history is saved.
 **Sign out** is the last header action. On personalized feeds, **Refresh
 suggestions** sits beside the heading and follows the video cards in
 sequential focus order.

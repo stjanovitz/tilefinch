@@ -16,13 +16,16 @@ class ResourceTests(unittest.TestCase):
     def test_provider_templates_have_translations(self):
         languages = generator.CATALOGS[-1][1]
         keys = {row[0] for row in generator.read_rows(generator.ACTIVE_VERSION, languages)}
-        source = (ROOT / "src/youtube_lite.c").read_text()
+        source = (ROOT / "src/youtube_lite.c").read_text() + (ROOT / "src/youtube_library.inc").read_text()
         # Only inspect C literals, not the explanatory template comment.
         tokens = re.findall(r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|/\*[\s\S]*?\*/|//[^\n]*''', source)
         labels = {label for token in tokens if token.startswith('"')
                   for label in re.findall(r"\{\{([^{}]+)\}\}", token)}
         self.assertGreater(len(labels), 40)
         self.assertEqual(labels - keys, set())
+        self.assertLessEqual({"Subscribe", "Unsubscribe", "Add to this playlist", "Remove", "Load more", "Remove from Watch Later",
+            "Updating...", "Added to playlist.", "Removed from playlist.", "Subscribed.", "Unsubscribed.",
+            "Not confirmed. Select again to retry.", "Sign in to use this action.", "Select an action."}, keys)
 
     def test_source_tree_contains_no_downloads(self):
         self.assertEqual(list((ROOT / "translations").rglob("*.tful")), [])

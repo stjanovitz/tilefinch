@@ -30,6 +30,25 @@ PSP EBOOT. It contains twenty-six public root certificates:
 - USERTrust RSA Certification Authority (expires 2038-01-18)
 - USERTrust ECC Certification Authority (expires 2038-01-18)
 
+## Redistribution notices
+
+Certificate data is not automatically covered by the project's MIT license.
+Keep the [CA-bundle provenance and redistribution notice](../third_party/notices/ca-bundle/NOTICE.md)
+with distributions of `roots.pem`. It records the fingerprints and
+redistribution basis for all 26 roots: Mozilla CA-store data and Microsoft's
+Azure Linux CA package (MPL-2.0), plus direct CA redistribution grants. The
+Microsoft anchor is byte-identical to its issuer's pinned, MPL-2.0-licensed
+Azure Linux source linked from that notice. The complete MPL text
+is in [LICENSE.MPL-2.0](../third_party/public_suffix/LICENSE.MPL-2.0).
+The install-tree manifest requires both the notice and that license text.
+
+Adding a root requires recording its source and applicable redistribution
+terms as well as its fingerprint. Public availability alone is not a license;
+do not label direct CA downloads as MPL-2.0 without establishing that provenance.
+Preserve each certificate's complete signed DER bytes when encoding it as PEM.
+
+## Trust policy and qualification
+
 The PEM encodings come from the CAs' authoritative repositories and are
 checked by fingerprint. Qualification uses Mbed TLS 3.6.x with this file as
 its only trust store. System curl is not an acceptable substitute on macOS:

@@ -8,6 +8,14 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.33 — 2026-10-10
+
+- Watch Later, playlists, and channel Subscribe/Unsubscribe controls in the
+  lightweight YouTube provider.
+- Compact search filters and selectable video chapters.
+- More reliable account-action confirmations and navigation.
+- Updated translations and clearer provider controls.
+
 ## 0.1.32 — 2026-10-10
 
 - Sign in to YouTube for recommendations and subscriptions, with optional

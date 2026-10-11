@@ -129,7 +129,7 @@ static int test_watch_metadata_reuse(void)
     for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
         if (session.site_adapter_document_cache[i].valid)
             retained += session.site_adapter_document_cache[i].length;
-    CHECK(retained > 0 && retained <= 16u * 1024u);
+    CHECK(retained > 0 && retained <= 20u * 1024u);
     printf("watch-reuse retained-bytes=%zu\n", retained);
     for (size_t i = 0; i < 2; i++) {
         CHECK(test_watch_reuse_load(&budget, &session, urls[i], false, &document,
@@ -432,8 +432,12 @@ static int test_cooperative_site_adapter_navigation(void)
         printf("provider-large-watch description=%u build-us=%llu slices=%zu bytes=%zu\n",
             description, (unsigned long long) metrics.build_us,
             metrics.build_slices, source_length);
-        CHECK(!description || metrics.build_slices < 80u);
-        CHECK(description || metrics.build_slices <= 114u);
+        /* Chapter discovery adds one cooperatively sliced metadata pass.
+           Retain the prior phase bounds rather than permitting unbounded work. */
+        size_t chapter_slices = (source_length + 16u * 1024u - 1u)
+            / (16u * 1024u) + 1u;
+        CHECK(!description || metrics.build_slices < 80u + chapter_slices);
+        CHECK(description || metrics.build_slices <= 114u + chapter_slices);
         if (!description) {
             youtube_lite_load_destroy(job);
             job = NULL;
@@ -5848,6 +5852,275 @@ static int test_youtube_rating_status_confirmation(void)
         fetch_trace_end();
         remove_google_identity_replay(fixture, 2u);
         CHECK(budget.current == 0 && budget.external_reserved == 0);
+    }
+    return 0;
+}
+
+static uint64_t test_youtube_account_clock(void *context)
+{
+    return *(uint64_t *) context;
+}
+
+static int test_youtube_library_actions(void)
+{
+    static const char library[] = "<script>var ytInitialData='{\"contents\":["
+        "{\"playlistRenderer\":{\"playlistId\":\"PLfixture\",\"title\":{\"simpleText\":\"One & two\"}}},"
+        "{\"lockupViewModel\":{\"contentType\":\"LOCKUP_CONTENT_TYPE_PLAYLIST\",\"contentId\":\"PLmodern\","
+        "\"metadata\":{\"lockupMetadataViewModel\":{\"title\":{\"content\":\"Modern list\"}}}}},"
+        "{\"playlistRenderer\":{\"playlistId\":\"bad/id\",\"title\":{\"simpleText\":\"Rejected list\"}}}]}';</script>";
+    static const char playlist[] = "<script>var ytInitialData='{\"playlistVideoListRenderer\":{"
+        "\"playlistId\":\"WL\",\"isEditable\":true,\"contents\":[{\"playlistVideoRenderer\":{"
+        "\"videoId\":\"TFTEST00001\",\"title\":{\"simpleText\":\"Saved video\"}}}]},"
+        "\"recommendations\":[{\"videoRenderer\":{\"videoId\":\"TFTEST00002\","
+        "\"title\":{\"simpleText\":\"Unrelated recommendation\"}}}]}';</script>";
+    Budget render_budget; budget_init(&render_budget, 4u * MIB);
+    YoutubeLiteDocument document = {0}; char build_error[128];
+    CHECK(youtube_lite_route("https://www.youtube.com/feed/playlists") == YOUTUBE_LITE_ROUTE_PLAYLISTS
+        && youtube_lite_route("https://www.youtube.com/playlist?list=WL") == YOUTUBE_LITE_ROUTE_PLAYLIST);
+    CHECK(youtube_lite_build_document(&render_budget,
+        "https://www.youtube.com/feed/playlists?tilefinch_save=TFTEST00001", library, strlen(library),
+        &document, build_error, sizeof(build_error)) && document.result_count == 2u
+        && strstr(document.html, "One &amp; two") && strstr(document.html, "Modern list")
+        && strstr(document.html, "Add to this playlist") && !strstr(document.html, "Rejected list"));
+    youtube_lite_document_destroy(&document);
+    CHECK(youtube_lite_build_document(&render_budget, "https://www.youtube.com/playlist?list=WL",
+        playlist, strlen(playlist), &document, build_error, sizeof(build_error))
+        && document.result_count == 1u && strstr(document.html, "Saved video")
+        && !strstr(document.html, "Unrelated recommendation")
+        && !strstr(document.html, "id=\"yt-watch-later-remove\"")
+        && strstr(document.html, "data-yt-action=2"));
+    youtube_lite_document_destroy(&document);
+    char *large = malloc(80u * 1024u);
+    CHECK(large != NULL);
+    const char *prefix = "<script>var ytInitialData='{\"playlistVideoListRenderer\":{\"contents\":["
+        "{\"playlistVideoRenderer\":{\"videoId\":\"TFTEST00001\",\"title\":{\"simpleText\":\"Saved video\"}}}],\"padding\":\"";
+    size_t length = strlen(prefix);
+    memcpy(large, prefix, length);
+    memset(large + length, 'x', 64u * 1024u); length += 64u * 1024u;
+    const char *suffix = "\",\"playlistId\":\"WL\",\"isEditable\":true}}';</script>";
+    memcpy(large + length, suffix, strlen(suffix) + 1u); length += strlen(suffix);
+    CHECK(youtube_lite_build_document(&render_budget, "https://www.youtube.com/playlist?list=WL",
+        large, length, &document, build_error, sizeof(build_error))
+        && document.result_count == 1u && strstr(document.html, "data-yt-action=2"));
+    youtube_lite_document_destroy(&document); free(large);
+    CHECK(!youtube_lite_build_document(&render_budget, "https://www.youtube.com/playlist?list=bad%2Fid",
+        playlist, strlen(playlist), &document, build_error, sizeof(build_error)));
+    CHECK(render_budget.current == 0);
+    static const char config[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"SESSION_INDEX\":\"2\",\"LOGGED_IN\":";
+    static const char auth[] = "\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":false}}";
+    static const char channel[] = "UCabcdefghijklmnopqrstuv";
+    for (unsigned action = 1u; action <= 4u; action++) {
+        bool subscription = action >= 3u;
+        bool desired = action == 1u || action == 3u;
+        for (unsigned lane = 0; lane < 15u; lane++) {
+            if (subscription && lane > 12u) continue;
+            uint64_t clock = 1000000u;
+            TilefinchPlatformServices services = {
+                .context = &clock, .monotonic_time_us = test_youtube_account_clock
+            };
+            tilefinch_platform_set_services(&services);
+            tilefinch_test_faults()->replayed_request_count = 0;
+            char bootstrap[1024], before[512], after[512], stale[512], endpoint[256], mutation[256];
+            snprintf(before, sizeof(before), subscription
+                ? "{\"subscribeButtonRenderer\":{\"channelId\":\"%s\",\"subscribed\":%s}}"
+                : "{%s,\"playlistAddToOptionRenderer\":{\"playlistId\":\"%s\",\"containsSelectedVideos\":\"%s\"}}",
+                subscription ? channel : auth, subscription ? ((lane == 2u ? desired : !desired) ? "true" : "false") : "WL",
+                (lane == 2u ? desired : !desired) ? "ALL" : "NONE");
+            snprintf(after, sizeof(after), subscription
+                ? "{\"subscribeButtonRenderer\":{\"channelId\":\"%s\",\"subscribed\":%s}}"
+                : "{%s,\"playlistAddToOptionRenderer\":{\"playlistId\":\"%s\",\"containsSelectedVideos\":\"%s\"}}",
+                subscription ? channel : auth, subscription ? ((lane == 1u ? !desired : desired) ? "true" : "false") : "WL",
+                (lane == 1u ? !desired : desired) ? "ALL" : "NONE");
+            snprintf(bootstrap, sizeof(bootstrap), "%s%s});</script><script>var ytInitialData=%s;</script>",
+                config, lane == 4u ? "false" : "true", subscription ? before : "{}");
+            snprintf(endpoint, sizeof(endpoint), "https://m.youtube.com/");
+            snprintf(mutation, sizeof(mutation), "https://m.youtube.com/youtubei/v1/%s?key=fixture-key&prettyPrint=false",
+                subscription ? desired ? "subscription/subscribe" : "subscription/unsubscribe" : "browse/edit_playlist");
+            if (subscription) {
+                snprintf(bootstrap, sizeof(bootstrap), "%s%s});</script>", config, lane == 4u ? "false" : "true");
+                const char *format = lane == 6u
+                    ? "{%s,\"subscribeButtonViewModel\":{\"isSubscribed\":%s,\"serviceEndpoints\":[{\"subscribeEndpoint\":{\"channelIds\":[\"%s\"]}}]}}"
+                    : "{%s,\"subscribeButtonRenderer\":{\"subscribed\":%s,\"channelId\":\"%s\"}}";
+                snprintf(before, sizeof(before), format, auth,
+                    (lane == 2u ? desired : !desired) ? "true" : "false", channel);
+                snprintf(after, sizeof(after), format, auth,
+                    (lane == 1u ? !desired : desired) ? "true" : "false", channel);
+                if (lane == 7u)
+                    snprintf(before, sizeof(before),
+                        "{%s,\"subscribeButtonRenderer\":{\"subscribed\":%s,"
+                        "\"channelId\":\"UCdifferentabcdefghijkl\",\"serviceEndpoints\":[{"
+                        "\"subscribeEndpoint\":{\"channelIds\":[\"%s\"]}}]}}",
+                        auth, desired ? "true" : "false", channel);
+                if (lane == 8u)
+                    snprintf(before, sizeof(before),
+                        "{%s,\"subscribeButtonRenderer\":{\"subscribed\":%s,\"serviceEndpoints\":[{"
+                        "\"subscribeEndpoint\":{\"channelIds\":[\"%s\",\"UCdifferentabcdefghijkl\"]}}]}}",
+                        auth, desired ? "true" : "false", channel);
+                if (lane >= 9u)
+                    snprintf(before, sizeof(before),
+                        "{%s,\"subscribeButtonViewModel\":{\"channelId\":\"%s\",\"buttonText\":\"fixture\"}}",
+                        auth, channel);
+                if (lane == 10u)
+                    snprintf(after, sizeof(after), "%s", before);
+                if (lane == 11u)
+                    snprintf(after, sizeof(after),
+                        "{%s,\"subscribeButtonRenderer\":{\"channelId\":\"%s\",\"subscribed\":%s}}",
+                        auth, channel, desired ? "false" : "true");
+            }
+            char mutation_state[512] = "{}";
+            if (subscription && lane >= 9u && lane != 10u)
+                snprintf(mutation_state, sizeof(mutation_state),
+                    "{\"actions\":[{\"updateSubscribeButtonAction\":{\"channelId\":\"%s\",\"subscribed\":%s}}]}",
+                    lane == 11u ? "UCdifferentabcdefghijkl" : channel,
+                    (lane == 12u ? !desired : desired) ? "true" : "false");
+            snprintf(stale, sizeof(stale), "%s", lane == 7u || lane == 9u || lane == 10u
+                ? "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":false}}}"
+                : lane == 13u ? "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":true}}}"
+                : before);
+            GoogleIdentityRecord records[] = {
+                {.url=endpoint, .status=200, .content_type="text/html", .body=bootstrap},
+                {.url=subscription ? "https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false"
+                    : "https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+                 .status=200, .content_type="application/json", .body=lane == 3u ? "{}" : before, .method="POST"},
+                {.url=mutation, .status=200, .content_type="application/json", .body=mutation_state, .method="POST"},
+                {.url=subscription ? "https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false"
+                    : "https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+                 .status=200, .content_type="application/json",
+                 .body=!subscription && lane >= 7u ? stale : after, .method="POST",
+                 .failed=!subscription && lane == 14u},
+                {.url="https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+                 .status=200, .content_type="application/json", .body=lane == 9u || lane == 10u ? stale : after, .method="POST"},
+                {.url="https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+                 .status=200, .content_type="application/json", .body=lane == 10u ? stale : after, .method="POST"},
+                {.url="https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+                 .status=200, .content_type="application/json", .body=lane == 10u ? stale : after, .method="POST"}
+            };
+            /* A transport success without matching state must never confirm. */
+            char fixture[128], error[256] = {0};
+            size_t record_count = subscription ? 4u : 7u;
+            CHECK(write_google_identity_replay(fixture, records, record_count)
+                && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+            Budget budget; budget_init(&budget, 4u * MIB);
+            BrowserSession session;
+            CHECK(browser_session_init(&session, &budget, 512u * 1024u)
+                && browser_session_cookie_set_http(&session, "https://m.youtube.com/",
+                    "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+            YoutubeLiteFeedJob *job = youtube_lite_account_action_begin(&budget, &session,
+                (YoutubeLiteAccountAction) action, subscription ? channel : "WL", "TFTEST00001",
+                !subscription && lane == 12u ? 600 : 20000);
+            CHECK(job != NULL);
+            if (lane == 5u) browser_session_clear_site_data(&session, "https://m.youtube.com/");
+            FetchPumpQuota quota = {.maximum_body_bytes=4096, .maximum_body_callbacks=4, .maximum_time_us=1000};
+            YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+            bool waited = false;
+            for (unsigned turn = 0; turn < 256u && status == YOUTUBE_LITE_LOAD_PENDING; turn++) {
+                status = youtube_lite_feed_pump(job, &quota);
+                YoutubeLiteAccountDiagnostics probe;
+                CHECK(youtube_lite_account_diagnostics(job, &probe));
+                if (!waited && probe.phase == 8u) {
+                    waited = true;
+                    unsigned requests = tilefinch_test_faults()->replayed_request_count;
+                    for (unsigned idle = 0; idle < 10u; idle++)
+                        CHECK(youtube_lite_feed_pump(job, &quota) == YOUTUBE_LITE_LOAD_PENDING);
+                    CHECK(tilefinch_test_faults()->replayed_request_count == requests);
+                    if (lane == 11u) browser_session_clear_site_data(&session, "https://m.youtube.com/");
+                }
+                clock += probe.phase == 8u ? 1000000u : 50000u;
+            }
+            bool success = lane == 0u || lane == 2u || lane == 6u || lane == 9u
+                || (!subscription && (lane == 7u || lane == 8u));
+            CHECK(status == (lane == 5u || (!subscription && lane == 11u) ? YOUTUBE_LITE_LOAD_CANCELLED
+                : success ? YOUTUBE_LITE_LOAD_SUCCEEDED : YOUTUBE_LITE_LOAD_FAILED));
+            if (!subscription && lane >= 7u) {
+                CHECK(waited == (lane <= 12u));
+                CHECK(tilefinch_test_faults()->replayed_request_count == (lane == 7u || lane == 8u ? 5u
+                    : lane == 9u ? 6u : lane == 10u ? 7u : 4u));
+                unsigned edits = 0;
+                for (unsigned i = 0; i < tilefinch_test_faults()->replayed_request_count; i++)
+                    if (strstr(tilefinch_test_faults()->replayed_requests[i].url, "/browse/edit_playlist?")) edits++;
+                CHECK(edits == 1u);
+            }
+            YoutubeLiteAccountDiagnostics diagnostics = {0};
+            CHECK(youtube_lite_account_diagnostics(job, &diagnostics));
+            if (!subscription && lane >= 7u)
+                CHECK(diagnostics.rechecks == (lane == 7u || lane == 8u || lane == 11u || lane == 12u ? 1u
+                    : lane == 9u ? 2u : lane == 10u ? 3u : 0u));
+            if (success) {
+                CHECK(diagnostics.status == 200 && diagnostics.bytes > 0
+                    && diagnostics.phase == 9u
+                    && diagnostics.submitted == (lane != 2u)
+                    && (diagnostics.flags & (subscription
+                        ? lane == 9u ? 1u << 27 : lane == 6u ? 32u : 16u : 4u)) != 0);
+                CHECK(diagnostics.selection == (desired ? 1u : 2u));
+            }
+            youtube_lite_feed_destroy(job); browser_session_destroy(&session); fetch_trace_end();
+            remove_google_identity_replay(fixture, record_count);
+            tilefinch_platform_set_services(NULL);
+            CHECK(budget.current == 0 && budget.external_reserved == 0);
+        }
+    }
+    return 0;
+}
+
+static int test_youtube_library_native_action(void)
+{
+    static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"channelId\":\"UCabcdefghijklmnopqrstuv\",\"title\":\"Saved fixture\"}};</script>";
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"SESSION_INDEX\":0,\"LOGGED_IN\":true});</script>";
+    static const char state[] = "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":false}},"
+        "\"playlistAddToOptionRenderer\":{\"playlistId\":\"WL\",\"containsSelectedVideos\":\"ALL\"}}";
+    for (unsigned lane = 0; lane < 3u; lane++) {
+        GoogleIdentityRecord records[] = {
+            {.url="https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1",
+             .status=200, .content_type="text/html", .body=watch},
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url="https://m.youtube.com/youtubei/v1/playlist/get_add_to_playlist?key=fixture-key&prettyPrint=false",
+             .status=200, .content_type="application/json", .method="POST", .body=state}
+        };
+        char fixture[128], error[256] = {0};
+        CHECK(write_google_identity_replay(fixture, records, 3u)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
+        BrowserConfig config; browser_config_init(&config, &device);
+        config.memory_limit = 16u * MIB; config.resources.enabled = false;
+        config.resources.web_fonts_enabled = false;
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine && browser_session_cookie_set_http(browser_engine_session(engine),
+            "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        const char *url = "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details";
+        if (lane == 2u) {
+            static const char forged[] = "<a id=yt-watch-later-add data-yt-action=1 data-yt-target=WL "
+                "data-yt-video=TFTEST00001 href='#tilefinch-account-action'>Add</a>";
+            CHECK(browser_engine_commit_html(engine, url, forged, sizeof(forged) - 1u, true));
+        } else CHECK(browser_engine_load_url(engine, url, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(browser_engine_render_frame(engine, NULL));
+        lxb_dom_node_t *node = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-watch-later-add");
+        CHECK(node && browser_engine_focus_node(engine, node));
+        uint64_t generation = nav->generation;
+        int scroll = navigation_current(nav)->scroll_y;
+        ControllerAction action;
+        CHECK(browser_engine_activate(engine, &action));
+        if (lane == 2u) CHECK(browser_engine_youtube_account_state(engine) == BROWSER_YOUTUBE_FEED_IDLE);
+        else {
+            CHECK(action.type == CONTROLLER_ACTION_CONTROL);
+            if (lane == 1u) CHECK(browser_engine_cancel_network_work(engine, "fixture cancel") == 1u);
+            for (unsigned turn = 0; turn < 256u && browser_engine_youtube_account_state(engine) == BROWSER_YOUTUBE_FEED_LOADING; turn++) {
+                bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+            }
+            CHECK(browser_engine_youtube_account_state(engine) == (lane == 0u
+                ? BROWSER_YOUTUBE_FEED_CURRENT : BROWSER_YOUTUBE_FEED_FAILED));
+            CHECK(nav->generation == generation && navigation_current(nav)->scroll_y == scroll
+                && controller_focused_node(browser_engine_controller(engine)) == node);
+        }
+        Budget *budget = browser_engine_budget(engine);
+        CHECK(browser_engine_shutdown(engine) && budget->current == 0);
+        browser_engine_destroy(engine); fetch_trace_end(); remove_google_identity_replay(fixture, 3u);
     }
     return 0;
 }

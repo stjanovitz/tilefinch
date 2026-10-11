@@ -1281,7 +1281,7 @@ configuration for every row:
 | combined candidate | 3,730,744 B | +82,132 B (+2.25%) | 1,841,252 B |
 
 The combined image has roughly 2,012 protected return sites and remains below
-the ordinary 4,760,000-byte `.text` ratchet. The hot-function size ratchets
+the ordinary 4,768,000-byte `.text` ratchet. The hot-function size ratchets
 also pass. Newlib initializes one process-wide fixed stack guard
 rather than a random per-process guard, so this is useful corruption detection
 and exploit friction, not a desktop-grade randomized canary.

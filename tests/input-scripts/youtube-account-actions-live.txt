@@ -1,0 +1,33 @@
+# Native provider details for the public jNQXAC9IVRw test video.
+# Requires an explicitly authorized test-account session. Each mutation is
+# undone in this journey; inspect confirmed account=3 receipts, not just taps.
+wait-page 90
+tap-page down
+tap-page up
+tap-page up
+tap-page up
+tap-page up
+tap-page up
+tap-page up
+mark-page subscribe-target
+tap-page cross
+wait-live 1200
+mark-page subscribed
+tap-page right
+mark-page unsubscribe-target
+tap-page cross
+wait-live 1200
+mark-page unsubscribed
+tap-page down
+tap-page down
+tap-page down
+mark-page wl-add-target
+tap-page cross
+wait-live 1200
+mark-page wl-added
+tap-page down
+mark-page wl-remove-target
+tap-page cross
+wait-live 1200
+mark-page wl-removed
+end

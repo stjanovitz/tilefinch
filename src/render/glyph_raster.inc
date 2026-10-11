@@ -161,8 +161,19 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
     *smoothed = false;
     humanist_profile = glyph_cache_ink_profile(humanist_profile, codepoint);
     size_t set = glyph_cache_set(cache, face, codepoint, pixel_height, bold);
+    /* A translated line can collide with a neighboring control's glyphs
+       despite an almost-empty cache. Four-way eviction then repeatedly
+       reloads optional pack blocks and prevents publication from settling.
+       Give non-ASCII glyphs an aligned pair of sets, without extra storage
+       or changing the ASCII hot path. Lookup and replacement use the same
+       bounded range, including entries belonging to ordinary ASCII sets. */
+    size_t ways = TILEFINCH_GLYPH_CACHE_WAYS;
+    if (codepoint >= 128u && cache->glyph_cache_capacity >= 2u * ways) {
+        set &= ~(size_t) 1u;
+        ways *= 2u;
+    }
     size_t begin = set * TILEFINCH_GLYPH_CACHE_WAYS;
-    size_t end = begin + TILEFINCH_GLYPH_CACHE_WAYS;
+    size_t end = begin + ways;
     if (end > cache->glyph_cache_capacity) end = cache->glyph_cache_capacity;
     for (size_t i = begin; i < end; i++) {
         GlyphCacheEntry *entry = &cache->glyph_cache[i];

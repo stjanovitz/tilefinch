@@ -1360,7 +1360,7 @@ bool psp_input_script_text_frame(PspUiInput *input);
 void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);
 void psp_input_script_observe_page(
-    const PspEngineViews *views);
+    const PspEngineViews *views, const BrowserEngine *engine);
 void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media);
 void psp_input_script_observe_gamepad(

@@ -262,6 +262,18 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
     ok = ok && fprintf(text, "YouTube rating diagnostics: state=%u selected=%u\n",
         (unsigned) browser_engine_youtube_like_state(engine),
         browser_engine_youtube_like_selected(engine) ? 1u : 0u) > 0;
+    ok = ok && fprintf(text, "YouTube account action diagnostics: state=%u\n",
+        (unsigned) browser_engine_youtube_account_state(engine)) > 0;
+    YoutubeLiteAccountDiagnostics account = {0};
+    (void) browser_engine_youtube_account_diagnostics(engine, &account);
+    ok = ok && fprintf(text, "YouTube account response diagnostics: status=%ld bytes=%zu phase=%u flags=%u prepared=%u submitted=%u\n",
+        account.status, account.bytes, account.phase, account.flags,
+        account.prepared, account.submitted) > 0;
+    ok = ok && fprintf(text, "YouTube account state diagnostics: candidates=%u matching=%u fields=%u model=%u selection=%u rechecks=%u\n",
+        account.candidates, account.matching, account.state_flags, account.model_flags,
+        account.selection, account.rechecks) > 0;
+    ok = ok && fprintf(text, "YouTube account mutation diagnostics: flags=%u status=%u bound=%u\n",
+        account.mutation_flags, account.mutation_status, account.mutation_bound) > 0;
     YoutubeLiteRatingDiagnostics rating = {0};
     (void) browser_engine_youtube_rating_diagnostics(engine, &rating);
     ok = ok && fprintf(text, "YouTube rating response diagnostics: bootstrap=%ld api=%ld bytes=%zu phase=%u flags=%u\n",

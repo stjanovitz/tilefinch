@@ -493,7 +493,9 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         "Suggestions will load in the background.", "Select Like or Unlike.",
         "Saving like...", "Video liked.", "Like failed - select Like to retry.",
         "Sign in to like this video.", "Removing like...", "Like removed.",
-        "Unlike failed - select Unlike to retry.", "Sign in to unlike this video."
+        "Unlike failed - select Unlike to retry.", "Sign in to unlike this video.",
+        "Updating...", "Added to playlist.", "Removed from playlist.", "Subscribed.", "Unsubscribed.",
+        "Not confirmed. Select again to retry.", "Sign in to use this action.", "Select an action."
     };
     BrowserDeviceProfile device;
     browser_device_profile_psp3000(&device);
@@ -511,7 +513,7 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 1536u * 1024u));
     char error[256] = {0};
-    for (unsigned lane = 0; lane < 3; lane++) {
+    for (unsigned lane = 0; lane < 6; lane++) {
         fprintf(stderr, "provider layout language=%s lane=%u\n", language_code, lane);
         BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
         CHECK(engine && browser_engine_set_youtube_topics(engine, false));
@@ -532,9 +534,12 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
                 }
                 CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
             }
-        } else {
-            static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        } else if (lane == 2) {
+            static const char watch[] = "<script>var ytInitialData='{\"chapterRenderer\":{"
+                "\"title\":{\"simpleText\":\"A long chapter title that wraps safely on the PSP screen\"},"
+                "\"timeRangeStartMillis\":60000}}';</script>"
                 "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+                "\"channelId\":\"UCabcdefghijklmnopqrstuv\","
                 "\"title\":\"Account\",\"shortDescription\":\"Account\",\"lengthSeconds\":\"200\"}};</script>";
             YoutubeLiteDocument document = {0};
             CHECK(youtube_lite_build_document(browser_engine_budget(engine),
@@ -547,6 +552,38 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
                 "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details",
                 document.html, document.html_length, true));
             youtube_lite_document_destroy(&document);
+        } else if (lane < 5) {
+            static const char library[] = "<script>var ytInitialData='{\"contents\":["
+                "{\"playlistRenderer\":{\"playlistId\":\"PLfixture\",\"title\":{\"simpleText\":\"A saved playlist\"}}}]}';</script>";
+            static const char playlist[] = "<script>var ytInitialData='{\"playlistVideoListRenderer\":{"
+                "\"playlistId\":\"WL\",\"isEditable\":true,\"contents\":[{\"playlistVideoRenderer\":{"
+                "\"videoId\":\"TFTEST00001\",\"title\":{\"simpleText\":\"A saved video\"}}},"
+                "{\"playlistVideoRenderer\":{\"videoId\":\"TFTEST00002\",\"title\":{\"simpleText\":\"Another saved video\"}}}]}}';</script>";
+            const char *url = lane == 3
+                ? "https://www.youtube.com/feed/playlists?tilefinch_save=TFTEST00001"
+                : "https://www.youtube.com/playlist?list=WL";
+            const char *source = lane == 3 ? library : playlist;
+            YoutubeLiteDocument document = {0};
+            CHECK(youtube_lite_build_document(browser_engine_budget(engine), url,
+                source, strlen(source), &document, error, sizeof(error)));
+            CHECK(browser_engine_commit_html(engine, url, document.html,
+                document.html_length, true));
+            youtube_lite_document_destroy(&document);
+        } else {
+            static const char search[] = "<script>var ytInitialData='{}';</script>";
+            const char *url = "https://www.youtube.com/results?search_query=fixture&tilefinch_date=2&tilefinch_duration=2&tilefinch_sort=1";
+            YoutubeLiteDocument document = {0};
+            CHECK(youtube_lite_build_document(browser_engine_budget(engine), url,
+                search, sizeof(search) - 1, &document, error, sizeof(error))
+                && browser_engine_commit_html(engine, url, document.html, document.html_length, true));
+            youtube_lite_document_destroy(&document);
+        }
+        if (lane == 2 || lane == 5) {
+            lxb_dom_node_t *panel = provider_node(engine, lane == 2 ? "yt-chapters" : "yt-filter-panel");
+            ControllerAction action = {0};
+            CHECK(panel && browser_engine_focus_node(engine, panel->first_child)
+                && browser_engine_activate(engine, &action)
+                && action.type == CONTROLLER_ACTION_CONTROL);
         }
         CHECK(provider_paint(engine, provider));
         lxb_dom_node_t *search = provider_node(engine, "yt-search");
@@ -569,7 +606,8 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         }
         const LayoutDocument *notice_layout = &browser_engine_navigation(engine)->page.layout;
         const LayoutNodeBox *notice = layout_box_for_node(notice_layout,
-            provider_node(engine, lane == 2 ? "yt-like-status" : "yt-feed-status"));
+            provider_node(engine, lane >= 3 ? "yt-library-status"
+                : lane == 2 ? "yt-like-status" : "yt-feed-status"));
         if (notice) {
             const FontFace *face = font_context_face(notice_layout->fonts, notice_layout->web_fonts, FONT_SANS);
             for (size_t at = 0; at < sizeof(notices) / sizeof(*notices); at++) {

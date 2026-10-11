@@ -6179,7 +6179,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
        dispatch has already moved to rather than the one it left. */
     PSP_LOOP_PHASE(LOOP_PROBE);
     psp_input_script_observe(&intent, &process->presentation.ui);
-    psp_input_script_observe_page(engine_views);
+    psp_input_script_observe_page(engine_views, browser->engine);
 #endif
     PSP_LOOP_PHASE(LOOP_NAVIGATION);
     if (intent.load_content_blocker_allowlist_requested) {

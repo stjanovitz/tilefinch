@@ -1450,7 +1450,8 @@ static bool private_console_command_allowed(const char *command)
         "focus-down", "focus-left", "focus-right", "focus-id", "tap", "click",
         "activate", "cross", "back", "forward", "reload", "tick", "pump", "drain",
         "idle", "heavy-answer", "private-text", "private-focus",
-        "private-focus-action", "private-feedback", "private-snapshot", "private-open", "quit", "exit"
+        "private-focus-action", "private-feedback", "private-snapshot", "private-open",
+        "private-export-youtube-login", "quit", "exit"
     };
     for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
         if (strcmp(command, allowed[i]) == 0) return true;
@@ -2757,6 +2758,19 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 }
                 reset_cache = ok;
             }
+        } else if (strcmp(line, "private-export-youtube-login") == 0
+                   && private_console_fd >= 0) {
+            /* Explicit local test action only: fixed filename in the keeper's
+               owner-only working directory, never a page-selected path. The
+               production serializer excludes passwords and non-YouTube cookies. */
+            struct stat directory;
+            BrowserSession *session = browser_engine_session(engine);
+            ok = (argument == NULL || argument[0] == '\0')
+                && stat(".", &directory) == 0 && S_ISDIR(directory.st_mode)
+                && directory.st_uid == getuid() && (directory.st_mode & 0077) == 0
+                && youtube_lite_session_signed_in(session)
+                && youtube_login_save(session, "youtube-device-session.bin", (int64_t) time(NULL));
+            changed = false;
         } else if (strcmp(line, "private-snapshot") == 0
                    && private_console_fd >= 0) {
             ok = private_snapshot_page(engine, navigation, argument);

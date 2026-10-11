@@ -174,10 +174,20 @@ struct BrowserEngine {
     YoutubeLiteLoadJob *youtube_topics_job;
     YoutubeLiteFeedJob *youtube_feed_job;
     YoutubeLiteFeedJob *youtube_like_job;
+    YoutubeLiteFeedJob *youtube_account_job;
+    lxb_dom_node_t *youtube_account_nodes[16];
+    size_t youtube_account_node_count;
+    YoutubeLiteAccountAction youtube_account_action;
+    BrowserYoutubeFeedState youtube_account_state;
+    BrowserYoutubeFeedState youtube_account_painted_state;
+    uint64_t youtube_account_generation;
+    uint64_t youtube_account_shell;
+    size_t youtube_account_layout_generation;
     BrowserYoutubeFeedState youtube_like_state;
     bool youtube_like_selected;
 #ifndef __PSP__
     YoutubeLiteRatingDiagnostics youtube_rating_diagnostics;
+    YoutubeLiteAccountDiagnostics youtube_account_diagnostics;
     unsigned youtube_history_metadata;
 #endif
     uint64_t youtube_like_generation;
@@ -287,6 +297,10 @@ static void browser_engine_clear_youtube_work(BrowserEngine *engine)
     engine->youtube_feed_job = NULL;
     youtube_lite_feed_destroy(engine->youtube_like_job);
     engine->youtube_like_job = NULL;
+    youtube_lite_feed_destroy(engine->youtube_account_job);
+    engine->youtube_account_job = NULL;
+    if (engine->youtube_account_state == BROWSER_YOUTUBE_FEED_LOADING)
+        engine->youtube_account_state = BROWSER_YOUTUBE_FEED_FAILED;
     if (engine->youtube_like_state == BROWSER_YOUTUBE_FEED_LOADING)
         engine->youtube_like_state = BROWSER_YOUTUBE_FEED_FAILED;
     youtube_lite_document_destroy(&engine->youtube_feed_pending);
@@ -337,6 +351,11 @@ bool browser_engine_youtube_like_selected(const BrowserEngine *engine)
     return engine != NULL && engine->youtube_like_selected;
 }
 
+BrowserYoutubeFeedState browser_engine_youtube_account_state(const BrowserEngine *engine)
+{
+    return engine == NULL ? BROWSER_YOUTUBE_FEED_IDLE : engine->youtube_account_state;
+}
+
 #ifndef __PSP__
 unsigned browser_engine_youtube_history_metadata(const BrowserEngine *engine)
 {
@@ -350,6 +369,14 @@ bool browser_engine_youtube_rating_diagnostics(const BrowserEngine *engine,
     *result = engine->youtube_rating_diagnostics;
     return true;
 }
+
+bool browser_engine_youtube_account_diagnostics(const BrowserEngine *engine,
+    YoutubeLiteAccountDiagnostics *result)
+{
+    if (engine == NULL || result == NULL) return false;
+    *result = engine->youtube_account_diagnostics;
+    return true;
+}
 #endif
 
 /* Bind account mutations only to a control we committed from the native
@@ -359,11 +386,19 @@ static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
     engine->youtube_like_node = NULL;
     engine->youtube_unlike_node = NULL;
     engine->youtube_signout_node = NULL;
+    engine->youtube_account_node_count = 0;
     engine->youtube_like_node_generation = engine->navigation.generation;
     if (youtube_lite_route(engine->navigation.page.document_url) == YOUTUBE_LITE_ROUTE_NONE)
         return;
     LayoutDocument *layout = &engine->navigation.page.layout;
     for (size_t i = 0; i < layout->link_count; i++) {
+        size_t action_length = 0;
+        const char *account_action = document_attribute(layout->links[i].node,
+            "data-yt-action", &action_length);
+        if (account_action != NULL && action_length == 1u
+            && account_action[0] >= '1' && account_action[0] <= '4'
+            && engine->youtube_account_node_count < 16u)
+            engine->youtube_account_nodes[engine->youtube_account_node_count++] = layout->links[i].node;
         size_t length = 0;
         const char *id = document_attribute(layout->links[i].node, "id", &length);
         if (id != NULL && length == sizeof("yt-like-action") - 1u
@@ -3994,7 +4029,8 @@ size_t browser_engine_cancel_network_work(
     if (engine == NULL) return 0;
     size_t cancelled = (engine->youtube_topics_job != NULL ? 1u : 0u)
         + (engine->youtube_feed_job != NULL ? 1u : 0u)
-        + (engine->youtube_like_job != NULL ? 1u : 0u);
+        + (engine->youtube_like_job != NULL ? 1u : 0u)
+        + (engine->youtube_account_job != NULL ? 1u : 0u);
     browser_engine_clear_youtube_work(engine);
     return cancelled + navigation_cancel_network_work(&engine->navigation, reason);
 }
@@ -5330,6 +5366,49 @@ bool browser_engine_activate(BrowserEngine *engine,
         engine->autofocus_pending = false;
         activated = controller_activate(&engine->controller, action);
     }
+    /* A delivered user action supersedes the deferred initial autofocus.
+       Otherwise the next idle turn can return to the search field while a
+       provider edit is still being confirmed, moving both focus and scroll. */
+    if (activated) engine->autofocus_pending = false;
+    if (activated && action->type == CONTROLLER_ACTION_NAVIGATE
+        && engine->navigation.page.runtime == NULL
+        && engine->youtube_like_node_generation == engine->navigation.generation
+        && navigation_url_is_same_document(&engine->navigation, action->url)
+        && strchr(action->url, '#') != NULL
+        && strcmp(strchr(action->url, '#'), "#tilefinch-account-action") == 0) {
+        lxb_dom_node_t *node = controller_focused_node(&engine->controller);
+        bool owned = false;
+        for (size_t i = 0; i < engine->youtube_account_node_count; i++)
+            owned |= engine->youtube_account_nodes[i] == node;
+        if (owned) {
+            if (engine->youtube_account_job == NULL) {
+#ifndef __PSP__
+                memset(&engine->youtube_account_diagnostics, 0, sizeof(engine->youtube_account_diagnostics));
+#endif
+                char target[128] = {0}, video[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
+                size_t length = 0;
+                const char *value = document_attribute(node, "data-yt-target", &length);
+                bool valid = value != NULL && length < sizeof(target);
+                if (valid) memcpy(target, value, length);
+                value = document_attribute(node, "data-yt-video", &length);
+                valid = valid && value != NULL && length < sizeof(video);
+                if (valid) memcpy(video, value, length);
+                value = document_attribute(node, "data-yt-action", &length);
+                valid = valid && value != NULL && length == 1u && value[0] >= '1' && value[0] <= '4';
+                engine->youtube_account_action = valid
+                    ? (YoutubeLiteAccountAction) (value[0] - '0') : YOUTUBE_LITE_ACTION_NONE;
+                engine->youtube_account_generation = engine->navigation.generation;
+                if (valid) engine->youtube_account_job = youtube_lite_account_action_begin(
+                    &engine->budget, &engine->session, engine->youtube_account_action,
+                    target, video, engine->config.navigation_timeout_ms);
+                engine->youtube_account_state = engine->youtube_account_job != NULL
+                    ? BROWSER_YOUTUBE_FEED_LOADING : youtube_lite_session_signed_in(&engine->session)
+                    ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED;
+            }
+            action->type = CONTROLLER_ACTION_CONTROL; action->url[0] = '\0';
+            return browser_engine_finish_input(engine, true);
+        }
+    }
     if (activated && action->type == CONTROLLER_ACTION_NAVIGATE
         && engine->navigation.page.runtime == NULL
         && engine->youtube_like_node_generation == engine->navigation.generation
@@ -6246,6 +6325,49 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
     return working;
 }
 
+static bool browser_engine_run_youtube_account(BrowserEngine *engine, bool *visual_changed)
+{
+    if (browser_engine_navigation_pending(engine) || !engine->navigation.page.loaded
+        || youtube_lite_route(engine->navigation.page.document_url) == YOUTUBE_LITE_ROUTE_NONE)
+        return false;
+    if (engine->youtube_account_generation != engine->navigation.generation) {
+        engine->youtube_account_generation = engine->navigation.generation;
+        engine->youtube_account_state = BROWSER_YOUTUBE_FEED_IDLE;
+    }
+    bool working = engine->youtube_account_job != NULL;
+    if (working) {
+        FetchPumpQuota quota = {.maximum_body_callbacks = 1, .maximum_body_bytes = 16u * KIB,
+            .maximum_time_us = engine->config.idle_work_budget_us};
+        YoutubeLiteLoadStatus status = youtube_lite_feed_pump(engine->youtube_account_job, &quota);
+#ifndef __PSP__
+        (void) youtube_lite_account_diagnostics(engine->youtube_account_job,
+            &engine->youtube_account_diagnostics);
+#endif
+        if (status != YOUTUBE_LITE_LOAD_PENDING) {
+            engine->youtube_account_state = status == YOUTUBE_LITE_LOAD_SUCCEEDED
+                ? BROWSER_YOUTUBE_FEED_CURRENT : BROWSER_YOUTUBE_FEED_FAILED;
+            youtube_lite_feed_destroy(engine->youtube_account_job);
+            engine->youtube_account_job = NULL;
+        }
+    }
+    if (engine->youtube_account_painted_state != engine->youtube_account_state
+        || engine->youtube_account_layout_generation != engine->navigation.incremental_relayouts
+        || engine->youtube_account_shell != engine->render_shell_serial) {
+        static const char *const done[] = {"", "Added to playlist.", "Removed from playlist.", "Subscribed.", "Unsubscribed."};
+        const char *label = engine->youtube_account_state == BROWSER_YOUTUBE_FEED_LOADING ? "Updating..."
+            : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_CURRENT ? done[engine->youtube_account_action]
+            : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_FAILED ? "Not confirmed. Select again to retry."
+            : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED ? "Sign in to use this action."
+            : "Select an action.";
+        if (browser_engine_youtube_notice_paint(engine, "yt-library-status", tilefinch_ui_text(label))
+            && visual_changed != NULL) *visual_changed = true;
+        engine->youtube_account_painted_state = engine->youtube_account_state;
+        engine->youtube_account_layout_generation = engine->navigation.incremental_relayouts;
+        engine->youtube_account_shell = engine->render_shell_serial;
+    }
+    return working;
+}
+
 static bool browser_engine_run_youtube_like(BrowserEngine *engine, bool *visual_changed)
 {
     if (browser_engine_navigation_pending(engine) || !engine->navigation.page.loaded
@@ -6299,6 +6421,7 @@ bool browser_engine_run_idle_work(
        turn, while still allowing the other bounded continuations to run. */
     bool topics_work = browser_engine_run_youtube_topics(engine, visual_changed);
     topics_work |= browser_engine_run_youtube_like(engine, visual_changed);
+    topics_work |= browser_engine_run_youtube_account(engine, visual_changed);
     if (visual_changed != NULL && *visual_changed) return true;
     /* Startup script tasks can still change the whole document's geometry.
        Do not compete with them by reading/publishing optional fonts and

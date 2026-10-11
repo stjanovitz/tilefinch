@@ -1055,6 +1055,24 @@ exercise real form submission rather than injecting a URL.
 Counts are frame-counted, not time-counted; avoid using
 them to qualify shortcuts whose meaning is intentionally millisecond-based.
 
+An explicit mark whose name starts with `targets-` records up to 64 link and
+64 control hit-test rectangles, with their indices, IDs and control types.
+It does not record field values, page text or link destinations. Use these
+validation-only records to check a journey's actual targets when layout or
+font changes make an old cursor-coordinate sequence miss a field.
+Every observed page mark also records numeric feed, account-action and Like
+states. Require a confirmed `CURRENT` state after the intended action;
+an activation receipt or completed script alone is not confirmation.
+
+`youtube-account-actions-live.txt` starts at the native provider details URL
+`https://www.youtube.com/watch?v=jNQXAC9IVRw&tilefinch_view=details` with an
+explicitly authorized test-account session. It subscribes/unsubscribes and
+adds/removes Watch Later. Require the target IDs at the four target marks,
+`account=3` at all four completion marks, unchanged page generation, and clean
+teardown. Do not run this mutation journey automatically on a personal account.
+If an intermediate action fails, verify and undo any preceding change before
+ending the test. Session transfer and all live evidence remain private.
+
 `wikipedia-native-priority-live.txt` exercises Select, Settings navigation,
 Triangle, and nub motion during a committed page's reflow. Require
 `busy-menu` to show `screen=menu`, `busy-settings` to show `screen=options`,
@@ -1301,13 +1319,14 @@ order or captures. A passing action golden alone is not a latency budget.
 Keep dated latency results and raw captures in the private investigation area.
 
 `wikipedia-search-keyboard-live` starts at the English Main Page, hides
-the toolbar, opens its responsive search icon, then moves the nub to the
-separate form's input, enters `psp` through Danzeff, and submits with R+Start.
+the toolbar, opens its responsive search icon, preserves the separate page's
+initial text-field focus, enters `psp` through Danzeff, and submits with R+Start.
 Check that `search-loaded` is loaded, its URL contains the nonempty `search=psp`
 query, and its capture shows search results. Optional resources may still be
 pending; a keyboard-close, empty-query page, or action acknowledgement alone
-is not success. Coordinates are tied to the live 480px layout: inspect the
-`search-field` capture and focus-target log when the site changes. This is a
+is not success. The initial icon coordinates are tied to the live 480px layout:
+inspect the `search-field` capture and focus-target log when the site changes.
+Require the text input `ooui-php-1`, not its overlapping label control. This is a
 live smoke, not a stable page-layout golden.
 `wikipedia-font-cursor-live` alternates nub movement and idle time during
 optional-font publication. Check the font adoption/rollback and owner-thread

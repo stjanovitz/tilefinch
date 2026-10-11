@@ -40,6 +40,7 @@
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/youtube_login.h"
 #include "diagnostic_trace.h"
 
 #define MIB (1024u * 1024u)

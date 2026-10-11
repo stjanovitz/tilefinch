@@ -657,6 +657,8 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-youtube-login-tests PROPERTIES LABELS "tilefinch;unit;session;youtube" TIMEOUT 30)
     add_test(NAME tilefinch-youtube-login-journey COMMAND tilefinch-browser-engine-tests --youtube-login-journey)
     set_tests_properties(tilefinch-youtube-login-journey PROPERTIES LABELS "tilefinch;journey;youtube" TIMEOUT 60)
+    add_test(NAME tilefinch-youtube-navigation-journey COMMAND tilefinch-browser-engine-tests --youtube-navigation-journey)
+    set_tests_properties(tilefinch-youtube-navigation-journey PROPERTIES LABELS "tilefinch;journey;youtube" TIMEOUT 60)
 
     # Cross-boot TLS session store (docs/engineering/PSP_TRANSPORT.md).
     # Pure data plus file I/O; does

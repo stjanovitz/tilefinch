@@ -180,8 +180,16 @@ notice in this file.
   (distributed by PSPDEV under its own GPL-3.0-only and MIT licensing
   metadata); the installed custom firmware supplies the implementation used
   to hand off to a slot EBOOT.
-- The PSP package stages the eight public CA root certificates listed in
-  `certs/README.md`; they are trust data, not private key material.
+- **TLS trust bundle**: the PSP package stages the 26 public CA root
+  certificates listed in `certs/README.md`; they contain no private keys.
+  Mozilla- and Microsoft Azure Linux-derived CA-store data is MPL-2.0,
+  not covered by Tilefinch's MIT license. The license text is included at
+  `third_party/public_suffix/LICENSE.MPL-2.0`. Certificate sources,
+  issuer-specific terms, and a fingerprint inventory covering all 26 roots
+  are recorded in `third_party/notices/ca-bundle/NOTICE.md`, staged as
+  `NOTICES/ca-bundle/NOTICE.md`. The Microsoft root matches its issuer's
+  MPL-2.0 Azure Linux CA package, not a license inferred from a website or
+  policy document.
 - **PPSSPP** 1.20.4 was used only to execute the EBOOT during validation and
   is not redistributed.
 
@@ -210,7 +218,8 @@ notices); the MIT texts for QuickJS, stb, and the QR encoder; the SheenBidi
 Apache-2.0 text; the NanoSVG zlib text; the
 libwebp copyright license and patent grant;
 Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source
-pointer; the complete PocketSphinx compound license; the DejaVu and both OFL
+pointer; the TLS CA-bundle provenance/redistribution notice and the shared
+MPL-2.0 text; the complete PocketSphinx compound license; the DejaVu and both OFL
 font licenses alongside the font files; the
 curl, nghttp2, mbed TLS, WAMR, SIMDe, and zlib texts for the PSP stack; the PSPDEV
 component notices; the FFmpeg LGPL-2.1 text when the software-decoder PRX is

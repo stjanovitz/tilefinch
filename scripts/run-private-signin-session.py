@@ -26,11 +26,15 @@ SERVICE_URLS = {"google": ENTRY_URL,
                 "youtube": "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F"}
 YOUTUBE_PAGES = {"youtube-home": "https://www.youtube.com/feed/recommended",
                  "youtube-subscriptions": "https://www.youtube.com/feed/subscriptions",
+                 "youtube-watch-later": "https://www.youtube.com/playlist?list=WL",
+                 "youtube-playlists": "https://www.youtube.com/feed/playlists",
                  "youtube-test-video": "https://www.youtube.com/watch?v=jNQXAC9IVRw&tilefinch_view=details"}
 YOUTUBE_UI_ACTIONS = {"youtube-like": b"yt-like-action", "youtube-unlike": b"yt-unlike-action",
+                      "youtube-watch-later-add": b"yt-watch-later-add", "youtube-watch-later-remove": b"yt-watch-later-remove",
+                      "youtube-subscribe": b"yt-subscribe-action", "youtube-unsubscribe": b"yt-unsubscribe-action",
                       "youtube-signout": b"yt-signout-action", "youtube-account": b"yt-account-action",
                       "youtube-refresh": b"yt-feed-refresh"}
-ACTIONS = {"status", "attempt", "restart", "advance", "view", "view-below", "view-above", "inspect", "stop", *YOUTUBE_UI_ACTIONS, *YOUTUBE_PAGES}
+ACTIONS = {"status", "attempt", "restart", "advance", "view", "view-below", "view-above", "inspect", "export-youtube-session", "stop", *YOUTUBE_UI_ACTIONS, *YOUTUBE_PAGES}
 MAX_REQUEST = 64
 MAX_RESPONSE = 4096
 MAX_PASSWORD_ATTEMPTS = 3
@@ -221,7 +225,8 @@ class SessionKeeper:
         self.session = None
         if old is not None:
             old.close()
-        for name in ("view.ppm", "view.png", "redacted.ppm", "redacted.ppm.txt", "redacted.png"):
+        for name in ("view.ppm", "view.png", "redacted.ppm", "redacted.ppm.txt", "redacted.png",
+                     "youtube-device-session.bin", "youtube-device-session.bin.tmp"):
             (self.directory / name).unlink(missing_ok=True)
         if self.stopping.is_set():
             return
@@ -285,6 +290,10 @@ class SessionKeeper:
                 self.inspection_ready = False
                 values = self.remember(PRIVATE.create_private_snapshot(self.session, self.directory))
                 self.inspection_ready = bool(values[8])
+            elif action == "export-youtube-session":
+                # Explicitly authorized USB hardware test. Return only the
+                # ordinary accepted bit; never read or expose session values.
+                self.remember(self.session.send(b"private-export-youtube-login\n"))
             elif action in YOUTUBE_PAGES:
                 self.set_phase("opening_youtube")
                 # These fixed destinations select the lightweight provider
@@ -368,6 +377,8 @@ class SessionKeeper:
                 self.session = None
         finally:
             self.credentials.close()
+            for name in ("youtube-device-session.bin", "youtube-device-session.bin.tmp"):
+                (self.directory / name).unlink(missing_ok=True)
 
 
 def serve(keeper, path, *, ready=None):

@@ -697,7 +697,12 @@ if(PSP)
             # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
             # engine: first usable input -3.2 s and first answer -6.5 s on
             # the device (chatgpt-ask); this build 4,647,460 bytes.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4760000)
+            # Bounded native playlist/subscription actions and the paired
+            # non-ASCII glyph-cache lookup measured 4,764,444 bytes. The
+            # user approved an 8,000-byte increase: these actions run in
+            # cooperative navigation jobs, not the gameplay frame path,
+            # and the glyph lookup retains the existing cache allocation.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4768000)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

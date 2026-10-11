@@ -31,6 +31,8 @@ set(TILEFINCH_NOTICES_MANIFEST
     NOTICES/public_suffix/LICENSE.MPL-2.0
     NOTICES/public_suffix/LICENSE.chromium
     NOTICES/public_suffix/README.md
+    # TLS root data: provenance/CA terms plus the shared MPL text above.
+    NOTICES/ca-bundle/NOTICE.md
     # Complete PocketSphinx compound license.
     NOTICES/pocketsphinx/POCKETSPHINX_LICENSE.txt
     # Alpha Cephei acoustic-model notice plus the complete CMUdict license and

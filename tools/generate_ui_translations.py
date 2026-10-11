@@ -20,7 +20,8 @@ CATALOGS = [(1, [("es", "Spanish", "EMBEDDED"), ("fr", "French", "EMBEDDED"),
                  ("ko", "Korean", "KOREAN"), ("hi", "Hindi", "DEVANAGARI"),
                  ("ar", "Arabic", "ARABIC")])]
 CATALOGS.append((5, CATALOGS[-1][1]))
-ACTIVE_VERSION = 5
+CATALOGS.append((6, CATALOGS[-1][1]))
+ACTIVE_VERSION = 6
 
 def read_rows(version, languages):
     source = ROOT / f"translations/ui/v{version}/source.tsv"

@@ -20,7 +20,9 @@ typedef enum {
     YOUTUBE_LITE_ROUTE_HOME,
     YOUTUBE_LITE_ROUTE_SEARCH,
     YOUTUBE_LITE_ROUTE_WATCH,
-    YOUTUBE_LITE_ROUTE_CHANNEL
+    YOUTUBE_LITE_ROUTE_CHANNEL,
+    YOUTUBE_LITE_ROUTE_PLAYLISTS,
+    YOUTUBE_LITE_ROUTE_PLAYLIST
 } YoutubeLiteRoute;
 
 typedef struct {
@@ -96,9 +98,9 @@ typedef struct {
 } YoutubeLiteLoadMetrics;
 
 /*
- * The lightweight provider is deliberately narrow. It owns only the public
- * HTTPS home, search, and playable watch routes; every other YouTube URL
- * remains an ordinary browser navigation.
+ * The lightweight provider owns HTTPS home, search, watch, channel and
+ * library routes. Unsupported YouTube paths return its local Home surface;
+ * account actions never require executing the full service page.
  */
 YoutubeLiteRoute youtube_lite_route(const char *url);
 
@@ -181,6 +183,19 @@ void youtube_lite_feed_destroy(YoutubeLiteFeedJob *job);
 YoutubeLiteFeedJob *youtube_lite_rating_begin(Budget *budget,
     BrowserSession *session, const char *video_id, bool liked, long timeout_ms);
 
+typedef enum {
+    YOUTUBE_LITE_ACTION_NONE = 0,
+    YOUTUBE_LITE_ACTION_PLAYLIST_ADD,
+    YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
+    YOUTUBE_LITE_ACTION_SUBSCRIBE,
+    YOUTUBE_LITE_ACTION_UNSUBSCRIBE
+} YoutubeLiteAccountAction;
+/* Explicit native-provider actions only. IDs are bounded, fresh service
+   state authorizes edits, and HTTP success alone never confirms a mutation. */
+YoutubeLiteFeedJob *youtube_lite_account_action_begin(Budget *budget,
+    BrowserSession *session, YoutubeLiteAccountAction action,
+    const char *target_id, const char *video_id, long timeout_ms);
+
 #ifndef __PSP__
 /* Content-free first-history-card metadata presence for host qualification. */
 unsigned youtube_lite_feed_history_metadata(const YoutubeLiteFeedJob *job);
@@ -196,6 +211,20 @@ typedef struct YoutubeLiteRatingDiagnostics {
    cookies or authorization material. */
 bool youtube_lite_rating_diagnostics(const YoutubeLiteFeedJob *job,
                                     YoutubeLiteRatingDiagnostics *result);
+typedef struct YoutubeLiteAccountDiagnostics {
+    long status;
+    size_t bytes;
+    unsigned phase, flags;
+    bool prepared, submitted;
+    unsigned candidates, matching, state_flags;
+    unsigned mutation_flags, mutation_status;
+    bool mutation_bound;
+    unsigned model_flags;
+    unsigned selection, rechecks; /* 0 unknown, 1 selected, 2 not selected */
+} YoutubeLiteAccountDiagnostics;
+/* Fixed numeric schema/transport evidence only, never response content. */
+bool youtube_lite_account_diagnostics(const YoutubeLiteFeedJob *job,
+                                     YoutubeLiteAccountDiagnostics *result);
 /* Host-only, data-only qualification boundary. No credential, URL, response
    text or video metadata crosses this result; the existing session owns all
    authentication and transport policy. It does not execute page scripts. */
