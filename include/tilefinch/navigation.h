@@ -141,6 +141,7 @@ typedef void (*NavigationScriptFrontierCallback)(
 
 typedef struct {
     uint16_t control_index;
+    /* High bit tags bounded option-selectedness bytes, not text. */
     uint16_t value_length;
     char value[128];
 } NavigationHistoryControl;
@@ -991,6 +992,9 @@ struct NavigationSession {
     char *user_css;
     size_t user_css_length;
     NavigationCandidatePrepareCallback candidate_prepare;
+    /* Optional pre-shell restoration may replace the candidate layout. The
+       final prepare hook below is still guarded against graph replacement. */
+    NavigationCandidatePrepareCallback candidate_graph_prepare;
     NavigationCandidateFinalizeCallback candidate_abort;
     NavigationCandidateFinalizeCallback candidate_commit;
     void *candidate_commit_opaque;

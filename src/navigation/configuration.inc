@@ -84,6 +84,7 @@ bool navigation_set_candidate_commit_hooks(
         return false;
     }
     session->candidate_prepare = prepare;
+    session->candidate_graph_prepare = NULL;
     session->candidate_abort = abort;
     session->candidate_commit = commit;
     session->candidate_commit_opaque = opaque;

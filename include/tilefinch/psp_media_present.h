@@ -145,6 +145,15 @@ bool psp_media_present_plan_portrait_crop(
     PspMediaPresentPlan *plan,
     int source_width, int source_height, int source_stride_pixels,
     int screen_width, int screen_height);
+/* Bounded, conservative black-pillarbox probe; never crops automatically. */
+bool psp_media_present_has_portrait_content(
+    const uint32_t *pixels, int width, int height, int stride_pixels);
+/* Five seconds of active playback, independent of media timestamps/seeks.
+   Pauses and buffering do not consume the window. No sample is due at or
+   beyond the limit; decoded frames, not repeated presents, pace sampling. */
+bool psp_media_present_portrait_probe_due(
+    uint16_t *playback_ms, uint8_t *phase, unsigned elapsed_ms,
+    bool playing, bool new_frame);
 void psp_media_present_quad_vertices(
     const PspMediaPresentQuad *quad, PspMediaPresentVertex vertices[4]);
 

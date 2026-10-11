@@ -31,6 +31,8 @@ typedef struct {
     bool (*seek_us)(void *opaque, uint64_t target_us, uint64_t *actual_us);
     bool (*seek_after_us)(void *opaque, uint64_t target_us,
                           uint64_t *actual_us);
+    /* Optional cooperative metadata preparation. */
+    bool (*prepare_seek_us)(void *opaque, uint64_t target_us);
     void (*rewind)(void *opaque);
     size_t (*retained_bytes)(const void *opaque);
 } MediaSampleSourceOps;

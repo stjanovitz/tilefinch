@@ -941,6 +941,11 @@ MediaPlaybackSourcePrimeStatus media_playback_prime_video_source(
 MediaPlaybackSourcePrimeStatus media_playback_prime_audio_source(
     MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
     char *error, size_t error_size);
+/* Poll every source, including audio when video is pending, so independent
+   metadata requests overlap instead of blocking the interactive thread. */
+MediaPlaybackSourcePrimeStatus media_playback_prepare_seek_sources(
+    MediaPlayback *playback, uint64_t target_us,
+    char *error, size_t error_size);
 bool media_playback_seek(MediaPlayback *playback, uint64_t target_us,
                          uint64_t *actual_us, char *error,
                          size_t error_size);

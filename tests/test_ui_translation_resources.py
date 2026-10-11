@@ -13,6 +13,20 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
+    def test_native_player_labels_have_translations(self):
+        languages = generator.CATALOGS[-1][1]
+        rows = generator.read_rows(generator.ACTIVE_VERSION, languages)
+        keys = {row[0] for row in rows}
+        self.assertLessEqual({"Audio", "Subtitles", "Chapters", "LIVE", "SEEK",
+            "SELECT ROTATE", "X PAUSE", "X PLAY", "X PAUSE  TRI TRACKS",
+            "X PLAY  TRI TRACKS", "X PAUSE  TRI MENU  L/R SEEK",
+            "X PLAY  TRI MENU  L/R SEEK", "STICK/L/R SEEK  X PAUSE",
+            "STICK/L/R SEEK  X PLAY", "X GO   O CANCEL",
+            "L/R  X SELECT  O BACK"}, keys)
+        header = (ROOT / "include/tilefinch/ui_language.h").read_text()
+        bound = int(re.search(r"TILEFINCH_UI_TRANSLATION_ROWS (\d+)u", header).group(1))
+        self.assertLessEqual(len(rows), bound)
+
     def test_provider_templates_have_translations(self):
         languages = generator.CATALOGS[-1][1]
         keys = {row[0] for row in generator.read_rows(generator.ACTIVE_VERSION, languages)}

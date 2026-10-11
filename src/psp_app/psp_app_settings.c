@@ -980,6 +980,14 @@ void psp_app_apply_setting(
                 : "NO DECLINED OFFERS TO RESET",
             150);
     }
+    if (intent->setting.id == PSP_UI_SETTING_ROTATE_HINT_ALWAYS) {
+        bool always = intent->setting.value.boolean;
+        browser_profile_set_rotate_hint_always(profile, always);
+        app->process->presentation.ui.rotate_hint_always = always;
+        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(&app->process->presentation.ui,
+            always ? "ROTATE HINT ALWAYS" : "ROTATE HINT AUTO", 150);
+    }
     if (intent->setting.id == PSP_UI_SETTING_VIDEO_SCALING) {
         BrowserVideoScaling scaling = intent->setting.value.video_scaling;
         browser_profile_set_video_scaling(profile, scaling);

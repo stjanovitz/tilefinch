@@ -40,6 +40,8 @@ static bool preview_media_mode(const char *mode)
     return strcmp(mode, "media") == 0
         || strcmp(mode, "media-playing") == 0
         || strcmp(mode, "media-playing-bbb") == 0
+        || strcmp(mode, "media-chapters") == 0
+        || strcmp(mode, "media-chapter-menu") == 0
         || strcmp(mode, "media-loading") == 0
         || strcmp(mode, "seek") == 0
         || strcmp(mode, "media-error") == 0
@@ -769,7 +771,9 @@ int main(int argc, char **argv)
     }
     if (preview_media_mode(mode)) {
         PspUiMediaState media;
+        PspUiMediaPresentation presentation;
         psp_ui_media_init(&media);
+        psp_ui_media_bind_presentation(&media, &presentation);
         bool big_buck_bunny = strcmp(mode, "media-playing-bbb") == 0;
         /* `media` is the paused control (the pointer), `media-playing` the
            running one (the two bars): both halves of the same overlay have
@@ -780,6 +784,19 @@ int main(int argc, char **argv)
             big_buck_bunny ? UINT64_C(120000000) : UINT64_C(10000000),
             big_buck_bunny ? UINT64_C(596000000) : UINT64_C(18950000),
             big_buck_bunny ? "Big Buck Bunny" : "Fixture video");
+        if (strcmp(mode, "media-chapters") == 0 || strcmp(mode, "media-chapter-menu") == 0) {
+            const MediaChapter chapters[] = {{0, "Introduction"}, {45, "Getting started"},
+                {120, "Working with examples"}, {240, "Next steps"}, {360, "Summary"}};
+            psp_ui_media_set(&media, true, true, false, UINT64_C(155000000),
+                              UINT64_C(420000000), "Video with chapters");
+            psp_ui_media_set_chapters(&media, chapters, sizeof(chapters) / sizeof(chapters[0]));
+            const PspUiMediaTrack tracks[] = {{"English"}};
+            psp_ui_media_set_tracks(&media, tracks, 1u, 0, tracks, 1u, -1);
+            if (strcmp(mode, "media-chapter-menu") == 0) {
+                PspUiInput input = {.pressed = PSP_UI_BUTTON_TOOLBAR};
+                (void) psp_ui_media_update(&media, &input);
+            }
+        }
         if (strcmp(mode, "media-loading") == 0) {
             psp_ui_media_set_resolving(&media, "Fixture video");
             psp_ui_media_set_resolving_progress(

@@ -1693,6 +1693,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         navigation_compiled_stylesheet_cache_move(candidate, session);
         memset(&candidate->page, 0, sizeof(candidate->page));
         candidate->candidate_prepare = NULL;
+        candidate->candidate_graph_prepare = NULL;
         candidate->candidate_abort = NULL;
         candidate->candidate_commit = NULL;
         candidate->candidate_commit_opaque = NULL;
@@ -1906,10 +1907,18 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
         return false;
     }
     NavigationCandidatePrepareCallback prepare = session->candidate_prepare;
+    NavigationCandidatePrepareCallback graph_prepare = session->candidate_graph_prepare;
     NavigationCandidateFinalizeCallback abort = session->candidate_abort;
     NavigationCandidateFinalizeCallback commit = session->candidate_commit;
     void *hook_opaque = session->candidate_commit_opaque;
     bool hook_prepared = false;
+    if (prepare != NULL && graph_prepare != NULL
+        && !graph_prepare(hook_opaque, candidate)) {
+        abort(hook_opaque);
+        navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
+                                  "candidate state restoration failed");
+        return false;
+    }
     lxb_html_document_t *candidate_document = candidate->page.document.html;
     ScriptRuntime *candidate_runtime = candidate->page.runtime;
     DrawCommand *candidate_commands = candidate->page.layout.commands;
@@ -1987,6 +1996,7 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
         session->images = &session->page.images;
     }
     session->candidate_prepare = prepare;
+    session->candidate_graph_prepare = graph_prepare;
     session->candidate_abort = abort;
     session->candidate_commit = commit;
     session->candidate_commit_opaque = hook_opaque;

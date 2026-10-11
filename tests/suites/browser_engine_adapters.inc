@@ -280,6 +280,20 @@ static int test_journey_complete(BrowserEngine *engine)
 /* The native decoder is covered separately by the offline hardware journey.
    This host lane joins real provider transactions and native control intents:
    it never treats a synthetic media clock as proof that decoding succeeded. */
+static bool test_journey_player_button(PspUiMediaState *media, unsigned button,
+                                      PspUiMediaAction expected, bool pixels)
+{
+    static uint16_t before[480 * 272], after[480 * 272];
+    memset(before, 0, sizeof(before));
+    psp_ui_media_composite(media, before, 480, 272, 480);
+    PspUiInput input = {.pressed = button, .analog_x = 128, .analog_y = 128};
+    PspUiMediaIntent intent = psp_ui_media_update(media, &input);
+    memset(after, 0, sizeof(after));
+    psp_ui_media_composite(media, after, 480, 272, 480);
+    return intent.action == expected
+        && (!pixels || (intent.visual_changed && memcmp(before, after, sizeof(before))));
+}
+
 static int test_search_video_journey(void)
 {
     BrowserDeviceProfile profile;
@@ -351,6 +365,8 @@ static int test_search_video_journey(void)
     CHECK(browser_engine_set_page_visibility(engine, false));
     browser_engine_suspend_page_presentations(engine);
     PspUiMediaState media = {0};
+    PspUiMediaPresentation presentation;
+    psp_ui_media_bind_presentation(&media, &presentation);
     psp_ui_media_set_resolving(&media, "Fixture video");
     PspUiInput buttons = { .pressed = PSP_UI_BUTTON_CANCEL, .analog_x = 128, .analog_y = 128 };
     CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_CLOSE);
@@ -359,10 +375,56 @@ static int test_search_video_journey(void)
     buttons.pressed = PSP_UI_BUTTON_CONFIRM;
     CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_RETRY);
     psp_ui_media_set(&media, true, true, false, 1000000, 20000000, "Fixture video");
-    psp_ui_media_set_seek_preview(&media, 8000000);
-    CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_SEEK);
-    psp_ui_media_commit_seek(&media, 8000000);
-    CHECK(media.seek_in_progress && media.current_time_us == 8000000);
+    MediaChapter chapters[] = {{0, "Intro"}, {8, "Second chapter"}};
+    PspUiMediaTrack audio[] = {{"Original"}, {"Alternate"}}, subtitles[] = {{"English"}};
+    psp_ui_media_set_chapters(&media, chapters, 2);
+    psp_ui_media_set_tracks(&media, audio, 2, 0, subtitles, 1, -1);
+    presentation.rotation_available = true;
+    for (unsigned lap = 0; lap < 8; lap++) {
+        psp_ui_media_set(&media, true, true, false, 1000000, 20000000, NULL);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_TOOLBAR,
+            PSP_UI_MEDIA_ACTION_NONE, true) && presentation.track_menu_tab == 2);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_DOWN,
+            PSP_UI_MEDIA_ACTION_NONE, true) && presentation.track_menu_selection == 1);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_CONFIRM,
+            PSP_UI_MEDIA_ACTION_SEEK, true) && media.seek_preview_time_us == 8000000);
+        psp_ui_media_commit_seek(&media, 8000000);
+        CHECK(media.seek_in_progress && media.current_time_us == 8000000);
+        /* Menu/cancel feedback must not wait for seek preparation or caption
+           loading. The compositor changes on the very next publication. */
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_TOOLBAR,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_CANCEL,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        psp_ui_media_set(&media, true, true, false, 8000000, 20000000, NULL);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_MENU,
+            PSP_UI_MEDIA_ACTION_ROTATE, false));
+        presentation.clockwise = true;
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_MENU,
+            PSP_UI_MEDIA_ACTION_ROTATE, false));
+        presentation.portrait_crop = true;
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_TOOLBAR,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_PAGE_DOWN,
+            PSP_UI_MEDIA_ACTION_NONE, true) && presentation.track_menu_tab == 0);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_CONFIRM,
+            PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK, true));
+        psp_ui_media_set(&media, true, true, false, 8100000, 20000000, NULL);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_TOOLBAR,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_PAGE_DOWN,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_PAGE_DOWN,
+            PSP_UI_MEDIA_ACTION_NONE, true) && presentation.track_menu_tab == 1);
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_LEFT,
+            PSP_UI_MEDIA_ACTION_NONE, true));
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_CONFIRM,
+            PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK, true));
+        psp_ui_media_set_subtitle(&media, "Caption after seek");
+        CHECK(test_journey_player_button(&media, PSP_UI_BUTTON_MENU,
+            PSP_UI_MEDIA_ACTION_ROTATE, false));
+        presentation.clockwise = presentation.portrait_crop = false;
+    }
     buttons.pressed = PSP_UI_BUTTON_CANCEL;
     CHECK(psp_ui_media_update(&media, &buttons).action == PSP_UI_MEDIA_ACTION_CLOSE);
     CHECK(browser_engine_set_page_visibility(engine, true) && browser_engine_render_frame(engine, NULL)

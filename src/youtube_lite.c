@@ -72,8 +72,8 @@ typedef struct {
     char url[256];
 } YoutubeLiteTopic;
 
-#define YOUTUBE_LITE_MAXIMUM_CHAPTERS 24u
-typedef struct { unsigned seconds; char title[80]; } YoutubeLiteChapter;
+#define YOUTUBE_LITE_MAXIMUM_CHAPTERS MEDIA_CHAPTER_LIMIT
+typedef MediaChapter YoutubeLiteChapter;
 
 typedef struct {
     YoutubeLiteVideo video;
@@ -4072,6 +4072,27 @@ static void lite_document_cache_store(YoutubeLiteLoadJob *job)
             tilefinch_platform_monotonic_time_ns())) {
         job->metrics.document_cache_stores++;
     }
+}
+
+size_t youtube_lite_copy_chapters(BrowserSession *session, const char *url,
+                                 MediaChapter *chapters, size_t capacity)
+{
+    char fetch_url[1024];
+    if (session == NULL || chapters == NULL || capacity == 0
+        || !lite_fetch_url(url, YOUTUBE_LITE_ROUTE_WATCH, fetch_url)) return 0;
+    BrowserSiteAdapterDocumentCacheView cached = {0};
+    TilefinchRequestContext authority = lite_primary_context(url, fetch_url);
+    if (!browser_session_site_adapter_document_cache_get(session,
+            YOUTUBE_LITE_WATCH_CACHE_ADAPTER, fetch_url, 0, &authority,
+            tilefinch_platform_monotonic_time_ns(),
+            YOUTUBE_LITE_DOCUMENT_CACHE_MAX_AGE_NS, &cached)
+        || cached.length != sizeof(YoutubeLiteWatchFacts)) return 0;
+    const YoutubeLiteWatchFacts *facts = (const void *) cached.data;
+    size_t count = facts->watch.chapter_count;
+    if (count > MEDIA_CHAPTER_LIMIT) return 0;
+    if (count > capacity) count = capacity;
+    memcpy(chapters, facts->watch.chapters, count * sizeof(*chapters));
+    return count;
 }
 
 static bool lite_watch_facts_get(YoutubeLiteLoadJob *job)

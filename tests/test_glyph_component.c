@@ -480,12 +480,15 @@ static bool test_release_artifacts(void)
               == TILEFINCH_UPDATE_PACKAGE_GLYPH);
         bool revised_hindi = pack == TILEFINCH_GLYPH_PACK_DEVANAGARI
             && (verified.manifest.release_sequence == 2u
-                || verified.manifest.release_sequence == 3u);
+                || verified.manifest.release_sequence == 3u
+                || verified.manifest.release_sequence == 4u);
         CHECK(revised_hindi || verified.manifest.release_sequence == 1u);
         CHECK(strcmp(verified.manifest.tag,
                      revised_hindi
-                        ? (verified.manifest.release_sequence == 3u
-                            ? "components-v3" : "components-v2")
+                        ? (verified.manifest.release_sequence == 4u
+                            ? "components-v4"
+                            : verified.manifest.release_sequence == 3u
+                                ? "components-v3" : "components-v2")
                         : "components-v1") == 0);
         CHECK(strcmp(verified.manifest.asset, spec->pack_asset) == 0);
         if (pack == TILEFINCH_GLYPH_PACK_CYRILLIC

@@ -185,8 +185,9 @@ static uint32_t ui_media_menu_hash_string(uint32_t hash, const char *text,
 }
 
 static uint32_t ui_media_menu_signature(
-    const PspUiMediaPresentation *presentation)
+    const PspUiMediaState *media)
 {
+    const PspUiMediaPresentation *presentation = media->presentation;
     uint32_t hash = UINT32_C(2166136261);
     /* A retained opaque menu is invalid when the process theme changes even
        if its track catalog is byte-identical. */
@@ -199,6 +200,20 @@ static uint32_t ui_media_menu_signature(
     hash = ui_media_menu_hash_byte(hash, presentation->track_menu_selection);
     hash = ui_media_menu_hash_byte(hash, presentation->audio_track_count);
     hash = ui_media_menu_hash_byte(hash, presentation->subtitle_track_count);
+    hash = ui_media_menu_hash_byte(hash, presentation->chapter_count);
+    unsigned current_chapter = 0;
+    uint64_t time = media->seek_preview_active
+        ? media->seek_preview_time_us : media->current_time_us;
+    for (size_t at = 0; at < presentation->chapter_count; at++) {
+        uint32_t seconds = presentation->chapters[at].seconds;
+        if ((uint64_t) seconds * 1000000u <= time) current_chapter = (unsigned) at + 1u;
+        for (unsigned byte = 0; byte < 4u; byte++)
+            hash = ui_media_menu_hash_byte(hash, (unsigned char) (seconds >> (byte * 8u)));
+        hash = ui_media_menu_hash_string(hash, presentation->chapters[at].title,
+                                        sizeof(presentation->chapters[at].title));
+    }
+    if (presentation->track_menu_tab == 2)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) current_chapter);
     hash = ui_media_menu_hash_byte(
         hash, (unsigned char) (presentation->selected_audio_track + 1));
     hash = ui_media_menu_hash_byte(
@@ -249,7 +264,7 @@ void psp_ui_media_composite_8888_cached(
     ui_media_composite_8888(
         media, preview, pixels, width, height, stride,
         scratch, false, true);
-    uint32_t signature = ui_media_menu_signature(presentation);
+    uint32_t signature = ui_media_menu_signature(media);
     bool source_changed = !menu_cache->valid
         || menu_cache->signature != signature
         || menu_cache->edram_epoch != edram_epoch;

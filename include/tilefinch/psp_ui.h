@@ -7,6 +7,7 @@
 
 #include "tilefinch/diagnostic_qr.h"
 #include "tilefinch/diagnostics.h"
+#include "tilefinch/media_chapters.h"
 #include "tilefinch/psp_media_state.h"
 #include "tilefinch/psp_ui_theme.h"
 
@@ -400,7 +401,8 @@ typedef enum {
     PSP_UI_SETTING_WIFI_DIAGNOSTICS,
     PSP_UI_SETTING_YOUTUBE_TOPICS,
     PSP_UI_SETTING_UI_LANGUAGE,
-    PSP_UI_SETTING_YOUTUBE_LOGIN
+    PSP_UI_SETTING_YOUTUBE_LOGIN,
+    PSP_UI_SETTING_ROTATE_HINT_ALWAYS
 } PspUiSettingId;
 
 typedef union {
@@ -620,6 +622,7 @@ typedef struct {
        within the existing 1 KiB admission ceiling. */
     uint8_t ui_language : 4;
     uint8_t youtube_login_policy : 2;
+    uint8_t rotate_hint_always : 1;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -973,15 +976,24 @@ typedef struct {
     uint8_t track_menu_selection;
     uint8_t audio_track_count;
     uint8_t subtitle_track_count;
+    uint8_t chapter_count;
     int8_t selected_audio_track;
     int8_t selected_subtitle_track;
     uint8_t subtitle_size;
     uint8_t subtitle_background;
     bool clockwise;
     bool rotation_available;
+    /* Capability remains available via Select; reserve its hint row only for
+       portrait geometry or conservatively detected pillarboxed content. */
+    bool rotation_suggested;
+    bool rotation_hint_always;
+    uint16_t rotation_probe_playback_ms;
+    uint8_t rotation_probe_phase;
+    uint8_t rotation_probe_matches;
     bool portrait_crop;
     PspUiMediaTrack audio_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
+    MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
 } PspUiMediaPresentation;
 
@@ -1426,6 +1438,8 @@ void psp_ui_media_set_tracks(
     const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
     int selected_subtitle);
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text);
+void psp_ui_media_set_chapters(PspUiMediaState *media,
+                               const MediaChapter *chapters, size_t count);
 void psp_ui_media_set_subtitle_style(
     PspUiMediaState *media, BrowserSubtitleSize size,
     BrowserSubtitleBackground background);

@@ -284,6 +284,10 @@ bool media_mp4_read_sample(MediaMp4Demux *demux,
  * Audio is aligned to that decode time. This scans retained sample tables,
  * never media payload, and therefore has a fixed memory cost.
  */
+/* Cooperatively load the target fragment's metadata before resetting the
+   decoder. False with would_block is pending, not a failed seek. No new cache
+   is retained, and the ordinary seek still validates the actual keyframe. */
+bool media_mp4_prepare_seek_us(MediaMp4Demux *demux, uint64_t target_us);
 bool media_mp4_seek_us(MediaMp4Demux *demux, uint64_t target_us,
                        uint64_t *actual_us);
 /* Repositions to the first actual video keyframe strictly after target_us.

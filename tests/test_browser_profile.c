@@ -421,6 +421,9 @@ int main(void)
           && browser_profile_alternate_language(profile)
               == BROWSER_ALTERNATE_LANGUAGE_FRENCH);
     browser_profile_set_video_scaling(profile, BROWSER_VIDEO_SCALING_SHARP);
+    CHECK(!browser_profile_rotate_hint_always(profile));
+    browser_profile_set_rotate_hint_always(profile, true);
+    CHECK(browser_profile_rotate_hint_always(profile));
     browser_profile_set_video_startup_buffering(profile, false);
     browser_profile_set_resume_offline_downloads(profile, true);
     browser_profile_set_text_entry_mode(
@@ -682,6 +685,7 @@ int main(void)
                     "es") == 0
           && browser_profile_video_scaling(loaded)
                  == BROWSER_VIDEO_SCALING_SHARP
+          && browser_profile_rotate_hint_always(loaded)
           && !browser_profile_video_startup_buffering(loaded)
           && browser_profile_resume_offline_downloads(loaded)
           && browser_profile_text_entry_mode(loaded)
@@ -827,6 +831,7 @@ int main(void)
                  == BROWSER_SUBTITLE_BACKGROUND_SHADOW
           && browser_profile_video_scaling(legacy_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
+          && !browser_profile_rotate_hint_always(legacy_loaded)
           && browser_profile_video_startup_buffering(legacy_loaded)
           && !browser_profile_resume_offline_downloads(legacy_loaded)
           && browser_profile_text_entry_mode(legacy_loaded)

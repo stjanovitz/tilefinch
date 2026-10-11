@@ -702,7 +702,15 @@ if(PSP)
             # user approved an 8,000-byte increase: these actions run in
             # cooperative navigation jobs, not the gameplay frame path,
             # and the glyph lookup retains the existing cache allocation.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4768000)
+            # The bounded chapter overlay measured 4,770,704 bytes. The
+            # user approved 4 KiB more code; its 24-entry catalog is owned
+            # by the media presentation, with no frame-path allocation or
+            # network work and no growth of the hot UI snapshot.
+            # Bounded select-history restoration and offline history routing
+            # measure 4,773,760 bytes. The user approved 2 KiB more code;
+            # snapshots reuse the existing RAM-only history records, and
+            # restoration runs before candidate publication, not per frame.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4774144)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

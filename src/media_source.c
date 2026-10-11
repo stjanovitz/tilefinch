@@ -57,6 +57,11 @@ static bool mp4_seek_after_us(void *opaque, uint64_t target_us,
     return media_mp4_seek_after_us(opaque, target_us, actual_us);
 }
 
+static bool mp4_prepare_seek_us(void *opaque, uint64_t target_us)
+{
+    return media_mp4_prepare_seek_us(opaque, target_us);
+}
+
 static void mp4_rewind(void *opaque)
 {
     media_mp4_rewind(opaque);
@@ -78,6 +83,7 @@ static const MediaSampleSourceOps mp4_source_ops = {
     .read_sample = mp4_read_sample,
     .seek_us = mp4_seek_us,
     .seek_after_us = mp4_seek_after_us,
+    .prepare_seek_us = mp4_prepare_seek_us,
     .rewind = mp4_rewind,
     .retained_bytes = mp4_retained_bytes
 };

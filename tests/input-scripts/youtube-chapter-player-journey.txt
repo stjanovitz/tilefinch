@@ -1,0 +1,53 @@
+# LIVE DEVICE JOURNEY; not a network-dependent golden.
+# Start at a native provider detail page with chapters, audio and captions.
+# Qualify all until-met marks, media targets, track changes and clean exit.
+wait-page 90
+tap-live down
+tap-live down
+tap-live down
+tap-live cross
+until-live 2400
+wait-live 60
+tap-live triangle
+wait-live 30
+tap-live down
+tap-live cross
+until-live 2400
+wait-live 60
+tap-live select
+tap-live triangle
+wait-live 30
+tap-live left
+tap-live cross
+until-live 2400
+wait-live 60
+# Chapters -> Audio, select a different available audio track.
+tap-live triangle
+tap-live rtrigger
+tap-live left
+tap-live cross
+until-live 2400
+wait-live 90
+# Chapters -> Audio -> Subtitles, enable the first caption language.
+tap-live triangle
+tap-live rtrigger
+tap-live rtrigger
+tap-live left
+tap-live cross
+wait-live 180
+# Let a large caption track finish in bounded slices without contending with
+# decoding. Resume and check that playback remains ready afterwards.
+tap-live cross
+wait-live 900
+tap-live cross
+until-live 2400
+# Dismiss a reopened picker without exiting playback.
+tap-live triangle
+wait-live 30
+tap-live circle
+until-live 2400
+# Return to landscape, then leave playback for the retained detail page.
+tap-live select
+tap-live circle
+wait-page 90
+end

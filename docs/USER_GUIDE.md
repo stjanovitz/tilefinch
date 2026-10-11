@@ -93,13 +93,25 @@ Some posterless video cards show the linked article's preview image instead
 of a blank box. This does not mean the video format is supported; unsupported
 videos still show the player's normal explanation when opened.
 X pauses or resumes, L/R or the nub previews a seek, and X confirms the new
-position. Circle cancels a preview or closes playback. Triangle opens audio
-and subtitle tracks when available.
+position. Circle cancels a preview or closes playback. Triangle opens the
+chapter, audio and subtitle picker when available, with Chapters first,
+followed by Audio and Subtitles. Use L/R to change category, Up/Down to choose
+an entry, and X to select it; Circle dismisses the picker.
+Videos with chapters in their details show chapter ticks on the timeline and
+the current chapter's name above it. Scrubbing previews the chapter name;
+choosing a chapter seeks directly to its start, including in portrait mode.
 
 **Select rotates the picture and player controls** for holding the PSP
 vertically. For landscape 240p video it cycles through portrait fit, a central
 9:16 crop, and landscape. The crop is useful when vertical footage has black
 sidebars baked into a horizontal video; it is never applied automatically.
+The Rotate hint reserves a row only for portrait video, detected black-sided
+vertical footage, or an already rotated view. Select still permits manual
+rotation when footage cannot be detected reliably.
+Black-side detection runs only during the first five seconds of active
+playback, excluding pauses, buffering and seeking. Settings → Video → Rotate
+hint offers **Auto** (the default) or **Always** for videos you prefer to
+rotate manually. This setting shows the hint; it never rotates automatically.
 For 360p landscape video, Select toggles directly between that crop and
 landscape. Native portrait video toggles between portrait fit and landscape.
 Captions, track menus, D-pad directions and nub seeking follow the rotated

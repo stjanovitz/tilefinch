@@ -400,10 +400,23 @@ bool psp_media_seek_decode_pump(
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
         || media->job_phase
              == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE) {
+        MediaPlaybackSourcePrimeStatus prepared =
+            media_playback_prepare_seek_sources(
+                media->playback, target_us, error, sizeof(error));
+        if (prepared == MEDIA_PLAYBACK_SOURCE_PRIME_PENDING) {
+            if (psp_media_deadline_reached(
+                    media->job_started_us,
+                    psp_media_internal_now_us(media),
+                    PSP_MEDIA_SEEK_TIMEOUT_US))
+                psp_media_job_failed(
+                    media, "seek preparation", "VIDEO SEEK TIMED OUT");
+            return true;
+        }
         media->have_frame = false;
         memset(&media->frame, 0, sizeof(media->frame));
         uint64_t actual_us = 0;
-        if (!media_playback_seek(
+        if (prepared == MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
+            || !media_playback_seek(
                 media->playback, target_us, &actual_us,
                 error, sizeof(error))) {
             if (psp_media_retry_delivery_failure(

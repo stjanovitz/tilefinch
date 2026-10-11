@@ -1,4 +1,5 @@
 #include "tilefinch/psp_media_session.h"
+#include "tilefinch/psp_media_present.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
+#include "tilefinch/youtube_lite.h"
 
 #define printf psp_log_printf
 #define KIB 1024u
@@ -190,6 +192,10 @@ void psp_media_raise_error(
     media->ui_presentation.clockwise = false;
     media->ui_presentation.portrait_crop = false;
     media->ui_presentation.rotation_available = false;
+    media->ui_presentation.rotation_suggested = false;
+    media->ui_presentation.rotation_probe_phase = 0;
+    media->ui_presentation.rotation_probe_playback_ms = 0;
+    media->ui_presentation.rotation_probe_matches = 0;
     if (reason != NULL) {
         psp_ui_media_set_error_reason(&media->ui, message, reason);
     } else {
@@ -1511,6 +1517,11 @@ static void psp_media_prepare_route_kind(
             media->page_media_node_handle = 0;
             media->suspended_for_internal_view = false;
             psp_ui_media_init(&media->ui);
+            /* Reset controls without losing the session-owned catalog/font
+               binding when another video is opened after a real navigation. */
+            media->ui.presentation = &media->ui_presentation;
+            media->ui_presentation.track_menu_open = false;
+            media->ui_presentation.chapter_count = 0;
             psp_media_session_checkpoint(media, "leave-video-complete");
         }
         return;
@@ -1609,6 +1620,10 @@ static void psp_media_prepare_route_kind(
     media->offline_audio_path[0] = '\0';
     media->suspended_for_internal_view = false;
     snprintf(media->source, sizeof(media->source), "%s", url);
+    size_t chapter_count = youtube_lite_copy_chapters(media->session, url,
+        media->ui_presentation.chapters, MEDIA_CHAPTER_LIMIT);
+    psp_ui_media_set_chapters(&media->ui, media->ui_presentation.chapters,
+                              chapter_count);
     media->generation = generation;
     media->last_resume_saved_us = 0;
     media->requested_quality = psp_media_open_quality(media);
@@ -1914,6 +1929,10 @@ void psp_media_close(PspMediaSession *media)
     media->ui_presentation.clockwise = false;
     media->ui_presentation.portrait_crop = false;
     media->ui_presentation.rotation_available = false;
+    media->ui_presentation.rotation_suggested = false;
+    media->ui_presentation.rotation_probe_phase = 0;
+    media->ui_presentation.rotation_probe_playback_ms = 0;
+    media->ui_presentation.rotation_probe_matches = 0;
     /* Hidden retained pipelines consume no transport work. Keeping media
        priority here would permanently reserve two of the six shared worker
        descriptors after Back, including when the next navigation fails and
@@ -1962,7 +1981,8 @@ bool psp_media_reclaim_hidden_pipeline_for_navigation(
 
 static void psp_media_request_user_retry(PspMediaSession *media)
 {
-    if (media == NULL || media->source[0] == '\0') return;
+    /* Called only by execute_intent, after its session NULL guard. */
+    if (media->source[0] == '\0') return;
     if (!psp_media_continuation_reopening(&media->continuation)
         && media->playback != NULL)
         psp_media_remember_retry_state(media, false);
@@ -2147,6 +2167,7 @@ void psp_media_execute_intent(PspMediaSession *media,
         case PSP_UI_MEDIA_ACTION_PLAY_PAUSE:
             if (media->playback != NULL) {
                 bool was_playing = psp_media_machine_wants_playing(media);
+                bool starts_from_zero = !was_playing && media->clock_us == 0;
                 if (media->ui.ended) {
                     psp_ui_media_set_resolving(
                         &media->ui, media->stream.title);
@@ -2159,7 +2180,7 @@ void psp_media_execute_intent(PspMediaSession *media,
                     }
                 } else {
                     PspMediaPresentationReadiness readiness =
-                        !was_playing && media->clock_us == 0
+                        starts_from_zero
                             ? PSP_MEDIA_PRESENTATION_NEEDS_PRIME
                             : psp_media_sample_readiness(media);
                     psp_media_dispatch(media, (PspMediaEvent) {
@@ -2180,8 +2201,13 @@ void psp_media_execute_intent(PspMediaSession *media,
                     if (!wants_playing) {
                         psp_media_buffering_end(
                             media, psp_media_now_us(media));
-                    } else if (!was_playing
+                    } else if (starts_from_zero
                                && !media->startup_buffer_applied) {
+                        /* Autoplay and chapter seeks can already have played
+                           without passing through this button. Resuming them
+                           is not startup: freezing their clock here can leave
+                           a shallow decoded queue unable to reach the startup
+                           reserve. Ordinary starvation still uses hysteresis. */
                         media->startup_buffer_applied = true;
                         MediaPlaybackJobStats stats = {0};
                         media_playback_job_stats(media->playback, &stats);
@@ -2692,7 +2718,8 @@ static bool psp_media_pump_dma_quarantine(PspMediaSession *media)
      * would be refused for the rest of the session with nothing left to clear
      * it.
      */
-    if (media == NULL || !psp_media_present_ge_stage_dma_quarantined())
+    /* The only caller is advance, after its session NULL guard. */
+    if (!psp_media_present_ge_stage_dma_quarantined())
         return false;
     int slot = media->dma_quarantine_slot;
     if (psp_media_present_ge_stage_dma_quarantine_poll()) {
@@ -2737,8 +2764,8 @@ static bool psp_media_pump_dma_quarantine(PspMediaSession *media)
 static bool psp_media_start_pending_preview_commit(
     PspMediaSession *media)
 {
-    if (media == NULL
-        || !psp_media_target_commit_pending(&media->pending_target)
+    /* Both callers are in advance, after its session NULL guard. */
+    if (!psp_media_target_commit_pending(&media->pending_target)
         || media->playback == NULL
         || media->job_phase != PSP_MEDIA_JOB_NONE) return false;
     uint64_t target_us = media->pending_target.target_us;
@@ -2778,7 +2805,9 @@ bool psp_media_advance(
        replay, and an internal provider view may temporarily hide one. Neither
        state is permission to refresh expiring URLs, poll firmware, or resume
        a first-frame/seek continuation in the background. */
-    if (!media->ui.visible) return changed;
+    /* A terminal error retains the pipeline only for Retry/normal close.
+       Advancing it could publish an old frame and erase the failure panel. */
+    if (!media->ui.visible || media->ui.failed) return changed;
     bool open_work = psp_media_open_work_pending(media);
     if (open_work) {
         (void) psp_media_open_pump(media, cancellation);
@@ -2817,10 +2846,10 @@ bool psp_media_advance(
         || media->job_phase
              == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE) {
         (void) psp_media_seek_decode_pump(media, cancellation);
-        if (!psp_media_seek_phase(media->job_phase)
-            && !media->ui.failed
+        /* The commit helper itself requires JOB_NONE. */
+        if (!media->ui.failed
             && psp_media_start_pending_preview_commit(media)) return true;
-        if (!psp_media_seek_phase(media->job_phase)
+        if (media->job_phase == PSP_MEDIA_JOB_NONE
             && !media->ui.failed
             && psp_media_scrub_active(&media->scrub)
             && media->ui.seek_preview_active
@@ -2833,7 +2862,11 @@ bool psp_media_advance(
                 media, latest_target_us, true);
             return true;
         }
-        if (!psp_media_seek_phase(media->job_phase)
+        /* A failed range may have retired this seek and issued a replacement
+           OPEN. Never borrow that new service token to complete the old seek:
+           doing so clears the opener's token and strands its phase machine. */
+        if (media->job_phase == PSP_MEDIA_JOB_NONE
+            && media->machine.state == PSP_MEDIA_SESSION_SEEKING
             && !media->ui.failed) {
             psp_media_dispatch(
                 media,
@@ -3208,6 +3241,13 @@ bool psp_media_advance(
         received_frame =
             media_playback_take_video_frame(media->playback, &frame);
     frame_progress = frame_progress || received_frame;
+    PspUiMediaPresentation *p = &media->ui_presentation;
+    p->rotation_hint_always = browser_profile_rotate_hint_always(media->profile);
+    bool portrait_probe_due = psp_media_present_portrait_probe_due(
+            &p->rotation_probe_playback_ms, &p->rotation_probe_phase, elapsed_ms,
+            media->have_frame && media->ui.playing && !media->ui.buffering
+                && !media->ui.resolving && !media->ui.seek_in_progress,
+            received_frame && !p->rotation_suggested && !p->rotation_hint_always);
     if (received_frame) {
         uint64_t first_frame_opened_us = media->first_frame_opened_us;
         psp_media_startup_claim(&media->startup);
@@ -3224,6 +3264,17 @@ bool psp_media_advance(
         }
         media->frame = frame;
         media->have_frame = true;
+        if (frame.format == MEDIA_PIXEL_RGBA8888) {
+            if (frame.height > frame.width) p->rotation_suggested = true;
+            else if (portrait_probe_due) {
+                /* Three spaced positive samples avoid a single transition
+                   promoting the hint. No allocation or full-frame scan. */
+                p->rotation_probe_matches = psp_media_present_has_portrait_content(
+                    frame.pixels, frame.width, frame.height, frame.stride_pixels)
+                    ? p->rotation_probe_matches + 1u : 0u;
+                if (p->rotation_probe_matches >= 3u) p->rotation_suggested = true;
+            }
+        }
         media->first_frame_started_us = 0;
         media->no_frame_ms = 0;
         if (first_frame_opened_us != 0) {

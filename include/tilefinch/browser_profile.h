@@ -339,6 +339,7 @@ bool browser_profile_youtube_audio_only(
     const BrowserProfile *profile);
 BrowserVideoScaling browser_profile_video_scaling(
     const BrowserProfile *profile);
+bool browser_profile_rotate_hint_always(const BrowserProfile *profile);
 /* Hold the presentation clock briefly at playback start until the existing
    bounded HTTP windows contain a useful prefix. Enabled by default. */
 bool browser_profile_video_startup_buffering(
@@ -458,6 +459,7 @@ bool browser_profile_set_chrome_theme_file(
     BrowserProfile *profile, const char *filename);
 void browser_profile_set_video_scaling(
     BrowserProfile *profile, BrowserVideoScaling scaling);
+void browser_profile_set_rotate_hint_always(BrowserProfile *profile, bool always);
 void browser_profile_set_youtube_quality(
     BrowserProfile *profile, BrowserYoutubeQuality quality);
 void browser_profile_set_video_language(

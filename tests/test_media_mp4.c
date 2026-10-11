@@ -1853,6 +1853,19 @@ int main(void)
           && media_mp4_next_sample(demux, &third)
           && third.offset == second_window_payload
           && third.dts == 2000);
+    puts("test: retained seek metadata survives HTTP-window eviction");
+    size_t retained_seek_reads = sidx_reader.reads;
+    size_t retained_seek_charge = budget.current;
+    sidx_reader.fail_offset = second_moof_offset;
+    sidx_reader.fail_enabled = true;
+    CHECK(media_mp4_seek_us(
+              demux, UINT64_C(2500000), &actual_seek_us)
+          && actual_seek_us == UINT64_C(2000000)
+          && sidx_reader.reads == retained_seek_reads
+          && budget.current == retained_seek_charge
+          && media_mp4_next_sample(demux, &third)
+          && third.offset == second_window_payload);
+    sidx_reader.fail_enabled = false;
     CHECK(media_mp4_seek_after_us(
               demux, UINT64_C(1500000), &actual_seek_us)
           && actual_seek_us == UINT64_C(2000000)
@@ -3575,6 +3588,89 @@ int main(void)
 
     media_mp4_close(split_audio);
     media_mp4_close(split_video);
+
+    puts("test: seek metadata preparation polls both sources before reset");
+    FixtureReader prepare_video_reader = {
+        .bytes = sidx_fixture.bytes, .length = sidx_fixture.length
+    };
+    FixtureReader prepare_audio_reader = prepare_video_reader;
+    MediaRangeReader prepare_video_source = {
+        .opaque = &prepare_video_reader, .length = sidx_fixture.length,
+        .read = fixture_read, .poll = fixture_poll,
+        .describe_failure = fixture_describe_failure
+    };
+    MediaRangeReader prepare_audio_source = prepare_video_source;
+    prepare_audio_source.opaque = &prepare_audio_reader;
+    split_video = media_mp4_open(
+        &budget, &prepare_video_source, NULL, error, sizeof(error));
+    split_audio = media_mp4_open(
+        &budget, &prepare_audio_source, NULL, error, sizeof(error));
+    CHECK(split_video != NULL && split_audio != NULL);
+    backend_fixture = (BackendFixture) {0};
+    playback = media_playback_create_split(
+        &budget, split_video, split_audio, &backend, &playback_options,
+        error, sizeof(error));
+    CHECK(playback != NULL);
+    prepare_video_reader.block_polls = 2;
+    prepare_audio_reader.block_polls = 2;
+    size_t preparation_reads = prepare_video_reader.reads
+        + prepare_audio_reader.reads;
+    CHECK(media_playback_prepare_seek_sources(
+              playback, UINT64_C(2500000), error, sizeof(error))
+          == MEDIA_PLAYBACK_SOURCE_PRIME_PENDING
+          && prepare_video_reader.polls == 1
+          && prepare_audio_reader.polls == 1
+          && prepare_video_reader.reads + prepare_audio_reader.reads
+             == preparation_reads
+          && backend_fixture.resets == 0);
+    MediaPlaybackSourcePrimeStatus preparation =
+        MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
+    for (unsigned step = 0;
+         step < 16 && preparation == MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
+         step++)
+        preparation = media_playback_prepare_seek_sources(
+            playback, UINT64_C(2500000), error, sizeof(error));
+    CHECK(preparation == MEDIA_PLAYBACK_SOURCE_PRIME_READY
+          && backend_fixture.resets == 0);
+    preparation_reads = prepare_video_reader.reads + prepare_audio_reader.reads;
+    CHECK(media_playback_seek(
+              playback, UINT64_C(2500000), &actual_seek_us,
+              error, sizeof(error))
+          && actual_seek_us == UINT64_C(2000000)
+          && backend_fixture.resets == 1
+          && prepare_video_reader.reads + prepare_audio_reader.reads
+             == preparation_reads);
+    media_playback_destroy(playback);
+    media_mp4_close(split_audio);
+    media_mp4_close(split_video);
+
+    puts("test: refused seek preparation is retryable and leak-free");
+    for (size_t failure_at = 0; failure_at < 12; failure_at++) {
+        FixtureReader refused_reader = {
+            .bytes = sidx_fixture.bytes, .length = sidx_fixture.length
+        };
+        MediaRangeReader refused_source = {
+            .opaque = &refused_reader, .length = sidx_fixture.length,
+            .read = fixture_read, .poll = fixture_poll
+        };
+        Budget refused_budget;
+        budget_init(&refused_budget, 1024u * 1024u);
+        MediaMp4Demux *refused_demux = media_mp4_open(
+            &refused_budget, &refused_source, NULL, error, sizeof(error));
+        CHECK(refused_demux != NULL);
+        budget_inject_failure_after(&refused_budget, failure_at);
+        (void) media_mp4_prepare_seek_us(
+            refused_demux, UINT64_C(2500000));
+        budget_clear_failure_injection(&refused_budget);
+        CHECK(media_mp4_prepare_seek_us(refused_demux, UINT64_C(2500000))
+              && media_mp4_seek_us(
+                  refused_demux, UINT64_C(2500000), &actual_seek_us)
+              && actual_seek_us == UINT64_C(2000000));
+        media_mp4_close(refused_demux);
+        CHECK(refused_budget.current == 0
+              && refused_budget.allocation_head == NULL
+              && refused_budget.accounting_repair_count == 0);
+    }
 
     puts("test: split seek failure stops instead of half-repositioning");
     FixtureReader failed_seek_video_reader = {

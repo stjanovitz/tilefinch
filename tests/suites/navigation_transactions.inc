@@ -61,6 +61,17 @@ static bool test_candidate_hook_set_is_transactional(void)
         && probe.replacement_abort_calls == 0
         && navigation.page.loaded
         && strcmp(navigation.page.document.title, "Prior") == 0;
+    /* Pre-shell graph restoration has the same captured abort ownership;
+       swapping live hooks from inside it cannot redirect rollback. */
+    ok = ok && navigation_set_candidate_commit_hooks(
+        &navigation, replacement_prepare, original_abort, original_commit, &probe);
+    navigation.candidate_graph_prepare = replacing_prepare;
+    generation = ok ? navigation_begin(&navigation) : 0;
+    ok = ok && !navigation_commit_html(&navigation, generation,
+        "https://candidate.test/", candidate, sizeof(candidate) - 1,
+        480, NULL, NULL, true)
+        && probe.original_abort_calls == 2 && probe.replacement_abort_calls == 0
+        && navigation.page.loaded && !strcmp(navigation.page.document.title, "Prior");
     navigation_destroy(&navigation);
     ok = ok && budget.current == 0 && budget_uninstall_lexbor(&budget);
     return ok;

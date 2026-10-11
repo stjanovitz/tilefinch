@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.34 — 2026-10-11
+
+- Chapter markers and a chapter picker in the video player.
+- More responsive seeking and more reliable playback recovery.
+- Clearer translated player controls and smarter rotation options.
+- Preserve search filters, scroll, and focus when returning from a video.
+
 ## 0.1.33 — 2026-10-10
 
 - Watch Later, playlists, and channel Subscribe/Unsubscribe controls in the

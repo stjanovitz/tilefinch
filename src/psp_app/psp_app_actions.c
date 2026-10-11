@@ -351,7 +351,8 @@ static bool psp_history_open_internal(
     PspApp *app, PspAppFrameState *frame, bool forward,
     const char *history_url)
 {
-    if (app == NULL || frame == NULL || history_url == NULL) return false;
+    if (app == NULL || frame == NULL || history_url == NULL
+        || psp_offline_url(history_url)) return false;
     BrowserEngine *engine = app->browser->engine;
     BrowserProfile *profile = app->browser->profile;
     BrowserTabs *tabs = app->browser->tabs;

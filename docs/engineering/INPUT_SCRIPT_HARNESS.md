@@ -57,6 +57,31 @@ ordinary scripted browsing/gameplay outcome.
 
 ### Portrait video seeking and cadence
 
+`youtube-chapter-player-journey.txt` checks a native provider detail page's
+chapter start, two chapter selections, portrait seeking, an audio-track change,
+caption selection, pause/resume, picker cancellation and return to the detail page. It needs
+a video with chapters, multiple audio tracks and captions. Its readiness probe
+uses `@media-playing`; require every wait to succeed, the expected seek/track
+actions, a completed caption load, a clock that advances after resume and
+picker cancellation, and a clean terminal
+report. It has no screenshot commands or account/session writes. Live service
+responses are not stable goldens; navigation-continuity assertions also run in
+the host's synthetic provider journeys.
+
+`youtube-player-return-journey.txt` extends this through Back to a local,
+scrollable results fixture, including selected-filter preservation. Package
+`tests/fixtures/player-journey-results.html` using the authenticated offline
+app fixture writer, stage its library on host0, and start at its local app URL.
+Boot URLs must remain HTTP(S); a raw host0 path is not a valid boot URL.
+Use the fixture's tall spacer to require a nonzero saved scroll position.
+Require the before/after marks
+to identify `journey-video` with the same scroll and focus, and all six media
+waits to succeed. The 360p source rotates directly into portrait crop. Captures
+are made only on the page before and after playback, not during ME decoding.
+The host search-video journey repeats the control sequence eight times and
+compares the immediate compositor output for menu, seek, and track feedback;
+this proves next-publication feedback, not physical-device latency.
+
 `media-portrait-seek.txt` exercises clockwise playback using the same native
 button receiver as physical input: forward seek, a 60-second rewind (decoder
 reopen), preview/cancel, vertical-nub seek, paused seek and resume. Use a local

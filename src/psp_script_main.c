@@ -9294,6 +9294,30 @@ static TILEFINCH_COLD_PATH void psp_migrate_boot_file_kb(const char *path)
 #endif
 }
 
+/* Boot-only download recovery must not expand main when player-owned
+   metadata changes the browser owner's layout. */
+static TILEFINCH_COLD_PATH void psp_boot_resume_download(
+    BrowserProfile *profile, PspOfflineStore *store, PspUiState *ui)
+{
+    if (!browser_profile_resume_offline_downloads(profile)
+        || !offline_library_load(&store->library)) return;
+    uint32_t resumed_id = 0;
+    for (size_t index = 0; index < store->library.count; index++) {
+        OfflineLibraryItem *item = &store->library.items[index];
+        if (item->type == OFFLINE_ITEM_YOUTUBE
+            && (item->state == OFFLINE_ITEM_PAUSED
+                || item->state == OFFLINE_ITEM_QUEUED)
+            && offline_download_manager_start(&store->download, item->id)) {
+            resumed_id = item->id;
+            break;
+        }
+    }
+    if (resumed_id != 0) {
+        printf("tilefinch-offline: event=auto-resume id=%u\n", (unsigned) resumed_id);
+        psp_ui_show_status(ui, "RESUMING SAVED VIDEO", 240);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     psp_fpu_mask_exceptions();
@@ -10385,6 +10409,8 @@ int main(int argc, char *argv[])
     process.presentation.ui.video_scaling_sharp =
         browser_profile_video_scaling(browser.profile)
             == BROWSER_VIDEO_SCALING_SHARP;
+    process.presentation.ui.rotate_hint_always =
+        browser_profile_rotate_hint_always(browser.profile);
     process.presentation.ui.video_startup_buffering =
         browser_profile_video_startup_buffering(browser.profile);
     process.presentation.ui.resume_offline_downloads =
@@ -10983,30 +11009,8 @@ report:
         psp_media_prepare_route(
             &browser.media, media_entry == NULL ? NULL : media_entry->url,
             engine_views.navigation->generation);
-        if (browser_profile_resume_offline_downloads(browser.profile)
-            && offline_library_load(&browser.offline_store.library)) {
-            uint32_t resumed_id = 0;
-            for (size_t index = 0;
-                 index < browser.offline_store.library.count; index++) {
-                OfflineLibraryItem *item =
-                    &browser.offline_store.library.items[index];
-                if (item->type == OFFLINE_ITEM_YOUTUBE
-                    && (item->state == OFFLINE_ITEM_PAUSED
-                        || item->state == OFFLINE_ITEM_QUEUED)
-                    && offline_download_manager_start(
-                        &browser.offline_store.download, item->id)) {
-                    resumed_id = item->id;
-                    break;
-                }
-            }
-            if (resumed_id != 0) {
-                printf(
-                    "tilefinch-offline: event=auto-resume id=%u\n",
-                    (unsigned) resumed_id);
-                psp_ui_show_status(
-                    &process.presentation.ui, "RESUMING SAVED VIDEO", 240);
-            }
-        }
+        psp_boot_resume_download(browser.profile, &browser.offline_store,
+                                  &process.presentation.ui);
 
         printf("tilefinch-psp-script: frame-hash=%016llx ui-state=%zuB\n",
                (unsigned long long)

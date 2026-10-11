@@ -1,0 +1,57 @@
+# Start at the USB-only player-journey-results.html fixture. Only the native
+# provider details/media requests use Wi-Fi. No account or Memory Stick writes.
+wait-page 90
+tap down
+tap up
+tap cross
+tap down
+mark-page results-before
+tap cross
+wait-page 90
+tap down
+tap down
+tap down
+tap cross
+until-live 2400
+wait-live 60
+tap-live triangle
+wait-live 30
+tap-live down
+tap-live cross
+until-live 2400
+wait-live 60
+# 360p horizontal content rotates directly into the central portrait crop.
+tap-live select
+tap-live triangle
+wait-live 30
+tap-live left
+tap-live cross
+until-live 2400
+wait-live 60
+tap-live triangle
+tap-live rtrigger
+tap-live left
+tap-live cross
+until-live 2400
+wait-live 90
+tap-live triangle
+tap-live rtrigger
+tap-live rtrigger
+tap-live left
+tap-live cross
+wait-live 180
+tap-live cross
+wait-live 900
+tap-live cross
+until-live 2400
+tap-live triangle
+wait-live 30
+tap-live circle
+until-live 2400
+tap-live select
+tap-live circle
+wait-page 90
+tap circle
+wait-page 90
+mark-page results-after
+end

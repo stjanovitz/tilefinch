@@ -7,6 +7,7 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_chapters.h"
 #include "tilefinch/session.h"
 
 #define YOUTUBE_LITE_MAXIMUM_RESULTS 12
@@ -38,6 +39,11 @@ typedef struct {
 } YoutubeLiteDocument;
 
 typedef struct YoutubeLiteLoadJob YoutubeLiteLoadJob;
+
+/* Copy only this video's already-cached chapter facts. Never fetch a page or
+   return cache-owned pointers; expiry and request-authority rules still apply. */
+size_t youtube_lite_copy_chapters(BrowserSession *session, const char *url,
+                                 MediaChapter *chapters, size_t capacity);
 
 /* Preserve a typed query in a locally generated Home document before its
    first layout. Transactional and bounded; failure leaves HTML unchanged. */

@@ -229,6 +229,12 @@ bool controller_focused_outline_style(
     BrowserController *controller, ControllerFocusOutline *outline);
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action);
+/* Bounded selectedness snapshot, by option ordinal rather than value (values
+   may be duplicated). Neither mode dispatches input. Zero means inapplicable;
+   SIZE_MAX means write refusal: the unpublished candidate must be discarded. */
+size_t controller_select_history(lxb_dom_node_t *select, char *state,
+                                 size_t length, bool restore);
+
 /* User-activated playback for a page-level explicit declaration. This is the
    same resolution/CSP/probe-bound action as a src-less <video>, but carries
    no author media-node handle. */

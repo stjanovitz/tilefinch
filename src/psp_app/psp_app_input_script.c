@@ -584,9 +584,11 @@ void psp_input_script_observe_page(
     const ExternalImageStats *images = &page->images.stats;
     const char *page_url = navigation_active_document_url(navigation);
     printf("tilefinch-input-page: mark=%s generation=%llu loaded=%u "
-           "resources-pending=%u url=%.512s\n", mark,
+           "resources-pending=%u scroll=%d url=%.512s\n", mark,
            (unsigned long long) navigation->generation, page->loaded ? 1u : 0u,
            navigation_background_resources_pending(navigation) ? 1u : 0u,
+           navigation_current(navigation) == NULL ? 0
+               : navigation_current(navigation)->scroll_y,
            page_url == NULL ? "" : page_url);
     printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "

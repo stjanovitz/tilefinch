@@ -83,9 +83,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_GLYPH_OPTION_ROWS 7u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 50u
+#define UI_OPTIONS_ITEM_COUNT 51u
 #else
-#define UI_OPTIONS_ITEM_COUNT 48u
+#define UI_OPTIONS_ITEM_COUNT 49u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -259,7 +259,8 @@ typedef enum {
     UI_OPTION_HEAVY_PAGES,
     UI_OPTION_WIFI_DIAGNOSTICS,
     UI_OPTION_YOUTUBE_TOPICS,
-    UI_OPTION_YOUTUBE_LOGIN
+    UI_OPTION_YOUTUBE_LOGIN,
+    UI_OPTION_ROTATE_HINT
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -327,7 +328,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_HEAVY_PAGES,
     UI_OPTION_WIFI_DIAGNOSTICS,
     UI_OPTION_YOUTUBE_TOPICS,
-    UI_OPTION_YOUTUBE_LOGIN
+    UI_OPTION_YOUTUBE_LOGIN,
+    UI_OPTION_ROTATE_HINT
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -361,6 +363,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_HEAVY_PAGES:
             return "BROWSING & INPUT";
         case UI_OPTION_VIDEO_SCALING:
+        case UI_OPTION_ROTATE_HINT:
         case UI_OPTION_YOUTUBE_QUALITY:
         case UI_OPTION_VIDEO_LANGUAGE:
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
@@ -505,6 +508,8 @@ static const char *ui_option_description(UiOptionId option)
             return "X chooses built-in or data/themes file";
         case UI_OPTION_VIDEO_SCALING:
             return "Smooth uses the graphics chip; Sharp the CPU";
+        case UI_OPTION_ROTATE_HINT:
+            return "Auto checks the first five seconds of playback";
         case UI_OPTION_LANGUAGE_AND_EMOJI:
             return "Optional signed packs; embedded fallback remains";
         case UI_OPTION_YOUTUBE_QUALITY:
@@ -953,6 +958,19 @@ static void draw_panel_hint_bar(uint16_t *pixels, int width, int height,
                   (UiRect) {box.x + inset, y, box.width - 2 * inset, 1},
                   PSP_THEME_HINT_BAR, 4);
     }
+}
+
+/* Keep the repeated panel setup out of each painter. Offsets belong to the
+   caller: differing separator and hint positions are intentional. */
+static TILEFINCH_OUT_OF_LINE void draw_panel_furniture(
+    uint16_t *pixels, int width, int height, int stride, UiRect box,
+    int separator_offset, int hint_bottom_offset)
+{
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box,
+                    box.y + separator_offset);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - hint_bottom_offset);
 }
 
 static int triangle_edge(
@@ -4229,6 +4247,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                             ? BROWSER_VIDEO_SCALING_SHARP
                             : BROWSER_VIDEO_SCALING_SMOOTH;
                     break;
+                case UI_OPTION_ROTATE_HINT:
+                    ui->rotate_hint_always = !ui->rotate_hint_always;
+                    intent.setting.id = PSP_UI_SETTING_ROTATE_HINT_ALWAYS;
+                    intent.setting.value.boolean = ui->rotate_hint_always;
+                    break;
                 case UI_OPTION_YOUTUBE_QUALITY:
                     ui->youtube_240p = !ui->youtube_240p;
                     intent.setting.id = PSP_UI_SETTING_YOUTUBE_QUALITY;
@@ -5191,10 +5214,7 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
     UiRect shadow = { 58, 10, width - 116, 252 };
     ui_apply_overlay_motion(ui, &shadow);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, shadow);
-    draw_panel_rule(pixels, width, height, stride, shadow, shadow.y + 40);
-    draw_panel_hint_bar(pixels, width, height, stride, shadow,
-                        shadow.y + shadow.height - 18);
+    draw_panel_furniture(pixels, width, height, stride, shadow, 40, 18);
     draw_text_bold(pixels, width, height, stride,
                    shadow.x + 16, shadow.y + 14,
                    "Tilefinch", 24, text, scale);
@@ -5242,10 +5262,7 @@ static void draw_routed_list(
 {
     UiRect box = {58, 10, width - 116, 252};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 45);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 45, 20);
     int title_right = box.x + box.width - 16;
     if (context != NULL && context[0] != '\0') {
         int context_left = title_right
@@ -5377,10 +5394,7 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
 {
     UiRect box = {42, 12, width - 84, 248};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
                    "Site information", 40, text, 2);
     char domain[64], detail[128], connection[48], data[96];
@@ -5452,10 +5466,7 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
     const PspUiOfflineAppPreview *preview = ui->offline_app_preview;
     UiRect box = {42, 12, width - 84, 248};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
     static const char *const operations[] = {
         "Install offline app", "Update offline app", "Reinstall offline app",
         "Recompile offline app"
@@ -5563,10 +5574,7 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
 {
     UiRect box = {38, 8, width - 76, 256};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 15, box.y + 13,
                    ui->failure_recovery_heavy ? "Too heavy for the PSP"
@@ -5607,10 +5615,7 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
 {
     UiRect box = {52, 24, width - 104, 224};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 43, 20);
     const char *title = "Help";
     const char *lines[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     if (ui->menu_selection == 2u) {
@@ -5660,10 +5665,7 @@ static TILEFINCH_OUT_OF_LINE void draw_tabs(
     UiRect box = {52, 8, width - 104, 256};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 19);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 19);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 13,
                    tilefinch_ui_text("Tabs"), 32, text, 2);
 
@@ -5799,10 +5801,7 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
     UiRect box = {42, 17, width - 84, 238};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 20);
+    draw_panel_furniture(pixels, width, height, stride, box, 43, 20);
     draw_fitted_ui_text(pixels, width, height, stride, box.x + 16, box.y + 14,
         tilefinch_ui_text("Settings"), box.x + box.width - 16, text, 2, true);
     for (size_t at = 0; at < UI_SETTINGS_GROUP_COUNT; at++) {
@@ -5985,6 +5984,10 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *label = "Video scaling";
             *value = ui->video_scaling_sharp ? "Sharp" : "Smooth";
             break;
+        case UI_OPTION_ROTATE_HINT:
+            *label = "Rotate hint";
+            *value = ui->rotate_hint_always ? "Always" : "Auto";
+            break;
         case UI_OPTION_YOUTUBE_QUALITY:
             *label = "YouTube";
             snprintf(formatted, formatted_size, "%up",
@@ -6140,10 +6143,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     UiRect box = {58, 10, width - 116, 252};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 48);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 18);
+    draw_panel_furniture(pixels, width, height, stride, box, 48, 18);
     draw_ui_settings_heading(pixels, width, height, stride, box,
         ui_option_group_at(ui_option_group_index(
             ui_option_id(ui->options_selection))), text, accent);
@@ -6230,10 +6230,7 @@ static TILEFINCH_OUT_OF_LINE void draw_experimental_options(
     UiRect box = {42, 14, width - 84, 244};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14,
                    "Experimental", 24, text, 2);
@@ -6397,10 +6394,7 @@ static TILEFINCH_OUT_OF_LINE void draw_theme_options(
     size_t count = builtins + custom_count;
     UiRect box = {58, 10, width - 116, 252};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 48);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 18);
+    draw_panel_furniture(pixels, width, height, stride, box, 48, 18);
     draw_ui_settings_heading(pixels, width, height, stride, box,
         "Themes", text, accent);
     draw_text_right_aligned(pixels, width, height, stride,
@@ -6478,10 +6472,7 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     UiRect box = {42, 14, width - 84, 244};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_fitted_ui_text(pixels, width, height, stride,
                    box.x + 16, box.y + 14,
                    tilefinch_ui_text("Language & emoji"),
@@ -6557,10 +6548,7 @@ static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
     UiRect box = {42, 30, width - 84, 210};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_ui_settings_heading(pixels, width, height, stride, box,
         tilefinch_ui_text("Audio & subtitles"), text, accent);
     static const char *const labels[5] = {
@@ -6602,10 +6590,7 @@ static TILEFINCH_OUT_OF_LINE void draw_update(
     UiRect box = {42, 14, width - 84, 244};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 18);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 18);
     draw_text(
         pixels, width, height, stride, box.x + 16, box.y + 14,
         "Tilefinch update", 30, text, 2);
@@ -6674,10 +6659,7 @@ static TILEFINCH_OUT_OF_LINE void draw_update_versions(
 {
     UiRect box = {70, 14, width - 140, 244};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14,
                    "Previous versions", 24, text, 2);
@@ -6788,10 +6770,7 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
 {
     UiRect box = {54, 15, width - 108, 242};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14, "Site data & storage", 24, text,
                    2);
@@ -6944,10 +6923,7 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_site(
     size_t site = ui->data_options_selection;
     UiRect box = {54, 15, width - 108, 242};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     if (view == NULL || site >= view->count) return;
     const PspUiSiteStorageRow *row = &view->rows[site];
     draw_text_with_font(pixels, width, height, stride, box.x + 16,
@@ -6998,10 +6974,7 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_confirm(
     if (spec == NULL) return;
     UiRect box = {50, 66, width - 100, 140};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     char title[64], size[16];
     bool ready = ui->glyph_confirm_phase == PSP_UI_GLYPH_CONFIRM_READY;
     if (ready) {
@@ -7064,10 +7037,7 @@ static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
 {
     UiRect box = {40, 34, width - 80, 204};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14, "This site is a large app", 28,
                    text, 2);
@@ -7110,10 +7080,7 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_offer(
 {
     UiRect box = {40, 34, width - 80, 204};
     ui_apply_overlay_motion(ui, &box);
-    draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
-    draw_panel_hint_bar(pixels, width, height, stride, box,
-                        box.y + box.height - 22);
+    draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14, "Site storage is full", 28,
                    text, 2);
@@ -8983,6 +8950,24 @@ void psp_ui_media_set_tracks(
         ? (int8_t) selected_subtitle : -1;
 }
 
+void psp_ui_media_set_chapters(PspUiMediaState *media,
+                               const MediaChapter *chapters, size_t count)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    PspUiMediaPresentation *p = media->presentation;
+    p->chapter_count = 0;
+    if (count > MEDIA_CHAPTER_LIMIT) count = MEDIA_CHAPTER_LIMIT;
+    for (size_t at = 0; chapters != NULL && at < count; at++) {
+        if (chapters[at].title[0] == '\0'
+            || memchr(chapters[at].title, '\0', sizeof(chapters[at].title)) == NULL
+            || chapters[at].seconds > 604800u
+            || (p->chapter_count != 0 && chapters[at].seconds
+                <= p->chapters[p->chapter_count - 1u].seconds)) continue;
+        p->chapters[p->chapter_count++] = chapters[at];
+    }
+    p->track_menu_open = false;
+}
+
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text)
 {
     if (media == NULL || media->presentation == NULL) return;
@@ -9351,6 +9336,46 @@ static uint64_t media_seek_position_time(
     return whole * position + remainder * position / extent;
 }
 
+static TILEFINCH_OUT_OF_LINE int media_current_chapter(const PspUiMediaState *media)
+{
+    const PspUiMediaPresentation *p = media->presentation;
+    uint64_t time = media->seek_preview_active
+        ? media->seek_preview_time_us : media->current_time_us;
+    int chapter = -1;
+    for (unsigned at = 0; p != NULL && at < p->chapter_count; at++) {
+        if ((uint64_t) p->chapters[at].seconds * 1000000u > time) break;
+        chapter = (int) at;
+    }
+    return chapter;
+}
+
+static TILEFINCH_OUT_OF_LINE unsigned media_menu_count(const PspUiMediaState *media, unsigned tab)
+{
+    const PspUiMediaPresentation *p = media->presentation;
+    return tab == 0 ? p->audio_track_count
+        : tab == 1 ? (unsigned) p->subtitle_track_count + 1u
+        : media->seek_enabled && !media->live && media->duration_us != 0
+            ? p->chapter_count : 0u;
+}
+
+static TILEFINCH_OUT_OF_LINE void media_menu_select_tab(PspUiMediaState *media, unsigned tab)
+{
+    PspUiMediaPresentation *p = media->presentation;
+    int selected = tab == 0 ? p->selected_audio_track
+        : tab == 1 ? p->selected_subtitle_track + 1
+        : media_current_chapter(media);
+    unsigned count = media_menu_count(media, tab);
+    p->track_menu_tab = (uint8_t) tab;
+    p->track_menu_selection = (uint8_t) (selected < 0 || (unsigned) selected >= count
+        ? 0 : selected);
+}
+
+static unsigned media_menu_first(const PspUiMediaPresentation *p)
+{
+    return p->track_menu_selection > PSP_UI_MEDIA_TRACK_LIMIT
+        ? p->track_menu_selection - PSP_UI_MEDIA_TRACK_LIMIT : 0u;
+}
+
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input)
 {
@@ -9373,9 +9398,9 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     }
     uint32_t pressed = input->pressed;
     if (presentation != NULL && presentation->track_menu_open) {
-        unsigned count = presentation->track_menu_tab == 0
-            ? presentation->audio_track_count
-            : (unsigned) presentation->subtitle_track_count + 1u;
+        unsigned count = media_menu_count(media, presentation->track_menu_tab);
+        if (presentation->track_menu_selection >= count)
+            presentation->track_menu_selection = 0;
         if (pressed & PSP_UI_BUTTON_CANCEL) {
             presentation->track_menu_open = false;
             /* Circle dismisses the modal back to unobscured playback. Keeping
@@ -9384,26 +9409,13 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             media->controls_visible = false;
             media->controls_remaining_ms = 0u;
         } else if ((pressed & (PSP_UI_BUTTON_PAGE_UP
-                               | PSP_UI_BUTTON_PAGE_DOWN))
-                   && presentation->audio_track_count != 0) {
-            /* Subtitles always list "Off"; Audio has entries only for a
-               video with alternate tracks. Switching onto an empty Audio
-               tab left a menu where Cross did nothing and every other
-               press (seeks included) was swallowed until Circle. */
-            presentation->track_menu_tab ^= 1u;
-            count = presentation->track_menu_tab == 0
-                ? presentation->audio_track_count
-                : (unsigned) presentation->subtitle_track_count + 1u;
-            presentation->track_menu_selection =
-                presentation->track_menu_tab == 0
-                ? (presentation->selected_audio_track < 0
-                    ? 0u : (uint8_t) presentation->selected_audio_track)
-                : (presentation->selected_subtitle_track < 0
-                    ? 0u
-                    : (uint8_t) presentation->selected_subtitle_track + 1u);
-            if (count != 0 && presentation->track_menu_selection >= count)
-                presentation->track_menu_selection =
-                    (uint8_t) (count - 1u);
+                               | PSP_UI_BUTTON_PAGE_DOWN))) {
+            unsigned tab = presentation->track_menu_tab;
+            for (unsigned step = 0; step < 3u; step++) {
+                tab = (tab + ((pressed & PSP_UI_BUTTON_PAGE_DOWN) ? 1u : 2u)) % 3u;
+                if (media_menu_count(media, tab) != 0) break;
+            }
+            media_menu_select_tab(media, tab);
         } else if (count != 0 && (pressed & PSP_UI_BUTTON_UP)) {
             presentation->track_menu_selection =
                 presentation->track_menu_selection == 0
@@ -9416,11 +9428,17 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             if (presentation->track_menu_tab == 0) {
                 intent.action = PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK;
                 intent.track_index = presentation->track_menu_selection;
-            } else {
+            } else if (presentation->track_menu_tab == 1) {
                 intent.action = PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK;
                 intent.track_index = presentation->track_menu_selection == 0
                     ? UINT8_MAX
                     : (uint8_t) (presentation->track_menu_selection - 1u);
+            } else {
+                intent.action = PSP_UI_MEDIA_ACTION_SEEK;
+                intent.seek_time_us = media_seek_clamped(media,
+                    (uint64_t) presentation->chapters[presentation->track_menu_selection].seconds
+                        * 1000000u, 0);
+                psp_ui_media_set_seek_preview(media, intent.seek_time_us);
             }
             presentation->track_menu_open = false;
         }
@@ -9473,19 +9491,14 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
         && !media->resolving && (pressed & PSP_UI_BUTTON_MENU)) {
         intent.action = PSP_UI_MEDIA_ACTION_ROTATE;
     } else if (!media->failed && presentation != NULL
+        && (!media->resolving || media->seek_in_progress)
         && (pressed & PSP_UI_BUTTON_TOOLBAR)
         && (presentation->audio_track_count != 0
-            || presentation->subtitle_track_count != 0)) {
+            || presentation->subtitle_track_count != 0
+            || media_menu_count(media, 2u) != 0)) {
         presentation->track_menu_open = true;
-        presentation->track_menu_tab =
-            presentation->audio_track_count == 0 ? 1u : 0u;
-        presentation->track_menu_selection =
-            presentation->track_menu_tab == 0
-            ? (presentation->selected_audio_track < 0
-                ? 0u : (uint8_t) presentation->selected_audio_track)
-            : (presentation->selected_subtitle_track < 0
-                ? 0u
-                : (uint8_t) presentation->selected_subtitle_track + 1u);
+        media_menu_select_tab(media, media_menu_count(media, 2u) != 0
+            ? 2u : presentation->audio_track_count == 0 ? 1u : 0u);
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
         if (media->seek_preview_active) {
             psp_ui_media_cancel_seek_preview(media);
@@ -9596,6 +9609,42 @@ static bool ui_rect_contains(UiRect rect, int x, int y)
         && y >= rect.y && y < rect.y + rect.height;
 }
 
+static UiRect media_track_menu_rect(int width, int height);
+static const char *const media_menu_tabs[] = {"Chapters", "Audio", "Subtitles"};
+
+/* Equal columns needlessly clip long translated category names in portrait.
+   Reserve their compact measured widths, then share the remaining space. The
+   painter and pointer use these same bounded edges. */
+static void media_menu_tab_edges(UiRect box, int edges[4])
+{
+    int widths[3], total = 0;
+    for (unsigned at = 0; at < 3u; at++) {
+        const char *label = tilefinch_ui_text(media_menu_tabs[at]);
+        widths[at] = chrome_text_width_bytes(label, strlen(label), 1, true) + 8;
+        total += widths[at];
+    }
+    edges[0] = box.x;
+    int used = 0;
+    for (unsigned at = 0; at < 3u; at++) {
+        used += widths[at];
+        edges[at + 1u] = total > box.width
+            ? box.x + (int) (at + 1u) * box.width / 3
+            : box.x + used + (box.width - total) * (int) (at + 1u) / 3;
+    }
+}
+
+static bool media_rotation_hint(const PspUiMediaState *media)
+{
+    return media->presentation != NULL && media->presentation->rotation_available
+        && (media->presentation->rotation_hint_always
+            || media->presentation->rotation_suggested || media->presentation->clockwise);
+}
+
+static int media_control_offset(const PspUiMediaState *media)
+{
+    return media_rotation_hint(media) ? 0 : 16;
+}
+
 PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
                                           int x, int y,
                                           int width, int height)
@@ -9615,6 +9664,26 @@ PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
     psp_ui_media_show_controls(media);
     intent.visual_changed = true;
     if (controls_were_hidden) return intent;
+    if (media->presentation != NULL && media->presentation->track_menu_open) {
+        UiRect box = media_track_menu_rect(width, height);
+        PspUiMediaPresentation *p = media->presentation;
+        if (!ui_rect_contains(box, x, y)) return intent;
+        if (y < box.y + 35) {
+            int edges[4];
+            media_menu_tab_edges(box, edges);
+            unsigned column = x < edges[1] ? 0u : x < edges[2] ? 1u : 2u;
+            unsigned tab = (column + 2u) % 3u;
+            if (media_menu_count(media, tab) != 0) media_menu_select_tab(media, tab);
+        } else if (y >= box.y + 41 && y < box.y + 153) {
+            unsigned at = media_menu_first(p) + (unsigned) (y - box.y - 41) / 16u;
+            if (at < media_menu_count(media, p->track_menu_tab)) {
+                p->track_menu_selection = (uint8_t) at;
+                PspUiInput input = {.pressed = PSP_UI_BUTTON_CONFIRM};
+                return psp_ui_media_update(media, &input);
+            }
+        }
+        return intent;
+    }
     if (media->failed) {
         UiRect message = media_failed_panel_rect(width, height);
         UiRect retry = media_failed_retry_rect(message);
@@ -9632,7 +9701,7 @@ PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
        click must not toggle a backend which is only partially constructed;
        Circle is what stops an opening video. */
     if (media->resolving) return intent;
-    int progress_y = height - 69;
+    int progress_y = height - 69 + media_control_offset(media);
     if (y >= progress_y - 8 && y <= progress_y + 10
         && media->duration_us != 0) {
         int left = 24, right = width - 24;
@@ -9976,6 +10045,13 @@ typedef struct {
 
 #define UI_MEDIA_RAW_REGION_LIMIT 6u
 
+static int media_control_bar_height(const PspUiMediaState *media)
+{
+    return UI_MEDIA_CONTROL_BAR_HEIGHT + (media->presentation != NULL
+        && media->presentation->chapter_count != 0 && media->duration_us != 0
+        && !media->live ? 12 : 0) - media_control_offset(media);
+}
+
 static UiRect media_track_menu_rect(int width, int height)
 {
     (void) height;
@@ -9993,7 +10069,7 @@ static UiRect media_subtitle_rect(
     const PspUiMediaState *media, int width, int height)
 {
     int bottom = media != NULL && media->controls_visible
-        ? height - UI_MEDIA_CONTROL_BAR_HEIGHT - 8 : height - 18;
+        ? height - media_control_bar_height(media) - 8 : height - 18;
     bool small = media != NULL && media->presentation != NULL
         && media->presentation->subtitle_size
                == BROWSER_SUBTITLE_SIZE_SMALL;
@@ -10212,7 +10288,7 @@ static size_t ui_media_overlay_regions(
         if (media->resolving) {
             ui_media_add_raw_region(
                 raw, &raw_count, 0,
-                height - UI_MEDIA_CONTROL_BAR_HEIGHT, width, height,
+                height - media_control_bar_height(media), width, height,
                 width, height, false);
         }
         return ui_media_union_regions(
@@ -10241,7 +10317,7 @@ static size_t ui_media_overlay_regions(
             + UI_MEDIA_BADGE_HEIGHT,
         width, height, true);
     ui_media_add_raw_region(
-        raw, &raw_count, 0, height - UI_MEDIA_CONTROL_BAR_HEIGHT,
+        raw, &raw_count, 0, height - media_control_bar_height(media),
         width, height, width, height, false);
     if (presentation != NULL && presentation->subtitle_text[0] != '\0') {
         UiRect subtitle = media_subtitle_rect(media, width, height);
@@ -10273,15 +10349,16 @@ size_t psp_ui_media_overlay_regions_without_track_menu(
 }
 
 static void draw_media_control_bar_ground(
-    uint16_t *pixels, int width, int height, int stride)
+    const PspUiMediaState *media, uint16_t *pixels, int width, int height, int stride)
 {
-    int bar_top = height - UI_MEDIA_CONTROL_BAR_HEIGHT;
+    int bar_top = height - media_control_bar_height(media);
     fill_rect(pixels, width, height, stride,
               (UiRect) {0, bar_top, width, height - bar_top},
               PSP_THEME_CHROME_BAR, 4);
     /* Control legend sits on the darker hint ground, like the page chrome. */
     fill_rect(pixels, width, height, stride,
-              (UiRect) {0, height - 38, width, 38}, PSP_THEME_HINT_BAR, 3);
+              (UiRect) {0, height - 38 + media_control_offset(media),
+                        width, 38 - media_control_offset(media)}, PSP_THEME_HINT_BAR, 3);
 }
 
 static void draw_media_control_bar(
@@ -10293,9 +10370,11 @@ static void draw_media_control_bar(
     uint16_t accent = PSP_THEME_ACCENT_EMBER;
     bool tracks_available = media->presentation != NULL
         && (media->presentation->audio_track_count != 0
-            || media->presentation->subtitle_track_count != 0);
-    draw_media_control_bar_ground(pixels, width, height, stride);
-    int left = 24, right = width - 24, track_y = height - 69;
+            || media->presentation->subtitle_track_count != 0
+            || media_menu_count(media, 2u) != 0);
+    draw_media_control_bar_ground(media, pixels, width, height, stride);
+    int offset = media_control_offset(media);
+    int left = 24, right = width - 24, track_y = height - 69 + offset;
     fill_round_rect(pixels, width, height, stride,
                     (UiRect) {left, track_y, right - left, 4}, 2,
                     PSP_THEME_TEXT_FAINT, 4);
@@ -10308,19 +10387,18 @@ static void draw_media_control_bar(
         fill_round_rect(pixels, width, height, stride,
                         (UiRect) {right - 5, track_y - 3, 10, 10}, 5,
                         PSP_THEME_ACCENT_EMBER_HI, 4);
-        draw_text(pixels, width, height, stride, left, height - 53,
-                  "LIVE", 8, text, 2);
-        draw_text(pixels, width, height, stride, left, height - 29,
-                  tracks_available
+        draw_fitted_ui_text(pixels, width, height, stride, left, height - 53 + offset,
+                  tilefinch_ui_text("LIVE"), right, text, 2, false);
+        draw_fitted_ui_text(pixels, width, height, stride, left, height - 31 + offset,
+                  tilefinch_ui_text(tracks_available
                       ? (media->playing
                           ? "X PAUSE  TRI TRACKS"
                           : "X PLAY  TRI TRACKS")
-                      : (media->playing ? "X PAUSE" : "X PLAY"),
-                  24, muted, width < 360 ? 1 : 2);
-        if (media->presentation != NULL
-            && media->presentation->rotation_available)
-            draw_text(pixels, width, height, stride, left, height - 13,
-                      "SELECT ROTATE", 13, muted, 1);
+                      : (media->playing ? "X PAUSE" : "X PLAY")),
+                  right, muted, width < 360 ? 1 : 2, false);
+        if (media_rotation_hint(media))
+            draw_fitted_ui_text(pixels, width, height, stride, left, height - 13,
+                      tilefinch_ui_text("SELECT ROTATE"), right, muted, 1, false);
         return;
     }
     if (media->duration_us != 0 && media->buffered_visual_pixel != 0u) {
@@ -10345,31 +10423,48 @@ static void draw_media_control_bar(
                         (UiRect) {left, track_y, filled, 4},
                         2, accent, 4);
     }
+    if (media->presentation != NULL && media->duration_us != 0) {
+        const PspUiMediaPresentation *p = media->presentation;
+        for (unsigned at = 0; at < p->chapter_count; at++) {
+            uint64_t time = (uint64_t) p->chapters[at].seconds * 1000000u;
+            if (time >= media->duration_us) break;
+            int x = left + (int) ((unsigned) media_timeline_pixel(time, media->duration_us)
+                * (unsigned) (right - left) / UI_MEDIA_TIMELINE_PIXELS);
+            fill_rect(pixels, width, height, stride,
+                (UiRect) {x - 1, track_y - 2, 2, 8}, muted, 4);
+        }
+        int chapter = media_current_chapter(media);
+        if (chapter >= 0)
+            draw_text_with_font(pixels, width, height, stride, left, height - 85 + offset,
+                p->chapters[chapter].title, MEDIA_CHAPTER_TITLE_CAPACITY - 1u,
+                right, text, 1, p->title_font, false);
+    }
     fill_round_rect(pixels, width, height, stride,
                     (UiRect) {left + filled - 4, track_y - 3, 10, 10},
                     5, PSP_THEME_ACCENT_EMBER_HI, 4);
     char current[24], duration[24], legend[64];
     media_format_time(display_time, current, sizeof(current));
     media_format_time(media->duration_us, duration, sizeof(duration));
-    snprintf(legend, sizeof(legend), "%s%s / %s",
-             media->seek_preview_active ? "SEEK " : "",
+    snprintf(legend, sizeof(legend), "%s%s%s / %s",
+             media->seek_preview_active ? tilefinch_ui_text("SEEK") : "",
+             media->seek_preview_active ? " " : "",
              current, duration);
-    draw_text(pixels, width, height, stride, left, height - 53,
-              legend, 30, text, 2);
-    draw_text(pixels, width, height, stride, left, height - 29,
-              media->seek_preview_active
+    draw_fitted_ui_text(pixels, width, height, stride, left, height - 53 + offset,
+              legend, right, text, 2, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, height - 31 + offset,
+              tilefinch_ui_text(media->seek_preview_active
                   ? "X GO   O CANCEL"
                   : tracks_available
                       ? (media->playing
-                          ? "X PAUSE  TRI TRACKS  L/R SEEK"
-                          : "X PLAY  TRI TRACKS  L/R SEEK")
+                          ? "X PAUSE  TRI MENU  L/R SEEK"
+                          : "X PLAY  TRI MENU  L/R SEEK")
                       : (media->playing
                           ? "STICK/L/R SEEK  X PAUSE"
-                          : "STICK/L/R SEEK  X PLAY"),
-              32, muted, width < 360 ? 1 : 2);
-    if (media->presentation != NULL && media->presentation->rotation_available)
-        draw_text(pixels, width, height, stride, left, height - 13,
-                  "SELECT ROTATE", 13, muted, 1);
+                          : "STICK/L/R SEEK  X PLAY")),
+              right, muted, width < 360 ? 1 : 2, false);
+    if (media_rotation_hint(media))
+        draw_fitted_ui_text(pixels, width, height, stride, left, height - 13,
+                  tilefinch_ui_text("SELECT ROTATE"), right, muted, 1, false);
 }
 
 static void draw_media_subtitle(
@@ -10472,24 +10567,28 @@ static void draw_media_track_menu_box(
        can clear and redraw it without narrowing 61,952 moving video pixels
        to RGB565 on every frame. */
     fill_rect(pixels, width, height, stride, box, PSP_THEME_PANEL, 4);
-    draw_text_bold(pixels, width, height, stride,
-                   box.x + 16, box.y + 12, "Audio", 5,
-                   presentation->track_menu_tab == 0
-                       ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2);
-    draw_text_bold(pixels, width, height, stride,
-                   box.x + 110, box.y + 12, "Subtitles", 9,
-                   presentation->track_menu_tab == 1
-                       ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2);
+    int edges[4];
+    media_menu_tab_edges(box, edges);
+    for (unsigned column = 0; column < 3u; column++) {
+        unsigned tab = (column + 2u) % 3u;
+        if (media_menu_count(media, tab) == 0) continue;
+        draw_fitted_ui_text(pixels, width, height, stride, edges[column] + 4, box.y + 12,
+            tilefinch_ui_text(media_menu_tabs[column]), edges[column + 1u] - 4,
+            presentation->track_menu_tab == tab
+                ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2, true);
+    }
     draw_panel_rule(pixels, width, height, stride, box, box.y + 35);
-    unsigned count = presentation->track_menu_tab == 0
-        ? presentation->audio_track_count
-        : (unsigned) presentation->subtitle_track_count + 1u;
-    for (unsigned at = 0; at < count && at < PSP_UI_MEDIA_TRACK_LIMIT + 1u;
-         at++) {
-        int y = box.y + 44 + (int) at * 16;
+    unsigned count = media_menu_count(media, presentation->track_menu_tab);
+    unsigned first = media_menu_first(presentation);
+    for (unsigned row = 0; row < PSP_UI_MEDIA_TRACK_LIMIT + 1u && first + row < count;
+         row++) {
+        unsigned at = first + row;
+        int y = box.y + 44 + (int) row * 16;
         bool selected = presentation->track_menu_tab == 0
             ? presentation->selected_audio_track == (int) at
-            : (at == 0 ? presentation->selected_subtitle_track < 0
+            : presentation->track_menu_tab == 2
+                ? (int) at == media_current_chapter(media)
+                : (at == 0 ? presentation->selected_subtitle_track < 0
                        : presentation->selected_subtitle_track
                              == (int) at - 1);
         if (at == presentation->track_menu_selection)
@@ -10499,14 +10598,24 @@ static void draw_media_track_menu_box(
                 4, PSP_THEME_SURFACE, 4);
         const char *label = presentation->track_menu_tab == 0
             ? presentation->audio_tracks[at].label
-            : (at == 0 ? "Off"
+            : presentation->track_menu_tab == 2 ? presentation->chapters[at].title
+            : (at == 0 ? tilefinch_ui_text("Off")
                        : presentation->subtitle_tracks[at - 1u].label);
+        int label_x = box.x + 20;
+        if (presentation->track_menu_tab == 2) {
+            char time[24];
+            media_format_time((uint64_t) presentation->chapters[at].seconds * 1000000u,
+                              time, sizeof(time));
+            draw_text(pixels, width, height, stride, label_x, y, time, 10,
+                      PSP_THEME_TEXT_MUTED, 1);
+            label_x += 62;
+        }
         draw_text_with_font(
-            pixels, width, height, stride, box.x + 20, y,
+            pixels, width, height, stride, label_x, y,
             label, 42, box.x + box.width - 42,
             at == presentation->track_menu_selection
                 ? PSP_THEME_TEXT : PSP_THEME_TEXT_MUTED,
-            1, NULL, false);
+            1, presentation->title_font, false);
         if (selected)
             draw_text(pixels, width, height, stride,
                       box.x + box.width - 30, y, "X", 1,
@@ -10514,8 +10623,17 @@ static void draw_media_track_menu_box(
     }
     draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 16, box.y + box.height - 17,
-              tilefinch_ui_text("L/R CATEGORY   X SELECT   O BACK"),
-              box.x + box.width - 16, PSP_THEME_TEXT_MUTED, 1, false);
+              tilefinch_ui_text("L/R  X SELECT  O BACK"),
+              box.x + box.width - (presentation->track_menu_tab == 2 ? 62 : 16),
+              PSP_THEME_TEXT_MUTED, 1, false);
+    if (presentation->track_menu_tab == 2) {
+        char position[12];
+        snprintf(position, sizeof(position), "%u/%u",
+                 (unsigned) presentation->track_menu_selection + 1u, count);
+        draw_text_right_aligned(pixels, width, height, stride,
+            box.x + box.width - 16, box.y + box.height - 17,
+            position, 8, PSP_THEME_TEXT_MUTED, 1, false);
+    }
 }
 
 static void draw_media_track_menu(
@@ -10551,7 +10669,7 @@ void psp_ui_media_composite_controls(
         if (media->seek_in_progress)
             draw_media_control_bar(media, pixels, width, height, stride);
         else
-            draw_media_control_bar_ground(pixels, width, height, stride);
+            draw_media_control_bar_ground(media, pixels, width, height, stride);
         return;
     }
     draw_media_control_bar(media, pixels, width, height, stride);
@@ -10636,7 +10754,7 @@ void psp_ui_media_composite_layers(
                     media, pixels, width, height, stride);
             else
                 draw_media_control_bar_ground(
-                    pixels, width, height, stride);
+                    media, pixels, width, height, stride);
         }
         UiRect message = media->failed
             ? media_failed_panel_rect(width, height)

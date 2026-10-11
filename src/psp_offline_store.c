@@ -72,8 +72,9 @@ static bool offline_commit(
        still leaves the existing bounded fallback available. */
     (void) browser_engine_prepare_navigation_fonts(engine, "GET", url);
     (void) browser_engine_set_user_css(engine, "", 0);
-    bool loaded = browser_engine_commit_html(
-        engine, url, html, length, record_history);
+    bool loaded = record_history
+        ? browser_engine_commit_html(engine, url, html, length, true)
+        : browser_engine_commit_history_html(engine, url, html, length);
     budget_free(browser_engine_budget(engine), html);
     if (!loaded || !browser_engine_refresh_shell(engine)) return false;
     NavigationSession *navigation = browser_engine_navigation(engine);

@@ -83,6 +83,7 @@ struct BrowserProfile {
        the neighbouring bool already leaves. The public type stays an enum
        because callers should not have to know which way the flag points. */
     bool video_scaling_sharp;
+    bool rotate_hint_always;
     bool video_startup_buffering;
     BrowserTextEntryMode text_entry_mode;
     TilefinchGamepadFaceMapping gamepad_face_mapping;
@@ -637,13 +638,14 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         /* Fields are append-only: old binaries ignore a suffix and newer
            binaries supply defaults for a missing suffix. */
         ok = fprintf(
-            file, "MEDIA\t%u\t%u\t%u\t%u\t%u\t%u\n",
+            file, "MEDIA\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
             (unsigned) profile->youtube_quality,
             profile->resume_offline_downloads ? 1u : 0u,
             profile->video_scaling_sharp ? 1u : 0u,
             profile->video_startup_buffering ? 1u : 0u,
             profile->youtube_compact_results ? 1u : 0u,
-            profile->youtube_audio_only ? 1u : 0u) > 0;
+            profile->youtube_audio_only ? 1u : 0u,
+            profile->rotate_hint_always ? 1u : 0u) > 0;
     }
     if (ok) {
         /* Separate append-only record: older A/B slots ignore it and retain
@@ -1054,6 +1056,8 @@ static bool profile_load_internal(
             if (fifth != NULL) *fifth++ = '\0';
             char *sixth = fifth == NULL ? NULL : strchr(fifth, '\t');
             if (sixth != NULL) *sixth++ = '\0';
+            char *seventh = sixth == NULL ? NULL : strchr(sixth, '\t');
+            if (seventh != NULL) *seventh++ = '\0';
             BrowserYoutubeQuality quality =
                 (BrowserYoutubeQuality) strtoul(first, NULL, 10);
             if (profile_valid_youtube_quality(quality))
@@ -1077,6 +1081,8 @@ static bool profile_load_internal(
             if (sixth != NULL)
                 loaded->youtube_audio_only =
                     strtoul(sixth, NULL, 10) != 0;
+            if (seventh != NULL)
+                loaded->rotate_hint_always = strtoul(seventh, NULL, 10) != 0;
         } else if (strcmp(line, "VIDLANG") == 0) {
             BrowserVideoLanguage language =
                 (BrowserVideoLanguage) strtoul(first, NULL, 10);
@@ -1771,6 +1777,11 @@ BrowserVideoScaling browser_profile_video_scaling(
         ? BROWSER_VIDEO_SCALING_SHARP : BROWSER_VIDEO_SCALING_SMOOTH;
 }
 
+bool browser_profile_rotate_hint_always(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->rotate_hint_always;
+}
+
 bool browser_profile_video_startup_buffering(
     const BrowserProfile *profile)
 {
@@ -2269,6 +2280,11 @@ void browser_profile_set_video_scaling(
     if (profile != NULL && profile_valid_video_scaling(scaling))
         profile->video_scaling_sharp =
             scaling == BROWSER_VIDEO_SCALING_SHARP;
+}
+
+void browser_profile_set_rotate_hint_always(BrowserProfile *profile, bool always)
+{
+    if (profile != NULL) profile->rotate_hint_always = always;
 }
 
 void browser_profile_set_youtube_quality(

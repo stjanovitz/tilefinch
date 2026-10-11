@@ -5,6 +5,46 @@
 
 #include <string.h>
 
+bool psp_media_present_portrait_probe_due(
+    uint16_t *playback_ms, uint8_t *phase, unsigned elapsed_ms,
+    bool playing, bool new_frame)
+{
+    if (playback_ms == NULL || phase == NULL || !playing || *playback_ms >= 5000u)
+        return false;
+    unsigned remaining = 5000u - *playback_ms;
+    *playback_ms += elapsed_ms < remaining ? elapsed_ms : remaining;
+    return *playback_ms < 5000u && new_frame && (++*phase & 15u) == 0;
+}
+
+bool psp_media_present_has_portrait_content(
+    const uint32_t *pixels, int width, int height, int stride_pixels)
+{
+    if (pixels == NULL || width <= height || height < 32 || width > 640
+        || height > 512 || stride_pixels < width || stride_pixels > 2048)
+        return false;
+    int crop = height * 9 / 16;
+    int margin = (width - crop) / 2;
+    unsigned lit = 0;
+    /* Sample both outer bands and the centre away from padding/edges. Dark
+       fades and horizontal letterboxing alone cannot qualify. */
+    for (int row = 0; row < 8; row++) {
+        const uint32_t *p = pixels + ((row * 2 + 1) * height / 16) * stride_pixels;
+        for (int at = 0; at < 4; at++) {
+            int x = (at % 2 + 1) * margin / 3;
+            if (at >= 2) x = width - 1 - x;
+            uint32_t rgb = p[x];
+            if ((rgb & 255u) > 8u || ((rgb >> 8) & 255u) > 8u
+                || ((rgb >> 16) & 255u) > 8u) return false;
+        }
+        for (int at = 1; at <= 3; at++) {
+            uint32_t rgb = p[margin + at * crop / 4];
+            if ((rgb & 255u) > 24u || ((rgb >> 8) & 255u) > 24u
+                || ((rgb >> 16) & 255u) > 24u) lit++;
+        }
+    }
+    return lit >= 8u;
+}
+
 static int present_floor_to_int(float value)
 {
     int truncated = (int) value;

@@ -1057,6 +1057,30 @@ MediaPlaybackSourcePrimeStatus media_playback_prime_audio_source(
         error, error_size);
 }
 
+MediaPlaybackSourcePrimeStatus media_playback_prepare_seek_sources(
+    MediaPlayback *playback, uint64_t target_us,
+    char *error, size_t error_size)
+{
+    if (playback == NULL) return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    bool pending = false;
+    for (size_t i = 0; i < playback->source_count; i++) {
+        MediaSampleSource *source = &playback->source[i];
+        if (source->ops->prepare_seek_us == NULL
+            || source->ops->prepare_seek_us(source->opaque, target_us))
+            continue;
+        if (source->ops->would_block(source->opaque)) {
+            pending = true;
+            continue;
+        }
+        if (!source->ops->last_error(source->opaque, error, error_size))
+            playback_error(error, error_size,
+                           "media source could not prepare seek");
+        return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    }
+    return pending ? MEDIA_PLAYBACK_SOURCE_PRIME_PENDING
+                   : MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+}
+
 static bool media_playback_seek_internal(MediaPlayback *playback,
                                          uint64_t target_us,
                                          bool strictly_after,

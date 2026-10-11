@@ -2,6 +2,7 @@
 
 #include "media_mp4_policy.h"
 #include "media_video_geometry.h"
+#include "tilefinch_compiler.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -1464,6 +1465,16 @@ static bool mp4_load_sidx_window(
 {
     if (demux == NULL || !demux->lazy_fragmented
         || index >= demux->fragment_index_count) return false;
+    /* The sample tables, unlike the HTTP window, stay owned by the demux.
+       Priming/restoring a cursor in this same fragment must not re-fetch its
+       moof or rebuild those tables after sample reads evict the metadata. */
+    if (demux->fragment_index_at == index) {
+        for (size_t at = 0; at < demux->track_count; at++) {
+            if (demux->tracks[at].fragmented)
+                mp4_track_rewind(&demux->tracks[at]);
+        }
+        return true;
+    }
     demux->fragment_error[0] = '\0';
     const Mp4SidxEntry *entry = &demux->fragment_index[index];
     uint64_t moof_offset = 0;
@@ -1774,6 +1785,7 @@ static int mp4_prepare_lazy_sidx(MediaMp4Demux *demux)
     demux->fragment_index = entries;
     demux->fragment_index_count = count;
     demux->fragment_index_timescale = timescale;
+    demux->fragment_index_at = SIZE_MAX;
     demux->retained_bytes += index_bytes;
     demux->lazy_fragmented = true;
     for (size_t i = 0; i < demux->track_count; i++) {
@@ -2600,6 +2612,39 @@ static uint64_t mp4_time_units_from_us(uint64_t microseconds,
     return mp4_rescale_time(microseconds, UINT32_C(1000000), timescale);
 }
 
+static TILEFINCH_OUT_OF_LINE size_t mp4_seek_fragment_index(
+    const MediaMp4Demux *demux, uint64_t target_us)
+{
+    uint64_t units = mp4_time_units_from_us(
+        target_us, demux->fragment_index_timescale);
+    uint64_t first = demux->fragment_index[0].start_time;
+    units = units > UINT64_MAX - first ? UINT64_MAX : units + first;
+    size_t selected = 0;
+    for (size_t i = 1; i < demux->fragment_index_count; i++) {
+        if (demux->fragment_index[i].start_time > units) break;
+        selected = i;
+    }
+    return selected;
+}
+
+bool media_mp4_prepare_seek_us(MediaMp4Demux *demux, uint64_t target_us)
+{
+    if (demux == NULL) return false;
+    demux->runtime_failed = false;
+    demux->runtime_error[0] = '\0';
+    demux->runtime_would_block = false;
+    if (!demux->lazy_fragmented) return true;
+    size_t selected = mp4_seek_fragment_index(demux, target_us);
+    if (demux->fragment_index_at == selected) return true;
+    if (mp4_load_sidx_window(demux, selected, false)) return true;
+    if (!demux->runtime_would_block) {
+        demux->runtime_failed = true;
+        snprintf(demux->runtime_error, sizeof(demux->runtime_error),
+                 "%s", demux->fragment_error);
+    }
+    return false;
+}
+
 static bool media_mp4_seek_internal(MediaMp4Demux *demux,
                                     uint64_t target_us,
                                     bool strictly_after,
@@ -2609,19 +2654,7 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
     demux->runtime_failed = false;
     demux->runtime_error[0] = '\0';
     if (demux->lazy_fragmented) {
-        uint64_t target_index_units = mp4_time_units_from_us(
-            target_us, demux->fragment_index_timescale);
-        uint64_t first_time = demux->fragment_index[0].start_time;
-        if (target_index_units > UINT64_MAX - first_time)
-            target_index_units = UINT64_MAX;
-        else
-            target_index_units += first_time;
-        size_t selected = 0;
-        for (size_t i = 1; i < demux->fragment_index_count; i++) {
-            if (demux->fragment_index[i].start_time
-                > target_index_units) break;
-            selected = i;
-        }
+        size_t selected = mp4_seek_fragment_index(demux, target_us);
         if (!mp4_load_sidx_window(demux, selected, true)) {
             demux->runtime_failed = true;
             snprintf(

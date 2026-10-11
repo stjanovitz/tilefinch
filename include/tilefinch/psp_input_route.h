@@ -71,6 +71,8 @@ typedef struct {
        while a rewind rebuilds the decoder): Circle drops the highlight
        rather than stopping the video. */
     bool media_preview_active;
+    /* Circle dismisses the chapter/track picker, not the media operation. */
+    bool media_menu_open;
     /* Gamepad polling owns page buttons/nub even during a raster slice.
        HOME is handled independently; the held escape chord is consumed by
        the owner loop on its next pass. */
@@ -106,8 +108,9 @@ typedef enum {
 #define PSP_INPUT_ROUTE_FORWARD_BUTTONS \
     (PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_PAGE_DOWN)
 #define PSP_INPUT_ROUTE_MEDIA_BUTTONS \
-    (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT | PSP_UI_BUTTON_PAGE_UP \
-     | PSP_UI_BUTTON_PAGE_DOWN | PSP_UI_BUTTON_CONFIRM)
+    (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_LEFT \
+     | PSP_UI_BUTTON_RIGHT | PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN \
+     | PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_TOOLBAR)
 
 static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
 {
@@ -128,7 +131,7 @@ static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
     bool media = c->owner == PSP_INPUT_OWNER_MEDIA;
     if (loading && c->loop != PSP_INPUT_LOOP_ON_PAGE)
         return PSP_INPUT_ROUTE_FORWARD;
-    if (media && c->media_preview_active && !c->cancelling
+    if (media && (c->media_preview_active || c->media_menu_open) && !c->cancelling
         && (c->pressed & PSP_UI_BUTTON_CANCEL) != 0)
         return PSP_INPUT_ROUTE_MEDIA;
     if ((c->pressed & PSP_UI_BUTTON_CANCEL) != 0 && !c->cancelling)

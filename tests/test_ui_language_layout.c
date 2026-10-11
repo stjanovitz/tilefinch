@@ -25,7 +25,8 @@ typedef struct {
 static TextRun runs[RUN_LIMIT];
 static size_t run_count;
 static bool run_overflow;
-static uint16_t storage[STRIDE * HEIGHT + 32];
+/* The rotated player paints in a 272x480 logical viewport. */
+static uint16_t storage[STRIDE * WIDTH + 32];
 static char catalog[TILEFINCH_UI_TRANSLATION_BYTES + 1];
 static char *keys[TILEFINCH_UI_TRANSLATION_ROWS], *values[TILEFINCH_UI_TRANSLATION_ROWS];
 static size_t key_count, checked_frames, checked_labels;
@@ -218,7 +219,8 @@ static bool make_metric_pack(char path[64])
     return true;
 }
 
-static bool validate_frame(const PspUiState *ui)
+static bool validate_frame_geometry(const PspUiState *ui, int width, int height,
+                                    int stride)
 {
     CHECK(!run_overflow && run_count > 0);
     for (size_t i = 0; i < run_count; i++) {
@@ -236,7 +238,7 @@ static bool validate_frame(const PspUiState *ui)
         bool known = catalog_text(a->text);
         if (known) {
             checked_labels++;
-            if (a->truncated || a->missing_glyph || a->left < 0 || a->right > WIDTH || a->top < 0 || a->bottom > HEIGHT) {
+            if (a->truncated || a->missing_glyph || a->left < 0 || a->right > width || a->top < 0 || a->bottom > height) {
                 fprintf(stderr, "locale=%s screen=%u option=%u glyph=%u choice=%u clipped '%s' ink=%d,%d..%d,%d\n",
                     language_code, ui->screen, ui->options_selection, ui->glyph_language,
                     ui->ui_language, a->text,
@@ -261,11 +263,16 @@ static bool validate_frame(const PspUiState *ui)
             if (y_overlap && b->right <= a->left) CHECK(a->left - b->right >= 5);
         }
     }
-    for (size_t at = 0; at < 16; at++) CHECK(storage[at] == 0xa55a && storage[16 + STRIDE * HEIGHT + at] == 0xa55a);
-    for (int y = 0; y < HEIGHT; y++)
-        for (int x = WIDTH; x < STRIDE; x++) CHECK(storage[16 + y * STRIDE + x] == 0xa55a);
+    for (size_t at = 0; at < 16; at++) CHECK(storage[at] == 0xa55a && storage[16 + stride * height + at] == 0xa55a);
+    for (int y = 0; y < height; y++)
+        for (int x = width; x < stride; x++) CHECK(storage[16 + y * stride + x] == 0xa55a);
     checked_frames++;
     return true;
+}
+
+static bool validate_frame(const PspUiState *ui)
+{
+    return validate_frame_geometry(ui, WIDTH, HEIGHT, STRIDE);
 }
 
 static bool paint(PspUiState *ui, TilefinchGlyphProvider *provider)
@@ -325,20 +332,159 @@ static bool paint_failed_media(PspUiState *ui, TilefinchGlyphProvider *provider)
     return true;
 }
 
-static bool snapshot(const char *name)
+static bool player_has_text(const char *key)
+{
+    const char *expected = tilefinch_ui_text(key);
+    for (size_t at = 0; at < run_count; at++)
+        if (!strcmp(runs[at].text, expected)) return true;
+    fprintf(stderr, "missing translated player label: locale=%s key='%s'\n",
+        language_code, key);
+    return false;
+}
+
+static bool snapshot_geometry(const char *name, int width, int height, int stride);
+
+static bool test_player_language(const PspUiState *ui,
+                                 TilefinchGlyphProvider *provider)
+{
+    PspUiMediaPresentation presentation = {0};
+    PspUiMediaState media = {
+        .visible = true, .playing = true, .controls_visible = true,
+        .seek_enabled = true, .duration_us = UINT64_C(9000000000),
+        .current_time_us = UINT64_C(1800000000),
+        .presentation = &presentation
+    };
+    snprintf(media.title, sizeof(media.title),
+        "A long video title that must stay inside the player title bar in either orientation");
+    presentation.audio_track_count = 2;
+    presentation.subtitle_track_count = 2;
+    presentation.chapter_count = MEDIA_CHAPTER_LIMIT;
+    for (unsigned at = 0; at < MEDIA_CHAPTER_LIMIT; at++) {
+        presentation.chapters[at].seconds = at * 300u;
+        snprintf(presentation.chapters[at].title,
+            sizeof(presentation.chapters[at].title),
+            "Chapter %u: a deliberately long title that is safely ellipsized, not clipped", at + 1u);
+    }
+    snprintf(presentation.audio_tracks[0].label,
+        sizeof(presentation.audio_tracks[0].label), "Original language - descriptive audio");
+    snprintf(presentation.audio_tracks[1].label,
+        sizeof(presentation.audio_tracks[1].label), "Alternative language - commentary");
+    snprintf(presentation.subtitle_tracks[0].label,
+        sizeof(presentation.subtitle_tracks[0].label), "Original language - auto-generated");
+    snprintf(presentation.subtitle_tracks[1].label,
+        sizeof(presentation.subtitle_tracks[1].label), "Alternative language - translated");
+    for (unsigned portrait = 0; portrait < 2; portrait++) {
+        int width = portrait ? HEIGHT : WIDTH;
+        int height = portrait ? WIDTH : HEIGHT;
+        int stride = portrait ? HEIGHT + 16 : STRIDE;
+        presentation.clockwise = portrait != 0;
+        presentation.rotation_available = true;
+        presentation.rotation_suggested = portrait != 0;
+        /* Open every category, including the first and last chapter pages;
+           then paint playing, paused, seek-preview and live controls. */
+        for (unsigned lane = 0; lane < 13; lane++) {
+            presentation.track_menu_open = lane < 5;
+            presentation.track_menu_tab = lane < 3 ? lane : 2u;
+            presentation.track_menu_selection = lane == 3 ? 6u
+                : lane == 4 ? MEDIA_CHAPTER_LIMIT - 1u : 0u;
+            media.playing = lane != 6 && lane != 10 && lane != 12;
+            media.seek_preview_active = lane == 7;
+            media.seek_preview_time_us = UINT64_C(8765000000);
+            media.live = lane == 8 || lane == 11 || lane == 12;
+            presentation.audio_track_count = lane < 9 ? 2u : 0u;
+            presentation.subtitle_track_count = lane < 9 ? 2u : 0u;
+            presentation.chapter_count = lane < 9 ? MEDIA_CHAPTER_LIMIT : 0u;
+            bool settled = false;
+            for (unsigned pass = 0; pass < 64; pass++) {
+                run_count = 0;
+                run_overflow = false;
+                for (size_t at = 0; at < sizeof(storage) / sizeof(storage[0]); at++)
+                    storage[at] = 0xa55a;
+                psp_ui_media_composite(&media, storage + 16,
+                    width, height, stride);
+                bool changed = false;
+                size_t read = 0;
+                CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+                if (read) continue;
+                CHECK(validate_frame_geometry(ui, width, height, stride));
+                if (presentation.track_menu_open) {
+                    CHECK(player_has_text("Audio") && player_has_text("Subtitles")
+                        && player_has_text("Chapters")
+                        && player_has_text("L/R  X SELECT  O BACK"));
+                } else {
+                    CHECK(player_has_text(lane == 7 ? "X GO   O CANCEL"
+                        : lane == 12 ? "X PLAY"
+                        : lane == 11 ? "X PAUSE"
+                        : lane == 10 ? "STICK/L/R SEEK  X PLAY"
+                        : lane == 9 ? "STICK/L/R SEEK  X PAUSE"
+                        : lane == 8 ? "X PAUSE  TRI TRACKS"
+                        : lane == 6 ? "X PLAY  TRI MENU  L/R SEEK"
+                        : "X PAUSE  TRI MENU  L/R SEEK"));
+                    if (portrait) CHECK(player_has_text("SELECT ROTATE"));
+                    if (media.live) CHECK(player_has_text("LIVE"));
+                }
+                for (size_t at = 0; at < run_count; at++) {
+                    const TextRun *run = &runs[at];
+                    /* Author-provided titles may shorten, but their ink must
+                       remain bounded just like native translated labels. */
+                    CHECK(!run->missing_glyph && run->left >= 0
+                        && run->right <= width && run->top >= 0
+                        && run->bottom <= height);
+                }
+                if (presentation.track_menu_open) {
+                    unsigned saved_tab = presentation.track_menu_tab;
+                    static const char *const categories[] = {"Chapters", "Audio", "Subtitles"};
+                    for (unsigned column = 0; column < 3; column++) {
+                        const TextRun *label = NULL;
+                        for (size_t at = 0; at < run_count; at++)
+                            if (!strcmp(runs[at].text, tilefinch_ui_text(categories[column])))
+                                label = &runs[at];
+                        CHECK(label);
+                        int x = label->left + 1;
+                        int y = media_track_menu_rect(width, height).y + 18;
+                        PspUiMediaIntent intent = portrait
+                            ? psp_ui_media_activate_at(&media, WIDTH - 1 - y, x, WIDTH, HEIGHT)
+                            : psp_ui_media_activate_at(&media, x, y, WIDTH, HEIGHT);
+                        CHECK(intent.visual_changed
+                            && presentation.track_menu_tab == (column + 2u) % 3u);
+                    }
+                    presentation.track_menu_tab = (uint8_t) saved_tab;
+                }
+                if (lane == 2 || lane == 7) {
+                    char name[48];
+                    snprintf(name, sizeof(name), "player-%s-%s",
+                        portrait ? "portrait" : "landscape",
+                        lane == 2 ? "chapters" : "seek");
+                    CHECK(snapshot_geometry(name, width, height, stride));
+                }
+                settled = true;
+                break;
+            }
+            CHECK(settled);
+        }
+    }
+    return true;
+}
+
+static bool snapshot_geometry(const char *name, int width, int height, int stride)
 {
     if (!capture_directory) return true;
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s-%s.ppm", capture_directory, language_code, name);
     FILE *file = fopen(path, "wb");
-    CHECK(file && fprintf(file, "P6\n480 272\n255\n") > 0);
-    for (int y = 0; y < HEIGHT; y++) for (int x = 0; x < WIDTH; x++) {
-        uint16_t p = storage[16 + y * STRIDE + x];
+    CHECK(file && fprintf(file, "P6\n%d %d\n255\n", width, height) > 0);
+    for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
+        uint16_t p = storage[16 + y * stride + x];
         unsigned char rgb[3] = {(p >> 11) * 255 / 31, ((p >> 5) & 63) * 255 / 63, (p & 31) * 255 / 31};
         CHECK(fwrite(rgb, 1, 3, file) == 3);
     }
     CHECK(fclose(file) == 0);
     return true;
+}
+
+static bool snapshot(const char *name)
+{
+    return snapshot_geometry(name, WIDTH, HEIGHT, STRIDE);
 }
 
 static bool test_square_button_symbol(void)
@@ -703,6 +849,7 @@ static bool test_all_languages(void)
             ui.overlay_motion = 0;
             ui.chrome_theme = theme ? BROWSER_CHROME_THEME_LIGHT : BROWSER_CHROME_THEME_FINCH;
             ui.ui_language = language;
+            CHECK(test_player_language(&ui, provider));
             ui.screen = PSP_UI_SCREEN_OPTIONS;
             for (unsigned group = 0; group < UI_SETTINGS_GROUP_COUNT; group++) {
                 ui.options_group_selection = group;

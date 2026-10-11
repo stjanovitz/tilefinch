@@ -1075,6 +1075,8 @@ static bool navigation_commit_document(
     ReaderDocumentAnalysis reader_analysis = {0};
     NavigationCandidatePrepareCallback candidate_prepare =
         session->candidate_prepare;
+    NavigationCandidatePrepareCallback candidate_graph_prepare =
+        session->candidate_graph_prepare;
     NavigationCandidateFinalizeCallback candidate_abort =
         session->candidate_abort;
     NavigationCandidateFinalizeCallback candidate_commit =
@@ -2328,6 +2330,13 @@ static bool navigation_commit_document(
             session, url, streaming, previous_page,
             progressive_preview_candidate, fonts, images)) goto fail;
     if (candidate_prepare != NULL) {
+        candidate_hook_attempted = true;
+        if (candidate_graph_prepare != NULL
+            && !candidate_graph_prepare(candidate_opaque, session)) {
+            snprintf(session->last_error, sizeof(session->last_error),
+                     "candidate state restoration failed");
+            goto fail;
+        }
         lxb_html_document_t *candidate_document = session->page.document.html;
         ScriptRuntime *candidate_runtime = session->page.runtime;
         DrawCommand *candidate_commands = session->page.layout.commands;

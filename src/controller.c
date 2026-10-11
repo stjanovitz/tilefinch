@@ -2362,18 +2362,15 @@ static bool controller_option_selected(lxb_dom_node_t *option)
                          : has_attribute(option, "selected");
 }
 
-static ControllerNativeDefaultResult controller_advance_select(
-    BrowserController *controller, lxb_dom_node_t *select)
+static size_t controller_select_options(lxb_dom_node_t *select,
+                                       lxb_dom_node_t **options)
 {
-    lxb_dom_node_t *options[128];
-    size_t count = 0, selected = SIZE_MAX, visited = 0;
+    size_t count = 0, visited = 0;
     for (lxb_dom_node_t *at = select->first_child;
          at != NULL && visited++ < 1024u;) {
         if (node_name_is(at, "option")) {
-            if (count >= 128u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            if (count >= 128u) return SIZE_MAX;
             options[count] = at;
-            if (selected == SIZE_MAX && controller_option_selected(at))
-                selected = count;
             count++;
         }
         if (at->first_child != NULL) {
@@ -2385,7 +2382,66 @@ static ControllerNativeDefaultResult controller_advance_select(
         if (at == NULL || at == select) break;
         at = at->next;
     }
-    if (visited >= 1024u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    return visited >= 1024u ? SIZE_MAX : count;
+}
+
+static void controller_select_restore_markers(lxb_dom_node_t **options,
+                                              const char *previous, size_t count)
+{
+    for (size_t at = 0; at < count; at++) {
+        if (previous[at] == 0)
+            (void) controller_attribute_remove(options[at], "data-tilefinch-option-selected");
+        else
+            (void) controller_attribute_set(options[at], "data-tilefinch-option-selected",
+                                           previous[at] == 2 ? "true" : "false");
+    }
+}
+
+static bool controller_select_apply(lxb_dom_node_t **options, size_t count,
+                                     const char *state, char *previous)
+{
+    for (size_t at = 0; at < count; at++) {
+        size_t n = 0;
+        const char *marker = document_attribute(options[at], "data-tilefinch-option-selected", &n);
+        if (state[at] != '0' && state[at] != '1') return false;
+        if (marker != NULL && !((n == 4 && !memcmp(marker, "true", 4))
+            || (n == 5 && !memcmp(marker, "false", 5)))) return false;
+        previous[at] = marker == NULL ? 0 : n == 4 ? 2 : 1;
+    }
+    for (size_t at = 0; at < count; at++) {
+        if (!controller_attribute_set(options[at], "data-tilefinch-option-selected",
+                                       state[at] == '1' ? "true" : "false")) {
+            controller_select_restore_markers(options, previous, at);
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t controller_select_history(lxb_dom_node_t *select, char *state,
+                                 size_t length, bool restore)
+{
+    lxb_dom_node_t *options[128];
+    char previous[128];
+    if (!node_name_is(select, "select") || state == NULL) return 0;
+    size_t count = controller_select_options(select, options);
+    if (count == 0 || count > 128u || (restore ? count != length : count > length)) return 0;
+    if (!restore) {
+        for (size_t at = 0; at < count; at++)
+            state[at] = controller_option_selected(options[at]) ? '1' : '0';
+        return count;
+    }
+    return controller_select_apply(options, count, state, previous) ? count : SIZE_MAX;
+}
+
+static ControllerNativeDefaultResult controller_advance_select(
+    BrowserController *controller, lxb_dom_node_t *select)
+{
+    lxb_dom_node_t *options[128];
+    size_t count = controller_select_options(select, options), selected = SIZE_MAX;
+    if (count == SIZE_MAX) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    for (size_t at = 0; at < count; at++)
+        if (selected == SIZE_MAX && controller_option_selected(options[at])) selected = at;
     if (count == 0) return CONTROLLER_NATIVE_DEFAULT_NONE;
     /* HTML's selectedness default is the first enabled option even when no
        option carries an authored selected attribute. Activation advances
@@ -2409,52 +2465,13 @@ static ControllerNativeDefaultResult controller_advance_select(
         }
     }
     if (!found || next == selected) return CONTROLLER_NATIVE_DEFAULT_NONE;
-    bool marker_present[128];
-    bool marker_selected[128];
-    for (size_t at = 0; at < count; at++) {
-        size_t marker_length = 0;
-        const char *marker = document_attribute(
-            options[at], "data-tilefinch-option-selected", &marker_length);
-        marker_present[at] = marker != NULL;
-        marker_selected[at] = marker != NULL && marker_length == 4u
-            && memcmp(marker, "true", 4u) == 0;
-        if (marker != NULL && !marker_selected[at]
-            && !(marker_length == 5u
-                 && memcmp(marker, "false", 5u) == 0)) {
-            return CONTROLLER_NATIVE_DEFAULT_FAILED;
-        }
-    }
-    for (size_t at = 0; at < count; at++) {
-        if (!controller_attribute_set(
-                options[at], "data-tilefinch-option-selected",
-                at == next ? "true" : "false")) {
-            for (size_t rollback = 0; rollback < at; rollback++) {
-                if (marker_present[rollback]) {
-                    (void) controller_attribute_set(
-                        options[rollback],
-                        "data-tilefinch-option-selected",
-                        marker_selected[rollback] ? "true" : "false");
-                } else {
-                    (void) controller_attribute_remove(
-                        options[rollback],
-                        "data-tilefinch-option-selected");
-                }
-            }
-            return CONTROLLER_NATIVE_DEFAULT_FAILED;
-        }
-    }
+    char previous[128], state[128];
+    for (size_t at = 0; at < count; at++) state[at] = at == next ? '1' : '0';
+    if (!controller_select_apply(options, count, state, previous))
+        return CONTROLLER_NATIVE_DEFAULT_FAILED;
     if (controller_native_default_refresh(controller))
         return CONTROLLER_NATIVE_DEFAULT_CHANGED;
-    for (size_t at = 0; at < count; at++) {
-        if (marker_present[at]) {
-            (void) controller_attribute_set(
-                options[at], "data-tilefinch-option-selected",
-                marker_selected[at] ? "true" : "false");
-        } else {
-            (void) controller_attribute_remove(
-                options[at], "data-tilefinch-option-selected");
-        }
-    }
+    controller_select_restore_markers(options, previous, count);
     (void) controller_native_default_refresh(controller);
     return CONTROLLER_NATIVE_DEFAULT_FAILED;
 }

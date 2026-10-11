@@ -18,7 +18,7 @@
 enum {
     WIDTH = 480,
     HEIGHT = 272,
-    CONTROL_HEIGHT = 78,
+    CONTROL_HEIGHT = 62,
     QUIET_MARGIN = 16
 };
 

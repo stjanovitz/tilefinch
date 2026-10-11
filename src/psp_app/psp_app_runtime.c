@@ -3583,6 +3583,9 @@ static void psp_work_ui_tick(bool owner_thread)
         .acknowledge_busy = cooperate->acknowledge_non_cancel_busy,
         .media_preview_active = cooperate->media_surface
             && cooperate->supervisor_media_ui.seek_preview_active,
+        .media_menu_open = cooperate->media_surface
+            && cooperate->supervisor_media_ui.presentation != NULL
+            && cooperate->supervisor_media_ui.presentation->track_menu_open,
         .page_gamepad_capture = cooperate->supervisor_ui.page_gamepad_capture
     };
     switch (psp_input_route(&route_context)) {

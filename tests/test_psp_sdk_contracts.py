@@ -136,6 +136,73 @@ def frame_pump_policy(name):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_offline_history_reaches_the_authenticated_library_handler(self):
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text())
+        start = actions.index("static bool psp_history_open_internal(")
+        routing = actions[start:actions.index(
+            "    const NavigationEntry *moved_entry", start)]
+        fixture = r'''
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+typedef void BrowserEngine;
+typedef void BrowserProfile;
+typedef void BrowserTabs;
+typedef int PspUiCollectionSection;
+typedef int PspProfilePageKind;
+#define PSP_UI_COLLECTION_OFFLINE 0
+#define PSP_PROFILE_PAGE_NONE 0
+typedef struct { BrowserEngine *engine; BrowserProfile *profile; BrowserTabs *tabs; } Browser;
+typedef struct { struct { int ui; } presentation; } Process;
+typedef struct { Browser *browser; Process *process; } PspApp;
+typedef int PspAppFrameState;
+static int unavailable;
+static bool psp_offline_url(const char *url) {
+    const char *root = "https://tilefinch.local/offline";
+    size_t n = strlen(root);
+    return url && !strncmp(url, root, n) && (!url[n] || url[n] == '/');
+}
+static bool psp_ui_native_home_url(const char *url) { (void)url; return false; }
+static bool psp_ui_legacy_collection_url(const char *url, int *section) {
+    (void)url; (void)section; return false;
+}
+static int psp_profile_page_kind(const char *url) { (void)url; return 0; }
+static bool psp_ui_internal_url(const char *url) {
+    return !strncmp(url, "https://tilefinch.local/", 23);
+}
+static void psp_ui_show_status(int *ui, const char *text, int frames) {
+    (void)ui; (void)text; (void)frames; unavailable++;
+}
+'''
+        fixture += routing + "    return true;\n}\n" + r'''
+int main(void) {
+    Browser browser = {0}; Process process = {0}; PspAppFrameState frame = 0;
+    PspApp app = {&browser, &process};
+    const char *urls[] = {"https://tilefinch.local/offline",
+        "https://tilefinch.local/offline/app?id=1",
+        "https://tilefinch.local/offline/article?id=2"};
+    for (unsigned i = 0; i < 3; i++)
+        if (psp_history_open_internal(&app, &frame, false, urls[i]) || unavailable) return 1;
+    if (!psp_history_open_internal(&app, &frame, false,
+            "https://tilefinch.local/unknown") || unavailable != 1) return 2;
+    if (psp_history_open_internal(&app, &frame, false,
+            "https://example.test/") || unavailable != 1) return 3;
+    return 0;
+}
+'''
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "history.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", str(path / "history.c"),
+                                       "-o", str(path / "history")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "history")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_portrait_stage_copy_is_fenced_and_uses_the_borrowed_picture(self):
         source = without_comments((ROOT / "src/psp_media_present_ge.c").read_text())
         copy = source[source.index("bool psp_media_present_ge_stage_rows("):
@@ -1507,9 +1574,9 @@ int main(void) {
             source.index("void psp_media_prepare_route(")]
         self.assertIn("!media->ui.visible", pending)
         advance = source[source.index("bool psp_media_advance("):]
-        self.assertIn("if (!media->ui.visible) return changed;", advance)
+        self.assertIn("if (!media->ui.visible || media->ui.failed) return changed;", advance)
         self.assertLess(
-            advance.index("if (!media->ui.visible) return changed;"),
+            advance.index("if (!media->ui.visible || media->ui.failed) return changed;"),
             advance.index("psp_media_open_work_pending(media)"),
             "A hidden retained player must stop before open, seek, expiry, "
             "or decoder work is considered.")
@@ -7487,6 +7554,111 @@ int main(void) {
         advance = session[session.index("bool psp_media_advance("):]
         self.assertIn(
             "psp_media_open_pump(media, cancellation)", advance)
+
+    def test_seek_completion_does_not_consume_a_replacement_open(self):
+        source = without_comments(
+            (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
+        advance = source[source.index("bool psp_media_advance("):]
+        leg = advance[advance.index("psp_media_seek_decode_pump("):
+                      advance.index('"seek-complete"')]
+        conditions = re.findall(
+            r"if\s*\(([^{};]*?)\)\s*\{\s*psp_media_dispatch\(", leg, re.S)
+        self.assertEqual(len(conditions), 1)
+        admission = re.search(r"if\s*\(([^{};]*?)\)\s*return changed;", advance)
+        self.assertIsNotNone(admission)
+        # Compile the actual PSP-only actuator guard. A 403 can replace the
+        # seek with OPEN while leaving physical phase NONE for its next pump.
+        # Reporting SEEK_COMPLETE then consumes that new open service token.
+        probe = r'''
+#include "tilefinch/psp_media_state.h"
+enum { PSP_MEDIA_JOB_NONE, PSP_MEDIA_JOB_OPEN_RESOLVE,
+       PSP_MEDIA_JOB_SEEK_PREPARE };
+typedef struct { int job_phase; PspMediaMachine machine;
+                 struct { int failed; int visible; } ui; } Media;
+static int psp_media_seek_phase(int phase)
+{ return phase == PSP_MEDIA_JOB_SEEK_PREPARE; }
+static int completes(Media *media) { return GUARD; }
+static int stops(Media *media) { return ADMISSION; }
+int main(void) {
+    Media m = { .machine.state = PSP_MEDIA_SESSION_SEEKING };
+    if (!stops(&m)) return 7;
+    m.ui.visible = 1;
+    if (stops(&m)) return 8;
+    m.ui.failed = 1;
+    if (!stops(&m)) return 9;
+    m.ui.failed = 0;
+    if (!completes(&m)) return 1;
+    m.job_phase = PSP_MEDIA_JOB_SEEK_PREPARE;
+    if (completes(&m)) return 2;
+    m.job_phase = PSP_MEDIA_JOB_NONE;
+    m.machine.state = PSP_MEDIA_SESSION_OPENING;
+    if (completes(&m)) return 3;
+    m.job_phase = PSP_MEDIA_JOB_OPEN_RESOLVE;
+    if (completes(&m)) return 4;
+    m.job_phase = PSP_MEDIA_JOB_NONE;
+    m.machine.state = PSP_MEDIA_SESSION_FAILED;
+    if (completes(&m)) return 5;
+    m.machine.state = PSP_MEDIA_SESSION_SEEKING; m.ui.failed = 1;
+    return completes(&m) ? 6 : 0;
+}
+'''.replace("GUARD", conditions[0]).replace("ADMISSION", admission.group(1))
+        compiler = shutil.which("cc")
+        self.assertIsNotNone(compiler)
+        with tempfile.TemporaryDirectory(prefix="tf-seek-completion-") as tmp:
+            path = Path(tmp)
+            (path / "probe.c").write_text(probe, encoding="utf-8")
+            compiled = subprocess.run(
+                [compiler, "-std=c11", "-I", str(ROOT / "include"),
+                 str(path / "probe.c"), "-o", str(path / "probe")],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "probe")], timeout=5)
+            self.assertEqual(result.returncode, 0,
+                "A retired seek must not complete the replacement open")
+
+    def test_resuming_playback_does_not_reapply_startup_buffering(self):
+        source = without_comments(
+            (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
+        intent = source[source.index("void psp_media_execute_intent("):]
+        conditions = re.findall(
+            r"else if\s*\(([^{};]*?)\)\s*\{\s*"
+            r"media->startup_buffer_applied = true;", intent, re.S)
+        self.assertEqual(len(conditions), 1)
+        start = re.search(r"bool starts_from_zero = ([^;]+);", intent)
+        self.assertIsNotNone(start)
+        probe = r'''
+#include <stdbool.h>
+#include <stdint.h>
+typedef struct { bool startup_buffer_applied; uint64_t clock_us; } Media;
+static bool begins(Media *media, bool was_playing) {
+    bool starts_from_zero = START;
+    return GUARD;
+}
+int main(void) {
+    Media m = {0};
+    if (!begins(&m, false)) return 1;
+    if (begins(&m, true)) return 2;
+    m.startup_buffer_applied = true;
+    if (begins(&m, false)) return 3;
+    m.startup_buffer_applied = false; m.clock_us = 628381143;
+    if (begins(&m, false)) return 4;
+    m.clock_us = 1;
+    return begins(&m, false) ? 5 : 0;
+}
+'''.replace("GUARD", conditions[0]).replace("START", start.group(1))
+        compiler = shutil.which("cc")
+        self.assertIsNotNone(compiler)
+        with tempfile.TemporaryDirectory(prefix="tf-resume-buffer-") as tmp:
+            path = Path(tmp)
+            (path / "probe.c").write_text(probe, encoding="utf-8")
+            compiled = subprocess.run(
+                [compiler, "-std=c11", str(path / "probe.c"),
+                 "-o", str(path / "probe")],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "probe")], timeout=5)
+            self.assertEqual(result.returncode, 0,
+                "Resume after autoplay/seek must not freeze for startup")
 
     def test_psp_dns_resolution_is_bounded(self):
         network = without_comments(

@@ -705,9 +705,63 @@ static bool test_crop_stage_exact_source_rows(void)
     return true;
 }
 
+static bool test_portrait_content_probe(void)
+{
+    enum {W = 640, H = 360, S = 768};
+    static uint32_t pixels[S * H];
+    memset(pixels, 0, sizeof(pixels));
+    CHECK(!psp_media_present_has_portrait_content(pixels, W, H, S));
+    int crop = H * 9 / 16, left = (W - crop) / 2;
+    for (int y = 0; y < H; y++)
+        for (int x = left; x < left + crop; x++) pixels[y * S + x] = 0xff808040u;
+    /* Decoder padding is deliberately bright: it must never be sampled. */
+    for (int y = 0; y < H; y++)
+        for (int x = W; x < S; x++) pixels[y * S + x] = 0xffffffffu;
+    CHECK(psp_media_present_has_portrait_content(pixels, W, H, S));
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) pixels[y * S + x] = 0xff808040u;
+    CHECK(!psp_media_present_has_portrait_content(pixels, W, H, S));
+    for (int y = 0; y < H / 4; y++)
+        memset(pixels + y * S, 0, W * sizeof(*pixels));
+    CHECK(!psp_media_present_has_portrait_content(pixels, W, H, S));
+    CHECK(!psp_media_present_has_portrait_content(NULL, W, H, S));
+    CHECK(!psp_media_present_has_portrait_content(pixels, W, H, W - 1));
+    CHECK(!psp_media_present_has_portrait_content(pixels, H, W, S));
+    CHECK(!psp_media_present_has_portrait_content(pixels, W, H, 2049));
+    return true;
+}
+
+static bool test_portrait_probe_window(void)
+{
+    uint16_t playback_ms = 0;
+    uint8_t phase = 0;
+    /* Pause/buffer/seek intervals do not spend playback time. */
+    CHECK(!psp_media_present_portrait_probe_due(&playback_ms, &phase, 60000, false, true));
+    CHECK(playback_ms == 0 && phase == 0);
+    for (unsigned frame = 1; frame <= 100; frame++) {
+        bool due = psp_media_present_portrait_probe_due(
+            &playback_ms, &phase, 50, true, true);
+        CHECK(due == (frame < 100 && frame % 16 == 0));
+    }
+    CHECK(playback_ms == 5000 && phase == 99);
+    uint8_t stopped_phase = phase;
+    for (unsigned frame = 0; frame < 1000; frame++)
+        CHECK(!psp_media_present_portrait_probe_due(
+            &playback_ms, &phase, 50, true, true));
+    CHECK(playback_ms == 5000 && phase == stopped_phase);
+    playback_ms = 0; phase = 0;
+    CHECK(!psp_media_present_portrait_probe_due(&playback_ms, &phase, 4999, true, false));
+    CHECK(playback_ms == 4999 && phase == 0);
+    CHECK(!psp_media_present_portrait_probe_due(&playback_ms, &phase, UINT32_MAX, true, true));
+    CHECK(playback_ms == 5000 && phase == 0);
+    return true;
+}
+
 int main(void)
 {
     struct { const char *name; bool (*run)(void); } cases[] = {
+        {"portrait-probe-five-second-window", test_portrait_probe_window},
+        {"portrait-content-probe", test_portrait_content_probe},
         {"clockwise-portrait-geometry", test_clockwise_portrait_geometry},
         {"central-portrait-crop", test_central_portrait_crop},
         {"crop-stage-exact-source-rows", test_crop_stage_exact_source_rows},

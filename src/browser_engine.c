@@ -244,7 +244,7 @@ struct BrowserEngine {
    allocator owner behind when it is destroyed. */
 static BrowserEngine *active_engine;
 
-static void browser_engine_restore_controls(
+static bool browser_engine_restore_controls(
     NavigationSession *navigation,
     const NavigationHistoryControl *controls, size_t count);
 
@@ -1340,7 +1340,7 @@ static bool browser_engine_history_url_matches_document(
     return strcmp(history, document) == 0;
 }
 
-static bool browser_engine_prepare_candidate_shell(
+static bool browser_engine_restore_candidate_controls(
     void *opaque, NavigationSession *candidate)
 {
     BrowserEngine *engine = opaque;
@@ -1357,9 +1357,9 @@ static bool browser_engine_prepare_candidate_shell(
         if (target != NULL
             && browser_engine_history_url_matches_document(
                    target->url, candidate->page.document_url)) {
-            browser_engine_restore_controls(
+            if (!browser_engine_restore_controls(
                 candidate, work->restore_controls,
-                work->restore_control_count);
+                work->restore_control_count)) return false;
         } else {
             /* The response redirected or otherwise committed a different
                document.  Ordinal control state belongs to the requested
@@ -1367,6 +1367,17 @@ static bool browser_engine_prepare_candidate_shell(
             work->restore_control_count = 0u;
         }
     }
+    return true;
+}
+
+static bool browser_engine_prepare_candidate_shell(
+    void *opaque, NavigationSession *candidate)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || candidate == NULL
+        || candidate->budget != &engine->budget || !candidate->page.loaded)
+        return false;
     bool keep_progressive_render = engine->candidate_render_ready
         && engine->candidate_render.budget == &engine->budget
         && engine->candidate_render.source_layout
@@ -2929,25 +2940,33 @@ static void browser_engine_store_current_controls(BrowserEngine *engine)
             continue;
         }
         size_t value_length = 0u;
+        char selected[128];
+        size_t option_count = controller_select_history(
+            node, selected, sizeof(selected), false);
         const char *value = node == NULL ? NULL
             : document_control_value(node, &value_length);
-        if (value == NULL || value_length >= 128u || index > UINT16_MAX)
+        if (option_count != 0) {
+            value = selected;
+            value_length = option_count;
+        }
+        if (value == NULL || (!option_count && value_length >= 128u) || index > UINT16_MAX)
             continue;
         NavigationHistoryControl *saved =
             &entry->controls[entry->control_count++];
         saved->control_index = (uint16_t) index;
-        saved->value_length = (uint16_t) value_length;
+        saved->value_length = (uint16_t) value_length | (option_count ? 0x8000u : 0u);
         if (value_length != 0u)
             memcpy(saved->value, value, value_length);
-        saved->value[value_length] = '\0';
+        if (value_length < sizeof(saved->value)) saved->value[value_length] = '\0';
     }
 }
 
-static void browser_engine_restore_controls(
+static bool browser_engine_restore_controls(
     NavigationSession *navigation,
     const NavigationHistoryControl *controls, size_t count)
 {
-    if (navigation == NULL || controls == NULL) return;
+    if (navigation == NULL || controls == NULL) return false;
+    bool selected = false;
     if (count > NAVIGATION_HISTORY_CONTROL_LIMIT)
         count = NAVIGATION_HISTORY_CONTROL_LIMIT;
     for (size_t at = 0; at < count; at++) {
@@ -2957,11 +2976,25 @@ static void browser_engine_restore_controls(
         lxb_dom_node_t *node = navigation->page.layout.controls[
             saved->control_index].node;
         if (node != NULL) {
-            (void) document_control_value_set(
+            if (saved->value_length & 0x8000u) {
+                char state[128];
+                memcpy(state, saved->value, sizeof(state));
+                size_t restored = controller_select_history(node, state,
+                    saved->value_length & 0x7fffu, true);
+                if (restored == SIZE_MAX) return false;
+                selected |= restored != 0;
+            } else if (saved->value_length < sizeof(saved->value))
+                (void) document_control_value_set(
                 &navigation->page.document, node, saved->value,
                 saved->value_length);
         }
     }
+    /* Select labels are layout commands, unlike live editable text. Rebuild
+       before candidate paint, never publish a label from the old selection. */
+    if (!selected) return true;
+    layout_reuse_cache_reset(navigation->page.layout_reuse);
+    return document_refresh(&navigation->page.document)
+        && navigation_relayout(navigation);
 }
 
 static bool browser_engine_settle_same_document_events(
@@ -3429,6 +3462,7 @@ static bool browser_engine_begin_navigation_request(
             TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "candidate-shell-hook",
             "could not install the candidate render-shell transaction");
     }
+    engine->navigation.candidate_graph_prepare = browser_engine_restore_candidate_controls;
     work->hooks_installed = true;
     uint64_t generation = navigation_begin(&engine->navigation);
     work->generation = generation;
@@ -4490,6 +4524,7 @@ static bool browser_engine_run_load(BrowserEngine *engine,
             TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "candidate-shell-hook",
             "could not install the candidate render-shell transaction");
     }
+    engine->navigation.candidate_graph_prepare = browser_engine_restore_candidate_controls;
     uint64_t generation = navigation_begin(&engine->navigation);
     bool loaded = operation(engine, generation, opaque);
     (void) navigation_set_candidate_commit_hooks(
@@ -4575,6 +4610,34 @@ bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
     return browser_engine_run_load(
         engine, browser_engine_do_commit, &load, TILEFINCH_SUBSYSTEM_PARSER,
         TILEFINCH_DIAGNOSTIC_PARSE_FAILED);
+}
+
+bool browser_engine_commit_history_html(BrowserEngine *engine, const char *url,
+                                        const char *html, size_t html_length)
+{
+    if (engine == NULL || browser_engine_navigation_pending(engine)
+        || engine->navigation_work.history_move) return false;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    if (entry == NULL
+        || !browser_engine_history_url_matches_document(entry->url, url)
+        || browser_engine_history_url_matches_document(
+            entry->url, navigation_active_document_url(&engine->navigation)))
+        return browser_engine_commit_html(engine, url, html, html_length, false);
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    work->history_move = true;
+    work->restore_scroll_y = entry->scroll_y;
+    work->restore_focus_kind = entry->focus_kind;
+    work->restore_focus_index = entry->focus_index;
+    work->restore_control_count = entry->control_count;
+    if (work->restore_control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
+        work->restore_control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    memcpy(work->restore_controls, entry->controls,
+           work->restore_control_count * sizeof(*entry->controls));
+    bool loaded = browser_engine_commit_html(engine, url, html, html_length, false);
+    if (loaded) browser_engine_navigation_restore_view(engine, work);
+    work->history_move = false;
+    work->restore_control_count = 0;
+    return loaded;
 }
 
 typedef struct {

@@ -460,6 +460,11 @@ bool browser_engine_content_blocker_metrics(
 bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
                                 const char *html, size_t html_length,
                                 bool record_history);
+/* Rebuild a locally supplied history target after the frontend moved the
+   cursor. Restore matching-document controls before shell publication, then
+   semantic focus and scroll. Same-document refreshes remain ordinary commits. */
+bool browser_engine_commit_history_html(BrowserEngine *engine, const char *url,
+                                        const char *html, size_t html_length);
 bool browser_engine_load_url(BrowserEngine *engine, const char *url,
                              bool record_history);
 bool browser_engine_load_url_with_limits(

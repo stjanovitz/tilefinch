@@ -1086,6 +1086,17 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id == PSP_UI_SETTING_VIDEO_SCALING
           && intent.setting.value.video_scaling
                  == BROWSER_VIDEO_SCALING_SMOOTH);
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+    ui.options_selection = 50; /* Append-only Rotate hint row. */
+#else
+    ui.options_selection = 48;
+#endif
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.rotate_hint_always && intent.setting.id == PSP_UI_SETTING_ROTATE_HINT_ALWAYS
+          && intent.setting.value.boolean);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.rotate_hint_always && intent.setting.id == PSP_UI_SETTING_ROTATE_HINT_ALWAYS
+          && !intent.setting.value.boolean);
     ui.screen = PSP_UI_SCREEN_OPTIONS;
     ui.options_group_selection = 3;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
@@ -3750,7 +3761,7 @@ static bool test_media_controls_and_composite(void)
           && !media.seek_preview_active);
     memset(frame, 0, sizeof(frame));
     psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
-    CHECK(frame[(HEIGHT - 69) * WIDTH + WIDTH - 28]
+    CHECK(frame[(HEIGHT - 53) * WIDTH + WIDTH - 28]
           != PSP_THEME_TEXT_FAINT);
 
     psp_ui_media_set(&media, true, false, false,
@@ -3934,13 +3945,13 @@ static bool test_media_controls_and_composite(void)
                      UINT64_C(5000000), UINT64_C(20000000),
                      "Example video");
 
-    intent = psp_ui_media_activate_at(&media, WIDTH / 2, HEIGHT - 69,
+    intent = psp_ui_media_activate_at(&media, WIDTH / 2, HEIGHT - 53,
                                       WIDTH, HEIGHT);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
     CHECK(intent.seek_time_us > UINT64_C(9000000)
           && intent.seek_time_us < UINT64_C(11000000));
     media.duration_us = UINT64_MAX;
-    intent = psp_ui_media_activate_at(&media, WIDTH / 2, HEIGHT - 69,
+    intent = psp_ui_media_activate_at(&media, WIDTH / 2, HEIGHT - 53,
                                       WIDTH, HEIGHT);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
           && intent.seek_time_us > UINT64_MAX / 2u - UINT64_C(50000000)
@@ -3956,7 +3967,7 @@ static bool test_media_controls_and_composite(void)
     psp_ui_media_composite_with_preview(
         &media, &preview_view, frame, WIDTH, HEIGHT, WIDTH);
     CHECK(frame[14 * WIDTH + 14] != 0);
-    CHECK(frame[(HEIGHT - 69) * WIDTH + WIDTH / 2] != 0);
+    CHECK(frame[(HEIGHT - 53) * WIDTH + WIDTH / 2] != 0);
     CHECK(frame[60 * WIDTH + 30] == 0x07e0u);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_media_update(&media, &input);
@@ -4023,7 +4034,7 @@ static bool test_media_controls_and_composite(void)
     /* A short refill is reported by the centre pill. It must not replace the
        bottom legend as well: toggling that whole text row after resume made
        an otherwise-stable timeline band appear to flash. */
-    enum { CONTROL_HEIGHT = 78 };
+    enum { CONTROL_HEIGHT = 62 };
     static uint16_t stable_controls[WIDTH * CONTROL_HEIGHT];
     memset(frame, 0, sizeof(frame));
     psp_ui_media_set(&media, true, true, false,
@@ -4559,7 +4570,7 @@ static bool test_media_play_control_matches_the_page_overlay(void)
               &media, BADGE_LEFT, BADGE_TOP, WIDTH, HEIGHT).action
           == PSP_UI_MEDIA_ACTION_PLAY_PAUSE);
     CHECK(psp_ui_media_activate_at(
-              &media, CX, HEIGHT - 69, WIDTH, HEIGHT).action
+              &media, CX, HEIGHT - 53, WIDTH, HEIGHT).action
           == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
     return true;
 }
@@ -5291,9 +5302,9 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     bool subtitle_box_found = false;
     for (size_t at = 0; at < subtitle_regions; at++) {
         if (initial_regions[at].left == 38
-            && initial_regions[at].top == 136
+            && initial_regions[at].top == 152
             && initial_regions[at].right == 442
-            && initial_regions[at].bottom == 186) {
+            && initial_regions[at].bottom == 202) {
             subtitle_box_found = true;
             CHECK(!initial_regions[at].needs_backdrop);
         }
@@ -5311,9 +5322,9 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     subtitle_box_found = false;
     for (size_t at = 0; at < subtitle_regions; at++) {
         if (initial_regions[at].left == 38
-            && initial_regions[at].top == 136
+            && initial_regions[at].top == 152
             && initial_regions[at].right == 442
-            && initial_regions[at].bottom == 186) {
+            && initial_regions[at].bottom == 202) {
             subtitle_box_found = true;
             CHECK(!initial_regions[at].needs_backdrop);
         }
@@ -5464,7 +5475,7 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
        title and footer are opaque and are exported without importing video. */
     CHECK(imported_pixels == 50u * 38u);
     CHECK(exported_pixels
-          == 50u * 38u + (size_t) WIDTH * (42u + 78u));
+          == 50u * 38u + (size_t) WIDTH * (42u + 62u));
     bool overlay_landed = false;
     for (int y = 0; y < HEIGHT; y++) {
         for (int x = 0; x < WIDTH; x++) {
@@ -5500,7 +5511,7 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
      * maximally different decoded frames.
      */
     enum {
-        CONTROL_HEIGHT = 78,
+        CONTROL_HEIGHT = 62,
         TITLE_HEIGHT = 42,
         BADGE_WIDTH = 50,
         BADGE_HEIGHT = 38,
@@ -5633,7 +5644,7 @@ static bool test_media_buffering_transition_frames_are_stable(void)
         psp_ui_media_composite_8888(
             &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
         CHECK(!media.controls_visible);
-        for (int y = HEIGHT - 78; y < HEIGHT; y++) {
+        for (int y = HEIGHT - 62; y < HEIGHT; y++) {
             for (int x = 0; x < WIDTH; x++)
                 CHECK(video[(size_t) y * WIDTH + x] == frames[frame]);
         }
@@ -5818,7 +5829,7 @@ static bool test_media_chrome_is_stable_across_motion_sequence(void)
         WIDTH = 480,
         HEIGHT = 272,
         TITLE_HEIGHT = 42,
-        CONTROL_HEIGHT = 78,
+        CONTROL_HEIGHT = 62,
         FRAMES = 24
     };
     static uint32_t video[WIDTH * HEIGHT];
@@ -5876,7 +5887,7 @@ static bool test_media_first_frame_transition_keeps_bottom_ground_stable(void)
     enum {
         WIDTH = 480,
         HEIGHT = 272,
-        CONTROL_HEIGHT = 78,
+        CONTROL_HEIGHT = 62,
         QUIET_MARGIN = 16
     };
     static uint32_t video[WIDTH * HEIGHT];
@@ -5954,14 +5965,14 @@ static bool test_media_first_frame_transition_keeps_bottom_ground_stable(void)
 /*
  * A committed seek is invoked work, but it is not a new media open. The
  * frozen scrubber is useful state and must remain the exact surface Playing
- * will inherit. Treating SEEKING as generic resolving used to erase all 78
+ * will inherit. Treating SEEKING as generic resolving used to erase the
  * footer rows during every cooperative work slice, then restore them at the
  * first post-seek frame; the physical LCD showed that transition as a noisy
  * shimmer across the bottom edge.
  */
 static bool test_media_committed_seek_keeps_timeline_stable(void)
 {
-    enum { WIDTH = 480, HEIGHT = 272, CONTROL_HEIGHT = 78 };
+    enum { WIDTH = 480, HEIGHT = 272, CONTROL_HEIGHT = 62 };
     static uint32_t video[WIDTH * HEIGHT];
     static uint16_t scratch[WIDTH * HEIGHT];
     static uint32_t seeking_bottom[WIDTH * CONTROL_HEIGHT];
@@ -6255,6 +6266,8 @@ static bool test_media_clockwise_controls_and_pixels(void)
     psp_ui_media_bind_presentation(&media, &presentation);
     psp_ui_media_set(&media, true, true, false, UINT64_C(10000000),
                      UINT64_C(60000000), "Portrait fixture");
+    const MediaChapter chapters[] = {{0, "Introduction"}, {30, "Second chapter"}};
+    psp_ui_media_set_chapters(&media, chapters, 2u);
     presentation.rotation_available = true;
     PspUiInput input = {.pressed = PSP_UI_BUTTON_MENU,
                          .analog_x = 128, .analog_y = 128};
@@ -6325,7 +6338,7 @@ static bool test_media_clockwise_controls_and_pixels(void)
         memset(scratch, 0xa5, sizeof(scratch));
         presentation.track_menu_open = variant == 2;
         presentation.subtitle_track_count = 1;
-        presentation.track_menu_tab = 1;
+        presentation.track_menu_tab = 2;
         strcpy(presentation.subtitle_tracks[0].label, "English");
         strcpy(presentation.subtitle_text,
                variant == 1 || variant == 3 ? "Portrait subtitle" : "");
@@ -6355,9 +6368,154 @@ static bool test_media_clockwise_controls_and_pixels(void)
     return true;
 }
 
+static bool test_player_chapter_timeline_and_menu(void)
+{
+    enum {WIDTH = 480, HEIGHT = 272};
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(65000000),
+                     UINT64_C(240000000), "Chapter fixture");
+    MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
+    for (unsigned i = 0; i < MEDIA_CHAPTER_LIMIT; i++) {
+        chapters[i].seconds = i * 10u;
+        snprintf(chapters[i].title, sizeof(chapters[i].title), "Chapter %u", i + 1u);
+    }
+    static uint16_t before[WIDTH * HEIGHT], after[WIDTH * HEIGHT];
+    memset(before, 0, sizeof(before));
+    psp_ui_media_composite(&media, before, WIDTH, HEIGHT, WIDTH);
+    psp_ui_media_set_chapters(&media, chapters, MEDIA_CHAPTER_LIMIT + 1u);
+    CHECK(presentation.chapter_count == MEDIA_CHAPTER_LIMIT);
+    memset(after, 0, sizeof(after));
+    psp_ui_media_composite(&media, after, WIDTH, HEIGHT, WIDTH);
+    CHECK(before[(HEIGHT - 55) * WIDTH + 59] != after[(HEIGHT - 55) * WIDTH + 59]);
+    CHECK(memcmp(before + (HEIGHT - 69) * WIDTH,
+                 after + (HEIGHT - 69) * WIDTH, 10u * WIDTH * sizeof(*after)) != 0);
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "chapter-timeline"));
+    /* Landscape controls reclaim the unused Rotate row; suggested portrait
+       content restores it. Hit targets follow the same compact geometry. */
+    presentation.rotation_available = true;
+    for (unsigned lane = 0; lane < 3; lane++) {
+        presentation.rotation_suggested = lane == 1;
+        presentation.rotation_hint_always = lane == 2;
+        PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+        size_t count = psp_ui_media_overlay_regions(&media, NULL, WIDTH, HEIGHT,
+            regions, PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+        bool found = false;
+        for (size_t at = 0; at < count; at++)
+            if (regions[at].bottom == HEIGHT && regions[at].left == 0
+                && regions[at].right == WIDTH)
+                found = regions[at].top == HEIGHT - (lane == 0 ? 74 : 90);
+        CHECK(found);
+        CHECK(psp_ui_media_activate_at(&media, WIDTH / 2,
+            HEIGHT - (lane == 0 ? 53 : 69), WIDTH, HEIGHT).action
+            == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK);
+        psp_ui_media_cancel_seek_preview(&media);
+    }
+    presentation.rotation_suggested = false;
+    presentation.rotation_hint_always = false;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_TOOLBAR, .analog_x = 128, .analog_y = 128};
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_open && presentation.track_menu_tab == 2
+          && presentation.track_menu_selection == 6);
+    /* Painted order and pointer order are Chapters, Audio, Subtitles. */
+    presentation.audio_track_count = 1;
+    (void) psp_ui_media_activate_at(&media, WIDTH / 2, 60, WIDTH, HEIGHT);
+    CHECK(presentation.track_menu_tab == 0);
+    (void) psp_ui_media_activate_at(&media, WIDTH - 90, 60, WIDTH, HEIGHT);
+    CHECK(presentation.track_menu_tab == 1);
+    (void) psp_ui_media_activate_at(&media, 90, 60, WIDTH, HEIGHT);
+    CHECK(presentation.track_menu_tab == 2 && presentation.track_menu_selection == 6);
+    presentation.audio_track_count = 0;
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    for (unsigned i = 0; i < 17; i++) (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_selection == 23);
+    memset(after, 0, sizeof(after));
+    psp_ui_media_composite(&media, after, WIDTH, HEIGHT, WIDTH);
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "chapter-menu-scrolled"));
+    static uint32_t plain[WIDTH * HEIGHT], cached[WIDTH * HEIGHT];
+    static uint16_t scratch[WIDTH * HEIGHT], menu[PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        * PSP_UI_MEDIA_TRACK_MENU_HEIGHT];
+    PspUiMediaTrackMenuCache cache = {0};
+    presentation.track_menu_selection = 7;
+    uint32_t previous_signature = 0;
+    for (unsigned lane = 0; lane < 4; lane++) {
+        media.current_time_us = lane == 0 ? UINT64_C(65000000) : UINT64_C(75000000);
+        if (lane == 3) strcpy(presentation.chapters[23].title, "Updated chapter");
+        for (size_t at = 0; at < WIDTH * HEIGHT; at++) plain[at] = cached[at] = 0xff123456u;
+        psp_ui_media_composite_8888(&media, NULL, plain, WIDTH, HEIGHT, WIDTH, scratch);
+        psp_ui_media_composite_8888_cached(&media, NULL, cached, WIDTH, HEIGHT, WIDTH,
+            scratch, menu, sizeof(menu) / sizeof(menu[0]), 1u, &cache, NULL, NULL);
+        CHECK(cache.valid && !memcmp(plain, cached, sizeof(plain)));
+        if (lane != 0)
+            CHECK(lane == 2 ? cache.signature == previous_signature
+                            : cache.signature != previous_signature);
+        previous_signature = cache.signature;
+    }
+    presentation.track_menu_selection = 23;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    PspUiMediaIntent intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && intent.seek_time_us == UINT64_C(230000000)
+          && media.seek_preview_active && !presentation.track_menu_open);
+    psp_ui_media_commit_seek(&media, intent.seek_time_us);
+    CHECK(media.current_time_us == intent.seek_time_us && media.seek_in_progress);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(65000000),
+                     UINT64_C(240000000), NULL);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_tab == 1); /* Skip empty Audio. */
+    input.pressed = PSP_UI_BUTTON_PAGE_UP;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_tab == 2);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_NONE && !presentation.track_menu_open
+          && media.current_time_us == UINT64_C(65000000));
+    /* Preview chapter labels follow the tentative time, not the old clock. */
+    psp_ui_media_set_seek_preview(&media, UINT64_C(110000000));
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_selection == 11);
+    /* A pointer selects the scrolled row, not the underlying video's Pause. */
+    intent = psp_ui_media_activate_at(&media, 150, 48 + 44 + 16, WIDTH, HEIGHT);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && intent.seek_time_us == UINT64_C(60000000));
+    presentation.clockwise = true;
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_LEFT; /* Logical Down in portrait. */
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && intent.seek_time_us == UINT64_C(70000000));
+    /* Stale tracks cannot authorize seeking a live/nonseekable stream. */
+    media.seek_enabled = false;
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(!presentation.track_menu_open);
+    MediaChapter invalid[] = {{0, "Intro"}, {0, "Duplicate"}, {20, ""},
+                              {10, "Valid"}, {604801, "Too far"}};
+    psp_ui_media_set_chapters(&media, invalid, sizeof(invalid) / sizeof(invalid[0]));
+    CHECK(presentation.chapter_count == 2 && presentation.chapters[1].seconds == 10);
+    /* Overlapping input is intentional when metadata goes straight to its owner. */
+    psp_ui_media_set_chapters(&media, presentation.chapters, presentation.chapter_count);
+    CHECK(presentation.chapter_count == 2);
+    psp_ui_media_set_chapters(&media, NULL, 0);
+    CHECK(presentation.chapter_count == 0);
+    return true;
+}
+
 int main(void)
 {
-    if (!test_media_clockwise_controls_and_pixels()
+    if (!test_player_chapter_timeline_and_menu()
+        || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()
         || !test_every_interface_language_fits_the_ui_state()
         || !test_priority_menu_during_page_work()

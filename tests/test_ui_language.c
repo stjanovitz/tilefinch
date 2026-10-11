@@ -24,7 +24,7 @@ int main(void)
         == BROWSER_GLYPH_LANGUAGE_KOREAN);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->glyphs
         == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 3);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 4);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->minimum_glyph_sequence == 1);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->glyphs
         == BROWSER_GLYPH_LANGUAGE_ARABIC);

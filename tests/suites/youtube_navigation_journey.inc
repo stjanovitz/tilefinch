@@ -87,6 +87,17 @@ static int test_youtube_filters_and_chapters(void)
         && chapters.html_length == cooperative.html_length
         && !memcmp(chapters.html, cooperative.html, chapters.html_length));
     youtube_lite_document_destroy(&cooperative);
+    MediaChapter player_chapters[MEDIA_CHAPTER_LIMIT];
+    size_t retained = budget.current;
+    CHECK(youtube_lite_copy_chapters(&session,
+        "https://www.youtube.com/watch?v=TFTEST00001&t=60", player_chapters,
+        MEDIA_CHAPTER_LIMIT) == 3u
+        && player_chapters[1].seconds == 60u
+        && !strcmp(player_chapters[1].title, "One & two")
+        && player_chapters[2].seconds == 90u && budget.current == retained);
+    CHECK(youtube_lite_copy_chapters(&session,
+        "https://www.youtube.com/watch?v=TFTEST00002", player_chapters,
+        MEDIA_CHAPTER_LIMIT) == 0u);
     CHECK(youtube_lite_load(&budget, &session,
         "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=description",
         1u * MIB, 1000, &cooperative, error, sizeof(error))
@@ -142,6 +153,13 @@ static int test_youtube_filters_and_chapters(void)
         && strstr(action.url, "tilefinch_date=1")
         && strstr(action.url, "tilefinch_duration=1")
         && strstr(action.url, "tilefinch_sort=1"));
+    ControllerFocusKind results_focus_kind = browser_engine_controller(engine)->focus_kind;
+    size_t results_focus_index = browser_engine_controller(engine)->focus_index;
+    int results_scroll_y = navigation_current(nav)->scroll_y;
+    CHECK(results_scroll_y > 0);
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-search"))
+        && browser_engine_replace_text(engine, "edited fixture", 14u));
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-filter-apply")));
     CHECK(browser_engine_commit_html(engine, watch_url, chapters.html, chapters.html_length, true));
     root = lxb_dom_interface_node(nav->page.document.html);
     panel = test_reader_find_id(root, "yt-chapters");
@@ -152,6 +170,74 @@ static int test_youtube_filters_and_chapters(void)
         && browser_engine_activate(engine, &action)
         && action.type == CONTROLLER_ACTION_NAVIGATE && action.prefer_native_media
         && youtube_watch_url_start_time_us(action.url) == UINT64_C(60000000));
+    /* Returning from the native player/detail page must keep the results
+       focus and edited search text, even when the provider rebuilds the page. */
+    CHECK(write_document_replay(fixture,
+        "https://m.youtube.com/results?search_query=fixture",
+        search, strlen(search), 200, "")
+        && fetch_trace_replay_begin(fixture, error, sizeof(error))
+        && browser_engine_history_move(engine, false));
+    CHECK(browser_engine_controller(engine)->focus_kind == results_focus_kind
+        && browser_engine_controller(engine)->focus_index == results_focus_index
+        && navigation_current(nav)->scroll_y == results_scroll_y);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    size_t restored_text_length = 0;
+    const char *restored_text = document_control_value(
+        test_reader_find_id(root, "yt-search"), &restored_text_length);
+    CHECK(restored_text != NULL && restored_text_length == 14u
+        && !memcmp(restored_text, "edited fixture", 14u));
+    CHECK(browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strstr(action.url, "tilefinch_date=1")
+        && strstr(action.url, "tilefinch_duration=1")
+        && strstr(action.url, "tilefinch_sort=1"));
+    fetch_trace_end(); remove_google_identity_replay(fixture, 1u);
+    static const char select_fixture[] = "<form><select id=s multiple>"
+        "<optgroup><option value=same selected>A</option>"
+        "<option value=same disabled>B</option></optgroup>"
+        "<option value=same selected>C</option></select></form>"
+        "<div style='height:900px'></div>";
+    CHECK(browser_engine_commit_html(engine, "https://select-history.test/",
+        select_fixture, sizeof(select_fixture) - 1, true));
+    root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *select = test_reader_find_id(root, "s");
+    char selected[128], observed[128];
+    CHECK(controller_select_history(select, selected, sizeof(selected), false) == 3
+        && !memcmp(selected, "101", 3));
+    memcpy(observed, "010", 3);
+    CHECK(controller_select_history(select, observed, 2, true) == 0);
+    CHECK(controller_select_history(select, observed, 3, true) == 3);
+    CHECK(controller_select_history(select, observed, sizeof(observed), false) == 3
+        && !memcmp(observed, "010", 3));
+    char invalid[3] = {'1', 'X', '1'};
+    CHECK(controller_select_history(select, invalid, 3, true) == SIZE_MAX);
+    CHECK(controller_select_history(select, observed, sizeof(observed), false) == 3
+        && !memcmp(observed, "010", 3));
+    CHECK(controller_select_history(select, selected, 3, true) == 3
+        && controller_select_history(select, observed, sizeof(observed), false) == 3
+        && !memcmp(observed, "101", 3));
+    /* Offline history supplies authenticated HTML rather than a network
+       response. It must use the same pre-paint control restoration. */
+    char local_selection[] = "010";
+    CHECK(controller_select_history(select, local_selection, 3, true) == 3
+        && browser_engine_focus_node(engine, select)
+        && navigation_set_scroll(nav, 200));
+    CHECK(browser_engine_commit_html(engine, "https://other-local.test/",
+        "<p>Other page", 13, true));
+    const NavigationEntry *local_entry = NULL;
+    CHECK(navigation_back(nav, &local_entry) && local_entry != NULL);
+    CHECK(!browser_engine_commit_history_html(engine, "https://select-history.test/",
+        NULL, 0) && nav->page.loaded
+        && !strcmp(nav->page.document_url, "https://other-local.test/"));
+    CHECK(browser_engine_commit_history_html(engine, "https://select-history.test/",
+        select_fixture, sizeof(select_fixture) - 1));
+    root = lxb_dom_interface_node(nav->page.document.html);
+    select = test_reader_find_id(root, "s");
+    CHECK(controller_select_history(select, observed, sizeof(observed), false) == 3
+        && !memcmp(observed, "010", 3)
+        && browser_engine_controller(engine)->focus_kind == CONTROLLER_FOCUS_CONTROL
+        && browser_engine_controller(engine)->focus_index == 0
+        && navigation_current(nav)->scroll_y == 200);
     browser_engine_destroy(engine);
     youtube_lite_document_destroy(&filters); youtube_lite_document_destroy(&chapters);
     browser_session_destroy(&session);

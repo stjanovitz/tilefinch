@@ -85,13 +85,14 @@ int main(void)
     CHECK(route(service, on_page, PSP_UI_BUTTON_CONFIRM, false)
           == PSP_INPUT_ROUTE_QUEUE_PAGE);
 
-    /* The player: its controls, Circle stops it, others are "busy". */
+    /* The player keeps rotation and picker input live during decoder work;
+       Circle stops it unless a preview or picker owns that press. */
     CHECK(route(media, on_page, PSP_UI_BUTTON_RIGHT, false)
           == PSP_INPUT_ROUTE_MEDIA);
     CHECK(route(media, on_page, PSP_UI_BUTTON_CANCEL, false)
           == PSP_INPUT_ROUTE_CANCEL);
     CHECK(route(media, on_page, PSP_UI_BUTTON_MENU, false)
-          == PSP_INPUT_ROUTE_BUSY);
+          == PSP_INPUT_ROUTE_MEDIA);
     CHECK(route(media, on_page, PSP_UI_BUTTON_RIGHT, true)
           == PSP_INPUT_ROUTE_STILL_STOPPING);
     /* A highlighted scrub time: Circle drops it instead of stopping the
@@ -101,6 +102,17 @@ int main(void)
         .acknowledge_busy = true, .media_preview_active = true
     };
     CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    highlighted.media_preview_active = false;
+    highlighted.media_menu_open = true;
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    const uint32_t menu_buttons[] = {PSP_UI_BUTTON_UP, PSP_UI_BUTTON_DOWN,
+        PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_MENU};
+    for (size_t at = 0; at < sizeof(menu_buttons) / sizeof(menu_buttons[0]); at++) {
+        highlighted.pressed = menu_buttons[at];
+        CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    }
+    highlighted.media_menu_open = false;
+    highlighted.pressed = PSP_UI_BUTTON_CANCEL;
     highlighted.cancelling = true;
     CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_STILL_STOPPING);
     /* The flag means nothing to a loading page. */
