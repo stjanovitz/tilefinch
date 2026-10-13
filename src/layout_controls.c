@@ -9,6 +9,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool layout_control_text_style(LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, bool placeholder, DrawCommand *text)
+{
+    ComputedStyle resolved;
+    if (placeholder) {
+        resolved = style_for_pseudo(context->sheet, node, PSEUDO_PLACEHOLDER, style);
+        style = &resolved;
+        if (style->opacity == 0 || style->visibility_hidden) return false;
+    }
+    text->color = style->color;
+    text->scale = style->font_scale;
+    text->font_size = style->font_size;
+    draw_command_set_text_font_family(text, style->font_family);
+    text->font_weight = draw_font_weight(style);
+    text->font_italic = style->font_italic;
+    text->letter_spacing = style->letter_spacing;
+    text->radius |= (int) style->font_size_fraction << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
+        | (computed_style_kerning_none(style) ? LAYOUT_TEXT_KERNING_NONE : 0);
+    text->image_fit = text_decoration_bits(style);
+    text->opacity_scale = alpha_opacity_scale((unsigned) style->color_alpha
+        * (placeholder ? style->opacity : 255u) / 255u);
+    return true;
+}
+
 ControlType layout_input_control_type(lxb_dom_node_t *node)
 {
     if (attribute_is(node, "type", "checkbox")

@@ -118,6 +118,21 @@ use a host0 launch to keep it off the Memory Stick. It does not capture the
 separate RGB8888 video surface and reports `final-frame-dumped=0` when that
 surface owns scanout. Ordinary release builds do not contain this final dump.
 
+### Partial scroll completion
+
+`youtube-scroll-interrupt.txt` opens provider details, returns to results,
+and sends Select, Triangle, and focus input while visible tiles are still
+being prepared. Use a captured results/watch response set and the same
+explicit emulator clock. Require the menu mark, both chrome-toggle response
+receipts, a visible final focus, and clean completion. The scenario does not
+play media or write account/session state.
+
+`youtube-bbb.txt` measures first visible scroll movement separately from
+complete visible-tile publication. Partial publications use the same display
+fence as complete frames; the next bounded raster slice samples input without
+an additional entry-vblank wait. Raster time/unit limits are unchanged. Check
+both timing fields: a fast checkerboard is not evidence of fast completion.
+
 ## Script format
 
 The language is line-oriented. Blank lines and `#` comments are ignored.
@@ -137,6 +152,39 @@ that step must continue while the application reports asynchronous work. For
 example, `wait-live 30` advances for 30 sampled frames during a navigation
 or sustained media session. Without the suffix, a step pauses until the
 ordinary browser loop is ready to accept scripted input.
+
+`tap-after-live MILLISECONDS BUTTONS` schedules a press independently of
+browser readiness (1–65535 ms after the step is armed). It retains the due
+time when the next input poll is late. Validation logs therefore include
+polling delay in press-to-visible timing, rather than measuring only from
+when busy work finally samples the button. A timed step following another
+step is armed when that preceding step finishes, before returning to owner
+work—not at the next poll after that work. Select and Triangle report an
+accepted-frame `tilefinch-input-response`; focus and scrolling use their
+existing accepted-frame feedback records. Missing or superseded responses
+are not successful samples. `page-response-live` exercises these controls
+while optional page work is still active, then repeats page input later.
+Use identical captured responses and an explicit emulator clock for A/Bs;
+emulator timings are not physical-device latency claims.
+`page-focus-live` isolates focus from menu presses that would supersede it.
+EOF is finalized only in the owner loop after queued presses drain. Require
+one Down response (focus, or accepted completion-time scroll) and two
+focus-right receiver receipts, not merely a clean exit.
+Read-only selector preparation, cache preparation and tile raster keep the last completed page framebuffer
+immutable and use owner-thread checkpoints for native controls. Composition
+suppresses those presents until its framebuffer writes finish; a completion
+publication retains the supervisor's latest menu state. Queued page input
+defers additional author tasks only between tasks, after their microtask
+checkpoint, and defers further tile units without cancelling completed work.
+Optional image admission has the same resumable boundary before each request:
+waiting page input keeps the job pending before the first request, or retains
+the first request and leaves the optional second target in the page queue.
+Replay metadata polls between bounded line groups without skipping its full
+integrity validation. Native feedback still uses immutable incumbent pixels;
+no DOM input dispatch occurs inside request preparation.
+Visible, in-viewport targets can emit `tilefinch-focus-first-visible` before
+author styling completes; an offscreen target must use the later complete
+frame. A `visible=0` completion is not a successful focus-feedback sample.
 
 Use plain `mark` for page/runtime profiling boundaries. A `mark-live` can be
 consumed by the input supervisor while page work is still running: its UI
@@ -218,6 +266,15 @@ the fixed wait it replaces. The probe never runs inside page script. Like
 validation-only device diagnostic.
 
 ### Send/interaction wall-time accounting
+
+The host interactive lab's `interaction-latency` records separate `total-us`
+(wall time) from `cpu-us` (owner-thread CPU), with `cpu-clock-valid=1` only
+when both thread-clock queries succeeded. A zero with validity 0 is unavailable,
+not free computation. Both intervals cover command handling through its rendered
+frame; CPU includes native work invoked by JavaScript and rendering. The two
+clock brackets are adjacent, not identical, and include bounded clock-query
+cost. Neither number measures a PSP button press to its first visible feedback;
+the device supervisor can acknowledge input before owner work completes.
 
 Scripted validation runs emit `tilefinch-loop-timing` for every owner-loop
 invocation, including short frames and early returns. Its ordered phase

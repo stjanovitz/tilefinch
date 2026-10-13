@@ -98,6 +98,62 @@ static bool test_modal_exhaustion(void)
     return true;
 }
 
+static bool test_scheduled_press_includes_polling_delay(void)
+{
+    PspInputScript script;
+    CHECK(psp_input_script_parse(&script,
+        "tap-after-live 50 select\nend\n", "inline", record_warning, NULL));
+    PspUiInput input = {0};
+    script.now_us = UINT64_C(1000000);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+        && input.pressed == 0 && script.pressed_us == 0
+        && script.step_due_us == UINT64_C(1050000));
+    script.now_us = UINT64_C(1049000);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+        && input.pressed == 0 && script.step_remaining == 2u);
+    /* The owner was busy for 250 ms past the scheduled press. The event
+       must retain that wait rather than starting its clock at sampling. */
+    script.now_us = UINT64_C(1300000);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+        && input.pressed == PSP_UI_BUTTON_MENU
+        && script.pressed_us == UINT64_C(1050000));
+    CHECK(psp_input_script_advance(&script, &input, PSP_UI_BUTTON_MENU, false)
+        && input.held == 0 && script.pressed_us == 0);
+    CHECK(!psp_input_script_advance(&script, &input, 0, true)
+        && script.reached_end);
+    CHECK(psp_input_script_parse(&script,
+        "wait-live 1\ntap-after-live 1 select\nend\n",
+        "inline", record_warning, NULL));
+    script.now_us = UINT64_C(2000000);
+    CHECK(psp_input_script_advance(&script, &input, 0, false));
+    /* The owner may now spend 80 ms in request setup. The press was due
+       after 1 ms, not 1 ms after setup finally polls the next step. */
+    script.now_us = UINT64_C(2080000);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+        && input.pressed == PSP_UI_BUTTON_MENU
+        && script.pressed_us == UINT64_C(2001000));
+    CHECK(parse_rejects("tap-after 50 select\n")
+        && parse_rejects("tap-after-live 0 select\n")
+        && parse_rejects("tap-after-live 65536 select\n"));
+    return true;
+}
+
+static bool test_eof_waits_for_owner_boundary(void)
+{
+    PspInputScript script;
+    PspUiInput input = {0};
+    CHECK(!psp_input_script_eof_pending(NULL));
+    CHECK(psp_input_script_parse(&script, "wait-live 1\n", "eof", NULL, NULL));
+    CHECK(!psp_input_script_eof_pending(&script));
+    CHECK(psp_input_script_advance(&script, &input, 0, false));
+    CHECK(psp_input_script_eof_pending(&script) && !script.finished && !script.reached_end);
+    /* The busy frontend leaves this state alone while queued owner actions
+       are dispatched. EOF needs no fully-idle page once the owner returns. */
+    CHECK(!psp_input_script_advance(&script, &input, 0, false));
+    CHECK(script.reached_end && !psp_input_script_eof_pending(&script));
+    return true;
+}
+
 static bool test_parser(void)
 {
     PspInputScript script;
@@ -752,7 +808,9 @@ int main(int argc, char **argv)
              "%s/menu-tour.host-trace.txt", directory);
     snprintf(trace_path, sizeof(trace_path), "menu-tour.host-trace.produced");
 
-    if (!test_timing_log_capture() || !test_parser() || !test_file_capacity_boundary()
+    if (!test_timing_log_capture() || !test_parser()
+        || !test_scheduled_press_includes_polling_delay() || !test_file_capacity_boundary()
+        || !test_eof_waits_for_owner_boundary()
         || !test_stepper() || !test_names() || !test_modal_exhaustion()
         || !test_every_scenario_loads(directory)
         || !test_live_media_scenario(directory)

@@ -328,8 +328,30 @@ static void test_silent_loop_bulk_advance(void)
     printf("silent-loop parity: %u blocks plus audible continuation\n", cases);
 }
 
+static void test_unsigned_eight_bit_wav(void)
+{
+    static const unsigned char wav[] = {
+        'R','I','F','F',40,0,0,0,'W','A','V','E',
+        'f','m','t',' ',16,0,0,0,1,0,1,0,
+        0x40,0x1f,0,0,0x40,0x1f,0,0,1,0,8,0,
+        'd','a','t','a',4,0,0,0,0,127,128,255
+    };
+    static const int16_t expected[] = {-32768, -256, 0, 32512};
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    TilefinchGameAudio *audio = tilefinch_game_audio_create(&budget);
+    assert(audio != NULL);
+    TilefinchGameAudioBufferInfo info;
+    assert(tilefinch_game_audio_decode_wav(audio, wav, sizeof(wav), &info));
+    assert(info.frames == 4 && info.channels == 1 && info.sample_rate == 8000);
+    assert(memcmp(audio->buffers[0].samples, expected, sizeof(expected)) == 0);
+    tilefinch_game_audio_destroy(audio);
+    assert(budget.current == 0);
+}
+
 int main(void)
 {
+    test_unsigned_eight_bit_wav();
     test_sequential_curve_state();
     test_silent_loop_bulk_advance();
     test_span_admission_and_refusal();

@@ -12,6 +12,159 @@ redistributing site captures.
 
 ## What is measured
 
+Named font declarations retain bounded resolution programs when their face is
+declared by a later stylesheet. Font shorthand replay preserves subsequent
+declarations in the same block. Generated inline content inherits white-space,
+so an icon cannot wrap out of a nowrap navigation label. Explicit underline
+inheritance resolves against the parent independently of ancestor decoration
+propagation. Reduced regression tests cover these cases, including zero-owned-
+byte teardown. Retaining the font program adds 102 declaration bytes in the
+grid counter fixture; its other work counters remain unchanged.
+
+The application admits up to 32 stylesheet requests and 3 MiB of CSS input,
+matching its existing bounded resource ledger. The shared page Budget,
+individual file ceiling and parse/layout headroom checks are unchanged.
+Viewport scroll events target Document and bubble to Window, allowing author
+scroll-driven controls to update without a browser-specific workaround.
+
+Reference capture explicitly checks touch/coarse-pointer emulation before
+author execution. Its per-target protocol audit includes favicon requests and
+redirect hops, including document completion after a cross-process frame handoff.
+Only cancellation after a fulfilled retained response is accepted; unexplained
+transport failure remains disqualifying. Denied unload beacons to explicitly
+excluded telemetry routes are counted separately, not silently discarded.
+These checks do not make partial page initialization or an unclosed resource
+trace a qualified comparison. No fidelity floor is lowered for this batch.
+
+Compact percentage-width text controls contribute their edges, rather than
+their default editing width, to a cyclic min-content calculation. Generated
+text includes letter spacing in intrinsic widths, including the boundary
+between author text and a generated suffix. Placeholder text resolves its
+own color, font and opacity without changing entered values. Table headers
+use the UA bold default unless author CSS overrides it.
+
+Inline fragment backgrounds and borders follow the fragment's text baseline.
+Their padding and borders paint outside the text without enlarging the line
+box. Generated masks retain their explicit size, position and repetition.
+Same-color rounded generated borders retain unequal side widths in existing
+command fields; scaling and quarter turns transform those widths too. Reduced
+geometry and pixel tests cover these paths; no fidelity floor was lowered.
+
+Diagnostic native captures adapt fully captured, anonymous visual redirect
+chains to the native recorder's completed-fetch format. The source trace stays
+immutable, the terminal body must match its length and hash, and the derived
+trace digest and exact hop chain are retained in the invocation receipt.
+Missing/ambiguous visual hops, credentialed chains and policy-sensitive chains
+are refused. This adapter does not change production fetch or image loading.
+
+These control and decoration fixes measure 4,785,392 bytes of shipping
+`.text` after consolidation. A user-approved 2 KiB increase sets the cap to
+4,786,432 bytes. Page memory ceilings and the validation cap stay unchanged;
+unequal border widths reuse existing command storage without a raster surface,
+and placeholder rule partitions add eight bytes per stylesheet.
+
+Horizontal flex rows treat in-flow generated text and decorations as virtual
+items, rather than reserving space at the container edges. They participate in
+ordering, gaps, wrapping, shrink and cross-axis alignment without synthetic DOM
+nodes. Percentage edges use the container's inline size. Reduced tests cover
+normal/reversed/ordered rows, percentage padding, wrapped lines and positioned
+pseudos that must remain outside the flex item list.
+
+Font discovery retains up to eight named families so early text faces do not
+exclude later icon faces. The existing download-attempt, encoded-byte,
+per-response, backend and shared page-memory budgets remain authoritative.
+One spare text-only command bit retains the sixth family bit independently of
+compositing filters; display commands remain 56 bytes on PSP. Regressions cover
+late generated glyphs, the family ceiling, all family/fallback/filter combinations
+and clean teardown. Shipping `.text` measures 4,786,400 bytes, within the existing
+4,786,432-byte cap; no limit increase was required.
+
+Named web-font families retain up to four distinct authored weights rather
+than merging all light/medium faces into one regular slot. Selection follows
+the CSS weight-search order, while existing download and backend budgets
+remain authoritative. Inline-block baselines use their line-box baseline,
+not the lowest vertically shifted glyph; single-line inline fragments align
+their generated content as a group. No retained node or draw-command storage
+was added for baselines.
+
+Static import maps are snapshotted before first module resolution, with
+128 entries, 32 maps, 32 scopes per map and a 64 KiB retained-string ceiling. Exact,
+prefix and scoped mappings retain ordinary module fetch/CSP/CORS admission;
+blocked mappings never fall back to an unrelated URL. Late map changes are
+not supported, and child realms never inherit the top document's map.
+Cached modules retain their original specifiers and re-resolve them against
+the new document's map, preserving bytecode reuse across revisits.
+Readiness transitions emit `readystatechange` before the
+corresponding DOM-ready and load events, allowing waiting components to
+initialize without a site-specific workaround. Client geometry reads use
+the retained padding box rather than adding padding to used widths twice.
+
+These fixes measure 4,792,332 bytes of shipping `.text`. A user-approved
+6 KiB increase sets its cap to 4,792,576 bytes. Page-memory, download and
+validation limits are unchanged. Reduced regressions and retained-input
+comparison captures cover weight selection, grouped inline baselines,
+readiness event order, client boxes and import-map resolution. No fidelity
+floor was lowered.
+
+Content-sized grid rows now stretch earlier auto-sized items to their final
+track height, carrying that size through bounded percentage-height chains
+and preserving flex order, reverse columns, height limits and full-box links.
+This updates retained geometry without a second whole-row layout or a new
+raster surface. Empty icon buttons synthesize their baseline at the content
+edge. DOM interfaces expose their standard object tags so libraries do not
+mistake elements for plain objects during cloning. Rounded image tile spans
+use fitted per-side corner radii, preventing rectangular gaps when an authored
+radius exceeds half the image size.
+
+The batch measures 4,795,176 bytes of shipping `.text`; a user-approved 3 KiB
+increase sets its cap to 4,795,648 bytes. Production page-memory limits remain
+unchanged. Reduced regressions cover final row sizing, empty-button baselines,
+DOM brands and circular/unequal image corners. No fidelity floor was lowered.
+
+Complete synchronous geometry layouts can now move into presentation when
+document, cascade, container, font and viewport generations still match and
+the mutation journal requires no resource replacement. Immutable image bodies
+and loaded font faces have lifetime keys, retaining bounded raster caches
+across layout updates without trusting recycled addresses. Raw image buffers
+still evict conservatively; pressure reclamation and cache byte ceilings remain
+unchanged. Pixel comparisons and lifetime/refusal regressions cover the reuse.
+The shipping image measures 4,796,684 bytes of `.text`; the approved 2 KiB
+increase sets its cap to 4,797,696 bytes, without changing page-memory limits.
+
+Content-sized grid rows apply center/end alignment after final row sizing,
+without applying it twice when definite-height row sharing already aligned
+the item. URL masks can retain a gradient background through alpha and
+generated-content painting rather than substituting a solid text color.
+The gradient uses the existing bounded ramp table and raster setup cache;
+display commands and page-memory ceilings do not grow. At the style-cache
+entry ceiling, a large document-order scan preserves entries used in the
+current build instead of cyclically evicting them. Fresh resolution remains
+authoritative whenever optional cache admission is declined.
+Reduced regressions fail with the prior behavior and pass with these fixes.
+The shipping image measures 4,798,552 bytes of `.text`; the approved 1 KiB
+increase sets its cap to 4,798,720 bytes. No fidelity floor is lowered.
+
+Inline replaced images resolve percentage heights against their immediate
+definite block, not a positioned ancestor or the viewport. An intervening
+auto-height block keeps that percentage indefinite. Blockified single-line
+inputs retain the same minimum text height as their inline equivalents, even
+when empty or using `appearance:none`; explicit heights remain authoritative.
+
+The shared SVG decoder supports bounded local `clipPath` geometry and nested
+viewport clipping, including forward references, inline-style precedence,
+`objectBoundingBox` units and transformed object bounds. External clip URLs
+never fetch. Clipping admits 128 definitions/uses, 4096 shape bindings and
+32 nested clip/viewport levels. Its two byte-per-pixel scratch masks are
+Budget-owned and released after decoding; unclipped images allocate no masks.
+This is not complete SVG/CSS masking or arbitrary-angle CSS border rotation.
+Pixel and allocation-refusal tests cover the supported path. No fidelity floor
+was lowered for these changes.
+
+The measured shipping `.text` after this batch is 4,780,144 bytes. A reviewed
+6 KiB increase sets its cap to 4,780,288 bytes; page memory ceilings and the
+validation cap are unchanged. The extra code supplies shared clipping and
+layout behavior, not site-specific rendering rules.
+
 Ordinary component selectors are admitted up to 1023 bytes, retaining only
 their actual text in the stylesheet arena. Rewrite/nesting scratch remains
 bounded to 256 bytes; neither ordinary nor sparse rule records grow. Reduced
@@ -42,6 +195,23 @@ alignment. Solid, square generated decorations also retain bounded horizontal
 affine-transform support: text, image, rounded, gradient and blurred spans
 still decline that specialized path. Pixel tests cover both shear directions,
 `transform:none` overrides and all-or-nothing span refusal.
+
+Absolutely positioned generated boxes center automatic margins when both
+opposing insets and a definite size are supplied. Their square solid borders
+and fills also retain non-quarter rotations in a fixed-size display command,
+with bounded fixed-point coverage instead of an offscreen surface. Unsupported
+spans decline before any command is changed; ancestor quarter turns, scaling
+and viewport clones preserve the payload. Rare rotation uses existing optional
+paint-stack padding, without growing ordinary styles or display commands.
+
+Inline SVGs with definite CSS dimensions that change the authored viewport
+ratio apply those dimensions before viewBox mapping and cache hashing. This
+preserves the artwork's proportions instead of stretching a raster made for
+the old viewport. Uniform resizes retain the existing display-retarget path.
+The linked shipping `.text` for this follow-up is 4,783,952 bytes. The approved
+4 KiB cap increase sets the ceiling to 4,784,384 bytes; page memory ceilings
+and the validation cap remain unchanged. The shared rotated-fill painter is
+outside the ordinary raster hot path and allocates no intermediate surface.
 
 Large sampled external stylesheets can be re-sampled transactionally when
 script-inserted subtrees introduce new selector tokens. The document census
@@ -368,9 +538,16 @@ retained in private investigation records rather than the public source tree.
 traces (`fidelity/captures/mdn-r1` and `guardian-home-r1`, copied unmodified;
 the census trace format is the fidelity capture format). Neither closed
 Chrome's ledger: Chrome loads resources the engine never requests, namely the
-WOFF2 web fonts (Tilefinch takes the WOFF/TTF alternatives), MDN's
+WOFF2 web fonts (the engine at capture time took the WOFF/TTF alternatives), MDN's
 browser-icon SVGs and two lazily imported chunks, and the Guardian's card
-images. A fresh engine capture would not contain them either.
+images. Those original captures therefore lacked resources needed by the reference.
+
+The pinned font backend now accepts TrueType-flavored WOFF2, including
+transformed glyph tables, under the existing per-face allocation ceiling.
+Brotli decoding uses that same Budget-backed allocator; decompression and
+glyph reconstruction include cancellation checkpoints. Collections and CFF
+fonts remain unsupported. Font downloads retain their existing byte and
+attempt limits; unsupported or refused fonts continue using fallback faces.
 
 With explicit approval of exactly those routes, they were acquired live once
 with `benchmarks/acquire-trace-plan.py` (honest UA, no cookies or

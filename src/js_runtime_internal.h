@@ -155,6 +155,9 @@ JSValue js_dom_parse_color(JSContext *context,
    Still bounded per call to keep PSP worst cases finite. */
 #define DOM_TRAVERSAL_VISIT_LIMIT 32768u
 
+#undef budget_malloc
+#undef budget_calloc
+#undef budget_realloc
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (p), (s))
@@ -792,6 +795,8 @@ typedef enum {
 } ScriptHostTimerKind;
 
 #define SCRIPT_WORKER_REALM_LIMIT 4
+bool js_rt_geometry_opacity_write_begin(DomBridge *bridge, lxb_dom_node_t *node);
+void js_rt_geometry_opacity_write_end(DomBridge *bridge);
 #define SCRIPT_FRAME_REALM_LIMIT 16
 #define SCRIPT_CHECKPOINT_CONTINUATION_LIMIT 8
 /* Consecutive turns FinalizationRegistry cleanup may go without a task slot
@@ -808,6 +813,9 @@ struct ScriptRuntime {
     uint64_t geometry_content_generation;
     uint64_t geometry_style_generation;
     uint64_t geometry_sheet_generation;
+    uint64_t geometry_font_generation;
+    uint64_t geometry_container_generation;
+    bool geometry_paint_stale;
     ScriptDocumentScope document_scope;
     JSRuntime *runtime;
     JSContext *context;
@@ -951,6 +959,9 @@ struct ScriptRuntime {
     ScriptModuleFreeCallback module_release;
     void *module_opaque;
     ScriptModuleOpaqueDestroyCallback module_opaque_destroy;
+    struct ScriptImportMapEntry *import_map;
+    size_t import_map_count;
+    bool import_map_prepared;
     ScriptModuleBaseEntry *module_bases;
     size_t module_base_count;
     size_t module_base_capacity;

@@ -9,12 +9,20 @@
 
 typedef struct TilefinchGlyphProvider TilefinchGlyphProvider;
 
+typedef enum {
+    WEB_FONTS_ON = 0,
+    WEB_FONTS_SMART,
+    WEB_FONTS_OFF,
+    WEB_FONTS_MODE_COUNT
+} WebFontMode;
+
 /* Keep retained transform products from turning a single glyph into an
    unbounded stb_truetype raster job on the PSP.  This is deliberately above
    the largest untransformed CSS font accepted by the style layer. */
 #define TILEFINCH_FONT_RASTER_PIXEL_LIMIT 256
 #define TILEFINCH_BITMAP_FONT_SCALE_LIMIT 32
-#define TILEFINCH_WEB_FONT_FAMILY_LIMIT 2
+#define TILEFINCH_WEB_FONT_FAMILY_LIMIT 8
+#define TILEFINCH_WEB_FONT_WEIGHT_LIMIT 4
 #define TILEFINCH_WEB_FONT_FAMILY_STRIDE 5
 #define TILEFINCH_WEB_FONT_BASE 16
 #define TILEFINCH_WEB_FONT_GLYPH_PIXEL_LIMIT (64u * 1024u)
@@ -28,7 +36,7 @@ typedef enum {
     FONT_FACE_BACKEND_FREETYPE_WEB
 } FontFaceBackend;
 
-/* Font families are retained in every computed style.  The two web-font
+/* Font families are retained in every computed style.  The bounded web-font
    slots are encoded above the built-ins but still fit comfortably in one
    byte; keep the semantic type explicit instead of relying on the compiler's
    four-byte enum representation. */
@@ -57,7 +65,25 @@ typedef struct {
     void *implementation;
     FontFaceBackend backend;
     bool loaded;
+    /* Zero for application faces; declared CSS weight for loaded page faces.
+       Reuses tail padding on both host and PSP. */
+    uint16_t authored_weight;
+    /* Stable lifetime identity, independent of allocator address reuse. */
+    uint64_t serial;
 } FontFace;
+
+/* Changes when a loaded face is published or retired. */
+uint64_t font_generation(void);
+
+/* Retained allocator payload for the backend, excluding encoded bytes and
+   Budget bookkeeping. Useful for comparing page-font ownership. */
+size_t font_face_backend_bytes(const FontFace *face);
+size_t font_face_cached_ascii_advances(const FontFace *face);
+/* Share an already admitted page face only after the new response has passed
+   request policy and its exact bytes and allocator ceiling match. */
+bool font_face_share_encoded(FontFace *destination, const FontFace *source,
+    Budget *budget, const unsigned char *data, size_t length,
+    size_t maximum_backend_bytes);
 
 typedef struct {
     FontFace sans;
@@ -94,8 +120,11 @@ enum {
    incumbent page.  The style layer encodes the family slot plus a bounded
    fallback family in FontFamily. */
 typedef struct {
-    FontFace regular;
-    FontFace bold;
+    union {
+        struct { FontFace regular; FontFace bold; };
+        FontFace faces[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
+    };
+    uint16_t weights[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
 } WebFontFamilyFaces;
 
 typedef struct {
@@ -172,6 +201,9 @@ FontFamily font_context_metric_family(
 const FontFace *font_context_face_variant(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
     bool italic, bool bold);
+const FontFace *font_context_face_at_weight(
+    const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
+    bool italic, bool fallback_bold, unsigned weight);
 const FontFace *font_context_face(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family);
 bool font_context_face_is_bold(
@@ -179,7 +211,9 @@ bool font_context_face_is_bold(
     const FontFace *face);
 /* Accepts bounded TrueType-flavoured sfnt or WOFF 1.0 data through the
    size-aware page-font backend and owns an internal encoded copy on success.
-   WOFF2, TTC, CFF, and every stb path are deliberately rejected here. */
+   The pinned backend also accepts TrueType-flavored WOFF2, charging Brotli
+   state and reconstructed tables to this same cap with cancellation slices.
+   TTC, CFF, and every stb path are deliberately rejected here. */
 bool font_face_load_encoded(FontFace *face, Budget *budget,
                             const unsigned char *data, size_t length,
                             size_t maximum_backend_bytes);

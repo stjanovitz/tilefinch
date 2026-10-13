@@ -227,11 +227,16 @@ static bool layout_block_with_float_output(
                                      positioned_box, bottom);
     }
     lxb_dom_node_t *link_container = context->link_container;
+    scratch->line.has_baseline = false;
     bool success = layout_block_impl(context, node, parent, x, y, width,
                                      containing_height, assigned_width,
                                      positioned_box, bottom, scratch,
                                      float_output, float_output_capacity,
                                      float_output_count);
+    context->completed_baseline_node = success && scratch->line.has_baseline
+        ? node : NULL;
+    context->completed_first_baseline = scratch->line.first_baseline;
+    context->completed_last_baseline = scratch->line.last_baseline;
     context->link_container = link_container;
     layout_bidi_flow_destroy(scratch->bidi_flow);
     scratch->bidi_flow = NULL;
@@ -713,6 +718,16 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
     }
     int native_control_height = layout_control_default_height(node);
+    if (!style->has_height && layout_node_name_is(node, "input")
+        && native_control_height == 0) {
+        /* Blockification does not remove the anonymous single-line value
+           box. Match inline controls even when the value is empty or native
+           appearance is disabled; padding/borders are added by normal flow. */
+        int text_height = layout_fixed_ceil(computed_style_font_size_fixed(style));
+        if (text_height < 1) text_height = 7 * style->font_scale;
+        if (declared_content_height < text_height)
+            declared_content_height = text_height;
+    }
     int textarea_rows_height = style->has_height ? 0
         : layout_textarea_rows_content_height(context, node, style);
     if (textarea_rows_height > declared_content_height)
@@ -808,6 +823,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         .direction_rtl = computed_style_direction_rtl(style),
         .clamp_limit = computed_style_line_clamp(style),
         .positioned_box = *descendant_positioned_box,
+        .containing_height = child_containing_height,
         .floats_enabled = true,
         .first_inline_block_collapses_top =
             !multicolumn.active && block_parent_collapses_top(style)
@@ -937,8 +953,16 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         first_flow_content = false;
     }
-    bool before_pseudo_flowed_inline = false;
-    if (!content_visibility_hidden && !before_pseudo_flow.active
+    bool generated_flex_row = (style->display == DISPLAY_FLEX
+                              || style->display == DISPLAY_INLINE_FLEX)
+        && (style->flex_direction == FLEX_ROW
+            || style->flex_direction == FLEX_ROW_REVERSE);
+    bool before_flex_item = generated_flex_row && layout_generated_flex_in_flow(
+        context, node, style, PSEUDO_BEFORE);
+    bool after_flex_item = generated_flex_row && layout_generated_flex_in_flow(
+        context, node, style, PSEUDO_AFTER);
+    bool before_pseudo_flowed_inline = before_flex_item;
+    if (!content_visibility_hidden && !before_flex_item && !before_pseudo_flow.active
         && !flow_generated_inline_pseudo(
             context, node, style, PSEUDO_BEFORE, line, NULL, 0, NULL,
             &before_pseudo_flowed_inline)) {
@@ -1059,11 +1083,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         if (image_width < 1) image_width = 1;
         if (image_height < 1) image_height = 1;
-        if (image_available) {
+        bool fixed_image_slot = layout_fixed_image_slot(node, style, parent);
+        if (image_available || fixed_image_slot) {
             DrawCommand command = {
                 .type = DRAW_IMAGE, .x = content_x, .y = line->y,
                 .width = image_width, .height = image_height,
-                .image = block_image, .image_fit = style->object_fit,
+                .image = image_available ? block_image : NULL,
+                .image_fit = style->object_fit,
+                .text = fixed_image_slot ? (const char *) node : NULL,
                 .scale = paint_plan.border_radius_code
             };
             draw_command_set_object_position(
@@ -1120,6 +1147,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 &command, paint_plan.mask_layer, block_mask,
                 mask_width, mask_height);
         }
+        layout_mask_background_gradient(context, style, &command);
         if (layout_add_command(context->layout, command) == NULL) return false;
         line->y = layout_add_coordinate(line->y, mask_height);
     }
@@ -1328,39 +1356,15 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
        condition. Construct the transfer frame here too: filling seventeen
        fields for every ordinary article block was unnecessary refactor-only
        work even after the calls themselves were gated. */
-    /* A row flex container's box-bearing ::before/::after (an empty
-       sized box: an icon, a chevron, a rule) are flex items (CSS Flexbox
-       4): the main axis reserves their outer width at the start and end of
-       the line and they are painted there, aligned on the cross axis.
-       MDN's breadcrumb chevrons and search caret are such items. Text
-       pseudos keep the inline flow; reversed rows keep the old painter. */
-    LayoutFlexPseudo flex_before = {0}, flex_after = {0};
-    bool flex_pseudos = flex_container && flex_row && !table_row
-        && !css_table_row && !anonymous_cell_row && !reverse_row
-        && !replaced_content && !content_visibility_hidden;
-    if (flex_pseudos) {
-        flex_before = layout_flex_pseudo_item(context, node, style,
-                                              PSEUDO_BEFORE, content_width);
-        flex_after = layout_flex_pseudo_item(context, node, style,
-                                             PSEUDO_AFTER, content_width);
-    }
-    int flex_pseudo_top = line->y;
-    size_t flex_command_start = context->layout->count;
     if (grid || flex_row) {
-        int reserved_start = flex_before.active
-            ? layout_add_coordinate(flex_before.outer_width, style->gap) : 0;
-        int reserved_end = flex_after.active
-            ? layout_add_coordinate(flex_after.outer_width, style->gap) : 0;
         LayoutBlockFrame frame = {
             .node = node,
             .style = style,
             .scratch = scratch,
             .line = line,
             .descendant_positioned_box = descendant_positioned_box,
-            .content_x = layout_add_coordinate(content_x, reserved_start),
-            .content_width = content_width - reserved_start - reserved_end
-                                 > 0
-                ? content_width - reserved_start - reserved_end : 0,
+            .content_x = content_x,
+            .content_width = content_width,
             .child_containing_height = child_containing_height,
             .declared_content_height = declared_content_height,
             .definite_height = definite_height,
@@ -1383,22 +1387,6 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         if (grid && !layout_block_grid_section(context, &frame)) return false;
         if (flex_row && !layout_block_flexrow_section(context, &frame)) {
             return false;
-        }
-        if ((flex_before.active || flex_after.active)
-            && !layout_flex_pseudo_paint(
-                   context, node, style, &flex_before, &flex_after,
-                   content_x, content_width, flex_pseudo_top, line->y,
-                   flex_command_start)) {
-            return false;
-        }
-        /* A generated item taller than the line extends the container. */
-        for (int i = 0; i < 2; i++) {
-            const LayoutFlexPseudo *item = i == 0 ? &flex_before : &flex_after;
-            if (!item->active) continue;
-            int bottom = layout_add_coordinate(
-                layout_add_coordinate(flex_pseudo_top, item->margin_top),
-                layout_add_coordinate(item->height, item->margin_bottom));
-            if (bottom > line->y) line->y = bottom;
         }
     }
     if (flex_row && !replaced_content) {
@@ -1954,9 +1942,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             first_flow_content = false;
         }
     }
-    bool after_pseudo_flowed_inline = flex_after.active;
+    bool after_pseudo_flowed_inline = after_flex_item;
     if (!replaced_content && !after_pseudo_flow.active
-        && !flex_after.active
+        && !after_flex_item
         && !flow_generated_inline_pseudo(
             context, node, style, PSEUDO_AFTER, line, NULL, 0, NULL,
             &after_pseudo_flowed_inline)) {
@@ -2337,7 +2325,6 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
        Paint it after the decorations so the single content range remains
        contiguous; the batch insertion fixes every retained command range
        once regardless of how many square border sides the box has. */
-    if (flex_before.active) before_pseudo_flowed_inline = true;
     if ((!before_pseudo_flow.active && !before_pseudo_flowed_inline
          && !paint_pseudo(context, node, style, PSEUDO_BEFORE,
                       outer_x, outer_y, outer_width, border_height,
@@ -2449,23 +2436,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                      : outer_y + (border_height - text_height) / 2,
                 .width = text_width,
                 .height = text_height,
-                .color = placeholder_value ? 0x70757a : style->color,
                 .text = value,
                 .text_length = (uint32_t) value_length,
-                .scale = style->font_scale,
-                .font_size = style->font_size,
-                .font_family = style->font_family,
-                .font_weight = draw_font_weight(style),
-                .font_italic = style->font_italic,
-                .letter_spacing = style->letter_spacing,
-                .radius = (int) style->font_size_fraction
-                          << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
-                          | (computed_style_kerning_none(style)
-                             ? LAYOUT_TEXT_KERNING_NONE : 0),
-                .image_fit = text_decoration_bits(style),
-                .opacity_scale = alpha_opacity_scale(style->color_alpha)
             };
             if (text.width > 0
+                && layout_control_text_style(context, node, style, placeholder_value, &text)
                 && (!layout_add_text_shadow_commands(
                         context, style, &text)
                     || layout_add_command(
@@ -2577,13 +2552,19 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     /* painted_content_bottom already includes the box's end padding.  Adding
        it again creates a false scroll tail for padded root descendants. */
-    int content_height = painted_content_bottom - outer_y;
+    /* Scrollable overflow is measured from the padding edge, not the
+       outer border edge. The normal-flow bottom includes our own bottom
+       border; overflowing descendants do not. */
+    int content_height = painted_content_bottom - outer_y - content_border_top;
+    if (painted_content_bottom == content_bottom)
+        content_height -= content_border_bottom;
     int client_width = outer_width - content_border_left
                        - content_border_right;
     int client_height = border_height - content_border_top
                         - content_border_bottom;
     if (client_width < 0) client_width = 0;
     if (client_height < 0) client_height = 0;
+    if (content_height < client_height) content_height = client_height;
     int scroll_width = client_width;
     /* Node boxes are appended in DOM post-order. Scan them backwards so a
        clipping descendant is seen before its children and can suppress that

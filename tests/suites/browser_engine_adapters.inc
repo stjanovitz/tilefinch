@@ -122,8 +122,16 @@ static int test_watch_metadata_reuse(void)
             &metrics, i ? "cold-comments" : "cold-description") == 0
             && metrics.requests_started == i + 1u);
     }
+    browser_session_site_adapter_document_cache_clear(&session);
     CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
         &metrics, "cold-watch") == 0 && metrics.requests_started == 1);
+    YoutubeLiteDocument reused_watch = {0};
+    CHECK(test_watch_reuse_load(&budget, &session, watch, false, &reused_watch,
+        &metrics, "warm-watch") == 0 && metrics.requests_started == 0
+        && metrics.body_bytes == 0 && metrics.document_cache_hits == 1
+        && reused_watch.html_length == document.html_length
+        && !memcmp(reused_watch.html, document.html, document.html_length));
+    youtube_lite_document_destroy(&reused_watch);
     youtube_lite_document_destroy(&document);
     size_t retained = 0;
     for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
@@ -450,6 +458,174 @@ static int test_search_video_journey(void)
     return 0;
 }
 
+#include "tilefinch/screenshot_png.h"
+
+static int test_fixed_image_publication(void)
+{
+    char path[] = "/tmp/tilefinch-fixed-png-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0 && close(fd) == 0);
+    uint16_t pixels[16];
+    for (size_t i = 0; i < 16; i++) pixels[i] = i & 1u ? 0xf800u : 0x001fu;
+    ScreenshotPngWriter writer = {0};
+    CHECK(screenshot_png_begin(&writer, path, pixels, 4, 4, 4)
+        && screenshot_png_pump(&writer, 4) == SCREENSHOT_PNG_COMPLETE);
+    size_t bytes = 0;
+    char *png = read_test_file(path, &bytes);
+    CHECK(png != NULL && unlink(path) == 0);
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.declared_css_width = 720;
+    config.declared_css_height = 408;
+    config.javascript.enabled = false;
+    config.resources.enabled = false;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(fetch_trace_replay_begin_response_keyed(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-video-journey", error, sizeof(error))
+        && browser_engine_load_url(engine,
+            "https://www.youtube.com/results?search_query=journey", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.runtime == NULL && browser_engine_render_frame(engine, NULL));
+    const DrawCommand *retained_visual_commands = browser_engine_render_metrics_view(engine)->layout->commands;
+    navigation_enable_external_resources(nav, 16, 2u * MIB, 512u * 1024u,
+        24, 4u * MIB, MIB, 4u * MIB, 1000);
+    nav->page.resource_scheduler = fetch_scheduler_create_in_domain(
+        nav->page.fetch_domain, 4, 4u * MIB);
+    CHECK(nav->page.resource_scheduler != NULL);
+    nav->page.deferred_image_targets = budget_calloc_category(nav->budget,
+        BUDGET_CATEGORY_RESOURCE, 4, sizeof(ImagePriorityTarget));
+    CHECK(nav->page.deferred_image_targets != NULL);
+    for (size_t i = 0; i < nav->page.layout.count; i++) {
+        const DrawCommand *command = &nav->page.layout.commands[i];
+        if (command->type != DRAW_IMAGE || command->text == NULL) continue;
+        CHECK(nav->page.deferred_image_count < 4);
+        nav->page.deferred_image_targets[nav->page.deferred_image_count++] =
+            (ImagePriorityTarget) {.node = (lxb_dom_node_t *)command->text,
+                .kind = IMAGE_PRIORITY_KIND_DOCUMENT};
+    }
+    CHECK(nav->page.deferred_image_count == 4);
+    nav->page.image_continuation_pending = true;
+    static const char *const ids[] = {"TFTEST00001", "TFTEST00002", "TFTEST00003", "TFTEST00004"};
+    fetch_trace_end();
+    char replay[] = "/tmp/tilefinch-fixed-images-XXXXXX";
+    CHECK(mkdtemp(replay) != NULL);
+    for (size_t i = 0; i < 4; i++) {
+        char url[128], file[256];
+        snprintf(url, sizeof(url), "https://i.ytimg.com/vi/%s/mqdefault.jpg", ids[i]);
+        snprintf(file, sizeof(file), "%s/%04zu.body", replay, i);
+        FILE *body = fopen(file, "wb");
+        CHECK(body != NULL && fwrite(png, 1, bytes, body) == bytes && fclose(body) == 0);
+        snprintf(file, sizeof(file), "%s/%04zu.meta", replay, i);
+        FILE *meta = fopen(file, "w");
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (size_t b = 0; b < bytes; b++)
+            hash = (hash ^ (unsigned char) png[b]) * UINT64_C(1099511628211);
+        CHECK(meta != NULL && fprintf(meta,
+            "psp-http-trace=10\n"
+            "cookie-values=redacted\n"
+            "method=GET\n"
+            "url=%s\n"
+            "logical-request-url=%s\n"
+            "success=1\n"
+            "async-delay-pumps=0\n"
+            "external-cancel=0\n"
+            "transport-timeout=0\n"
+            "redirect-origin-tainted=0\n"
+            "error=\n"
+            "request-body-length=0\n"
+            "request-body-hash=cbf29ce484222325\n"
+            "request-content-type=\n"
+            "request-cookie-bytes=0\n"
+            "request-has-cf-clearance=0\n"
+            "request-extra-header-bytes=0\n"
+            "request-extra-header-shape=\n"
+            "request-allow-http-errors=0\n"
+            "request-enforce-cors=0\n"
+            "request-redirect-same-origin-only=0\n"
+            "request-cors-cached-response-validated=0\n"
+            "request-if-none-match=\n"
+            "request-if-modified-since=\n"
+            "request-referer=\n"
+            "request-origin=\n"
+            "request-accept=\n"
+            "request-sec-fetch-dest=\n"
+            "request-sec-fetch-mode=\n"
+            "request-sec-fetch-site=\n"
+            "request-send-client-hints=0\n"
+            "request-client-hint-tokens=\n"
+            "request-client-hint-origin=\n"
+            "request-send-low-client-hints=1\n"
+            "request-sec-fetch-user=0\n"
+            "request-upgrade-insecure=0\n"
+            "request-user-agent=Tilefinch test fixture\n"
+            "request-diagnostic-mobile-safari=0\n"
+            "request-credentials=0\n"
+            "request-credential-origin=\n"
+            "request-initiator-url=\n"
+            "request-referrer-source=\n"
+            "request-referrer-policy=\n"
+            "status=200\n"
+            "length=%zu\n"
+            "response-body-hash=%016llx\n"
+            "effective-url=%s\n"
+            "content-type=image/png\n"
+            "etag=\n"
+            "last-modified=\n"
+            "cf-mitigated=\n"
+            "accept-ch=\n"
+            "critical-ch=\n"
+            "server=fixture-performance\n"
+            "cf-ray=\n"
+            "response-referrer-policy-metadata-valid=1\n"
+            "response-referrer-policy-present=0\n"
+            "response-referrer-policy=\n"
+            "response-security-headers-truncated=0\n"
+            "response-header-count=1\n"
+            "set-cookie-count=0\n"
+            "response-header-0=content-type: image/png\n",
+            url, url, bytes, (unsigned long long) hash, url) > 0 && fclose(meta) == 0);
+    }
+    free(png);
+    char trace_path[256];
+    snprintf(trace_path, sizeof(trace_path), "%s/trace.meta", replay);
+    FILE *trace = fopen(trace_path, "w");
+    CHECK(trace != NULL && fprintf(trace, "psp-http-trace-clock=1\norigin-ms=1700000000000\ncapture-complete=yes\nrecord-count=4\n") > 0 && fclose(trace) == 0
+        && fetch_trace_replay_begin_response_keyed(replay, error, sizeof(error)));
+    int height = nav->page.layout.height;
+    for (unsigned i = 0; nav->page.image_continuation_pending && i < 512; i++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+        CHECK(browser_engine_last_error(engine)[0] == '\0');
+    }
+    CHECK(nav->performance.background_images_loaded > 0);
+    CHECK(nav->performance.background_image_relayouts == 0);
+    CHECK(browser_engine_render_metrics_view(engine)->layout->commands == retained_visual_commands);
+    CHECK(nav->page.layout.height == height);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    const uint16_t *actual_pixels = browser_engine_framebuffer(engine, &count);
+    uint64_t actual = frame_checksum(actual_pixels, count);
+    CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+    size_t reference_count = 0;
+    const uint16_t *reference = browser_engine_framebuffer(engine, &reference_count);
+    CHECK(reference_count == count && actual == frame_checksum(reference, reference_count));
+    fetch_trace_end();
+    for (size_t i = 0; i < 4; i++) {
+        char file[256];
+        snprintf(file, sizeof(file), "%s/%04zu.body", replay, i); unlink(file);
+        snprintf(file, sizeof(file), "%s/%04zu.meta", replay, i); unlink(file);
+    }
+    unlink(trace_path); rmdir(replay);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_cooperative_site_adapter_navigation(void)
 {
     CHECK(test_cooperative_lockup_cards() == 0);
@@ -526,6 +702,20 @@ static int test_cooperative_site_adapter_navigation(void)
                 && warm.html_length == reference.html_length
                 && memcmp(warm.html, reference.html, warm.html_length) == 0);
             youtube_lite_document_destroy(&reference);
+            youtube_lite_document_destroy(&warm);
+            youtube_lite_load_destroy(reuse);
+            reuse = youtube_lite_load_begin(&budget, &session, url,
+                1u * MIB, 2000, error, sizeof(error));
+            CHECK(reuse != NULL);
+            status = YOUTUBE_LITE_LOAD_PENDING;
+            for (size_t pump = 0; pump < 128 && status == YOUTUBE_LITE_LOAD_PENDING; pump++)
+                status = youtube_lite_load_pump(reuse, NULL);
+            CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+                && youtube_lite_load_metrics(reuse, &metrics)
+                && youtube_lite_load_take_document(reuse, &warm)
+                && metrics.document_cache_hits == 1 && metrics.requests_started == 0
+                && warm.html_length == actual.html_length
+                && !memcmp(warm.html, actual.html, actual.html_length));
             youtube_lite_document_destroy(&warm);
             youtube_lite_load_destroy(reuse);
         }
@@ -723,6 +913,26 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(test_navigation_fragment_visible(engine, "comments"));
     fetch_trace_end();
 
+    /* Returning to details reuses parsed facts; an explicit Reload still
+       fetches fresh metadata through both frontend and synchronous APIs. */
+    static const char details_url[] =
+        "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details";
+    for (unsigned reload = 0; reload < 3; reload++) {
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        if (reload == 2) {
+            CHECK(browser_engine_load_url_with_limits(engine, details_url,
+                1u * MIB, 1000, false));
+        } else {
+            CHECK(browser_engine_begin_navigation_url(engine, details_url,
+                1u * MIB, 1000, reload == 0)
+                && test_pump_provider_navigation_cpu_paced(engine, &quota, 128)
+                    == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+            CHECK(browser_engine_navigation_job_metrics(engine, &metrics)
+                && metrics.load.body_bytes == (reload ? 845u : 0u));
+        }
+        fetch_trace_end();
+    }
+
     /* Exercise the provider's user-facing watch subroutes through complete
        BrowserEngine transactions. Description is primary-only, an ordinary
        watch exposes both optional views, and neither may inherit comments
@@ -749,6 +959,16 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(test_navigation_fragment_visible(engine, "description"));
     fetch_trace_end();
 
+    /* The synchronous embedder's Back is history, not an explicit Reload. */
+    CHECK(fetch_trace_replay_begin_response_keyed(fixture, error, sizeof(error))
+        && browser_engine_history_move(engine, false));
+    FetchTraceReplayStats history_replay = {0};
+    CHECK(fetch_trace_replay_stats(&history_replay)
+        && history_replay.request_count == 0
+        && strcmp(browser_engine_navigation(engine)->page.document_url,
+            details_url) == 0);
+    fetch_trace_end();
+
     static const char watch_url[] =
         "https://www.youtube.com/watch?v=TFTEST00001";
     CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
@@ -771,10 +991,14 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(body_text, "View full description") != NULL
           && strstr(body_text, "View comments") != NULL
           && strstr(body_text, "Cooperative comment") == NULL);
-    /* The play card is usable before its nonessential poster is fetched. */
+    /* The play card is usable before its nonessential poster is fetched.
+       Tiny inline action icons are ready without admitting that request. */
     CHECK(browser_engine_navigation(engine)->page.deferred_image_count > 0
           && browser_engine_navigation(engine)->performance.progressive_image_priority_nodes == 0
-          && browser_engine_navigation(engine)->performance.progressive_image_priority_loaded == 0);
+          && browser_engine_navigation(engine)->performance.progressive_image_priority_loaded
+              == browser_engine_navigation(engine)->performance.markup_image_priority_nodes);
+    for (size_t image = 0; image < browser_engine_navigation(engine)->page.images.count; image++)
+        CHECK(browser_engine_navigation(engine)->page.images.items[image].node->local_name == LXB_TAG_SVG);
     ControllerAction watch_play = {0};
     CHECK(browser_engine_activate(engine, &watch_play)
           && watch_play.type == CONTROLLER_ACTION_NAVIGATE
@@ -2601,7 +2825,7 @@ static int test_blank_reader_frontend_recovery(void)
     config.tile_capacity = 4u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -3271,7 +3495,7 @@ static int test_declared_media_card_recovery(void)
     config.tile_capacity = 4u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -3671,7 +3895,8 @@ static int test_basic_view_admission_and_presentation(void)
     config.tile_capacity = 4u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    /* Presentation semantics, not bootstrap allocation exhaustion. */
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -3913,7 +4138,7 @@ static int test_basic_view_recovery_large_and_hidden_pages(void)
     config.tile_capacity = 4u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -3993,7 +4218,7 @@ static int test_basic_view_native_root_provenance(void)
     config.tile_capacity = 0u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -4085,7 +4310,7 @@ static int test_basic_view_handle_capacity_is_transactional(void)
     config.tile_capacity = 0u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -4178,7 +4403,7 @@ static int test_basic_view_bypasses_author_delegated_actions(void)
     config.tile_capacity = 0u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 8u;
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
@@ -4254,7 +4479,7 @@ static int test_basic_view_form_safety_edges(void)
     config.tile_capacity = 0u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 4u;
     config.javascript.maximum_total_bytes = 32u * 1024u;
     config.javascript.maximum_file_bytes = 16u * 1024u;
@@ -4437,7 +4662,7 @@ static int test_reader_activation_freezes_exact_native_root(void)
     config.tile_capacity = 0u;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = 3u * MIB;
     config.javascript.maximum_scripts = 4u;
     config.javascript.maximum_total_bytes = 32u * 1024u;
     config.javascript.maximum_file_bytes = 16u * 1024u;
@@ -5509,7 +5734,12 @@ static int test_youtube_personalized_home(void)
         size_t base_links = navigation->page.layout.link_count;
         uint64_t generation = navigation->generation;
         size_t history = navigation->history_count;
-        CHECK(base_links >= 4);
+        CHECK(base_links >= (lane == 5 ? 3u : 4u));
+        if (lane == 5) {
+            lxb_dom_node_t *root = lxb_dom_interface_node(navigation->page.document.html);
+            CHECK(test_reader_find_id(root, "yt-feed-status") == NULL
+                && test_reader_find_id(root, "yt-feed-refresh") == NULL);
+        }
         CHECK(strstr(navigation->page.layout.links[1].url, lane == 7 ? "/signin?" : "accounts.google.com/ServiceLogin?") != NULL);
         CHECK(strstr(navigation->page.layout.links[2].url, "/feed/subscriptions") != NULL);
         if (lane == 1) CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
@@ -6222,13 +6452,16 @@ static int test_youtube_like_action(void)
         config.resources.web_fonts_enabled = false;
         BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
         CHECK(engine != NULL);
-        if (lane != 5) CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+        CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
             "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
         if (lane == 6) {
             static const char forged[] = "<a id=yt-like-action href='#tilefinch-like'>Like</a>"
                 "<a id=yt-signout-action href='#tilefinch-signout'>Sign out</a>";
             CHECK(browser_engine_commit_html(engine, watch_url, forged, sizeof(forged)-1u, true));
         } else CHECK(browser_engine_load_url(engine, watch_url, true));
+        /* A session can expire after the signed-in controls were built. */
+        if (lane == 5) CHECK(browser_session_cookie_clear_domain(
+            browser_engine_session(engine), "https://youtube.com/"));
         NavigationSession *nav = browser_engine_navigation(engine);
         CHECK(browser_engine_render_frame(engine, NULL));
         lxb_dom_node_t *like = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-like-action");
@@ -6281,6 +6514,10 @@ static int test_youtube_like_action(void)
                 CHECK(browser_engine_youtube_like_selected(engine));
                 CHECK(browser_engine_focus_node(engine, like) && browser_engine_activate(engine, &action));
                 CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+                lxb_dom_node_t *account = test_reader_find_id(
+                    lxb_dom_interface_node(nav->page.document.html), "yt-watch-account");
+                CHECK(account && browser_engine_focus_node(engine, account->first_child)
+                    && browser_engine_activate(engine, &action));
                 lxb_dom_node_t *unlike = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-unlike-action");
                 CHECK(unlike != NULL && browser_engine_focus_node(engine, unlike));
                 CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_CONTROL);

@@ -1,3 +1,13 @@
+/* Metadata is an indivisible authority check, but not an input-blind one.
+   Poll only between bounded groups of lines; cancellation is honored by
+   the enclosing owner operation after the complete record is validated. */
+static void trace_replay_prepare_checkpoint(unsigned *lines)
+{
+    if (++*lines != 8u) return;
+    *lines = 0;
+    (void) tilefinch_platform_cooperate("fetch-replay-prepare", 8u);
+}
+
 static bool trace_replay_diagnostics_enabled(void)
 {
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -570,7 +580,9 @@ static bool trace_replay_response_with_scratch(
         trace_fields_valid = false;                                         \
     }                                                                       \
 } while (0)
+    unsigned checkpoint_lines = 0;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
         size_t length = strlen(scratch->line);
         while (length != 0
                && (scratch->line[length - 1] == '\n'
@@ -1877,7 +1889,9 @@ static bool trace_record_request_key(
     unsigned trace_version = 0;
     FetchCacheMode recorded_cache_mode = FETCH_CACHE_DEFAULT;
     bool cache_mode_seen = false;
+    unsigned checkpoint_lines = 0;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
         size_t length = strlen(scratch->line);
         while (length != 0
                && (scratch->line[length - 1] == '\n'
@@ -1958,7 +1972,9 @@ static bool trace_record_request_key_hash(
     bool version_seen = false, cache_mode_seen = false;
     bool extra_shape_seen = false;
     bool method_seen = false, url_seen = false, parse_ok = true;
+    unsigned checkpoint_lines = 0;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
         size_t length = strlen(scratch->line);
         while (length != 0
                && (scratch->line[length - 1] == '\n'
@@ -2035,8 +2051,10 @@ static bool trace_response_key_descriptor(
     bool success_seen = false, status_seen = false;
     bool external_cancel_seen = false, transport_timeout_seen = false;
     bool valid = true;
+    unsigned checkpoint_lines = 0;
     while (valid
            && fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
         size_t length = strlen(scratch->line);
         while (length != 0
                && (scratch->line[length - 1] == '\n'

@@ -1,3 +1,14 @@
+/* Only immutable shared bodies have a lifetime identity. Raw buffers keep
+   their existing within-layout cache, but are evicted at replacement. */
+static uint64_t image_cache_serial(const TileCache *cache,
+                                   const ImageResource *image)
+{
+    const BrowserSharedBody *body = image->pixels != NULL
+        ? image->pixel_body : image->encoded_body;
+    return !image->is_canvas && body != NULL && body->budget == cache->budget
+        ? body->serial : 0;
+}
+
 static void decoded_image_evict(TileCache *cache, size_t index)
 {
     DecodedImageCacheEntry *entry = &cache->decoded_images[index];
@@ -44,7 +55,7 @@ static size_t decoded_image_oldest_valid(const TileCache *cache)
 }
 
 static DecodedImageCacheEntry *decoded_image_insert(
-    TileCache *cache, const void *identity, int width, int height,
+    TileCache *cache, const void *identity, uint64_t serial, int width, int height,
     unsigned char *pixels, bool failed)
 {
     size_t bytes = pixels != NULL ? budget_usable_size(pixels) : 0;
@@ -67,6 +78,7 @@ static DecodedImageCacheEntry *decoded_image_insert(
     DecodedImageCacheEntry *entry = &cache->decoded_images[slot];
     *entry = (DecodedImageCacheEntry) {
         .identity = identity,
+        .serial = serial,
         .pixels = pixels,
         .width = width,
         .height = height,
@@ -91,9 +103,11 @@ static const unsigned char *decoded_image_pixels(
     if (image->pixels != NULL) return image->pixels;
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
+    uint64_t serial = image_cache_serial(cache, image);
     for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
         DecodedImageCacheEntry *entry = &cache->decoded_images[i];
         if (!entry->valid || entry->identity != identity
+            || entry->serial != serial
             || entry->width != image->width || entry->height != image->height) {
             continue;
         }
@@ -114,14 +128,14 @@ static const unsigned char *decoded_image_pixels(
     if (decode_status != IMAGE_DECODE_SUCCEEDED) {
         cache->decoded_image_failures++;
         if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
-            (void) decoded_image_insert(cache, identity, image->width,
+            (void) decoded_image_insert(cache, identity, serial, image->width,
                                         image->height, NULL, true);
         }
         return NULL;
     }
     cache->decoded_image_builds++;
     DecodedImageCacheEntry *entry = decoded_image_insert(
-        cache, identity, image->width, image->height, pixels, false);
+        cache, identity, serial, image->width, image->height, pixels, false);
     if (entry == NULL) {
         /*
          * Keep the cache at a real hard cap.  An oversized decode (or a
@@ -180,7 +194,7 @@ static size_t scaled_image_oldest_valid(const TileCache *cache)
 }
 
 static ScaledImageCacheEntry *scaled_image_insert(
-    TileCache *cache, const void *identity, int source_width,
+    TileCache *cache, const void *identity, uint64_t serial, int source_width,
     int source_height, int width, int height, unsigned char *pixels,
     bool failed)
 {
@@ -202,6 +216,7 @@ static ScaledImageCacheEntry *scaled_image_insert(
     ScaledImageCacheEntry *entry = &cache->scaled_images[slot];
     *entry = (ScaledImageCacheEntry) {
         .identity = identity,
+        .serial = serial,
         .pixels = pixels,
         .source_width = source_width,
         .source_height = source_height,
@@ -223,6 +238,7 @@ static const unsigned char *image_pixels_for_command(
 {
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
+    uint64_t serial = image_cache_serial(cache, image);
     int scaled_width = command->width;
     int scaled_height = command->height;
     /* Mutable canvas pixels are replaced every animation frame. Building a
@@ -280,6 +296,7 @@ static const unsigned char *image_pixels_for_command(
         for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
             ScaledImageCacheEntry *entry = &cache->scaled_images[i];
             if (!entry->valid || entry->identity != identity
+                || entry->serial != serial
                 || entry->source_width != image->width
                 || entry->source_height != image->height
                 || entry->width != scaled_width
@@ -310,7 +327,7 @@ static const unsigned char *image_pixels_for_command(
             cache->max_decoded_image_us = decode_elapsed;
         if (decode_status == IMAGE_DECODE_SUCCEEDED) {
             ScaledImageCacheEntry *entry = scaled_image_insert(
-                cache, identity, image->width, image->height,
+                cache, identity, serial, image->width, image->height,
                 scaled_width, scaled_height, pixels, false);
             if (entry != NULL) {
                 cache->decoded_image_builds++;
@@ -327,7 +344,7 @@ static const unsigned char *image_pixels_for_command(
         cache->decoded_image_failures++;
         if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
             (void) scaled_image_insert(
-                cache, identity, image->width, image->height,
+                cache, identity, serial, image->width, image->height,
                 scaled_width, scaled_height, NULL, true);
         }
     }
@@ -364,7 +381,7 @@ static const unsigned char *image_pixels_for_command(
                     cache->max_scaled_image_us = scale_elapsed;
                 }
                 ScaledImageCacheEntry *entry = scaled_image_insert(
-                    cache, identity, image->width, image->height,
+                    cache, identity, serial, image->width, image->height,
                     scaled_width, scaled_height, scaled, false);
                 if (entry != NULL) {
                     cache->scaled_image_builds++;
@@ -384,8 +401,58 @@ static const unsigned char *image_pixels_for_command(
     return source;
 }
 
-static void rasterize_image(TileCache *cache, RasterTarget *target,
-                            const DrawCommand *command)
+typedef struct {
+    const StyleGradient *ramp;
+    const RenderGradientCacheEntry *setup;
+    DrawCommand local;
+} ImageMaskGradient;
+
+static void image_mask_gradient_prepare(TileCache *cache,
+    const DrawCommand *command, ImageMaskGradient *paint,
+    RenderGradientCacheEntry *fallback);
+static uint32_t image_mask_gradient_argb(const DrawCommand *command,
+    const ImageMaskGradient *paint, int x, int y);
+
+/* A conservative interior: rounded coverage is exactly four here. Keep
+   antialiased corners on the original pixel path, including asymmetric radii. */
+static void raster_rounded_interior(const DrawCommand *command,
+    const int radii[4], int y, int *start, int *end)
+{
+    int left_inset = 0, right_inset = 0;
+    int64_t top = command->y, bottom = top + command->height;
+    if ((int64_t) y < top + radii[0]) left_inset = radii[0];
+    if ((int64_t) y >= bottom - radii[3] && radii[3] > left_inset)
+        left_inset = radii[3];
+    if ((int64_t) y < top + radii[1]) right_inset = radii[1];
+    if ((int64_t) y >= bottom - radii[2] && radii[2] > right_inset)
+        right_inset = radii[2];
+    int64_t left = (int64_t) command->x + left_inset;
+    int64_t right = (int64_t) command->x + command->width - right_inset;
+    int old_start = *start, old_end = *end;
+    if (left > *start) *start = left < old_end ? (int) left : old_end;
+    if (right < *end) *end = right > old_start ? (int) right : old_start;
+}
+
+/* Destination-sized decoded rows need neither scaling nor general color
+   resolution. Do not assume opacity from the format: transparent samples
+   still use precisely the existing compositing arithmetic. */
+static __attribute__((noinline)) void rasterize_image_row(
+    RasterTarget *target, size_t index, const unsigned char *pixel, int count)
+{
+    for (int at = 0; at < count; at++, index++, pixel += 4) {
+        if (pixel[3] == 255u) {
+            target->pixels[index] = tilefinch_rgb565_pack_u8(
+                pixel[0], pixel[1], pixel[2]);
+            if (target->alpha != NULL) target->alpha[index] = 255u;
+        } else if (pixel[3] != 0u) {
+            blend_at_index(target, index, ((uint32_t) pixel[0] << 16)
+                | ((uint32_t) pixel[1] << 8) | pixel[2], pixel[3]);
+        }
+    }
+}
+
+static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
+    const DrawCommand *command, const ImageMaskGradient *mask_gradient)
 {
     const ImageResource *image = command->image;
     if (!image_resource_available(image) || image->width <= 0
@@ -473,6 +540,12 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
                        | ((uint32_t) pixel[1] << 8) | pixel[2]);
                 unsigned alpha = (unsigned) pixel[3]
                     * command->opacity_scale / 256u;
+                if (mask_gradient != NULL && mask_gradient->setup != NULL) {
+                    uint32_t argb = image_mask_gradient_argb(
+                        command, mask_gradient, x, y);
+                    color = argb & UINT32_C(0xffffff);
+                    alpha = alpha * (argb >> 24) / 255u;
+                }
                 if (image_has_clip_radius) {
                     unsigned coverage = rounded_rect_coverage_quarters(
                         x, y, command->x, command->y,
@@ -675,7 +748,13 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
                                  : (((uint32_t) pixel[0] << 16)
                                     | ((uint32_t) pixel[1] << 8) | pixel[2]);
                 unsigned alpha = (unsigned) pixel[3]
-                                 * command->opacity_scale / 256u;
+                    * command->opacity_scale / 256u;
+                if (mask_gradient != NULL && mask_gradient->setup != NULL) {
+                    uint32_t argb = image_mask_gradient_argb(
+                        command, mask_gradient, x, y);
+                    color = argb & UINT32_C(0xffffff);
+                    alpha = alpha * (argb >> 24) / 255u;
+                }
                 if (image_has_clip_radius) {
                     unsigned coverage = rounded_rect_coverage_quarters(
                         x, y, command->x, command->y,
@@ -691,6 +770,13 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
     }
     ScaleStepper source_y_step = scale_stepper(y0 - draw_y, source_height,
                                                 draw_height);
+    bool row_spans = source_width == draw_width && !image->is_mask
+        && command->opacity_scale == 256u && mask_gradient == NULL
+        && target->filter_code == STYLE_FILTER_NONE && !target->forced_dark
+        && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
+#ifndef __PSP__
+    row_spans = row_spans && !tilefinch_test_faults()->raster_span_reference;
+#endif
     for (int y = y0; y < y1; y++) {
         int source_y = render_saturating_add_int(
             source_y_offset, source_y_step.value);
@@ -716,7 +802,30 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
         index += (size_t) (span_x0 - unclipped_x0);
         ScaleStepper source_x_step = scale_stepper(
             span_x0 - draw_x, source_width, draw_width);
+        int interior_start = span_x0, interior_end = span_x1;
+        if (image_has_clip_radius)
+            raster_rounded_interior(command, image_clip_radii, y,
+                                    &interior_start, &interior_end);
+        int64_t source_start = (int64_t) source_x_offset
+            + interior_start - draw_x;
+        if (!row_spans || rounded || source_start < 0
+            || source_start > pixel_width
+            || interior_end - interior_start > pixel_width - source_start)
+            interior_start = interior_end = span_x1;
         for (int x = span_x0; x < span_x1; x++, index++) {
+            if (x == interior_start && interior_end > x) {
+                int count = interior_end - x;
+                rasterize_image_row(target, index, pixels
+                    + ((size_t) source_y * (size_t) pixel_width
+                       + (size_t) source_start) * 4u, count);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+                cache->image_span_pixels += (unsigned) count;
+#endif
+                x += count - 1;
+                index += (size_t) count - 1u;
+                source_x_step.value += count;
+                continue;
+            }
             int source_x = render_saturating_add_int(
                 source_x_offset, source_x_step.value);
             if (source_x < 0) source_x = 0;
@@ -730,6 +839,12 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
                                 | ((uint32_t) pixel[1] << 8) | pixel[2]);
             unsigned alpha = (unsigned) pixel[3] * command->opacity_scale
                              / 256u;
+            if (mask_gradient != NULL && mask_gradient->setup != NULL) {
+                uint32_t argb = image_mask_gradient_argb(
+                    command, mask_gradient, x, y);
+                color = argb & UINT32_C(0xffffff);
+                alpha = alpha * (argb >> 24) / 255u;
+            }
             if (image_has_clip_radius) {
                 unsigned coverage = rounded_rect_coverage_quarters(
                     x, y, command->x, command->y,
@@ -742,6 +857,24 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
         scale_stepper_advance(&source_y_step);
     }
     image_resource_free_decoded(cache->budget, temporary_decoded);
+}
+
+/* Keep the allocation-refusal LUT fallback off ordinary image stacks. */
+static __attribute__((noinline)) void rasterize_gradient_mask_image(
+    TileCache *cache, RasterTarget *target, const DrawCommand *command)
+{
+    ImageMaskGradient gradient = {0};
+    RenderGradientCacheEntry fallback;
+    image_mask_gradient_prepare(cache, command, &gradient, &fallback);
+    rasterize_image_pixels(cache, target, command, &gradient);
+}
+
+static void rasterize_image(TileCache *cache, RasterTarget *target,
+                            const DrawCommand *command)
+{
+    if (draw_command_mask_gradient(command, NULL))
+        rasterize_gradient_mask_image(cache, target, command);
+    else rasterize_image_pixels(cache, target, command, NULL);
 }
 
 /* Interpolate two 0xAARRGGBB stops in sRGB.  The rest of this rasterizer
@@ -791,6 +924,16 @@ static void gradient_build_geometry(RenderGradientCacheEntry *entry,
                                     const DrawCommand *command,
                                     const StyleGradient *ramp)
 {
+    DrawCommand local;
+    if (command->type == DRAW_IMAGE) {
+        local = *command;
+        local.x = local.y = 0;
+        if ((draw_command_rotation_quadrants(command) & 1u) != 0) {
+            local.width = command->height;
+            local.height = command->width;
+        }
+        command = &local;
+    }
     if ((ramp->angle & STYLE_GRADIENT_RADIAL) != 0) {
         int width = command->width > 0 ? command->width : 1;
         int height = command->height > 0 ? command->height : 1;
@@ -863,6 +1006,13 @@ static int64_t gradient_radial_position(
     return approximate;
 }
 
+static bool gradient_lut_has_long_runs(const uint32_t *lut)
+{
+    unsigned equal = 0;
+    for (unsigned i = 1; i < 256; i++) equal += lut[i] == lut[i - 1];
+    return equal >= 192u;
+}
+
 static const RenderGradientCacheEntry *gradient_cached_setup(
     TileCache *cache, const DrawCommand *command, size_t slot,
     const StyleGradient *ramp, RenderGradientCacheEntry *fallback)
@@ -874,6 +1024,7 @@ static const RenderGradientCacheEntry *gradient_cached_setup(
     if (cache->gradient_cache == NULL) {
         memset(fallback, 0, sizeof(*fallback));
         gradient_build_lut(ramp, fallback->lut);
+        fallback->long_color_runs = gradient_lut_has_long_runs(fallback->lut);
         gradient_build_geometry(fallback, command, ramp);
         cache->gradient_lut_builds++;
         return fallback;
@@ -893,6 +1044,7 @@ static const RenderGradientCacheEntry *gradient_cached_setup(
         }
     }
     gradient_build_lut(ramp, victim->lut);
+    victim->long_color_runs = gradient_lut_has_long_runs(victim->lut);
     gradient_build_geometry(victim, command, ramp);
     victim->slot = slot;
     victim->command = command;
@@ -900,6 +1052,76 @@ static const RenderGradientCacheEntry *gradient_cached_setup(
     victim->last_used = ++cache->gradient_cache->clock;
     cache->gradient_lut_builds++;
     return victim;
+}
+
+/* Fully covered, opaque linear runs retain the same four world-coordinate
+   dither phases. Resolve filter/dark-mode color once per phase and run, not
+   once per pixel. Short runs and translucent stops retain the exact blend.
+   No pixel surface, palette cache or wider color quantization is introduced. */
+__attribute__((noinline))
+static void rasterize_gradient_span(TileCache *cache, RasterTarget *target,
+    const DrawCommand *command, const StyleGradient *ramp,
+    const RenderGradientCacheEntry *setup, int x, int end, int y,
+    size_t index, int64_t position)
+{
+    (void) cache; /* Counters are omitted from ordinary PSP builds. */
+    bool raw_color = target->filter_code == STYLE_FILTER_NONE
+        && !target->forced_dark;
+    while (x < end) {
+        uint32_t argb = setup->lut[gradient_lut_index(ramp, position)];
+        int run_end = x + 1;
+        int64_t next_position = position + setup->step_x;
+        while (run_end < end
+               && setup->lut[gradient_lut_index(ramp, next_position)] == argb) {
+            run_end++;
+            next_position += setup->step_x;
+        }
+        unsigned alpha = argb >> 24;
+        uint32_t color = (command->image_fit & LAYOUT_FILL_GRADIENT_AS_MASK) != 0
+            ? target->resolved_color_value : argb & 0x00ffffffu;
+        if (alpha == 255u && raw_color && run_end - x < 4) {
+            /* Short exact-color runs dominate ramps with narrow transitions.
+               The span is fully covered and normally blended: no destination
+               read or general color/alpha resolution is needed here. */
+            for (int at = x; at < run_end; at++, index++) {
+                uint32_t source = rgb565_dither_source_inline(color, at, y);
+                target->pixels[index] = tilefinch_rgb565_pack_u8(
+                    (source >> 16) & 255u, (source >> 8) & 255u, source & 255u);
+                if (target->alpha != NULL) target->alpha[index] = 255u;
+            }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+            cache->gradient_direct_pixels += (unsigned) (run_end - x);
+#endif
+        } else if (alpha == 255u && run_end - x >= 4) {
+            uint16_t colors[4];
+            for (int lane = 0; lane < 4; lane++) {
+                if (raw_color) {
+                    uint32_t source = rgb565_dither_source_inline(color, lane, y);
+                    colors[lane] = tilefinch_rgb565_pack_u8(
+                        (source >> 16) & 255u, (source >> 8) & 255u, source & 255u);
+                } else {
+                    colors[lane] = rgb565(raster_target_color(target,
+                        rgb565_dither_source(color, lane, y)));
+                }
+            }
+            for (int at = x; at < run_end; at++, index++) {
+                target->pixels[index] = colors[(unsigned) at & 3u];
+                if (target->alpha != NULL) target->alpha[index] = 255u;
+            }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+            cache->gradient_span_pixels += (unsigned) (run_end - x);
+            if (raw_color)
+                cache->gradient_direct_pixels += (unsigned) (run_end - x);
+#endif
+        } else {
+            for (int at = x; at < run_end; at++, index++)
+                if (alpha != 0)
+                    blend_at_index(target, index,
+                        rgb565_dither_source(color, at, y), alpha);
+        }
+        x = run_end;
+        position = next_position;
+    }
 }
 
 static void rasterize_gradient_fill(TileCache *cache,
@@ -928,6 +1150,11 @@ static void rasterize_gradient_fill(TileCache *cache,
     int32_t step_y = setup->step_y;
     int64_t origin = setup->origin;
     bool radial = (ramp->angle & STYLE_GRADIENT_RADIAL) != 0;
+    bool spans = !radial && setup->long_color_runs && alpha == 255u
+        && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
+#ifndef __PSP__
+    spans = spans && !tilefinch_test_faults()->raster_span_reference;
+#endif
     for (int y = y0; y < y1; y++) {
         int span_x0 = 0, span_x1 = 0;
         size_t index = 0;
@@ -936,6 +1163,11 @@ static void rasterize_gradient_fill(TileCache *cache,
                                 &index, &rounded)) continue;
         int64_t position = origin + (int64_t) step_y * y
                            + (int64_t) step_x * span_x0;
+        int interior_start = span_x0, interior_end = span_x1;
+        if (has_radius)
+            raster_rounded_interior(command, corner_radii, y,
+                                    &interior_start, &interior_end);
+        if (!spans || rounded) interior_start = interior_end = span_x1;
         /*
          * Square-cornered gradients keep the pre-antialiasing inner loop.
          * Coverage there is 4/4 for every pixel, and (blended * 4 + 2) / 4
@@ -948,6 +1180,15 @@ static void rasterize_gradient_fill(TileCache *cache,
         if (!has_radius) {
             for (int x = span_x0; x < span_x1; x++, index++,
                                                position += step_x) {
+                if (x == interior_start && interior_end > x) {
+                    int count = interior_end - x;
+                    rasterize_gradient_span(cache, target, command, ramp,
+                        setup, x, interior_end, y, index, position);
+                    x += count - 1;
+                    index += (size_t) count - 1u;
+                    position += (int64_t) step_x * (count - 1);
+                    continue;
+                }
                 if (rounded
                     && !point_in_rounded_clips(target->rounded_clips,
                                                target->rounded_clip_count,
@@ -970,6 +1211,15 @@ static void rasterize_gradient_fill(TileCache *cache,
         }
         for (int x = span_x0; x < span_x1; x++, index++,
                                            position += step_x) {
+            if (x == interior_start && interior_end > x) {
+                int count = interior_end - x;
+                rasterize_gradient_span(cache, target, command, ramp,
+                    setup, x, interior_end, y, index, position);
+                x += count - 1;
+                index += (size_t) count - 1u;
+                position += (int64_t) step_x * (count - 1);
+                continue;
+            }
             unsigned coverage = rounded_rect_coverage_quarters(
                 x, y, command->x, command->y,
                 command->width, command->height, corner_radii);
@@ -994,6 +1244,48 @@ static void rasterize_gradient_fill(TileCache *cache,
                            rgb565_dither_source(color, x, y), blended);
         }
     }
+}
+
+static void image_mask_gradient_prepare(TileCache *cache,
+    const DrawCommand *command, ImageMaskGradient *paint,
+    RenderGradientCacheEntry *fallback)
+{
+    size_t slot;
+    if (!draw_command_mask_gradient(command, &slot)
+        || slot >= cache->layout->gradient_count) return;
+    paint->ramp = &cache->layout->gradients[slot];
+    paint->local = *command;
+    paint->local.x = paint->local.y = 0;
+    if ((draw_command_rotation_quadrants(command) & 1u) != 0) {
+        paint->local.width = command->height;
+        paint->local.height = command->width;
+    }
+    paint->setup = gradient_cached_setup(cache, command, slot,
+                                         paint->ramp, fallback);
+}
+
+static uint32_t image_mask_gradient_argb(const DrawCommand *command,
+    const ImageMaskGradient *paint, int x, int y)
+{
+    int local_x = x - command->x, local_y = y - command->y;
+    unsigned rotation = draw_command_rotation_quadrants(command);
+    int at_x = local_x, at_y = local_y;
+    if (rotation == 1u) {
+        at_x = local_y;
+        at_y = paint->local.height - 1 - local_x;
+    } else if (rotation == 2u) {
+        at_x = paint->local.width - 1 - local_x;
+        at_y = paint->local.height - 1 - local_y;
+    } else if (rotation == 3u) {
+        at_x = paint->local.width - 1 - local_y;
+        at_y = local_x;
+    }
+    int64_t position = (paint->ramp->angle & STYLE_GRADIENT_RADIAL) != 0
+        ? gradient_radial_position(paint->setup, &paint->local,
+                                    paint->ramp, at_x, at_y)
+        : paint->setup->origin + (int64_t) paint->setup->step_x * at_x
+          + (int64_t) paint->setup->step_y * at_y;
+    return paint->setup->lut[gradient_lut_index(paint->ramp, position)];
 }
 
 static unsigned integer_sqrt(uint32_t value)
@@ -1348,16 +1640,27 @@ static void rasterize_stroke_rect(TileCache *cache, RasterTarget *target,
     if (thickness > RASTER_COMMAND_SCALE_LIMIT) {
         thickness = RASTER_COMMAND_SCALE_LIMIT;
     }
-    int64_t inner_width64 = (int64_t) command->width - 2 * thickness;
-    int64_t inner_height64 = (int64_t) command->height - 2 * thickness;
+    int top = thickness, right = thickness, bottom = thickness, left = thickness;
+    if (command->image_fit == LAYOUT_STROKE_SIDES) {
+        top = command->text_length & 65535u;
+        right = command->text_length >> 16;
+        bottom = (uint32_t) command->font_size & 65535u;
+        left = (uint32_t) command->font_size >> 16;
+        if (top > RASTER_COMMAND_SCALE_LIMIT) top = RASTER_COMMAND_SCALE_LIMIT;
+        if (right > RASTER_COMMAND_SCALE_LIMIT) right = RASTER_COMMAND_SCALE_LIMIT;
+        if (bottom > RASTER_COMMAND_SCALE_LIMIT) bottom = RASTER_COMMAND_SCALE_LIMIT;
+        if (left > RASTER_COMMAND_SCALE_LIMIT) left = RASTER_COMMAND_SCALE_LIMIT;
+    }
+    int64_t inner_width64 = (int64_t) command->width - left - right;
+    int64_t inner_height64 = (int64_t) command->height - top - bottom;
     bool has_inner = inner_width64 > 0 && inner_height64 > 0;
     int inner_x = 0, inner_y = 0, inner_width = 0, inner_height = 0;
     int inner_right = 0, inner_bottom = 0;
     if (has_inner) {
         /* Both extents are positive here, so every edge can only leave
            the int range upward and the sizes never do at all. */
-        int64_t inner_x64 = (int64_t) command->x + thickness;
-        int64_t inner_y64 = (int64_t) command->y + thickness;
+        int64_t inner_x64 = (int64_t) command->x + left;
+        int64_t inner_y64 = (int64_t) command->y + top;
         inner_x = raster_extent_to_int(inner_x64);
         inner_y = raster_extent_to_int(inner_y64);
         inner_width = (int) inner_width64;
@@ -1631,8 +1934,9 @@ static void rasterize_sheared_fill(RasterTarget *target,
                                   const DrawCommand *command)
 {
     unsigned alpha = 255u * command->opacity_scale / 256u;
-    if (alpha == 0 || command->font_size <= 0
-        || command->text_length > INT_MAX) return;
+    bool rotated = command->type == DRAW_ROTATED_FILL;
+    if (alpha == 0 || (!rotated && (command->font_size <= 0
+        || command->text_length > INT_MAX))) return;
     int left = command->x > target->left ? command->x : target->left;
     int top = command->y > target->top ? command->y : target->top;
     int64_t far_x = (int64_t) command->x + command->width;
@@ -1642,7 +1946,12 @@ static void rasterize_sheared_fill(RasterTarget *target,
     unsigned rotation = draw_command_rotation_quadrants(command);
     int64_t local_width = (int64_t) ((rotation & 1u)
         ? command->height : command->width) * 1024;
-    int64_t local_height = (int64_t) command->font_size * 1024;
+    int64_t local_height = rotated
+        ? local_width : (int64_t) command->font_size * 1024;
+    if (rotated) local_height = (int64_t) ((rotation & 1u)
+        ? command->width : command->height) * 1024;
+    int cosine = (int16_t) ((uint32_t) command->font_size & 65535u);
+    int sine = (int16_t) ((uint32_t) command->font_size >> 16);
     for (int y = top; y < bottom; y++) {
         for (int x = left; x < right; x++) {
             unsigned covered = 0;
@@ -1657,11 +1966,22 @@ static void rasterize_sheared_fill(RasterTarget *target,
                 int64_t ly = rotation == 1u ? local_height - dx
                     : (rotation == 2u ? local_height - dy
                        : (rotation == 3u ? dx : dy));
-                int64_t edge = command->radius
-                    + (int64_t) command->scale * ly / 1024;
-                if (ly >= 0 && ly < local_height && lx >= edge
-                    && lx < edge + (int64_t) command->text_length * 1024)
-                    covered++;
+                if (rotated) {
+                    int64_t rx = lx - command->radius;
+                    int64_t ry = ly - command->scale;
+                    int64_t u = (rx * cosine + ry * sine) / 16384;
+                    int64_t v = (-rx * sine + ry * cosine) / 16384;
+                    if (u >= 0 && v >= 0
+                        && u < (int64_t) (command->text_length & 65535u) * 1024
+                        && v < (int64_t) (command->text_length >> 16) * 1024)
+                        covered++;
+                } else {
+                    int64_t edge = command->radius
+                        + (int64_t) command->scale * ly / 1024;
+                    if (ly >= 0 && ly < local_height && lx >= edge
+                        && lx < edge + (int64_t) command->text_length * 1024)
+                        covered++;
+                }
             }
             size_t index = 0;
             if (covered != 0 && raster_target_index(target, x, y, &index))
@@ -1683,6 +2003,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         ? FORCED_DARK_NONE
         : (command->type == DRAW_FILL_RECT
                || command->type == DRAW_SHEARED_FILL
+               || command->type == DRAW_ROTATED_FILL
                || command->type == DRAW_SHADOW_RECT
              ? FORCED_DARK_SURFACE
              : (command->type == DRAW_STROKE_RECT
@@ -1695,7 +2016,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
     target->resolved_color_valid = true;
     if (!intersects(command, target->left, target->top,
                     target->right, target->bottom)) return;
-    if (command->type == DRAW_SHEARED_FILL) {
+    if (command->type == DRAW_SHEARED_FILL || command->type == DRAW_ROTATED_FILL) {
         rasterize_sheared_fill(target, command);
         return;
     }
@@ -1840,11 +2161,12 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         rasterize_image(cache, target, command);
         return;
     }
-    if (font_context_face_variant(cache->layout->fonts,
+    if (font_context_face_at_weight(cache->layout->fonts,
                                   cache->layout->web_fonts,
                                   draw_command_font_family(command),
                                   draw_command_font_italic(command),
-                                  draw_uses_bold_face(command)) != NULL) {
+                                  draw_uses_bold_face(command),
+                                  draw_command_font_weight(command)) != NULL) {
         if (draw_command_text_shadow_blur(command) != 0) {
             rasterize_blurred_text_shadow(cache, target, command);
         } else {

@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.35 — 2026-10-13
+
+- More responsive scrolling, focus navigation, and browser controls while pages load.
+- Improved page layouts, images, icons, and text, with new website font options.
+- Clearer YouTube search filters and compact video actions.
+- Improved low-memory handling and stability.
+
 ## 0.1.34 — 2026-10-11
 
 - Chapter markers and a chapter picker in the video player.

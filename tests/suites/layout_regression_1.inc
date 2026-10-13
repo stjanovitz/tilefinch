@@ -4,6 +4,9 @@
 
     CHECK(test_flow_profile_exclusive_scopes(&budget) == 0);
     CHECK(test_layout_elapsed_input_checkpoint(&budget) == 0);
+    CHECK(test_scroll_extent_linear_and_interruptible(&budget) == 0);
+    CHECK(test_focus_within_unrelated_branches(&budget) == 0);
+    CHECK(test_spatial_ranges_service_input_before_finishing(&budget) == 0);
     CHECK(test_long_text_input_checkpoint(&budget) == 0);
     CHECK(test_font_publication_style_reuse(&budget) == 0);
     CHECK(test_font_publication_preserves_retained_tail(&budget) == 0);
@@ -208,6 +211,7 @@
     puts("test: focus and custom-property invalidation matches a fresh build");
     CHECK(test_state_invalidation_matches_fresh(&budget) == 0);
     CHECK(test_children_invalidation_scope(&budget) == 0);
+    CHECK(test_non_element_style_retirement(&budget) == 0);
     CHECK(test_fixed_drawer_rows(&budget) == 0);
     CHECK(test_checked_invalidation_cancel_drops_lists(&budget) == 0);
     CHECK(test_overflow_index_uses_nearby_bands(&budget) == 0);
@@ -255,6 +259,7 @@
     CHECK(test_background_layers_paint_front_to_back(&budget) == 0);
     puts("test: hostile object-position remains inside decoded pixels");
     CHECK(test_cover_object_position_stays_in_source(&budget) == 0);
+    CHECK(test_rounded_image_radius_fits_tiled_spans(&budget) == 0);
     puts("test: visual clones preserve packed image positions");
     CHECK(test_visual_clone_preserves_object_position(&budget) == 0);
     puts("test: PPM output rejects invalid frame extents");

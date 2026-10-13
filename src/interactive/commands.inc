@@ -165,6 +165,22 @@ static uint64_t interaction_now_us(void)
     return tilefinch_platform_monotonic_time_us();
 }
 
+/* Wall latency includes scheduling and I/O waits; this separate owner-thread
+   clock prices the action's computation without charging other processes. */
+static bool interaction_cpu_us(uint64_t *value)
+{
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    struct timespec time;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0) {
+        *value = (uint64_t) time.tv_sec * UINT64_C(1000000)
+            + (uint64_t) time.tv_nsec / UINT64_C(1000);
+        return true;
+    }
+#endif
+    *value = 0;
+    return false;
+}
+
 typedef struct {
     uint64_t raster_us;
     uint64_t frame_us;
@@ -1725,6 +1741,8 @@ static bool run_command_loop(FILE *commands, bool interactive,
         char *line = trim_line(scratch->input);
         if (line[0] == '\0' || line[0] == '#') continue;
         uint64_t input_started = interaction_now_us();
+        uint64_t input_cpu = 0;
+        bool input_cpu_valid = interaction_cpu_us(&input_cpu);
         /* Input always wins over speculative work from the preceding frame.
            The latest scroll will schedule a replacement after presentation. */
         browser_engine_cancel_idle_work(engine);
@@ -2904,16 +2922,22 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 goto failed;
             }
             uint64_t finished = interaction_now_us();
+            uint64_t finished_cpu = 0;
+            bool cpu_valid = interaction_cpu_us(&finished_cpu)
+                && input_cpu_valid && finished_cpu >= input_cpu;
             uint64_t total_us = finished - input_started;
             uint64_t dispatch_us = dispatch_finished - input_started;
             uint64_t cache_us = cache_finished - dispatch_finished;
             printf("interaction-latency command=%s total-us=%llu "
+                   "cpu-us=%llu cpu-clock-valid=%d "
                    "dispatch-us=%llu network-us=%llu script-us=%llu "
                    "runtime-us=%llu relayout-us=%llu cache-us=%llu "
                    "paint-us=%llu raster-us=%llu frame-us=%llu "
                    "focus-us=%llu present-us=%llu glyph-misses=%zu "
                    "image-decodes=%zu image-scales=%zu",
                    line, (unsigned long long) total_us,
+                   (unsigned long long) (cpu_valid ? finished_cpu - input_cpu : 0),
+                   (int) cpu_valid,
                    (unsigned long long) dispatch_us,
                    (unsigned long long)
                      (navigation->performance.network_us - network_before),
@@ -2941,7 +2965,9 @@ static bool run_command_loop(FILE *commands, bool interactive,
                      : cache->scaled_image_builds);
 #ifndef TILEFINCH_NO_TRACE
             printf(" focus-outline-us=%llu", (unsigned long long)
-                   (controller->focus_outline_us - focus_outline_before));
+                   (controller->focus_outline_us >= focus_outline_before
+                       ? controller->focus_outline_us - focus_outline_before
+                       : controller->focus_outline_us));
 #endif
             printf(" setup-us=%llu tiles-us=%llu overflow-us=%llu sticky-us=%llu fixed-us=%llu",
                    (unsigned long long) paint.setup_us, (unsigned long long) paint.tiles_us,

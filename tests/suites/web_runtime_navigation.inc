@@ -76,11 +76,16 @@
     for (size_t realm_generation_index = 0;
          realm_generation_index < 4; realm_generation_index++) {
         uint64_t generation = navigation_begin(&repeated_realm_navigation);
-        CHECK(navigation_commit_html(
+        bool committed = navigation_commit_html(
             &repeated_realm_navigation, generation,
             "https://realm-lifecycle.test/challenge",
             repeated_realm_page, strlen(repeated_realm_page), 480,
-            NULL, NULL, true));
+            NULL, NULL, true);
+        if (!committed) {
+            fprintf(stderr, "realm commit error=%s\n",
+                    repeated_realm_navigation.last_error);
+        }
+        CHECK(committed);
         for (size_t turn = 0; turn < 8; turn++) {
             CHECK(navigation_advance_runtime(
                 &repeated_realm_navigation, turn, 8));
@@ -1101,6 +1106,9 @@
         "const recordScroll=name=>{scrollOrder.push(name+':'+scrollY);"
         "globalThis.pocSummary=scrollOrder.join(',');};"
         "addEventListener('scroll',()=>recordScroll('window'));"
+        "document.addEventListener('scroll',e=>{if(e.target!==document||"
+        "!e.bubbles||!e.isTrusted)throw new Error('wrong document scroll');"
+        "recordScroll('document')});"
         "const recordViewport=()=>recordScroll('viewport');"
         "visualViewport.addEventListener('scroll',recordViewport);"
         "document.getElementById('nested').addEventListener('scroll',"
@@ -1129,7 +1137,8 @@
              scroll_maximum);
     char dispatched_scroll_summary[256];
     snprintf(dispatched_scroll_summary, sizeof(dispatched_scroll_summary),
-             "window:128,viewport:128,window:%d,viewport-error:%d,viewport:%d",
+             "document:128,window:128,viewport:128,document:%d,window:%d,viewport-error:%d,viewport:%d",
+             scroll_maximum,
              scroll_maximum, scroll_maximum, scroll_maximum);
     lxb_dom_node_t *nested_scroll_node = find_id(
         lxb_dom_interface_node(interactive.page.document.html), "nested");
@@ -1147,7 +1156,7 @@
     CHECK(strcmp(interactive.page.script_result.summary, "scroll:pending") == 0);
     CHECK(navigation_advance_runtime(&interactive, 0, 0));
     CHECK(strcmp(interactive.page.script_result.summary,
-                 "window:128,viewport:128") == 0);
+                 "document:128,window:128,viewport:128") == 0);
     CHECK(nested_scroll_box->scroll_y == 0);
     CHECK(interactive.page.script_result.host_compile_attempts
           == scroll_compile_attempts);
@@ -3363,7 +3372,8 @@
 
     puts("test: details disclosure activation while background work is pending");
     static const char details_page[] =
-        "<!doctype html><body><details id=disclosure><summary id=summary>More"
+        "<!doctype html><style>details p{display:block;position:fixed}</style>"
+        "<body><details id=disclosure><summary id=summary>More"
         " information</summary><p id=secret>DISCLOSED CONTENT</p></details>"
         "<p id=result>WAIT</p><script>const details=document.getElementById("
         "'disclosure'),summary=document.getElementById('summary');details."
@@ -3869,10 +3879,15 @@
     navigation_enable_scripts(&smooth_scroll_navigation, 4 * MIB, 1000);
     uint64_t smooth_scroll_generation =
         navigation_begin(&smooth_scroll_navigation);
-    CHECK(navigation_commit_html(
+    bool smooth_committed = navigation_commit_html(
         &smooth_scroll_navigation, smooth_scroll_generation,
         "https://scroll.test/", smooth_scroll_page,
-        strlen(smooth_scroll_page), 160, NULL, NULL, true));
+        strlen(smooth_scroll_page), 160, NULL, NULL, true);
+    if (!smooth_committed) {
+        fprintf(stderr, "smooth commit error=%s\n",
+                smooth_scroll_navigation.last_error);
+    }
+    CHECK(smooth_committed);
     for (size_t frame = 0; frame < 20; frame++) {
         CHECK(navigation_advance_runtime(
             &smooth_scroll_navigation, 16, 8));

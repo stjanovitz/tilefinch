@@ -369,6 +369,11 @@ bool section_route_stream_body(void *opaque, const unsigned char *data,
     SectionRouteStream *router = opaque;
     if (router == NULL || !router->active
         || (data == NULL && length != 0)) return false;
+    /* Refuse an impossible cumulative length before scanning input. The
+       buffered path also needs one byte for its terminator. */
+    if (length > SIZE_MAX - router->scanned_bytes
+        || router->length == SIZE_MAX
+        || length >= SIZE_MAX - router->length) return false;
     if (router->sectioned) {
         while (length != 0) {
             size_t step = length < router->block_bytes

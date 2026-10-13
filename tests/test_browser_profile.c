@@ -329,6 +329,7 @@ int main(void)
           && browser_profile_content_blocker_total_blocked(profile) == 0
           && browser_profile_reader_font(profile)
                  == BROWSER_READER_FONT_SANS
+          && browser_profile_web_font_mode(profile) == WEB_FONTS_SMART
           && !browser_profile_remember_reader_site_scale(profile)
           && !browser_profile_reader_auto_mode(profile)
           && browser_profile_basic_fallback_mode(profile)
@@ -455,6 +456,9 @@ int main(void)
                  == BROWSER_BASIC_FALLBACK_AUTOMATIC
           && browser_profile_set_basic_fallback_mode(
                  profile, BROWSER_BASIC_FALLBACK_ASK));
+    CHECK(!browser_profile_set_web_font_mode(profile, WEB_FONTS_MODE_COUNT)
+          && !browser_profile_set_web_font_mode(profile, (WebFontMode) -1)
+          && browser_profile_set_web_font_mode(profile, WEB_FONTS_OFF));
     /* Heavy pages: the mode and the always-run sites round-trip; a site is
        its registrable domain; the list is bounded. */
     CHECK(browser_profile_heavy_pages_mode(profile) == BROWSER_HEAVY_PAGES_ASK
@@ -711,6 +715,7 @@ int main(void)
           && browser_profile_reader_auto_mode(loaded)
           && browser_profile_basic_fallback_mode(loaded)
                  == BROWSER_BASIC_FALLBACK_ASK
+          && browser_profile_web_font_mode(loaded) == WEB_FONTS_OFF
           && browser_profile_heavy_pages_mode(loaded)
                  == BROWSER_HEAVY_PAGES_BASIC
           && browser_profile_heavy_site_allowed(loaded, "https://m.vk.ru/")

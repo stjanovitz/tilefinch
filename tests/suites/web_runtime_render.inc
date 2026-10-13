@@ -836,8 +836,15 @@ static int test_web_runtime(void)
 
     puts("test: backing-keyed bounded decoded and scaled image caches");
     static const unsigned char invalid_image[] = {0x00, 0x01, 0x02, 0x03};
+    unsigned char *cached_body_bytes = budget_malloc(&budget, sizeof(tiny_bmp));
+    CHECK(cached_body_bytes != NULL);
+    memcpy(cached_body_bytes, tiny_bmp, sizeof(tiny_bmp));
+    BrowserSharedBody *cached_body = browser_shared_body_take(
+        &budget, cached_body_bytes, sizeof(tiny_bmp));
+    CHECK(cached_body != NULL);
     ImageResource cache_image_a = {
-        .encoded = (unsigned char *) tiny_bmp,
+        .encoded = cached_body->data,
+        .encoded_body = cached_body,
         .encoded_length = sizeof(tiny_bmp),
         .source_width = 2, .source_height = 2, .width = 2, .height = 2
     };
@@ -909,7 +916,24 @@ static int test_web_runtime(void)
           && image_cache_frame[12u * 16u] == test_rgb565(0xffffff)
           && image_cache_frame[12u * 16u + 3u]
              == test_rgb565(0xffffff));
+    uint16_t retained_frame[16u * 16u];
+    memcpy(retained_frame, image_cache_frame, sizeof(retained_frame));
+    size_t retained_builds = image_cache.scaled_image_builds;
+    CHECK(tile_cache_replace_layout(&image_cache, &image_cache_layout)
+          && tile_cache_render_frame(&image_cache, 0, 16, 16, NULL)
+          && image_cache.scaled_image_builds == retained_builds
+          && memcmp(retained_frame, image_cache_frame, sizeof(retained_frame)) == 0);
+    /* Model a different immutable body allocated at the same address: a
+       pointer match alone must not reuse its decoded/scaled cache entries. */
+    cached_body->serial++;
+    CHECK(tile_cache_replace_layout(&image_cache, &image_cache_layout)
+          && tile_cache_render_frame(&image_cache, 0, 16, 16, NULL)
+          && image_cache.scaled_image_builds == retained_builds + 2u
+          && memcmp(retained_frame, image_cache_frame, sizeof(retained_frame)) == 0);
     tile_cache_destroy(&image_cache);
+    browser_shared_body_release(cached_body);
+    cache_image_a.encoded = (unsigned char *) tiny_bmp;
+    cache_image_a.encoded_body = NULL;
     budget_free(&budget, image_cache_frame);
     CHECK(budget.current == 0);
 
@@ -2236,7 +2260,10 @@ static int test_web_runtime(void)
         "<div id=escaping-positioned></div></div></div>"
         "<div id=sibling-clip-row><div id=sibling-clip>FIELD</div>"
         "<div id=sibling-positioned><input id=sibling-hit type=submit>"
-        "<span id=sibling-mark></span></div></div></body>";
+        "<span id=sibling-mark></span></div></div>"
+        "<div id=scroll-border style='width:80px;height:60px;padding:0;"
+        "border:2px solid;box-sizing:border-box;overflow:auto'>"
+        "<div style='width:100px;height:100px;overflow:hidden;background:#123456'></div></div></body>";
     static NavigationSession geometry_navigation;
     CHECK(navigation_init(&geometry_navigation, &budget, 4));
     navigation_enable_scripts(&geometry_navigation, 3 * MIB, 1000);
@@ -2422,6 +2449,21 @@ static int test_web_runtime(void)
           && layout_scroll_node(&geometry_navigation.page.layout,
                                 clip_only, 0, 999)
           && clip_only_box->scroll_y == 0);
+    puts("test: client dimensions use the retained padding box exactly once");
+    bool client_probe_ok = script_runtime_evaluate_diagnostic(
+        geometry_navigation.page.runtime,
+        "(()=>{const e=document.querySelector('#sized');"
+        "globalThis.pocSummary=[e.clientWidth,e.clientHeight,"
+        "e.scrollHeight,document.firstElementChild===document.documentElement,"
+        "document.getElementById('scroll-border').scrollHeight].join(':');})();",
+        "<client-box-probe>", &geometry_navigation.page.script_result);
+    if (!client_probe_ok || strcmp(geometry_navigation.page.script_result.summary,
+                                  "76:56:56:true:100") != 0)
+        fprintf(stderr, "client box probe: %s error=%s\n",
+            geometry_navigation.page.script_result.summary,
+            geometry_navigation.page.script_result.error);
+    CHECK(client_probe_ok && strcmp(geometry_navigation.page.script_result.summary,
+                                   "76:56:56:true:100") == 0);
     TileCache overflow_cache;
     uint16_t *overflow_frame = budget_malloc(
         &budget, 480u * 272u * sizeof(*overflow_frame));
@@ -2719,9 +2761,13 @@ static int test_web_runtime(void)
     CHECK(document_parse(&string_switch_document, &budget,
                          string_switch_page,
                          strlen(string_switch_page), 16));
-    CHECK(scripts_run_document(&string_switch_document, &budget,
+    bool switch_ran = scripts_run_document(&string_switch_document, &budget,
                                4 * MIB, 1000,
-                               &string_switch_result));
+                               &string_switch_result);
+    if (!switch_ran) {
+        fprintf(stderr, "switch error=%s\n", string_switch_result.error);
+    }
+    CHECK(switch_ran);
     CHECK(string_switch_result.success &&
           strcmp(string_switch_result.summary,
                  "string-switch:ok") == 0);

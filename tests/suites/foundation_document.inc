@@ -417,7 +417,15 @@
         "$('mi').namespaceURI==='http://www.w3.org/1998/Math/MathML',"
         "ce instanceof MyEl,cb instanceof XB,"
         "sp instanceof HTMLElement&&!(sp instanceof HTMLDivElement),"
-        "b instanceof Text&&!(b instanceof Element)];"
+        "b instanceof Text&&!(b instanceof Element),"
+        "Object.prototype.toString.call(k)==='[object HTMLDivElement]',"
+        "Object.prototype.toString.call(sp)==='[object HTMLSpanElement]',"
+        "Object.prototype.toString.call(root)==='[object ShadowRoot]',"
+        "Object.prototype.toString.call(frag)==='[object DocumentFragment]',"
+        "Object.prototype.toString.call(a)==='[object Text]',"
+        "Object.prototype.toString.call(k.children)==='[object HTMLCollection]',"
+        "Object.prototype.toString.call(ce)==='[object HTMLElement]',"
+        "Object.prototype.toString.call(cb)==='[object HTMLButtonElement]'];"
         "Object.assign(globalThis,{__k:k,__u:u,__l0:l0,__h:h,__inner:inner,"
         "__MyEl:MyEl,__XB:XB,__creates:__tilefinchRetentionStats."
         "wrapperCreates});"
@@ -4685,6 +4693,28 @@
     document_destroy(&console_document);
     CHECK(budget.current == console_baseline);
 
+    puts("test: document readiness changes precede their lifecycle events");
+    static const char readiness_page[] =
+        "<!doctype html><body><script>let readiness=[];"
+        "document.addEventListener('readystatechange',()=>{"
+        "readiness.push(document.readyState)});"
+        "document.addEventListener('DOMContentLoaded',()=>{"
+        "readiness.push('dom:'+document.readyState)});"
+        "addEventListener('load',()=>{"
+        "readiness.push('load:'+document.readyState);"
+        "globalThis.pocSummary=readiness.join(',')});</script>";
+    PocDocument readiness_document;
+    size_t readiness_baseline = budget.current;
+    CHECK(document_parse(&readiness_document, &budget, readiness_page,
+                         sizeof(readiness_page) - 1, 17));
+    ScriptResult readiness_result;
+    CHECK(scripts_run_document(&readiness_document, &budget, 4 * MIB, 1000,
+                               &readiness_result));
+    CHECK(strcmp(readiness_result.summary,
+                 "interactive,dom:interactive,complete,load:complete") == 0);
+    document_destroy(&readiness_document);
+    CHECK(budget.current == readiness_baseline);
+
     puts("test: uncaught event listener isolation");
     size_t listener_baseline = budget.current;
     static const char listener_page[] =
@@ -4951,6 +4981,18 @@
     document_body_snapshot_destroy(&scriptless_snapshot);
     document_destroy(&scriptless_document);
     CHECK(budget.current == listener_baseline);
+
+    /* A cache without a caller-owned frame uses one temporary Budget surface.
+       Refusing that surface must leave the cache reusable. */
+    size_t unbound_baseline = budget.current;
+    TileCache unbound_cache;
+    CHECK(tile_cache_init(&unbound_cache, &budget, &layout, 4));
+    budget_inject_failure_after(&budget, 0);
+    CHECK(!tile_cache_render_frame(&unbound_cache, 0, 480, 272, NULL));
+    budget_clear_failure_injection(&budget);
+    CHECK(tile_cache_render_frame(&unbound_cache, 0, 480, 272, NULL));
+    tile_cache_destroy(&unbound_cache);
+    CHECK(budget.current == unbound_baseline);
 
     TileCache cache;
     puts("test: tiles");

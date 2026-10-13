@@ -9,7 +9,7 @@ const { EventEmitter } = require("node:events");
 /* OOPIFs have separate Fetch domains. Use the documented non-flattened CDP
    target tunnel so every frame stays paused until hermetic routing is ready.
    This does not alter site isolation or rewrite cross-origin responses. */
-async function installInterception(root, onRequest, runHost, track, onFailure = () => {}) {
+async function installInterception(root, onRequest, runHost, track, onFailure = () => {}, audit = null) {
   const sessions = new Set([root]);
   const children = new Map();
   const pending = new Map();
@@ -17,6 +17,12 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
   let failures = 0, overflow = false;
   const fail = (error) => { failures += 1; onFailure(error); };
   const attach = async (session) => {
+    if (audit) {
+      session.on("Network.requestWillBeSent", (event) => audit.networkBegin(session, event));
+      session.on("Network.loadingFinished", (event) => audit.networkEnd(session, event));
+      session.on("Network.loadingFailed", (event) => audit.networkEnd(session, event, true));
+      await runHost("request-audit-enable", () => session.send("Network.enable"));
+    }
     session.on("Fetch.requestPaused", (event) => onRequest(session, event));
     session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
       const child = children.get(`${session._captureKey || "root"}\0${sessionId}`);
@@ -38,6 +44,7 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
         if (sessions.size >= 64) { overflow = true; throw new Error("capture exceeds 64 frame targets"); }
         const child = new EventEmitter();
         child._captureKey = `${session._captureKey || "root"}\0${sessionId}`;
+        child._captureTargetId = targetInfo.targetId;
         child.send = (method, params = {}) => {
           if (pending.size >= 128) {
             overflow = true;
@@ -100,7 +107,7 @@ function retainedUserAgent(records, url) {
    Chromium Fetch interception sees every hop, keeping the original 302 and
    Location intact. The adapter deliberately exposes only the Route operations
    used by the hermetic recorder; it cannot fetch or follow a URL itself. */
-function cdpRoute(session, event, onAbort = () => {}) {
+function cdpRoute(session, event, onAbort = () => {}, onFulfill = () => {}) {
   const headers = Object.fromEntries(Object.entries(event.request.headers || {})
     .map(([name, value]) => [name.toLowerCase(), String(value)]));
   const errors = {
@@ -125,12 +132,15 @@ function cdpRoute(session, event, onAbort = () => {}) {
       return send("Fetch.failRequest", { errorReason: errors[code] || "Failed" });
     },
     continue: () => send("Fetch.continueRequest", {}),
-    fulfill: ({ status, headers: responseHeaders, body }) => send("Fetch.fulfillRequest", {
+    fulfill: async ({ status, headers: responseHeaders, body }) => {
+      await send("Fetch.fulfillRequest", {
       responseCode: status,
       responseHeaders: Object.entries(responseHeaders).map(([name, value]) =>
         ({ name, value: String(value) })),
       body: Buffer.from(body).toString("base64"),
-    }),
+      });
+      onFulfill();
+    },
   };
 }
 
@@ -140,7 +150,60 @@ function createRequestAudit() {
   const expectedFailures = new Map();
   let observed = 0;
   let overflow = false;
-  return {
+  const networks = new Map();
+  const networkKey = (session, id) => `${session._captureKey || "root"}\0${id}`;
+  const fulfilled = new Set();
+  const result = {
+    networkBegin(session, event) {
+      const key = networkKey(session, event.requestId);
+      if (event.redirectResponse) {
+        pending.delete(key);
+        fulfilled.delete(key);
+      }
+      if (!/^https?:/i.test(event.request.url)) return;
+      observed += 1;
+      if (networks.size >= MAX_REQUESTS && !networks.has(key)) { overflow = true; return; }
+      networks.set(key, { url: event.request.url, method: event.request.method,
+        type: String(event.type || "other").toLowerCase(), frameId: event.frameId });
+      pending.add(key);
+    },
+    networkFulfilled(session, event) {
+      if (!event.networkId) { overflow = true; return; }
+      if (fulfilled.size >= MAX_REQUESTS) { overflow = true; return; }
+      fulfilled.add(networkKey(session, event.networkId));
+    },
+    networkEnd(session, event, failed = false) {
+      let key = networkKey(session, event.requestId), request = networks.get(key);
+      /* OOPIF document navigation begins in the parent target, but its
+         completion can arrive only on the newly attached child. Transfer
+         that exact document ticket, never an unrelated same-ID request. */
+      if (!request && session._captureTargetId) {
+        const suffix = `\0${event.requestId}`;
+        const candidates = [...networks].filter(([id, value]) => id.endsWith(suffix)
+          && value.type === "document" && value.frameId === session._captureTargetId);
+        if (candidates.length === 1) [key, request] = candidates[0];
+        else if (candidates.length > 1) overflow = true;
+      }
+      if (!request) return; // Non-HTTP work is outside the replay ledger.
+      pending.delete(key);
+      if (failed) {
+        const expectedKey = `${request.method}\0${request.url}`;
+        const expected = expectedFailures.get(expectedKey) || 0;
+        if (expected) expectedFailures.set(expectedKey, expected - 1);
+        /* A browser cancellation after a successful hermetic fulfillment is
+           not a missing response. Unknown cancellations and transport errors
+           still fail. Visual completeness remains independently mandatory. */
+        const canceledReplay = event.canceled === true && fulfilled.has(key);
+        if (failures.length >= 512) overflow = true;
+        else failures.push({ ...request, expected: expected > 0 || canceledReplay,
+          reason: expected > 0 ? "declared-policy" : canceledReplay ? "canceled-replayed-response" : "unexpected",
+          error: String(event.errorText || "request failed").slice(0, 256) });
+      }
+      fulfilled.delete(key);
+      networks.delete(key);
+    },
+  };
+  return Object.assign(result, {
     expectFailure(method, url) {
       const key = `${method}\0${url}`;
       if (!expectedFailures.has(key) && expectedFailures.size >= MAX_REQUESTS) overflow = true;
@@ -167,12 +230,12 @@ function createRequestAudit() {
       }
     },
     summary(intercepted) {
-      return { version: "browser-request-audit-v1", observed, intercepted,
+      return { version: "browser-request-audit-v2", observed, intercepted,
         pending: pending.size, overflow, failures: failures.slice(),
         ready: !overflow && pending.size === 0 && observed === intercepted
           && failures.every((failure) => failure.expected) };
     },
-  };
+  });
 }
 
 function createOriginEvidence() {

@@ -9,6 +9,16 @@
 #undef budget_malloc
 #undef budget_calloc
 #undef budget_realloc
+#if defined(TILEFINCH_BUDGET_CALLSITE_TRACE) && !defined(__PSP__)
+/* This file deliberately opts out of style's category aliases. Restore
+   uncategorized callsite tracing after that opt-out in probe builds only. */
+#define budget_malloc(b, s) \
+    budget_malloc_at((b), (s), __FILE__, __LINE__)
+#define budget_calloc(b, n, s) \
+    budget_calloc_at((b), (n), (s), __FILE__, __LINE__)
+#define budget_realloc(b, p, s) \
+    budget_realloc_at((b), (p), (s), __FILE__, __LINE__)
+#endif
 #include "js_runtime_internal.h"
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/text.h>
@@ -23,6 +33,7 @@
 #include <lexbor/ns/ns.h>
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -8413,6 +8424,8 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
                        && memcmp(pseudo_name, ":after", 6) == 0)) {
             pseudo = PSEUDO_AFTER;
         }
+        if (pseudo_length == 13 && memcmp(pseudo_name, "::placeholder", 13) == 0)
+            pseudo = PSEUDO_PLACEHOLDER;
         if (pseudo != PSEUDO_NONE) {
             /* A pseudo-element's containing block is its originating
                element, whose style this is. */
@@ -9921,6 +9934,15 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
         updated[used++] = ';';
     }
     updated[used] = '\0';
+    /* A CSSOM assignment of the existing declaration is not a DOM write.
+       Require existing CSSOM provenance too: an equal string can otherwise
+       newly authorize an inline style blocked by the document policy. */
+    if (old != NULL && old_length == used && memcmp(old, updated, used) == 0
+        && document_style_attribute_cssom_authorized(node)) {
+        JS_FreeCString(context, value);
+        JS_FreeCString(context, wanted);
+        return JS_TRUE;
+    }
     /* CSSOM changes the style attribute, not a selector-visible attribute
        named after the property. Preserve :has([style]) invalidation while
        allowing unrelated :has() rules to keep ancestor/sibling caches. The
@@ -9928,6 +9950,19 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
     bool relational = stylesheet_attribute_change_may_affect_has(
         bridge == NULL ? NULL : bridge->stylesheet, "style", 5,
         old, old_length, updated, used);
+    bool preserve_geometry = false;
+    if (wanted_length == 7 && strncasecmp(wanted, "opacity", 7) == 0
+        && document_style_attribute_cssom_authorized(node)) {
+        char *end = NULL;
+        float number = value_length == 0 ? 0.0f : strtof(value, &end);
+        if (end != NULL && *end == '%') end++;
+        while (end != NULL && isspace((unsigned char) *end)) end++;
+        /* A numeric value cannot splice another declaration into this
+           serializer. Other CSS syntax keeps the conservative path. */
+        if (value_length == 0 || (end != value && isfinite(number)
+            && end == value + value_length))
+            preserve_geometry = js_rt_geometry_opacity_write_begin(bridge, node);
+    }
     lxb_status_t status;
     document_style_quiet_begin();
     status = lxb_dom_element_set_attribute(
@@ -9952,6 +9987,7 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
         bridge_mutated_with_relational(
             bridge, SCRIPT_MUTATION_INLINE_STYLE, node, wanted, wanted_length,
             relational, NULL, 0);
+        if (preserve_geometry) js_rt_geometry_opacity_write_end(bridge);
     }
     JS_FreeCString(context, value);
     JS_FreeCString(context, wanted);

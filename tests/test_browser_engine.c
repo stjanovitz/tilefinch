@@ -324,12 +324,16 @@ static bool backing_node_write(
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--fixed-images-only") == 0)
+        return test_fixed_image_publication();
+    if (argc == 2 && strcmp(argv[1], "--fixed-image-repaint-only") == 0)
+        return test_deferred_image_relayout_requests_repaint();
     if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
         return test_youtube_login_journey() || test_youtube_personalized_home()
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
-        return test_youtube_filters_and_chapters();
+        return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
     if ((argc == 4 || argc == 5)
         && (strcmp(argv[1], "--native-navigation-replay") == 0
             || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
@@ -388,6 +392,8 @@ int main(int argc, char **argv)
         return test_computed_style_resolved_values();
     if (argc == 2 && strcmp(argv[1], "--container-style-only") == 0)
         return test_computed_style_tracks_container_geometry();
+    if (argc == 2 && strcmp(argv[1], "--opacity-geometry-only") == 0)
+        return test_opacity_geometry_snapshot_reuse();
     if (argc == 2 && strcmp(argv[1], "--css-transitions-only") == 0) {
         /* Every test runs, so one failure does not hide another. */
         int failed = test_css_transition_lifecycle();
@@ -410,6 +416,8 @@ int main(int argc, char **argv)
         return test_managed_challenge_script_heap();
     if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
         return test_deferred_startup_journey();
+    if (argc == 2 && strcmp(argv[1], "--image-admission-only") == 0)
+        return test_deferred_image_admission_yields_to_input();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
         return test_loading_interaction_journey();
     if (argc == 2 && strcmp(argv[1], "--text-memory-only") == 0)
@@ -430,6 +438,20 @@ int main(int argc, char **argv)
         return profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
             "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
             0, true, "psp", false);
+    if ((argc == 2 || argc == 3)
+        && strcmp(argv[1], "--font-focus-policy-only") == 0) {
+        int selected = argc == 3 ? atoi(argv[2]) : 0;
+        if (selected < 0 || selected > 3) return 2;
+        return ((selected == 0 || selected == 1)
+                && test_smart_font_pressure_preempts_startup())
+            || ((selected == 0 || selected == 2)
+                && test_sibling_focus_retains_unrelated_matches())
+            || ((selected == 0 || selected == 3)
+                && test_required_rebuild_pressure_keeps_static_document());
+    }
+    CHECK(test_smart_font_pressure_preempts_startup() == 0);
+    CHECK(test_sibling_focus_retains_unrelated_matches() == 0);
+    CHECK(test_required_rebuild_pressure_keeps_static_document() == 0);
     CHECK(test_engine_lifecycle() == 0);
     CHECK(profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
@@ -453,6 +475,7 @@ int main(int argc, char **argv)
     CHECK(test_script_free_browsing_journey() == 0);
     CHECK(test_background_interruption_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
+    CHECK(test_deferred_image_admission_yields_to_input() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
     CHECK(test_deferred_images_skip_oversized_pages() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
@@ -472,6 +495,7 @@ int main(int argc, char **argv)
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
+    CHECK(test_opacity_geometry_snapshot_reuse() == 0);
     CHECK(test_inline_style_mutations_skip_stylesheet_rebuild() == 0);
     CHECK(test_transition_clock_bounded() == 0);
     CHECK(test_transition_eviction_inline_once() == 0);
@@ -505,6 +529,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_rating_status_confirmation() == 0);
     CHECK(test_youtube_library_actions() == 0);
     CHECK(test_youtube_library_native_action() == 0);
+    CHECK(test_youtube_provider_layout_states() == 0);
     CHECK(test_youtube_filters_and_chapters() == 0);
     CHECK(test_youtube_like_action() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
@@ -528,6 +553,7 @@ int main(int argc, char **argv)
     CHECK(test_reader_alias_relocation_rebinds_declined_auto_layout() == 0);
     CHECK(test_reader_deferred_images_alias_before_relayout() == 0);
     CHECK(test_cooperative_site_adapter_navigation() == 0);
+    CHECK(test_fixed_image_publication() == 0);
     CHECK(test_headless_repeated_teardown() == 0);
     CHECK(test_single_active_engine() == 0);
     CHECK(test_late_candidate_failure_transaction() == 0);

@@ -18,3 +18,13 @@ with tempfile.TemporaryDirectory() as directory:
         expected = 0 if direction == "-R" else 1
         assert source.read_bytes().count(marker) == expected, "control left a fast path active"
     assert source.read_bytes() == original, "patch round trip changed unrelated engine code"
+
+scope_patch = Path(sys.argv[2]) if len(sys.argv) > 2 else root / "patches/bellard-quickjs-04be246-scope-oom.patch"
+with tempfile.TemporaryDirectory() as directory:
+    source = Path(directory) / "quickjs.c"
+    source.write_bytes(original)
+    subprocess.run(["patch", "--force", "--batch", "--silent", "-R", "-p1",
+                    "-i", str(scope_patch.resolve())], cwd=directory, check=True)
+    subprocess.run(["patch", "--force", "--batch", "--silent", "--forward", "-p1",
+                    "-i", str(scope_patch.resolve())], cwd=directory, check=True)
+    assert source.read_bytes() == original, "scope OOM guard moved to another function"

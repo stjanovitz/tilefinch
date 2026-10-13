@@ -665,6 +665,16 @@ void psp_app_apply_setting(
                        : "BASIC VIEW FALLBACK: AUTOMATIC"),
             180);
     }
+    if (intent->setting.id == PSP_UI_SETTING_WEB_FONTS) {
+        WebFontMode mode = intent->setting.value.web_font_mode;
+        if (browser_engine_set_web_font_mode(engine, mode)
+            && browser_profile_set_web_font_mode(profile, mode))
+            psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+        app->process->presentation.ui.web_font_mode = (unsigned) browser_profile_web_font_mode(profile);
+        psp_ui_show_status(&app->process->presentation.ui,
+            mode == WEB_FONTS_ON ? "WEBSITE FONTS ON"
+                : mode == WEB_FONTS_OFF ? "WEBSITE FONTS OFF" : "WEBSITE FONTS SMART", 180);
+    }
     if (intent->setting.id == PSP_UI_SETTING_BROWSER_UI_SCALE) {
         /* Owner thread, page work paused by the menu: fill the chrome cache
            at the new size before the next frame draws at it. */

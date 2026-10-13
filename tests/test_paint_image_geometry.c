@@ -163,6 +163,80 @@ static int test_scaled_background_geometry(Budget *budget)
     return 0;
 }
 
+static int test_gradient_mask_paint(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;background:white}"
+        ".paint{position:absolute;width:16px;height:8px;"
+        "background:linear-gradient(90deg,red 0%,red 50%,blue 50%,blue 100%)}"
+        "#reference{left:0;top:0}#alpha{left:24px;top:0;opacity:.5}"
+        "#mask{left:0;top:16px;mask:url(mask.svg)}"
+        "#half{left:24px;top:16px;mask:url(mask.svg)}"
+        "#pseudo{position:absolute;left:0;top:32px;width:16px;height:8px}"
+        "#pseudo::before{content:'';display:block;width:16px;height:8px;"
+        "background:linear-gradient(90deg,red 0%,red 50%,blue 50%,blue 100%);"
+        "mask:url(mask.svg)}"
+        "</style><div id=reference class=paint></div>"
+        "<div id=alpha class=paint></div><div id=mask class=paint></div>"
+        "<div id=half class=paint></div><div id=pseudo></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, budget, &document, 64));
+    unsigned char pixels[16u * 8u * 4u], half[sizeof(pixels)];
+    memset(pixels, 255, sizeof(pixels));
+    pixels[4u * (16u + 1u) + 3u] = 0;
+    memcpy(half, pixels, sizeof(pixels));
+    /* Opacity .5 uses 128/256 of opaque alpha, truncated to 127. */
+    for (size_t i = 3; i < sizeof(half); i += 4) half[i] = 127;
+    half[4u * (16u + 1u) + 3u] = 0;
+    ImageResource items[] = {
+        {.node=find_id(lxb_dom_interface_node(document.html), "mask"),
+         .pixels=pixels,.width=16,.height=8,.is_mask=true},
+        {.node=find_id(lxb_dom_interface_node(document.html), "half"),
+         .pixels=half,.width=16,.height=8,.is_mask=true},
+        {.node=find_id(lxb_dom_interface_node(document.html), "pseudo"),
+         .pixels=pixels,.width=16,.height=8,.is_mask=true,.pseudo=PSEUDO_BEFORE}
+    };
+    ImageResources images = {.items=items,.count=3};
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, &images, 64));
+    size_t masks = 0;
+    for (size_t i = 0; i < layout.count; i++) {
+        if (layout.commands[i].type == DRAW_IMAGE) {
+            CHECK(draw_command_mask_gradient(&layout.commands[i], NULL));
+            masks++;
+        }
+    }
+    CHECK(masks == 3);
+    TileCache cache = {0};
+    CHECK(tile_cache_init(&cache, budget, &layout, 4));
+    uint16_t frame[64u * 48u];
+    CHECK(tile_cache_set_frame(&cache, frame, 64u * 48u)
+          && tile_cache_render_frame(&cache, 0, 64, 48, NULL));
+    for (size_t y = 0; y < 8; y++) {
+        for (size_t x = 0; x < 16; x++) {
+            bool hole = x == 1 && y == 1;
+            uint16_t reference = hole ? UINT16_C(0xffff) : frame[y * 64u + x];
+            if (frame[(y + 16u) * 64u + x] != reference
+                || frame[(y + 32u) * 64u + x] != reference)
+                fprintf(stderr, "mask mismatch %zu/%zu %04x/%04x/%04x\n",
+                        x, y, reference, frame[(y + 16u) * 64u + x],
+                        frame[(y + 32u) * 64u + x]);
+            CHECK(frame[(y + 16u) * 64u + x] == reference
+                  && frame[(y + 32u) * 64u + x] == reference);
+            CHECK(frame[(y + 16u) * 64u + x + 24u]
+                  == (hole ? UINT16_C(0xffff) : frame[y * 64u + x + 24u]));
+        }
+    }
+    tile_cache_destroy(&cache);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0u);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
@@ -170,6 +244,7 @@ int main(void)
     budget_install_lexbor(&budget);
     CHECK(test_svg_default_aspect_ratio(&budget) == 0);
     CHECK(test_scaled_background_geometry(&budget) == 0);
+    CHECK(test_gradient_mask_paint(&budget) == 0);
     puts("SVG aspect ratio and transformed background geometry passed");
     return 0;
 }

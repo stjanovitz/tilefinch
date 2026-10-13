@@ -1,0 +1,8 @@
+# Observe focus without a menu superseding the selected target.
+wait-page 1
+tap-after-live 5 down
+tap-after-live 3000 right
+tap-after-live 3000 right
+wait-live 180
+mark-live focused-page
+# EOF completes the window independently of optional author tasks.

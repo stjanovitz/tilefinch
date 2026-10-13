@@ -1794,19 +1794,20 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
     char key_scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
     sheet->rule_index_derived_keys = 0;
     size_t universal_count = 0;
-    uint32_t universal_counts[3] = {0};
-    uint32_t universal_scoped[3] = {0};
+    uint32_t universal_counts[PSEUDO_COUNT] = {0};
+    uint32_t universal_scoped[PSEUDO_COUNT] = {0};
     /* Rules of adopted sheets only shadow roots adopt are kept after the
        other rules of each range, so elements outside every adopting
        carrier never see them as candidates. */
     uint64_t shadow_only = sheet->adopted_scopes_failed
         ? 0 : sheet->adopted_shadow_only_mask;
     sheet->rule_index_scoped_split = false;
-    _Static_assert(PSEUDO_NONE == 0 && PSEUDO_BEFORE == 1 && PSEUDO_AFTER == 2,
+    _Static_assert(PSEUDO_NONE == 0 && PSEUDO_BEFORE == 1 && PSEUDO_AFTER == 2
+                   && PSEUDO_PLACEHOLDER == 3 && PSEUDO_COUNT == 4,
                    "rule-index partitions must cover every pseudo element");
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRule *rule = &sheet->rules[i];
-        if (rule->pseudo > PSEUDO_AFTER) {
+        if (rule->pseudo >= PSEUDO_COUNT) {
             stylesheet_drop_rule_index(sheet);
             sheet->rule_index_attempted = true;
             return;
@@ -1858,11 +1859,11 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         sheet->rule_index_attempted = true;
         return;
     }
-    uint32_t universal_at[3] = {
-        0, universal_counts[0], universal_counts[0] + universal_counts[1]
-    };
-    uint32_t universal_scoped_at[3];
-    for (size_t i = 0; i < 3; i++) {
+    uint32_t universal_at[PSEUDO_COUNT] = {0};
+    for (size_t i = 1; i < PSEUDO_COUNT; i++)
+        universal_at[i] = universal_at[i - 1] + universal_counts[i - 1];
+    uint32_t universal_scoped_at[PSEUDO_COUNT];
+    for (size_t i = 0; i < PSEUDO_COUNT; i++) {
         sheet->rule_index_universal_ends[i] = universal_at[i] + universal_counts[i];
         sheet->rule_index_universal_unscoped_ends[i] =
             sheet->rule_index_universal_ends[i] - universal_scoped[i];
@@ -2281,6 +2282,8 @@ static bool stylesheet_parse_elements_body(StyleCssParseContext *parse,
         if (!tilefinch_csp_allows_inline_style(input->policy, element)) continue;
         unsigned scope_begin = parse->sheet->next_order;
         bool scoped = document_shadow_carrier_containing(element) != NULL;
+        if (scoped && !stylesheet_reserve_shadow_scope(parse->sheet))
+            continue;
         parse->sheet->parsing_scoped_source = scoped;
         if (override != NULL) {
             TILEFINCH_WORK_ADD(css_bytes, override_length);
@@ -2552,6 +2555,23 @@ void stylesheet_note_style_source(Stylesheet *sheet,
     sheet->style_source_nodes[sheet->style_source_count++] = element;
 }
 
+bool stylesheet_reserve_shadow_scope(Stylesheet *sheet)
+{
+    if (sheet == NULL || sheet->budget == NULL
+        || sheet->shadow_scope_count >= STYLE_SHADOW_SCOPE_LIMIT) return false;
+    if (sheet->shadow_scope_count < sheet->shadow_scope_capacity) return true;
+    size_t capacity = sheet->shadow_scope_capacity == 0
+        ? 8u : sheet->shadow_scope_capacity * 2u;
+    if (capacity > STYLE_SHADOW_SCOPE_LIMIT)
+        capacity = STYLE_SHADOW_SCOPE_LIMIT;
+    StyleShadowScope *grown = budget_realloc(
+        sheet->budget, sheet->shadow_scopes, capacity * sizeof(*grown));
+    if (grown == NULL) return false;
+    sheet->shadow_scopes = grown;
+    sheet->shadow_scope_capacity = (uint16_t) capacity;
+    return true;
+}
+
 void stylesheet_note_shadow_scope(Stylesheet *sheet,
                                   const lxb_dom_node_t *element,
                                   unsigned begin, unsigned end)
@@ -2561,19 +2581,7 @@ void stylesheet_note_shadow_scope(Stylesheet *sheet,
     const lxb_dom_node_t *carrier =
         document_shadow_carrier_containing(element);
     if (carrier == NULL) return;
-    if (sheet->shadow_scope_count == sheet->shadow_scope_capacity) {
-        if (sheet->shadow_scope_capacity >= STYLE_SHADOW_SCOPE_LIMIT) return;
-        size_t capacity = sheet->shadow_scope_capacity == 0
-            ? 8u : sheet->shadow_scope_capacity * 2u;
-        if (capacity > STYLE_SHADOW_SCOPE_LIMIT)
-            capacity = STYLE_SHADOW_SCOPE_LIMIT;
-        StyleShadowScope *grown = budget_realloc(
-            sheet->budget, sheet->shadow_scopes,
-            capacity * sizeof(*grown));
-        if (grown == NULL) return;
-        sheet->shadow_scopes = grown;
-        sheet->shadow_scope_capacity = (uint16_t) capacity;
-    }
+    if (sheet->shadow_scope_count == sheet->shadow_scope_capacity) return;
     /* Ascending by begin; a source parsed before an earlier one (a late
        insertion) shifts the later ranges up. */
     size_t at = sheet->shadow_scope_count;
@@ -4095,8 +4103,8 @@ size_t stylesheet_web_font_source_count(const Stylesheet *sheet)
     if (sheet == NULL || sheet->web_fonts == NULL) return 0;
     size_t count = 0;
     for (size_t i = 0; i < sheet->web_fonts->family_count; i++) {
-        count += sheet->web_fonts->families[i].regular.source_count;
-        count += sheet->web_fonts->families[i].bold.source_count;
+        for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++)
+            count += sheet->web_fonts->families[i].faces[face].source_count;
     }
     return count;
 }
@@ -4110,26 +4118,28 @@ bool stylesheet_web_font_source(const Stylesheet *sheet, size_t index,
     for (size_t slot = 0; slot < sheet->web_fonts->family_count; slot++) {
         const StyleWebFontFamily *family =
             &sheet->web_fonts->families[slot];
-        const StyleWebFontFaceSource *faces[2] = {
-            &family->regular, &family->bold
-        };
-        for (size_t bold = 0; bold < 2; bold++) {
+        for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++) {
+            const StyleWebFontFaceSource *selected = &family->faces[face];
             for (size_t candidate = 0;
-                 candidate < faces[bold]->source_count; candidate++) {
+                 candidate < selected->source_count; candidate++) {
                 if (index != 0) {
                     index--;
                     continue;
                 }
                 *source = (StylesheetWebFontSource) {
-                    .reference = faces[bold]->references[candidate],
-                    .source_base_url = faces[bold]->source_bases[candidate],
+                    .reference = selected->references[candidate],
+                    .source_base_url = selected->source_bases[candidate],
                     .source_referrer_policy =
-                        faces[bold]->source_bases[candidate] == NULL
+                        selected->source_bases[candidate] == NULL
                         ? NULL
-                        : faces[bold]
+                        : selected
                               ->source_referrer_policies[candidate],
                     .family_slot = (unsigned) slot,
-                    .bold = bold != 0
+                    .bold = sheet->web_fonts->loaded.families[slot]
+                                .weights[face] >= 600,
+                    .face_slot = (uint8_t) face,
+                    .weight = sheet->web_fonts->loaded.families[slot]
+                                  .weights[face]
                 };
                 return true;
             }
@@ -4141,12 +4151,19 @@ bool stylesheet_web_font_source(const Stylesheet *sheet, size_t index,
 FontFace *stylesheet_web_font_face(Stylesheet *sheet, unsigned family_slot,
                                    bool bold)
 {
+    return stylesheet_web_font_face_at(sheet, family_slot, bold ? 1u : 0u);
+}
+
+FontFace *stylesheet_web_font_face_at(Stylesheet *sheet, unsigned family_slot,
+                                     unsigned face_slot)
+{
     if (sheet == NULL || sheet->web_fonts == NULL
         || family_slot >= sheet->web_fonts->family_count
-        || family_slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT) return NULL;
+        || family_slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT
+        || face_slot >= TILEFINCH_WEB_FONT_WEIGHT_LIMIT) return NULL;
     WebFontFamilyFaces *faces =
         &sheet->web_fonts->loaded.families[family_slot];
-    return bold ? &faces->bold : &faces->regular;
+    return &faces->faces[face_slot];
 }
 
 const WebFontSet *stylesheet_web_font_set(const Stylesheet *sheet)
@@ -4272,17 +4289,16 @@ void stylesheet_destroy(Stylesheet *sheet)
             web_font_set_destroy(&sheet->web_fonts->loaded);
             for (size_t slot = 0;
                  slot < sheet->web_fonts->family_count; slot++) {
-                StyleWebFontFaceSource *faces[2] = {
-                    &sheet->web_fonts->families[slot].regular,
-                    &sheet->web_fonts->families[slot].bold
-                };
-                for (size_t bold = 0; bold < 2; bold++) {
+                for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
+                     face++) {
+                    StyleWebFontFaceSource *selected =
+                        &sheet->web_fonts->families[slot].faces[face];
                     for (size_t source = 0;
-                         source < faces[bold]->source_count; source++) {
+                         source < selected->source_count; source++) {
                         budget_free(sheet->budget,
-                                    faces[bold]->source_bases[source]);
+                                    selected->source_bases[source]);
                         budget_free(sheet->budget,
-                                    faces[bold]->references[source]);
+                                    selected->references[source]);
                     }
                 }
             }

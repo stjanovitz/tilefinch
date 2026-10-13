@@ -167,6 +167,7 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
 void stylesheet_prepare_for_document_reuse(Stylesheet *sheet)
 {
     if (sheet == NULL) return;
+    sheet->metric_web_font_families = 0;
     style_selector_cooperation_end(sheet);
     sheet->selector_cooperate = NULL;
     sheet->selector_cooperate_opaque = NULL;

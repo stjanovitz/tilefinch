@@ -1,6 +1,7 @@
 #include "tilefinch/font.h"
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/platform.h"
+#include "tilefinch_test_faults.h"
 
 #include <limits.h>
 #include <math.h>
@@ -23,13 +24,27 @@
 #include FT_FREETYPE_H
 #include FT_MODULE_H
 #include FT_SYSTEM_H
+#ifdef TILEFINCH_HAVE_BOUNDED_WOFF2
+#include <brotli/decode.h>
+#endif
 #endif
 
 #define WOFF_HEADER_BYTES 44u
 #define SFNT_TRUETYPE_SIGNATURE UINT32_C(0x00010000)
 #define WOFF_SIGNATURE UINT32_C(0x774f4646)
+#define WOFF2_SIGNATURE UINT32_C(0x774f4632)
 
 #include "generated/font_fallback_bitmaps.inc"
+
+static uint64_t face_generation;
+
+uint64_t font_generation(void) { return face_generation; }
+
+static uint64_t font_next_generation(void)
+{
+    if (++face_generation == 0) ++face_generation;
+    return face_generation;
+}
 
 static uint32_t read_be32(const unsigned char *data)
 {
@@ -57,7 +72,8 @@ static bool face_adopt_trusted(FontFace *face, Budget *budget,
         .data_length = data_length,
         .implementation = info,
         .backend = FONT_FACE_BACKEND_STB_TRUSTED,
-        .loaded = true
+        .loaded = true,
+        .serial = font_next_generation()
     };
     return true;
 }
@@ -155,6 +171,65 @@ static bool face_load(FontFace *face, Budget *budget, const char *path,
 }
 
 #ifdef TILEFINCH_HAVE_FREETYPE
+#ifdef TILEFINCH_HAVE_BOUNDED_WOFF2
+static void *woff2_allocate(void *opaque, size_t size)
+{
+    FT_Memory memory = opaque;
+    return size == 0 || size > (size_t) LONG_MAX ? NULL
+        : memory->alloc(memory, (long) size);
+}
+
+static void woff2_release(void *opaque, void *allocation)
+{
+    FT_Memory memory = opaque;
+    if (allocation != NULL) memory->free(memory, allocation);
+}
+
+int tilefinch_font_woff2_cooperate(FT_ULong work)
+{
+    return tilefinch_platform_cooperate("font-woff2", (size_t) work);
+}
+
+/* Called only by the pinned FreeType patch. Both compressed input and
+   produced output are sliced; malformed streams cannot spin without work.
+   All decoder state is charged to the same capped face allocator. */
+int tilefinch_font_woff2_decompress(FT_Memory memory, FT_Byte *output,
+    FT_ULong output_length, const FT_Byte *input, FT_ULong input_length)
+{
+    BrotliDecoderState *decoder = BrotliDecoderCreateInstance(
+        woff2_allocate, woff2_release, memory);
+    if (decoder == NULL) return -1;
+    const uint8_t *next_input = input;
+    uint8_t *next_output = output;
+    size_t input_left = (size_t) input_length;
+    size_t output_left = (size_t) output_length;
+    int status = -1;
+    for (unsigned turn = 0; turn < 4096u; turn++) {
+        if (!tilefinch_font_woff2_cooperate(
+                (FT_ULong) ((size_t) output_length - output_left))) break;
+        size_t available_input = input_left < 16384u ? input_left : 16384u;
+        size_t available_output = output_left < 16384u ? output_left : 16384u;
+        size_t supplied_input = available_input, supplied_output = available_output;
+        BrotliDecoderResult result = BrotliDecoderDecompressStream(decoder,
+            &available_input, &next_input, &available_output, &next_output, NULL);
+        size_t consumed = supplied_input - available_input;
+        size_t produced = supplied_output - available_output;
+        input_left -= consumed;
+        output_left -= produced;
+        if (result == BROTLI_DECODER_RESULT_SUCCESS) {
+            if (input_left == 0 && output_left == 0) status = 0;
+            break;
+        }
+        if (result == BROTLI_DECODER_RESULT_ERROR
+            || (consumed == 0 && produced == 0)
+            || (result == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT && input_left == 0)
+            || (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT && output_left == 0))
+            break;
+    }
+    BrotliDecoderDestroyInstance(decoder);
+    return status;
+}
+#endif
 typedef struct {
     Budget *budget;
     size_t current_bytes;
@@ -166,6 +241,12 @@ typedef struct {
        pixel height (a chrome cache fill, a text run) pays FT_Set_Char_Size
        once rather than per glyph. Zero until first set. */
     int selected_pixel_height_fixed;
+    /* Exact advances from the ordinary outline loader, at the selected size.
+       Avoid loading outlines repeatedly just to measure ASCII prose. */
+    int ascii_advances[128];
+    uint32_t ascii_advance_valid[4];
+    unsigned references;
+    bool cache_ascii_advances;
 } FreeTypeWebFace;
 
 static void *freetype_allocate(FT_Memory memory, long size)
@@ -226,6 +307,11 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
     FreeTypeWebFace *state = budget_calloc(budget, 1, sizeof(*state));
     if (state == NULL) return false;
     state->budget = budget;
+    state->references = 1;
+    state->cache_ascii_advances = true;
+#ifndef __PSP__
+    state->cache_ascii_advances = !tilefinch_test_faults()->legacy_web_font_work;
+#endif
     state->maximum_bytes = maximum_backend_bytes;
     state->memory.user = state;
     state->memory.alloc = freetype_allocate;
@@ -236,8 +322,9 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
         return false;
     }
     FT_Add_Default_Modules(state->library);
-    if (FT_New_Memory_Face(state->library, data, (FT_Long) data_length, 0,
-                           &state->face) != 0
+    FT_Error open_error = FT_New_Memory_Face(state->library, data, (FT_Long) data_length, 0,
+                           &state->face);
+    if (open_error != 0
         || !FT_IS_SCALABLE(state->face) || !FT_HAS_HORIZONTAL(state->face)
         || state->face->num_glyphs <= 0 || state->face->num_glyphs > 65535
         || state->face->units_per_EM < 16
@@ -252,7 +339,8 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
         .data_length = data_length,
         .implementation = state,
         .backend = FONT_FACE_BACKEND_FREETYPE_WEB,
-        .loaded = true
+        .loaded = true,
+        .serial = font_next_generation()
     };
     return true;
 }
@@ -272,6 +360,17 @@ bool font_face_load_encoded(FontFace *face, Budget *budget,
             || read_be32(data + 4) != SFNT_TRUETYPE_SIGNATURE
             || read_be32(data + 8) != length
             || read_be32(data + 16) > maximum_backend_bytes) return false;
+#ifdef TILEFINCH_HAVE_BOUNDED_WOFF2
+    } else if (signature == WOFF2_SIGNATURE) {
+        if (length < 48u || read_be32(data + 4) != SFNT_TRUETYPE_SIGNATURE
+            || read_be32(data + 8) != length || data[14] != 0 || data[15] != 0
+            || ((unsigned) data[12] << 8 | data[13]) == 0
+            || ((unsigned) data[12] << 8 | data[13]) > 256u
+            || read_be32(data + 16) < 12u
+            || read_be32(data + 16) > maximum_backend_bytes
+            || read_be32(data + 20) == 0
+            || read_be32(data + 20) > length - 48u) return false;
+#endif
     } else if (signature != SFNT_TRUETYPE_SIGNATURE
                || length > maximum_backend_bytes) {
         return false;
@@ -285,6 +384,64 @@ bool font_face_load_encoded(FontFace *face, Budget *budget,
     budget_free(budget, encoded);
 #endif
     return false;
+}
+
+size_t font_face_backend_bytes(const FontFace *face)
+{
+    if (face == NULL || face->budget == NULL || !face->loaded
+        || face->implementation == NULL) return 0;
+    size_t bytes = budget_usable_size(face->implementation);
+#ifdef TILEFINCH_HAVE_FREETYPE
+    if (face->backend == FONT_FACE_BACKEND_FREETYPE_WEB)
+        bytes += ((const FreeTypeWebFace *) face->implementation)->current_bytes;
+#endif
+    return bytes;
+}
+
+size_t font_face_cached_ascii_advances(const FontFace *face)
+{
+    size_t count = 0;
+#ifdef TILEFINCH_HAVE_FREETYPE
+    if (face != NULL && face->loaded
+        && face->backend == FONT_FACE_BACKEND_FREETYPE_WEB
+        && face->implementation != NULL) {
+        const FreeTypeWebFace *state = face->implementation;
+        for (unsigned at = 0; at < 128; at++)
+            count += (state->ascii_advance_valid[at >> 5] >> (at & 31u)) & 1u;
+    }
+#else
+    (void) face;
+#endif
+    return count;
+}
+
+bool font_face_share_encoded(FontFace *destination, const FontFace *source,
+    Budget *budget, const unsigned char *data, size_t length,
+    size_t maximum_backend_bytes)
+{
+#ifdef TILEFINCH_HAVE_FREETYPE
+#ifndef __PSP__
+    if (tilefinch_test_faults()->legacy_web_font_work) return false;
+#endif
+    if (destination == NULL || source == NULL || budget == NULL || data == NULL
+        || destination->loaded || destination->data != NULL
+        || destination->implementation != NULL || !source->loaded
+        || source->budget != budget || source->backend != FONT_FACE_BACKEND_FREETYPE_WEB
+        || source->implementation == NULL || source->data == NULL
+        || source->data_length != length) return false;
+    FreeTypeWebFace *state = source->implementation;
+    if (state->maximum_bytes != maximum_backend_bytes || state->references == 0
+        || state->references >= TILEFINCH_WEB_FONT_FAMILY_LIMIT * TILEFINCH_WEB_FONT_WEIGHT_LIMIT
+        || memcmp(source->data, data, length) != 0) return false;
+    state->references++;
+    *destination = *source;
+    destination->serial = font_next_generation();
+    return true;
+#else
+    (void) destination; (void) source; (void) budget; (void) data;
+    (void) length; (void) maximum_backend_bytes;
+    return false;
+#endif
 }
 
 bool font_set_load(FontSet *fonts, Budget *budget,
@@ -381,9 +538,16 @@ bool font_set_load_selected(
 void font_face_destroy(FontFace *face)
 {
     if (face == NULL) return;
+    if (face->loaded) (void) font_next_generation();
     if (face->budget != NULL) {
         if (face->backend == FONT_FACE_BACKEND_FREETYPE_WEB) {
 #ifdef TILEFINCH_HAVE_FREETYPE
+            FreeTypeWebFace *state = face->implementation;
+            if (state != NULL && state->references > 1) {
+                state->references--;
+                memset(face, 0, sizeof(*face));
+                return;
+            }
             freetype_web_destroy((FreeTypeWebFace *) face->implementation);
 #endif
         } else {
@@ -410,8 +574,8 @@ void web_font_set_destroy(WebFontSet *fonts)
 {
     if (fonts == NULL) return;
     for (size_t i = 0; i < TILEFINCH_WEB_FONT_FAMILY_LIMIT; i++) {
-        font_face_destroy(&fonts->families[i].bold);
-        font_face_destroy(&fonts->families[i].regular);
+        for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++)
+            font_face_destroy(&fonts->families[i].faces[face]);
     }
     memset(fonts, 0, sizeof(*fonts));
 }
@@ -457,9 +621,8 @@ FontFamily font_context_metric_family(
     unsigned slot = font_family_web_slot(family);
     if (web_fonts != NULL && slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) {
         const WebFontFamilyFaces *faces = &web_fonts->families[slot];
-        if (face == &faces->regular || face == &faces->bold) {
-            return FONT_SANS;
-        }
+        for (size_t at = 0; at < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; at++)
+            if (face == &faces->faces[at]) return FONT_SANS;
     }
     return font_family_web_fallback(family);
 }
@@ -468,13 +631,47 @@ const FontFace *font_context_face_variant(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
     bool italic, bool bold)
 {
+    return font_context_face_at_weight(fonts, web_fonts, family, italic,
+                                       bold, bold ? 700u : 400u);
+}
+
+/* CSS Fonts 4: the 400..500 interval searches upwards through 500, then
+   downwards, then above 500. Other weights search toward their outer edge
+   before reversing direction. Scores preserve that ordering exactly. */
+static unsigned font_weight_rank(unsigned requested, unsigned candidate)
+{
+    if (requested >= 400 && requested <= 500) {
+        if (candidate >= requested && candidate <= 500)
+            return candidate - requested;
+        return candidate < requested ? 1000u + requested - candidate
+            : 2000u + candidate - requested;
+    }
+    if (requested < 400)
+        return candidate <= requested ? requested - candidate
+            : 1000u + candidate - requested;
+    return candidate >= requested ? candidate - requested
+        : 1000u + requested - candidate;
+}
+
+const FontFace *font_context_face_at_weight(
+    const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
+    bool italic, bool bold, unsigned weight)
+{
     if (font_family_is_web(family)) {
         unsigned slot = font_family_web_slot(family);
         if (web_fonts != NULL && slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) {
             const WebFontFamilyFaces *faces = &web_fonts->families[slot];
-            if (bold && faces->bold.loaded) return &faces->bold;
-            if (faces->regular.loaded) return &faces->regular;
-            if (faces->bold.loaded) return &faces->bold;
+            const FontFace *selected = NULL;
+            unsigned rank = UINT_MAX;
+            for (size_t at = 0; at < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; at++) {
+                if (!faces->faces[at].loaded) continue;
+                unsigned declared = faces->weights[at];
+                if (declared == 0) declared = at == 1 ? 700u : 400u;
+                unsigned score = font_weight_rank(weight, declared);
+                if (score < rank) { rank = score; selected = &faces->faces[at]; }
+                if (rank == 0) break;
+            }
+            if (selected != NULL) return selected;
         }
         family = font_family_web_fallback(family);
     }
@@ -492,6 +689,7 @@ bool font_context_face_is_bold(
     const FontFace *face)
 {
     if (face == NULL) return false;
+    if (face->authored_weight != 0) return face->authored_weight >= 600;
     if (web_fonts != NULL) {
         for (size_t i = 0; i < TILEFINCH_WEB_FONT_FAMILY_LIMIT; i++) {
             if (face == &web_fonts->families[i].bold) return true;
@@ -597,9 +795,11 @@ static bool freetype_set_pixel_height_fixed(FreeTypeWebFace *state,
     if (FT_Set_Char_Size(state->face, 0, (FT_F26Dot6) pixel_height_fixed,
                          72, 72) != 0) {
         state->selected_pixel_height_fixed = 0;
+        memset(state->ascii_advance_valid, 0, sizeof(state->ascii_advance_valid));
         return false;
     }
     state->selected_pixel_height_fixed = pixel_height_fixed;
+    memset(state->ascii_advance_valid, 0, sizeof(state->ascii_advance_valid));
     return true;
 }
 
@@ -1021,6 +1221,7 @@ bool font_optional_glyph_provider_install(TilefinchGlyphProvider *provider)
 {
     if (provider == NULL || (optional_glyph_provider != NULL
         && optional_glyph_provider != provider)) return false;
+    if (optional_glyph_provider != provider) (void) font_next_generation();
     optional_glyph_provider = provider;
     return true;
 }
@@ -1028,6 +1229,7 @@ bool font_optional_glyph_provider_install(TilefinchGlyphProvider *provider)
 bool font_optional_glyph_provider_uninstall(TilefinchGlyphProvider *provider)
 {
     if (provider == NULL || optional_glyph_provider != provider) return false;
+    (void) font_next_generation();
     optional_glyph_provider = NULL;
     return true;
 }
@@ -1661,9 +1863,21 @@ int font_text_width_at_size_fixed_mode(
                     width += delta.x;
                 }
             }
-            if (FT_Load_Glyph(freetype->face, glyph,
-                              freetype_outline_load_flags()) != 0) return -1;
-            width += freetype->face->glyph->advance.x + (bold ? 22 : 0);
+            uint32_t bit = UINT32_C(1) << (codepoint & 31u);
+            int advance;
+            if (freetype->cache_ascii_advances && codepoint < 128u
+                && (freetype->ascii_advance_valid[codepoint >> 5] & bit) != 0) {
+                advance = freetype->ascii_advances[codepoint];
+            } else {
+                if (FT_Load_Glyph(freetype->face, glyph,
+                                  freetype_outline_load_flags()) != 0) return -1;
+                advance = (int) freetype->face->glyph->advance.x;
+                if (freetype->cache_ascii_advances && codepoint < 128u) {
+                    freetype->ascii_advances[codepoint] = advance;
+                    freetype->ascii_advance_valid[codepoint >> 5] |= bit;
+                }
+            }
+            width += advance + (bold ? 22 : 0);
             if (width > INT_MAX) return INT_MAX;
             if (width < INT_MIN) return INT_MIN;
             previous = glyph;

@@ -105,6 +105,77 @@
     document_destroy(&collapsed_document);
     CHECK(budget.current == 0);
 
+    puts("test: middle-aligned inline fragments retain the line-box baseline");
+    static const char middle_menu[] =
+        "<!doctype html><style>@font-face{font-family:Icons;src:url(icon.ttf)}"
+        "body{margin:0;font-size:16px;line-height:32px;font-weight:700}"
+        "nav{white-space:nowrap}ul{list-style:none;margin:0;padding:0}li{display:inline-block}"
+        "a{display:inline-block;height:32px;padding:9px 15px}"
+        ".label,.icon{vertical-align:middle}.icon{font-size:25px;font-family:Icons;font-weight:400}"
+        ".icon:before{content:'X';font-size:25px;line-height:1}"
+        "</style><nav><ul><li><a id=middle-home href=a><span class=icon></span></a></li>"
+        "<li><a id=middle-topic href=b><span class=label>Topics</span> <span class=icon></span></a></li>"
+        "<li><a id=middle-news href=c><span class=label>News</span></a></li></ul></nav>";
+    PocDocument middle_document;
+    Stylesheet middle_sheet;
+    LayoutDocument middle_layout;
+    FontSet middle_fonts;
+    CHECK(font_set_load(&middle_fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+        TILEFINCH_TEST_SERIF_FONT, TILEFINCH_TEST_SANS_ITALIC_FONT,
+        TILEFINCH_TEST_SANS_BOLD_FONT, TILEFINCH_TEST_SERIF_BOLD_FONT,
+        TILEFINCH_TEST_METRIC_SANS_FONT, TILEFINCH_TEST_METRIC_SANS_BOLD_FONT,
+        2 * MIB));
+    CHECK(document_parse(&middle_document, &budget, middle_menu,
+                         strlen(middle_menu), 19)
+          && stylesheet_build(&middle_sheet, &budget, &middle_document, 480));
+    /* Generated text uses an independently owned face with different
+       metrics, as an icon font would. */
+    FontFace *middle_icon = stylesheet_web_font_face(&middle_sheet, 0, false);
+    CHECK(middle_icon != NULL && font_face_load_encoded(middle_icon, &budget,
+        middle_fonts.serif.data, middle_fonts.serif.data_length, 2 * MIB));
+    CHECK(layout_build(&middle_layout, &budget, &middle_document,
+                       &middle_sheet, &middle_fonts, NULL, 480));
+    lxb_dom_node_t *middle_root = lxb_dom_interface_node(middle_document.html);
+    const LayoutNodeBox *middle_home = layout_box_for_node(
+        &middle_layout, find_id(middle_root, "middle-home"));
+    const LayoutNodeBox *middle_topic = layout_box_for_node(
+        &middle_layout, find_id(middle_root, "middle-topic"));
+    const LayoutNodeBox *middle_news = layout_box_for_node(
+        &middle_layout, find_id(middle_root, "middle-news"));
+    CHECK(middle_home != NULL && middle_topic != NULL && middle_news != NULL);
+    CHECK(middle_home->y == middle_topic->y && middle_topic->y == middle_news->y);
+    CHECK(middle_home->height == 50 && middle_topic->height == 50
+          && middle_news->height == 50);
+    layout_destroy(&middle_layout);
+    stylesheet_destroy(&middle_sheet);
+    document_destroy(&middle_document);
+    puts("test: empty icon buttons synthesize a content-edge baseline");
+    static const char empty_button_page[] =
+        "<!doctype html><style>body{margin:0;font:16px/24px sans-serif}"
+        "#header{display:flex;align-items:center;padding:16px 0}"
+        "#slot{flex:1}button{display:inline-block;border:0;padding:4px;"
+        "font:inherit}button>i{display:block;width:22px;height:22px}"
+        "#logo{width:32px;height:32px}</style><body><div id=header>"
+        "<div id=slot><button id=icon><i></i></button></div>"
+        "<div id=logo></div></div></body>";
+    CHECK(document_parse(&middle_document, &budget, empty_button_page,
+                         strlen(empty_button_page), 19)
+          && stylesheet_build(&middle_sheet, &budget, &middle_document, 480)
+          && layout_build(&middle_layout, &budget, &middle_document,
+                          &middle_sheet, &middle_fonts, NULL, 480));
+    middle_root = lxb_dom_interface_node(middle_document.html);
+    const LayoutNodeBox *empty_button = layout_box_for_node(&middle_layout,
+        find_id(middle_root, "icon"));
+    const LayoutNodeBox *empty_header = layout_box_for_node(&middle_layout,
+        find_id(middle_root, "header"));
+    CHECK(empty_button && empty_header && empty_button->height == 30
+          && empty_header->height <= 65);
+    layout_destroy(&middle_layout);
+    stylesheet_destroy(&middle_sheet);
+    document_destroy(&middle_document);
+    font_set_destroy(&middle_fonts);
+    CHECK(budget.current == 0);
+
     puts("test: inline button faces and authored horizontal rules retain box geometry");
     static const char face_rule_page[] =
         "<!doctype html><style>body{margin:0;font-size:14px}"

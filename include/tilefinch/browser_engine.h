@@ -69,8 +69,11 @@
    request's. */
 #define BROWSER_PSP_APP_NAVIGATION_TIMEOUT_MS 30000L
 #define BROWSER_PSP_APP_NETWORK_TIMEOUT_MS 15000L
-#define BROWSER_PSP_APP_STYLESHEETS 24u
-#define BROWSER_PSP_APP_STYLESHEET_BYTES (2112u * 1024u)
+/* Match the existing bounded document ledger, including late component
+   chunks. These are request/input ceilings; parse admission still reserves
+   layout headroom inside the unchanged shared page Budget. */
+#define BROWSER_PSP_APP_STYLESHEETS 32u
+#define BROWSER_PSP_APP_STYLESHEET_BYTES (3u * 1024u * 1024u)
 #define BROWSER_PSP_APP_STYLESHEET_FILE_BYTES (768u * 1024u)
 #define BROWSER_PSP_APP_IMAGES 24u
 #define BROWSER_PSP_APP_IMAGE_BYTES (1536u * 1024u)
@@ -118,6 +121,7 @@ typedef struct {
 typedef struct {
     bool enabled;
     bool web_fonts_enabled;
+    WebFontMode web_font_mode;
     size_t maximum_stylesheets;
     size_t maximum_stylesheet_bytes;
     size_t maximum_stylesheet_file_bytes;
@@ -435,6 +439,7 @@ const BrowserConfig *browser_engine_config(const BrowserEngine *engine);
    realm. Callers arm immediately before committing an offline app's
    document and disarm right after, so the floor can only reach that app. */
 void browser_engine_arm_installed_app_heap(BrowserEngine *engine, bool armed);
+bool browser_engine_set_web_font_mode(BrowserEngine *engine, WebFontMode mode);
 bool browser_engine_set_javascript_enabled(
     BrowserEngine *engine, bool enabled);
 const char *browser_engine_last_error(const BrowserEngine *engine);
@@ -877,7 +882,8 @@ typedef enum {
 /*
  * Prepare at most maximum_units expensive tiles and publish the completed
  * frame only after all selected resident tiles are ready. Repeated calls are
- * latest-wins when scroll or layout state changes.
+ * latest-wins when scroll or layout state changes. Zero units checks cached
+ * tiles only: a warm frame completes, while a cold frame remains pending.
  */
 BrowserRenderJobStatus browser_engine_render_frame_bounded(
     BrowserEngine *engine, uint64_t budget_us, size_t maximum_units);

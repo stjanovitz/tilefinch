@@ -2412,7 +2412,8 @@ BrowserSharedBody *browser_shared_body_take(Budget *budget,
         .budget = budget,
         .data = data,
         .length = length,
-        .references = 1
+        .references = 1,
+        .serial = budget->next_sequence
     };
     return body;
 }

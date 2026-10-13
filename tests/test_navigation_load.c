@@ -415,7 +415,7 @@ static bool test_progressive_preview_is_bounded_and_transient(void)
                &navigation, capture_progressive_preview, &probe)
         && progressive_preview_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -514,7 +514,7 @@ static bool test_progressive_preview_waits_for_external_visuals(void)
                &navigation, capture_progressive_preview, &probe)
         && progressive_visual_readiness_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -1315,6 +1315,7 @@ static bool test_static_images_retry_after_transient_idle_failure(void)
         html, sizeof(html) - 1u, 480, NULL, NULL, true);
     size_t relayouts_before = navigation.performance.fast_relayouts
         + navigation.performance.full_relayouts;
+    size_t publications_before = navigation.incremental_relayouts;
     bool first_frame = committed && navigation.page.loaded
         && navigation.performance.static_image_layout_adoptions == 0
         && navigation.page.images.stats.loaded == 1
@@ -1355,10 +1356,11 @@ static bool test_static_images_retry_after_transient_idle_failure(void)
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 2
         && navigation.performance.background_images_loaded == 1
-        && navigation.performance.background_image_relayouts == 1
+        && navigation.performance.background_image_relayouts == 0
         && navigation.performance.background_image_failures == 1
         && navigation.performance.background_image_rank_scans == 2
-        && relayouts_after == relayouts_before + 1
+        && relayouts_after == relayouts_before
+        && navigation.incremental_relayouts == publications_before + 1
         && pumps >= 10u;
     if (!ok) {
         fprintf(stderr,
@@ -1390,13 +1392,20 @@ static bool test_static_images_retry_after_transient_idle_failure(void)
     return ok && clean;
 }
 
-static bool test_visible_lazy_static_image_waits_until_idle(void)
+static bool test_visible_lazy_static_image_variant(bool inline_icon)
 {
-    static const char html[] =
+    static const char plain[] =
         "<!doctype html><title>Lazy image</title>"
         "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
         "</style><body><h1>Results</h1><a href=/play>"
         "<img loading=lazy src=/hero.svg>Play this result</a></body>";
+    static const char with_icon[] =
+        "<!doctype html><title>Lazy image with an icon</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><h1>Results</h1><a href=/play>"
+        "<img loading=lazy src=/hero.svg>Play this result</a>"
+        "<svg width=20 height=20 viewBox='0 0 20 20'><circle cx=10 cy=10 r=8 fill='#abc'/></svg></body>";
+    const char *html = inline_icon ? with_icon : plain;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -1411,12 +1420,14 @@ static bool test_visible_lazy_static_image_waits_until_idle(void)
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
     bool committed = ready && navigation_commit_static_html(
         &navigation, generation, "https://deferred-images.test/page",
-        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+        html, strlen(html), 480, NULL, NULL, true);
+    FetchTraceReplayStats replay = {0};
     bool ok = committed && navigation.page.loaded
-        && navigation.page.images.stats.loaded == 0
+        && navigation.page.images.stats.loaded == (inline_icon ? 1u : 0u)
         && navigation.page.deferred_image_count == 1
-        && navigation.performance.static_image_layout_adoptions == 1
+        && navigation.performance.static_image_layout_adoptions == (inline_icon ? 0u : 1u)
         && navigation.page.deferred_image_cursor == 0
+        && fetch_trace_replay_stats(&replay) && replay.request_count == 0
         && navigation_background_resources_pending(&navigation);
     /* Moving the planning layout must preserve final pixels and geometry,
        not merely save a counted build. Compare against a fresh full build. */
@@ -1461,6 +1472,12 @@ static bool test_visible_lazy_static_image_waits_until_idle(void)
         && budget_categories_reconcile(&budget);
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+static bool test_visible_lazy_static_image_waits_until_idle(void)
+{
+    return test_visible_lazy_static_image_variant(false)
+        && test_visible_lazy_static_image_variant(true);
 }
 
 static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
@@ -1525,7 +1542,8 @@ static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 2
         && navigation.performance.background_images_loaded == 2
-        && navigation.performance.background_image_relayouts == 1;
+        && navigation.performance.background_image_relayouts == 0
+        && navigation.incremental_relayouts == 1;
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0
@@ -2108,7 +2126,8 @@ static bool test_failed_visible_image_retries_after_first_paint(void)
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 2
         && navigation.performance.background_images_loaded == 2
-        && navigation.performance.background_image_relayouts == 2
+        && navigation.performance.background_image_relayouts == 0
+        && navigation.incremental_relayouts == 2
         && navigation.performance.background_image_failures == 0;
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
@@ -4169,7 +4188,7 @@ static bool test_resource_scheduler_refusal_is_not_script_degradation(void)
     return ok && clean;
 }
 
-static bool test_streaming_preview_pressure_preserves_final_commit(void)
+static bool test_streaming_preview_pressure_preserves_final_commit_counted(void)
 {
     Budget budget;
     budget_init(&budget, 16 * MIB);
@@ -4182,7 +4201,7 @@ static bool test_streaming_preview_pressure_preserves_final_commit(void)
                &navigation, capture_progressive_preview, &probe)
         && streaming_preview_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -4257,6 +4276,14 @@ static bool test_streaming_preview_pressure_preserves_final_commit(void)
     return ok && clean;
 }
 
+static bool test_streaming_preview_pressure_preserves_final_commit(void)
+{
+    /* This verifies Budget pressure, not elapsed-time refusal. Host
+       preemption must not shed optional work before the pressure injection. */
+    return run_on_counting_clock(
+        test_streaming_preview_pressure_preserves_final_commit_counted);
+}
+
 typedef struct {
     uint64_t frame_hash;
     size_t command_count;
@@ -4306,7 +4333,7 @@ static bool capture_streaming_final_snapshot(
                &navigation, capture_progressive_preview, &probe)
         && streaming_preview_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -4382,7 +4409,7 @@ static bool test_streaming_preview_skips_inert_prefix_layout(void)
         && streaming_preview_empty_replay_begin();
     bool ready = replay_started;
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -4523,7 +4550,7 @@ static bool test_streaming_stylesheet_follows_late_viewport(void)
         && navigation_init(&navigation, &budget, 4)
         && viewport_after_stylesheet_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -4600,7 +4627,7 @@ static bool test_streaming_preview_rejects_incomplete_external_css(void)
                &navigation, capture_progressive_preview, &probe)
         && streaming_preview_css_failure_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -4675,7 +4702,7 @@ static bool test_streaming_preview_cancel_is_transient(void)
                &navigation, capture_progressive_preview, &probe)
         && streaming_preview_replay_begin();
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(

@@ -1462,8 +1462,7 @@ static bool synchronize_dom_focus(BrowserController *controller,
        focus handlers or focus styling mutate that borrowed DOM. Do not move
        scroll or dispatch events reentrantly at this presentation boundary. */
     controller->has_authored_focus_outline = false;
-    if (navigation->page.runtime != NULL
-        && !tilefinch_platform_cooperate("page-focus-feedback", 1)) return false;
+    if (!tilefinch_platform_cooperate("page-focus-feedback", 1)) return false;
     if (navigation->page.runtime != NULL) {
         /*
          * Focus movement is a user-agent operation. A page-realm failure
@@ -2431,6 +2430,18 @@ size_t controller_select_history(lxb_dom_node_t *select, char *state,
             state[at] = controller_option_selected(options[at]) ? '1' : '0';
         return count;
     }
+    bool changed = false;
+    for (size_t at = 0; at < count; at++) {
+        if (state[at] != '0' && state[at] != '1') return SIZE_MAX;
+        size_t n = 0;
+        const char *marker = document_attribute(options[at], "data-tilefinch-option-selected", &n);
+        if (marker != NULL && !((n == 4 && !memcmp(marker, "true", 4))
+            || (n == 5 && !memcmp(marker, "false", 5)))) return SIZE_MAX;
+        changed |= controller_option_selected(options[at]) != (state[at] == '1');
+    }
+    /* A successful history no-op must not allocate selectedness markers or
+       force the caller to rebuild an already-correct label and focus map. */
+    if (!changed) return 0;
     return controller_select_apply(options, count, state, previous) ? count : SIZE_MAX;
 }
 

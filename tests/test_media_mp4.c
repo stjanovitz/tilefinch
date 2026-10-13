@@ -2214,6 +2214,18 @@ int main(void)
         .maximum_packet_bytes = 16,
         .preallocate_maximum_packet_bytes = true
     };
+    size_t playback_owned_before = budget.current;
+    for (size_t refusal = 0u; refusal < 2u; refusal++) {
+        size_t failures_before = budget.injected_failure_count;
+        budget_inject_failure_after(&budget, refusal);
+        MediaPlayback *denied = media_playback_create(
+            &budget, demux, &backend, &playback_options,
+            error, sizeof(error));
+        budget_clear_failure_injection(&budget);
+        CHECK(denied == NULL
+              && budget.injected_failure_count == failures_before + 1u
+              && budget.current == playback_owned_before);
+    }
     MediaPlayback *playback = media_playback_create(
         &budget, demux, &backend, &playback_options,
         error, sizeof(error));

@@ -33,6 +33,7 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_BROWSER_UI_SCALE: return "browser-ui-scale";
         case PSP_UI_SETTING_PAGE_FONT_PERCENT: return "page-font-percent";
         case PSP_UI_SETTING_READER_FONT: return "reader-font";
+        case PSP_UI_SETTING_WEB_FONTS: return "web-fonts";
         case PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE:
             return "remember-reader-site-scale";
         case PSP_UI_SETTING_READER_AUTO_MODE: return "reader-auto-mode";
@@ -74,6 +75,7 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
             return "youtube-audio-only";
         case PSP_UI_SETTING_VIDEO_SCALING: return "video-scaling";
+        case PSP_UI_SETTING_ROTATE_HINT_ALWAYS: return "rotate-hint-always";
         case PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING:
             return "video-startup-buffering";
         case PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS:
@@ -294,6 +296,23 @@ static bool script_parse_line(
     unsigned long count = 0;
     uint32_t buttons = 0;
     PspInputScriptStep *step = NULL;
+
+    if (strcmp(command, "tap-after") == 0) {
+        if (!advance_while_busy || field_count != 3u
+            || !script_positive_count(fields[1], &count)
+            || !script_parse_buttons(fields[2], &buttons)) {
+            *reason = "tap-after-live needs a delay in milliseconds and buttons";
+            return false;
+        }
+        step = script_push(script);
+        if (step == NULL) { *reason = "too many steps"; return false; }
+        step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_TIMED_PRESS;
+        step->advance_while_busy = true;
+        step->ticks = 2u;
+        step->delay_ms = (uint16_t) count;
+        step->buttons = (uint16_t) buttons;
+        return true;
+    }
 
     if (strcmp(command, "wait") == 0 || strcmp(command, "until") == 0) {
         bool until = command[0] == 'u';
@@ -538,6 +557,14 @@ void psp_input_script_interrupt(PspInputScript *script)
     script->mark = NULL;
 }
 
+bool psp_input_script_eof_pending(const PspInputScript *script)
+{
+    return script != NULL && script->armed && !script->finished
+        && (script->step >= script->step_count
+            || (script->step_remaining == 0u
+                && (size_t) script->step + 1u >= script->step_count));
+}
+
 const char *psp_input_script_mark(const PspInputScript *script)
 {
     return script == NULL ? NULL : script->mark;
@@ -599,9 +626,12 @@ bool psp_input_script_advance_with_page(
     }
     if (script == NULL) return false;
     script->mark = NULL;
+    script->pressed_us = 0;
     if (!script->armed || script->finished) return false;
     while (script->step < script->step_count && script->step_remaining == 0u) {
         script->step++;
+        script->step_due_us = script->next_step_due_us;
+        script->next_step_due_us = 0;
         if (script->step < script->step_count)
             script->step_remaining = script->steps[script->step].ticks;
     }
@@ -611,6 +641,15 @@ bool psp_input_script_advance_with_page(
         return false;
     }
     const PspInputScriptStep *step = &script->steps[script->step];
+    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_TIMED_PRESS
+        && script->step_remaining == 2u) {
+        if (script->step_due_us == 0u) {
+            uint64_t delay = (uint64_t) step->delay_ms * 1000u;
+            script->step_due_us = delay > UINT64_MAX - script->now_us
+                ? UINT64_MAX : script->now_us + delay;
+        }
+        if (script->now_us < script->step_due_us) return true;
+    }
     if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_UNTIL
         && script->condition_met && script->step_remaining > 1u)
         script->step_remaining = 1u;
@@ -648,7 +687,8 @@ bool psp_input_script_advance_with_page(
     bool holding = step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_HOLD
         || (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANALOG
             && step->buttons != 0);
-    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PRESS) {
+    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PRESS
+        || step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_TIMED_PRESS) {
         /* Frames run down from an even total, so an even remainder is the
            held half and the following odd remainder releases it. */
         holding = (script->step_remaining % 2u) == 0u;
@@ -656,6 +696,9 @@ bool psp_input_script_advance_with_page(
     if (holding && input != NULL) {
         input->held = step->buttons;
         input->pressed = step->buttons & ~previous_buttons;
+        if (input->pressed != 0
+            && step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_TIMED_PRESS)
+            script->pressed_us = script->step_due_us;
         script->held_ticks++;
         if (!ready && input->pressed != 0) script->busy_press_edges++;
     }
@@ -667,5 +710,14 @@ bool psp_input_script_advance_with_page(
     if (!ready) script->busy_ticks++;
     script->step_remaining--;
     script->ticks++;
+    if (script->step_remaining == 0u && script->step + 1u < script->step_count
+        && script->steps[script->step + 1u].kind
+               == (uint8_t) PSP_INPUT_SCRIPT_STEP_TIMED_PRESS) {
+        /* Arm before returning to owner work. Waiting until the next poll
+           would exclude exactly the busy interval this probe measures. */
+        uint64_t delay = (uint64_t) script->steps[script->step + 1u].delay_ms * 1000u;
+        script->next_step_due_us = delay > UINT64_MAX - script->now_us
+            ? UINT64_MAX : script->now_us + delay;
+    }
     return true;
 }

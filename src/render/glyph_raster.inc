@@ -178,6 +178,7 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
     for (size_t i = begin; i < end; i++) {
         GlyphCacheEntry *entry = &cache->glyph_cache[i];
         if (entry->valid && entry->face == face
+            && entry->face_serial == (face == NULL ? 0 : face->serial)
             && entry->codepoint == codepoint
             && entry->pixel_height == pixel_height && entry->bold == bold
             && entry->humanist_profile == humanist_profile) {
@@ -225,6 +226,7 @@ static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
     if (cache->glyph_cache[slot].valid) glyph_cache_evict(cache, slot);
     GlyphCacheEntry *entry = &cache->glyph_cache[slot];
     entry->face = face;
+    entry->face_serial = face == NULL ? 0 : face->serial;
     entry->codepoint = codepoint;
     entry->pixel_height = pixel_height;
     entry->bold = bold;
@@ -388,17 +390,18 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                     const DrawCommand *command)
 {
     bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_variant(
+    const FontFace *face = font_context_face_at_weight(
         cache->layout->fonts, cache->layout->web_fonts,
         draw_command_font_family(command), draw_command_font_italic(command),
-        bold_face);
+        bold_face, draw_command_font_weight(command));
     if (face == NULL) return;
     bool synthetic_italic = draw_command_font_italic(command)
-        && face == font_context_face_variant(
+        && face == font_context_face_at_weight(
             cache->layout->fonts, cache->layout->web_fonts,
-            draw_command_font_family(command), false, bold_face);
+            draw_command_font_family(command), false, bold_face, draw_command_font_weight(command));
     unsigned weight = draw_font_weight(command);
     bool synthetic_bold = weight >= 550u
+        && face->authored_weight != weight
         && (weight < 650u
             || !font_context_face_is_bold(cache->layout->fonts,
                                           cache->layout->web_fonts, face));
@@ -731,10 +734,10 @@ static void rasterize_text_underline(TileCache *cache, RasterTarget *target,
 {
     if (!draw_command_text_has_underline(command)
         || command->width <= 0 || command->height <= 0) return;
-    const FontFace *face = font_context_face_variant(
+    const FontFace *face = font_context_face_at_weight(
         cache->layout->fonts, cache->layout->web_fonts,
         draw_command_font_family(command), draw_command_font_italic(command),
-        draw_uses_bold_face(command));
+        draw_uses_bold_face(command), draw_command_font_weight(command));
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;

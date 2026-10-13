@@ -1306,6 +1306,10 @@
       "Track UList ").trim().split(" ")) {
     const name = "HTML" + stem + "Element",
       constructor = { [name]: class extends HTMLElement {} }[name];
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: name,
+    });
     sharedLayerPrototypes.push(constructor.prototype);
     Object.defineProperty(globalThis, name, {
       configurable: true,
@@ -1445,7 +1449,7 @@
   }
   class HTMLCollection {}
   class Window extends EventTarget {}
-  Object.assign(globalThis, {
+  const domInterfaces = {
     EventTarget,
     Node,
     Attr,
@@ -1503,19 +1507,13 @@
     NodeList,
     HTMLCollection,
     Window,
-  });
-  Object.defineProperty(HTMLDocument.prototype, Symbol.toStringTag, {
-    configurable: true,
-    value: "HTMLDocument",
-  });
-  Object.defineProperty(XMLDocument.prototype, Symbol.toStringTag, {
-    configurable: true,
-    value: "XMLDocument",
-  });
-  Object.defineProperty(Window.prototype, Symbol.toStringTag, {
-    configurable: true,
-    value: "Window",
-  });
+  };
+  for (const [name, constructor] of Object.entries(domInterfaces))
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: name,
+    });
+  Object.assign(globalThis, domInterfaces);
   if (!(globalThis instanceof Window))
     Object.setPrototypeOf(globalThis, Window.prototype);
   /* QuickJS gives its global object an internal `global` class tag which
@@ -2151,7 +2149,7 @@
       writable: true,
       value: { supports(type) {
         type = String(type);
-        return type === "classic" || type === "module";
+        return type === "classic" || type === "module" || type === "importmap";
       } }.supports,
     });
   }
@@ -2821,6 +2819,10 @@
     set: () => {},
   };
   Object.defineProperties(Document.prototype, {
+    firstElementChild: {
+      configurable: true, enumerable: true,
+      get() { return this.documentElement || null; },
+    },
     parentNode: documentNull,
     parentElement: documentNull,
     previousSibling: documentNull,
@@ -4362,40 +4364,27 @@
     },
     get clientWidth() {
       if (this === document.documentElement) return innerWidth;
-      const style = getComputedStyle(this),
-        width = parseFloat(style.width),
-        left =
-          parseFloat(style.getPropertyValue("padding-left")) ||
-          parseFloat(style.padding) ||
-          0,
-        right =
-          parseFloat(style.getPropertyValue("padding-right")) ||
-          parseFloat(style.padding) ||
-          0;
+      const geometry = this.__tilefinchGeometryValue();
+      /* The retained client box already includes padding and excludes
+         borders. Used CSS widths may be border-box sizes; adding padding
+         to them again changes overflow decisions. */
+      if (geometry.retained) return geometry.clientWidth;
+      const style = getComputedStyle(this), width = parseFloat(style.width),
+        left = parseFloat(style.getPropertyValue("padding-left")) || parseFloat(style.padding) || 0,
+        right = parseFloat(style.getPropertyValue("padding-right")) || parseFloat(style.padding) || 0;
       if (Number.isFinite(width) && width > 0)
-        return Math.round(
-          width +
-            (String(this.tagName).toLowerCase() === "input"
-              ? 0
-              : left + right),
-        );
-      return this.__tilefinchGeometryValue().clientWidth;
+        return Math.round(width + (String(this.tagName).toLowerCase() === "input" ? 0 : left + right));
+      return geometry.clientWidth;
     },
     get clientHeight() {
       if (this === document.documentElement) return innerHeight;
-      const style = getComputedStyle(this),
-        height = parseFloat(style.height),
-        top =
-          parseFloat(style.getPropertyValue("padding-top")) ||
-          parseFloat(style.padding) ||
-          0,
-        bottom =
-          parseFloat(style.getPropertyValue("padding-bottom")) ||
-          parseFloat(style.padding) ||
-          0;
-      if (Number.isFinite(height) && height > 0)
-        return Math.round(height + top + bottom);
-      return this.__tilefinchGeometryValue().clientHeight;
+      const geometry = this.__tilefinchGeometryValue();
+      if (geometry.retained) return geometry.clientHeight;
+      const style = getComputedStyle(this), height = parseFloat(style.height),
+        top = parseFloat(style.getPropertyValue("padding-top")) || parseFloat(style.padding) || 0,
+        bottom = parseFloat(style.getPropertyValue("padding-bottom")) || parseFloat(style.padding) || 0;
+      if (Number.isFinite(height) && height > 0) return Math.round(height + top + bottom);
+      return geometry.clientHeight;
     },
     get clientTop() {
       if (this === document.documentElement) return 0;

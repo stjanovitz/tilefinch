@@ -161,6 +161,8 @@ typedef struct BrowserSharedBody {
     unsigned char *data;
     size_t length;
     size_t references;
+    /* Immutable-body lifetime; renderer keys must survive address reuse. */
+    uint64_t serial;
 } BrowserSharedBody;
 
 /* Security provenance for an ECMAScript module representation.  The HTTP

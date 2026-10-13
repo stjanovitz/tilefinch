@@ -93,6 +93,140 @@ typedef struct {
     uint64_t last_us, maximum_gap_us;
 } TextInputProbe;
 
+typedef struct {
+    LayoutDocument *layout;
+    bool early;
+    size_t calls;
+} RangeCheckpointProbe;
+
+static bool range_checkpoint_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    RangeCheckpointProbe *probe = opaque;
+    if (strcmp(phase, "layout-index") != 0) return true;
+    probe->calls++;
+    probe->early = probe->layout->command_flags != NULL
+        && probe->layout->command_flags[probe->layout->count - 1u] == 0;
+    return false;
+}
+
+static int test_spatial_ranges_service_input_before_finishing(Budget *budget)
+{
+    size_t baseline = budget->current;
+    LayoutDocument layout = {.budget = budget, .count = 4096u,
+        .paint_order_count = 4096u, .height = 272};
+    layout.commands = budget_calloc(budget, layout.count, sizeof(*layout.commands));
+    layout.paint_order = budget_calloc(budget, layout.count, sizeof(*layout.paint_order));
+    layout.fixed_ranges = budget_calloc(budget, 1u, sizeof(*layout.fixed_ranges));
+    LayoutContext *context = budget_calloc(budget, 1u, sizeof(*context));
+    CHECK(layout.commands != NULL && layout.paint_order != NULL
+        && layout.fixed_ranges != NULL && context != NULL);
+    layout.fixed_count = 1u;
+    layout.fixed_ranges[0].command_end = layout.count;
+    for (size_t i = 0u; i < layout.count; i++) layout.paint_order[i] = (uint32_t) i;
+    context->layout = &layout;
+    RangeCheckpointProbe probe = {.layout = &layout};
+    TilefinchPlatformServices services = {.context = &probe,
+        .cooperate = range_checkpoint_poll};
+    tilefinch_platform_set_services(&services);
+    bool built = build_spatial_index(&layout, context);
+    tilefinch_platform_set_services(NULL);
+    CHECK(!built && probe.calls == 1u && probe.early && context->cancelled);
+    budget_free(budget, context);
+    layout_destroy(&layout);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+static int test_focus_within_unrelated_branches(Budget *budget)
+{
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    const char *html = "<style>a:focus{outline:2px solid red}"
+        ".field:focus-within{padding:4px}"
+        ".editor .correction:not(:focus-within) .placeholder{display:none}"
+        "</style><a id='outside' href='#'>Outside</a>"
+        "<div class='field'><a id='inside' href='#'>Inside</a></div>"
+        "<div class='editor'><div class='correction'>"
+        "<a id='negated' href='#'>Other</a><span class='placeholder'>Hint</span>"
+        "</div></div>";
+    CHECK(document_parse(&document, budget, html, strlen(html), 31));
+    CHECK(stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const char *ids[] = {"outside", "inside", "negated"};
+    for (size_t i = 0u; i < 3u; i++) {
+        lxb_dom_node_t *node = find_id(root, ids[i]);
+        ComputedStyle normal = {0}, focused = {0};
+        CHECK(node != NULL);
+        StyleFocusChange change = style_focus_change_classify(
+            &sheet, node, NULL, &normal, &focused);
+        CHECK(change == (i == 0u ? STYLE_FOCUS_CHANGE_OUTLINE_ONLY
+                               : STYLE_FOCUS_CHANGE_UNSAFE));
+    }
+    const char *nested = ":where(.field:focus-within *){margin:2px}";
+    CHECK(stylesheet_add_css(&sheet, nested, strlen(nested)));
+    ComputedStyle normal = {0}, focused = {0};
+    CHECK(style_focus_change_classify(&sheet,
+        find_id(root, "outside"), NULL, &normal, &focused)
+        == STYLE_FOCUS_CHANGE_UNSAFE);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+typedef struct { size_t calls, cancel_after; } ScrollExtentProbe;
+
+static bool scroll_extent_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    ScrollExtentProbe *probe = opaque;
+    if (strcmp(phase, "layout-index") != 0) return true;
+    probe->calls++;
+    return probe->cancel_after == 0u || probe->calls < probe->cancel_after;
+}
+
+static int test_scroll_extent_linear_and_interruptible(Budget *budget)
+{
+    size_t baseline = budget->current;
+    LayoutDocument layout = {.budget = budget, .count = 4096u,
+        .node_box_count = 4096u, .height = 4096};
+    layout.commands = budget_calloc(budget, layout.count, sizeof(*layout.commands));
+    layout.command_flags = budget_calloc(budget, layout.count, sizeof(*layout.command_flags));
+    layout.node_boxes = budget_calloc(budget, layout.node_box_count, sizeof(*layout.node_boxes));
+    LayoutContext *context = budget_calloc(budget, 1u, sizeof(*context));
+    CHECK(layout.commands != NULL && layout.command_flags != NULL
+        && layout.node_boxes != NULL && context != NULL);
+    context->layout = &layout;
+    for (size_t i = 0u; i < layout.count; i++) {
+        layout.commands[i].type = DRAW_FILL_RECT;
+        layout.commands[i].x = layout.node_boxes[i].x = (int) (i * 3u);
+        layout.commands[i].width = layout.node_boxes[i].width = 2;
+        layout.node_boxes[i].command_start = i;
+    }
+    ScrollExtentProbe probe = {0};
+    TilefinchPlatformServices services = {.context = &probe,
+        .cooperate = scroll_extent_poll};
+    tilefinch_platform_set_services(&services);
+    int width = root_scroll_width_after_clipping(&layout, 480, context);
+    CHECK(width == 12287 && probe.calls == 96u
+        && layout.layout_work_units == 0u);
+    /* Cancellation after the optional table is constructed returns every
+       scratch byte; the mandatory extent must not be partly published. */
+    size_t loaded = budget->current;
+    layout.node_boxes[0].clips_x = true;
+    probe.calls = 0u;
+    probe.cancel_after = 65u;
+    (void) root_scroll_width_after_clipping(&layout, 480, context);
+    CHECK(context->cancelled && probe.calls == 65u && budget->current == loaded);
+    tilefinch_platform_set_services(NULL);
+    budget_free(budget, context);
+    layout_destroy(&layout);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static bool text_input_poll(void *opaque, const char *phase, size_t work)
 {
     (void) work;
@@ -535,6 +669,9 @@ static int container_one_pass_compare(Budget *budget, const char *page,
     LayoutDocument layouts[2] = {{0}};
     int narrow[2] = {0}, wide[2] = {0};
     for (size_t run = 0; run < 2; run++) {
+        LayoutReuseCache *reuse = run == 0
+            ? layout_reuse_cache_create(budget) : NULL;
+        CHECK(run != 0 || reuse != NULL);
         /* Run 0 logs; run 1 is the probe-and-rebuild it replaces. */
         if (run == 0) unsetenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG");
         else setenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG", "1", 1);
@@ -542,8 +679,15 @@ static int container_one_pass_compare(Budget *budget, const char *page,
                              33 + (unsigned) run)
               && stylesheet_build(&sheets[run], budget, &documents[run], 480)
               && stylesheet_has_container_queries(&sheets[run])
-              && layout_build(&layouts[run], budget, &documents[run],
-                              &sheets[run], NULL, NULL, 480));
+              && layout_build_context_reuse(&layouts[run], budget,
+                    &documents[run], &sheets[run], NULL, NULL,
+                    &(ViewportContext) { .css_width = 480, .css_height = 272,
+                        .device_width = 480, .device_height = 272,
+                        .scale_numerator = 1, .scale_denominator = 1 }, reuse));
+        LayoutReuseStats reuse_stats = {0};
+        layout_reuse_cache_stats(reuse, &reuse_stats);
+        CHECK(reuse_stats.full_resets == 0);
+        layout_reuse_cache_destroy(reuse);
         unsetenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG");
         lxb_dom_node_t *root = lxb_dom_interface_node(documents[run].html);
         const LayoutNodeBox *narrow_box = layout_box_for_node(
@@ -569,9 +713,59 @@ static int container_one_pass_compare(Budget *budget, const char *page,
     return 0;
 }
 
+static int test_container_signature_ignores_inert_boxes(Budget *budget)
+{
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.size{container:card / inline-size}"
+        ".named{container-name:card}"
+        "@container card (width > 100px){.child{color:blue}}"
+        "@container card{.child{height:20px}}</style>"
+        "<div id=size class=size><div class=child></div></div>"
+        "<div id=named class=named><div class=child></div></div>"
+        "<div id=ordinary></div>";
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 35)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *size = find_id(root, "size");
+    lxb_dom_node_t *named = find_id(root, "named");
+    lxb_dom_node_t *ordinary = find_id(root, "ordinary");
+    CHECK(size != NULL && named != NULL && ordinary != NULL
+          && style_container_layout_state_begin(&sheet, budget, 16)
+          && style_container_layout_state_add(&sheet, size, 120, 30, 0, 0)
+          && style_container_layout_state_add(&sheet, named, 80, 20, 0, 0));
+    uint64_t initial = style_container_layout_state_signature(&sheet);
+    CHECK(initial != 0 && style_container_log_begin(&sheet, budget, &sheet));
+    /* Ordinary boxes are not container-query inputs and must not change
+       the geometry signature used to validate a probe. */
+    style_container_live_update(&sheet, ordinary, 480, 100);
+    CHECK(style_container_layout_state_signature(&sheet) == initial);
+    style_container_live_update(&sheet, ordinary, 480, 600);
+    CHECK(style_container_layout_state_signature(&sheet) == initial);
+    style_container_live_update(&sheet, size, 220, 30);
+    CHECK(style_container_layout_state_signature(&sheet) != initial);
+    uint64_t resized = style_container_layout_state_signature(&sheet);
+    /* A named, non-size container still participates in name-only queries. */
+    style_container_live_update(&sheet, named, 90, 20);
+    CHECK(style_container_layout_state_signature(&sheet) != resized);
+    style_container_log_end(&sheet, &sheet);
+    CHECK(style_container_layout_state_begin(&sheet, budget, 16)
+          && style_container_log_begin(&sheet, budget, &sheet));
+    style_container_live_update(&sheet, ordinary, 480, 600);
+    CHECK(style_container_layout_state_signature(&sheet) == 0);
+    style_container_log_end(&sheet, &sheet);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_container_queries_one_pass(Budget *budget)
 {
     size_t baseline = budget->current;
+    CHECK(test_container_signature_ignores_inert_boxes(budget) == 0);
 #define CONTAINER_ONE_PASS_STYLE \
         "<!doctype html><style>body{margin:0}" \
         ".card{container:card / inline-size;box-sizing:border-box;" \
@@ -581,7 +775,7 @@ static int test_container_queries_one_pass(Budget *budget)
         ".t{height:10px;background:#111}" \
         ".t::before{content:'x'}" \
         "@container card (width < 200px){.t{height:30px;background:#222}" \
-        " .t::before{content:'narrow'}}" \
+        " .t::before{content:'narrow'}.p::after{content:'small'}}" \
         "@container card (width >= 200px){.t{height:12px}.x{display:none}}" \
         "</style>"
     /* Block containers, a nested one, and pseudo-elements inside the
@@ -601,9 +795,9 @@ static int test_container_queries_one_pass(Budget *budget)
     static const char flex[] = CONTAINER_ONE_PASS_STYLE
         "<div class='card wide'><div class=t id=wide-t></div></div>"
         "<div class='card narrow'><div class=t id=narrow-t></div></div>"
-        "<div class=row><div class=card><div class=t></div></div>"
-        "<div class=card><div class=t></div></div>"
-        "<div class=card><div class=t></div></div></div>";
+        "<div class=row><div class=card><div class=t></div><div class=p></div></div>"
+        "<div class=card><div class=t></div><div class=p></div></div>"
+        "<div class=card><div class=t></div><div class=p></div></div></div>";
     CHECK(container_one_pass_compare(budget, flex, 2) == 0);
 #undef CONTAINER_ONE_PASS_STYLE
     CHECK(budget->current == baseline);
@@ -3804,7 +3998,11 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
           && transform_matrix.transform_y == 9
           && transform_matrix.transform_scale_q6 == 128
           && transform_matrix.individual_rotate_quadrants == 1
-          && !transform_rejected.has_transform);
+          && transform_rejected.has_transform
+          && transform_rejected.individual_rotate_quadrants == 0);
+    const StylePaintStack *rotated_paint = stylesheet_paint_stack(
+        &sheet, computed_style_paint_stack_id(&transform_rejected));
+    CHECK(rotated_paint != NULL && rotated_paint->rotation_q6 == 45 * 64);
     CHECK(style_border_radius_corner(transform.border_radius, 0) == 7
           && style_border_radius_corner(transform.border_radius, 1) == 9
           && style_border_radius_corner(transform.border_radius, 2) == 13

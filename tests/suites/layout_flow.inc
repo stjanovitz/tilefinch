@@ -4247,6 +4247,59 @@ static int test_has_scoped_invalidation_matches_fresh(Budget *budget)
     return 0;
 }
 
+/* Computed-style reads can retain non-element nodes until native retirement. */
+static int test_non_element_style_retirement(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>p:empty{color:red}p{color:blue}</style>"
+        "<body><p id=owner>old<!--note--></p><p>survivor</p>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1u, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    LayoutDocument retained = {0}, fresh = {0};
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_destroy(&retained);
+    lxb_dom_node_t *owner = find_id(document_body_node(&document), "owner");
+    CHECK(owner != NULL);
+    ComputedStyle parent = style_for_node(&sheet, owner, NULL), result;
+    while (owner->first_child != NULL) {
+        lxb_dom_node_t *child = owner->first_child;
+        /* Computed-style reads can retain text/comment nodes too. */
+        (void) layout_reuse_cache_resolve_style(
+            reuse, &sheet, NULL, child, &parent, &result);
+        CHECK(layout_reuse_cache_resolve_style(
+            reuse, &sheet, NULL, child, &parent, &result));
+        layout_reuse_cache_retire_subtree(reuse, child);
+        CHECK(!layout_reuse_cache_resolve_style(
+            reuse, &sheet, NULL, child, &parent, &result));
+        /* The miss above republished the still-live child. */
+        layout_reuse_cache_retire_subtree(reuse, child);
+        lxb_dom_node_remove(child);
+        BudgetAllocationOwner previous = document_allocation_owner_enter(&document);
+        lxb_dom_node_destroy_deep(child);
+        document_allocation_owner_leave(&document, previous);
+    }
+    layout_reuse_cache_invalidate_children(reuse, owner, NULL, false);
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    CHECK(layout_build_context(&fresh, budget, &document, &sheet,
+        NULL, NULL, &viewport));
+    CHECK(commands_equal(&retained, &fresh));
+    layout_destroy(&retained);
+    layout_destroy(&fresh);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 /* A child leaving a parent restyles the parent's subtree, not its
    parent's: siblings of the parent keep their cached styles, unless an
    :empty test outside :has() lets the parent's children reach them. */

@@ -149,7 +149,8 @@ static const uint8_t bayer_4x4[16] = {
    the thresholded quantisation -- and scales the dither down with alpha for
    a translucent one, so a faint overlay is not made noisy.  Keeping it here
    also leaves the blend and span machinery below completely untouched. */
-static inline uint32_t rgb565_dither_source(uint32_t color, int x, int y)
+static inline __attribute__((always_inline)) uint32_t rgb565_dither_source_inline(
+    uint32_t color, int x, int y)
 {
     unsigned threshold = bayer_4x4[((unsigned) y & 3u) * 4u
                                    + ((unsigned) x & 3u)];
@@ -162,6 +163,11 @@ static inline uint32_t rgb565_dither_source(uint32_t color, int x, int y)
     if (g > 255u) g = 255u;
     if (b > 255u) b = 255u;
     return (color & 0xff000000u) | (r << 16) | (g << 8) | b;
+}
+
+static inline uint32_t rgb565_dither_source(uint32_t color, int x, int y)
+{
+    return rgb565_dither_source_inline(color, x, y);
 }
 
 static size_t utf8_advance(const char *text, size_t remaining,
@@ -544,7 +550,6 @@ static bool rounded_rect_clip_row_span(int rect_x, int rect_y,
 {
     if (x0 == NULL || x1 == NULL || *x0 >= *x1
         || width <= 0 || height <= 0) return false;
-    int radius = style_border_radius_maximum(radius_code);
     int radii[4];
     style_border_radius_resolve_corners(
         radius_code, width, height, radii);
@@ -561,10 +566,15 @@ static bool rounded_rect_clip_row_span(int rect_x, int rect_y,
     if (clipped_left >= clipped_right) return false;
     int span_left = (int) clipped_left;
     int span_right = (int) clipped_right;
-    if (radius > 0
-        && ((int64_t) y < top + radius
-            || (int64_t) y >= bottom - radius)) {
-        int64_t left_corner_end = left + radius;
+    /* Use the fitted corner on each side of this row. An oversized raw
+       radius (e.g. 100%) can span both halves of the image; the predicate
+       is then false/true/false instead of monotone within a tile. */
+    int left_radius = (int64_t) y < top + radii[0] ? radii[0]
+        : (int64_t) y >= bottom - radii[3] ? radii[3] : 0;
+    int right_radius = (int64_t) y < top + radii[1] ? radii[1]
+        : (int64_t) y >= bottom - radii[2] ? radii[2] : 0;
+    if (left_radius > 0 || right_radius > 0) {
+        int64_t left_corner_end = left + left_radius;
         if ((int64_t) span_left < left_corner_end) {
             int low = span_left;
             int high = span_right < left_corner_end
@@ -581,7 +591,7 @@ static bool rounded_rect_clip_row_span(int rect_x, int rect_y,
             }
             span_left = low;
         }
-        int64_t right_corner_start = right - radius;
+        int64_t right_corner_start = right - right_radius;
         if ((int64_t) span_right > right_corner_start) {
             int low = span_left > right_corner_start
                 ? span_left : (int) right_corner_start;
@@ -715,6 +725,26 @@ struct RenderOverflowCache {
 
 #define RENDER_OVERFLOW_SIGNATURE_EMPTY UINT64_C(14695981039346656037)
 
+static bool render_platform_cooperate(TileCache *cache, const char *phase,
+                                      size_t work)
+{
+    /* A frontend may present the incumbent here, but must not reenter the
+       render/scroll API against the shell whose accelerator is being built. */
+    bool previous = cache->preparation_polling;
+    cache->preparation_polling = true;
+    bool continued = tilefinch_platform_cooperate(phase, work);
+    cache->preparation_polling = previous;
+    return continued;
+}
+
+static void render_prepare_checkpoint(TileCache *cache)
+{
+    if (cache->frame_composing || cache->raster_cooperate_phase == NULL) return;
+    if ((++cache->preparation_visits & 127u) != 0) return;
+    (void) render_platform_cooperate(cache, cache->raster_cooperate_phase,
+                                     cache->preparation_visits);
+}
+
 static void overflow_cache_destroy(TileCache *cache)
 {
     if (cache == NULL || cache->overflow_cache == NULL) return;
@@ -747,12 +777,14 @@ static bool overflow_cache_build(TileCache *cache)
         || layout->count > UINT32_MAX) return false;
     size_t clip_count = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
+        render_prepare_checkpoint(cache);
         if (layout->node_boxes[i].clips_x || layout->node_boxes[i].clips_y) {
             clip_count++;
         }
     }
     size_t geometry_count = 0;
     for (size_t i = 0; i < layout->count; i++) {
+        render_prepare_checkpoint(cache);
         if (layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW) {
             geometry_count++;
         }
@@ -792,9 +824,11 @@ static bool overflow_cache_build(TileCache *cache)
 
     for (size_t i = 0; i < layout->node_box_count; i++) {
         uint32_t parent = OVERFLOW_PARENT_NONE;
+        render_prepare_checkpoint(cache);
         const lxb_dom_node_t *node = layout->node_boxes[i].node;
         for (const lxb_dom_node_t *at = node != NULL ? node->parent : NULL;
              at != NULL; at = at->parent) {
+            render_prepare_checkpoint(cache);
             const LayoutNodeBox *parent_box = layout_box_for_node(layout, at);
             if (parent_box == NULL) continue;
             ptrdiff_t index = parent_box - layout->node_boxes;
@@ -810,6 +844,7 @@ static bool overflow_cache_build(TileCache *cache)
     size_t rounded = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *box = &layout->node_boxes[i];
+        render_prepare_checkpoint(cache);
         if (!box->clips_x && !box->clips_y) continue;
         int rounded_ordinal = -1;
         if (box->clips_x && box->clips_y
@@ -828,6 +863,7 @@ static bool overflow_cache_build(TileCache *cache)
     overflow->rounded_count = rounded;
     size_t geometry_at = 0;
     for (size_t i = 0; i < layout->count; i++) {
+        render_prepare_checkpoint(cache);
         if (!(layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW)) continue;
         overflow->geometry[geometry_at++].command_index = (uint32_t) i;
     }
@@ -909,6 +945,7 @@ static bool overflow_cache_prepare(TileCache *cache)
     overflow->checked_generation = state_generation;
     if (!changed) {
         for (size_t i = 0; i < layout->node_box_count; i++) {
+            render_prepare_checkpoint(cache);
             if (overflow->scroll_values[i * 2u]
                     != layout->node_boxes[i].scroll_x
                 || overflow->scroll_values[i * 2u + 1u]
@@ -924,6 +961,7 @@ static bool overflow_cache_prepare(TileCache *cache)
        keeps every undamaged tile. */
     uint64_t signature = RENDER_OVERFLOW_SIGNATURE_EMPTY;
     for (size_t i = 0; i < layout->node_box_count; i++) {
+        render_prepare_checkpoint(cache);
         const LayoutNodeBox *box = &layout->node_boxes[i];
         if (box->scroll_x == 0 && box->scroll_y == 0) continue;
         const int values[4] = { box->x, box->y, box->scroll_x, box->scroll_y };
@@ -941,10 +979,12 @@ static bool overflow_cache_prepare(TileCache *cache)
         layout_positioned_clip_index_prepare(layout, &positioned);
     for (size_t i = 0; i < layout->node_box_count; i++) {
         overflow->scroll_values[i * 2u] = layout->node_boxes[i].scroll_x;
+        render_prepare_checkpoint(cache);
         overflow->scroll_values[i * 2u + 1u] = layout->node_boxes[i].scroll_y;
     }
     for (size_t i = 0; i < overflow->clip_count; i++) {
         OverflowClipBox *clip = &overflow->clip_boxes[i];
+        render_prepare_checkpoint(cache);
         const LayoutNodeBox *box = &layout->node_boxes[clip->box_index];
         clip->visual_x = box->x;
         clip->visual_y = box->y;
@@ -953,6 +993,7 @@ static bool overflow_cache_prepare(TileCache *cache)
         while (parent != OVERFLOW_PARENT_NONE
                && parent < layout->node_box_count
                && guard++ < layout->node_box_count) {
+            render_prepare_checkpoint(cache);
             clip->visual_x -= layout->node_boxes[parent].scroll_x;
             clip->visual_y -= layout->node_boxes[parent].scroll_y;
             parent = overflow->parent_indices[parent];
@@ -960,6 +1001,7 @@ static bool overflow_cache_prepare(TileCache *cache)
     }
     for (size_t i = 0; i < overflow->geometry_count; i++) {
         OverflowGeometry *geometry = &overflow->geometry[i];
+        render_prepare_checkpoint(cache);
         geometry->dx = 0;
         geometry->dy = 0;
         geometry->clip_left = INT_MIN / 2;
@@ -977,6 +1019,7 @@ static bool overflow_cache_prepare(TileCache *cache)
         while (at < overflow->geometry_count
                && overflow->geometry[at].command_index
                   < box->scroll_command_end) {
+            render_prepare_checkpoint(cache);
             OverflowGeometry *geometry = &overflow->geometry[at++];
             if (layout_positioned_command_escapes_clip_indexed(
                     layout, geometry->command_index, box, &positioned)) {

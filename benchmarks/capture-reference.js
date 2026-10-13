@@ -3806,6 +3806,11 @@ function blockedUrlMatches(value, blockedEntries) {
     && (!pathPrefix || url.pathname.startsWith(pathPrefix)));
 }
 
+function isSuppressedTeardownBeacon(method, kind, value, blockedEntries) {
+  return method === "POST" && kind === "beacon"
+    && blockedUrlMatches(value, blockedEntries);
+}
+
 function loadScenario(manifestPath, wanted) {
   if (fs.statSync(manifestPath).size > MAX_MANIFEST_BYTES) {
     throw new CaptureError(`${manifestPath}: manifest exceeds ${MAX_MANIFEST_BYTES} bytes`);
@@ -4435,6 +4440,7 @@ async function captureReference(options) {
   const routeLifecycle = {
     phase: "OPEN", nextBrowserOrdinal: 0, handlers: new Set(),
     closingCallbacks: 0, closedCallbacks: 0, lateBindingCallbacks: 0,
+    lateBindingDetails: [], suppressedTeardownBeacons: 0,
     terminalFailures: 0,
   };
   let responseScheduler = null;
@@ -4501,9 +4507,8 @@ async function captureReference(options) {
   const requestAudit = captureAudit.createRequestAudit();
   const originEvidence = captureAudit.createOriginEvidence();
   let interceptedHttpRequests = 0;
-  context.on("request", (request) => requestAudit.begin(request));
-  context.on("requestfinished", (request) => requestAudit.end(request));
-  context.on("requestfailed", (request) => requestAudit.end(request, true));
+  /* CDP Network includes favicon requests and every redirect hop which
+     Playwright's page-level events can omit. Audit each intercepted target. */
   responseScheduler = createResponseScheduler({
     browserOrdinalSemantics: "raw-chromium-fetch-callback-v1",
     /* BrowserContext.cookies() is a read-only round trip on the same
@@ -4795,7 +4800,21 @@ async function captureReference(options) {
   await context.exposeBinding(
     "__tilefinchReadOnlyDenied", (_source, method, kind, value) => {
       if (routeLifecycle.phase !== "OPEN") {
+        /* An unload beacon to an explicitly excluded telemetry route cannot
+           change the frozen page or replay: the read-only hook denied it
+           before any request was issued. Keep a separate teardown receipt.
+           Unknown late writes/capabilities still invalidate the capture. */
+        if (isSuppressedTeardownBeacon(method, kind, value, scenario.blockedOrigins)
+            && routeLifecycle.suppressedTeardownBeacons < 16384) {
+          routeLifecycle.suppressedTeardownBeacons += 1;
+          return null;
+        }
         routeLifecycle.lateBindingCallbacks += 1;
+        if (routeLifecycle.lateBindingDetails.length < 8) {
+          let endpoint = "invalid";
+          try { const url = new URL(String(value)); endpoint = url.origin + url.pathname; } catch (_) {}
+          routeLifecycle.lateBindingDetails.push({method, kind, endpoint});
+        }
         return null;
       }
       activity.value += 1;
@@ -4829,10 +4848,23 @@ async function captureReference(options) {
   {
     const session = await runHost("redirect-interception-session", () => context.newCDPSession(page));
     pageSession = session;
+    /* Pin the requested device input profile before author code runs. Some
+       Chromium/Playwright combinations omit the context-level touch override;
+       a desktop pointer changes responsive CSS and is not a mobile oracle. */
+    await runHost("device-touch-profile", () => session.send(
+      "Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 },
+    ));
+    const initialInput = await runHost("device-touch-profile-check", () => page.evaluate(() => ({
+      coarse: matchMedia("(pointer:coarse)").matches, touch: navigator.maxTouchPoints,
+    })));
+    if (!initialInput.coarse || initialInput.touch !== 1) {
+      throw new CaptureError("requested device input profile was not applied");
+    }
     targetInterception = await captureAudit.installInterception(session, (target, event) => {
       dispatchRoute(captureAudit.cdpRoute(target, event,
-        (method, url) => requestAudit.expectFailure(method, url)));
-    }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"));
+        (method, url) => requestAudit.expectFailure(method, url),
+        () => requestAudit.networkFulfilled(target, event)));
+    }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"), requestAudit);
   }
   /* Diagnostic evidence only: surface page-side failures (script errors,
      failed dynamic imports) in the reference state so stalled SPA
@@ -5394,6 +5426,8 @@ async function captureReference(options) {
       browser_closed: browserCloseSucceeded,
       final_activity: activity.value,
       late_callbacks: teardownAfterBrowser.late_callbacks,
+      late_binding_details: routeLifecycle.lateBindingDetails,
+      suppressed_teardown_beacons: routeLifecycle.suppressedTeardownBeacons,
       teardown_changes: teardownChanges,
     },
     acquisition_plan: acquisitionPlan,
@@ -5493,7 +5527,7 @@ if (require.main === module) {
 module.exports = {
   captureReference,
   CaptureError, applyResponseCookies, buildReadOnlyAcquisitionPlan, compactRanges,
-  blockedUrlMatches, boundedDrainRouteHandlers,
+  blockedUrlMatches, isSuppressedTeardownBeacon, boundedDrainRouteHandlers,
   claimRouteRecord, cookieReplayOperation, createRequestDiagnostics,
   createHostOperationTracker, createResponseScheduler, inspectTrace,
   deliverReplayRecord, teardownEvidenceChanges, teardownEvidenceReady,

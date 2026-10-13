@@ -41,6 +41,11 @@ runtime assets or immutable engine data.
   streams' byte-wide history and omit an unused frame alpha reservation.
   Complete `COPYING` and `PATENTS` texts are
   checked in under `third_party/notices/libwebp/`.
+- **Brotli 1.2.0**: MIT license. Only the pinned common and decoder C sources
+  are linked into the browser for bounded WOFF2 fonts. Decoder state uses the
+  capped font allocator; input/output advance in cancellable slices. The host
+  unit tests separately use the encoder to generate owned font fixtures.
+  The complete license is in `third_party/notices/brotli/LICENSE`.
 - **FreeType 2.14.3**: dual-licensed FreeType License (FTL) or GPLv2.
   **Tilefinch elects the FTL** for all use and distribution of FreeType; the
   GPLv2 alternative is not exercised. The FTL's credit clause requires the
@@ -214,7 +219,7 @@ notice in this file.
 A browser release archive must bundle, at minimum: the Lexbor `LICENSE` and
 `NOTICE`;
 the FreeType FTL text and credit line (plus its embedded zlib/HarfBuzz
-notices); the MIT texts for QuickJS, stb, and the QR encoder; the SheenBidi
+notices); the MIT texts for Brotli, QuickJS, stb, and the QR encoder; the SheenBidi
 Apache-2.0 text; the NanoSVG zlib text; the
 libwebp copyright license and patent grant;
 Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source

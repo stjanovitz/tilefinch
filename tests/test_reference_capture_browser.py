@@ -148,7 +148,10 @@ class BrowserCaptureTests(unittest.TestCase):
         # Native lazy loading requires the scroll sweep; the hidden broken
         # image must not falsely fail visual qualification.
         html = b'''<!doctype html><meta name="viewport" content="width=device-width">
-<title>Capture fixture</title><style>body{margin:0}img{width:32px;height:32px}</style>
+<title>Capture fixture</title><link rel="icon" href="/favicon.svg">
+<style>body{margin:0}img{width:32px;height:32px}</style>
+<script>if(!matchMedia('(pointer:coarse)').matches||navigator.maxTouchPoints!==1)
+document.title='Capture fixture invalid input';</script>
 <h1>Fixture ready</h1><img src="/redirect.svg"><div style="height:800px"></div>
 <img loading="lazy" src="/lazy.svg"><img hidden src="/hidden.svg">'''
         if viewport_units:
@@ -163,6 +166,7 @@ class BrowserCaptureTests(unittest.TestCase):
                    ("https://capture.test/redirect.svg", b"", "text/plain", 302,
                     ("Location: https://images.test/final.svg",)),
                    ("https://capture.test/lazy.svg", svg, "image/svg+xml", 200, ()),
+                   ("https://capture.test/favicon.svg", svg, "image/svg+xml", 200, ()),
                    ("https://capture.test/hidden.svg", svg, "image/svg+xml", 200, ())]
         if iframe:
             # Different registrable domains force Chromium's separate frame

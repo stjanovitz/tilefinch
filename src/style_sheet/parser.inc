@@ -134,6 +134,9 @@ static bool web_font_format_supported(const char *text, size_t length)
         format[i] = (char) tolower((unsigned char) format[i]);
     }
     return strcmp(format, "woff") == 0
+#ifdef TILEFINCH_HAVE_BOUNDED_WOFF2
+        || strcmp(format, "woff2") == 0
+#endif
         || strcmp(format, "truetype") == 0
         || strcmp(format, "opentype") == 0;
 }
@@ -321,9 +324,22 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
                strlen(family) + 1u);
         fonts->family_count++;
     }
-    StyleWebFontFaceSource *destination = weight >= 600
-        ? &fonts->families[family_slot].bold
-        : &fonts->families[family_slot].regular;
+    uint16_t *weights = fonts->loaded.families[family_slot].weights;
+    size_t face_slot = weight >= 600 ? 1u : 0u;
+    for (size_t i = 0; i < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; i++) {
+        if (weights[i] == weight) { face_slot = i; break; }
+    }
+    if (weights[face_slot] != 0 && weights[face_slot] != weight) {
+        for (face_slot = 2; face_slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
+             face_slot++) if (weights[face_slot] == 0) break;
+        if (face_slot == TILEFINCH_WEB_FONT_WEIGHT_LIMIT) {
+            fonts->stats.skipped_source_limit++;
+            return;
+        }
+    }
+    weights[face_slot] = weight;
+    StyleWebFontFaceSource *destination =
+        &fonts->families[family_slot].faces[face_slot];
     for (size_t source = 0; source < source_count; source++) {
         bool duplicate = false;
         for (size_t i = 0; i < destination->source_count; i++) {
@@ -1141,13 +1157,17 @@ static bool collect_styles(
             Stylesheet *sheet = context->sheet;
             unsigned scope_begin = sheet->next_order;
             bool scoped = document_shadow_carrier_containing(node) != NULL;
-            sheet->parsing_scoped_source = scoped;
-            if (override != NULL && !parse_css_range(
+            /* Do not parse a confined source unless its order range can be
+               recorded. Otherwise an allocation refusal makes it global. */
+            bool admitted = !scoped || stylesheet_reserve_shadow_scope(sheet);
+            sheet->parsing_scoped_source = scoped && admitted;
+            if (admitted && override != NULL && !parse_css_range(
                     context, override, 0, override_length)) {
                 sheet->parsing_scoped_source = false;
                 return false;
             }
-            for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
+            for (lxb_dom_node_t *child = admitted && override == NULL
+                     ? node->first_child : NULL;
                  child != NULL; child = child->next) {
                 size_t length = 0;
                 const char *css = document_text_data(child, &length);
@@ -1158,7 +1178,7 @@ static bool collect_styles(
                 }
             }
             sheet->parsing_scoped_source = false;
-            if (scoped) {
+            if (scoped && admitted) {
                 stylesheet_note_shadow_scope(sheet, node, scope_begin,
                                              sheet->next_order);
             }

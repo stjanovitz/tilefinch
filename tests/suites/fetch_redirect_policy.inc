@@ -720,6 +720,32 @@ static bool test_single_hop_redirect_boundary(Budget *budget, unsigned port)
           && result.length == 0 && result.data != NULL
           && result.data[0] == '\0');
     fetch_result_destroy(&result);
+
+    /* A real one-hop request must allocate, validate and release a serialized
+       extra-header line. Refuse each Budget allocation in that transaction,
+       then verify a fresh request and the shared owner still work. */
+    request.method = "GET";
+    request.extra_headers = "X-Tilefinch-Test: bounded";
+    size_t before = budget->allocation_count;
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_request_single_hop(
+              budget, url, &request, 64u * 1024u, 5000, &result));
+    fetch_result_destroy(&result);
+    size_t attempts = budget->allocation_count - before;
+    CHECK(attempts > 0 && attempts < 128 && budget->current == baseline);
+    for (size_t point = 0; point < attempts; point++) {
+        result = (FetchResult) {.budget = budget};
+        budget_inject_failure_after(budget, point);
+        (void) fetch_request_single_hop(
+            budget, url, &request, 64u * 1024u, 5000, &result);
+        budget_clear_failure_injection(budget);
+        fetch_result_destroy(&result);
+        CHECK(budget->current == baseline);
+    }
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_request_single_hop(
+              budget, url, &request, 64u * 1024u, 5000, &result));
+    fetch_result_destroy(&result);
     return budget->current == baseline;
 }
 

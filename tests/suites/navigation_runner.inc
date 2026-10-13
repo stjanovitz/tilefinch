@@ -6,6 +6,12 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--paint-damage-only") == 0) {
+        RUN_TEST(test_relayout_damage_skips_unchanged_middle);
+        RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
+        puts("retained paint damage tests passed");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--parser-head-cssom-only") == 0) {
         RUN_TEST(test_parser_head_cssom_preserves_initialization);
         puts("parser head CSSOM tests passed");
@@ -34,7 +40,9 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
+        RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
         RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
+        RUN_TEST(test_svg_local_clips_preserve_artwork);
         RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
         RUN_TEST(test_display_retarget_follows_painted_size);
         RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
@@ -62,7 +70,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_inline_script_configured_source_allowance);
     RUN_TEST(test_parser_refusal_stops_speculative_preview_retries);
     RUN_TEST(test_display_retarget_follows_painted_size);
+    RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
     RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
+    RUN_TEST(test_svg_local_clips_preserve_artwork);
     RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
     RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
     RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
@@ -119,6 +129,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_candidate_cancel_preserves_late_incumbent_dom);
     RUN_TEST(test_bounded_finalize_preserves_history_pruning);
     RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
+    RUN_TEST(test_relayout_damage_skips_unchanged_middle);
     RUN_TEST(test_provisional_relayout_completes_in_idle_work);
     RUN_TEST(test_extension_reaching_the_end_queues_discovered_visuals);
     RUN_TEST(test_candidate_hook_set_is_transactional);

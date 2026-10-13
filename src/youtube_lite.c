@@ -1157,6 +1157,40 @@ static bool lite_html_escape(YoutubeLiteHtml *html, const char *text)
     return lite_html_escape_bytes(html, text, strlen(text));
 }
 
+/* The icon name is native-template data, never service content. Small vector
+   silhouettes have a box-painted fallback when optional images are disabled
+   or refused. No font pack or network request is needed for either path. */
+static bool lite_html_action_content(YoutubeLiteHtml *html,
+    const char *label, const char *icon)
+{
+    static const struct { const char *name, *shape; } icons[] = {
+        {"bell", "<path d='M18 9a6 6 0 0 0-12 0c0 6-2 6-2 8h16c0-2-2-2-2-8M10 20a2 2 0 0 0 4 0'/>"},
+        {"like", "<path d='M7 10v11H3V10h4Zm0 0 5-8c2 0 3 1 2 4l-1 4h6c1 0 2 1 2 2l-2 7c0 1-1 2-2 2H7'/>"},
+        {"clock", "<circle cx=12 cy=12 r=9/><path d='M12 7v5l4 2'/>"},
+        {"playlist", "<path d='M4 5h12M4 10h12M4 15h7M17 14v7M13.5 17.5h7'/>"},
+        {"download", "<path d='M12 3v12M7 10l5 5 5-5M4 17v4h16v-4'/>"},
+        {"more", "<circle cx=4 cy=12 r=1.5/><circle cx=12 cy=12 r=1.5/><circle cx=20 cy=12 r=1.5/>"}
+    };
+    const char *shape = NULL;
+    for (size_t i = 0; icon != NULL && i < sizeof(icons) / sizeof(icons[0]); i++)
+        if (strcmp(icon, icons[i].name) == 0) { shape = icons[i].shape; break; }
+    if (icon != NULL && shape == NULL) return false;
+    const char *translated = tilefinch_ui_logical_text(label);
+    return lite_html_text(html, "aria-label=\"")
+        && lite_html_escape(html, translated)
+        && lite_html_text(html, "\" title=\"")
+        && lite_html_escape(html, translated)
+        && lite_html_text(html, "\">")
+        && (icon == NULL ? lite_html_escape(html, translated)
+            : lite_html_format(html, "<span aria-hidden=true class=\"action-icon icon-%s\">"
+                "<i class=a></i><i class=b></i><i class=c></i>%s", icon,
+                strcmp(icon, "playlist") == 0 ? "<i class=d></i>" : "")
+                && lite_html_text(html, "<svg class=action-vector aria-hidden=true xmlns='http://www.w3.org/2000/svg' "
+                    "width=20 height=20 viewBox='0 0 24 24'><rect width=24 height=24 fill='#0f0f0f'/>"
+                    "<g fill=none stroke='#eee' stroke-width='1.6' stroke-linecap=round stroke-linejoin=round>")
+                && lite_html_text(html, shape) && lite_html_text(html, "</g></svg></span>"));
+}
+
 /* Only trusted native templates use {{English key}}. Values are escaped as
    data, including inside quoted attributes; author text never enters here.
    Format arguments in these templates are validated IDs or numeric values. */
@@ -1196,7 +1230,7 @@ static bool lite_html_continuation_link(
 static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
                              const char *page_title,
                              bool search_autofocus,
-                             bool compact_results, bool signed_in)
+                             bool compact_results, bool signed_in, bool watch_page)
 {
     static const char prefix[] =
         "<!doctype html><html><head><meta charset=utf-8>"
@@ -1224,8 +1258,10 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "form{display:flex;gap:6px;width:100%}"
         ".search-filters,.chapters{border:1px solid #555;border-radius:6px;margin:10px 0;padding:8px}"
         ".search-filters summary,.chapters summary{color:#fff;line-height:24px}"
-        ".search-filters form{display:block}.search-filters label{display:block;margin:6px 0 3px}"
-        ".search-filters select{width:100%;height:28px;background:#222;color:#fff;border:1px solid #777}"
+        ".search-filters{padding:12px}.search-filters summary{padding:2px 0}"
+        ".search-filters form{display:block}.filter-fields{display:flex;gap:8px}"
+        ".filter-field{flex:1;min-width:0}.filter-label{display:block;font-size:12px;line-height:18px;margin:4px 0 2px}"
+        ".search-filters select{width:100%;height:30px;line-height:20px;padding:4px 8px;background:#222;color:#fff;border:1px solid #777}"
         ".search-filters button{width:auto;min-width:110px;max-width:100%;margin-top:8px}"
         ".chapter{display:block;color:#ddd;text-decoration:none;padding:6px 0;border-top:1px solid #444;line-height:20px}"
         "input{flex:none;width:calc(100% - 82px);min-width:0;"
@@ -1286,7 +1322,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "flex:0 0 48%;max-width:230px;border-radius:8px;"
         "color:#fff;text-decoration:none}.watch-target:focus{outline:3px solid "
         "#fff;outline-offset:2px}.watch{display:block;width:100%;min-width:0;"
-        "aspect-ratio:16 / 9;object-fit:cover;background:#222;"
+        "aspect-ratio:16 / 9;object-fit:cover;"
         /* The badge is a painted box, not an inline <svg>: an inline SVG only
            reaches the screen through the image pipeline (discovery, NanoSVG
            parse, rasterise, decoded-image budget), so it vanished on any
@@ -1305,6 +1341,40 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".watch-copy{flex:1;min-width:0}.watch-copy h1{font-size:17px;"
         "line-height:1.25;margin:0 0 8px}.watch-meta{line-height:1.45;"
         "margin:0 0 8px}"
+        ".watch-actions{position:relative;margin:8px 0}.watch-actions p{margin:6px 0;line-height:36px}"
+        ".watch-actions .comments-link{margin:0 6px 4px 0;line-height:18px}"
+        ".watch-actions summary{line-height:28px;color:#ddd}";
+    static const char action_style[] =
+        ".watch-action-row{display:flex;align-items:center;gap:8px}"
+        ".watch-action-row .comments-link{margin:0;white-space:nowrap}"
+        ".watch-action-row .icon-action{display:block;flex:none;width:40px;height:36px;padding:7px 9px}"
+        ".watch-account-menu{margin:0;padding:0;border:0;flex:none;width:40px}"
+        ".watch-account-menu summary{list-style:none;border:1px solid #666;border-radius:16px}"
+        ".watch-account-panel{position:absolute;left:0;top:44px;width:100%;padding:8px;"
+        "background:#222;border:1px solid #666;border-radius:6px;z-index:3}"
+        ".action-icon{display:block;position:relative;width:20px;height:20px;color:#eee}"
+        ".action-vector{display:block;position:absolute;left:0;top:0;width:20px;height:20px}"
+        ".action-icon i{display:block;position:absolute}"
+        ".icon-bell .a{left:4px;top:2px;width:12px;height:13px;border:2px solid #eee;border-radius:6px}"
+        ".icon-bell .b{left:2px;top:14px;width:16px;height:2px;background:#eee}"
+        ".icon-bell .c{left:8px;top:18px;width:4px;height:2px;background:#eee;border-radius:2px}"
+        ".icon-like .a{left:7px;top:7px;width:12px;height:12px;border:2px solid #eee;border-radius:2px}"
+        ".icon-like .b{left:1px;top:8px;width:4px;height:11px;background:#eee}"
+        ".icon-like .c{left:8px;top:1px;width:5px;height:9px;border:2px solid #eee;border-radius:2px}"
+        ".icon-clock .a{left:1px;top:1px;width:18px;height:18px;border:2px solid #eee;border-radius:10px}"
+        ".icon-clock .b{left:9px;top:4px;width:2px;height:7px;background:#eee}"
+        ".icon-clock .c{left:9px;top:9px;width:5px;height:2px;background:#eee}"
+        ".icon-playlist .a{left:1px;top:3px;width:12px;height:12px;border-top:2px solid #eee;border-bottom:2px solid #eee}"
+        ".icon-playlist .b{left:1px;top:8px;width:12px;height:2px;background:#eee}"
+        ".icon-playlist .c{left:15px;top:14px;width:6px;height:2px;background:#eee}"
+        ".icon-playlist .d{left:17px;top:12px;width:2px;height:6px;background:#eee}"
+        ".icon-download .a{left:8px;top:1px;width:3px;height:11px;background:#eee}"
+        ".icon-download .b{left:5px;top:6px;width:9px;height:9px;border-right:3px solid #eee;border-bottom:3px solid #eee;transform:rotate(45deg)}"
+        ".icon-download .c{left:2px;top:16px;width:16px;height:4px;border:2px solid #eee;border-top:0}"
+        ".icon-more .a,.icon-more .b,.icon-more .c{top:8px;width:4px;height:4px;border-radius:2px;background:#eee}"
+        ".icon-more .a{left:1px}.icon-more .b{left:8px}.icon-more .c{left:15px}";
+    static const char content_tail[] =
+        ".watch-actions .watch-status{font-size:12px;line-height:16px;color:#aaa;min-height:16px;margin:2px 0}"
         ".description{background:#1d1d1d;border-radius:8px;padding:10px;"
         "line-height:1.45;color:#ddd}.comments-link{display:inline-block;"
         "color:#fff;border:1px solid #666;border-radius:16px;padding:7px 13px;"
@@ -1316,6 +1386,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".comment-meta{color:#aaa;font-size:12px;margin-left:6px}"
         ".comment-text{margin:5px 0}.comment-likes{color:#aaa;font-size:12px}"
         "@media(max-width:380px){.thumb-wrap{width:136px;height:77px}"
+        ".filter-fields{display:block}"
         ".card{min-height:77px}.title{font-size:14px}"
         ".watch-hero{display:block}.watch-target{max-width:none}"
         ".watch-copy{margin-top:10px}}";
@@ -1351,6 +1422,8 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         && lite_html_escape(html, page_title)
         && lite_html_text(html, style)
         && lite_html_text(html, content_style)
+        && lite_html_text(html, content_tail)
+        && (!watch_page || lite_html_text(html, action_style))
         && (!compact_results || lite_html_text(html, compact_style))
         && (tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ENGLISH
             || lite_html_text(html,
@@ -1381,7 +1454,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         && lite_html_text(html, ">")
         && lite_html_ui_markup(html, "<button type=submit>{{Search}}</button></form>")
         && lite_html_text(html, "</header>")
-        && lite_html_text(html, signed_in ? "<main class=feed-home>" : "<main>");
+        && lite_html_text(html, search_autofocus ? "<main class=feed-home>" : "<main>");
 }
 
 static bool lite_html_video(YoutubeLiteHtml *html,
@@ -1818,8 +1891,12 @@ static bool lite_html_feed_refresh(YoutubeLiteHtml *html)
         "<a id=yt-feed-refresh class=feed-refresh href=\"#tilefinch-refresh\">{{Refresh suggestions}}</a>");
 }
 
-static bool lite_html_feed_notice(YoutubeLiteHtml *html, bool defer_refresh)
+static bool lite_html_feed_notice(YoutubeLiteHtml *html, bool defer_refresh,
+                                  bool signed_in)
 {
+    /* Public explore topics may still load while signed out, but they are
+       not a personalized feed. Do not advertise account suggestions there. */
+    if (!signed_in) return true;
     /* One fixed-size native status line: idle updates repaint this line only,
        never relayout or replace the result nodes beneath a selection. */
     return lite_html_ui_markup(html,
@@ -1940,7 +2017,7 @@ static bool lite_html_description_summary(YoutubeLiteHtml *html,
 
 static bool lite_html_watch_intro(
     YoutubeLiteHtml *html, const YoutubeLiteWatch *watch,
-    bool autofocus, unsigned resume_seconds)
+    bool autofocus, unsigned resume_seconds, bool signed_in)
 {
     bool ok = lite_html_format(
         html, "<section class=watch-hero><a class=watch-target%s "
@@ -1971,21 +2048,44 @@ static bool lite_html_watch_intro(
     if (ok && watch->category[0] != '\0')
         ok = lite_html_ui_markup(html, "<br>{{Category}}: ")
             && lite_html_escape(html, watch->category);
-    ok = ok && lite_html_text(html, "</p>")
-        && lite_html_subscribe(html, watch->channel_id);
-    return ok
-        && lite_html_ui_format(
-            html,
-            "<p><a class=comments-link href=\"https://tilefinch.local/offline/youtube?id=%s\">{{Save video offline}}</a></p><p><a id=yt-like-action class=comments-link href=\"#tilefinch-like\">{{Like}}</a> <a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a></p><p>",
-            watch->video.id)
-        && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_ADD,
-            "WL", watch->video.id, "Watch Later", "yt-watch-later-add")
-        && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
-            "WL", watch->video.id, "Remove from Watch Later", "yt-watch-later-remove")
-        && lite_html_ui_format(html,
-            "</p><p><a class=comments-link href=\"https://www.youtube.com/feed/playlists?tilefinch_save=%s\">{{Save to playlist}}</a></p></div></section><p id=yt-like-status class=feed-status>{{Select Like or Unlike.}}</p>",
-            watch->video.id)
-        && lite_html_account_notice(html)
+    ok = ok && lite_html_text(html, "</p></div></section><section id=yt-watch-actions class=watch-actions><div class=watch-action-row>");
+    if (ok && signed_in) {
+        ok = (watch->channel_id[0] == '\0'
+                || lite_html_account_action(html, YOUTUBE_LITE_ACTION_SUBSCRIBE,
+                    watch->channel_id, "", "Subscribe", "yt-subscribe-action", "bell"))
+            && lite_html_text(html, "<a id=yt-like-action class=\"comments-link icon-action\" href=\"#tilefinch-like\" ")
+            && lite_html_action_content(html, "Like", "like") && lite_html_text(html, "</a>")
+            && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_ADD,
+                "WL", watch->video.id, "Watch Later", "yt-watch-later-add", "clock")
+            && lite_html_format(html,
+                "<a id=yt-playlist-save class=\"comments-link icon-action\" href=\"https://www.youtube.com/feed/playlists?tilefinch_save=%s\" ", watch->video.id)
+            && lite_html_action_content(html, "Save to playlist", "playlist") && lite_html_text(html, "</a>");
+    } else if (ok) {
+        ok = lite_html_ui_markup(html,
+            "<a id=yt-watch-signin class=comments-link href=\"https://accounts.google.com/ServiceLogin?service=youtube&amp;continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Sign in}}</a>");
+    }
+    ok = ok && lite_html_format(html,
+        "<a id=yt-offline-save class=\"comments-link icon-action\" href=\"https://tilefinch.local/offline/youtube?id=%s\" ", watch->video.id)
+        && lite_html_action_content(html, "Save video offline", "download") && lite_html_text(html, "</a>");
+    if (ok && signed_in) {
+        /* The response does not always expose current membership/rating.
+           Keep explicit removal available without presenting contradictory
+           primary actions or guessing a user's account state. */
+        ok = lite_html_ui_markup(html,
+            "<details id=yt-watch-account class=watch-account-menu><summary class=icon-action ")
+            && lite_html_action_content(html, "Account", "more")
+            && lite_html_text(html, "</summary><div class=watch-account-panel><p>")
+            && (watch->channel_id[0] == '\0'
+                || lite_html_account_action(html, YOUTUBE_LITE_ACTION_UNSUBSCRIBE,
+                    watch->channel_id, "", "Unsubscribe", "yt-unsubscribe-action", NULL))
+            && lite_html_ui_markup(html, "<a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a> ")
+            && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
+                "WL", watch->video.id, "Remove from Watch Later", "yt-watch-later-remove", NULL)
+            && lite_html_text(html, "</p></div></details>");
+    }
+    return ok && lite_html_text(html, "</div>")
+        && (!signed_in || lite_html_text(html, "<p id=yt-like-status class=watch-status>&nbsp;</p><p id=yt-library-status class=watch-status>&nbsp;</p>"))
+        && lite_html_text(html, "</section>")
         && lite_html_chapters(html, watch);
 }
 
@@ -2006,7 +2106,8 @@ static bool lite_build_document_with_comments_decoded(
     size_t source_length, const char *comments_source,
     size_t comments_length, YoutubeLiteDocument *document,
     char *error, size_t error_size,
-    const char *prepared_decoded, size_t prepared_decoded_length)
+    const char *prepared_decoded, size_t prepared_decoded_length,
+    bool signed_in)
 {
     if (error != NULL && error_size != 0) error[0] = '\0';
     YoutubeLiteRoute route =
@@ -2132,7 +2233,7 @@ static bool lite_build_document_with_comments_decoded(
     }
     bool ok = lite_html_header(
         &html, query, page_title, route == YOUTUBE_LITE_ROUTE_HOME,
-        compact_results, false);
+        compact_results, false, route == YOUTUBE_LITE_ROUTE_WATCH);
     if (ok && route == YOUTUBE_LITE_ROUTE_HOME) {
         YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS] = {0};
         size_t count = 0;
@@ -2152,7 +2253,7 @@ static bool lite_build_document_with_comments_decoded(
         }
         ok = (count != 0 || lite_html_ui_markup(
             &html, "<section class=hero><h1>{{Watch YouTube on this device}}</h1></section>"))
-            && lite_html_feed_notice(&html, false)
+            && lite_html_feed_notice(&html, false, signed_in)
             && (!lite_topics_requested(url)
                 || lite_html_topics(&html, topics, count));
     } else if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH) {
@@ -2176,10 +2277,7 @@ static bool lite_build_document_with_comments_decoded(
         ok = lite_html_watch_intro(
             &html, watch,
             !comments_requested && !description_requested,
-            (unsigned) (youtube_watch_url_start_time_us(url) / 1000000u));
-        if (ok && !comments_requested && !description_requested)
-            ok = lite_html_ui_markup(
-                &html, "<p class=hint>{{Select the thumbnail to retry playback. The player provides play, pause, seek, time, and exit controls.}}</p>");
+            (unsigned) (youtube_watch_url_start_time_us(url) / 1000000u), false);
         if (ok && watch->description[0] != '\0') {
             ok = lite_html_ui_markup(
                     &html, "<h2>{{Description}}</h2><div id=description class=description>")
@@ -2272,7 +2370,7 @@ bool youtube_lite_build_document_with_comments(
 {
     return lite_build_document_with_comments_decoded(
         budget, url, source, source_length, comments_source,
-        comments_length, document, error, error_size, NULL, 0);
+        comments_length, document, error, error_size, NULL, 0, false);
 }
 
 bool youtube_lite_build_document(
@@ -2873,7 +2971,8 @@ static bool lite_build_emit_header(YoutubeLiteBuildWork *work)
     return lite_html_header(
         &work->html, work->query, title,
         work->route == YOUTUBE_LITE_ROUTE_HOME,
-        work->compact_results, work->personalized_feed || work->signed_in);
+        work->compact_results, work->personalized_feed || work->signed_in,
+        work->route == YOUTUBE_LITE_ROUTE_WATCH);
 }
 
 static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
@@ -2897,14 +2996,14 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
             (void) lite_query_value(work->url, "tilefinch_feed", feed, sizeof(feed));
             return lite_html_ui_markup(html, strcmp(feed, "subscriptions") == 0
                 ? "<h1>{{Your subscriptions}}</h1>" : "<h1>{{Recommended for you}}</h1>")
-                && lite_html_feed_notice(html, true)
+                && lite_html_feed_notice(html, true, true)
                 && (work->video_count != 0 || lite_html_ui_markup(html,
                     "<p class=empty>{{No videos are available in this feed yet.}}</p>"));
         }
         return ((lite_topics_requested(work->url) && work->topic_count != 0)
             || lite_html_ui_markup(
             html, "<section class=hero><h1>{{Watch YouTube on this device}}</h1></section>"))
-            && lite_html_feed_notice(html, false)
+            && lite_html_feed_notice(html, false, work->signed_in)
             && (!lite_topics_requested(work->url)
                 || lite_html_topics(html, work->topics, work->topic_count));
     }
@@ -2925,11 +3024,7 @@ static bool lite_build_emit_intro(YoutubeLiteBuildWork *work)
     bool ok = lite_html_watch_intro(
         html, watch,
         !work->comments_requested && !work->description_requested,
-        (unsigned) (youtube_watch_url_start_time_us(work->url) / 1000000u));
-    if (ok && !work->comments_requested
-        && !work->description_requested)
-        ok = lite_html_ui_markup(
-            html, "<p class=hint>{{Select the thumbnail to retry playback. The player provides play, pause, seek, time, and exit controls.}}</p>");
+        (unsigned) (youtube_watch_url_start_time_us(work->url) / 1000000u), work->signed_in);
     return ok;
 }
 
@@ -3128,7 +3223,7 @@ static void lite_build_work_pump(YoutubeLiteBuildWork *work)
                 if (ok && work->route == YOUTUBE_LITE_ROUTE_PLAYLIST && work->playlist_editable)
                     ok = lite_html_text(&work->html, "<p>")
                         && lite_html_account_action(&work->html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
-                            work->playlist_id, video->id, "Remove from playlist", "")
+                            work->playlist_id, video->id, "Remove from playlist", "", NULL)
                         && lite_html_text(&work->html, "</p>");
             }
         } else {
@@ -4097,9 +4192,10 @@ size_t youtube_lite_copy_chapters(BrowserSession *session, const char *url,
 
 static bool lite_watch_facts_get(YoutubeLiteLoadJob *job)
 {
-    if (job->route != YOUTUBE_LITE_ROUTE_WATCH
-        || (!lite_description_view_requested(job->url)
-            && !lite_comments_view_requested(job->url))) return false;
+    /* Normal details emits the same bounded watch facts and six retained
+       recommendations as the original build. Back must not fetch the raw
+       watch response again merely to return from a disclosure. */
+    if (job->route != YOUTUBE_LITE_ROUTE_WATCH) return false;
     BrowserSiteAdapterDocumentCacheView cached = {0};
     TilefinchRequestContext authority =
         lite_primary_context(job->url, job->fetch_url);
@@ -4213,8 +4309,10 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     if (route == YOUTUBE_LITE_ROUTE_HOME && !lite_topics_requested(url)) {
         /* The search form is local. Optional discovery gets a separate idle
            job after first paint; it must not delay entering a query. */
-        if (!youtube_lite_build_document(budget, url, NULL, 0,
-                &job->document, error, error_size)) {
+        if (!lite_build_document_with_comments_decoded(
+                budget, url, NULL, 0, NULL, 0,
+                &job->document, error, error_size, NULL, 0,
+                youtube_lite_session_signed_in(session))) {
             youtube_lite_load_destroy(job);
             return NULL;
         }

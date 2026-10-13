@@ -51,6 +51,8 @@ static int test_engine_lifecycle(void)
                  == (size_t) BROWSER_PSP_APP_SCRIPT_TOTAL_MB * MIB
           && config.javascript.maximum_file_bytes
                  == (size_t) BROWSER_PSP_APP_SCRIPT_FILE_KB * 1024u
+          && config.resources.maximum_stylesheets == 32u
+          && config.resources.maximum_stylesheet_bytes == 3u * MIB
           && config.javascript.execution_policy.maximum_host_compile_source_bytes
                  == 4u * MIB);
     config.memory_limit = 16u * MIB;
@@ -329,6 +331,14 @@ static int test_engine_lifecycle(void)
         engine, 10000, 1);
     CHECK(frame_job == BROWSER_RENDER_JOB_PENDING
           || frame_job == BROWSER_RENDER_JOB_COMPLETE);
+    if (frame_job == BROWSER_RENDER_JOB_PENDING) {
+        size_t prepared = render_shell->frame_job_units;
+        size_t placeholders = 0;
+        CHECK(browser_engine_render_placeholder_frame(engine, &placeholders)
+              && placeholders != 0
+              && render_shell->frame_job_units == prepared
+              && tile_cache_frame_work_pending(render_shell));
+    }
     while (frame_job == BROWSER_RENDER_JOB_PENDING) {
         frame_job = browser_engine_render_frame_bounded(
             engine, 10000, 2);
@@ -1105,6 +1115,128 @@ static int computed_style_container_geometry_case(bool inline_units)
     return 0;
 }
 
+static int test_opacity_geometry_snapshot_reuse(void)
+{
+    {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = false;
+        char error[256] = {0};
+        char page[16384];
+        size_t length = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><style>.card{width:100px;height:20px}"
+            ".wide{width:180px}</style><main>"
+            "<div class=card id=first></div>");
+        for (unsigned i = 0; i < 300; i++)
+            length += (size_t) snprintf(page + length, sizeof(page) - length,
+                "<div class=card></div>");
+        length += (size_t) snprintf(page + length, sizeof(page) - length, "</main>");
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            "https://geometry-cache.test/", page, length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        CHECK(nav->page.layout_reuse != NULL);
+        LayoutReuseStats before = {0}, after = {0};
+        layout_reuse_cache_stats(nav->page.layout_reuse, &before);
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('first');"
+            "n.className='card wide';const a=n.offsetWidth;"
+            "n.style.width='140px';const b=n.offsetWidth;"
+            "n.innerHTML='<span>x</span>';const c=n.offsetWidth;"
+            "globalThis.pocSummary=[a,b,c].join(',')})()",
+            "<geometry-style-reuse>", &result));
+        CHECK(strcmp(result.summary, "180,140,140") == 0);
+        CHECK(script_runtime_has_pending_mutations(nav->page.runtime));
+        layout_reuse_cache_stats(nav->page.layout_reuse, &after);
+        if (after.style_hits < before.style_hits + 7u)
+            fprintf(stderr, "geometry reuse hits=%zu/%zu misses=%zu/%zu resets=%zu/%zu\n",
+                before.style_hits, after.style_hits, before.style_misses,
+                after.style_misses, before.full_resets, after.full_resets);
+        /* Untouched siblings keep their exact styles during forced geometry
+           builds, while every author change above remains visible. */
+        CHECK(after.style_hits >= before.style_hits + 7u);
+        before = after;
+        /* Resource completion can already have queued the next stylesheet
+           publication. A geometry read still uses the installed cascade. */
+        nav->style_rebuild_required = true;
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const link=document.createElement('link');link.rel='stylesheet';"
+            "link.href='/pending.css';document.head.appendChild(link);"
+            "const n=document.getElementById('first');n.style.width='160px';"
+            "globalThis.pocSummary=String(n.offsetWidth)})()",
+            "<geometry-pending-resource>", &result));
+        CHECK(strcmp(result.summary, "160") == 0);
+        CHECK(script_runtime_has_pending_resource_mutations(nav->page.runtime));
+        layout_reuse_cache_stats(nav->page.layout_reuse, &after);
+        CHECK(after.full_resets == before.full_resets);
+        CHECK(after.style_hits >= before.style_hits + 7u);
+        CHECK(navigation_relayout(nav));
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+    }
+    for (unsigned sensitive = 0; sensitive < 3; sensitive++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.javascript.enabled = true;
+        config.resources.enabled = false;
+        char page[512], error[256] = {0};
+        int length = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}#card{width:100px;height:32px;"
+            "background:#123456}%s</style><div id=card></div>",
+            sensitive == 1 ? "#card[style*='opacity']{width:200px}"
+                : sensitive == 2 ? "#card::before{content:attr(style)}" : "");
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            "https://geometry-reuse.test/", page, (size_t) length, true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('card');n.style.opacity='.8';"
+            "const w=n.offsetWidth;for(let i=0;i<40;i++){n.style.opacity=String(i%2?.4:.6);"
+            "if(n.offsetWidth!==w)throw Error('geometry changed')}"
+            "globalThis.pocSummary=String(w)})()", "<opacity-geometry>", &result));
+        CHECK(strcmp(result.summary, sensitive == 1 ? "200" : "100") == 0);
+        CHECK(sensitive ? result.geometry_snapshot_builds > 20
+            : result.geometry_snapshot_builds == 1 && result.geometry_snapshot_hits >= 40);
+        LayoutDocument declined = {0};
+        if (!sensitive) CHECK(!script_runtime_take_geometry_layout(
+            nav->page.runtime, &nav->viewport, &declined));
+        CHECK(script_runtime_has_pending_mutations(nav->page.runtime));
+        CHECK(navigation_relayout(nav));
+        bool translucent = false;
+        for (size_t i = 0; i < nav->page.layout.count; i++) {
+            const DrawCommand *command = &nav->page.layout.commands[i];
+            if (command->type == DRAW_FILL_RECT && command->color == 0x123456
+                && command->opacity_scale > 0 && command->opacity_scale < 256)
+                translucent = true;
+        }
+        CHECK(translucent);
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('card');n.style.width='130px';"
+            "if(n.offsetWidth!==130)throw Error('stale width')})()",
+            "<opacity-width-change>", &result));
+        CHECK(result.geometry_snapshot_builds > 0);
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('card');n.style.width='150px';"
+            "n.style.opacity='.2';if(n.offsetWidth!==150)throw Error('lost invalidation')})()",
+            "<opacity-mixed-change>", &result));
+        CHECK(result.geometry_snapshot_builds > 0);
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('card');"
+            "n.style.opacity='.3; width:170px';void n.offsetWidth})()",
+            "<opacity-nonnumeric>", &result));
+        CHECK(result.geometry_snapshot_builds > 0);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
 static int test_computed_style_tracks_container_geometry(void)
 {
     CHECK(computed_style_container_geometry_case(false) == 0);
@@ -1657,10 +1789,17 @@ static int test_css_transition_lifecycle(void)
                                                &navigation->viewport));
     /* A same-generation read is allocation-free; refusal on a later build
        does not retire the realm or consume the browser's pending work. */
+    ViewportContext different_viewport = navigation->viewport;
+    different_viewport.css_width++;
+    LayoutDocument declined_geometry = {0};
+    CHECK(!script_runtime_take_geometry_layout(navigation->page.runtime,
+        &different_viewport, &declined_geometry));
     budget_inject_failure_after(navigation->budget, 0);
     CHECK(script_runtime_flush_geometry_layout(navigation->page.runtime,
                                                &navigation->viewport));
     document_note_connected_mutation(&navigation->page.document);
+    CHECK(!script_runtime_take_geometry_layout(navigation->page.runtime,
+        &navigation->viewport, &declined_geometry));
     CHECK(!script_runtime_flush_geometry_layout(navigation->page.runtime,
                                                 &navigation->viewport));
     budget_clear_failure_injection(navigation->budget);
@@ -1668,6 +1807,12 @@ static int test_css_transition_lifecycle(void)
     CHECK(script_runtime_has_pending_mutations(navigation->page.runtime));
     CHECK(script_runtime_flush_geometry_layout(navigation->page.runtime,
                                                &navigation->viewport));
+    /* The owner can publish the already-complete snapshot without admitting
+       another layout. Old duplicate builds fail under this refusal. */
+    budget_inject_failure_after(navigation->budget, 0);
+    CHECK(navigation_relayout(navigation));
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(navigation->page.loaded && navigation->page.layout.count != 0);
     CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
     script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
         computed_style_test_flush, navigation);
@@ -3177,6 +3322,155 @@ static int test_promoted_page_preserves_style_reuse(void)
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     fetch_trace_end();
+    return 0;
+}
+
+static int test_smart_font_pressure_preempts_startup(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_font_mode = WEB_FONTS_ON;
+    static const char page[] = "<!doctype html><style>"
+        "@font-face{font-family:Optional;src:url(/late.ttf)}"
+        "a{font-family:Optional,sans-serif}</style><a href=/next>Readable link</a>"
+        "<script>var late=document.createElement('script');late.src='/late.js';"
+        "document.head.appendChild(late);</script>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://font-pressure.test/", page, sizeof(page)-1, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(script_runtime_has_pending_startup_scripts(navigation->page.runtime)
+        && fonts_external_loader_pending(&navigation->page.external_font_loader)
+        && browser_engine_set_web_font_mode(engine, WEB_FONTS_SMART));
+    size_t remaining = budget_remaining(budget);
+    CHECK(remaining > 1536u * 1024u);
+    void *pressure = budget_malloc(budget, remaining - 1536u * 1024u);
+    CHECK(pressure != NULL);
+    bool changed = false;
+    (void) browser_engine_run_idle_work(engine, &changed);
+    CHECK(navigation->page.loaded && navigation->page.web_font_pressure_fallback
+        && navigation->page.web_font_fallback_attempted
+        && !fonts_external_loader_pending(&navigation->page.external_font_loader)
+        && navigation->page.script_result.runtime_ticks < 128u
+        && script_runtime_has_pending_startup_scripts(navigation->page.runtime)
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_focus_move(engine, true));
+    budget_free(budget, pressure);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_sibling_focus_retains_unrelated_matches(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    char page[16384];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0;background:white}"
+        "p{margin:4px}span{color:#333}"
+        "a{display:block;width:180px;height:40px;margin:12px;background:white}"
+        "a:focus{color:#900;border:5px solid #0077b6;box-shadow:0 0 0 3px #0077b6}"
+        "input:focus~button{color:red}a:focus~a{color:green}"
+        "[data-tilefinch-focus]~a{padding-top:2px}");
+    for (unsigned i = 0; i < 64; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                 ".unused%u{color:black}", i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used, "</style>");
+    for (unsigned i = 0; i < 128; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                 "<p><span>Unrelated text %u</span></p>", i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "<a id=first href=/one><span>First</span></a>"
+        "<a id=second href=/two><span>Second</span></a><script>void 0</script>");
+    CHECK(used < sizeof(page));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://focus-paint.test/", page, used, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    size_t before = navigation->incremental_relayouts;
+    LayoutReuseStats old_stats, new_stats;
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &old_stats);
+    CHECK(browser_engine_focus_move(engine, true)
+        && navigation->incremental_relayouts == before + 1);
+    CHECK(browser_engine_focus_move(engine, true)
+        && navigation->incremental_relayouts == before + 2
+        && browser_engine_render_frame(engine, NULL));
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &new_stats);
+    CHECK(new_stats.style_hits > old_stats.style_hits
+          && new_stats.full_resets == old_stats.full_resets);
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    uint64_t fast = frame_checksum(pixels, count);
+    layout_reuse_cache_reset(navigation->page.layout_reuse);
+    CHECK(navigation_relayout(navigation) && browser_engine_refresh_render_shell(engine)
+        && browser_engine_render_frame(engine, NULL));
+    pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(frame_checksum(pixels, count) == fast);
+    static const char variable_css[] =
+        "a:focus{--focus-ink:#084}a span{color:var(--focus-ink,#333)}"
+        "body:has(a:focus) p{padding-left:2px}";
+    CHECK(stylesheet_add_css(&navigation->page.stylesheet, variable_css,
+        sizeof(variable_css)-1) && navigation_relayout(navigation));
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &old_stats);
+    CHECK(browser_engine_focus_move(engine, false)
+        && browser_engine_refresh_render_shell(engine)
+        && browser_engine_render_frame(engine, NULL));
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &new_stats);
+    CHECK(new_stats.full_resets > old_stats.full_resets);
+    pixels = browser_engine_framebuffer(engine, &count);
+    fast = frame_checksum(pixels, count);
+    layout_reuse_cache_reset(navigation->page.layout_reuse);
+    CHECK(navigation_relayout(navigation) && browser_engine_refresh_render_shell(engine)
+        && browser_engine_render_frame(engine, NULL));
+    pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(frame_checksum(pixels, count) == fast);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_required_rebuild_pressure_keeps_static_document(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    static const char page[] = "<!doctype html><style>p{margin:0}</style>"
+        "<a href=/next>Next page</a><p>Original readable text</p>"
+        "<script>globalThis.retained=new Uint8Array(512*1024)</script>";
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://rebuild-pressure.test/", page, sizeof(page)-1, true));
+    NavigationSession *n = browser_engine_navigation(engine);
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(n->page.runtime,
+        "for(let i=0;i<600;i++){let p=document.createElement('p');"
+        "p.textContent='Updated readable row '+i+' '+('text '.repeat(30));"
+        "document.body.appendChild(p)}", "<required-update>", &result));
+    n->style_rebuild_required = true;
+    Budget *budget = browser_engine_budget(engine);
+    size_t original_limit = budget->limit;
+    budget->limit = budget->current + 128u*1024u;
+    CHECK(navigation_relayout(n));
+    CHECK(n->page.loaded && n->page.runtime == NULL
+        && n->page.script_degradation_observed
+        && n->page.layout.count > 600 && n->page.layout.link_count >= 1);
+    budget->limit = original_limit;
+    CHECK(browser_engine_refresh_render_shell(engine)
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_focus_move(engine, true));
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
     return 0;
 }
 

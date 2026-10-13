@@ -2147,6 +2147,38 @@ static int test_cover_object_position_stays_in_source(Budget *budget)
     return 0;
 }
 
+static int test_rounded_image_radius_fits_tiled_spans(Budget *budget)
+{
+    enum { W = 256, H = 144 };
+    unsigned char pixel[] = {255, 255, 255, 255};
+    ImageResource image = {.pixels = pixel, .width = 1, .height = 1};
+    DrawCommand command = {.type = DRAW_IMAGE, .image = &image,
+        .x = 80, .y = 16, .width = 98, .height = 98,
+        .opacity_scale = 256, .image_fit = LAYOUT_IMAGE_FIT_COVER};
+    LayoutDocument layout = {.budget = budget, .commands = &command,
+        .count = 1, .capacity = 1, .width = W, .scroll_width = W,
+        .height = H, .page_background = 0};
+    CHECK(viewport_context_init(&layout.viewport, W, H, W, H));
+    uint16_t *expected = budget_malloc(budget, W * H * sizeof(*expected));
+    uint16_t *actual = budget_malloc(budget, W * H * sizeof(*actual));
+    CHECK(expected && actual);
+    command.scale = 49;
+    CHECK(paint_layout_frame(budget, &layout, expected, W, H));
+    command.scale = 32767;
+    CHECK(paint_layout_frame(budget, &layout, actual, W, H));
+    CHECK(memcmp(actual, expected, W * H * sizeof(*actual)) == 0);
+    /* Unequal corners must use the radius on that side of the current
+       row, not the largest radius from an unrelated corner. */
+    command.scale = style_border_radius_pack(80, 10, 80, 10);
+    CHECK(paint_layout_frame(budget, &layout, actual, W, H));
+    CHECK(actual[(16 + 5) * W + 80 + 85] != 0
+          && actual[(16 + 92) * W + 80 + 12] != 0);
+    budget_free(budget, actual);
+    budget_free(budget, expected);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_visual_clone_preserves_object_position(Budget *budget)
 {
     DrawCommand commands[2] = {

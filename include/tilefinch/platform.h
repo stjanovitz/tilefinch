@@ -58,7 +58,12 @@ typedef struct {
        using them before this returns. */
     void (*retire_frame)(void *context, const uint16_t *pixels);
     /* Called at deterministic engine work boundaries. Returning false asks
-       the current operation to cancel without committing partial state. */
+       the current operation to cancel without committing partial state.
+       At page-task-boundary, render-input-boundary and image-admission-boundary
+       it instead defers the next resumable unit, retaining completed work. render-prepare
+       and style-prepare may present immutable incumbent pixels but must not
+       mutate/reenter the borrowed document/render shell; render-compose brackets writes
+       during which that incumbent may not be sampled. */
     bool (*cooperate)(void *context, const char *phase,
                       size_t completed_work_units);
     void (*log_message)(void *context, const char *message);

@@ -1233,27 +1233,126 @@ static int test_retained_cache_eligibility(void)
     CHECK(reuse != NULL);
     layout_reuse_cache_enable_retained_matches(reuse);
     layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
-    CHECK(reuse->matches == NULL && !reuse->matches_attempted);
+    CHECK(reuse->matches != NULL && reuse->matches_attempted);
     layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
     CHECK(reuse->matches != NULL);
-    LayoutReuseStats eligible, ineligible;
+    LayoutReuseStats eligible, conditional;
     layout_reuse_cache_stats(reuse, &eligible);
     size_t match_bytes = style_retained_matches_bytes(reuse->matches);
     layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
-    layout_reuse_cache_stats(reuse, &ineligible);
-    CHECK(reuse->matches == NULL && !reuse->matches_attempted
-          && eligible.retained_bytes - ineligible.retained_bytes == match_bytes);
+    layout_reuse_cache_stats(reuse, &conditional);
+    CHECK(reuse->matches != NULL && reuse->matches_attempted
+          && style_retained_matches_bytes(reuse->matches) == match_bytes
+          && conditional.retained_bytes == eligible.retained_bytes);
+    Stylesheet too_large = { .count = (size_t) UINT16_MAX + 1u };
+    CHECK(!style_retained_matches_supported(&too_large));
     layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
     CHECK(reuse->matches != NULL);
-    layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
+    layout_reuse_cache_destroy(reuse);
+    reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
     size_t limit = budget.limit;
     budget.limit = budget.current;
-    layout_reuse_cache_prepare(reuse, &ordinary, NULL, NULL, 480);
+    layout_reuse_cache_prepare(reuse, &containers, NULL, NULL, 480);
     CHECK(reuse->matches == NULL && reuse->matches_attempted);
     budget.limit = limit;
     layout_reuse_cache_destroy(reuse);
     stylesheet_destroy(&ordinary);
     stylesheet_destroy(&containers);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_unrelated_container_custom_rules(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<style>.target{color:var(--tone,red)}"
+        "@container (width > 100px){.missing{--tone:blue}}"
+        "</style><p id=target class=target>Text</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "target");
+    CHECK(node != NULL);
+    uint32_t before = style_container_consults(&sheet);
+    ComputedStyle result = style_for_node(&sheet, node, NULL);
+    CHECK(result.color == 0xff0000u);
+    CHECK(style_container_consults(&sheet) == before);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_retained_container_selectors(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.outer{container:outer / inline-size}"
+        ".inner{container:inner / inline-size}.target{color:red}"
+        "@container inner (width > 100px){"
+        " @container outer (width > 500px){.target{color:blue}"
+        " .target::before{content:'wide'}}}</style>"
+        "<div id=outer class=outer><div id=inner class=inner>"
+        "<p id=target class=target>Text</p></div></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *outer = find_id(root, "outer");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    lxb_dom_node_t *node = find_id(root, "target");
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(outer != NULL && inner != NULL && node != NULL && retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    static const int widths[][2] = {{600, 90}, {600, 200}, {600, 80}, {400, 200}, {600, 200}};
+    for (size_t turn = 0; turn < sizeof(widths) / sizeof(widths[0]); turn++) {
+        CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+              && style_container_layout_state_add(&sheet, outer, widths[turn][0], 100, 0, 0)
+              && style_container_layout_state_add(&sheet, inner, widths[turn][1], 50, 0, 0));
+        uint64_t candidates = sheet.rule_index_candidates;
+        ComputedStyle result = style_for_node(&sheet, node, NULL);
+        ComputedStyle pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &result);
+        bool active = widths[turn][0] > 500 && widths[turn][1] > 100;
+        CHECK(result.color == (active ? 0x0000ffu : 0xff0000u)
+              && pseudo.generated_content == active);
+        /* Inactive conditional selectors must be retained too, so a later
+           resize can activate them without repeating selector matching. */
+        if (turn != 0) CHECK(sheet.rule_index_candidates == candidates);
+        (void) style_retained_matches_attach(&sheet, NULL);
+        ComputedStyle fresh = style_for_node(&sheet, node, NULL);
+        ComputedStyle fresh_pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &fresh);
+        CHECK(fresh.color == result.color
+              && fresh_pseudo.generated_content == pseudo.generated_content);
+        (void) style_retained_matches_attach(&sheet, retained);
+        if (turn == 1) {
+            CHECK(style_container_log_begin(&sheet, &budget, &sheet));
+            uint64_t generation = sheet.container_state_generation;
+            style_container_live_update(&sheet, inner, 200, 50);
+            CHECK(sheet.container_state_generation == generation);
+            style_container_live_update(&sheet, inner, 90, 50);
+            CHECK(sheet.container_state_generation != generation);
+            ComputedStyle narrow = style_for_node(&sheet, node, NULL);
+            CHECK(narrow.color == 0xff0000u);
+            style_container_live_update(&sheet, inner, 200, 50);
+            ComputedStyle wide = style_for_node(&sheet, node, NULL);
+            CHECK(wide.color == 0x0000ffu);
+            style_container_log_end(&sheet, &sheet);
+        }
+    }
+    CHECK(retained->hits >= 8u);
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
@@ -3331,6 +3430,143 @@ static int test_selector_metadata_refusal(void)
     return 0;
 }
 
+static int test_transition_candidate_rejection(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    budget_install_lexbor(&budget);
+    char html[16384];
+    size_t html_length = (size_t) snprintf(html, sizeof(html),
+        "<section class='parent'><div id='target' class='hot a:b'>x</div>"
+        "<p id='other'>y</p></section><aside class='");
+    for (unsigned i = 0; i < 512u; i++) {
+        int length = snprintf(html + html_length, sizeof(html) - html_length,
+                              "absent%u ", i);
+        CHECK(length > 0 && (size_t) length < sizeof(html) - html_length);
+        html_length += (size_t) length;
+    }
+    CHECK(sizeof(html) - html_length > sizeof("'>z</aside>"));
+    memcpy(html + html_length, "'>z</aside>", sizeof("'>z</aside>"));
+    html_length += sizeof("'>z</aside>") - 1u;
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, html_length, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    for (unsigned i = 0; i < 512u; i++) {
+        char css[128];
+        int length = snprintf(css, sizeof(css),
+            ".absent%u:not(.off){transition:opacity 1s}", i);
+        CHECK(length > 0 && (size_t) length < sizeof(css));
+        CHECK(stylesheet_add_css(&sheet, css, (size_t) length));
+    }
+    static const char css[] =
+        ".parent>.hot{transition:color 150ms}"
+        "#target{transition-delay:20ms}"
+        "DIV{transition-timing-function:linear}"
+        ".a\\:b{transition-duration:250ms}"
+        ":is(.hot,p){transition-property:opacity}"
+        ":not(.hot){transition-duration:350ms}"
+        ".parent:has(.hot) p{transition-delay:40ms}"
+        ".hot::before{transition:transform 450ms}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *nodes[] = {
+        find_id(lxb_dom_interface_node(document.html), "target"),
+        find_id(lxb_dom_interface_node(document.html), "other")
+    };
+    for (unsigned mutation = 0; mutation < 2u; mutation++) {
+        if (mutation != 0) {
+            CHECK(lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(nodes[0]),
+                (const lxb_char_t *) "class", 5,
+                (const lxb_char_t *) "cold", 4) != NULL);
+        }
+        for (size_t n = 0; n < 2u; n++) {
+            for (PseudoElement pseudo = PSEUDO_NONE; pseudo <= PSEUDO_BEFORE;
+                 pseudo++) {
+                StyleTransitionComputed fast, linear;
+                uint64_t before = sheet.selector_match_calls;
+                CHECK(style_transition_computed(&sheet, nodes[n], pseudo,
+                                                &fast));
+                uint64_t fast_calls = sheet.selector_match_calls - before;
+                /* Disable only rejection metadata in this same sheet. The
+                   full matcher remains the oracle for every declaration. */
+                uint8_t suffix[520];
+                CHECK(sheet.transition_rule_count <= sizeof(suffix));
+                for (size_t r = 0; r < sheet.transition_rule_count; r++) {
+                    suffix[r] = sheet.transition_rules[r].fast_key_suffix_bytes;
+                    sheet.transition_rules[r].fast_key_suffix_bytes = UINT8_MAX;
+                }
+                before = sheet.selector_match_calls;
+                CHECK(style_transition_computed(&sheet, nodes[n], pseudo,
+                                                &linear));
+                uint64_t linear_calls = sheet.selector_match_calls - before;
+                for (size_t r = 0; r < sheet.transition_rule_count; r++)
+                    sheet.transition_rules[r].fast_key_suffix_bytes = suffix[r];
+                CHECK(memcmp(&fast, &linear, sizeof(fast)) == 0);
+                if (pseudo == PSEUDO_NONE) {
+                    if (linear_calls < fast_calls + 512u)
+                        fprintf(stderr, "transition candidates rules=%zu fast=%llu linear=%llu\n",
+                            sheet.transition_rule_count,
+                            (unsigned long long) fast_calls,
+                            (unsigned long long) linear_calls);
+                    CHECK(linear_calls >= fast_calls + 512u);
+                }
+            }
+        }
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_shadow_scope_allocation_refusal(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<body><p id=outside>Outside</p><x-host><div id=carrier>"
+        "<style>p{color:#ff0000}</style><p id=inside>Inside</p>"
+        "</div></x-host></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *carrier = find_id(root, "carrier");
+    lxb_dom_node_t *inside = find_id(root, "inside");
+    lxb_dom_node_t *outside = find_id(root, "outside");
+    CHECK(carrier != NULL && inside != NULL && outside != NULL);
+    CHECK(document_mark_shadow_carrier(carrier));
+    size_t document_bytes = budget.current;
+    bool saw_refusal = false;
+    for (size_t failure_at = 0; failure_at < 256u; failure_at++) {
+        Stylesheet sheet = {0};
+        size_t before = budget.injected_failure_count;
+        budget_inject_failure_after(&budget, failure_at);
+        bool built = stylesheet_build(&sheet, &budget, &document, 480);
+        budget_clear_failure_injection(&budget);
+        if (built) {
+            ComputedStyle outside_style = style_for_node(&sheet, outside, NULL);
+            CHECK(outside_style.color == 0x000000u);
+            if (before != budget.injected_failure_count)
+                saw_refusal = true;
+        }
+        stylesheet_destroy(&sheet);
+        CHECK(budget.current == document_bytes);
+    }
+    CHECK(saw_refusal);
+    Stylesheet complete = {0};
+    CHECK(stylesheet_build(&complete, &budget, &document, 480));
+    CHECK(complete.shadow_scope_count == 1u);
+    CHECK(style_for_node(&complete, inside, NULL).color == 0xff0000u);
+    CHECK(style_for_node(&complete, outside, NULL).color == 0x000000u);
+    stylesheet_destroy(&complete);
+    CHECK(budget.current == document_bytes);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     /* The selector offset and container query share one field. Exercise the
@@ -3368,16 +3604,24 @@ int main(int argc, char **argv)
         return test_registered_custom_properties();
     if (argc == 2 && strcmp(argv[1], "--attribute-names-only") == 0)
         return test_selector_attribute_names();
+    if (argc == 2 && strcmp(argv[1], "--shadow-scope-refusal-only") == 0)
+        return test_shadow_scope_allocation_refusal();
     if (argc == 2 && strcmp(argv[1], "--attribute-bench-only") == 0)
         return benchmark_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--escaped-utilities-only") == 0)
         return test_escaped_utility_classes_indexed();
+    if (argc == 2 && strcmp(argv[1], "--transition-candidates-only") == 0)
+        return test_transition_candidate_rejection();
+    CHECK(test_transition_candidate_rejection() == 0);
     CHECK(test_selector_attribute_names() == 0);
+    CHECK(test_shadow_scope_allocation_refusal() == 0);
     CHECK(test_computed_style_payload_storage() == 0);
     CHECK(test_sparse_selector_metadata() == 0);
     CHECK(test_selector_metadata_refusal() == 0);
     CHECK(benchmark_selector_attribute_names() == 0);
     CHECK(test_retained_cache_eligibility() == 0);
+    CHECK(test_retained_container_selectors() == 0);
+    CHECK(test_unrelated_container_custom_rules() == 0);
     CHECK(test_retained_dense_storage() == 0);
     CHECK(test_retained_range_cache_handoff() == 0);
     CHECK(test_class_token_byte_boundaries() == 0);

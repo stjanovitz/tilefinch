@@ -92,7 +92,7 @@ static bool test_script_oom_retains_usable_target(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -608,7 +608,7 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* This covers retiring a realm that has run out of heap; keep its
@@ -744,7 +744,7 @@ static bool test_authored_oom_text_does_not_trigger_static_recovery(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -790,7 +790,9 @@ static bool test_late_oom_static_relayout_refusal_is_transactional(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* Leave bootstrap headroom; exhaustion must happen in the later
+           author timer, not before the refusal seam is armed. */
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -2159,7 +2161,7 @@ static bool test_low_memory_external_script_incumbent_falls_back(void)
     bool navigation_ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 2 * MIB, 512 * 1024, 1000);
     }

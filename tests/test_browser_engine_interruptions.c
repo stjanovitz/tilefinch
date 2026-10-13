@@ -61,7 +61,7 @@ static bool focus_feedback_checkpoint(void *opaque, const char *phase, size_t wo
     return true;
 }
 
-static int test_focus_feedback_before_author_work(void)
+static int test_focus_feedback_before_author_work(bool javascript)
 {
     static uint16_t base[480u * 272u], shown[480u * 272u];
     static const char html[] =
@@ -73,7 +73,7 @@ static int test_focus_feedback_before_author_work(void)
     browser_device_profile_psp3000(&profile);
     BrowserConfig config;
     browser_config_init(&config, &profile);
-    config.javascript.enabled = config.javascript.document_scripts_enabled = true;
+    config.javascript.enabled = config.javascript.document_scripts_enabled = javascript;
     config.resources.enabled = false;
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
@@ -81,10 +81,10 @@ static int test_focus_feedback_before_author_work(void)
         "https://focus-feedback.test/page", html, sizeof(html) - 1u, true));
     NavigationSession *nav = browser_engine_navigation(engine);
     lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
-    CHECK(nav->page.runtime != NULL
+    CHECK((nav->page.runtime != NULL) == javascript
         && browser_engine_focus_node(engine, test_reader_find_id(root, "first"))
         && browser_engine_render_frame(engine, NULL));
-    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+    if (javascript) CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
         "document.getElementById('second').addEventListener('focus',function(){"
         "this.setAttribute('data-count',String(Number(this.getAttribute('data-count')||0)+1));"
         "document.body.insertAdjacentHTML('beforeend','<p id=changed>Changed</p>');});",
@@ -103,10 +103,128 @@ static int test_focus_feedback_before_author_work(void)
     tilefinch_platform_set_services(NULL);
     CHECK(moved && probe.feedback && probe.before_handler && probe.visible && probe.menu_visible);
     root = lxb_dom_interface_node(nav->page.document.html);
-    CHECK(test_reader_find_id(root, "changed") != NULL);
-    size_t count_length = 0;
-    const char *count = document_attribute(test_reader_find_id(root, "second"), "data-count", &count_length);
-    CHECK(count != NULL && count_length == 1u && count[0] == '1');
+    CHECK((test_reader_find_id(root, "changed") != NULL) == javascript);
+    if (javascript) {
+        size_t count_length = 0;
+        const char *count = document_attribute(test_reader_find_id(root, "second"), "data-count", &count_length);
+        CHECK(count != NULL && count_length == 1u && count[0] == '1');
+    }
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+typedef struct {
+    BrowserEngine *engine;
+    const uint16_t *frame, *before;
+    size_t pixels, preparations;
+    bool composing, changed_early, nested_preparation, defer_tiles;
+    bool nested_rendered;
+} PaintPreparationProbe;
+
+static bool paint_preparation_checkpoint(void *opaque, const char *phase, size_t work)
+{
+    PaintPreparationProbe *probe = opaque;
+    if (strcmp(phase, "render-compose") == 0) {
+        probe->composing = work != 0;
+    } else if (strcmp(phase, "render-prepare") == 0) {
+        probe->preparations++;
+        probe->nested_rendered |= browser_engine_render_frame(probe->engine, NULL);
+        probe->nested_preparation |= probe->composing;
+        probe->changed_early |= memcmp(probe->frame, probe->before,
+                                      probe->pixels * sizeof(uint16_t)) != 0;
+    } else if (strcmp(phase, "render-input-boundary") == 0) {
+        return !probe->defer_tiles;
+    }
+    return true;
+}
+
+static bool style_preparation_checkpoint(void *opaque, const char *phase, size_t work)
+{
+    size_t *visits = opaque;
+    if (strcmp(phase, "style-prepare") == 0) *visits = work;
+    return true;
+}
+
+static int test_paint_preparation_preserves_incumbent(void)
+{
+    static uint16_t before[480u * 272u], reference[480u * 272u];
+    static char html[32768];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}section{height:230px;overflow:hidden}"
+        "p{height:12px;margin:0}aside{position:fixed;top:0;right:0;background:red}"
+        "</style><body><aside>Fixed panel</aside><section>");
+    for (unsigned i = 0; i < 400u; i++) {
+        int n = snprintf(html + used, sizeof(html) - used, "<p>Row %u</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    used += (size_t) snprintf(html + used, sizeof(html) - used, "</section></body>");
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = config.javascript.document_scripts_enabled = false;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://paint-preparation.test/", html, used, true)
+        && browser_engine_render_frame(engine, NULL));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    size_t style_visits = 0;
+    TilefinchPlatformServices style_services = { .context = &style_visits,
+                                               .cooperate = style_preparation_checkpoint };
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build_context_deferred(&sheet, nav->budget,
+        &nav->page.document, &nav->viewport));
+    static const char css[] = "body:has(.not-present){color:red}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    tilefinch_platform_set_services(&style_services);
+    ComputedStyle absent = style_for_node(&sheet,
+        document_body_node(&nav->page.document), NULL);
+    tilefinch_platform_set_services(NULL);
+    CHECK(absent.color == 0 && style_visits >= 128u);
+    stylesheet_destroy(&sheet);
+    size_t pixels = 0;
+    const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+    CHECK(frame != NULL && pixels == 480u * 272u);
+    memcpy(reference, frame, sizeof(reference));
+    CHECK(browser_engine_refresh_render_shell(engine));
+    frame = browser_engine_framebuffer(engine, &pixels);
+    memcpy(before, frame, sizeof(before));
+    const TileCache *cache = browser_engine_render_metrics_view(engine);
+    size_t rasterized = cache->rasterized;
+    CHECK(browser_engine_render_frame_bounded(engine, 8000u, 0u)
+              == BROWSER_RENDER_JOB_PENDING
+        && browser_engine_render_frame_pending(engine)
+        && cache->rasterized == rasterized
+        && memcmp(frame, before, sizeof(before)) == 0);
+    PaintPreparationProbe probe = { .engine = engine, .frame = frame, .before = before, .pixels = pixels,
+                                   .defer_tiles = true };
+    TilefinchPlatformServices services = { .context = &probe,
+                                           .cooperate = paint_preparation_checkpoint };
+    tilefinch_platform_set_services(&services);
+    BrowserRenderJobStatus status = browser_engine_render_frame_bounded(engine, 8000u, 64u);
+    CHECK(status == BROWSER_RENDER_JOB_PENDING
+        && memcmp(frame, before, sizeof(before)) == 0);
+    probe.defer_tiles = false;
+    for (unsigned i = 0; i < 128u && status == BROWSER_RENDER_JOB_PENDING; i++)
+        status = browser_engine_render_frame_bounded(engine, 8000u, 64u);
+    tilefinch_platform_set_services(NULL);
+    CHECK(status == BROWSER_RENDER_JOB_COMPLETE && probe.preparations != 0
+        && !probe.composing && !probe.changed_early && !probe.nested_preparation
+        && !probe.nested_rendered
+        && memcmp(frame, reference, sizeof(reference)) == 0);
+    browser_engine_cancel_render_job(engine);
+    rasterized = cache->rasterized;
+    CHECK(browser_engine_render_frame_bounded(engine, 8000u, 0u)
+              == BROWSER_RENDER_JOB_COMPLETE
+        && !browser_engine_render_frame_pending(engine)
+        && cache->rasterized == rasterized
+        && memcmp(frame, reference, sizeof(reference)) == 0);
     CHECK(browser_engine_shutdown(engine));
     BrowserEngineMetrics metrics = {0};
     CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);
@@ -200,7 +318,9 @@ static bool interruption_checkpoint(void *opaque, const char *phase, size_t work
 
 int test_background_interruption_journey(void)
 {
-    CHECK(test_focus_feedback_before_author_work() == 0);
+    CHECK(test_paint_preparation_preserves_incumbent() == 0);
+    CHECK(test_focus_feedback_before_author_work(true) == 0);
+    CHECK(test_focus_feedback_before_author_work(false) == 0);
     CHECK(test_idle_publication_retirement_clears_shell() == 0);
     static uint16_t base[480u * 272u], before[480u * 272u], shown[480u * 272u];
     static char html[32768];

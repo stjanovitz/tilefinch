@@ -39,6 +39,13 @@ int main(void)
     navigation.history[5].focus_kind = 2;
     navigation.history[5].focus_index = 4;
 
+    size_t bytes_before_tabs = budget.current;
+    for (size_t point = 0; point < 2u; point++) {
+        budget_inject_failure_after(&budget, point);
+        BrowserTabs *refused = browser_tabs_create(&budget, &navigation);
+        budget_clear_failure_injection(&budget);
+        CHECK(refused == NULL && budget.current == bytes_before_tabs);
+    }
     size_t allocations_before_tabs = budget.allocation_count;
     BrowserTabs *tabs = browser_tabs_create(&budget, &navigation);
     CHECK(tabs != NULL

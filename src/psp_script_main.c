@@ -2221,7 +2221,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_schedule_page_render_work(
         return false;
     }
     if (psp_ui_page_work_paused(&app->process->presentation.ui)) return false;
-    if (frame->page_dirty) {
+    if (frame->page_dirty || frame->focus_partial_presented) {
         if (!*render_job_pending) {
             *render_job_last_progress_us =
                 (uint64_t) sceKernelGetSystemTimeWide();
@@ -4385,9 +4385,10 @@ static TILEFINCH_OUT_OF_LINE BrowserRenderJobStatus psp_render_page_job(
         canvas ? 48u : PSP_RENDER_JOB_MAXIMUM_TILES, cancellation);
 }
 
-/* A completed page/cursor frame publishes at the next vblank, so another
+/* A page/cursor frame publishes at the next vblank, so another
    full wait at the top of the following loop would cap continuous canvas
-   animation at 30 Hz. Start those follow-up frames immediately: their
+   animation and unfinished scroll raster at 30 Hz. Start those follow-up
+   slices immediately: their
    eventual publication wait is the cooperative yield and preserves scanout
    synchronization. A frame with page work already waiting (see
    psp_loop_page_work_waiting) yields briefly instead of waiting for a
@@ -5013,6 +5014,7 @@ typedef struct {
     /* Sample the next input without another vblank wait (see
        psp_wait_before_interactive_input). */
     bool fast_page_followup;
+    uint64_t render_progress_present_us;
     bool canvas_page_followup;
     /* The previous iteration presented a focus move over a live canvas
        and skipped the page's animation callbacks. */
@@ -5735,15 +5737,17 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
        neither scanned nor queued for NEXTFRAME. A short yield samples
        input again without the otherwise mandatory extra vblank. Video
        remains double buffered and uses its separately fenced path. */
-    loop->page_task_yield = !fullscreen_media_poll
+    bool queued_page_input = psp_navigation_cooperate_page_input_pending();
+    loop->page_task_yield = !queued_page_input && !fullscreen_media_poll
         && !loop->fast_page_followup && psp_loop_page_work_waiting(loop);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_loop_timing.task_yield = loop->page_task_yield;
     psp_loop_timing.fast_followup = loop->fast_page_followup;
 #endif
     psp_wait_before_interactive_input(
-        fullscreen_media_poll, loop->fast_page_followup,
-        loop->page_task_yield, psp_canvas_followup_wait(loop));
+        fullscreen_media_poll, loop->fast_page_followup || queued_page_input,
+        loop->page_task_yield,
+        queued_page_input ? 0 : psp_canvas_followup_wait(loop));
     bool canvas_live = loop->canvas_page_followup;
     loop->fast_page_followup = false;
     loop->canvas_page_followup = false;
@@ -5834,6 +5838,9 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     if (psp_input_script_running()) {
         if (!psp_loop_scripted_input(loop, &input, supervisor_page_input))
             return;
+        if (input.pressed != 0 && frame.replayed_press_us == 0)
+            frame.replayed_press_us =
+                psp_input_script_request_time(frame.ui_sample_us);
         /* The loop's own millisecond consumers -- the reader-mode
            hold, the power policy -- read this rather than the input,
            and a frame that took 800 ms under a loaded host would
@@ -6248,6 +6255,9 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
        second time this iteration. The callbacks run next iteration (at
        most every other one is skipped); page time advances by the usual
        tick, so the game neither speeds up nor builds a backlog. */
+    /* A completed scope may have queued the next focus/activation. Do not
+       put a fresh task or raster slice in front of an already sampled press. */
+    frame.defer_runtime |= psp_navigation_cooperate_page_input_pending();
     loop->focus_runtime_deferred = frame.defer_runtime;
     if (!frame.defer_runtime)
         psp_advance_page_runtime_with_reader_recovery(
@@ -6267,6 +6277,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     (void) psp_site_data_restore_idle_pump(
         app, &input, frame.page_dirty, loop->render_job_pending);
     bool page_input_active = input.pressed != 0 || input.held != 0
+        || psp_navigation_cooperate_page_input_pending()
         || intent.action != PSP_UI_ACTION_NONE
         || intent.pointer_phase != PSP_UI_POINTER_NONE
         || intent.scroll_delta != 0;
@@ -6292,15 +6303,21 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     psp_find_sync(browser->engine, &process->presentation.ui, &process->presentation.find_view);
     PSP_LOOP_PHASE(LOOP_RASTER);
     unsigned render_visual_state = 0;
+    if (frame.focus_partial_presented) {
+        loop->render_placeholder_active = true;
+        loop->render_progress_present_us = sceKernelGetSystemTimeWide();
+    }
     psp_reconcile_page_render_before_raster(
         app, &frame, &loop->render_job_pending,
         &loop->render_job_last_progress_us);
     /* Time spent serving a native menu is not a stalled raster job. */
     if (loop->render_job_pending
-        && psp_ui_page_work_paused(&process->presentation.ui))
+        && (psp_ui_page_work_paused(&process->presentation.ui)
+            || psp_navigation_cooperate_page_input_pending()))
         loop->render_job_last_progress_us =
             (uint64_t) sceKernelGetSystemTimeWide();
     if (loop->render_job_pending
+        && !psp_navigation_cooperate_page_input_pending()
         && !psp_ui_page_work_paused(&process->presentation.ui))
         render_visual_state = psp_loop_render_job(loop, &frame);
     if (browser_profile_restore_last_page(browser->profile))
@@ -6345,6 +6362,8 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
 #endif
             bool published = psp_present(
                 engine_views->frame, &process->presentation.ui);
+            if (published)
+                loop->render_progress_present_us = sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             uint64_t canvas_present_finished_us =
                 (uint64_t) sceKernelGetSystemTimeWide();
@@ -6362,7 +6381,14 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
                        (unsigned long long)
                            engine_views->navigation->page.layout.text_fingerprint);
 #endif
-            loop->fast_page_followup |= render_visual_state == 2u;
+            /* A partial scroll already waited for safe scanout publication.
+               Do not wait a second vblank before its next bounded slice.
+               The next turn still samples input before raster, and each
+               publication retains the normal three-buffer fence. A failed
+               publication must not authorize a wait-free continuation. */
+            loop->fast_page_followup |= published
+                && (render_visual_state == 2u
+                    || (render_visual_state == 1u && loop->render_job_pending));
             loop->canvas_page_followup = published && render_visual_state == 2u;
             psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
             /* Direct Play commits the native player before the optional
@@ -8374,11 +8400,19 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
     bool canvas_render =
         browser_engine_canvas_frame_pending(browser->engine);
     bool render_scope = false;
+    bool owner_render_scope = false;
     if (!psp_navigation_cooperate_active()) {
-        psp_work_cooperate_begin(
-            &process->presentation.ui, engine_views->frame, false, true, false,
-            "STOPPING PAGE UPDATE...",
-            "render-raster-unit", NULL, NULL);
+        if (!canvas_render && engine_views->frame != NULL
+            && !process->presentation.ui.page_gamepad_capture) {
+            psp_runtime_cooperate_begin(&process->presentation.ui,
+                engine_views->frame, &interactive->toolbar_input);
+            owner_render_scope = true;
+        } else {
+            psp_work_cooperate_begin(
+                &process->presentation.ui, engine_views->frame, false, true, false,
+                "STOPPING PAGE UPDATE...",
+                "render-raster-unit", NULL, NULL);
+        }
         render_scope = true;
     }
     const TileCache *render_stats =
@@ -8428,8 +8462,14 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
     bool render_cancelled =
         render_status == BROWSER_RENDER_JOB_CANCELLED;
     if (render_scope) {
-        psp_navigation_cooperate_end_adopting_buttons(
-            "render-raster-unit", &interactive->previous_buttons);
+        if (owner_render_scope) {
+            uint32_t observed_buttons = 0;
+            if (psp_runtime_cooperate_end(&observed_buttons))
+                interactive->previous_buttons = psp_ui_buttons(observed_buttons);
+        } else {
+            psp_navigation_cooperate_end_adopting_buttons(
+                "render-raster-unit", &interactive->previous_buttons);
+        }
     }
     if (render_status == BROWSER_RENDER_JOB_FAILED) {
         psp_report_job_failure(
@@ -8476,7 +8516,9 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
             && render_stats != NULL
             && render_stats->frame_job_units > units_before;
         size_t placeholders = 0;
-        if (!canvas_render && (scrolled || progressed)
+        if (!canvas_render
+            && frame_paint_progress_due(render_now_us,
+                    loop->render_progress_present_us, scrolled, progressed)
             && browser_engine_render_placeholder_frame(
                    browser->engine, &placeholders)) {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -8487,6 +8529,11 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
             render_visual_state = 1;
             (void) psp_engine_views_refresh(
                 engine_views, browser->engine);
+        } else if (!canvas_render && progressed) {
+            /* Keep the 2 ms slice and sample input again, rather than
+               paying a vblank for every completed tile. Scanout ownership
+               and fences are unchanged when a frame is published. */
+            loop->fast_page_followup = true;
         }
         if (loop->render_job_last_progress_us != 0
             && render_now_us - loop->render_job_last_progress_us
@@ -10025,6 +10072,8 @@ int main(int argc, char *argv[])
     if (browser_profile_load_without_content_blocker_sites(
             browser.profile, process.storage.profile))
         printf("tilefinch-profile: loaded\n");
+    (void) browser_engine_set_web_font_mode(browser.engine,
+        browser_profile_web_font_mode(browser.profile));
     (void) psp_failure_report_configure(
         browser_profile_save_diagnostic_reports(browser.profile), false);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -10326,6 +10375,8 @@ int main(int argc, char *argv[])
         browser_profile_reader_auto_mode(browser.profile);
     process.presentation.ui.basic_fallback_mode =
         (unsigned) browser_profile_basic_fallback_mode(browser.profile);
+    process.presentation.ui.web_font_mode =
+        (unsigned) browser_profile_web_font_mode(browser.profile);
     psp_app_heavy_boot(browser.engine, browser.profile, &interactive,
                        &process.presentation.ui);
     process.presentation.ui.custom_homepage_enabled =

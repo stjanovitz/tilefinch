@@ -3082,7 +3082,17 @@ static bool navigation_relayout_body(NavigationSession *session)
             session->committed_layout_servable = true;
             (void) tilefinch_platform_cooperate("page-scroll-servable", 1);
         }
-        bool built = provisional
+        /* Forced geometry already performed the complete flow for this exact
+           generation. Resource work must be settled without replacing any
+           borrowed image storage before ownership can move to presentation. */
+        bool geometry_adopted = mutation_driven && !provisional
+            && !style_append_tried && !image_rebuild
+            && !image_resource_scan && !image_resource_refresh
+            && !mutations.overflowed && !mutations.retirement_unobserved
+            && !mutations.resource_rebuild_required
+            && script_runtime_take_geometry_layout(session->page.runtime,
+                &session->viewport, &next);
+        bool built = geometry_adopted ? true : provisional
             ? navigation_build_provisional_layout(
                   session, &next, session->page.layout.height, 0)
             : navigation_build_layout(
@@ -3146,8 +3156,9 @@ static bool navigation_relayout_body(NavigationSession *session)
         if (mutation_driven) {
             session->performance.mutation_fast_relayouts++;
         }
-        uint64_t elapsed = navigation_record_layout_slices(
-            session, started, &next);
+        uint64_t elapsed = geometry_adopted
+            ? navigation_now_us() - started
+            : navigation_record_layout_slices(session, started, &next);
         session->performance.layout_us += elapsed;
         session->performance.relayout_us += elapsed;
         navigation_attach_layout(session);
@@ -3336,12 +3347,41 @@ static bool navigation_relayout_body(NavigationSession *session)
     if (injected_refusal)
         budget_inject_failure_after(session->budget, 0u);
 #endif
+    size_t rebuild_failures = session->budget->failure_count;
+    size_t rebuild_injections = session->budget->injected_failure_count;
     bool built = navigation_build_layout(
         session, &session->page.layout, session->fonts, session->images);
 #if !defined(__PSP__)
     if (injected_refusal)
         budget_clear_failure_injection(session->budget);
 #endif
+    if (!built && !session->layout_build_cancelled
+        && session->page.runtime != NULL
+        && session->budget->failure_count > rebuild_failures
+        && session->budget->injected_failure_count == rebuild_injections) {
+        /* The old display list is already gone on this full-rebuild path.
+           Reclaim transient VM storage once before refusing a required flow;
+           never resurrect its borrowed pre-mutation pointers. */
+        (void) script_runtime_collect_and_trim(session->page.runtime);
+        layout_reuse_cache_destroy(session->page.layout_reuse);
+        session->page.layout_reuse = NULL;
+        size_t retry_failures = session->budget->failure_count;
+        built = navigation_build_layout(session, &session->page.layout,
+                                        session->fonts, session->images);
+        if (!built && !session->layout_build_cancelled
+            && session->budget->failure_count > retry_failures
+            && session->budget->injected_failure_count == rebuild_injections) {
+            /* This is a genuine shared-budget refusal after collection,
+               not an author-thrown OOM or a synthetic fault. Stop all page
+               realms before constructing a new static display list. No
+               borrowed commands from the failed update are published. */
+            layout_reuse_cache_destroy(session->page.layout_reuse);
+            session->page.layout_reuse = NULL;
+            if (navigation_retire_exhausted_script_realms(session, true))
+                built = navigation_build_layout(session, &session->page.layout,
+                                                session->fonts, session->images);
+        }
+    }
     if (!built) {
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
@@ -3812,11 +3852,139 @@ bool navigation_image_retarget_pending(const NavigationSession *session)
         && navigation_image_retarget_candidates(session);
 }
 
+static size_t navigation_web_font_reserve(const NavigationSession *session)
+{
+    size_t reserve = session->budget->limit / 8u;
+    if (reserve < 512u * 1024u) reserve = 512u * 1024u;
+    return reserve > 3u * 1024u * 1024u ? 3u * 1024u * 1024u : reserve;
+}
+
+static bool navigation_web_font_fallback_pending(const NavigationSession *session)
+{
+    return session->web_fonts_enabled && !session->page.web_font_fallback_attempted
+        && (session->web_font_mode == WEB_FONTS_OFF
+            || (session->web_font_mode == WEB_FONTS_SMART
+                && (session->page.web_font_pressure_fallback
+                    || budget_remaining(session->budget) < navigation_web_font_reserve(session))));
+}
+
+bool navigation_set_web_font_mode(NavigationSession *session, WebFontMode mode)
+{
+    if (session == NULL || mode < WEB_FONTS_ON || mode >= WEB_FONTS_MODE_COUNT) return false;
+    if (session->web_font_mode == mode) return true;
+    session->web_font_mode = mode;
+    session->page.web_font_fallback_attempted = false;
+    session->page.web_font_pressure_fallback = false;
+    if (mode == WEB_FONTS_OFF) {
+        fonts_external_loader_cancel(&session->page.external_font_loader,
+            session->page.resource_scheduler, &session->page.external_fonts);
+    } else if (session->page.loaded && session->web_fonts_enabled) {
+        (void) navigation_load_web_fonts(session, session->page.document_url);
+        navigation_attach_layout(session);
+    }
+    return true;
+}
+
+/* Retire page fonts only after a complete fallback layout can replace the
+   incumbent. Refusal/cancellation restores faces and leaves the page intact.
+   A pressure episode gets one attempt, not a retry on every idle frame. */
+static TILEFINCH_OUT_OF_LINE bool navigation_fallback_web_fonts(NavigationSession *session)
+{
+    if (script_runtime_has_pending_mutations(session->page.runtime)) return true;
+    session->page.web_font_fallback_attempted = true;
+    FontFace retained[TILEFINCH_WEB_FONT_FAMILY_LIMIT][TILEFINCH_WEB_FONT_WEIGHT_LIMIT] = {{{0}}};
+    bool any = false;
+    for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
+        for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++) {
+            FontFace *face = stylesheet_web_font_face_at(&session->page.stylesheet, family, slot);
+            if (face == NULL) continue;
+            retained[family][slot] = *face;
+            any |= face->loaded;
+            memset(face, 0, sizeof(*face));
+        }
+    }
+    if (!any) return true;
+    int offset = 0;
+    NavigationEntry *entry = session->history_count == 0 ? NULL : &session->history[session->history_index];
+    const DrawCommand *anchor = navigation_scroll_text_anchor(&session->page.layout,
+        entry == NULL ? 0 : entry->scroll_y, &offset);
+    LayoutDocument next = {0};
+    uint64_t started = navigation_now_us();
+    layout_reuse_cache_begin_font_publication(session->page.layout_reuse);
+    bool built = navigation_build_layout(session, &next, session->fonts, session->images);
+    layout_reuse_cache_end_font_publication(session->page.layout_reuse);
+    if (!built) {
+        layout_destroy(&next);
+        for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
+            for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++) {
+                FontFace *face = stylesheet_web_font_face_at(&session->page.stylesheet, family, slot);
+                if (face != NULL) *face = retained[family][slot];
+            }
+        }
+        layout_reuse_cache_reset(session->page.layout_reuse);
+        /* Input interruption is temporary. Retry at a later idle turn;
+           allocation refusal is latched to avoid pressure thrashing. */
+        session->page.web_font_fallback_attempted = !session->layout_build_cancelled;
+        return false;
+    }
+    layout_transfer_scroll_state(&session->page.layout, &next);
+    int scroll = navigation_scroll_for_text_anchor(&next, anchor, offset,
+        entry == NULL ? 0 : entry->scroll_y);
+    /* Equal advances do not imply equal glyph pixels. Both display lists
+       borrow the same now-empty font set, so command equality cannot detect
+       the old face. Invalidate every retained tile once on successful drop. */
+    session->relayout_damage_valid = true;
+    session->relayout_damage_left = session->relayout_damage_top = 0;
+    session->relayout_damage_right = session->page.layout.scroll_width > next.scroll_width
+        ? session->page.layout.scroll_width : next.scroll_width;
+    if (session->relayout_damage_right < next.width) session->relayout_damage_right = next.width;
+    session->relayout_damage_bottom = session->page.layout.height > next.height
+        ? session->page.layout.height : next.height;
+    layout_destroy(&session->page.layout);
+    session->page.layout = next;
+    for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++)
+        for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++)
+            font_face_destroy(&retained[family][slot]);
+    session->page.external_fonts.retained_encoded_bytes = 0;
+    session->incremental_relayouts++;
+    session->performance.fast_relayouts++;
+    uint64_t elapsed = navigation_record_layout_slices(session, started, &next);
+    session->performance.layout_us += elapsed;
+    session->performance.relayout_us += elapsed;
+    if (entry != NULL) entry->scroll_y = scroll;
+    navigation_attach_layout(session);
+    navigation_clamp_scroll_to_layout(session);
+    return true;
+}
+
+NavigationBackgroundWorkOutcome navigation_run_web_font_memory_work(
+    NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded)
+        return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    if (session->web_font_mode == WEB_FONTS_SMART
+        && fonts_external_loader_pending(&session->page.external_font_loader)) {
+        size_t free = budget_remaining(session->budget);
+        size_t reserve = navigation_web_font_reserve(session);
+        if (free < reserve || session->maximum_font_face_backend_bytes > free - reserve
+            || session->maximum_font_file_bytes > free - reserve - session->maximum_font_face_backend_bytes)
+            session->page.web_font_pressure_fallback = true;
+    }
+    if (!navigation_web_font_fallback_pending(session))
+        return NAVIGATION_BACKGROUND_WORK_SUCCESS;
+    session->page.web_font_pressure_fallback = session->web_font_mode == WEB_FONTS_SMART;
+    fonts_external_loader_cancel(&session->page.external_font_loader,
+        session->page.resource_scheduler, &session->page.external_fonts);
+    return navigation_fallback_web_fonts(session)
+        ? NAVIGATION_BACKGROUND_WORK_SUCCESS : NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
+}
+
 bool navigation_background_resources_pending(
     const NavigationSession *session)
 {
     return session != NULL && session->page.loaded
-        && (fonts_external_loader_pending(
+        && (navigation_web_font_fallback_pending(session)
+            || fonts_external_loader_pending(
                 &session->page.external_font_loader)
             || session->page.image_continuation_pending
             || session->page.visual_batch_targets != NULL);
@@ -4196,6 +4364,93 @@ static void navigation_rank_deferred_images(NavigationSession *session, int scro
     if (distances[start] == UINT64_MAX) page->image_continuation_pending = false;
 }
 
+static bool navigation_publish_fixed_image_paint(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    LayoutDocument *layout = &page->layout;
+    if (page->runtime != NULL || page->layout_provisional
+        || session->style_rebuild_required || layout->count == 0
+        || layout->fixed_count != 0 || layout->sticky_count != 0
+        || layout->image_content_generation != page->document.content_generation
+        || layout->image_style_generation != document_style_generation()
+        || layout->image_sheet_generation != page->stylesheet.build_generation)
+        return false;
+    /* Resource-table growth can move every ImageResource, not just the new
+       images. Preflight the entire list without dereferencing old pointers.
+       Unknown paint/intrinsic forms retain the transactional full rebuild. */
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (draw_command_filter_code(command) != 0
+            || draw_command_backdrop_blur(command) != 0) return false;
+        if (command->type == DRAW_IMAGE
+            && (command->text == NULL || command->text_length != 0
+                || command->width <= 0 || command->height <= 0)) return false;
+    }
+    for (size_t i = 0; i < layout->visual_priority_count; i++) {
+        const ImagePriorityTarget *target = &layout->visual_priority_targets[i];
+        if (target->kind != IMAGE_PRIORITY_KIND_DOCUMENT) return false;
+        bool found = false;
+        for (size_t j = 0; j < layout->count; j++) {
+            const DrawCommand *command = &layout->commands[j];
+            if (command->type == DRAW_IMAGE
+                && command->text == (const char *) target->node) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (size_t i = 0; i < page->images.count; i++) {
+        const ImageResource *image = &page->images.items[i];
+        if (image->is_background || image->is_mask || image->is_canvas)
+            return false;
+        bool found = false;
+        for (size_t j = 0; j < layout->count; j++) {
+            const DrawCommand *command = &layout->commands[j];
+            if (command->type == DRAW_IMAGE
+                && command->text == (const char *) image->node) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    bool unresolved = false;
+    int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN;
+    for (size_t i = 0; i < layout->count; i++) {
+        DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_IMAGE) continue;
+        const ImageResource *next = images_find_node(&page->images,
+            (lxb_dom_node_t *) command->text);
+        bool available = image_resource_available(next);
+        if (command->image == NULL && available) {
+            int r = command->x > INT_MAX - command->width
+                ? INT_MAX : command->x + command->width;
+            int b = command->y > INT_MAX - command->height
+                ? INT_MAX : command->y + command->height;
+            if (command->x < left) left = command->x;
+            if (command->y < top) top = command->y;
+            if (r > right) right = r;
+            if (b > bottom) bottom = b;
+        }
+        command->image = available ? next : NULL;
+        if (!available) unresolved = true;
+    }
+    if (!layout->visual_priority_overflow)
+        layout->unresolved_external_visuals = unresolved;
+    /* The retained command boxes already include layout translations and
+       transforms. Fixed/sticky layers and expanding filters declined above.
+       Keep unrelated tiles and the active frame job, not just flow geometry. */
+    session->relayout_damage_valid = right > left && bottom > top;
+    session->relayout_damage_left = session->relayout_damage_valid ? left : 0;
+    session->relayout_damage_top = session->relayout_damage_valid ? top : 0;
+    session->relayout_damage_right = session->relayout_damage_valid ? right : 0;
+    session->relayout_damage_bottom = session->relayout_damage_valid ? bottom : 0;
+    session->canvas_paint_damage_pending = true;
+    session->incremental_relayouts++;
+    return true;
+}
+
 static bool navigation_publish_deferred_images(NavigationSession *session)
 {
     NavigationPage *page = &session->page;
@@ -4203,6 +4458,7 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
     page->deferred_image_publication_age = 0;
     if (session->deferred_image_ready != NULL)
         session->deferred_image_ready(session->deferred_image_ready_opaque, session);
+    if (navigation_publish_fixed_image_paint(session)) return true;
     if (!navigation_relayout(session)) {
         session->performance.background_image_failures++;
         navigation_deferred_images_finish(session);
@@ -4449,7 +4705,7 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
     if (session == NULL || !session->page.loaded)
         return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
     NavigationBackgroundWorkOutcome outcome =
-        NAVIGATION_BACKGROUND_WORK_SUCCESS;
+        navigation_run_web_font_memory_work(session);
     if (fonts_external_loader_pending(
             &session->page.external_font_loader)) {
         bool face_loaded = false;
@@ -4493,13 +4749,17 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         session->performance.font_resource_us += elapsed;
         if (face_loaded) {
             session->performance.background_fonts_loaded++;
-            /* Fallback glyph advances participate in intrinsic sizing and
-               line breaking.  Reusing those measurements after a face swap
-               can produce a visually mixed layout, so invalidate the bounded
-               layout cache before rebuilding against the newly loaded face. */
-            layout_reuse_cache_destroy(session->page.layout_reuse);
-            session->page.layout_reuse = NULL;
-            session->performance.layout_reuse_retained_bytes = 0;
+            /* Face changes invalidate sizing and ch-dependent styles, not
+               the font-independent cascade. Use the same transaction as
+               application-font publication. */
+#ifndef __PSP__
+            if (tilefinch_test_faults()->legacy_web_font_work) {
+                layout_reuse_cache_destroy(session->page.layout_reuse);
+                session->page.layout_reuse = NULL;
+                session->performance.layout_reuse_retained_bytes = 0;
+            } else
+#endif
+            layout_reuse_cache_begin_font_publication(session->page.layout_reuse);
             bool relaid_out = false;
 #if !defined(__PSP__)
             if (tilefinch_test_faults()->refuse_next_background_font_relayout) {
@@ -4509,6 +4769,7 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             {
                 relaid_out = navigation_relayout(session);
             }
+            layout_reuse_cache_end_font_publication(session->page.layout_reuse);
             if (!relaid_out) {
                 fonts_external_loader_cancel(
                     &session->page.external_font_loader,

@@ -83,9 +83,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_GLYPH_OPTION_ROWS 7u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 51u
+#define UI_OPTIONS_ITEM_COUNT 52u
 #else
-#define UI_OPTIONS_ITEM_COUNT 49u
+#define UI_OPTIONS_ITEM_COUNT 50u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -260,7 +260,8 @@ typedef enum {
     UI_OPTION_WIFI_DIAGNOSTICS,
     UI_OPTION_YOUTUBE_TOPICS,
     UI_OPTION_YOUTUBE_LOGIN,
-    UI_OPTION_ROTATE_HINT
+    UI_OPTION_ROTATE_HINT,
+    UI_OPTION_WEB_FONTS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -329,7 +330,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_WIFI_DIAGNOSTICS,
     UI_OPTION_YOUTUBE_TOPICS,
     UI_OPTION_YOUTUBE_LOGIN,
-    UI_OPTION_ROTATE_HINT
+    UI_OPTION_ROTATE_HINT,
+    UI_OPTION_WEB_FONTS
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -349,6 +351,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_COLOR_MODE:
         case UI_OPTION_CHROME_THEME:
         case UI_OPTION_LANGUAGE_AND_EMOJI:
+        case UI_OPTION_WEB_FONTS:
             return "APPEARANCE";
         case UI_OPTION_CUSTOM_HOMEPAGE:
         case UI_OPTION_HISTORY:
@@ -472,6 +475,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Larger page text means more scrolling";
         case UI_OPTION_READER_FONT:
             return "Typeface used by Reader mode";
+        case UI_OPTION_WEB_FONTS:
+            return "Smart uses built-in fonts when memory is low";
         case UI_OPTION_REMEMBER_READER_SCALE:
             return "Remember Reader size for this site";
         case UI_OPTION_READER_AUTO_MODE:
@@ -1986,6 +1991,7 @@ void psp_ui_init(PspUiState *ui)
     ui->activity_frames = UI_AUTOHIDE_FRAMES;
     ui->browser_ui_scale = 1;
     ui->page_font_percent = 100;
+    ui->web_font_mode = WEB_FONTS_SMART;
     ui->analog_cursor_enabled = true;
     ui->youtube_topics = true;
     ui->javascript_enabled = 1u;
@@ -4099,6 +4105,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                             ? BROWSER_READER_FONT_SERIF
                             : BROWSER_READER_FONT_SANS;
                     break;
+                case UI_OPTION_WEB_FONTS:
+                    ui->web_font_mode = (ui->web_font_mode + WEB_FONTS_MODE_COUNT + direction) % WEB_FONTS_MODE_COUNT;
+                    intent.setting.id = PSP_UI_SETTING_WEB_FONTS;
+                    intent.setting.value.web_font_mode = (WebFontMode) ui->web_font_mode;
+                    break;
                 case UI_OPTION_REMEMBER_READER_SCALE:
                     ui->remember_reader_site_scale =
                         !ui->remember_reader_site_scale;
@@ -5898,6 +5909,11 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_READER_FONT:
             *label = "Reader font";
             *value = ui->reader_font_serif ? "Serif" : "Sans";
+            break;
+        case UI_OPTION_WEB_FONTS:
+            *label = "Website fonts";
+            *value = ui->web_font_mode == WEB_FONTS_ON ? "On"
+                : ui->web_font_mode == WEB_FONTS_OFF ? "Off" : "Smart";
             break;
         case UI_OPTION_REMEMBER_READER_SCALE:
             *label = "Remember size";

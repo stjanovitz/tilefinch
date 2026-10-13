@@ -1599,11 +1599,46 @@
         LayoutDocument span = {.commands = commands, .count = 2};
         CHECK(!layout_skew_solid_command_span(&span, 0, 2, 14, 1024)
               && memcmp(commands, previous, sizeof(commands)) == 0);
+        CHECK(!layout_rotate_solid_command_span(&span, 0, 2, 14, 14, 45 * 64)
+              && memcmp(commands, previous, sizeof(commands)) == 0);
         commands[1].type = DRAW_FILL_RECT;
         commands[1].radius = 3;
         memcpy(previous, commands, sizeof(commands));
         CHECK(!layout_skew_solid_command_span(&span, 0, 2, 14, 1024)
               && memcmp(commands, previous, sizeof(commands)) == 0);
+        CHECK(!layout_rotate_solid_command_span(&span, 0, 2, 14, 14, 45 * 64)
+              && memcmp(commands, previous, sizeof(commands)) == 0);
+    }
+
+    puts("test: rotated solid payload survives ancestor and viewport transforms");
+    for (int angle = -45; angle <= 45; angle += 90) {
+        DrawCommand command = {.type = DRAW_FILL_RECT, .x = 12, .y = 12,
+            .width = 16, .height = 16, .color = 0xff0000, .opacity_scale = 256};
+        uint8_t flags = 0;
+        LayoutDocument span = {.budget = &budget, .commands = &command,
+            .command_flags = &flags, .count = 1, .capacity = 1,
+            .width = 40, .height = 40, .page_background = 0xffffff};
+        CHECK(layout_rotate_solid_command_span(&span, 0, 1, 40, 40, angle * 64));
+        CHECK(command.type == DRAW_ROTATED_FILL
+            && (command.text_length & 65535u) == 16 && command.text_length >> 16 == 16);
+        layout_rotate_range_quadrants(&span, 0, 0, 0, 0, 40, 40, 1, NULL);
+        layout_scale_range(&span, 0, 0, 0, 0, 40, 40, 128, NULL);
+        CHECK((command.text_length & 65535u) == 32 && command.text_length >> 16 == 32);
+        CHECK(viewport_context_init(&span.viewport, 40, 40, 80, 80));
+        LayoutDocument visual = {0};
+        CHECK(layout_clone_visual(&visual, &span));
+        CHECK((visual.commands[0].text_length & 65535u) == 64
+            && visual.commands[0].text_length >> 16 == 64
+            && visual.commands[0].font_size == command.font_size);
+        TileCache cache = {0};
+        uint16_t pixels[80u * 80u];
+        CHECK(tile_cache_init(&cache, &budget, &visual, 8)
+            && tile_cache_set_frame(&cache, pixels, 80u * 80u)
+            && tile_cache_render_frame(&cache, 0, 80, 80, NULL));
+        CHECK(pixels[40u * 80u + 40u] == 0xf800u
+            && pixels[4u * 80u + 4u] != 0xf800u);
+        tile_cache_destroy(&cache);
+        layout_destroy(&visual);
     }
 
     /* CSS 2.1 10.4: a float's percentage min/max-width refer to its
@@ -2199,6 +2234,10 @@
     static const char decoration_page[] =
         "<!doctype html><style>body{margin:0;padding:0}"
         "#removed{text-decoration:none}"
+        "#inherit-clear,#inherit-line{text-decoration:inherit}"
+        "#inherit-reset{text-decoration:inherit;text-decoration:none}"
+        "#nowrap-pseudo{white-space:nowrap;width:20px}"
+        "#nowrap-pseudo::after{content:' AFTER'}"
         "#plain{text-decoration-line:underline}"
         "#ancestor{text-decoration:underline;text-underline-offset:4px}"
         "#descendant{text-decoration:none;text-underline-offset:-2px}"
@@ -2219,17 +2258,21 @@
         "text-decoration:underline;text-underline-offset:4px;"
         "transform:scale(.5)}"
         "</style><body><a id=removed href=/removed>REMOVED</a>"
+        "<a id=inherit-clear href=/clear>CLEAR</a>"
         "<span id=plain>PLAIN</span>"
         "<span id=ancestor><span id=inherited-offset>INHERITED</span>"
         "<span id=descendant>PROPAGATED</span>"
         "<span id=own-decoration>OWNOFFSET</span>"
+        "<a id=inherit-line href=/line>LINE</a>"
+        "<a id=inherit-reset href=/reset>RESET</a>"
         "<span id=atomic>ATOMIC</span></span>"
         "<span id=cascaded>CASCADED</span>"
         "<span id=invalid-offset>INVALIDOFFSET</span>"
         "<span id=auto-offset>AUTOOFFSET</span>"
         "<span id=zero-offset>ZEROOFFSET</span>"
         "<span id=clipped>CLIPPEDLONG</span>"
-        "<span id=scaled-underline>SCALEUNDER</span></body>";
+        "<span id=scaled-underline>SCALEUNDER</span>"
+        "<div id=nowrap-pseudo>BEFORE</div></body>";
     PocDocument decoration_document;
     Stylesheet decoration_sheet;
     LayoutDocument decoration_layout;
@@ -2286,6 +2329,24 @@
         &decoration_sheet, auto_offset, NULL);
     ComputedStyle zero_offset_style = style_for_node(
         &decoration_sheet, zero_offset, NULL);
+    ComputedStyle inherit_clear_style = style_for_node(
+        &decoration_sheet, find_id(decoration_root, "inherit-clear"), NULL);
+    ComputedStyle inherit_line_style = style_for_node(
+        &decoration_sheet, find_id(decoration_root, "inherit-line"),
+        &ancestor_style);
+    ComputedStyle inherit_reset_style = style_for_node(
+        &decoration_sheet, find_id(decoration_root, "inherit-reset"),
+        &ancestor_style);
+    CHECK(!computed_style_has_text_underline(&inherit_clear_style)
+          && computed_style_has_text_underline(&inherit_line_style)
+          && !computed_style_has_text_underline(&inherit_reset_style)
+          && computed_style_has_ancestor_text_underline(&inherit_reset_style));
+    ComputedStyle nowrap_pseudo_parent_style = style_for_node(
+        &decoration_sheet, find_id(decoration_root, "nowrap-pseudo"), NULL);
+    ComputedStyle nowrap_pseudo_style = style_for_pseudo(
+        &decoration_sheet, find_id(decoration_root, "nowrap-pseudo"),
+        PSEUDO_AFTER, &nowrap_pseudo_parent_style);
+    CHECK(nowrap_pseudo_style.white_space_mode == WHITE_SPACE_NOWRAP);
     int inherited_pixels = 0, descendant_pixels = 0, effective_pixels = 0;
     int own_pixels = 0, cascaded_pixels = 0, invalid_pixels = 0;
     int zero_pixels = 1;

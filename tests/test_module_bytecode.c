@@ -8,6 +8,7 @@
 #include "tilefinch/session_persistence.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/viewport.h"
+#include "../src/js_runtime_internal.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -181,6 +182,164 @@ static bool run_root(ModuleFixture *fixture, ModuleMap *map,
         if (!script_runtime_advance(runtime, 0, 32, result)) return false;
     }
     return true;
+}
+
+static int test_module_allocation_refusal_recovery(void)
+{
+    static const char root[] =
+        "import {value} from './dep.js';globalThis.pocSummary='MODULE:'+value";
+    size_t attempts = 0;
+    for (size_t point = 0;; point++) {
+        ModuleFixture fixture;
+        CHECK(fixture_open(&fixture));
+        ModuleMap map = {0};
+        CHECK(module_map_add(&map, "https://mod.test/dep.js",
+            "https://mod.test/dep.js", copy_text("export const value=7", 20)));
+        ScriptResult result = {0};
+        ScriptRuntime *runtime = script_runtime_create_configured(
+            &fixture.document, &fixture.budget, 8u * MIB, 8000,
+            "https://mod.test/", &fixture.options, &result);
+        CHECK(runtime != NULL);
+        script_runtime_set_module_loader(
+            runtime, module_map_load, module_map_release, &map);
+        budget_inject_failure_after(&fixture.budget,
+                                    point == 0 ? SIZE_MAX : point - 1u);
+        (void) script_runtime_evaluate_external_module_context(
+            runtime, fixture.script, root, sizeof(root) - 1u,
+            "https://mod.test/root.js", "https://mod.test/root.js", "",
+            TILEFINCH_CREDENTIALS_SAME_ORIGIN, &result);
+        for (size_t turn = 0; turn < 8; turn++) {
+            if (!script_runtime_advance(runtime, 0, 32, &result)) break;
+        }
+        if (point == 0) {
+            CHECK(strcmp(result.summary, "MODULE:7") == 0);
+            attempts = SIZE_MAX - fixture.budget.failure_injection_countdown;
+            CHECK(attempts > 0 && attempts < 512);
+        } else {
+            CHECK(fixture.budget.injected_failure_count != 0);
+        }
+        budget_clear_failure_injection(&fixture.budget);
+        script_runtime_destroy(runtime);
+        if (point != 0) {
+            ScriptRuntime *retry = NULL;
+            CHECK(run_root(&fixture, &map, root, &retry, &result)
+                  && retry != NULL
+                  && strcmp(result.summary, "MODULE:7") == 0);
+            script_runtime_destroy(retry);
+        }
+        module_map_free(&map);
+        CHECK(fixture_close(&fixture));
+        if (point == attempts) break;
+    }
+    return 0;
+}
+
+static int test_import_map_resolution(void)
+{
+    static const struct {
+        const char *html;
+        const char *specifier;
+        const char *expected_url;
+    } cases[] = {
+        {"<script type=IMPORTMAP>{\"imports\":{\"alias\":\"./a.js\"}}</script>", "alias", "https://mod.test/a.js"},
+        {"<script type=importmap>{\"imports\":{\"pkg/\":\"./lib/\"}}</script>", "pkg/a.js", "https://mod.test/lib/a.js"},
+        {"<script type=importmap>{\"imports\":{\"alias\":\"./a.js\"},\"scopes\":{\"./\":{\"alias\":\"./b.js\"}}}</script>", "alias", "https://mod.test/b.js"},
+        {"<script type=importmap>{\"imports\":{\"__proto__\":\"./a.js\"}}</script>", "__proto__", "https://mod.test/a.js"},
+        {"<script type=importmap>{\"imports\":{\"alias\":null}}</script>", "alias", NULL},
+        {"<script type=importmap>{\"imports\":{\"pkg/\":\"./lib/a.js\"}}</script>", "pkg/a.js", NULL},
+        {"<script type=importmap>{\"imports\":{\"pkg/\":\"./lib/\"}}</script>", "pkg/../escape.js", NULL},
+        {"<script type=importmap>{\"imports\":{\"alias\\u0000bad\":\"./a.js\"}}</script>", "alias", NULL},
+        {"<script type=importmap src=ignored>{\"imports\":{\"alias\":\"./a.js\"}}</script>", "alias", NULL},
+        {"<script type=importmap>{bad json</script>", "alias", NULL},
+        {"<meta http-equiv=Content-Security-Policy content=\"script-src 'none'\"><script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}</script>", "alias", NULL},
+        {"<svg><script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}</script></svg>", "alias", NULL},
+        {"<script type=importmap>{\"scopes\":{\"./\\u0000bad\":{\"alias\":\"./a.js\"}}}</script>", "alias", NULL},
+        {"<script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}</script><script type=importmap>{\"imports\":{\"alias\":\"./b.js\"}}</script>", "alias", "https://mod.test/a.js"},
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        ModuleFixture fixture;
+        CHECK(script_page_fixture_open(&fixture, cases[i].html, 0));
+        if (strstr(cases[i].html, "http-equiv=Content-Security-Policy") != NULL) {
+            static const char policy[] = "content-security-policy: script-src 'none'\n";
+            CHECK(tilefinch_csp_parse_response_headers(
+                &fixture.document.content_security_policy, "https://mod.test/",
+                policy, sizeof(policy) - 1, false));
+        }
+        ModuleMap map = {0};
+        CHECK(module_map_add(&map, cases[i].expected_url == NULL
+              ? "https://mod.test/a.js" : cases[i].expected_url,
+              "https://mod.test/delivered.js", copy_text("export const value=7", 20)));
+        char source[160];
+        snprintf(source, sizeof(source), "import {value} from '%s';globalThis.pocSummary='MAP:'+value", cases[i].specifier);
+        ScriptResult result;
+        ScriptRuntime *runtime = NULL;
+        CHECK(run_root(&fixture, &map, source, &runtime, &result));
+        CHECK(runtime != NULL);
+        if (cases[i].expected_url != NULL) {
+            CHECK(strcmp(result.summary, "MAP:7") == 0 && map.loads[0] == 1);
+            CHECK(strcmp(map.referrer[0], "https://mod.test/root.js") == 0);
+            if (i == 0) {
+                JSContext *child = JS_NewContext(JS_GetRuntime(runtime->context));
+                CHECK(child != NULL);
+                static const char child_source[] = "import 'alias';";
+                JSValue evaluated = JS_Eval(child, child_source,
+                    sizeof(child_source) - 1, "https://other.test/frame.js",
+                    JS_EVAL_TYPE_MODULE);
+                CHECK(JS_IsException(evaluated) && map.loads[0] == 1);
+                JSValue exception = JS_GetException(child);
+                const char *detail = JS_ToCString(child, exception);
+                CHECK(detail != NULL && strstr(detail, "TypeError") != NULL);
+                JS_FreeCString(child, detail);
+                JS_FreeValue(child, exception);
+                JS_FreeContext(child);
+            }
+        } else {
+            CHECK(map.loads[0] == 0);
+            CHECK(strstr(result.error, "TypeError") != NULL);
+        }
+        script_runtime_destroy(runtime);
+        module_map_free(&map);
+        CHECK(fixture_close(&fixture));
+    }
+    return 0;
+}
+
+static int test_import_map_cache_rebinding(void)
+{
+    ModuleFixture fixture;
+    CHECK(script_page_fixture_open(&fixture,
+        "<script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}</script>", 0));
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &fixture.budget, 512u * 1024u));
+    browser_session_module_bytecode_set_limit(&session, 512u * 1024u);
+    fixture.options.session = &session;
+    ModuleMap map = {0};
+    CHECK(module_map_add(&map, "https://mod.test/a.js", "https://mod.test/a.js",
+              padded_source("export const value=1;", 9u * 1024u))
+          && module_map_add(&map, "https://mod.test/b.js", "https://mod.test/b.js",
+              padded_source("export const value=2;", 9u * 1024u)));
+    char *source = padded_source(
+        "import {value} from 'alias';globalThis.pocSummary='MAP:'+value;", 9u * 1024u);
+    CHECK(source != NULL);
+    ScriptRuntime *runtime = NULL;
+    ScriptResult result;
+    CHECK(run_root(&fixture, &map, source, &runtime, &result));
+    CHECK(strcmp(result.summary, "MAP:1") == 0
+          && result.module_bytecode_cache_stores == 2);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "document.querySelector('script').textContent="
+        "'{\"imports\":{\"alias\":\"./b.js\"}}'", "<map-rebind>", &result));
+    script_runtime_destroy(runtime);
+    CHECK(run_root(&fixture, &map, source, &runtime, &result));
+    CHECK(strcmp(result.summary, "MAP:2") == 0
+          && result.module_bytecode_cache_hits == 1
+          && map.loads[0] == 1 && map.loads[1] == 1);
+    script_runtime_destroy(runtime);
+    free(source);
+    module_map_free(&map);
+    browser_session_destroy(&session);
+    CHECK(fixture_close(&fixture));
+    return 0;
 }
 
 static int test_large_module_source_is_not_retained(void)
@@ -1074,6 +1233,9 @@ int main(void)
        directory instead. */
     char private_root[] = "module-bytecode-tests-XXXXXX";
     CHECK(mkdtemp(private_root) != NULL && chdir(private_root) == 0);
+    CHECK(test_import_map_resolution() == 0);
+    CHECK(test_module_allocation_refusal_recovery() == 0);
+    CHECK(test_import_map_cache_rebinding() == 0);
     CHECK(test_large_module_heap_excludes_source() == 0);
     CHECK(test_large_module_source_is_not_retained() == 0);
     CHECK(test_uncalled_commented_function_keeps_no_text() == 0);

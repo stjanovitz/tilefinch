@@ -8,6 +8,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/gamepad.h"
+#include "tilefinch/font.h"
 #include "tilefinch/omnibox.h"
 #include "tilefinch/site_storage.h"
 
@@ -357,6 +358,8 @@ bool browser_profile_content_blocker_cosmetic_hiding(
 uint64_t browser_profile_content_blocker_total_blocked(
     const BrowserProfile *profile);
 BrowserReaderFont browser_profile_reader_font(const BrowserProfile *profile);
+WebFontMode browser_profile_web_font_mode(const BrowserProfile *profile);
+bool browser_profile_set_web_font_mode(BrowserProfile *profile, WebFontMode mode);
 bool browser_profile_remember_reader_site_scale(
     const BrowserProfile *profile);
 /* Opt-in content-shape Reader detection. Disabled by default so ordinary

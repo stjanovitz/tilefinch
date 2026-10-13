@@ -8124,18 +8124,104 @@ int main(void) {
         focus = actions[actions.index("static void psp_app_finish_focus_action("):
                         actions.index("typedef struct", actions.index(
                             "static void psp_app_finish_focus_action("))]
-        prepare = focus.index("browser_engine_render_frame_bounded(")
+        prepare = focus.index("browser_engine_render_frame_bounded_cancelable(")
         complete = focus.index("rendered != BROWSER_RENDER_JOB_COMPLETE")
-        refresh = focus.index("psp_engine_views_refresh(")
-        present = focus.index("psp_present_internal(")
-        clean = focus.index("frame->page_dirty = false")
+        refresh = focus.index("psp_engine_views_refresh(", complete)
+        present = focus.index("psp_present_internal(", complete)
+        clean = focus.index("frame->page_dirty = false", complete)
         self.assertLess(prepare, complete)
         self.assertLess(complete, refresh)
         self.assertLess(refresh, present)
         self.assertLess(present, clean)
         self.assertIn("return;", focus[complete:present])
-        self.assertIn("PSP_RENDER_JOB_BUDGET_US, 4u", focus)
+        self.assertIn("single_composition ? 4u : 0u", focus)
         self.assertNotIn("browser_engine_render_frame(", focus)
+        self.assertLess(focus.index("psp_engine_views_refresh("),
+                        focus.index("psp_runtime_cooperate_begin("))
+        self.assertLess(focus.index("psp_runtime_cooperate_begin("), prepare)
+        self.assertLess(prepare, focus.index("psp_runtime_cooperate_end("))
+        self.assertLess(focus.index("psp_runtime_cooperate_end("), present)
+        pending = focus.index("rendered == BROWSER_RENDER_JOB_PENDING")
+        preview = focus.index("browser_engine_render_placeholder_frame(", pending)
+        preview_present = focus.index("psp_present_internal(", preview)
+        self.assertLess(focus.index("psp_runtime_cooperate_end("), pending)
+        self.assertLess(preview, preview_present)
+        self.assertLess(preview_present, focus.index("frame->focus_partial_presented = true;"))
+        self.assertIn("!psp_navigation_cooperate_page_input_pending()", focus[pending:preview])
+        main = (ROOT / "src/psp_script_main.c").read_text()
+        self.assertIn("if (frame->page_dirty || frame->focus_partial_presented)", main)
+        self.assertIn("frame_paint_progress_due(render_now_us,", main)
+        self.assertIn("else if (!canvas_render && progressed)", main)
+
+    def test_render_preparation_has_owner_only_presentation(self):
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
+        present = runtime[runtime.index("bool psp_platform_present("):
+                          runtime.index("static void psp_work_cooperate_begin_internal(")]
+        self.assertIn("cooperate->owner_thread_only", present)
+        self.assertIn("? &cooperate->supervisor_ui : cooperate->ui", present)
+        self.assertIn("psp_present_internal(pixels, shown_ui, false)", present)
+        cooperate = runtime[runtime.index("bool psp_platform_cooperate("):]
+        self.assertIn('strcmp(phase, "render-compose")', cooperate)
+        self.assertLess(cooperate.index("if (psp_runtime_cooperate.painting) return true"),
+                        cooperate.index("psp_work_ui_tick(true)"))
+        self.assertIn('strncmp(phase, "render-", 7u) != 0', cooperate)
+        self.assertIn('strcmp(phase, "page-task-boundary")', cooperate)
+        self.assertIn('strcmp(phase, "render-input-boundary")', cooperate)
+        admission = cooperate.index('strcmp(phase, "image-admission-boundary")')
+        lazy_arm = cooperate.index('now - psp_runtime_cooperate.started_us >= UINT64_C(8000)')
+        self.assertLess(admission, lazy_arm)
+        self.assertIn("psp_runtime_cooperate_activate(cooperate);",
+                      cooperate[admission:admission + 350])
+        self.assertEqual(cooperate.count('strcmp(phase, "image-admission-boundary")'), 3)
+        self.assertIn("psp_completed_supervisor_page_input_count == 0", cooperate)
+        fill = runtime[runtime.index("static void psp_runtime_serve_completion_scroll("):
+                       runtime.index("void psp_show_page_script_clock(")]
+        self.assertLess(fill.index("cooperate->pending_page_input_count != 0"),
+                        fill.index("browser_engine_completion_raster_step("))
+        self.assertIn("psp_completed_supervisor_page_input_count != 0) break", fill)
+
+    def test_resumable_page_input_skips_status_and_entry_display_wait(self):
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        queue = runtime[runtime.index("case PSP_INPUT_ROUTE_QUEUE_PAGE:"):
+                        runtime.index("case PSP_INPUT_ROUTE_BUSY:")]
+        self.assertIn("owner_thread && !cooperate->page_input_yield_boundary", queue)
+        self.assertIn("cooperate->page_input_yield_boundary = false;", runtime)
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        self.assertIn("bool queued_page_input = psp_navigation_cooperate_page_input_pending();", main)
+        self.assertIn("loop->fast_page_followup || queued_page_input", main)
+        self.assertIn("queued_page_input ? 0 : psp_canvas_followup_wait(loop)", main)
+
+    def test_toolbar_tracking_does_not_publish_an_unchanged_frame(self):
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
+        native = runtime[runtime.index("bool toolbar_tracking ="):
+                         runtime.index("PspInputRouteContext route_context =")]
+        self.assertLess(native.index("bool native_visual_changed = priority_handled;"),
+                        native.index("priority_handled |= toolbar_tracking;"))
+        self.assertIn("if (native_visual_changed)", native)
+        self.assertNotIn("if (priority_handled)", native)
+        self.assertIn("urgent_present = true;", native)
+        self.assertIn("uint64_t poll_interval_us = cooperate->owner_thread_only", runtime)
+
+    def test_completed_page_input_precedes_new_work(self):
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
+        pending = runtime[runtime.index("bool psp_navigation_cooperate_page_input_pending("):
+                          runtime.index("bool psp_navigation_cooperate_take_page_input(")]
+        self.assertIn("return psp_completed_supervisor_page_input_count != 0", pending)
+        actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text(encoding="utf-8"))
+        finish = actions[actions.index("static void psp_app_finish_focus_action("):
+                         actions.index("static void psp_app_dispatch_focus_action(")]
+        self.assertLess(finish.index("psp_navigation_cooperate_page_input_pending()"),
+                        finish.index("browser_engine_render_frame_bounded_cancelable("))
+        self.assertIn("frame->defer_runtime = true", finish)
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertIn("frame.defer_runtime |= psp_navigation_cooperate_page_input_pending()", main)
+        self.assertIn("&& !psp_navigation_cooperate_page_input_pending()", main)
+        self.assertIn("|| psp_navigation_cooperate_page_input_pending()", main)
+        script = without_comments((ROOT / "src/psp_app/psp_app_input_script.c").read_text(encoding="utf-8"))
+        busy = script[script.index("bool psp_input_script_busy_frame("):
+                      script.index("bool psp_input_script_text_frame(")]
+        self.assertLess(busy.index("psp_input_script_eof_pending(&psp_input_script)"),
+                        busy.index("psp_input_script_advance("))
 
     def test_focus_dispatch_is_supervised_before_author_work(self):
         actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text(encoding="utf-8"))
@@ -8143,6 +8229,11 @@ int main(void) {
         focus = actions[begin:actions.index("typedef struct", begin)]
         self.assertLess(focus.index("psp_runtime_cooperate_begin("),
                         focus.index("switch (intent->action)"))
+        self.assertLess(focus.index("psp_focus_feedback_begin("),
+                        focus.index("switch (intent->action)"))
+        finish_start = actions.index("static void psp_app_finish_focus_action(")
+        finish = actions[finish_start:begin]
+        self.assertNotIn("psp_focus_feedback_begin(", finish)
         self.assertLess(focus.index("psp_runtime_cooperate_serve_page_scroll(engine)"),
                         focus.index("browser_engine_focus_move("))
         self.assertLess(focus.index("psp_runtime_cooperate_end("),
@@ -8165,6 +8256,13 @@ int main(void) {
         self.assertLess(feedback.index("psp_present_internal("),
                         feedback.index("cooperate->presenting = 0"))
         self.assertNotIn("browser_engine_render_frame", feedback)
+        native_receipt = feedback.index("tilefinch-focus-first-visible:")
+        self.assertLess(feedback.index("psp_runtime_cooperate_activate(cooperate)"),
+                        feedback.index("__sync_bool_compare_and_swap("))
+        self.assertLess(feedback.index("if (psp_present_internal("), native_receipt)
+        self.assertIn("psp_focus_feedback.generation == nav->generation", feedback)
+        self.assertIn("psp_focus_feedback.first_visible_us == 0", feedback)
+        self.assertIn("!psp_focus_feedback_page_action", feedback)
         self.assertLess(runtime.index("sceKernelGetThreadId() != atomic_load_explicit(",
                                       runtime.index("bool psp_platform_cooperate(")), start)
 
@@ -8188,6 +8286,26 @@ int main(void) {
         main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
         self.assertLess(main.index("psp_focus_feedback_begin(NULL, 0, 0)"),
                         main.index("browser_engine_destroy(browser->engine)"))
+
+    def test_partial_page_publication_continues_without_second_vblank(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        publication = main[main.index("bool published = psp_present("):
+                           main.index("psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);",
+                                      main.index("bool published = psp_present("))]
+        self.assertIn(
+            "loop->fast_page_followup |= published\n"
+            "                && (render_visual_state == 2u\n"
+            "                    || (render_visual_state == 1u && loop->render_job_pending));",
+            publication)
+        # The continuation skips only the redundant entry wait. It still
+        # samples buttons, keeps the raster quota, and uses fenced publication.
+        sample = main.index("psp_wait_before_interactive_input(\n        fullscreen_media_poll")
+        self.assertLess(sample, main.index("sceCtrlPeekBufferPositive(&pad, 1)", sample))
+        self.assertLess(main.index("sceCtrlPeekBufferPositive(&pad, 1)", sample),
+                        main.index("render_visual_state = psp_loop_render_job(loop, &frame)", sample))
+        self.assertIn("loop->fast_page_followup = false;", main[sample:sample + 700])
+        self.assertIn("!psp_navigation_cooperate_page_input_pending()", main)
 
     def test_blank_failure_return_reuses_exact_history_receiver(self):
         actions = without_comments(

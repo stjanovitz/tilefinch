@@ -10162,6 +10162,7 @@
       navigationTiming = navigationState.navigation,
       domInteractive = __tilefinchPerformanceNow(3);
     documentReadyState = "interactive";
+    document.dispatchEvent(new Event("readystatechange"));
     navigationTiming.domInteractive = domInteractive;
     performanceTimingState.domInteractive =
       performanceTimeOrigin + domInteractive;
@@ -10173,6 +10174,7 @@
     globalThis.__tilefinchMaybeStartMotion?.();
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     documentReadyState = "complete";
+    document.dispatchEvent(new Event("readystatechange"));
     const domComplete = __tilefinchPerformanceNow(3),
       loadEventStart = __tilefinchPerformanceNow(3);
     navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;

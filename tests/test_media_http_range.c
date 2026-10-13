@@ -99,6 +99,47 @@ static void test_optional_second_lookahead_budget_fallback(void)
     CHECK(budget.current == 0);
 }
 
+static void test_range_buffer_construction_refusals(void)
+{
+    const char *url = "https://media.invalid/video.mp4";
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .lookahead_windows = 2u,
+        .initial_lookahead_windows = 2u
+    };
+    /* State, three URL strings, active cache, then two optional successors.
+       The first five refusals must roll back; the last two retain a usable
+       active window and as many successors as fit. */
+    for (size_t point = 0; point < 7u; point++) {
+        Budget budget;
+        budget_init(&budget, 8u * 1024u * 1024u);
+        char error[256] = {0};
+        budget_inject_failure_after(&budget, point);
+        MediaHttpRange *range = media_http_range_create(
+            &budget, NULL, url, 512u * 1024u, &options,
+            error, sizeof(error));
+        CHECK(budget.injected_failure_count == 1u);
+        if (point < 5u) {
+            CHECK(range == NULL && error[0] != '\0');
+        } else {
+            MediaHttpRangeStats stats = {0};
+            CHECK(range != NULL && media_http_range_stats(range, &stats)
+                  && stats.lookahead_slots == point - 5u);
+        }
+        media_http_range_destroy(range);
+        CHECK(budget.current == 0u);
+        budget_clear_failure_injection(&budget);
+        range = media_http_range_create(
+            &budget, NULL, url, 512u * 1024u, &options,
+            error, sizeof(error));
+        MediaHttpRangeStats stats = {0};
+        CHECK(range != NULL && media_http_range_stats(range, &stats)
+              && stats.lookahead_slots == 2u);
+        media_http_range_destroy(range);
+        CHECK(budget.current == 0u);
+    }
+}
+
 static void test_buffering_policy_hysteresis(void)
 {
     const uint64_t origin = UINT64_C(1000000);
@@ -2483,6 +2524,7 @@ int main(int argc, char **argv)
     test_range_window_liveness_policy();
     test_video_lookahead_policy();
     test_optional_second_lookahead_budget_fallback();
+    test_range_buffer_construction_refusals();
     if (argc == 2 && strcmp(argv[1], "--policy-only") == 0) {
         if (failures != 0) {
             printf("media-window-policy-tests: %d check(s) failed\n",

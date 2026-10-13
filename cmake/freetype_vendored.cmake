@@ -7,10 +7,11 @@
 # hostile-input version-gate guesswork: there is exactly one FreeType, pinned by
 # URL + SHA256, on every build.
 #
-# The module set (sfnt + truetype + smooth, with WOFF1 support) is selected
+# The module set (sfnt + truetype + smooth, with WOFF/WOFF2 support) is selected
 # identically for both targets via the FT_CONFIG_MODULES_H
 # override in cmake/freetype/ftmodule-minimal.h. WOFF1 uses the same zlib
 # already required by the browser, rather than FreeType's private inflater.
+# WOFF2 uses the pinned decode-only Brotli target and capped FreeType allocator.
 #
 # Every other optional external dependency is disabled EXPLICITLY so that
 # neither target silently links a system library the other lacks. zlib is
@@ -21,7 +22,8 @@ set(FT_REQUIRE_ZLIB     ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_BZIP2    ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG      ON  CACHE BOOL "" FORCE)
 set(FT_DISABLE_HARFBUZZ ON  CACHE BOOL "" FORCE)
-set(FT_DISABLE_BROTLI   ON  CACHE BOOL "" FORCE)  # WOFF2 is rejected by the backend
+set(FT_DISABLE_BROTLI   ON  CACHE BOOL "" FORCE) # Never discover a system decoder.
+include(cmake/brotli_vendored.cmake)
 set(FT_ENABLE_ERROR_STRINGS OFF CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL    ON  CACHE BOOL "" FORCE)
 set(DISABLE_FORCE_DEBUG_POSTFIX ON CACHE BOOL "" FORCE)  # stable `freetype` target/lib name
@@ -50,6 +52,20 @@ else()
     FetchContent_MakeAvailable(freetype)
 endif()
 
+# Run on existing mirrors/build trees too; a changed patch must not depend
+# on whether FetchContent happens to populate this configure.
+if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/freetype/CMakeLists.txt")
+    set(tilefinch_freetype_source "${PSP_BROWSER_VENDOR_DIR}/freetype")
+else()
+    set(tilefinch_freetype_source "${freetype_SOURCE_DIR}")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
+    "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-budgeted-woff2.patch"
+    "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+
 if(TARGET freetype)
     # ftinit.c includes FT_CONFIG_MODULES_H.  Overriding it here — identically
     # for host and PSP — narrows FT_Add_Default_Modules() to the three modules
@@ -58,6 +74,7 @@ if(TARGET freetype)
     target_compile_definitions(freetype PRIVATE
         "FT_CONFIG_MODULES_H=\"${PSP_BROWSER_FREETYPE_MINIMAL_MODULES}\""
         "FT_CONFIG_OPTIONS_H=\"${PSP_BROWSER_FREETYPE_OPTIONS}\"")
+    target_link_libraries(freetype PUBLIC tilefinch_brotli_decode)
     if(PSP)
         # psp-gcc rejects -fPIC under -mabi=eabi (the same accommodation the
         # lexbor static port needs); a trailing -fno-pic wins if anything up

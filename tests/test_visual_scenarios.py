@@ -408,6 +408,8 @@ def make_modern_reference(state: dict[str, object], item: Scenario) -> None:
             "terminal_failures": 0,
         },
         "teardown_changes": [],
+        "late_binding_details": [],
+        "suppressed_teardown_beacons": 0,
     }
     state["acquisition_plan"] = {
         "mode": "exact-get-head-plan-v1",

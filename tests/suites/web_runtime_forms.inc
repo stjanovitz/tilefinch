@@ -968,7 +968,7 @@
               &ready_frame->document, &budget, frame_fairness_child,
               sizeof(frame_fairness_child) - 1, 16));
     ready_frame->runtime = script_runtime_create_deferred(
-        &ready_frame->document, &budget, 2 * MIB, 1000,
+        &ready_frame->document, &budget, 3 * MIB, 1000,
         "https://frame-fairness.test/ready.html", NULL,
         &ready_frame->script_result);
     ready_frame->loaded = true;
@@ -1603,7 +1603,7 @@
     CHECK(document_parse(&owned_frame->document, &budget,
                          owned_child_page, sizeof(owned_child_page) - 1, 16));
     owned_frame->runtime = script_runtime_create_deferred(
-        &owned_frame->document, &budget, 2 * MIB, 1000,
+        &owned_frame->document, &budget, 3 * MIB, 1000,
         "https://frame-owner.test/replacement-child.html", NULL,
         &owned_frame->script_result);
     CHECK(owned_frame->runtime != NULL
@@ -1680,7 +1680,7 @@
     CHECK(document_parse(&owned_frame->document, &budget,
                          owned_child_page, sizeof(owned_child_page) - 1, 16));
     owned_frame->runtime = script_runtime_create_deferred(
-        &owned_frame->document, &budget, 2 * MIB, 1000,
+        &owned_frame->document, &budget, 3 * MIB, 1000,
         "https://frame-owner.test/refresh-child.html", NULL,
         &owned_frame->script_result);
     CHECK(owned_frame->runtime != NULL
@@ -1732,7 +1732,7 @@
                          navigation_wins_child,
                          sizeof(navigation_wins_child) - 1, 16));
     navigation_wins_frame->runtime = script_runtime_create_deferred(
-        &navigation_wins_frame->document, &budget, 2 * MIB, 1000,
+        &navigation_wins_frame->document, &budget, 3 * MIB, 1000,
         "https://navigation-wins.test/outgoing.html", NULL,
         &navigation_wins_frame->script_result);
     CHECK(navigation_wins_frame->runtime != NULL);
@@ -2000,7 +2000,7 @@
     CHECK(document_parse(&scale_frame->document, &budget, scale_child_page,
                          sizeof(scale_child_page) - 1, 16));
     scale_frame->runtime = script_runtime_create_deferred(
-        &scale_frame->document, &budget, 2 * MIB, 1000,
+        &scale_frame->document, &budget, 3 * MIB, 1000,
         "https://scale-frame.test/child.html", NULL,
         &scale_frame->script_result);
     CHECK(scale_frame->runtime != NULL);
@@ -5763,9 +5763,17 @@
               "pocSummary='OPFS-SYNC-ERROR:'+error.name+':'+error.message}}})()",
               "<opfs-worker-sync-access>", &worker_performance_result));
     for (size_t worker_turn = 0; worker_turn < 64; worker_turn++) {
-        CHECK(script_runtime_advance(
+        bool advanced = script_runtime_advance(
             worker_performance_runtime, worker_turn, 32,
-            &worker_performance_result));
+            &worker_performance_result);
+        if (!advanced) {
+            fprintf(stderr, "OPFS advance turn=%zu interrupted=%d "
+                "watchdog-ms=%lu error=%s\n", worker_turn,
+                (int) worker_performance_result.interrupted,
+                worker_performance_result.watchdog_elapsed_ms,
+                worker_performance_result.error);
+        }
+        CHECK(advanced);
     }
     if (strcmp(worker_performance_result.summary,
                "OPFS-SYNC-OK") != 0) {

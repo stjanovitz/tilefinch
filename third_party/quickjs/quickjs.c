@@ -3145,7 +3145,6 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->dynamic_code_enabled = TRUE;
     ctx->host_global_this = JS_UNDEFINED;
     js_rc(ctx)->ref_count = 1;
-    add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
 
     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
                                     rt->class_count);
@@ -3154,7 +3153,6 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     ctx->rt = rt;
-    list_add_tail(&ctx->link, &rt->context_list);
     for(i = 0; i < rt->class_count; i++)
         ctx->class_proto[i] = JS_NULL;
     ctx->array_ctor = JS_NULL;
@@ -3162,6 +3160,12 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     init_list_head(&ctx->loaded_modules);
+
+    /* Allocation can collect, and refusal can immediately destroy the
+       runtime. Publish only a fully markable context; an unallocated
+       prototype table must not leave a freed context in the GC list. */
+    add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
+    list_add_tail(&ctx->link, &rt->context_list);
 
     if (JS_AddIntrinsicBasicObjects(ctx)) {
         JS_FreeContext(ctx);
@@ -63815,6 +63819,8 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
     {
         JSObject *p;
         obj = JS_NewObjectProtoClassAlloc(ctx, JS_NULL, JS_CLASS_OBJECT, 4);
+        if (JS_IsException(obj))
+            return -1;
         p = JS_VALUE_GET_OBJ(ctx->global_obj);
         p->u.global_object.uninitialized_vars = obj;
     }

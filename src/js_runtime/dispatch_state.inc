@@ -586,6 +586,7 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
         runtime->geometry_incumbent = NULL;
     }
     runtime->bridge.layout = layout;
+    runtime->geometry_paint_stale = false;
     runtime->bridge.viewport_height = viewport_height > 0
                                       ? viewport_height : 272;
     if (layout != NULL) {
@@ -598,20 +599,61 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
     }
 }
 
-bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
-                                          const ViewportContext *viewport)
+static bool geometry_layout_current(const ScriptRuntime *runtime,
+                                     const ViewportContext *viewport)
+{
+    const DomBridge *bridge = &runtime->bridge;
+    const LayoutDocument *layout = runtime->geometry_layout;
+    return layout != NULL && layout->budget != NULL
+        && bridge->layout == layout
+        && bridge->document != NULL && bridge->stylesheet != NULL
+        && runtime->geometry_content_generation == bridge->document->content_generation
+        && runtime->geometry_style_generation == document_style_generation()
+        && runtime->geometry_sheet_generation == bridge->stylesheet->build_generation
+        && runtime->geometry_container_generation == bridge->stylesheet->container_state_generation
+        && runtime->geometry_font_generation == font_generation()
+        && layout->fonts == bridge->fonts
+        && layout->web_fonts == stylesheet_web_font_set(bridge->stylesheet)
+        && layout->viewport.css_width == viewport->css_width
+        && layout->viewport.css_height == viewport->css_height
+        && layout->viewport.device_width == viewport->device_width
+        && layout->viewport.device_height == viewport->device_height
+        && layout->viewport.scale_numerator == viewport->scale_numerator
+        && layout->viewport.scale_denominator == viewport->scale_denominator;
+}
+
+bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
+                                         const ViewportContext *viewport,
+                                         LayoutDocument *layout)
+{
+    if (runtime == NULL || viewport == NULL || layout == NULL
+        || layout->budget != NULL || runtime->geometry_paint_stale
+        || !geometry_layout_current(runtime, viewport))
+        return false;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_GEOMETRY_LAYOUT_ADOPTION") != NULL) return false;
+#endif
+    *layout = *runtime->geometry_layout;
+    budget_free(runtime->budget, runtime->geometry_layout);
+    runtime->geometry_layout = NULL;
+    runtime->bridge.layout = runtime->geometry_incumbent;
+    runtime->geometry_incumbent = NULL;
+    return true;
+}
+
+bool script_runtime_flush_geometry_layout_reuse(
+    ScriptRuntime *runtime, const ViewportContext *viewport,
+    ScriptGeometryReuseCallback prepare, void *opaque)
 {
     if (runtime == NULL || viewport == NULL) return false;
     DomBridge *bridge = &runtime->bridge;
     if (bridge->document == NULL || bridge->stylesheet == NULL) return false;
-    uint64_t content = bridge->document->content_generation;
-    uint64_t style = document_style_generation();
-    uint64_t sheet = bridge->stylesheet->build_generation;
-    if (runtime->geometry_layout != NULL
-        && bridge->layout == runtime->geometry_layout
-        && runtime->geometry_content_generation == content
-        && runtime->geometry_style_generation == style
-        && runtime->geometry_sheet_generation == sheet) return true;
+    if (geometry_layout_current(runtime, viewport)) {
+#ifndef TILEFINCH_NO_TRACE
+        if (bridge->result != NULL) bridge->result->geometry_snapshot_hits++;
+#endif
+        return true;
+    }
     if (runtime->geometry_layout == NULL) {
         runtime->geometry_layout = budget_calloc_category(
             runtime->budget, BUDGET_CATEGORY_LAYOUT, 1,
@@ -625,9 +667,12 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
         layout_destroy(runtime->geometry_layout);
         memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
     }
-    if (!layout_build_context(runtime->geometry_layout, runtime->budget,
+    LayoutReuseCache *reuse = prepare == NULL ? NULL
+        : prepare(opaque, bridge->mutations.count != 0
+            || bridge->mutations.overflowed ? &bridge->mutations : NULL);
+    if (!layout_build_context_reuse(runtime->geometry_layout, runtime->budget,
             bridge->document, bridge->stylesheet, bridge->fonts,
-            bridge->images, viewport)) {
+            bridge->images, viewport, reuse)) {
         layout_destroy(runtime->geometry_layout);
         memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
         return false;
@@ -635,6 +680,12 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
     runtime->geometry_content_generation = bridge->document->content_generation;
     runtime->geometry_style_generation = document_style_generation();
     runtime->geometry_sheet_generation = bridge->stylesheet->build_generation;
+    runtime->geometry_container_generation = bridge->stylesheet->container_state_generation;
+    runtime->geometry_font_generation = font_generation();
+    runtime->geometry_paint_stale = false;
+#ifndef TILEFINCH_NO_TRACE
+    if (bridge->result != NULL) bridge->result->geometry_snapshot_builds++;
+#endif
     layout_transfer_scroll_state(runtime->geometry_incumbent,
                                  runtime->geometry_layout);
     for (size_t i = 0; i < bridge->scroll_intent_count; i++) {
@@ -644,6 +695,40 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
     }
     bridge->layout = runtime->geometry_layout;
     return true;
+}
+
+bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
+                                          const ViewportContext *viewport)
+{
+    return script_runtime_flush_geometry_layout_reuse(
+        runtime, viewport, NULL, NULL);
+}
+
+bool js_rt_geometry_opacity_write_begin(DomBridge *bridge, lxb_dom_node_t *node)
+{
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    return runtime != NULL && runtime->geometry_layout != NULL
+        && bridge->stylesheet != NULL && bridge->shadow_root_count == 0
+        && !bridge->mutations.overflowed
+        && !bridge->mutations.resource_rebuild_required
+        && !bridge->mutations.conservative_resource_scan
+        && !stylesheet_has_container_queries(bridge->stylesheet)
+        && !style_container_layout_state_present(bridge->stylesheet)
+        && geometry_layout_current(runtime, &runtime->geometry_layout->viewport)
+        && !stylesheet_selectors_reference_attribute_prefix(bridge->stylesheet, "style", 5)
+        /* A pseudo-element can read attr(style) without a [style] selector.
+           Keep such generated geometry on the conservative path. */
+        && !style_node_pseudo_rules_may_affect_discovery(bridge->stylesheet, node);
+}
+
+void js_rt_geometry_opacity_write_end(DomBridge *bridge)
+{
+    ScriptRuntime *runtime = bridge->host;
+    runtime->geometry_content_generation = bridge->document->content_generation;
+    runtime->geometry_style_generation = document_style_generation();
+    /* Box geometry is current, but the old commands must never be adopted
+       as the new presentation. Owner mutation/repaint work stays pending. */
+    runtime->geometry_paint_stale = true;
 }
 
 void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,

@@ -141,7 +141,9 @@ typedef void (*NavigationScriptFrontierCallback)(
 
 typedef struct {
     uint16_t control_index;
-    /* High bit tags bounded option-selectedness bytes, not text. */
+    /* 0x8000 tags bounded option-selectedness; 0x4000 tags a disclosure's
+       open state, addressed by bounded DOM disclosure ordinal, not a visible
+       control index. Neither record contains a DOM pointer. */
     uint16_t value_length;
     char value[128];
 } NavigationHistoryControl;
@@ -257,6 +259,8 @@ typedef struct {
     ExternalStylesheetStats external_stylesheets;
     ExternalFontStats external_fonts;
     ExternalFontLoader external_font_loader;
+    bool web_font_pressure_fallback;
+    bool web_font_fallback_attempted;
     ImageResources images;
     LayoutDocument layout;
     LayoutReuseCache *layout_reuse;
@@ -758,6 +762,7 @@ struct NavigationSession {
     size_t maximum_stylesheet_bytes;
     size_t maximum_stylesheet_file_bytes;
     bool web_fonts_enabled;
+    WebFontMode web_font_mode;
     size_t maximum_font_attempts;
     size_t maximum_font_bytes;
     size_t maximum_font_file_bytes;
@@ -792,7 +797,7 @@ struct NavigationSession {
     int relayout_damage_top;
     int relayout_damage_right;
     int relayout_damage_bottom;
-    /* Same-geometry canvas publication changes pixels, not layout. The
+    /* Same-geometry canvas/fixed-image publication changes pixels, not layout. The
        browser engine uses this to invalidate mutable image derivatives and
        the affected tiles without cloning the display list. */
     bool canvas_paint_damage_pending;
@@ -1099,6 +1104,7 @@ bool navigation_set_script_execution_policy(
     NavigationSession *session, const ScriptExecutionPolicy *policy);
 void navigation_attach_browser_session(NavigationSession *session,
                                        BrowserSession *browser_session);
+bool navigation_set_web_font_mode(NavigationSession *session, WebFontMode mode);
 /* Installs one complete prepare/abort/commit set, or clears it when all three
    callbacks are NULL. Partial hook sets are rejected. */
 bool navigation_set_candidate_commit_hooks(
@@ -1398,6 +1404,10 @@ typedef enum {
     NAVIGATION_BACKGROUND_WORK_SUCCESS = 1,
     NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL = 2
 } NavigationBackgroundWorkOutcome;
+/* Memory relief only: never fetch or publish new resources, and never
+   defer behind startup scripts. A dirty DOM waits for its owner to settle. */
+NavigationBackgroundWorkOutcome navigation_run_web_font_memory_work(
+    NavigationSession *session);
 NavigationBackgroundWorkOutcome navigation_run_background_resources(
     NavigationSession *session);
 typedef enum {

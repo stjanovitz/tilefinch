@@ -96,6 +96,58 @@ static int test_per_site_allowances(void)
     return 0;
 }
 
+static int test_memory_storage_refusal_rollback(void)
+{
+    size_t create_attempts = 0u, replace_attempts = 0u;
+    for (unsigned phase = 0; phase < 2u; phase++) {
+        size_t *attempts = phase == 0u ? &create_attempts : &replace_attempts;
+        for (size_t point = 0;; point++) {
+            Budget budget;
+            budget_init(&budget, 2u * MIB);
+            BrowserSession session;
+            CHECK(browser_session_init(&session, &budget, 32u * 1024u));
+            if (phase != 0u)
+                CHECK(browser_session_storage_set(
+                    &session, game, true, "probe", "old", 3u));
+            budget_inject_failure_after(
+                &budget, point == 0u ? SIZE_MAX : point - 1u);
+            bool stored = browser_session_storage_set(
+                &session, game, true, "probe",
+                phase == 0u ? "new" : "replacement",
+                phase == 0u ? 3u : 11u);
+            if (point == 0u) {
+                CHECK(stored);
+                *attempts = SIZE_MAX - budget.failure_injection_countdown;
+                CHECK(*attempts > 0u && *attempts < 16u);
+            } else {
+                CHECK(!stored && budget.injected_failure_count == 1u);
+                const char *value_after = NULL;
+                size_t length_after = 0u;
+                bool found = browser_session_storage_get(
+                    &session, game, true, "probe",
+                    &value_after, &length_after);
+                CHECK(phase == 0u ? !found
+                                  : found && length_after == 3u
+                                    && memcmp(value_after, "old", 3u) == 0);
+            }
+            budget_clear_failure_injection(&budget);
+            CHECK(browser_session_storage_set(
+                &session, game, true, "probe", "replacement", 11u));
+            const char *value_after = NULL;
+            size_t length_after = 0u;
+            CHECK(browser_session_storage_get(
+                &session, game, true, "probe",
+                &value_after, &length_after)
+                && length_after == 11u
+                && memcmp(value_after, "replacement", 11u) == 0);
+            browser_session_destroy(&session);
+            CHECK(budget.current == 0u);
+            if (point == *attempts) break;
+        }
+    }
+    return 0;
+}
+
 static int test_background_growth(void)
 {
     Budget budget;
@@ -792,6 +844,7 @@ int main(void)
              "/tmp/tilefinch-site-storage-XXXXXX");
     if (mkdtemp(directory) == NULL) return 1;
     int failed = test_per_site_allowances()
+        || test_memory_storage_refusal_rollback()
         || test_background_growth()
         || test_offer_and_session_grant()
         || test_decline_and_policies()

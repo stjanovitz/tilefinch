@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include "tilefinch_test_faults.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -480,6 +481,8 @@ int main(int argc, char **argv)
     bool loop_capture_frames = true;
     bool platform_sim = false;
     bool external_resources = true;
+    bool web_fonts_enabled = true;
+    WebFontMode web_font_mode = WEB_FONTS_SMART;
     bool forced_dark = false;
     bool progressive_first_paint = true;
     uint64_t relayout_preview_us = UINT64_C(150000);
@@ -492,6 +495,16 @@ int main(int argc, char **argv)
     size_t experimental_section = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fetch-scripts") == 0) fetch_scripts = true;
+        else if (strcmp(argv[i], "--no-web-fonts") == 0) web_fonts_enabled = false;
+        else if (strcmp(argv[i], "--web-font-mode") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "on") == 0) web_font_mode = WEB_FONTS_ON;
+            else if (strcmp(mode, "smart") == 0) web_font_mode = WEB_FONTS_SMART;
+            else if (strcmp(mode, "off") == 0) web_font_mode = WEB_FONTS_OFF;
+            else { fprintf(stderr, "invalid website font mode\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--legacy-web-font-work") == 0)
+            tilefinch_test_faults()->legacy_web_font_work = true;
         else if (strcmp(argv[i], "--no-javascript") == 0) no_javascript = true;
         else if (strcmp(argv[i], "--pace-real-time") == 0) {
             pace_real_time = true;
@@ -941,13 +954,13 @@ int main(int argc, char **argv)
         stylesheet_file_bytes = 384 * KIB;
     }
     if (limit_mb >= 24) {
-        stylesheet_count = 24;
-        stylesheet_bytes = 2112 * KIB;
+        stylesheet_count = BROWSER_PSP_APP_STYLESHEETS;
+        stylesheet_bytes = BROWSER_PSP_APP_STYLESHEET_BYTES;
         stylesheet_file_bytes = 768 * KIB;
     }
     if (limit_mb >= 32 && psp_profile == NULL) {
-        stylesheet_count = 24;
-        stylesheet_bytes = 2112 * KIB;
+        stylesheet_count = BROWSER_PSP_APP_STYLESHEETS;
+        stylesheet_bytes = BROWSER_PSP_APP_STYLESHEET_BYTES;
         stylesheet_file_bytes = 768 * KIB;
         if (!script_heap_explicit) script_heap_mb = 8;
         if (!script_total_explicit) script_total_mb = 4;
@@ -1124,6 +1137,8 @@ int main(int argc, char **argv)
     engine_config->resources.maximum_image_bytes = image_bytes;
     engine_config->resources.maximum_image_file_bytes = image_file_bytes;
     engine_config->resources.maximum_decoded_image_bytes = decoded_image_bytes;
+    engine_config->resources.web_fonts_enabled = web_fonts_enabled;
+    engine_config->resources.web_font_mode = web_font_mode;
     /* Page fonts default to PSP-shaped ceilings (96 KiB/file) that reject the
        ~280 KiB WOFF / ~570 KiB TTF web faces real sites ship.  Reference
        scoring wants everything the engine can render, so let the harness raise
@@ -2696,6 +2711,42 @@ int main(int argc, char **argv)
            (unsigned long long) navigation.page.external_fonts.elapsed_ms,
            fonts_external_loader_pending(
                &navigation.page.external_font_loader) ? "yes" : "no");
+    /* Post-run ownership/usage census: outside navigation and paint timing. */
+    const WebFontSet *reported_fonts = stylesheet_web_font_set(&navigation.page.stylesheet);
+    printf("web-font-binding current-layout=%d\n",
+        reported_fonts == navigation.page.layout.web_fonts);
+    if (reported_fonts != NULL) {
+        for (size_t family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
+            for (size_t slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++) {
+                const FontFace *face = &reported_fonts->families[family].faces[slot];
+                if (!face->loaded) continue;
+                size_t commands = 0, visible = 0;
+                for (size_t at = 0; at < navigation.page.layout.count; at++) {
+                    const DrawCommand *command = &navigation.page.layout.commands[at];
+                    if (command->type != DRAW_TEXT) continue;
+                    unsigned weight = draw_command_font_weight(command);
+                    if (font_context_face_at_weight(browser_engine_fonts(engine), reported_fonts,
+                            draw_command_font_family(command), draw_command_font_italic(command),
+                            weight >= 650u, weight) != face) continue;
+                    commands++;
+                    if (command->y < navigation.viewport.css_height
+                        && (int64_t) command->y + command->height > 0) visible++;
+                }
+                bool shared = false;
+                for (size_t earlier = 0; earlier < family * TILEFINCH_WEB_FONT_WEIGHT_LIMIT + slot; earlier++) {
+                    const FontFace *other = &reported_fonts->families[
+                        earlier / TILEFINCH_WEB_FONT_WEIGHT_LIMIT].faces[
+                        earlier % TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
+                    if (other->loaded && other->implementation == face->implementation) shared = true;
+                }
+                printf("web-font-usage family=%zu slot=%zu weight=%u encoded=%zu "
+                       "backend=%zu shared=%d text-commands=%zu top-text-commands=%zu\n",
+                    family, slot, (unsigned) reported_fonts->families[family].weights[slot],
+                    shared ? 0 : face->data_length, shared ? 0 : font_face_backend_bytes(face),
+                    shared, commands, visible);
+            }
+        }
+    }
     printf("resource-responsiveness css-work=%zu css-yields=%zu "
            "css-max-slice-us=%llu css-max-slice-work=%zu image-work=%zu "
            "image-yields=%zu image-max-slice-us=%llu "
@@ -3388,11 +3439,13 @@ int main(int argc, char **argv)
            navigation.page.script_result.dom_handle_growths,
            navigation.page.script_result.dom_handle_growth_refusals);
     printf("javascript-geometry queries=%zu retained-fast-paths=%zu "
-           "ancestor-visits=%zu synchronous-layouts=%zu\n",
+           "ancestor-visits=%zu synchronous-layouts=%zu snapshot-builds=%zu snapshot-hits=%zu\n",
            navigation.page.script_result.geometry_queries,
            navigation.page.script_result.geometry_retained_fast_paths,
            navigation.page.script_result.geometry_ancestor_visits,
-           navigation.page.script_result.geometry_synchronous_layouts);
+           navigation.page.script_result.geometry_synchronous_layouts,
+           navigation.page.script_result.geometry_snapshot_builds,
+           navigation.page.script_result.geometry_snapshot_hits);
     printf("javascript-error=\"%s\" source=\"%s\"\n",
            navigation.page.script_result.error,
            navigation.page.script_result.error_source_context);
@@ -4179,6 +4232,9 @@ cleanup:
 #else
     interactive_media_destroy(&media);
 #endif
+    /* Media titles may use the page's preferred face without a chrome face.
+       Release those cached glyphs while their Budget/font owner is alive. */
+    psp_ui_clear_chrome_font();
     if (!success && navigation_ready) {
         if (getenv("TILEFINCH_DUMP_FRAME_MEMORY") != NULL) {
             if (navigation.page.runtime != NULL) {

@@ -701,6 +701,19 @@ static bool prepare_rule_declarations(
         if (deferred.container_relative[slot]) {
             sheet->has_container_relative_units = true;
         }
+        bool font_fixup = context->discover_font_faces
+            && deferred.font_family[slot] && !deferred.deferred[slot]
+            && (masks[slot] & S_FONT_FAMILY) != 0
+            && !font_family_is_web(values[slot].font_family);
+        /* A later stylesheet can register this named face. Keep the bounded
+           declaration program until that registry exists rather than freezing
+           a fallback family at the first external-sheet checkpoint. */
+        if (deferred.font_family[slot]
+            && (masks[slot] & S_FONT_FAMILY) != 0
+            && !font_family_is_web(values[slot].font_family)) {
+            deferred.deferred[slot] = true;
+            deferred.dynamic[slot] = true;
+        }
         if (masks[slot] == 0 && masks_high[slot] == 0
             && !deferred.deferred[slot]
             && !deferred.all_inherit[slot]) continue;
@@ -709,10 +722,6 @@ static bool prepare_rule_declarations(
         if (deferred.deferred[slot]
             && !stylesheet_current_image_source_slot(
                    sheet, &image_source_slot)) return false;
-        bool font_fixup = context->discover_font_faces
-            && deferred.font_family[slot] && !deferred.deferred[slot]
-            && (masks[slot] & S_FONT_FAMILY) != 0
-            && !font_family_is_web(values[slot].font_family);
         uint32_t declaration_index = 0;
         if (!add_declaration(
                 sheet, &values[slot], masks[slot], masks_high[slot],
@@ -1060,7 +1069,11 @@ static bool selector_to_rule(
         }
     }
     PseudoElement pseudo = PSEUDO_NONE;
-    if (length >= 7 && memcmp(selector + length - 7, "::after", 7) == 0) {
+    if (length >= 13 && memcmp(selector + length - 13, "::placeholder", 13) == 0) {
+        pseudo = PSEUDO_PLACEHOLDER;
+        length -= 13;
+        trim(&selector, &length);
+    } else if (length >= 7 && memcmp(selector + length - 7, "::after", 7) == 0) {
         pseudo = PSEUDO_AFTER;
         length -= 7;
         trim(&selector, &length);
@@ -1794,7 +1807,7 @@ static bool supports_selector_pseudo(const char *name, size_t length)
         "nth-last-child", "nth-last-of-type", "nth-of-type", "only-child",
         "only-of-type", "open", "optional", "popover-open", "required",
         "root", "visited", "where", "-moz-any", "-webkit-any", "host",
-        "before", "after", "marker"
+        "before", "after", "placeholder", "marker"
     };
     for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
         if (strlen(supported[i]) == length

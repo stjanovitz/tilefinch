@@ -22,6 +22,37 @@ static int test_sections(void)
         "second section second section second section</p>"
         "<h2 id=gamma>Gamma</h2><p>third section third section third section</p>"
         "</body></html>";
+    /* Refuse each allocation in the compressed-store construction in turn.
+       A refused optional index may still leave a usable store; either outcome
+       must release all memory and permit a clean retry. */
+    Budget refusal_budget;
+    budget_init(&refusal_budget, 4 * MIB);
+    CompressedSectionStore refusal_store = {0};
+    budget_inject_failure_after(&refusal_budget, SIZE_MAX);
+    CHECK(section_store_build(&refusal_store, &refusal_budget, section_page,
+                              strlen(section_page), 4096, 8192));
+    size_t refusal_attempts = SIZE_MAX - refusal_budget.failure_injection_countdown;
+    budget_clear_failure_injection(&refusal_budget);
+    section_store_destroy(&refusal_store);
+    CHECK(refusal_budget.current == 0 && refusal_attempts > 0
+          && refusal_attempts < 256);
+    for (size_t point = 0; point < refusal_attempts; point++) {
+        budget_inject_failure_after(&refusal_budget, point);
+        (void) section_store_build(&refusal_store, &refusal_budget,
+                                   section_page, strlen(section_page),
+                                   4096, 8192);
+        CHECK(refusal_budget.injected_failure_count != 0);
+        budget_clear_failure_injection(&refusal_budget);
+        section_store_destroy(&refusal_store);
+        CHECK(refusal_budget.current == 0
+              && refusal_budget.accounting_repair_count == 0);
+        CHECK(section_store_build(&refusal_store, &refusal_budget,
+                                  section_page, strlen(section_page),
+                                  4096, 8192)
+              && refusal_store.section_count == 4);
+        section_store_destroy(&refusal_store);
+        CHECK(refusal_budget.current == 0);
+    }
     CompressedSectionStore section_store;
     CHECK(section_store_build(&section_store, &budget, section_page,
                               strlen(section_page), 4096, 8192));
@@ -268,6 +299,17 @@ static int test_sections(void)
     puts("test: adaptive section routing delegates bounded documents");
     SectionRouteStream route = {0};
     SectionStoreStreamBuilder route_builder = {0};
+    /* A corrupt transport length must be refused before the router scans
+       past the supplied bytes or wraps its buffered-length arithmetic. */
+    static const unsigned char short_chunk[] = "x";
+    CHECK(section_route_stream_begin(
+              &route, &route_builder, &section_store, &budget,
+              4096, 16384, false));
+    CHECK(!section_route_stream_body(&route, short_chunk, SIZE_MAX));
+    route.scanned_bytes = SIZE_MAX;
+    CHECK(!section_route_stream_body(&route, short_chunk, 1u));
+    section_route_stream_abort(&route);
+    CHECK(budget.current == 0);
     CHECK(section_route_stream_begin(
               &route, &route_builder, &section_store, &budget,
               4096, 16384, false)

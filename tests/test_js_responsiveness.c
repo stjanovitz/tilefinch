@@ -32,7 +32,9 @@ typedef struct {
 static bool callback_abort_cooperate(void *context, const char *phase,
                                      size_t completed_work_units)
 {
-    (void) phase;
+    /* This fixture cancels a callback at VM entry. Task admission is a
+       separate, non-fatal yield boundary and must admit that callback. */
+    if (strcmp(phase, "page-task-boundary") == 0) return true;
     (void) completed_work_units;
     CallbackAbortCooperate *state = context;
     state->calls++;
@@ -1554,6 +1556,13 @@ static JSValue consume_task_slice(JSContext *context, JSValueConst this_value,
     return JS_UNDEFINED;
 }
 
+static bool defer_author_task(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    bool *pending_input = opaque;
+    return strcmp(phase, "page-task-boundary") != 0 || !*pending_input;
+}
+
 static int test_runtime_task_time_slice(void)
 {
     Budget budget;
@@ -1578,6 +1587,17 @@ static int test_runtime_task_time_slice(void)
         "<task-slice>", &result));
     TimedCooperate clock = { .now_ns = UINT64_C(1000000000) };
     task_slice_clock = &clock;
+    bool pending_input = true;
+    TilefinchPlatformServices input_services = { .context = &pending_input,
+                                                .cooperate = defer_author_task };
+    tilefinch_platform_set_services(&input_services);
+    CHECK(script_runtime_advance(runtime, 16, 16, &result));
+    JSValue deferred = JS_Eval(runtime->context, "taskOrder.length", 16, "<check>", 0);
+    int32_t deferred_length = -1;
+    CHECK(JS_ToInt32(runtime->context, &deferred_length, deferred) == 0
+        && deferred_length == 0 && script_runtime_has_pending_author_work(runtime));
+    JS_FreeValue(runtime->context, deferred);
+    tilefinch_platform_set_services(NULL);
     TilefinchPlatformServices services = {
         .context = &clock, .monotonic_time_ns = timed_cooperate_clock,
         .cooperate = timed_cooperate_poll
@@ -3959,6 +3979,63 @@ static int test_detached_move_is_a_removal(void)
     return 0;
 }
 
+static int test_identical_cssom_write_is_not_a_mutation(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<!doctype html><body><p id=p>Text</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000, "https://mutation.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    ScriptMutationJournal journal;
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "var p=document.getElementById('p');p.style.width='10px';",
+        "<initial-cssom-write>", &result));
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    uint64_t generation = document.content_generation;
+    uint64_t style_generation = document_style_generation();
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<32;i++)p.style.width='10px';",
+        "<identical-cssom-writes>", &result));
+    CHECK(!script_runtime_consume_mutations(runtime, &journal)
+          && journal.count == 0 && document.content_generation == generation
+          && document_style_generation() == style_generation);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.style.width='20px';", "<changed-cssom-write>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    lxb_dom_node_t *node = find_element_id(
+        lxb_dom_interface_node(document.html), "p");
+    CHECK(node != NULL);
+    /* An equal serialization can still change CSP authorization. It must
+       publish that change before later equal writes become no-ops. */
+    sheet.block_inline_style_attributes = true;
+    document_style_attribute_set_cssom_authorized(node, false);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.style.width='20px';", "<authorize-equal-cssom-write>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal)
+          && document_style_attribute_cssom_authorized(node));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.style.width='20px';", "<authorized-cssom-noop>", &result));
+    CHECK(!script_runtime_consume_mutations(runtime, &journal));
+    /* DOM setAttribute still has its own mutation semantics. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.setAttribute('style',p.getAttribute('style'));",
+        "<equal-dom-attribute-write>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_coalesced_attribute_tokens(void)
 {
     Budget budget;
@@ -5149,6 +5226,9 @@ int main(int argc, char **argv)
     CHECK(test_mutation_observer_shadow_boundaries() == 0);
     if (argc == 2 && strcmp(argv[1], "--coalesced-tokens-only") == 0)
         return test_coalesced_attribute_tokens();
+    if (argc == 2 && strcmp(argv[1], "--cssom-noop-only") == 0)
+        return test_identical_cssom_write_is_not_a_mutation();
+    CHECK(test_identical_cssom_write_is_not_a_mutation() == 0);
     if (argc == 2 && strcmp(argv[1], "--handle-table-only") == 0)
         return test_dom_handle_table_exhaustion()
             || test_dom_handle_table_scales_with_profile();

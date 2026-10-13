@@ -66,11 +66,17 @@ struct StylePaintStack {
     uint16_t transform_origin_x;
     uint16_t transform_origin_y;
     int16_t skew_x_q10;
+    /* Uses existing alignment padding; ordinary ComputedStyle is unchanged.
+       Non-quarter rotations are retained only for bounded solid spans. */
+    int16_t rotation_q6;
     StylePaintLayer backgrounds[STYLE_PAINT_LAYER_LIMIT];
     StylePaintLayer masks[STYLE_PAINT_LAYER_LIMIT];
     StyleBoxShadow text_shadows[STYLE_BOX_SHADOW_LIMIT];
     StyleBoxShadow box_shadows[STYLE_BOX_SHADOW_LIMIT];
 };
+
+_Static_assert(offsetof(StylePaintStack, backgrounds) == 16,
+               "rare rotation must use the paint stack's existing padding");
 
 /* Rare compositing state shares the optional paint stack instead of growing
    every ComputedStyle.  The backdrop radius is deliberately capped at three

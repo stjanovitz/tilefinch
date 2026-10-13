@@ -910,7 +910,7 @@ static const char platform_members_probe[] =
     ".enumerable;});"
     "t('HTMLScriptElement.supports',()=>HTMLScriptElement.supports('classic')"
     "&&HTMLScriptElement.supports('module')"
-    "&&!HTMLScriptElement.supports('importmap')"
+    "&&HTMLScriptElement.supports('importmap')"
     "&&!HTMLScriptElement.supports('speculationrules')"
     "&&!HTMLScriptElement.supports('Module')"
     "&&!HTMLScriptElement.supports('')&&HTMLScriptElement.supports.length===1);"

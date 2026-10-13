@@ -314,9 +314,134 @@ static int test_layout(void)
 #include "suites/layout_regression_positioning.inc"
 #include "suites/layout_regression_fonts.inc"
 
-int main(void)
+static int test_auto_grid_block_alignment(void)
+{
+    for (unsigned end = 0; end < 2; end++) {
+        for (unsigned reversed = 0; reversed < 2; reversed++) {
+            Budget budget;
+            budget_init(&budget, 4u * MIB);
+            CHECK(budget_install_lexbor(&budget));
+            char page[1024];
+            int length = snprintf(page, sizeof(page),
+                "<!doctype html><style>body{margin:0}.grid{display:grid;"
+                "grid-template-columns:50px 50px;align-items:%s}"
+                ".grid>*{display:block;box-sizing:border-box;padding:0;border:0}"
+                "#short{height:20px;margin:4px 0 6px}#tall{height:60px;margin:0}"
+                "</style><div class=grid>%s%s</div>",
+                end ? "end" : "center",
+                reversed ? "<button id=tall>T</button>" : "<a id=short href='/x'>S</a>",
+                reversed ? "<a id=short href='/x'>S</a>" : "<button id=tall>T</button>");
+            CHECK(length > 0 && (size_t) length < sizeof(page));
+            PocDocument document = {0};
+            Stylesheet sheet = {0};
+            LayoutDocument layout = {0};
+            CHECK(document_parse(&document, &budget, page, (size_t) length, 17)
+                  && stylesheet_build(&sheet, &budget, &document, 100)
+                  && layout_build(&layout, &budget, &document, &sheet,
+                                  NULL, NULL, 100));
+            const LayoutNodeBox *short_box = layout_box_for_node(&layout,
+                find_id(lxb_dom_interface_node(document.html), "short"));
+            const LayoutNodeBox *tall_box = layout_box_for_node(&layout,
+                find_id(lxb_dom_interface_node(document.html), "tall"));
+            CHECK(short_box != NULL && tall_box != NULL
+                  && short_box->height == 20 && tall_box->height == 60
+                  && tall_box->y == 0 && short_box->y == (end ? 34 : 19));
+            CHECK(layout.link_count != 0 && layout.control_count != 0);
+            layout_destroy(&layout);
+            stylesheet_destroy(&sheet);
+            document_destroy(&document);
+            CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+        }
+    }
+    return 0;
+}
+
+static int test_oversized_style_cache_scan(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static char html[200000];
+    const char *prefix = "<!doctype html><style>body{margin:0}"
+        "div{height:1px;background:#123456}.changed{background:#abcdef}</style>";
+    size_t length = strlen(prefix);
+    memcpy(html, prefix, length);
+    for (unsigned i = 0; i < 6500; i++) {
+        const char *element = "<div></div>";
+        size_t bytes = strlen(element);
+        CHECK(bytes < sizeof(html) - length);
+        memcpy(html + length, element, bytes);
+        length += bytes;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, &budget, html, length, 17)
+          && viewport_context_init(&viewport, 480, 272, 480, 272)
+          && stylesheet_build_context(&sheet, &budget, &document, &viewport));
+    LayoutReuseCache *cache = layout_reuse_cache_create(&budget);
+    CHECK(cache != NULL);
+    LayoutDocument retained = {0}, fresh = {0};
+    for (unsigned pass = 0; pass < 3; pass++) {
+        CHECK(layout_build_context_reuse(&retained, &budget, &document,
+            &sheet, NULL, NULL, &viewport, cache));
+        layout_destroy(&retained);
+    }
+    LayoutReuseStats before, after;
+    layout_reuse_cache_stats(cache, &before);
+    CHECK(layout_build_context_reuse(&retained, &budget, &document,
+        &sheet, NULL, NULL, &viewport, cache));
+    layout_reuse_cache_stats(cache, &after);
+    CHECK(after.style_hits - before.style_hits > 3000
+          && after.style_misses - before.style_misses < 4000);
+    CHECK(layout_build_context(&fresh, &budget, &document, &sheet,
+                              NULL, NULL, &viewport));
+    CHECK(commands_equal(&retained, &fresh));
+    layout_destroy(&fresh);
+    layout_destroy(&retained);
+    lxb_dom_node_t *node = document_body_node(&document)->first_child;
+    CHECK(node != NULL && lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(node), (const lxb_char_t *) "class", 5,
+        (const lxb_char_t *) "changed", 7) != NULL);
+    layout_reuse_cache_invalidate_tree(cache, node, false);
+    CHECK(layout_build_context_reuse(&retained, &budget, &document,
+        &sheet, NULL, NULL, &viewport, cache)
+        && layout_build_context(&fresh, &budget, &document, &sheet,
+                                NULL, NULL, &viewport)
+        && commands_equal(&retained, &fresh));
+    layout_destroy(&fresh);
+    layout_destroy(&retained);
+    layout_reuse_cache_destroy(cache);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && strcmp(argv[1], "--auto-grid-align-only") == 0)
+        return test_auto_grid_block_alignment();
+    if (argc == 2 && strcmp(argv[1], "--oversized-style-cache-only") == 0)
+        return test_oversized_style_cache_scan();
+    if (argc == 2 && strcmp(argv[1], "--container-cache-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        budget_install_lexbor(&budget);
+        return test_container_queries_one_pass(&budget);
+    }
+    CHECK(test_auto_grid_block_alignment() == 0);
+    CHECK(test_oversized_style_cache_scan() == 0);
+    if (argc == 3 && strcmp(argv[1], "--visual-regression") == 0) {
+        unsigned selected = (unsigned) strtoul(argv[2], NULL, 10);
+        if (selected >= 1 && selected <= 4)
+            return test_compact_controls_and_generated_intrinsics(1u << (selected - 1));
+        if (selected >= 5 && selected <= 6)
+            return test_inline_badge_baseline_and_mask_size(1u << (selected - 5));
+        if (selected == 7) return test_generated_rounded_border_sides();
+        return 1;
+    }
     CHECK(test_humanist_ink_fitting() == 0);
     puts("test: picture paints a replaced image through clipping");
     CHECK(test_picture_replaced_paint() == 0);

@@ -710,7 +710,38 @@ if(PSP)
             # measure 4,773,760 bytes. The user approved 2 KiB more code;
             # snapshots reuse the existing RAM-only history records, and
             # restoration runs before candidate publication, not per frame.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4774144)
+            # Compact controls, placeholder styling and bounded generated
+            # decoration fixes measure 4,785,392 bytes after consolidation.
+            # The user approved 2 KiB more code; unequal border widths use
+            # existing command fields with no additional raster surface.
+            # Placeholder indexing adds only 8 bytes per stylesheet, and
+            # all new layout work is outside the per-frame raster loop.
+            # Final grid stretching, DOM interface brands and fitted image
+            # corner spans measure 4,795,176 bytes. The user approved 3 KiB;
+            # geometry is updated in place with no retained surface growth.
+            # Current geometry adoption and immutable raster lifetime keys
+            # measure 4,796,684 bytes. The user approved 2 KiB more code.
+            # They eliminate redundant flow/raster work without relaxing
+            # page limits, cache byte ceilings or pressure reclamation.
+            # Bounded TrueType WOFF2 decoding plus opacity-only geometry
+            # reuse measure 4,839,912 bytes. The user approved 40 KiB then
+            # 1 KiB more code. Brotli allocations share the existing capped
+            # font allocator; page, font-download and cache limits stay fixed.
+            # Exact advance caching, retained font-independent styles and
+            # demand-driven font admission add about 1.8 KiB of code. The
+            # user approved 1 KiB more ceiling; per-face scratch is bounded
+            # and no page, cache, download or font allocator limit increases.
+            # The persisted website-font menu and rollback-safe Smart
+            # fallback require about 2.2 KiB more code. The user approved
+            # 3 KiB; fixed UI bits and normal page/font limits do not grow.
+            # Prompt font-pressure relief, scoped focus reuse and fresh
+            # static recovery measure 4,845,696 bytes after consolidation.
+            # The user approved 1 KiB above the prior ratchet; page, font
+            # and cache memory/download ceilings remain unchanged.
+            # The fresh 0.1.35 release profile measures 4,859,608 bytes.
+            # The user approved a measured 14 KiB increase for this engine
+            # code-generation difference; page/font/cache limits stay fixed.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4860160)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

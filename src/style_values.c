@@ -284,8 +284,8 @@ static bool transform_scale_number(const char *text, size_t length,
     return *end == '\0';
 }
 
-static bool transform_angle_quadrants(const char *text, size_t length,
-                                      unsigned *quadrants)
+static bool transform_angle_degrees(const char *text, size_t length,
+                                     double *degrees)
 {
     char buffer[40];
     if (length == 0 || length >= sizeof(buffer)) return false;
@@ -299,12 +299,8 @@ static bool transform_angle_quadrants(const char *text, size_t length,
     else if (strcasecmp(end, "rad") == 0) angle *= 57.29577951308232;
     else if (*end != '\0' && strcasecmp(end, "deg") != 0) return false;
     else if (*end == '\0' && angle != 0.0) return false;
-    double turns = angle / 90.0;
-    double rounded = turns < 0.0 ? ceil(turns - 0.5) : floor(turns + 0.5);
-    if (fabs(turns - rounded) > 0.000001) return false;
-    int result = (int) rounded % 4;
-    if (result < 0) result += 4;
-    *quadrants = (unsigned) result;
+    if (!isfinite(angle)) return false;
+    *degrees = fmod(angle, 360.0);
     return true;
 }
 
@@ -332,7 +328,8 @@ static bool transform_skew_number(const char *text, size_t length,
    translation tuple.  Parsing the complete function list fixes the former
    first-function-only behaviour while preserving the display list's exact,
    axis-aligned representation. Horizontal shear has a bounded solid-box
-   painter; non-uniform scale and arbitrary-angle rotation fail closed. */
+   painter; arbitrary rotation has a bounded solid-box painter. Non-uniform
+   scale and non-orthogonal rotation/shear combinations fail closed. */
 void style_parse_transform_translation(Stylesheet *sheet,
                                         const char *text, size_t length,
                                         ComputedStyle *style)
@@ -346,6 +343,7 @@ void style_parse_transform_translation(Stylesheet *sheet,
     StylePaintStack prior_paint = style_paint_stack_copy(sheet, style);
     if ((prior_paint.components & STYLE_PAINT_COMPONENT_SKEW) != 0) {
         prior_paint.skew_x_q10 = 0;
+        prior_paint.rotation_q6 = 0;
         prior_paint.components &= (uint8_t) ~STYLE_PAINT_COMPONENT_SKEW;
         bool retained = false;
         if (!style_apply_paint_stack(sheet, style, &prior_paint, &retained)
@@ -453,16 +451,16 @@ void style_parse_transform_translation(Stylesheet *sheet,
                     && strncasecmp(name, "rotate", 6) == 0)
                    || (name_length == 7
                        && strncasecmp(name, "rotatez", 7) == 0)) {
-            unsigned q = 0;
+            double angle = 0;
             if (count != 1
-                || !transform_angle_quadrants(parts[0], part_lengths[0], &q))
+                || !transform_angle_degrees(parts[0], part_lengths[0], &angle))
                 return;
-            static const int cosine[4] = {1, 0, -1, 0};
-            static const int sine[4] = {0, 1, 0, -1};
-            double na = a * cosine[q] + c * sine[q];
-            double nb = b * cosine[q] + d * sine[q];
-            double nc = -a * sine[q] + c * cosine[q];
-            double nd = -b * sine[q] + d * cosine[q];
+            double cosine = cos(angle * 0.017453292519943295);
+            double sine = sin(angle * 0.017453292519943295);
+            double na = a * cosine + c * sine;
+            double nb = b * cosine + d * sine;
+            double nc = -a * sine + c * cosine;
+            double nd = -b * sine + d * cosine;
             a = na; b = nb; c = nc; d = nd;
         } else if ((name_length == 6
                     && strncasecmp(name, "matrix", 6) == 0)
@@ -508,6 +506,7 @@ void style_parse_transform_translation(Stylesheet *sheet,
     if (!any || fabs(pxh) > 0.000001 || fabs(pyw) > 0.000001) return;
     double scale = hypot(a, b);
     double shear = 0.0;
+    int16_t rotation_q6 = 0;
     unsigned quadrants = 0;
     if (scale > 0.000001) {
         double na = a / scale, nb = b / scale;
@@ -515,12 +514,18 @@ void style_parse_transform_translation(Stylesheet *sheet,
         else if (fabs(na) < 0.000001 && fabs(nb - 1.0) < 0.000001) quadrants = 1;
         else if (fabs(na + 1.0) < 0.000001 && fabs(nb) < 0.000001) quadrants = 2;
         else if (fabs(na) < 0.000001 && fabs(nb + 1.0) < 0.000001) quadrants = 3;
-        else return;
+        else {
+            if (fabs(c + b) > 0.000001 || fabs(d - a) > 0.000001) return;
+            rotation_q6 = (int16_t) round(atan2(nb, na) * 3666.929888837269);
+        }
         double expected_c = quadrants == 1 ? -scale
                             : (quadrants == 3 ? scale : 0.0);
         double expected_d = quadrants == 2 ? -scale
                             : (quadrants == 0 ? scale : 0.0);
-        if (quadrants == 0 && fabs(d - scale) < 0.000001) {
+        if (rotation_q6 != 0) {
+            /* Orthogonal arbitrary rotation, represented by the optional
+               solid-paint sidecar, not an approximate quarter turn. */
+        } else if (quadrants == 0 && fabs(d - scale) < 0.000001) {
             shear = c / scale;
             if (fabs(shear) > 4.0) return;
         } else if (fabs(c - expected_c) > 0.000001
@@ -543,10 +548,11 @@ void style_parse_transform_translation(Stylesheet *sheet,
     style->transform_y = (int) (final_y < 0 ? final_y - 0.5 : final_y + 0.5);
     style->has_transform = style->transform_scale_q6 != 64
         || quadrants != 0 || style->transform_x != 0 || style->transform_y != 0
-        || shear != 0.0;
-    if (shear != 0.0) {
+        || shear != 0.0 || rotation_q6 != 0;
+    if (shear != 0.0 || rotation_q6 != 0) {
         StylePaintStack stack = style_paint_stack_copy(sheet, style);
         stack.skew_x_q10 = (int16_t) round(shear * 1024.0);
+        stack.rotation_q6 = rotation_q6;
         stack.components |= STYLE_PAINT_COMPONENT_SKEW;
         bool retained = false;
         if (!style_apply_paint_stack(sheet, style, &stack, &retained)
@@ -3907,12 +3913,17 @@ int style_parse_line_height(const Stylesheet *sheet, const char *text,
 
 bool style_parse_text_decoration_underline(const Stylesheet *sheet,
                                             const char *text, size_t length,
-                                            bool *underline)
+                                            bool *underline, bool *inherit)
 {
     char resolved[128];
-    if (underline == NULL
+    if (underline == NULL || inherit == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                           sizeof(resolved), 0)) return false;
+    *inherit = span_case_equal(resolved, strlen(resolved), "inherit");
+    if (*inherit) {
+        *underline = false;
+        return true;
+    }
     bool saw_underline = false;
     bool saw_none = false;
     size_t value_length = strlen(resolved);

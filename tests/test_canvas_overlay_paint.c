@@ -550,16 +550,20 @@ static bool full_viewport_canvas_relayout(bool covering)
 /* Fill spans in page tiles: a page of rounded, translucent and opaque
    fills (and the paint fixture) rasterized with spans and pixel by pixel
    must give identical frames, scrolled through the whole page. */
-static bool tile_fills_match_reference(const char *html, size_t length)
+static bool tile_fills_match_reference(const char *html, size_t length,
+                                        unsigned require_spans,
+                                        bool forced_dark)
 {
     static uint16_t frame[FRAME_W * FRAME_H];
     BrowserEngine *engine = make_engine();
     CHECK(engine != NULL);
     CHECK(browser_engine_commit_html(
         engine, "https://fills.test/index.html", html, length, true));
+    CHECK(advance_and_render(engine));
     while (!browser_engine_baseline_fonts_ready(engine))
         CHECK(browser_engine_pump_baseline_fonts(engine));
     TileCache *cache = render_cache(engine);
+    cache->forced_dark = forced_dark;
     NavigationSession *navigation = browser_engine_navigation(engine);
     int height = navigation->page.layout.height;
     for (int scroll = 0; scroll == 0 || scroll < height - FRAME_H;
@@ -568,12 +572,18 @@ static bool tile_fills_match_reference(const char *html, size_t length)
         tile_cache_invalidate_rect(cache, 0, 0, FRAME_W, height + FRAME_H);
         CHECK(browser_engine_render_frame(engine, NULL));
         memcpy(frame, cache->frame, sizeof(frame));
+        uint64_t span_pixels = cache->gradient_span_pixels;
+        uint64_t direct_pixels = cache->gradient_direct_pixels;
+        uint64_t image_pixels = cache->image_span_pixels;
         tilefinch_test_faults()->raster_span_reference = true;
         tile_cache_invalidate_rect(cache, 0, 0, FRAME_W, height + FRAME_H);
         (void) tile_cache_reclaim_optional(cache);
         bool rendered = browser_engine_render_frame(engine, NULL);
         tilefinch_test_faults()->raster_span_reference = false;
         CHECK(rendered);
+        CHECK(cache->gradient_span_pixels == span_pixels);
+        CHECK(cache->gradient_direct_pixels == direct_pixels);
+        CHECK(cache->image_span_pixels == image_pixels);
         size_t mismatches = 0;
         for (size_t at = 0; at < (size_t) FRAME_W * FRAME_H; at++)
             if (frame[at] != cache->frame[at]) mismatches++;
@@ -582,6 +592,9 @@ static bool tile_fills_match_reference(const char *html, size_t length)
                     "pixels at scroll %d\n", mismatches, scroll);
         CHECK(mismatches == 0);
     }
+    CHECK(require_spans != 1u || cache->gradient_span_pixels != 0);
+    CHECK(forced_dark || require_spans != 1u || cache->gradient_direct_pixels != 0);
+    CHECK(require_spans != 2u || cache->image_span_pixels != 0);
     browser_engine_destroy(engine);
     return true;
 }
@@ -615,7 +628,7 @@ static bool page_fills_match_reference(void)
         "255,.6);letter-spacing:1px\">Translucent ink, spaced</div>"
         "<p style=\"font:700 11px serif;color:#9fe\">Bold serif face</p>"
         "</body></html>";
-    if (!tile_fills_match_reference(page, sizeof(page) - 1u)) return false;
+    if (!tile_fills_match_reference(page, sizeof(page) - 1u, false, false)) return false;
     char path[512];
     snprintf(path, sizeof(path), "%s/fixtures/paint-features.html",
              TILEFINCH_TEST_SOURCE_DIR);
@@ -625,7 +638,57 @@ static bool page_fills_match_reference(void)
     size_t length = fread(fixture, 1, sizeof(fixture), file);
     fclose(file);
     CHECK(length > 0 && length < sizeof(fixture));
-    return tile_fills_match_reference(fixture, length);
+    return tile_fills_match_reference(fixture, length, false, false);
+}
+
+static bool gradient_spans_match_reference(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;background:#789}"
+        "div{width:327px;height:91px;margin:9px 0 11px 13px;"
+        "background:linear-gradient(110deg,#242424 30%,#383838 48%,#242424 66%)}"
+        ".round{border-radius:7px}.corners{border-radius:2px 33px 18px 0}"
+        ".reverse{background:linear-gradient(290deg,#203040,#283848);border-radius:50%}"
+        ".alpha{background:linear-gradient(90deg,rgba(36,36,36,.3),#383838);opacity:.7}"
+        ".repeat{background:repeating-linear-gradient(0deg,#242424 0%,#383838 25%)}"
+        ".filter{filter:grayscale(.5)}.blend{mix-blend-mode:multiply}"
+        ".clip{overflow:hidden;border-radius:19px;width:171px}"
+        ".clip div{margin-left:-9px;width:233px}"
+        ".radial{background:radial-gradient(#242424,#383838)}"
+        ".left{background:linear-gradient(270deg,#242424,#383838)}"
+        ".right{background:linear-gradient(90deg,#242424,#383838)}"
+        ".vertical{background:linear-gradient(0deg,#242424,#383838)}"
+        ".small{width:5px;background:linear-gradient(260deg,#242424,#383838)}"
+        ".stops{background:linear-gradient(290deg,#242424 40%,#383838 50%,#242424 60%)}"
+        "</style><body><div class=round></div><div class=corners></div>"
+        "<div class=reverse></div><div class=alpha></div><div class=repeat></div>"
+        "<div class=filter></div><div class=blend></div><section class=clip>"
+        "<div></div></section><div class=radial></div><div class=left></div>"
+        "<div class=right></div><div class=vertical></div><div class=small></div>"
+        "<div class=stops></div></body>";
+    return tile_fills_match_reference(html, sizeof(html) - 1, true, false)
+        && tile_fills_match_reference(html, sizeof(html) - 1, true, true);
+}
+
+static bool image_rows_match_reference(void)
+{
+#define ROW_IMAGE " width=137 height=91 src='data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%22137%22%20height=%2291%22%3E%3Crect%20x=%223%22%20y=%223%22%20width=%22127%22%20height=%2281%22%20fill=%22%232876d9%22/%3E%3Ccircle%20cx=%2268%22%20cy=%2245%22%20r=%2231%22%20fill=%22%23ed9123%22%20opacity=%22.5%22/%3E%3C/svg%3E'>"
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;background:#789}"
+        "img{display:block;margin:11px 0 13px 17px;border-radius:7px}"
+        ".corners{border-radius:3px 33px 18px 0}"
+        ".fade{opacity:.6}.filter{filter:grayscale(.5)}"
+        ".blend{mix-blend-mode:multiply}.scale{width:93px;height:73px}"
+        ".clip{overflow:hidden;border-radius:19px;width:101px}"
+        ".clip img{margin-left:-9px}"
+        "</style><body><img" ROW_IMAGE
+        "<img class=corners" ROW_IMAGE "<img class=fade" ROW_IMAGE
+        "<img class=filter" ROW_IMAGE "<img class=blend" ROW_IMAGE
+        "<img class=scale" ROW_IMAGE "<section class=clip><img" ROW_IMAGE
+        "</section></body>";
+#undef ROW_IMAGE
+    return tile_fills_match_reference(html, sizeof(html) - 1u, 2u, false)
+        && tile_fills_match_reference(html, sizeof(html) - 1u, 0u, true);
 }
 
 /* Every destination and source alpha, over destinations at the channel
@@ -656,6 +719,8 @@ int main(int argc, char **argv)
     }
     if (!timing_mode && !alpha_blend_exhaustive()) return 1;
     if (!timing_mode && !page_fills_match_reference()) return 1;
+    if (!timing_mode && !gradient_spans_match_reference()) return 1;
+    if (!timing_mode && !image_rows_match_reference()) return 1;
     if (!timing_mode && !plain_page_in_place_repaint()) return 1;
     if (!timing_mode && (!full_viewport_canvas_relayout(true)
                          || !full_viewport_canvas_relayout(false))) return 1;

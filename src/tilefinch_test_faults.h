@@ -45,6 +45,8 @@ typedef struct {
     bool refuse_next_frame_presentation;
     /* Refuse the next background web-font relayout once. */
     bool refuse_next_background_font_relayout;
+    /* Same-binary host control for page-font cost comparisons. */
+    bool legacy_web_font_work;
     /* Refuse one validated optional image-loader setup. */
     bool refuse_next_image_load_setup;
     /* Refuse the next render-shell initialization once. */

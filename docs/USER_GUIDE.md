@@ -29,6 +29,20 @@ D-pad Up/Down or L/R then move between highlighted matches (hold to repeat),
 X or Start edits the term, and Circle closes Find. Results stop at 256 so a
 very repetitive page cannot use unbounded memory.
 
+## Website fonts
+
+**Settings → Appearance → Website fonts** has three choices:
+
+- **On:** load fonts used by the page, within the normal download and memory limits.
+- **Smart** (default): use page fonts while memory allows, then keep using
+  built-in fonts for the rest of that page visit if headroom gets low.
+- **Off:** use built-in fonts without downloading website fonts.
+
+The setting is saved with your other preferences. Changing it affects the
+current page without another download of the page itself. Font removal waits
+for a safe layout replacement; if memory refuses that replacement, the
+current page stays readable. Language and emoji packs are independent.
+
 ## Reader mode and the offline library
 
 **Menu → Page tools → Reader mode** hides an article's surrounding navigation

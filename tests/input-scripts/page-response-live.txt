@@ -1,0 +1,27 @@
+# Request-to-accepted-frame measurements include delayed input sampling.
+# Run against a response-keyed page replay, with the same fonts and resources.
+wait-page 1
+tap-after-live 5 down
+wait-live 2
+tap-after-live 5 right
+wait-live 2
+tap-after-live 5 rtrigger
+wait-live 2
+tap-after-live 5 select
+mark-live busy-menu
+tap-after-live 300 select
+tap-after-live 300 triangle
+mark-live toolbar-change
+tap-after-live 300 triangle
+wait-live 2
+tap-after-live 50 select
+tap-after-live 300 select
+tap-after-live 300 triangle
+tap-after-live 300 triangle
+wait-live 120
+tap-after-live 5 down
+wait-live 2
+tap-after-live 5 rtrigger
+wait-live 30
+mark-live later-page
+# EOF completes this live measurement without waiting for optional work.

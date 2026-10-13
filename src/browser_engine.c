@@ -381,6 +381,9 @@ bool browser_engine_youtube_account_diagnostics(const BrowserEngine *engine,
 
 /* Bind account mutations only to a control we committed from the native
    provider, never to an author-supplied fragment or public DOM marker. */
+static lxb_dom_node_t *browser_engine_history_walk_next(
+    lxb_dom_node_t *root, lxb_dom_node_t *node);
+
 static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
 {
     engine->youtube_like_node = NULL;
@@ -390,26 +393,31 @@ static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
     engine->youtube_like_node_generation = engine->navigation.generation;
     if (youtube_lite_route(engine->navigation.page.document_url) == YOUTUBE_LITE_ROUTE_NONE)
         return;
-    LayoutDocument *layout = &engine->navigation.page.layout;
-    for (size_t i = 0; i < layout->link_count; i++) {
+    /* Bind the committed provider tree, including controls in disclosures.
+       Opening them later changes visibility, not provenance. */
+    lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html);
+    lxb_dom_node_t *node = root;
+    for (unsigned visited = 0u; node != NULL && visited < 8192u;
+         visited++, node = browser_engine_history_walk_next(root, node)) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_A) continue;
         size_t action_length = 0;
-        const char *account_action = document_attribute(layout->links[i].node,
+        const char *account_action = document_attribute(node,
             "data-yt-action", &action_length);
         if (account_action != NULL && action_length == 1u
             && account_action[0] >= '1' && account_action[0] <= '4'
             && engine->youtube_account_node_count < 16u)
-            engine->youtube_account_nodes[engine->youtube_account_node_count++] = layout->links[i].node;
+            engine->youtube_account_nodes[engine->youtube_account_node_count++] = node;
         size_t length = 0;
-        const char *id = document_attribute(layout->links[i].node, "id", &length);
+        const char *id = document_attribute(node, "id", &length);
         if (id != NULL && length == sizeof("yt-like-action") - 1u
             && memcmp(id, "yt-like-action", length) == 0) {
-            engine->youtube_like_node = layout->links[i].node;
+            engine->youtube_like_node = node;
         } else if (id != NULL && length == sizeof("yt-unlike-action") - 1u
             && memcmp(id, "yt-unlike-action", length) == 0) {
-            engine->youtube_unlike_node = layout->links[i].node;
+            engine->youtube_unlike_node = node;
         } else if (id != NULL && length == sizeof("yt-signout-action") - 1u
             && memcmp(id, "yt-signout-action", length) == 0) {
-            engine->youtube_signout_node = layout->links[i].node;
+            engine->youtube_signout_node = node;
         }
     }
 }
@@ -629,6 +637,7 @@ void browser_config_init(BrowserConfig *config,
             .maximum_publication_work_units = 200000u,
             .enabled = false,
             .web_fonts_enabled = true,
+            .web_font_mode = WEB_FONTS_SMART,
             .maximum_stylesheets = 16,
             .maximum_stylesheet_bytes = 2u * MIB,
             .maximum_stylesheet_file_bytes = 512u * KIB,
@@ -1058,6 +1067,9 @@ bool browser_config_validate(const BrowserConfig *config,
                                   != 0
                            && config->resources.timeout_ms > 0),
                    "external resources require complete bounded limits");
+    CONFIG_REQUIRE(config->resources.web_font_mode >= WEB_FONTS_ON
+                       && config->resources.web_font_mode < WEB_FONTS_MODE_COUNT,
+                   "invalid website font mode");
     CONFIG_REQUIRE(
         !config->resources.enabled
             || !config->resources.web_fonts_enabled
@@ -2079,6 +2091,7 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
                 resources->maximum_font_face_backend_bytes,
                 resources->timeout_ms);
         }
+        (void) navigation_set_web_font_mode(navigation, resources->web_font_mode);
     }
     return true;
 }
@@ -2557,23 +2570,22 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
                     image_resource_backing_identity(image));
             }
         }
-        if (!tile_cache_sync_canvas_paint(
+        if (tile_cache_sync_canvas_paint(
                 &engine->render,
                 engine->navigation.relayout_damage_left,
                 engine->navigation.relayout_damage_top,
                 engine->navigation.relayout_damage_right,
                 engine->navigation.relayout_damage_bottom)) {
-            return set_error_code(
-                engine, TILEFINCH_SUBSYSTEM_RENDER,
-                TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
-                "render-canvas-damage",
-                "render shell could not apply canvas damage");
+            engine->navigation.canvas_paint_damage_pending = false;
+            engine->render_relayout_generation =
+                engine->navigation.incremental_relayouts;
+            clear_error(engine);
+            return true;
         }
+        /* An embedder may have replaced the source document before refreshing
+           its visual shell. Same-geometry sync then declines; stage the
+           current paint list through the ordinary transactional fallback. */
         engine->navigation.canvas_paint_damage_pending = false;
-        engine->render_relayout_generation =
-            engine->navigation.incremental_relayouts;
-        clear_error(engine);
-        return true;
     }
     if (!tile_cache_replace_layout_damage(
             &engine->render, &engine->navigation.page.layout,
@@ -2918,11 +2930,38 @@ static void browser_engine_store_current_focus(BrowserEngine *engine)
     entry->focus_index = browser_engine_focus_ordinal(engine);
 }
 
+static lxb_dom_node_t *browser_engine_history_walk_next(
+    lxb_dom_node_t *root, lxb_dom_node_t *node)
+{
+    if (node->first_child != NULL) return node->first_child;
+    while (node != NULL && node != root) {
+        if (node->next != NULL) return node->next;
+        node = node->parent;
+    }
+    return NULL;
+}
+
 static void browser_engine_store_current_controls(BrowserEngine *engine)
 {
     NavigationEntry *entry = browser_engine_restorable_entry(engine);
     if (entry == NULL) return;
     entry->control_count = 0u;
+    /* Disclosure visibility determines all subsequent control ordinals.
+       Reserve these records first; a full eight-entry snapshot may omit
+       later text values, but must not assign them to the wrong controls. */
+    lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html);
+    lxb_dom_node_t *node = root;
+    unsigned ordinal = 0u;
+    for (unsigned visited = 0u; node != NULL && visited < 8192u
+         && entry->control_count < NAVIGATION_HISTORY_CONTROL_LIMIT;
+         visited++, node = browser_engine_history_walk_next(root, node)) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_DETAILS) continue;
+        NavigationHistoryControl *saved = &entry->controls[entry->control_count++];
+        saved->control_index = (uint16_t) ordinal++;
+        saved->value_length = 0x4000u;
+        saved->value[0] = lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+            (const lxb_char_t *) "open", 4u) ? 1 : 0;
+    }
     const LayoutDocument *layout = &engine->navigation.page.layout;
     for (size_t index = 0;
          index < layout->control_count
@@ -2969,8 +3008,40 @@ static bool browser_engine_restore_controls(
     bool selected = false;
     if (count > NAVIGATION_HISTORY_CONTROL_LIMIT)
         count = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    bool disclosed = false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(navigation->page.document.html);
+    lxb_dom_node_t *node = root;
+    unsigned ordinal = 0u;
+    bool have_disclosure = false;
+    for (size_t at = 0; at < count; at++)
+        have_disclosure |= controls[at].value_length == 0x4000u;
+    for (unsigned visited = 0u; have_disclosure && node != NULL && visited < 8192u;
+         visited++, node = browser_engine_history_walk_next(root, node)) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_DETAILS) continue;
+        for (size_t at = 0; at < count; at++) {
+            if (controls[at].value_length != 0x4000u
+                || controls[at].control_index != ordinal) continue;
+            bool open = lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                (const lxb_char_t *) "open", 4u);
+            if (open == (controls[at].value[0] != 0)) continue;
+            if (controls[at].value[0]) {
+                if (lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+                        (const lxb_char_t *) "open", 4u,
+                        (const lxb_char_t *) "", 0u) == NULL) return false;
+            } else if (lxb_dom_element_remove_attribute(lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "open", 4u) != LXB_STATUS_OK) return false;
+            disclosed = true;
+        }
+        ordinal++;
+    }
+    if (disclosed) {
+        layout_reuse_cache_reset(navigation->page.layout_reuse);
+        if (!document_refresh(&navigation->page.document)
+            || !navigation_relayout(navigation)) return false;
+    }
     for (size_t at = 0; at < count; at++) {
         const NavigationHistoryControl *saved = &controls[at];
+        if (saved->value_length == 0x4000u) continue;
         if (saved->control_index >= navigation->page.layout.control_count)
             continue;
         lxb_dom_node_t *node = navigation->page.layout.controls[
@@ -3636,6 +3707,10 @@ bool browser_engine_begin_navigation_url(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
+    /* An explicit replacement (Reload) requests fresh provider facts.
+       History moves use their own entry point and retain bounded reuse. */
+    if (engine != NULL && !record_history && engine->navigation.page.loaded)
+        browser_session_site_adapter_document_cache_clear(&engine->session);
     if (engine != NULL && !engine->script_navigation_attributed) {
         engine->navigation.pending_navigation_referer[0] = '\0';
         engine->navigation.pending_navigation_user_activated = false;
@@ -4755,6 +4830,9 @@ bool browser_engine_load_url_with_limits(
     /* A synchronous URL load is the embedder's (typed, reloaded, a lab
        command): the refresh loop guard starts over. */
     if (engine != NULL) navigation_note_user_input(&engine->navigation);
+    if (engine != NULL && !record_history && engine->navigation.page.loaded
+        && !engine->navigation_work.history_move)
+        browser_session_site_adapter_document_cache_clear(&engine->session);
     if (record_history && engine != NULL && engine->navigation.page.loaded) {
         browser_engine_store_current_focus(engine);
         browser_engine_store_current_controls(engine);
@@ -5081,7 +5159,8 @@ bool browser_engine_completion_scroll_page(BrowserEngine *engine,
                                            int direction)
 {
     if (!browser_engine_layout_completion_running(engine)
-        || !engine->render_ready || !engine->navigation.page.loaded)
+        || !engine->render_ready || !engine->navigation.page.loaded
+        || engine->render.preparation_polling || engine->render.frame_composing)
         return false;
     if (!controller_scroll_page(&engine->controller, direction,
                                 engine->config.device.framebuffer_height))
@@ -5098,7 +5177,8 @@ bool browser_engine_completion_raster_step(BrowserEngine *engine,
 {
     if (!browser_engine_layout_completion_running(engine)
         || !engine->completion_frame_pending || !engine->render_ready
-        || !engine->navigation.page.loaded) return false;
+        || !engine->navigation.page.loaded || engine->render.preparation_polling
+        || engine->render.frame_composing) return false;
     size_t before = engine->render.frame_job_units;
     /* The 8 ms budget bounds the slice; the unit cap only stops a run of
        cheap tiles from outlasting it. */
@@ -5973,6 +6053,7 @@ bool browser_engine_canvas_materialize(BrowserEngine *engine)
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path)
 {
+    if (engine != NULL && engine->render.preparation_polling) return false;
     if (engine == NULL || !engine->render_ready
         || !engine->navigation.page.loaded) {
         return set_error_code(
@@ -6125,6 +6206,8 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
     BrowserEngine *engine, uint64_t budget_us, size_t maximum_units,
     const TilefinchCancellation *cancellation)
 {
+    if (engine != NULL && engine->render.preparation_polling)
+        return BROWSER_RENDER_JOB_PENDING;
     if (engine == NULL || !engine->render_ready
         || !engine->navigation.page.loaded) {
         (void) set_error_code(
@@ -6421,7 +6504,7 @@ static bool browser_engine_run_youtube_account(BrowserEngine *engine, bool *visu
             : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_CURRENT ? done[engine->youtube_account_action]
             : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_FAILED ? "Not confirmed. Select again to retry."
             : engine->youtube_account_state == BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED ? "Sign in to use this action."
-            : "Select an action.";
+            : "";
         if (browser_engine_youtube_notice_paint(engine, "yt-library-status", tilefinch_ui_text(label))
             && visual_changed != NULL) *visual_changed = true;
         engine->youtube_account_painted_state = engine->youtube_account_state;
@@ -6459,9 +6542,9 @@ static bool browser_engine_run_youtube_like(BrowserEngine *engine, bool *visual_
     if (engine->youtube_like_painted_state != engine->youtube_like_state
         || engine->youtube_like_layout_generation != engine->navigation.incremental_relayouts
         || engine->youtube_like_shell != engine->render_shell_serial) {
-        static const char *const labels[] = {"Select Like or Unlike.", "Saving like...",
+        static const char *const labels[] = {"", "Saving like...",
             "", "Video liked.", "Like failed - select Like to retry.", "Sign in to like this video."};
-        static const char *const unlike_labels[] = {"Select Like or Unlike.", "Removing like...",
+        static const char *const unlike_labels[] = {"", "Removing like...",
             "", "Like removed.", "Unlike failed - select Unlike to retry.", "Sign in to unlike this video."};
         if (browser_engine_youtube_notice_paint(engine, "yt-like-status",
                 tilefinch_ui_text((engine->youtube_like_selected ? labels : unlike_labels)[engine->youtube_like_state]))
@@ -6486,6 +6569,19 @@ bool browser_engine_run_idle_work(
     topics_work |= browser_engine_run_youtube_like(engine, visual_changed);
     topics_work |= browser_engine_run_youtube_account(engine, visual_changed);
     if (visual_changed != NULL && *visual_changed) return true;
+    /* Dropping optional page fonts relieves pressure; it must not wait in
+       the startup queue that deliberately delays acquiring more resources.
+       The navigation transaction declines while DOM mutations are pending. */
+    size_t font_generation = engine->navigation.incremental_relayouts;
+    NavigationBackgroundWorkOutcome font_memory_work =
+        navigation_run_web_font_memory_work(&engine->navigation);
+    if (font_memory_work == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL) return true;
+    if (font_generation != engine->navigation.incremental_relayouts) {
+        (void) controller_rebind_focus(&engine->controller);
+        if (!browser_engine_apply_layout_damage(engine)) return false;
+        if (visual_changed != NULL) *visual_changed = true;
+        return true;
+    }
     /* Startup script tasks can still change the whole document's geometry.
        Do not compete with them by reading/publishing optional fonts and
        images only to reflow the same page again immediately. The committed
@@ -6582,9 +6678,7 @@ bool browser_engine_run_idle_work(
     }
     size_t focus_relayout_generation =
         engine->navigation.incremental_relayouts;
-    size_t relayouts_before =
-        engine->navigation.performance.fast_relayouts
-        + engine->navigation.performance.full_relayouts;
+    size_t relayouts_before = engine->navigation.incremental_relayouts;
     bool font_work = false;
     bool font_publication = false;
     FontSetFaceMask optional = engine->font_requested_faces
@@ -6795,9 +6889,7 @@ bool browser_engine_run_idle_work(
             TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "video-preview-publication",
             "preview publication relayout retired the page");
     }
-    size_t relayouts_after =
-        engine->navigation.performance.fast_relayouts
-        + engine->navigation.performance.full_relayouts;
+    size_t relayouts_after = engine->navigation.incremental_relayouts;
     if (engine->navigation.incremental_relayouts
             != focus_relayout_generation) {
         /* Optional font and image work share this continuation. Rebind once
@@ -6893,18 +6985,14 @@ bool browser_engine_run_deferred_image_work(
         || !engine->render_ready || browser_engine_navigation_pending(engine)) {
         return false;
     }
-    size_t relayouts_before =
-        engine->navigation.performance.fast_relayouts
-        + engine->navigation.performance.full_relayouts;
+    size_t relayouts_before = engine->navigation.incremental_relayouts;
     if (!navigation_run_deferred_image_work(&engine->navigation)) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_NETWORK,
             TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "deferred-image-work",
             "deferred image continuation failed");
     }
-    size_t relayouts_after =
-        engine->navigation.performance.fast_relayouts
-        + engine->navigation.performance.full_relayouts;
+    size_t relayouts_after = engine->navigation.incremental_relayouts;
     if (relayouts_after != relayouts_before) {
         (void) controller_rebind_focus(&engine->controller);
         if (!browser_engine_apply_layout_damage(engine)) return false;
@@ -6922,6 +7010,13 @@ void browser_engine_cancel_idle_work(BrowserEngine *engine)
 uint64_t browser_engine_render_shell_serial(const BrowserEngine *engine)
 {
     return engine == NULL ? 0 : engine->render_shell_serial;
+}
+
+bool browser_engine_set_web_font_mode(BrowserEngine *engine, WebFontMode mode)
+{
+    if (engine == NULL || mode < WEB_FONTS_ON || mode >= WEB_FONTS_MODE_COUNT) return false;
+    engine->config.resources.web_font_mode = mode;
+    return navigation_set_web_font_mode(&engine->navigation, mode);
 }
 
 bool browser_engine_reclaim_optional_memory(

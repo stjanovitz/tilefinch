@@ -96,7 +96,7 @@ option(PSP_BROWSER_ENABLE_LTO
 option(PSP_BROWSER_ENABLE_GIF
        "Enable bounded first-frame GIF decoding" ON)
 option(PSP_BROWSER_ENABLE_WEB_FONTS
-       "Enable bounded page-provided WOFF1 fonts through FreeType" ON)
+       "Enable bounded page-provided WOFF/WOFF2 fonts through FreeType" ON)
 option(PSP_BROWSER_ENABLE_HOST_WEBASSEMBLY
        "Enable the bounded WAMR-backed WebAssembly interpreter in host labs" ON)
 option(PSP_BROWSER_ENABLE_PSP_VOICE
@@ -236,6 +236,8 @@ set(PSP_BROWSER_LEXBOR_MRAW_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-mraw-shrink-offset.patch")
 set(PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-fragment-clone-storage.patch")
+set(PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-parser-init-refusal.patch")
 set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
 set(PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH
@@ -252,6 +254,8 @@ set(PSP_BROWSER_NANOSVG_DIVISIONS_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-bounded-curve-divisions.patch")
 set(PSP_BROWSER_NANOSVG_ALLOCATION_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-allocation-growth.patch")
+set(PSP_BROWSER_NANOSVG_COVERAGE_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-coverage-hooks.patch")
 set(PSP_BROWSER_POCKETSPHINX_SOURCE_DIR "" CACHE PATH
     "Optional prepared PocketSphinx 5.1.1 source tree for PSP voice input")
 option(PSP_BROWSER_PACKED_VOICE_LEXICON
@@ -276,6 +280,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_NANOSVG_PATCH}"
     "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
     "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}"
+    "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-no-mmap.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-timer.patch"
@@ -389,7 +394,8 @@ foreach(lexbor_patch IN ITEMS
         "${PSP_BROWSER_LEXBOR_PATCH}" "${PSP_BROWSER_LEXBOR_FOSTER_PATCH}"
         "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
         "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
-        "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}")
+        "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
+        "${PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
@@ -424,7 +430,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-    "ee698a0ab8f59179f836a8094935c147253f1c8ce96c2913f2c4eab2ee70a82f")
+    "1743b0aa4de17bb465b9ff379637b171923fc1dc5934eb99bf1aa5f2709d8cf3")
     set(tilefinch_quickjs_vendor_h_sha256
         "22ce1f238eb5bc0daddbda515d57441d71f7b69627654eaff1c3b697a5087f13")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
@@ -507,19 +513,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "24b0d275e949db9dd91577a4ac1b5cfc031d17d172fb06d94fea304a9aac39ab")
+            "47f45d2c0bee407a4eec2e871934a495373c05517e9b5b619a3899998a8b9a75")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "114df4fb6b4654772ae7d0ef6874481a380efcb1aef2f1d4b19c9910066ada7f")
+            "3845f7e25d57ad31c0d2273636f67fe7958fb8c23ee25d37d2882a6150a3d608")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "8a09498c4dfe501c1c7951f400da8ec5a7f60c9043a30d7bfaeb5d39c6b70513")
+            "454c8375768e74ed193c132d9e149414b55b004280fc412e8c2c0daabf82e2f1")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "df89b8b97db007510ec7dc5e6b48c2e72b1f2c5ccd333401bd7af7c4d3bdb1a8")
+            "5bc6bb13c9d23d08315ca5db614dd94134cf9bffc86d9e61b02f2c1c43a72923")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "0af773aec7d8311c7a6307d560d20939ec8063457148a7f02db1a45cfec4ad7c")
+            "9958389684d7cb7ac88bbe7c315536170a5641b55b2213aacf82f45255d50c4e")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "bb5256d6c2c6360343b9fbc31456a66257e2430218eaab299fe2369d09b141c9")
+            "b87041f61801e42c1e207e2f107081e25b72c666e5ffb2d1c38eccd8230b6cf6")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "767026fa9e172de1932800be485b2ab1aa9c529e84099da083de370e465cbfd3")
+            "bbfd7cd0a6c17f537b364b923258ffdff267c914bed1a2998b6f88f043d3bd62")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -568,7 +574,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "707934c64c3d98be50fb0200b9e44e988e9b4756d71f501ec5a539a0d1005a9b")
+                   "199dc15398487b5bcc1b9587804f0ec1b466d101d492ac035d8812fb26b3826b")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack reached "
                     "${tilefinch_quickjs_variant_baseline}, not the pinned "
@@ -1090,7 +1096,8 @@ else()
 endif()
 foreach(nanosvg_patch IN ITEMS
         "${PSP_BROWSER_NANOSVG_PATCH}" "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
-        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}" "${PSP_BROWSER_NANOSVG_ALLOCATION_PATCH}")
+        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}" "${PSP_BROWSER_NANOSVG_ALLOCATION_PATCH}"
+        "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}

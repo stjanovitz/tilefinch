@@ -192,3 +192,5 @@ but the code and its strings ship.
 | `TILEFINCH_VERIFY_CONTAINER_QUERY_LOG` | 1 | `src/layout.c` | host | After a one-pass container-query layout is verified, rebuild it anyway and print `container-query-log-check same|MISMATCH` comparing the two (commands, height, node boxes). |
 | `TILEFINCH_PROBE_EVAL_FILE` | 1 | `src/interactive_main.c` | always | Script file evaluated in the page context after the interactive lab tick loop. |
 | `TILEFINCH_EXECUTION_CENSUS` | 1 | `src/script_census.c` | host + PSP validation | 1: independent owner-CPU opcode/native census; 2: bounded function/job/path attribution. Off by default; shipping PSP omits instrumentation. Compare sampler-off runs; reference-count builds are count-only. |
+| `TILEFINCH_DISABLE_GEOMETRY_LAYOUT_ADOPTION` | 1 | `src/js_runtime/dispatch_state.inc` | host / PSP validation | Keep the duplicate presentation build for same-binary layout reuse comparisons. |
+| `TILEFINCH_DISABLE_LAYOUT_RASTER_RETENTION` | 1 | `src/render.c` | host / PSP validation | Clear image and font raster caches on layout replacement for same-binary comparisons. |

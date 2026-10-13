@@ -216,11 +216,12 @@ static bool dump_text_metrics(const char *path, const LayoutDocument *layout)
         unsigned weight = weight_code == 0
             ? 400u : (unsigned) weight_code * 10u;
         bool bold_face = weight >= 650u;
-        const FontFace *face = font_context_face_variant(
+        const FontFace *face = font_context_face_at_weight(
             layout->fonts, layout->web_fonts,
             draw_command_font_family(command),
-            draw_command_font_italic(command), bold_face);
+            draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
         bool synthetic_bold = weight >= 550u
+            && (face == NULL || face->authored_weight != weight)
             && (weight < 650u
                 || !font_context_face_is_bold(
                     layout->fonts, layout->web_fonts, face));

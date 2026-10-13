@@ -3,13 +3,16 @@
 #include "tilefinch/document.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
+#include "tilefinch/layout.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resources.h"
+#include "tilefinch/render.h"
 #include "tilefinch/session.h"
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
+#include "../src/tilefinch_test_faults.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +21,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef TILEFINCH_TEST_WOFF2
+#include <brotli/encode.h>
+#endif
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
 #define TILEFINCH_TEST_SOURCE_DIR "."
@@ -133,12 +139,20 @@ static bool test_inline_discovery_and_canonicalization(void)
     StylesheetWebFontSource source = {0};
     CHECK(stylesheet_web_font_source(&sheet, 0, &source));
     CHECK(source.family_slot == 0 && !source.bold);
+#ifdef TILEFINCH_TEST_WOFF2
+    CHECK(strcmp(source.reference, "regular.woff2") == 0);
+#else
     CHECK(strcmp(source.reference, "../fonts/regular.woff") == 0);
+#endif
     CHECK(source.source_base_url == NULL);
     CHECK(source.source_referrer_policy == NULL);
     CHECK(stylesheet_web_font_source(&sheet, 1, &source));
     CHECK(source.family_slot == 0 && !source.bold);
+#ifdef TILEFINCH_TEST_WOFF2
+    CHECK(strcmp(source.reference, "../fonts/regular.woff") == 0);
+#else
     CHECK(strcmp(source.reference, "./fallback.ttf") == 0);
+#endif
     CHECK(stylesheet_web_font_source(&sheet, 2, &source));
     CHECK(source.family_slot == 0 && source.bold);
     CHECK(strcmp(source.reference, "./bold.woff") == 0);
@@ -205,6 +219,162 @@ static bool test_external_base_and_source_order(void)
     CHECK(font_family_web_slot(computed.font_family) == 0);
     CHECK(font_family_web_fallback(computed.font_family) == FONT_MONOSPACE);
 
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return true;
+}
+
+static bool test_generated_icon_font_family(void)
+{
+    static const char html[] = "<!doctype html>"
+        "<span id=target class='icon icon-search'></span>";
+    static const char face_css[] =
+        "@font-face{font-family:body-one;src:url(one.ttf)}"
+        "@font-face{font-family:body-two;src:url(two.ttf)}"
+        "@font-face{font-family:unused-one;src:url(three.ttf)}"
+        "@font-face{font-family:unused-two;src:url(four.ttf)}"
+        "@font-face{font-family:unused-three;src:url(five.ttf)}"
+        "@font-face{font-family:icons;src:url(icons.woff2) format(woff2),"
+        "url(icons.ttf) format(truetype),url(icons.woff) format(woff)}"
+        "@font-face{font-family:body-three;src:url(seven.ttf)}"
+        "@font-face{font-family:body-four;src:url(eight.ttf)}"
+        "@font-face{font-family:refused-face;src:url(nine.ttf)}";
+    static const char css[] =
+        "span.icon:before,time.icon:before,a.icon:before{"
+        "font-family:'icons' !important;font-style:normal;font-weight:normal;"
+        "font-variant:normal;text-transform:none;line-height:1}"
+        ".icon-search:before{content:'\\f002'}"
+        "#target{font:16px icons;line-height:24px;font-weight:700}";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 19));
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(stylesheet_add_css_from(&sheet, css, sizeof(css) - 1u,
+                                 "https://example.test/site.css"));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "target");
+    CHECK(node != NULL);
+    ComputedStyle parent = style_for_node(&sheet, node, NULL);
+    ComputedStyle pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    CHECK(pseudo.generated_text_length == 3);
+    CHECK(!font_family_is_web(pseudo.font_family));
+    CHECK(parent.line_height == 24 && parent.font_weight == 700);
+    CHECK(stylesheet_add_css_from(&sheet, face_css, sizeof(face_css) - 1u,
+                                 "https://example.test/fonts.css"));
+    parent = style_for_node(&sheet, node, NULL);
+    CHECK(parent.line_height == 24 && parent.font_weight == 700);
+    CHECK(font_family_is_web(parent.font_family));
+    pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    CHECK(font_family_is_web(pseudo.font_family));
+    CHECK(font_family_web_slot(pseudo.font_family) == 5);
+    CHECK(stylesheet_web_font_source_count(&sheet) == 9);
+    StylesheetWebFontStats discovery = {0};
+    CHECK(stylesheet_web_font_stats(&sheet, &discovery));
+    CHECK(discovery.skipped_family_limit == 1);
+    StylesheetWebFontSource last = {0};
+    CHECK(stylesheet_web_font_source(&sheet, 8, &last)
+          && last.family_slot == 7);
+    CHECK(stylesheet_web_font_face(&sheet, 8, false) == NULL);
+    FontFamily refused = FONT_SERIF;
+    CHECK(!font_family_web(8, FONT_SANS, &refused)
+          && refused == FONT_SERIF);
+    LayoutDocument layout = {0};
+    FontSet fallback_fonts = {0};
+    CHECK(layout_build(&layout, &budget, &document, &sheet,
+                       &fallback_fonts, NULL, 480));
+    size_t generated_runs = 0;
+    for (size_t at = 0; at < layout.count; at++) {
+        const DrawCommand *command = &layout.commands[at];
+        if (command->type != DRAW_TEXT || command->text_length != 3
+            || memcmp(command->text, pseudo.generated_text, 3) != 0) continue;
+        CHECK(draw_command_font_family(command) == pseudo.font_family);
+        generated_runs++;
+    }
+    CHECK(generated_runs == 1);
+    layout_destroy(&layout);
+    /* Family and filter metadata must coexist, including copied shadows.
+       Exercise every admitted family/fallback without another command word. */
+    for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT; slot++) {
+        for (FontFamily fallback = FONT_SANS;
+             fallback <= FONT_HUMANIST_SANS; fallback++) {
+            FontFamily family = FONT_SANS;
+            CHECK(font_family_web(slot, fallback, &family));
+            for (unsigned filter = 0; filter < 8; filter++) {
+                DrawCommand command = {.type = DRAW_TEXT,
+                    .radius = LAYOUT_TEXT_KERNING_NONE
+                              | LAYOUT_TEXT_BASELINE_ALIGNED};
+                draw_command_set_filter_code(&command, filter);
+                draw_command_set_text_font_family(&command, family);
+                CHECK(draw_command_font_family(&command) == family);
+                CHECK(draw_command_filter_code(&command) == filter);
+                CHECK((command.radius & LAYOUT_TEXT_KERNING_NONE) != 0);
+                CHECK((command.radius & LAYOUT_TEXT_BASELINE_ALIGNED) != 0);
+                draw_command_set_filter_code(&command, 7 - filter);
+                CHECK(draw_command_font_family(&command) == family);
+                CHECK(draw_command_filter_code(&command) == 7 - filter);
+                draw_command_set_text_font_family(&command, FONT_SERIF);
+                CHECK(draw_command_font_family(&command) == FONT_SERIF);
+                CHECK(draw_command_filter_code(&command) == 7 - filter);
+                CHECK((command.radius & LAYOUT_TEXT_FONT_FAMILY_HIGH) == 0);
+            }
+        }
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return true;
+}
+
+static bool test_distinct_font_weights(void)
+{
+    static const char html[] = "<!doctype html><style>"
+        "@font-face{font-family:Weighted;src:url(light.woff),url(light.ttf);font-weight:300}"
+        "@font-face{font-family:Weighted;src:url(medium.woff);font-weight:500}"
+        "@font-face{font-family:Weighted;src:url(bold.woff);font-weight:700}"
+        "@font-face{font-family:Weighted;src:url(normal.woff);font-weight:400}"
+        "@font-face{font-family:Weighted;src:url(extra.woff);font-weight:900}"
+        "</style><div>weights</div>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 19));
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(stylesheet_web_font_source_count(&sheet) == 5);
+    WebFontSet selected = {0};
+    unsigned weights_seen = 0;
+    for (size_t i = 0; i < 5; i++) {
+        StylesheetWebFontSource source = {0};
+        CHECK(stylesheet_web_font_source(&sheet, i, &source));
+        CHECK(source.family_slot == 0 && source.face_slot < 4);
+        CHECK(source.weight == 300 || source.weight == 400
+              || source.weight == 500 || source.weight == 700);
+        CHECK(source.bold == (source.weight >= 600));
+        CHECK(stylesheet_web_font_face_at(&sheet, 0, source.face_slot) != NULL);
+        selected.families[0].weights[source.face_slot] = source.weight;
+        selected.families[0].faces[source.face_slot].loaded = true;
+        selected.families[0].faces[source.face_slot].authored_weight = source.weight;
+        weights_seen |= 1u << (source.weight / 100);
+    }
+    CHECK(weights_seen == ((1u << 3) | (1u << 4) | (1u << 5) | (1u << 7)));
+    FontFamily family = FONT_SANS;
+    CHECK(font_family_web(0, FONT_SERIF, &family));
+    static const unsigned requested[] = {200,300,350,400,450,500,550,600,700,800};
+    static const unsigned expected[] =  {300,300,300,400,500,500,700,700,700,700};
+    for (size_t i = 0; i < sizeof(requested)/sizeof(requested[0]); i++) {
+        const FontFace *face = font_context_face_at_weight(
+            NULL, &selected, family, false, requested[i] >= 650, requested[i]);
+        CHECK(face != NULL && face->authored_weight == expected[i]);
+    }
+    StylesheetWebFontStats stats = {0};
+    CHECK(stylesheet_web_font_stats(&sheet, &stats)
+          && stats.skipped_source_limit == 1);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0);
@@ -727,14 +897,135 @@ static bool test_async_font_loader_is_fallback_first(void)
     return true;
 }
 
-static bool test_optional_font_relayout_refusal_is_soft(void)
+static bool test_deferred_font_families_and_aliases(void)
 {
-    static const char html[] =
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+    static const char html[] = "<!doctype html><style>"
+        "@font-face{font-family:Used;src:url(https://font-async.test/font.ttf)}"
+        "@font-face{font-family:Later;src:url(https://font-async.test/font.ttf)}"
+        "</style><p>text</p>";
+    unsigned char *font = NULL;
+    size_t length = 0;
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf", &font, &length));
+    CHECK(write_async_font_replay(font, length, directory));
+    Budget budget; budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0}; Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(fetch_trace_replay_begin_response_keyed(directory, error, sizeof(error)));
+    FetchScheduler *scheduler = fetch_scheduler_create(&budget, 1, 256u * KIB);
+    ExternalFontLoader loader = {0}; ExternalFontStats stats = {0};
+    CHECK(scheduler != NULL && fonts_external_loader_begin(&loader, &sheet, 1000, &stats));
+    fonts_external_loader_set_usage(&loader, &sheet, 0);
+    CHECK(!fonts_external_loader_pending(&loader) && stats.attempted == 0);
+    fonts_external_loader_set_usage(&loader, &sheet, 1);
+    for (unsigned turn = 0; turn < 32 && fonts_external_loader_pending(&loader); turn++) {
+        bool loaded = false;
+        CHECK(fonts_external_loader_step(&loader, &sheet, &budget,
+            "https://font-async.test/page", "https://font-async.test/page", "no-referrer",
+            4, 512u * KIB, 256u * KIB, MIB, scheduler, NULL, NULL, &stats, 0, &loaded));
+    }
+    FontFace *used = stylesheet_web_font_face(&sheet, 0, false);
+    FontFace *later = stylesheet_web_font_face(&sheet, 1, false);
+    CHECK(used != NULL && later != NULL && used->loaded && !later->loaded
+        && stats.loaded_faces == 1 && !fonts_external_loader_pending(&loader));
+    fonts_external_loader_set_usage(&loader, &sheet, 3);
+    for (unsigned turn = 0; turn < 32 && fonts_external_loader_pending(&loader); turn++) {
+        bool loaded = false;
+        CHECK(fonts_external_loader_step(&loader, &sheet, &budget,
+            "https://font-async.test/page", "https://font-async.test/page", "no-referrer",
+            4, 512u * KIB, 256u * KIB, MIB, scheduler, NULL, NULL, &stats, 0, &loaded));
+    }
+    CHECK(later->loaded && stats.loaded_faces == 2 && stats.attempted == 2
+        && used->implementation == later->implementation && used->data == later->data);
+    int width = font_text_width(later, "AV test", 7, 17, false);
+    CHECK(width > 0 && font_face_cached_ascii_advances(later) > 0);
+    font_face_destroy(used);
+    CHECK(font_text_width(later, "AV test", 7, 17, false) == width);
+    fonts_external_loader_cancel(&loader, scheduler, &stats);
+    fonts_external_loader_set_usage(&loader, &sheet, 1);
+    CHECK(!fonts_external_loader_pending(&loader));
+    fetch_scheduler_destroy(scheduler); fetch_trace_end();
+    stylesheet_destroy(&sheet); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    remove_async_font_replay(directory); free(font);
+#endif
+    return true;
+}
+
+static bool test_exact_cached_web_font_advances(void)
+{
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+    unsigned char *bytes = NULL;
+    size_t length = 0;
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf", &bytes, &length));
+    Budget budget; budget_init(&budget, 8u * MIB);
+    FontFace face = {0}, alias = {0};
+    CHECK(font_face_load_encoded(&face, &budget, bytes, length, MIB));
+    char text[96];
+    for (unsigned at = 0; at < 95; at++) text[at] = (char) (32 + at);
+    text[95] = 0;
+    const int sizes[] = {9 * 64, 17 * 64, 1191, 28 * 64, 17 * 64};
+    for (unsigned at = 0; at < sizeof(sizes) / sizeof(sizes[0]); at++) {
+        for (unsigned bold = 0; bold < 2; bold++) {
+            for (unsigned kern = 0; kern < 2; kern++) {
+                int reference = 0;
+                for (unsigned c = 32; c < 127; c++) {
+                    FontGlyph glyph = {0};
+                    CHECK(font_glyph_load_at_size(&face, c, sizes[at], bold, &glyph));
+                    reference += glyph.advance_fixed;
+                    font_glyph_destroy(&face, &glyph);
+                    if (kern && c > 32)
+                        reference += font_kerning_at_size_fixed(&face, c - 1, c, sizes[at]);
+                }
+                CHECK(font_text_width_at_size_fixed_mode(&face, text, 95, sizes[at], bold, kern) == reference);
+                CHECK(font_face_cached_ascii_advances(&face) == 95);
+                for (unsigned repeat = 0; repeat < 8; repeat++)
+                    CHECK(font_text_width_at_size_fixed_mode(&face, text, 95, sizes[at], bold, kern) == reference);
+            }
+        }
+    }
+    size_t retained = budget.current;
+    CHECK(font_face_share_encoded(&alias, &face, &budget, bytes, length, MIB)
+        && budget.current == retained);
+    font_face_destroy(&alias); /* Alias first; source must remain usable. */
+    FontFace refused = {0};
+    CHECK(!font_face_share_encoded(&refused, &face, &budget, bytes, length, MIB - 1));
+    bytes[0] ^= 1;
+    CHECK(!font_face_share_encoded(&refused, &face, &budget, bytes, length, MIB));
+    bytes[0] ^= 1;
+    font_face_destroy(&face); free(bytes);
+    CHECK(budget.current == 0);
+#endif
+    return true;
+}
+
+static bool cancel_font_fallback(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    if (strcmp(phase, "layout") != 0) return true;
+    *(bool *) opaque = true;
+    return false;
+}
+
+static bool test_external_font_publication(bool refuse, bool smart)
+{
+    static const char prefix[] =
         "<!doctype html><style>"
         "@font-face{font-family:AsyncFace;"
         "src:url(https://font-async.test/font.ttf) format(truetype)}"
-        "body{font-family:AsyncFace,sans-serif}"
-        "</style><body>keep the committed fallback page</body>";
+        "#metric{font-family:AsyncFace,sans-serif;font-size:20px;width:20ch;height:8px}"
+        "</style><body><div id=metric></div>";
+    char html[16384];
+    size_t html_length = (size_t) snprintf(html, sizeof(html), "%s", prefix);
+    for (unsigned row = 0; row < 300; row++) {
+        int appended = snprintf(html + html_length, sizeof(html) - html_length,
+            "<p>font-independent row %u</p>", row);
+        CHECK(appended > 0 && (size_t) appended < sizeof(html) - html_length);
+        html_length += (size_t) appended;
+    }
     unsigned char *font = NULL;
     size_t font_length = 0;
     CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR
@@ -759,26 +1050,120 @@ static bool test_optional_font_relayout_refusal_is_soft(void)
     uint64_t generation = navigation_begin(&navigation);
     CHECK(navigation_commit_html(
         &navigation, generation, "https://font-async.test/page", html,
-        sizeof(html) - 1u, 480, NULL, NULL, true));
-    navigation_test_refuse_next_background_font_relayout();
+        html_length, 480, NULL, NULL, true));
+    lxb_dom_node_t *metric = find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "metric");
+    const LayoutNodeBox *metric_box = layout_box_for_node(&navigation.page.layout, metric);
+    CHECK(metric_box != NULL && navigation.page.stylesheet.metric_web_font_families == 1);
+    int old_width = metric_box->width;
+    LayoutReuseStats before = {0}, after = {0};
+    CHECK(navigation.page.layout_reuse != NULL);
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
+    if (refuse) navigation_test_refuse_next_background_font_relayout();
     NavigationBackgroundWorkOutcome outcome =
         NAVIGATION_BACKGROUND_WORK_SUCCESS;
     for (size_t slice = 0; slice < 16u; slice++) {
         outcome = navigation_run_background_resources(&navigation);
         if (outcome != NAVIGATION_BACKGROUND_WORK_SUCCESS) break;
+        if (navigation.performance.background_fonts_loaded != 0) break;
     }
-    CHECK(outcome == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &after);
+    CHECK(outcome == (refuse ? NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+                            : NAVIGATION_BACKGROUND_WORK_SUCCESS)
           && navigation.page.loaded
           && navigation.last_error[0] == '\0'
           && navigation.performance.background_fonts_loaded == 1u
-          && navigation.performance.background_font_failures == 1u
-          && navigation.performance.background_font_relayouts == 0u);
+          && navigation.performance.background_font_failures == (refuse ? 1u : 0u)
+          && navigation.performance.background_font_relayouts == (refuse ? 0u : 1u));
+    if (!refuse) {
+        metric_box = layout_box_for_node(&navigation.page.layout, metric);
+        CHECK(after.style_hits > before.style_hits && metric_box != NULL
+              && metric_box->width != old_width);
+        FontFace *face = stylesheet_web_font_face_at(&navigation.page.stylesheet, 0, 0);
+        CHECK(face != NULL && face->loaded);
+        if (smart) {
+            CHECK(navigation_set_web_font_mode(&navigation, WEB_FONTS_SMART));
+            size_t remaining = budget_remaining(&budget);
+            CHECK(remaining > 1536u * KIB);
+            void *pressure = budget_malloc(&budget, remaining - 1536u * KIB);
+            CHECK(pressure != NULL);
+            size_t old_memory = budget.current;
+            CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SUCCESS
+                  && navigation.page.web_font_pressure_fallback && !face->loaded
+                  && navigation.page.loaded && budget.current < old_memory);
+            budget_free(&budget, pressure);
+            CHECK(!navigation_background_resources_pending(&navigation));
+        } else {
+            CHECK(navigation_set_web_font_mode(&navigation, WEB_FONTS_OFF));
+            budget_inject_failure_after(&budget, 0);
+            CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+                  && navigation.page.loaded && face->loaded);
+            budget_clear_failure_injection(&budget);
+            CHECK(!navigation_background_resources_pending(&navigation));
+            CHECK(navigation_set_web_font_mode(&navigation, WEB_FONTS_ON)
+                  && navigation_set_web_font_mode(&navigation, WEB_FONTS_OFF));
+            bool cancelled = false;
+            TilefinchPlatformServices services = {.context = &cancelled, .cooperate = cancel_font_fallback};
+            tilefinch_platform_set_services(&services);
+            NavigationBackgroundWorkOutcome interrupted = navigation_run_background_resources(&navigation);
+            tilefinch_platform_set_services(NULL);
+            CHECK(interrupted == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL && cancelled
+                  && navigation.page.loaded && face->loaded
+                  && navigation_background_resources_pending(&navigation));
+            size_t old_memory = budget.current;
+            CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SUCCESS
+                  && navigation.page.loaded && !face->loaded && budget.current < old_memory);
+            CHECK(!navigation_background_resources_pending(&navigation));
+        }
+        CHECK(navigation.relayout_damage_valid && navigation.relayout_damage_top == 0
+              && navigation.relayout_damage_bottom >= navigation.page.layout.height);
+    }
     navigation_destroy(&navigation);
     browser_session_destroy(&browser);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     fetch_trace_end();
     remove_async_font_replay(directory);
     free(font);
+    return true;
+}
+
+static bool test_web_font_modes(void)
+{
+    static const char html[] = "<!doctype html><style>"
+        "@font-face{font-family:Demand;src:url(https://font-async.test/font.ttf)}"
+        "p{font-family:Demand,sans-serif}</style><p>Readable fallback</p>";
+    unsigned char *font = NULL; size_t length = 0;
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf", &font, &length)
+          && write_async_font_replay(font, length, directory));
+    for (WebFontMode mode = WEB_FONTS_ON; mode < WEB_FONTS_MODE_COUNT; mode++) {
+        Budget budget; budget_init(&budget, 16u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        NavigationSession navigation = {0};
+        CHECK(navigation_init(&navigation, &budget, 4)
+              && navigation_set_web_font_mode(&navigation, mode)
+              && !navigation_set_web_font_mode(&navigation, WEB_FONTS_MODE_COUNT));
+        navigation_enable_web_fonts(&navigation, 4, 256u * KIB, 256u * KIB, MIB, 1000);
+        CHECK(fetch_trace_replay_begin_response_keyed(directory, error, sizeof(error))
+              && navigation_commit_html(&navigation, navigation_begin(&navigation),
+                   "https://font-async.test/page", html, sizeof(html) - 1, 480, NULL, NULL, true));
+        size_t original_limit = budget.limit;
+        budget.limit = budget.current + 256u * KIB;
+        CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SUCCESS);
+        if (mode == WEB_FONTS_ON) {
+            CHECK(navigation.page.external_fonts.attempted == 1
+                  && !navigation.page.web_font_pressure_fallback);
+        } else {
+            CHECK(navigation.page.external_fonts.attempted == 0
+                  && !fonts_external_loader_pending(&navigation.page.external_font_loader));
+            if (mode == WEB_FONTS_SMART) CHECK(navigation.page.web_font_pressure_fallback);
+        }
+        budget.limit = original_limit;
+        if (mode != WEB_FONTS_ON) CHECK(!navigation_background_resources_pending(&navigation));
+        navigation_destroy(&navigation); fetch_trace_end();
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    remove_async_font_replay(directory); free(font);
     return true;
 }
 
@@ -946,6 +1331,8 @@ static bool probe_web_font(Budget *budget, const unsigned char *encoded,
         &face, budget, encoded, encoded_length, maximum_backend_bytes);
     bool ok = loaded && face.loaded
         && face.backend == FONT_FACE_BACKEND_FREETYPE_WEB;
+    if (ok) CHECK(font_face_backend_bytes(&face) > 0
+        && font_face_backend_bytes(&face) <= budget->current);
     if (ok) {
         measured.width = font_text_width(
             &face, "Tilefinch AV", 12, 17, false);
@@ -972,8 +1359,55 @@ static bool probe_web_font(Budget *budget, const unsigned char *encoded,
     }
     font_glyph_destroy(&face, &glyph);
     font_face_destroy(&face);
+    CHECK(font_face_backend_bytes(&face) == 0 && font_face_backend_bytes(NULL) == 0);
     if (ok && probe != NULL) *probe = measured;
     return ok;
+}
+
+static bool test_web_font_raster_retention(Budget *budget,
+    const unsigned char *encoded, size_t encoded_length,
+    size_t maximum_backend_bytes)
+{
+    /* Keep identical web-face glyphs across layout replacement, but reject
+       a newly loaded face in the very same family slot/address. */
+    WebFontSet cached_fonts = {0};
+    FontSet cached_fallback = {0};
+    CHECK(font_face_load_encoded(&cached_fonts.families[0].regular,
+        budget, encoded, encoded_length, maximum_backend_bytes));
+    FontFamily cached_family;
+    CHECK(font_family_web(0, FONT_SANS, &cached_family));
+    DrawCommand cached_text = {.type = DRAW_TEXT, .text = "AAA",
+        .text_length = 3, .x = 0, .y = 0, .width = 48, .height = 24,
+        .font_size = 16, .opacity_scale = 256};
+    draw_command_set_text_font_family(&cached_text, cached_family);
+    LayoutDocument cached_layout = {.budget = budget,
+        .commands = &cached_text, .count = 1, .width = 48, .height = 32,
+        .fonts = &cached_fallback, .web_fonts = &cached_fonts,
+        .page_background = 0xffffff};
+    TileCache cached_tiles;
+    uint16_t cached_pixels[48 * 32], expected_pixels[48 * 32];
+    CHECK(tile_cache_init(&cached_tiles, budget, &cached_layout, 1)
+          && tile_cache_set_frame(&cached_tiles, cached_pixels, 48 * 32)
+          && tile_cache_render_frame(&cached_tiles, 0, 48, 32, NULL));
+    CHECK(cached_tiles.glyph_cache_misses != 0);
+    size_t cached_misses = cached_tiles.glyph_cache_misses;
+    memcpy(expected_pixels, cached_pixels, sizeof(cached_pixels));
+    CHECK(tile_cache_replace_layout(&cached_tiles, &cached_layout)
+          && tile_cache_render_frame(&cached_tiles, 0, 48, 32, NULL)
+          && cached_tiles.glyph_cache_misses == cached_misses
+          && memcmp(cached_pixels, expected_pixels, sizeof(cached_pixels)) == 0);
+    uint64_t previous_serial = cached_fonts.families[0].regular.serial;
+    web_font_set_destroy(&cached_fonts);
+    CHECK(font_face_load_encoded(&cached_fonts.families[0].regular,
+        budget, encoded, encoded_length, maximum_backend_bytes)
+        && cached_fonts.families[0].regular.serial != previous_serial);
+    CHECK(tile_cache_replace_layout(&cached_tiles, &cached_layout)
+          && tile_cache_render_frame(&cached_tiles, 0, 48, 32, NULL)
+          && cached_tiles.glyph_cache_misses > cached_misses
+          && memcmp(cached_pixels, expected_pixels, sizeof(cached_pixels)) == 0);
+    tile_cache_destroy(&cached_tiles);
+    web_font_set_destroy(&cached_fonts);
+    return true;
 }
 
 static bool font_probes_equal(const FontProbe *left, const FontProbe *right)
@@ -1027,6 +1461,115 @@ static bool sweep_font_allocation_failures(const unsigned char *encoded,
         }
     }
     CHECK(reached_uninjected_success);
+    return true;
+}
+#endif
+
+#if defined(TILEFINCH_TEST_WOFF2) && defined(TILEFINCH_TEST_HAVE_FREETYPE)
+static bool build_null_transform_woff2(const unsigned char *sfnt, size_t length,
+    unsigned char **output, size_t *output_length)
+{
+    CHECK(length >= 12);
+    unsigned tables = read_be16(sfnt + 4);
+    CHECK(tables > 0 && tables <= 256 && tables <= (length - 12u) / 16u);
+    unsigned char directory[256u * 9u];
+    size_t directory_length = 0, payload_length = 0;
+    unsigned char *payload = malloc(length);
+    CHECK(payload != NULL);
+    for (unsigned i = 0; i < tables; i++) {
+        const unsigned char *entry = sfnt + 12u + i * 16u;
+        uint32_t tag = read_be32(entry), offset = read_be32(entry + 8);
+        uint32_t bytes = read_be32(entry + 12);
+        CHECK(offset <= length && bytes <= length - offset
+              && bytes <= length - payload_length);
+        directory[directory_length++] = (tag == UINT32_C(0x676c7966)
+            || tag == UINT32_C(0x6c6f6361)) ? 255u : 63u;
+        memcpy(directory + directory_length, entry, 4);
+        directory_length += 4;
+        unsigned char encoded[5];size_t count = 0;
+        do { encoded[count++] = (unsigned char) (bytes & 127u); bytes >>= 7; } while (bytes);
+        while (count) {
+            unsigned char byte = encoded[--count];
+            directory[directory_length++] = count ? byte | 128u : byte;
+        }
+        bytes = read_be32(entry + 12);
+        memcpy(payload + payload_length, sfnt + offset, bytes);
+        payload_length += bytes;
+    }
+    size_t compressed = BrotliEncoderMaxCompressedSize(payload_length);
+    unsigned char *result = calloc(1, 48u + directory_length + compressed + 3u);
+    CHECK(result != NULL && BrotliEncoderCompress(4, BROTLI_DEFAULT_WINDOW,
+        BROTLI_MODE_FONT, payload_length, payload, &compressed,
+        result + 48u + directory_length));
+    free(payload);
+    store_be32(result, UINT32_C(0x774f4632));
+    store_be32(result + 4, UINT32_C(0x00010000));
+    *output_length = (48u + directory_length + compressed + 3u) & ~(size_t) 3u;
+    store_be32(result + 8, (uint32_t) *output_length);
+    result[12] = (unsigned char) (tables >> 8);result[13] = (unsigned char) tables;
+    store_be32(result + 16, (uint32_t) length);
+    store_be32(result + 20, (uint32_t) compressed);
+    memcpy(result + 48u, directory, directory_length);
+    *output = result;
+    return true;
+}
+
+typedef struct {
+    unsigned calls;
+    unsigned refuse_at;
+} Woff2Cooperation;
+
+static bool cancel_woff2(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    if (strcmp(phase, "font-woff2") != 0) return true;
+    Woff2Cooperation *cooperation = opaque;
+    cooperation->calls++;
+    return cooperation->refuse_at == 0
+        || cooperation->calls < cooperation->refuse_at;
+}
+
+static bool test_bounded_woff2(void)
+{
+    unsigned char *sfnt = NULL, *woff2 = NULL;
+    size_t length = 0, encoded_length = 0;
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf", &sfnt, &length)
+        && build_null_transform_woff2(sfnt, length, &woff2, &encoded_length));
+    Budget budget;budget_init(&budget, 8u * MIB);
+    FontProbe raw = {0}, encoded = {0};
+    bool raw_ok = probe_web_font(&budget, sfnt, length, 4u * MIB, &raw);
+    bool encoded_ok = probe_web_font(&budget, woff2, encoded_length, 4u * MIB, &encoded);
+    CHECK(raw_ok && encoded_ok && font_probes_equal(&raw, &encoded));
+    Woff2Cooperation cooperation = {0};
+    TilefinchPlatformServices services = {
+        .context = &cooperation, .cooperate = cancel_woff2
+    };
+    tilefinch_platform_set_services(&services);
+    CHECK(probe_web_font(&budget, woff2, encoded_length, 4u * MIB, &encoded));
+    unsigned checkpoints = cooperation.calls;
+    CHECK(checkpoints > 1);
+    /* Refuse at every checkpoint, including reconstruction after realloc.
+       Each cancellation must roll back, and a later load must still work. */
+    for (unsigned point = 1; point <= checkpoints; point++) {
+        cooperation.calls = 0;
+        cooperation.refuse_at = point;
+        CHECK(rejected_without_retention(&budget, woff2, encoded_length, 4u * MIB));
+        CHECK(cooperation.calls >= point && budget.current == 0);
+    }
+    tilefinch_platform_set_services(NULL);
+    CHECK(budget.current == 0
+        && probe_web_font(&budget, woff2, encoded_length, 4u * MIB, &encoded));
+    CHECK(rejected_without_retention(&budget, woff2, encoded_length, length - 1u));
+    for (size_t prefix = 0; prefix < 48; prefix++)
+        CHECK(rejected_without_retention(&budget, woff2, prefix, MIB));
+    CHECK(rejected_without_retention(&budget, woff2, encoded_length - 1u, MIB));
+    uint32_t declared = read_be32(woff2 + 8);
+    store_be32(woff2 + 8, (uint32_t) encoded_length - 1u);
+    CHECK(rejected_without_retention(&budget, woff2, encoded_length - 1u, MIB));
+    store_be32(woff2 + 8, declared);
+    CHECK(sweep_font_allocation_failures(woff2, encoded_length, 4u * MIB));
+    free(woff2);free(sfnt);
+    CHECK(budget.current == 0);
     return true;
 }
 #endif
@@ -1115,6 +1658,8 @@ static bool test_bounded_font_loader(void)
     CHECK(glyph.pixels != NULL && glyph.budget == &budget
           && glyph.width > 0 && glyph.height > 0);
     font_glyph_destroy(&face, &glyph);
+    CHECK(test_web_font_raster_retention(&budget, bytes, length,
+        maximum_backend_bytes));
     font_face_destroy(&face);
     font_face_destroy(&face);
     CHECK(budget.current == baseline);
@@ -1332,15 +1877,37 @@ static bool test_external_fonts_bypass_generic_cache(void)
 }
 
 
-int main(void)
+int main(int argc, char **argv)
 {
-    if (!test_bounded_font_loader()
+    if ((argc == 2 || argc == 3) && (strcmp(argv[1], "--font-perf-only") == 0
+                     || strcmp(argv[1], "--legacy-font-perf-only") == 0)) {
+        tilefinch_test_faults()->legacy_web_font_work =
+            strcmp(argv[1], "--legacy-font-perf-only") == 0;
+        if (argc == 3 && strcmp(argv[2], "aliases") == 0)
+            return test_deferred_font_families_and_aliases() ? 0 : 1;
+        if (argc == 3 && strcmp(argv[2], "advances") == 0)
+            return test_exact_cached_web_font_advances() ? 0 : 1;
+        return test_external_font_publication(false, false)
+            && test_deferred_font_families_and_aliases()
+            && test_exact_cached_web_font_advances() ? 0 : 1;
+    }
+#if defined(TILEFINCH_TEST_WOFF2) && defined(TILEFINCH_TEST_HAVE_FREETYPE)
+    if (!test_bounded_woff2()) return 1;
+#endif
+    if (!test_distinct_font_weights()
+        || !test_bounded_font_loader()
         || !test_async_font_loader_is_fallback_first()
-        || !test_optional_font_relayout_refusal_is_soft()
+        || !test_deferred_font_families_and_aliases()
+        || !test_exact_cached_web_font_advances()
+        || !test_external_font_publication(false, false)
+        || !test_external_font_publication(true, false)
+        || !test_external_font_publication(false, true)
+        || !test_web_font_modes()
         || !test_blocked_font_settles_without_backpressure_retry()
         || !test_inline_discovery_and_canonicalization()
         || !test_single_pass_forward_reference_reinterns()
         || !test_external_base_and_source_order()
+        || !test_generated_icon_font_family()
         || !test_external_referrer_policy_identity()
         || !test_font_request_destination()
         || !test_cache_response_url_provenance()

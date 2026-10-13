@@ -260,4 +260,87 @@ size_t budget_concurrent_pool_usable_size(
 bool budget_concurrent_pool_metrics(const BudgetConcurrentPool *pool,
                                     BudgetConcurrentPoolMetrics *metrics);
 bool budget_concurrent_pool_destroy(BudgetConcurrentPool *pool);
+
+/* Opt-in host fault-campaign probe. Keep callsite capture outside the
+   shipping allocator and off the PSP: ordinary builds pay no branch, field,
+   or text cost. A probe records only actual injected refusals, not normal
+   capacity refusals or NULL returned by realloc(ptr, 0). */
+#if defined(TILEFINCH_BUDGET_CALLSITE_TRACE) && !defined(__PSP__) \
+    && !defined(TILEFINCH_BUDGET_IMPLEMENTATION)
+static inline void budget_trace_injected_callsite(const Budget *budget,
+    size_t before, const char *file, unsigned line)
+{
+    if (budget != NULL && budget->injected_failure_count != before)
+        fprintf(stderr, "budget-refused-site %s:%u\n", file, line);
+}
+
+static inline void *budget_malloc_category_at(Budget *budget,
+    BudgetCategory category, size_t size, const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_malloc_category(budget, category, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+static inline void *budget_calloc_category_at(Budget *budget,
+    BudgetCategory category, size_t count, size_t size,
+    const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_calloc_category(budget, category, count, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+static inline void *budget_realloc_category_at(Budget *budget,
+    BudgetCategory category, void *ptr, size_t size,
+    const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_realloc_category(budget, category, ptr, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+static inline void *budget_malloc_at(Budget *budget, size_t size,
+    const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_malloc(budget, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+static inline void *budget_calloc_at(Budget *budget, size_t count,
+    size_t size, const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_calloc(budget, count, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+static inline void *budget_realloc_at(Budget *budget, void *ptr,
+    size_t size, const char *file, unsigned line)
+{
+    size_t before = budget != NULL ? budget->injected_failure_count : 0;
+    void *result = budget_realloc(budget, ptr, size);
+    budget_trace_injected_callsite(budget, before, file, line);
+    return result;
+}
+
+#define budget_malloc_category(b, c, s) \
+    budget_malloc_category_at((b), (c), (s), __FILE__, __LINE__)
+#define budget_calloc_category(b, c, n, s) \
+    budget_calloc_category_at((b), (c), (n), (s), __FILE__, __LINE__)
+#define budget_realloc_category(b, c, p, s) \
+    budget_realloc_category_at((b), (c), (p), (s), __FILE__, __LINE__)
+#define budget_malloc(b, s) \
+    budget_malloc_at((b), (s), __FILE__, __LINE__)
+#define budget_calloc(b, n, s) \
+    budget_calloc_at((b), (n), (s), __FILE__, __LINE__)
+#define budget_realloc(b, p, s) \
+    budget_realloc_at((b), (p), (s), __FILE__, __LINE__)
+#endif
 #endif

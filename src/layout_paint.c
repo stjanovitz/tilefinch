@@ -3,6 +3,25 @@
    Split out of layout.c. */
 
 #include "layout_internal.h"
+
+void layout_mask_background_gradient(LayoutContext *context,
+                                      const ComputedStyle *style,
+                                      DrawCommand *command)
+{
+    if (style->background_image_kind != STYLE_BACKGROUND_IMAGE_GRADIENT)
+        return;
+    const StyleGradient *gradient = stylesheet_background_gradient(
+        context->sheet, style);
+    size_t slot;
+    if (gradient != NULL && layout_intern_gradient(
+            context->layout, gradient, &slot)) {
+        draw_command_set_mask_gradient(command, slot);
+    } else {
+        /* Refused optional paint must not substitute the text color for
+           an authored gradient. Keep its geometry and omit that layer. */
+        command->opacity_scale = 0;
+    }
+}
 #include "tilefinch/platform.h"
 
 _Static_assert((int) STYLE_MIX_BLEND_NORMAL == (int) LAYOUT_MIX_BLEND_NORMAL,
@@ -18,6 +37,7 @@ _Static_assert((int) STYLE_MIX_BLEND_DARKEN == (int) LAYOUT_MIX_BLEND_DARKEN,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int scale_around_center(int value, int origin_twice,
                                uint8_t scale_q6)
@@ -139,7 +159,8 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                     draw_command_image_offset_y(command), 0, scale_q6));
         }
         if (command->type != DRAW_TEXT && command->type != DRAW_IMAGE
-            && command->type != DRAW_SHEARED_FILL) {
+            && command->type != DRAW_SHEARED_FILL
+            && command->type != DRAW_ROTATED_FILL) {
             command->radius = layout_scale_radius_code(
                 command->radius, scale_q6, 64);
         }
@@ -176,6 +197,26 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                 (int) command->text_length, scale_q6);
             command->font_size = scale_dimension(command->font_size, scale_q6);
             command->radius = scale_dimension(command->radius, scale_q6);
+        }
+        if (command->type == DRAW_ROTATED_FILL) {
+            unsigned w = (unsigned) scale_dimension(
+                command->text_length & 65535u, scale_q6);
+            unsigned h = (unsigned) scale_dimension(
+                command->text_length >> 16, scale_q6);
+            if (w > 65535u) w = 65535u;
+            if (h > 65535u) h = 65535u;
+            command->text_length = w | (h << 16);
+            command->radius = scale_fixed_around_center(command->radius, 0, scale_q6);
+            command->scale = scale_fixed_around_center(command->scale, 0, scale_q6);
+        }
+        if (command->type == DRAW_STROKE_RECT
+            && command->image_fit == LAYOUT_STROKE_SIDES) {
+            unsigned sides[4];
+            for (unsigned side = 0; side < 4; side++) {
+                int width = scale_dimension(draw_command_stroke_side(command, side), scale_q6);
+                sides[side] = width > 65535 ? 65535u : (unsigned) width;
+            }
+            draw_command_set_stroke_sides(command, sides);
         }
         if (command->type == DRAW_TEXT
             || command->type == DRAW_STROKE_RECT
@@ -325,6 +366,13 @@ void layout_rotate_range_quadrants(LayoutDocument *layout,
         rotate_rect_quadrants(
             &command->x, &command->y, &command->width, &command->height,
             origin_x_twice, origin_y_twice, quadrants);
+        if (command->type == DRAW_STROKE_RECT
+            && command->image_fit == LAYOUT_STROKE_SIDES) {
+            unsigned sides[4];
+            for (unsigned side = 0; side < 4; side++)
+                sides[side] = draw_command_stroke_side(command, (side + 4u - quadrants) & 3u);
+            draw_command_set_stroke_sides(command, sides);
+        }
         draw_command_set_rotation_quadrants(command, combined);
         if (command->type == DRAW_TEXT)
             layout_bidi_rebase_command(layout, i, old_text_x_fixed);
@@ -1316,9 +1364,9 @@ static void draw_command_vertical_ink_bounds(const LayoutDocument *layout,
         || (command->image_fit & LAYOUT_TEXT_DECORATION_UNDERLINE) == 0
         || !draw_command_text_underline_offset(
                command, &underline_offset)) return;
-    const FontFace *face = font_context_face_variant(
+    const FontFace *face = font_context_face_at_weight(
         layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), draw_uses_bold_face(command));
+        draw_command_font_italic(command), draw_uses_bold_face(command), draw_command_font_weight(command));
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
@@ -1350,6 +1398,15 @@ static bool draw_commands_intersect(const LayoutDocument *layout,
         && left_top < right_bottom && right_top < left_bottom;
 }
 
+/* Range marking precedes the ordinary band-building checkpoints. Nested
+   clips can revisit many commands, so count visits rather than just boxes. */
+static bool spatial_range_work(LayoutContext *context, size_t *work)
+{
+    (*work)++;
+    return context == NULL || (*work & 127u) != 0u
+        || layout_index_poll(context, 128u);
+}
+
 bool build_spatial_index(LayoutDocument *layout,
                                 LayoutContext *context)
 {
@@ -1360,28 +1417,34 @@ bool build_spatial_index(LayoutDocument *layout,
     if (layout->command_flags == NULL) return false;
     LayoutPositionedClipIndex positioned;
     bool positioned_prepared = false;
+    size_t range_work = 0u;
     for (size_t range = 0; range < layout->fixed_count; range++) {
+        if (!spatial_range_work(context, &range_work)) return false;
         size_t end = layout->fixed_ranges[range].command_end;
         if (end > layout->count) end = layout->count;
         for (size_t i = layout->fixed_ranges[range].command_start;
              i < end; i++) {
             layout->command_flags[i] |= LAYOUT_COMMAND_FIXED;
+            if (!spatial_range_work(context, &range_work)) return false;
         }
     }
     /* Sticky content stays out of the tile index; the frame compositor
        paints it in every frame (render.c, paint_sticky_overlays). A fixed
        descendant keeps its fixed-layer paint. */
     for (size_t range = 0; range < layout->sticky_count; range++) {
+        if (!spatial_range_work(context, &range_work)) return false;
         size_t end = layout->sticky_ranges[range].command_end;
         if (end > layout->count) end = layout->count;
         for (size_t i = layout->sticky_ranges[range].command_start;
              i < end; i++) {
             if ((layout->command_flags[i] & LAYOUT_COMMAND_FIXED) == 0)
                 layout->command_flags[i] |= LAYOUT_COMMAND_STICKY;
+            if (!spatial_range_work(context, &range_work)) return false;
         }
     }
     for (size_t box_index = 0; box_index < layout->node_box_count;
          box_index++) {
+        if (!spatial_range_work(context, &range_work)) return false;
         const LayoutNodeBox *box = &layout->node_boxes[box_index];
         if (!box->clips_x && !box->clips_y) continue;
         if (!positioned_prepared) {
@@ -1399,6 +1462,11 @@ bool build_spatial_index(LayoutDocument *layout,
         size_t end = box->scroll_command_end;
         if (end > layout->count) end = layout->count;
         for (size_t i = box->scroll_command_start; i < end; i++) {
+            if (!spatial_range_work(context, &range_work)) return false;
+            /* An enclosing clip already supplied these same classification
+               bits. There is no per-clip state here to merge, and repeating
+               the positioned-owner search cannot change the result. */
+            if ((layout->command_flags[i] & flags) == flags) continue;
             if (layout_positioned_command_escapes_clip_indexed(
                     layout, i, box, &positioned)) {
                 continue;
@@ -1406,6 +1474,8 @@ bool build_spatial_index(LayoutDocument *layout,
             layout->command_flags[i] |= flags;
         }
     }
+    if (context != NULL && (range_work & 127u) != 0u
+        && !layout_index_poll(context, range_work & 127u)) return false;
     layout->spatial_band_count = ((size_t) layout->height
                                   + LAYOUT_SPATIAL_BAND_HEIGHT - 1)
                                  / LAYOUT_SPATIAL_BAND_HEIGHT;
@@ -1745,13 +1815,17 @@ static size_t scroll_clip_slot(const lxb_dom_node_t *node, size_t capacity)
 }
 
 static int root_scroll_extent_after_clipping(LayoutDocument *layout,
-                                            int minimum, bool vertical)
+                                            int minimum, bool vertical,
+                                            LayoutContext *context)
 {
     int maximum = minimum;
+    size_t work = 0u;
+    ScrollClipEntry *clip_set = NULL;
     bool trace = !vertical && LAYOUT_TRACE(layout, SCROLL_WIDTH);
     size_t trace_lines = 0;
     size_t clip_count = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
+        if (!spatial_range_work(context, &work)) goto cancelled;
         if (vertical ? layout->node_boxes[i].clips_y
                      : layout->node_boxes[i].clips_x) clip_count++;
     }
@@ -1766,7 +1840,6 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
        chain once per pair; a large article has thousands of boxes and dozens
        of clippers. Hash the clipping nodes once and walk each chain once,
        keeping the pairwise scan only when that small table is refused. */
-    ScrollClipEntry *clip_set = NULL;
     size_t clip_capacity = 0;
     if (clip_count != 0) {
         clip_capacity = 16;
@@ -1780,11 +1853,13 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
         }
         if (clip_set != NULL) {
             for (size_t i = 0; i < layout->node_box_count; i++) {
+                if (!spatial_range_work(context, &work)) goto cancelled;
                 const LayoutNodeBox *box = &layout->node_boxes[i];
                 if (!(vertical ? box->clips_y : box->clips_x)) continue;
                 size_t slot = scroll_clip_slot(box->node, clip_capacity);
                 while (clip_set[slot].node != NULL
                        && clip_set[slot].node != box->node) {
+                    if (!spatial_range_work(context, &work)) goto cancelled;
                     slot = (slot + 1u) & (clip_capacity - 1u);
                 }
                 if (clip_set[slot].node == NULL) {
@@ -1797,6 +1872,7 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
         }
     }
     for (size_t i = 0; i < layout->node_box_count; i++) {
+        if (!spatial_range_work(context, &work)) goto cancelled;
         const LayoutNodeBox *candidate = &layout->node_boxes[i];
         if (vertical && candidate->command_start < layout->count
             && (layout->command_flags[candidate->command_start]
@@ -1805,8 +1881,10 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
         if (clip_set != NULL) {
             for (const lxb_dom_node_t *at = candidate->node;
                  at != NULL && !clipped; at = at->parent) {
+                if (!spatial_range_work(context, &work)) goto cancelled;
                 size_t slot = scroll_clip_slot(at, clip_capacity);
                 while (clip_set[slot].node != NULL) {
+                    if (!spatial_range_work(context, &work)) goto cancelled;
                     if (clip_set[slot].node == at) {
                         clipped = (clip_set[slot].shared
                                   || clip_set[slot].box != candidate)
@@ -1819,8 +1897,9 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
                     slot = (slot + 1u) & (clip_capacity - 1u);
                 }
             }
-        } else {
+        } else if (clip_count != 0u) {
             for (size_t j = 0; j < layout->node_box_count && !clipped; j++) {
+                if (!spatial_range_work(context, &work)) goto cancelled;
                 const LayoutNodeBox *ancestor = &layout->node_boxes[j];
                 if (ancestor == candidate
                     || !(vertical ? ancestor->clips_y : ancestor->clips_x)) continue;
@@ -1875,7 +1954,9 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
         }
     }
     budget_free(layout->budget, clip_set);
+    clip_set = NULL;
     for (size_t i = 0; i < layout->count; i++) {
+        if (!spatial_range_work(context, &work)) goto cancelled;
         if ((layout->command_flags[i]
              & ((vertical ? LAYOUT_COMMAND_CLIPPED_Y : LAYOUT_COMMAND_CLIPPED_X)
                 | LAYOUT_COMMAND_FIXED)) != 0) {
@@ -1899,22 +1980,29 @@ static int root_scroll_extent_after_clipping(LayoutDocument *layout,
             }
         }
     }
+    if (context != NULL && (work & 127u) != 0u
+        && !layout_index_poll(context, work & 127u)) goto cancelled;
     return maximum;
+cancelled:
+    budget_free(layout->budget, clip_set);
+    return minimum; /* The cancelled build never adopts this partial extent. */
 }
 
-int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width)
+int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width,
+                                     LayoutContext *context)
 {
-    return root_scroll_extent_after_clipping(layout, viewport_width, false);
+    return root_scroll_extent_after_clipping(layout, viewport_width, false, context);
 }
 
-int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height)
+int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height,
+                                      LayoutContext *context)
 {
     /* Flow keeps its margins and border boxes. Only unclipped descendants
        and commands may extend it: retained contents of a collapsed local
        scroller are not document-space overflow. Reuse the positioned-clip
        rules so an absolute descendant with an outside containing block
        still contributes its genuine overflow. */
-    return root_scroll_extent_after_clipping(layout, minimum_height, true);
+    return root_scroll_extent_after_clipping(layout, minimum_height, true, context);
 }
 
 
@@ -1997,6 +2085,69 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
 /* Filled generated decorations retain a horizontal shear without a surface
    allocation or a larger command. Reject the whole span before any write
    if another primitive would require a general affine surface. */
+static bool rotated_solid_command(const DrawCommand *source,
+    int origin_x_twice, int origin_y_twice, int cosine, int sine,
+    DrawCommand *result)
+{
+    if (source->type != DRAW_FILL_RECT || source->radius != 0
+        || source->font_size != 0 || draw_command_backdrop_blur(source) != 0
+        || source->width <= 0 || source->height <= 0
+        || source->width > 32767 || source->height > 32767) return false;
+    int64_t dx = (int64_t) source->x * 2 - origin_x_twice;
+    int64_t dy = (int64_t) source->y * 2 - origin_y_twice;
+    int64_t x = (int64_t) origin_x_twice * 512 + (dx * cosine - dy * sine) / 32;
+    int64_t y = (int64_t) origin_y_twice * 512 + (dx * sine + dy * cosine) / 32;
+    int64_t min_x = x, max_x = x, min_y = y, max_y = y;
+    for (unsigned corner = 1; corner < 4; corner++) {
+        int64_t w = corner & 1u ? source->width : 0;
+        int64_t h = corner & 2u ? source->height : 0;
+        int64_t cx = x + (w * cosine - h * sine) / 16;
+        int64_t cy = y + (w * sine + h * cosine) / 16;
+        if (cx < min_x) min_x = cx;
+        if (cx > max_x) max_x = cx;
+        if (cy < min_y) min_y = cy;
+        if (cy > max_y) max_y = cy;
+    }
+    int64_t left = min_x < 0 ? (min_x - 1023) / 1024 : min_x / 1024;
+    int64_t top = min_y < 0 ? (min_y - 1023) / 1024 : min_y / 1024;
+    int64_t right = max_x > 0 ? (max_x + 1023) / 1024 : max_x / 1024;
+    int64_t bottom = max_y > 0 ? (max_y + 1023) / 1024 : max_y / 1024;
+    if (left < INT_MIN || top < INT_MIN || right > INT_MAX || bottom > INT_MAX
+        || right - left > 65535 || bottom - top > 65535) return false;
+    *result = *source;
+    result->type = DRAW_ROTATED_FILL;
+    result->text_length = (uint32_t) source->width | ((uint32_t) source->height << 16);
+    result->font_size = (int32_t) ((uint32_t) (uint16_t) cosine
+        | ((uint32_t) (uint16_t) sine << 16));
+    result->radius = (int) (x - left * 1024);
+    result->scale = (int) (y - top * 1024);
+    result->x = (int) left;
+    result->y = (int) top;
+    result->width = (int) (right - left);
+    result->height = (int) (bottom - top);
+    return true;
+}
+
+bool layout_rotate_solid_command_span(LayoutDocument *layout, size_t start,
+    size_t end, int origin_x_twice, int origin_y_twice, int16_t rotation_q6)
+{
+    if (layout == NULL || start > end || end > layout->count) return false;
+    float radians = (float) rotation_q6 * 0.0002727076956f;
+    int cosine = (int) lroundf(cosf(radians) * 16384.0f);
+    int sine = (int) lroundf(sinf(radians) * 16384.0f);
+    DrawCommand rotated;
+    /* Validate first: unsupported content leaves the whole span untouched. */
+    for (size_t i = start; i < end; i++)
+        if (!rotated_solid_command(&layout->commands[i], origin_x_twice,
+            origin_y_twice, cosine, sine, &rotated)) return false;
+    for (size_t i = start; i < end; i++) {
+        (void) rotated_solid_command(&layout->commands[i], origin_x_twice,
+            origin_y_twice, cosine, sine, &rotated);
+        layout->commands[i] = rotated;
+    }
+    return true;
+}
+
 bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
                                      size_t end, int origin_y_twice,
                                      int16_t shear_q10)

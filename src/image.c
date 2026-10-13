@@ -1830,17 +1830,6 @@ static bool inline_svg_apply_default_viewport(
     char height[16] = "150";
     float numeric_width = 0.0f;
     float numeric_height = 0.0f;
-    if (style != NULL && style->has_width && !style->width_percent
-        && style->width_offset == 0 && style->width > 0
-        && style->width <= 32767) {
-        snprintf(width, sizeof(width), "%d", style->width);
-        numeric_width = (float) style->width;
-    }
-    if (style != NULL && style->has_height && !style->height_percent
-        && style->height > 0 && style->height <= 32767) {
-        snprintf(height, sizeof(height), "%d", style->height);
-        numeric_height = (float) style->height;
-    }
     if (numeric_width <= 0.0f && width_attribute != NULL
         && width_length > 0u && width_length < 32u) {
         char value[32];
@@ -1866,6 +1855,32 @@ static bool inline_svg_apply_default_viewport(
             && isfinite(parsed) && parsed > 0.0f && parsed <= 32767.0f) {
             numeric_height = parsed;
         }
+    }
+    float authored_width = numeric_width, authored_height = numeric_height;
+    if (style != NULL && style->has_width && !style->width_percent
+        && style->width_offset == 0 && style->width > 0
+        && style->width <= 32767) {
+        snprintf(width, sizeof(width), "%d", style->width);
+        numeric_width = (float) style->width;
+    }
+    if (style != NULL && style->has_height && !style->height_percent
+        && style->height > 0 && style->height <= 32767) {
+        snprintf(height, sizeof(height), "%d", style->height);
+        numeric_height = (float) style->height;
+    }
+    /* Uniform resizing may retain the authored raster for display
+       retargeting. A changed viewport ratio must instead be applied before
+       viewBox mapping: stretching its old pixels distorts the artwork.
+       The resolved viewport is part of the serialized cache identity. */
+    if (style != NULL && style->has_width && !style->width_percent
+        && style->width_offset == 0 && style->has_height && !style->height_percent
+        && authored_width > 0 && authored_height > 0
+        && numeric_width > 0 && numeric_height > 0
+        && fabsf(numeric_width * authored_height
+                 - numeric_height * authored_width) > 0.01f) {
+        snprintf(width, sizeof(width), "%d", (int) ceilf(numeric_width));
+        snprintf(height, sizeof(height), "%d", (int) ceilf(numeric_height));
+        width_missing = height_missing = true;
     }
     /* A viewBox gives the SVG an intrinsic ratio. If exactly one dimension
        is known -- from CSS or from an attribute -- the other follows that
@@ -6074,6 +6089,13 @@ ImagePriorityLoadStatus images_priority_load_pump(
     if (job->terminal) return IMAGE_PRIORITY_LOAD_COMPLETE;
     ImageLoadContext *context = &job->context;
     if (!job->admitted) {
+        /* A resumable boundary: queued input defers admission, not the
+           transaction itself. Unlike a decoder checkpoint, no DOM/resource
+           state is borrowed here and no request has begun. */
+        if (!tilefinch_platform_cooperate("image-admission-boundary", 0)) {
+            image_finish_slice(context);
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
         if (fetch_scheduler_enqueue_would_block(
                 context->scheduler,
                 context->maximum_single_encoded_bytes)) {
@@ -6089,12 +6111,15 @@ ImagePriorityLoadStatus images_priority_load_pump(
         context->deadline_ms =
             job->started_ms + (double) context->timeout_ms;
         for (size_t at = 0; at < job->target_count; at++) {
-            if (at != 0 && fetch_scheduler_enqueue_would_block(
-                    context->scheduler,
-                    context->maximum_single_encoded_bytes)) {
+            if (at != 0
+                && (!tilefinch_platform_cooperate("image-admission-boundary", at)
+                    || fetch_scheduler_enqueue_would_block(
+                        context->scheduler,
+                        context->maximum_single_encoded_bytes))) {
                 /* The second visible target is optional overlap, never an
                    admission failure. Leave it in the page queue for the next
-                   job when only one descriptor is presently available. */
+                   job when input is waiting or only one descriptor is
+                   presently available. Keep the first request intact. */
                 job->target_count = at;
                 context->priority_target_count = at;
                 break;

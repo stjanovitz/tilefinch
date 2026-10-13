@@ -230,7 +230,8 @@ bool controller_focused_outline_style(
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action);
 /* Bounded selectedness snapshot, by option ordinal rather than value (values
-   may be duplicated). Neither mode dispatches input. Zero means inapplicable;
+   may be duplicated). Neither mode dispatches input. Zero means inapplicable
+   or a successful unchanged restore; a changed restore returns the count.
    SIZE_MAX means write refusal: the unpublished candidate must be discarded. */
 size_t controller_select_history(lxb_dom_node_t *select, char *state,
                                  size_t length, bool restore);

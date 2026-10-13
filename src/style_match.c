@@ -4,6 +4,7 @@
 
 #include "style_internal.h"
 #include "style_cache_internal.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -30,7 +31,16 @@ static bool style_selector_cooperate_visit(
     if (sheet == NULL) return true;
     Stylesheet *mutable_sheet = (Stylesheet *) sheet;
     if (sheet->selector_cooperate_cancelled) return false;
-    if (sheet->selector_cooperate == NULL) return true;
+    if (sheet->selector_cooperate == NULL) {
+        /* Focus/mutation preparation also walks relational selectors, but
+           has no layout context to install the cancellable matcher hook.
+           Service native UI without admitting author/DOM reentry or
+           publishing an incomplete match as a cached result. */
+        if ((++mutable_sheet->selector_cooperate_visits & 127u) == 0)
+            (void) tilefinch_platform_cooperate("style-prepare",
+                sheet->selector_cooperate_visits);
+        return true;
+    }
     mutable_sheet->selector_cooperate_visits++;
     if (sheet->selector_cooperate_visits
         < sheet->selector_cooperate_next) return true;
@@ -68,8 +78,8 @@ void style_match_subject_prepare(lxb_dom_node_t *node,
 /* HTML type selectors use ASCII-insensitive names; foreign-content and XML
    names remain exact. Keep the common lowercase spelling on the byte path,
    and apply the same rule to prepared query keys and the full matcher. */
-static bool style_subject_tag_matches(const StyleMatchSubject *subject,
-                                      const char *wanted, size_t length)
+bool style_subject_tag_matches(const StyleMatchSubject *subject,
+                               const char *wanted, size_t length)
 {
     if (subject->tag == NULL || subject->tag_length != length) return false;
     if (memcmp(subject->tag, wanted, length) == 0) return true;
@@ -1117,6 +1127,10 @@ static bool relative_candidate_matches(
     }
     walk->visits++;
     STYLE_SELECTOR_COUNT(sheet, selector_descendant_visits, 1);
+    /* The no-layout preparation path has no outer node-yield cadence.
+       Keep these extra polls out of a layout context's charged work quota. */
+    if (sheet != NULL && sheet->selector_cooperate == NULL)
+        (void) style_selector_cooperate_visit(sheet, candidate);
     if (candidate->type != LXB_DOM_NODE_TYPE_ELEMENT
         || !compound_matches_depth(
             sheet, candidate, compound, compound_length,

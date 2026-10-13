@@ -59,14 +59,19 @@ static bool lite_search_params(const char *url, char output[48])
 static bool lite_html_filter_select(YoutubeLiteHtml *html, const char *name,
     const char *label, const char *const *options, unsigned count, unsigned selected)
 {
-    bool ok = lite_html_format(html, "<label for=%s>", name)
+    /* Spatial navigation intentionally admits clickable HTML labels. These
+       compact captions are display-only; put their accessible name directly
+       on the select so the d-pad has one stop per field. */
+    bool ok = lite_html_text(html, "<div class=filter-field><span class=filter-label>")
         && lite_html_escape(html, tilefinch_ui_logical_text(label))
-        && lite_html_format(html, "</label><select id=%s name=%s>", name, name);
+        && lite_html_format(html, "</span><select id=%s name=%s aria-label=\"", name, name)
+        && lite_html_escape(html, tilefinch_ui_logical_text(label))
+        && lite_html_text(html, "\">");
     for (unsigned i = 0; ok && i < count; i++)
         ok = lite_html_format(html, "<option value=%u%s>", i, i == selected ? " selected" : "")
             && lite_html_escape(html, tilefinch_ui_logical_text(options[i]))
             && lite_html_text(html, "</option>");
-    return ok && lite_html_text(html, "</select>");
+    return ok && lite_html_text(html, "</select></div>");
 }
 
 static bool lite_html_search_filters(YoutubeLiteHtml *html, const char *url, const char *query)
@@ -79,11 +84,11 @@ static bool lite_html_search_filters(YoutubeLiteHtml *html, const char *url, con
         "<details id=yt-filter-panel class=search-filters><summary>{{Filters}}</summary>"
         "<form action='https://www.youtube.com/results' method=get>"
         "<input type=hidden name=search_query value=\"")
-        && lite_html_escape(html, query) && lite_html_text(html, "\">")
+        && lite_html_escape(html, query) && lite_html_text(html, "\"><div class=filter-fields>")
         && lite_html_filter_select(html, "tilefinch_date", "Upload date", dates, 5, f.date)
         && lite_html_filter_select(html, "tilefinch_duration", "Duration", durations, 4, f.duration)
         && lite_html_filter_select(html, "tilefinch_sort", "Sort by", sorts, 2, f.sort)
-        && lite_html_ui_markup(html, "<button id=yt-filter-apply type=submit>{{Apply filters}}</button></form></details>");
+        && lite_html_ui_markup(html, "</div><button id=yt-filter-apply type=submit>{{Apply filters}}</button></form></details>");
 }
 
 static bool lite_chapter_number(const YoutubeLiteSpan *value, unsigned *number)

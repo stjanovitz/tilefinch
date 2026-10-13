@@ -615,7 +615,8 @@ static bool navigation_load_web_fonts(NavigationSession *session,
         session->page.resource_scheduler, &session->page.external_fonts);
     memset(&session->page.external_fonts, 0,
            sizeof(session->page.external_fonts));
-    if (!session->web_fonts_enabled) return true;
+    if (!session->web_fonts_enabled || session->web_font_mode == WEB_FONTS_OFF
+        || session->page.web_font_pressure_fallback) return true;
     return fonts_external_loader_begin(
         &session->page.external_font_loader, &session->page.stylesheet,
         session->font_timeout_ms, &session->page.external_fonts);
@@ -808,16 +809,45 @@ static ScriptRuntime *navigation_create_runtime(
     return runtime;
 }
 
+static void navigation_prepare_layout_reuse(
+    NavigationSession *session, const ScriptMutationJournal *mutations,
+    bool full_rebuild);
+
+static LayoutReuseCache *navigation_prepare_geometry_reuse(
+    void *opaque, const ScriptMutationJournal *mutations)
+{
+    NavigationSession *session = opaque;
+    /* The normal publication still consumes these mutations later. Apply
+       its exact invalidation now as well, rather than using stale styles
+       or resolving the entire document anew inside a geometry accessor. */
+    /* A queued resource/style rebuild does not change this build's installed
+       cascade. Its generation guards invalidate the cache when replacement
+       rules actually arrive; the journal still invalidates changed DOM now. */
+    navigation_prepare_layout_reuse(session, mutations, false);
+    return session->page.layout_reuse;
+}
+
 static bool navigation_flush_committed_geometry(void *opaque)
 {
     NavigationSession *session = opaque;
     return session != NULL && session->page.loaded
-        && script_runtime_flush_geometry_layout(session->page.runtime,
-                                                &session->viewport);
+        && script_runtime_flush_geometry_layout_reuse(session->page.runtime,
+            &session->viewport, navigation_prepare_geometry_reuse, session);
 }
 
 static void navigation_attach_layout(NavigationSession *session)
 {
+    if (session != NULL && session->web_fonts_enabled) {
+        uint8_t required = session->page.stylesheet.metric_web_font_families;
+        for (size_t at = 0; at < session->page.layout.count; at++) {
+            const DrawCommand *command = &session->page.layout.commands[at];
+            if (command->type != DRAW_TEXT) continue;
+            unsigned slot = font_family_web_slot(draw_command_font_family(command));
+            if (slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) required |= (uint8_t) (1u << slot);
+        }
+        fonts_external_loader_set_usage(&session->page.external_font_loader,
+            &session->page.stylesheet, required);
+    }
     if (session != NULL) {
         session->page.layout_provisional =
             session->page.layout.content_limit_y != 0;
@@ -1161,6 +1191,114 @@ static void damage_add_bottom_edges(int *left, int *top, int *right,
                     taller - from);
 }
 
+/* Equal commands between two changes need not be repainted when their
+   retained paint context is identical. Compare sidecars too: unchanged
+   command bytes alone do not prove unchanged clipping, order or gradients.
+   Padding differences merely decline this optimization. No DOM/image/text
+   storage is dereferenced here; old commands may borrow retired storage. */
+typedef struct {
+    uint32_t clip_boxes[8];
+    size_t clip_count;
+} NavigationDamageContext;
+
+static bool navigation_damage_context_equal(const LayoutDocument *old,
+    const LayoutDocument *next, NavigationDamageContext *context)
+{
+    context->clip_count = 0;
+    if (old->width != next->width || old->height != next->height
+        || memcmp(&old->viewport, &next->viewport, sizeof(old->viewport)) != 0
+        || old->fonts != next->fonts || old->web_fonts != next->web_fonts
+        || old->scroll_generation != next->scroll_generation
+        || old->node_box_count != next->node_box_count
+        || old->bidi_command_count != 0 || next->bidi_command_count != 0
+        || old->sticky_count != 0 || next->sticky_count != 0
+        || old->fixed_count != 0 || next->fixed_count != 0
+        || old->overflow_order_count != 0 || next->overflow_order_count != 0
+        || old->late_positioned_order_count != 0
+        || next->late_positioned_order_count != 0)
+        return false;
+#define SAME_SIDECAR(field, count_field) \
+    if (old->count_field != next->count_field \
+        || (old->count_field != 0 \
+            && memcmp(old->field, next->field, \
+                      old->count_field * sizeof(*old->field)) != 0)) \
+        return false
+    SAME_SIDECAR(gradients, gradient_count);
+    SAME_SIDECAR(bidi_glyphs, bidi_glyph_count);
+    SAME_SIDECAR(bidi_commands, bidi_command_count);
+    SAME_SIDECAR(sticky_ranges, sticky_count);
+    SAME_SIDECAR(fixed_ranges, fixed_count);
+    SAME_SIDECAR(scroll_containers, scroll_container_count);
+    SAME_SIDECAR(overflow_orders, overflow_order_count);
+    SAME_SIDECAR(late_positioned_orders, late_positioned_order_count);
+#undef SAME_SIDECAR
+    for (size_t i = 0; i < old->node_box_count; i++) {
+        LayoutNodeBox before = old->node_boxes[i], after = next->node_boxes[i];
+        /* Range indices move when an outline is inserted. Geometry must
+           agree, and each matched command must retain its clip membership. */
+        if (before.clips_x || before.clips_y || before.clip_path_clip) {
+            if (context->clip_count == 8) return false;
+            context->clip_boxes[context->clip_count++] = (uint32_t) i;
+        } else {
+            /* Outline ink can grow a non-clipping wrapper's content extent
+               without changing its box or any command. Page height is
+               compared above; this metadata does not clip paint. */
+            before.content_width = before.content_height = 0;
+            after.content_width = after.content_height = 0;
+        }
+        before.command_start = before.command_end = 0;
+        before.scroll_command_start = before.scroll_command_end = 0;
+        after.command_start = after.command_end = 0;
+        after.scroll_command_start = after.scroll_command_end = 0;
+        if (memcmp(&before, &after, sizeof(before)) != 0) return false;
+    }
+    if ((old->node_clip_radius_codes == NULL)
+            != (next->node_clip_radius_codes == NULL)
+        || (old->node_clip_radius_codes != NULL
+            && memcmp(old->node_clip_radius_codes, next->node_clip_radius_codes,
+                      old->node_box_count * sizeof(*old->node_clip_radius_codes)) != 0))
+        return false;
+    const LayoutDocument *layouts[] = {old, next};
+    for (size_t lane = 0; lane < 2; lane++) {
+        const LayoutDocument *layout = layouts[lane];
+        if (layout->paint_order_count != layout->count) return false;
+        for (size_t i = 0; i < layout->count; i++) {
+            const DrawCommand *command = &layout->commands[i];
+            if ((layout->command_flags != NULL
+                    && (layout->command_flags[i] & (LAYOUT_COMMAND_DYNAMIC_OVERFLOW
+                        | LAYOUT_COMMAND_FIXED | LAYOUT_COMMAND_STICKY
+                        | LAYOUT_COMMAND_LATE_POSITIONED)) != 0)
+                || command->type == DRAW_SHADOW_RECT
+                || draw_command_filter_code(command) != 0
+                || draw_command_backdrop_blur(command) != 0
+                || draw_command_rotation_quadrants(command) != 0)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool navigation_damage_commands_equal(const LayoutDocument *old,
+    size_t before_order, const LayoutDocument *next, size_t after_order,
+    const NavigationDamageContext *context)
+{
+    size_t i = old->paint_order[before_order], j = next->paint_order[after_order];
+    if (!draw_command_equal(&old->commands[i], &next->commands[j])) return false;
+    uint8_t before_flags = old->command_flags == NULL ? 0 : old->command_flags[i];
+    uint8_t after_flags = next->command_flags == NULL ? 0 : next->command_flags[j];
+    if (before_flags != after_flags) return false;
+    for (size_t k = 0; k < context->clip_count; k++) {
+        const LayoutNodeBox *before = &old->node_boxes[context->clip_boxes[k]];
+        const LayoutNodeBox *after = &next->node_boxes[context->clip_boxes[k]];
+        if ((i >= before->scroll_command_start && i < before->scroll_command_end)
+              != (j >= after->scroll_command_start && j < after->scroll_command_end)
+            || (i >= before->command_start && i < before->command_end)
+              != (j >= after->command_start && j < after->command_end))
+            return false;
+    }
+    return true;
+}
+
 static void navigation_measure_damage(NavigationSession *session,
                                       const LayoutDocument *old_layout,
                                       const LayoutDocument *new_layout)
@@ -1193,7 +1331,54 @@ static void navigation_measure_damage(NavigationSession *session,
            index by index there, so the page background's new height does
            not repaint the screens the reader is on. */
         bool extended = old_layout->content_limit_y != 0;
+        NavigationDamageContext context;
+        bool aligned_paint = navigation_damage_context_equal(old_layout,
+                                                              new_layout, &context);
         size_t aligned = old_end < new_end ? old_end : new_end;
+        if (aligned_paint) {
+            /* Compare actual paint order, which need not equal DOM order. */
+            size_t i = 0, j = 0;
+            old_end = old_layout->count;
+            new_end = new_layout->count;
+            while (i < old_end || j < new_end) {
+                if (i < old_end && j < new_end
+                    && navigation_damage_commands_equal(old_layout, i,
+                                                         new_layout, j, &context)) {
+                    i++; j++;
+                    continue;
+                }
+                /* Focus decorations are small insertions/removals. Bounded
+                   lookahead also handles an adjacent changed paint command;
+                   never search an unbounded list or allocate a diff table. */
+                size_t old_skip = 0, new_skip = 0;
+                for (size_t distance = 1; distance <= 8; distance++) {
+                    if (i < old_end && distance < new_end - j
+                        && navigation_damage_commands_equal(old_layout, i,
+                            new_layout, j + distance, &context)) {
+                        new_skip = distance; break;
+                    }
+                    if (j < new_end && distance < old_end - i
+                        && navigation_damage_commands_equal(old_layout, i + distance,
+                            new_layout, j, &context)) {
+                        old_skip = distance; break;
+                    }
+                }
+                if (old_skip == 0 && new_skip == 0) {
+                    old_skip = i < old_end ? 1 : 0;
+                    new_skip = j < new_end ? 1 : 0;
+                }
+                while (old_skip > 0) {
+                    old_skip--;
+                    damage_add(&left, &top, &right, &bottom,
+                               &old_layout->commands[old_layout->paint_order[i++]]);
+                }
+                while (new_skip > 0) {
+                    new_skip--;
+                    damage_add(&left, &top, &right, &bottom,
+                               &new_layout->commands[new_layout->paint_order[j++]]);
+                }
+            }
+        } else {
         for (size_t i = prefix; i < old_end; i++) {
             if (extended && i < aligned) {
                 const DrawCommand *old = &old_layout->commands[i];
@@ -1217,6 +1402,7 @@ static void navigation_measure_damage(NavigationSession *session,
                            &new_layout->commands[i]))) continue;
             damage_add(&left, &top, &right, &bottom,
                        &new_layout->commands[i]);
+        }
         }
         if (old_layout->height != new_layout->height) {
             int shorter = old_layout->height < new_layout->height

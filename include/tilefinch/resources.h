@@ -199,6 +199,10 @@ typedef struct {
     uint64_t request_id;
     double started_ms;
     double deadline_ms;
+    uint64_t processed_sources;
+    uint8_t required_families;
+    bool usage_filter;
+    bool cancelled;
     bool active;
 } ExternalFontLoader;
 
@@ -629,6 +633,10 @@ void fonts_external_loader_cancel(ExternalFontLoader *loader,
                                   FetchScheduler *scheduler,
                                   ExternalFontStats *stats);
 bool fonts_external_loader_pending(const ExternalFontLoader *loader);
+/* Defer unreferenced families, but reconsider them after a later layout.
+   Standalone loaders retain declaration-order behavior until this is set. */
+void fonts_external_loader_set_usage(ExternalFontLoader *loader,
+    const Stylesheet *sheet, uint8_t required_families);
 
 bool images_load_external(const PocDocument *document, Stylesheet *stylesheet,
                           ImageResources *images,

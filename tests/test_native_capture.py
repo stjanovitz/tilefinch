@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 from native_capture import (StaleHeightError, VIEWS, build_five_view_commands,
                             run_native_capture, validate_native_capture,
                             _input_identity)
+from native_visual_trace import prepare_native_visual_trace
 
 LAB = None
 if '--lab' in sys.argv:
@@ -19,6 +20,61 @@ if '--lab' in sys.argv:
 
 
 class NativeCaptureTests(unittest.TestCase):
+    def visual_trace(self):
+        source = self.output / 'hops'
+        source.mkdir()
+        prefix = ('psp-http-trace=13\ncookie-values=redacted\nmethod=GET\n'
+                  'request-body-length=0\nrequest-cookie-bytes=0\n'
+                  'request-extra-header-bytes=0\nrequest-credentials=0\nsuccess=1\n')
+        (source / '0001.meta').write_text(prefix + 'url=https://example.test/photo.png\n'
+            'status=302\nlength=0\nresponse-body-hash=cbf29ce484222325\n'
+            'content-type=text/html\nresponse-header-count=1\n'
+            'response-header-0=location: /actual.png\n')
+        (source / '0001.body').write_bytes(b'')
+        (source / '0002.meta').write_text(prefix + 'url=https://example.test/actual.png\n'
+            'status=200\nlength=1\nresponse-body-hash=af63dc4c8601ec8c\n'
+            'content-type=image/png\nresponse-header-count=0\n')
+        (source / '0002.body').write_bytes(b'a')
+        return source
+
+    def test_visual_redirect_uses_exact_terminal_body_without_mutating_reference(self):
+        source = self.visual_trace()
+        original = (source / '0001.meta').read_bytes()
+        result = prepare_native_visual_trace(source, self.output / 'logical')
+        derived = Path(result['trace'])
+        self.assertEqual((source / '0001.meta').read_bytes(), original)
+        self.assertEqual((derived / '0001.body').read_bytes(), b'a')
+        meta = (derived / '0001.meta').read_text()
+        self.assertIn('url=https://example.test/photo.png\n', meta)
+        self.assertIn('effective-url=https://example.test/actual.png\n', meta)
+        self.assertIn('status=200\n', meta)
+        self.assertEqual(result['visual_redirects'][0]['chain'], ['0001.meta', '0002.meta'])
+
+    def test_visual_redirect_refuses_policy_sensitive_or_corrupt_response(self):
+        source = self.visual_trace()
+        terminal = source / '0002.meta'
+        terminal.write_text(terminal.read_text().replace('request-cookie-bytes=0', 'request-cookie-bytes=10'))
+        with self.assertRaisesRegex(ValueError, 'policy-sensitive'):
+            prepare_native_visual_trace(source, self.output / 'logical')
+        terminal.write_text(terminal.read_text().replace('request-cookie-bytes=10', 'request-cookie-bytes=0'))
+        (source / '0002.body').write_bytes(b'b')
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            prepare_native_visual_trace(source, self.output / 'logical')
+
+    def test_visual_redirect_refuses_missing_or_cyclic_chain(self):
+        source = self.visual_trace()
+        terminal = source / '0002.meta'
+        original = terminal.read_text()
+        terminal.write_text(original.replace('url=https://example.test/actual.png',
+                                            'url=https://example.test/other.png'))
+        with self.assertRaisesRegex(ValueError, 'missing or ambiguous'):
+            prepare_native_visual_trace(source, self.output / 'logical')
+        terminal.write_text(original.replace('status=200', 'status=302')
+            .replace('response-header-count=0',
+                     'response-header-count=1\nresponse-header-0=location: /photo.png'))
+        with self.assertRaisesRegex(ValueError, 'cyclic'):
+            prepare_native_visual_trace(source, self.output / 'logical')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

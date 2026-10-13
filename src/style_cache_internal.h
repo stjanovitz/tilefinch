@@ -3,6 +3,11 @@
 
 #include "tilefinch/style.h"
 
+bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet);
+bool style_selector_reads_focus(const char *selector);
+bool style_custom_rules_may_select_node(const Stylesheet *sheet,
+    const uint32_t *rules, size_t count, lxb_dom_node_t *node);
+
 typedef bool (*StyleSelectorCooperate)(
     void *opaque, lxb_dom_node_t *node, size_t completed_visits);
 
@@ -143,9 +148,19 @@ void style_retained_matches_remap(StyleRetainedMatches *table,
 void style_retained_matches_invalidate_rules(
     StyleRetainedMatches *table, const Stylesheet *sheet,
     const uint32_t *rules, size_t count);
+typedef struct {
+    uint32_t keys[128];
+    uint32_t keyless[64];
+    size_t keyless_count;
+} StyleRuleCandidatePlan;
+bool style_rule_candidate_plan(const Stylesheet *sheet,
+    const uint32_t *rules, size_t count, StyleRuleCandidatePlan *plan);
+bool style_rules_may_select_node(const Stylesheet *sheet,
+    StyleRetainedMatches *table, const StyleRuleCandidatePlan *plan,
+    lxb_dom_node_t *node);
 StyleRetainedMatches *style_retained_matches_create(Budget *budget);
-/* Match lists cannot retain geometry-dependent query admission. Use the
-   same gate for allocation and lookup; eligibility can change with CSS. */
+/* Lists retain selector answers, not geometry-dependent query admission.
+   The latter is rechecked on replay. Allocation and lookup share this gate. */
 bool style_retained_matches_supported(const Stylesheet *sheet);
 void style_retained_matches_destroy(StyleRetainedMatches *table);
 void style_retained_matches_clear(StyleRetainedMatches *table);

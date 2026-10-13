@@ -331,6 +331,33 @@ static int test_parity_percentages_and_strips(void)
    MDN's breadcrumb chevrons follow each crumb and widen it, and its search
    button's caret leads the line while space-between pushes the icon to
    the end. */
+static int test_inline_replaced_percentage_height(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}"
+        ".row{height:24px}img,svg{width:60px;height:100%;vertical-align:top}"
+        "#border{box-sizing:border-box;padding:2px;border:1px solid}"
+        "#auto{height:auto}#auto img{height:100%;width:60px}"
+        "</style><body><div class=row><img id=plain width=60 height=90>"
+        "<svg id=vector width=60 height=90></svg>"
+        "<img id=border width=60 height=90></div>"
+        "<div class=row><div id=auto><img id=indefinite width=60 height=90>"
+        "</div></div></body>"));
+    const LayoutNodeBox *plain = parity_box(&page, "plain");
+    const LayoutNodeBox *vector = parity_box(&page, "vector");
+    const LayoutNodeBox *border = parity_box(&page, "border");
+    const LayoutNodeBox *indefinite = parity_box(&page, "indefinite");
+    CHECK(plain && plain->width == 60 && plain->height == 24);
+    CHECK(vector && vector->width == 60 && vector->height == 24);
+    CHECK(border && border->width == 60 && border->height == 24);
+    /* An auto-height intermediate block does not inherit the outer
+       ancestor's definite percentage basis. */
+    CHECK(indefinite == NULL || indefinite->height != 24);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 static int test_parity_generated_flex_items(void)
 {
     static const char html[] =
@@ -371,6 +398,112 @@ static int test_parity_generated_flex_items(void)
                 caret ? caret->x : -1, caret ? caret->width : -1,
                 q ? q->x : -1, q ? q->width : -1, button ? button->x : -1);
     CHECK(ok);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_text_flex_order(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.row{display:flex;gap:5px;"
+        "align-items:center;width:200px;height:30px}.row::before{content:'['}"
+        ".row::after{content:']'}.reverse{flex-direction:row-reverse}"
+        ".ordered::before{order:2}.ordered::after{order:-1}"
+        "</style><body><div class=row><span id=normal>X</span></div>"
+        "<div class='row reverse'><span id=reverse>Y</span></div>"
+        "<div class='row ordered'><span id=ordered>Z</span></div></body>"));
+    const DrawCommand *left = text_command(&page.layout, "[");
+    const DrawCommand *right = text_command(&page.layout, "]");
+    const DrawCommand *x = text_command(&page.layout, "X");
+    CHECK(left && right && x);
+    CHECK(left->y == x->y && right->y == x->y);
+    CHECK(x->x == left->x + left->width + 5);
+    CHECK(right->x == x->x + x->width + 5);
+    const LayoutNodeBox *reverse = parity_box(&page, "reverse");
+    const LayoutNodeBox *ordered = parity_box(&page, "ordered");
+    CHECK(reverse && reverse->x > 100);
+    CHECK(ordered && ordered->x > 0 && ordered->x < 100);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_block_text_control_auto_height(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}input{font-size:14px;"
+        "padding:7px;border:1px solid;box-sizing:border-box;width:140px}"
+        "#block,#plain,#fixed{display:block}#plain{appearance:none}"
+        "#fixed{height:20px}.flex{display:flex;align-items:center}"
+        "</style><body><input id=inline type=search placeholder=Search>"
+        "<input id=block type=search placeholder=Search>"
+        "<input id=plain type=text><input id=fixed type=text>"
+        "<div class=flex><input id=flex type=search></div></body>"));
+    const LayoutNodeBox *inline_box = parity_box(&page, "inline");
+    const LayoutNodeBox *block = parity_box(&page, "block");
+    const LayoutNodeBox *plain = parity_box(&page, "plain");
+    const LayoutNodeBox *fixed = parity_box(&page, "fixed");
+    const LayoutNodeBox *flex = parity_box(&page, "flex");
+    CHECK(inline_box && block && plain && fixed && flex);
+    CHECK(block->height == inline_box->height && block->height >= 30);
+    CHECK(plain->height == block->height);
+    CHECK(flex->height == block->height);
+    CHECK(fixed->height == 20);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_flex_percentage_edges_and_wrap(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.row{display:flex;gap:5px}"
+        "#percent{width:200px}#percent::before{content:'P';padding:10%;"
+        "background:red}#percent span{width:10px;flex-shrink:0}"
+        "#wrap{width:60px;flex-wrap:wrap}#wrap::before{content:'AA BB';"
+        "width:40px;flex-shrink:0}#wrap span{width:30px;flex-shrink:0}"
+        "</style><body><div class=row id=percent><span id=q>Q</span></div>"
+        "<div class=row id=wrap><span id=r>R</span></div></body>"));
+    const DrawCommand *p = text_command(&page.layout, "P");
+    const DrawCommand *fill = parity_fill(&page.layout, 0xff0000u, 0);
+    const DrawCommand *aa = text_command(&page.layout, "AA");
+    const LayoutNodeBox *q = parity_box(&page, "q");
+    const LayoutNodeBox *r = parity_box(&page, "r");
+    CHECK(p && fill && aa && q && r);
+    CHECK(p->x == fill->x + 20);
+    CHECK(fill->width == p->width + 40);
+    CHECK(q->x == fill->x + fill->width + 5);
+    CHECK(r->y > aa->y && r->x == 0);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_empty_inline_positioned_border_pseudo(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.icon{position:relative;"
+        "float:right;border-radius:100%;background:#fff;height:42px;"
+        "min-width:42px}.icon i::before{position:absolute;top:6px;"
+        "bottom:0;left:0;right:0;margin:auto;border:2px solid #052962;"
+        "border-bottom:0;border-right:0;content:'';height:12px;width:12px;"
+        "transform:rotate(45deg)}"
+        "</style><body><span class=icon id=icon><i></i></span></body>"));
+    const LayoutNodeBox *icon = parity_box(&page, "icon");
+    CHECK(icon != NULL && icon->width == 42 && icon->height == 42);
+    TileCache cache = {0};
+    uint16_t pixels[480u * 48u];
+    CHECK(tile_cache_init(&cache, &page.budget, &page.layout, 8));
+    CHECK(tile_cache_set_frame(&cache, pixels, 480u * 48u));
+    CHECK(tile_cache_render_frame(&cache, 0, 480, 48, NULL));
+    /* The rotated top/left border forms a centered upward chevron, not a
+       square corner at the containing block's origin. */
+    CHECK(pixels[(icon->y + 15) * 480 + icon->x + 20] != test_rgb565(0xffffff));
+    CHECK(pixels[(icon->y + 22) * 480 + icon->x + 13] != test_rgb565(0xffffff));
+    CHECK(pixels[(icon->y + 22) * 480 + icon->x + 27] != test_rgb565(0xffffff));
+    CHECK(pixels[(icon->y + 4) * 480 + icon->x + 1] == test_rgb565(0xffffff));
+    tile_cache_destroy(&cache);
     CHECK(parity_page_destroy(&page));
     return 0;
 }
@@ -795,6 +928,147 @@ static int test_link_defaults_and_generated_gradient(void)
     return 0;
 }
 
+static int test_compact_controls_and_generated_intrinsics(unsigned checks)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:16px Arial}"
+        ".row{display:flex;width:480px;gap:12px}"
+        "#label{flex:1}#compact{flex:0 0 44px}"
+        "input{width:100%;box-sizing:border-box}input::placeholder{opacity:0}"
+        "#heading{max-width:fit-content;letter-spacing:2px}"
+        "#heading::after{content:'\\00a0|'}"
+        "#normal{font-weight:normal}#visible,#entered{color:#102030}"
+        "#visible::placeholder{color:#445566;opacity:.5}"
+        "#entered::placeholder{color:red;opacity:0}</style><body>"
+        "<div class=row><div id=label>Label</div><form id=compact>"
+        "<input id=entry placeholder=Search></form></div>"
+        "<div id=heading>VIDEOS</div>"
+        "<table><tr><th id=header>Header</th><td id=cell>Cell</td>"
+        "<th id=normal>Normal</th></tr></table>"
+        "<input id=visible placeholder=Hint><input id=entered placeholder=Hint value=Value>"
+        "</body>"));
+    const LayoutNodeBox *compact = parity_box(&page, "compact");
+    const LayoutNodeBox *heading = parity_box(&page, "heading");
+    const DrawCommand *word = text_command(&page.layout, "VIDEOS");
+    const DrawCommand *suffix = text_command(&page.layout, "\xc2\xa0|");
+    if (checks & 1u) CHECK(compact && compact->width == 44);
+    if ((checks & 2u) && !(heading && word && suffix && word->y == suffix->y)) {
+        fprintf(stderr, "generated intrinsic: heading=%d word=%d,%d suffix=%d,%d\n",
+            heading ? heading->width : -1, word ? word->x : -1,
+            word ? word->y : -1, suffix ? suffix->x : -1, suffix ? suffix->y : -1);
+        for (size_t i = 0; i < page.layout.count; i++) {
+            const DrawCommand *c = &page.layout.commands[i];
+            if (c->type == DRAW_TEXT) fprintf(stderr, "text %.*s %d,%d %dx%d\n",
+                (int) c->text_length, c->text, c->x, c->y, c->width, c->height);
+        }
+    }
+    if (checks & 2u) CHECK(heading && word && suffix && word->y == suffix->y);
+    if (checks & 4u) {
+        CHECK(text_command(&page.layout, "Search") == NULL);
+        const DrawCommand *hint = text_command(&page.layout, "Hint");
+        const DrawCommand *entered = text_command(&page.layout, "Value");
+        CHECK(hint && hint->color == 0x445566
+            && hint->opacity_scale == alpha_opacity_scale(128));
+        CHECK(entered && entered->color == 0x102030
+            && entered->opacity_scale == alpha_opacity_scale(255));
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(page.document.html);
+    if (checks & 8u) CHECK(style_for_node(&page.sheet, find_id(root, "header"), NULL).font_weight == 700);
+    CHECK(style_for_node(&page.sheet, find_id(root, "cell"), NULL).font_weight == 400);
+    CHECK(style_for_node(&page.sheet, find_id(root, "normal"), NULL).font_weight == 400);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_inline_badge_baseline_and_mask_size(unsigned checks)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}p{margin:0;font-size:20px;line-height:40px}"
+        "#badge{font-size:10px;padding:0 4px 1px;border:1px solid #112233;"
+        "border-radius:5px;background:#aabbcc}"
+        "#icon{position:relative;width:30px;height:40px}"
+        "#icon::before{content:'';position:absolute;width:15px;height:100%;"
+        "background:#123456;mask:url(icon.svg) center/15px 15px no-repeat}"
+        "</style><body><p>Large <span id=badge>TAG</span></p><div id=icon></div></body>"));
+    const DrawCommand *text = text_command(&page.layout, "TAG");
+    const DrawCommand *fill = parity_fill(&page.layout, 0xaabbcc, 0);
+    const DrawCommand *border = NULL;
+    for (size_t i = 0; i < page.layout.count; i++) {
+        const DrawCommand *c = &page.layout.commands[i];
+        if (c->type == DRAW_STROKE_RECT && c->color == 0x112233) border = c;
+    }
+    CHECK(text && fill && border);
+    if (checks & 1u) {
+        CHECK(fill->height == text->height + 3 && border->height == fill->height);
+        CHECK(fill->y == text->y - 1 && border->y == fill->y);
+        CHECK(fill->radius == border->radius);
+        CHECK(parity_box(&page, "icon")->y == 40);
+    }
+    lxb_dom_node_t *icon = find_id(lxb_dom_interface_node(page.document.html), "icon");
+    static unsigned char pixels[16] = {255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
+    ImageResource mask = {.node=icon, .pixels=pixels, .width=2, .height=2,
+        .is_mask=true, .pseudo=PSEUDO_BEFORE};
+    ImageResources images = {.items=&mask, .count=1};
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget, &page.document,
+        &page.sheet, NULL, &images, 480);
+    CHECK(page.layout_ready);
+    const DrawCommand *paint = NULL;
+    for (size_t i = 0; i < page.layout.count; i++)
+        if (page.layout.commands[i].type == DRAW_IMAGE
+            && page.layout.commands[i].image == &mask) paint = &page.layout.commands[i];
+    CHECK(paint && paint->width == 15 && paint->height == 40);
+    if (checks & 2u) {
+        CHECK(paint->image_fit == LAYOUT_IMAGE_FIT_SPRITE);
+        CHECK(draw_command_image_sprite_width(paint) == 15
+            && draw_command_image_sprite_height(paint) == 15);
+        CHECK(draw_command_image_offset_y(paint) == 12);
+    }
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_rounded_border_sides(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}#host{position:relative;height:60px}"
+        "#host::before{content:'';position:absolute;left:8px;top:8px;"
+        "width:20px;height:20px;border:solid #112233;"
+        "border-width:1px 2px 3px 4px;border-radius:8px}"
+        "</style><body><div id=host></div></body>"));
+    DrawCommand *border = NULL;
+    for (size_t i = 0; i < page.layout.count; i++) {
+        DrawCommand *c = &page.layout.commands[i];
+        if (c->type == DRAW_STROKE_RECT && c->color == 0x112233) border = c;
+    }
+    CHECK(border && border->image_fit == LAYOUT_STROKE_SIDES);
+    CHECK(border->radius != 0 && border->width > 16 && border->height > 16);
+    for (unsigned i = 0; i < 4; i++) CHECK(draw_command_stroke_side(border, i) == i + 1);
+    TileCache cache = {0};
+    uint16_t pixels[480u * 60u];
+    CHECK(tile_cache_init(&cache, &page.budget, &page.layout, 8));
+    CHECK(tile_cache_set_frame(&cache, pixels, 480u * 60u));
+    CHECK(tile_cache_render_frame(&cache, 0, 480, 60, NULL));
+    CHECK(pixels[border->y * 480 + border->x] != test_rgb565(0x112233));
+    CHECK(pixels[border->y * 480 + border->x + border->width / 2] == test_rgb565(0x112233));
+    CHECK(pixels[(border->y + border->height / 2) * 480 + border->x] == test_rgb565(0x112233));
+    CHECK(pixels[(border->y + border->height / 2) * 480 + border->x + border->width / 2] != test_rgb565(0x112233));
+    tile_cache_destroy(&cache);
+    size_t index = (size_t) (border - page.layout.commands);
+    layout_scale_range(&page.layout, index, page.layout.link_count,
+        page.layout.control_count, page.layout.node_box_count, 0, 0, 128, NULL);
+    for (unsigned i = 0; i < 4; i++) CHECK(draw_command_stroke_side(border, i) == (i + 1) * 2);
+    layout_rotate_range_quadrants(&page.layout, index, page.layout.link_count,
+        page.layout.control_count, page.layout.node_box_count, 0, 0, 1, NULL);
+    const unsigned rotated[4] = {8, 2, 4, 6};
+    for (unsigned i = 0; i < 4; i++) CHECK(draw_command_stroke_side(border, i) == rotated[i]);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 static int test_site_parity(void)
 {
     {
@@ -987,6 +1261,11 @@ static int test_site_parity(void)
     CHECK(test_parity_percentages_and_strips() == 0);
     puts("test: row flex containers lay out generated items");
     CHECK(test_parity_generated_flex_items() == 0);
+    CHECK(test_generated_text_flex_order() == 0);
+    CHECK(test_block_text_control_auto_height() == 0);
+    CHECK(test_generated_flex_percentage_edges_and_wrap() == 0);
+    CHECK(test_empty_inline_positioned_border_pseudo() == 0);
+    CHECK(test_inline_replaced_percentage_height() == 0);
     CHECK(test_parity_generated_inline_spacing() == 0);
     puts("test: bottom insets follow an auto-height containing block");
     CHECK(test_parity_bottom_inset_auto_height() == 0);
@@ -1005,5 +1284,8 @@ static int test_site_parity(void)
     puts("test: positioned empty pseudos retain margins at their static position");
     CHECK(test_parity_positioned_pseudo_static_margins() == 0);
     CHECK(test_link_defaults_and_generated_gradient() == 0);
+    CHECK(test_compact_controls_and_generated_intrinsics(15) == 0);
+    CHECK(test_inline_badge_baseline_and_mask_size(3) == 0);
+    CHECK(test_generated_rounded_border_sides() == 0);
     return 0;
 }

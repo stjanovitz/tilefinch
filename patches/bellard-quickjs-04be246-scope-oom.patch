@@ -16,8 +16,12 @@ diff --git a/quickjs.c b/quickjs.c
 +                    goto fail;
                  JS_FreeAtom(ctx, var_name);
              }
-@@ -36520,3 +36525,9 @@
+@@ -36517,7 +36522,13 @@
+     int stack_size;
+     int function_size, byte_code_offset, cpool_offset;
+     int closure_var_offset, vardefs_offset;
      BOOL strip_var_debug;
+     uint32_t oom_throws;
      
 +    /* Parsing may have stopped between an opcode and its operands. */
 +    if (dbuf_error(&fd->byte_code)) {

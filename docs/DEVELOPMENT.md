@@ -118,13 +118,67 @@ These run one behavior in isolation; they do not replace the complete suite.
 - `build-preset-release/tilefinch-navigation-load-tests --replacement-pressure-only`
   checks bounded replacement-layout recovery, cancellation after release,
   retained scrolling and deferred author viewport reflection.
+- `build-preset-release/tilefinch-navigation-load-tests --paint-damage-only`
+  checks narrow retained damage across inserted/removed focus decorations and
+  changes to image fit and text tracking. Clipping, order, and effect changes
+  retain the conservative repaint path.
 - `build-preset-release/tilefinch-browser-engine-tests --native-text-sync-only`
   checks native text synchronization without duplicate relayout.
+- `build-preset-release/tilefinch-browser-engine-tests --fixed-images-only`
+  checks fixed-image publication, retained scaled paint commands, exact pixels
+  against full flow, and clean teardown. `--fixed-image-repaint-only` checks
+  repaint notification and focus continuity across image completion.
+- `build-preset-release/tilefinch-browser-engine-tests --image-admission-only`
+  checks input deferral before/between optional requests, exact final pixels,
+  preserved retry counts, and teardown of paused or partially admitted jobs.
+- `build-preset-release/tilefinch-browser-engine-tests --font-focus-policy-only`
+  checks prompt Smart font-pressure relief, exact sibling-focus cache reuse,
+  and safe static recovery after a real required-layout allocation refusal.
+  An optional `1`, `2`, or `3` selects one of those checks respectively.
+- `build-preset-release/tilefinch-layout-tests --visual-regression N` selects
+  one reduced visual regression: 1 compact percentage controls, 2 generated
+  intrinsic spacing, 3 placeholder styling, 4 table-header defaults,
+  5 inline badge geometry, 6 generated mask sizing, or 7 rounded border sides.
+- `build-preset-release/tilefinch-layout-tests --auto-grid-align-only`
+  checks center/end alignment after content-sized grid rows finish sizing.
+- `build-preset-release/tilefinch-layout-tests --oversized-style-cache-only`
+  checks scan-resistant retention at the style-cache ceiling and exact output
+  after invalidation; it does not increase the cache's byte or entry limits.
+- `build-preset-release/tilefinch-layout-tests --container-cache-only`
+  compares cached container-query probe/final passes with an uncached reference,
+  including conditional pseudo-elements and unchanged element styles.
 - `build-preset-release/tilefinch-browser-engine-tests --computed-style-layout-only`
   checks that paint-style reads use the current cascade without forcing layout,
   while geometry and changed stylesheets still synchronize.
+- `build-preset-release/tilefinch-browser-engine-tests --opacity-geometry-only`
+  checks paint-only opacity geometry reuse, selector/generated-content
+  invalidation, mixed writes, and repaint safety. Geometry reports distinguish actual
+  `snapshot-builds` from `snapshot-hits`; `synchronous-layouts` counts flush
+  requests and must not be interpreted as full rebuilds.
 - `build-preset-release/tilefinch-browser-engine-tests --font-staging-only`
   checks optional-face publication, input cancellation, rollback and retry.
+- `psp-browser-interactive-lab --no-web-fonts` disables only page font loading
+  for same-binary comparisons. Built-in fonts, images, styles and script
+  settings remain unchanged; compare first-paint/commit timings, final memory,
+  and font usage rather than treating every downloaded face as a visible gain.
+  Post-run `web-font-usage` lists encoded and backend payload bytes plus text
+  commands selecting each face. Selection is not proof of visible pixel gain;
+  backend bytes exclude encoded storage and Budget bookkeeping. The binding
+  check confirms the displayed layout uses the current sheet's font set.
+  `--legacy-web-font-work` keeps page fonts enabled but restores the previous
+  publication, family admission, and measurement behavior for host A/B checks.
+  Shared faces report their storage only once (`shared=1` on later aliases).
+  `tilefinch-web-font-tests --font-perf-only` checks style retention, deferred
+  family activation, shared-face lifetimes and exact cached advances. The
+  `--legacy-font-perf-only` negative control must fail those new expectations.
+  `--web-font-mode on|smart|off` exercises the persisted menu policy (the lab
+  defaults to Smart); use explicit `on` for font-completion comparisons.
+  Smart reserves one eighth of the page budget, bounded to 512 KiB–3 MiB,
+  plus the capped incoming font working set before starting another load.
+  Pressure fallback latches per page and runs at a clean idle checkpoint,
+  never from an active JavaScript allocation hook. Refused or interrupted
+  fallback restores faces and the incumbent layout. Allocation refusal
+  stops automatic retries; input interruption retries at a later idle turn.
 - `build-preset-release/tilefinch-browser-engine-tests --font-staging-replay TRACE URL`
   profiles staged font publication on a captured page: elapsed time, largest
   cooperative gap and its ending phase, checkpoints, and style-cache work.
@@ -194,6 +248,12 @@ These run one behavior in isolation; they do not replace the complete suite.
   set of selector attribute names behind data-* style reuse (prefix lookup,
   escaped/namespaced opacity, rebuilds, bounds); `--attribute-bench-only`
   prints its build and query cost on a 5,000-rule sheet;
+- `tilefinch-style-index-tests --transition-candidates-only` compares
+  conservative transition-selector rejection with the full matcher in the
+  same sheet, including class changes and escaped/functional selectors;
+- `tilefinch-js-responsiveness-tests --cssom-noop-only` checks that identical
+  CSSOM writes avoid mutation/layout invalidation while changed values,
+  newly authorized styles and ordinary DOM attribute writes still publish;
 - the retained-cache review modes:
   `tilefinch-style-index-tests --retained-handoff-only`,
   `--retained-nested-only`, `--retained-focus-only`, and
@@ -228,6 +288,50 @@ These run one behavior in isolation; they do not replace the complete suite.
   inspects the supplied script files instead of running the default fixtures.
 - `build-preset-release/tilefinch-quickjs-oom-tests N` runs the allocation
   failure boundary after `N` successful allocations (not a byte budget).
+- `build-preset-release/tilefinch-quickjs-oom-tests --context-refusal-only`
+  refuses each allocation during raw and full QuickJS context creation, once
+  and persistently, then checks that the runtime releases every allocation.
+- `build-preset-release/tilefinch-memory-pressure-tests` sweeps initialization
+  limits, HTML-fragment parser failures, and every Budget allocation boundary
+  in ten browser operations: navigation, dynamic DOM mutation, Reader and
+  Basic preparation, CSS changes, rendering, history, container-query layout,
+  deferred image loading, and JS-driven DOM/query growth. Each case must
+  recover with a fresh navigation and release all owned bytes at teardown.
+  Pass a scenario number (`0` through `9`) to run one operation, or a scenario
+  and allocation index to reproduce one refusal. The sweep verifies these
+  boundaries; it cannot prove that every possible page and device failure is
+  crash-free.
+- When measuring the sweep, count distinct allocation sites actually refused,
+  not allocation attempts or lines merely executed by ordinary tests. Those
+  are different coverage measures; the private experiment ledger records the
+  latest source-site census and its limits.
+- For repeatable callsite measurement, configure a **disposable host** Clang
+  build with `-fprofile-instr-generate -fcoverage-mapping` and
+  `-DTILEFINCH_BUDGET_CALLSITE_TRACE=ON`. Run named tests with
+  `LLVM_PROFILE_FILE` set to a per-process `%p.profraw` path, capturing their
+  stderr; merge the raw files with `llvm-profdata merge -sparse`. Then run
+  `python3 scripts/budget-callsite-report.py --binary <build>/libtilefinch_core.dylib
+  --profile <merged.profdata> --fault-log <test.log> --llvm-cov <llvm-cov>`.
+  The report inventories every direct first-party Budget malloc/calloc/realloc
+  expression compiled into that host core and distinguishes ordinary source
+  reach from an *actual injected refusal*. A partial test run must be labelled
+  partial. The probe is forbidden in PSP builds and off by default; neither
+  site logs nor profiles belong in the public repository.
+  Its `coverage_targets` separately track resource, JS-module, media, and
+  storage source families. A targeted pressure campaign should include
+  `tilefinch-stylesheet-resource-tests`,
+  `tilefinch-image-decode-scaled-tests`, `tilefinch-module-bytecode-tests`,
+  `tilefinch-media-mp4-tests`, `tilefinch-media-http-range-tests`,
+  `tilefinch-offline-app-limits-tests`, and
+  `tilefinch-session-site-storage-tests`. Pass
+  `--require-target-refusal resource` (and likewise for the other three
+  names) to reject a campaign that never refuses an allocation in that area.
+  This is a source-site coverage target, not proof of full path coverage;
+  report each target's reached and refused counts alongside the tests run.
+- `build-preset-release/tilefinch-image-decode-scaled-tests --only allocation-refusals`
+  refuses each PNG, JPEG, and WebP decoder allocation in turn, then requires
+  the same image to decode with byte-identical pixels on retry and no retained
+  Budget ownership.
 
 Total relayout time is not input latency. Check cooperative gaps separately:
 the native UI can update the retained frame without entering the DOM at these

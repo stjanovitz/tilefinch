@@ -74,6 +74,63 @@ static bool test_nested_svg_viewports_preserve_atlas_geometry(void)
     return okay && budget.current == 0;
 }
 
+static bool test_svg_local_clips_preserve_artwork(void)
+{
+    static const char markup[] =
+        "<svg width='100' height='60' viewBox='0 0 100 60'>"
+        "<clipPath id='window'><rect width='20' height='20'/></clipPath>"
+        "<g transform='translate(10 5)' clip-path='url(#window)'>"
+        "<rect width='40' height='40' fill='#ff0000'/></g>"
+        "<defs><clipPath id='half' clipPathUnits='objectBoundingBox'>"
+        "<rect width='.5' height='1'/></clipPath></defs>"
+        "<rect x='50' y='5' width='40' height='20' fill='#0000ff' "
+        "clip-path='url(#half)'/>"
+        "<svg x='10' y='35' width='20' height='20' viewBox='0 0 20 20'>"
+        "<rect x='-10' y='-10' width='40' height='40' fill='#00ff00'/></svg>"
+        "<g clip-path='url(#late)'><rect x='50' y='35' width='40' "
+        "height='20' fill='#ff00ff'/></g>"
+        "<defs><clipPath id='late'><rect x='50' y='35' width='10' height='20'/>"
+        "<rect x='80' y='35' width='10' height='20'/></clipPath></defs>"
+        "<g transform='translate(50 30) rotate(90)' style='clip-path:url(\"#half\")'>"
+        "<rect width='20' height='10' fill='#ffff00'/></g>"
+        "</svg>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    unsigned char *pixels = image_svg_decode(markup, sizeof(markup) - 1,
+        &budget, MIB, &width, &height);
+    bool okay = pixels != NULL && width == 100 && height == 60;
+    static const int samples[][6] = {
+        {15,10,255,0,0,255}, {35,10,0,0,0,0}, {5,5,0,0,0,0},
+        {55,10,0,0,255,255}, {80,10,0,0,0,0},
+        {15,40,0,255,0,255}, {5,40,0,0,0,0}, {35,40,0,0,0,0},
+        {55,40,255,0,255,255}, {85,40,255,0,255,255}, {70,40,0,0,0,0},
+        {45,35,255,255,0,255}, {45,45,0,0,0,0}
+    };
+    for (size_t i = 0; okay && i < sizeof(samples) / sizeof(samples[0]); i++) {
+        const unsigned char *p = pixels
+            + ((size_t) samples[i][1] * 100u + (size_t) samples[i][0]) * 4u;
+        for (unsigned channel = 0; channel < 4; channel++) {
+            if (p[channel] != samples[i][channel + 2]) {
+                fprintf(stderr, "SVG clip sample %zu channel %u: %u != %d\n",
+                    i, channel, p[channel], samples[i][channel + 2]);
+                okay = false;
+            }
+        }
+    }
+    budget_free(&budget, pixels);
+    for (size_t failure = 0; okay && failure < 80; failure++) {
+        budget_inject_failure_after(&budget, failure);
+        width = height = 0;
+        pixels = image_svg_decode(markup, sizeof(markup) - 1,
+            &budget, MIB, &width, &height);
+        budget_clear_failure_injection(&budget);
+        budget_free(&budget, pixels);
+        okay = budget.current == 0;
+    }
+    return okay && budget.current == 0;
+}
+
 #define SVG_RETARGET_STRIPES(fill)                                          \
     "<rect width='256' height='256' fill='#ffffff'/>"                       \
     "<rect x='0' width='32' height='256' fill='" fill "'/>"                 \
@@ -162,6 +219,34 @@ static const ImageResource *svg_retarget_icon(NavigationSession *navigation,
     node = node == NULL ? NULL : node->first_child;
     return node == NULL ? NULL
         : images_find_node(&navigation->page.images, node);
+}
+
+static bool test_inline_svg_css_viewport_preserves_circle(void)
+{
+    static const char html[] =
+        "<!doctype html><style>svg{display:block;width:32px;height:20px}</style>"
+        "<div id=icon><svg width=32 height=32 viewBox='0 0 18 18'>"
+        "<circle cx=9 cy=9 r=5 fill='blue'/></svg></div>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) navigation_enable_external_resources(&navigation,
+        2, 32768, 16384, 8, 524288, 262144, MIB, 1000);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool okay = ready && navigation_commit_html(&navigation, generation,
+        "https://viewport.test/", html, sizeof(html) - 1u,
+        480, NULL, NULL, true);
+    const ImageResource *image = okay ? svg_retarget_icon(&navigation, "icon") : NULL;
+    okay = image != NULL && image->width == 32 && image->height == 20
+        && svg_retarget_pixel(image, 4, 10)[3] == 0
+        && svg_retarget_pixel(image, 16, 5)[3] > 240
+        && svg_retarget_pixel(image, 16, 14)[3] > 240;
+    if (!okay) fprintf(stderr, "CSS SVG viewport mismatch %dx%d\n",
+        image == NULL ? 0 : image->width, image == NULL ? 0 : image->height);
+    if (ready) navigation_destroy(&navigation);
+    return okay && budget.current == 0;
 }
 
 /* Icons with a 256-unit viewBox (two inline, one a data: <img>) painted at

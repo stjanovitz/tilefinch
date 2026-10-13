@@ -423,7 +423,14 @@ bool layout_block_flexrow_section(LayoutContext *context,
                               remaining, cursor_x, child_basis, child_width);
             int child_bottom = cursor_y;
             size_t command_start = context->layout->count;
-            if (item->anonymous_text) {
+            if (item->generated_pseudo != PSEUDO_NONE) {
+                if (!layout_generated_flex_item(context, item, cursor_x,
+                    cursor_y, child_width, content_width, child_containing_height,
+                    &child_bottom)) {
+                    flex_order_plan_destroy(row_order);
+                    return false;
+                }
+            } else if (item->anonymous_text) {
                 if (!layout_anonymous_text(context, item, node, cursor_x,
                                            cursor_y, child_width,
                                            &child_bottom)) {
@@ -553,8 +560,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
         while (flex_iterator_next(aligned_items, aligned_item)) {
             if (aligned_item->style.out_of_flow
                 || aligned_item->style.fixed_position) continue;
-            const LayoutNodeBox *aligned_box = layout_box_for_node(
-                context->layout, aligned_item->node);
+            const LayoutNodeBox *aligned_box = flex_item_box(
+                context->layout, aligned_item);
             if (aligned_box == NULL) continue;
             int aligned_bottom = layout_add_coordinate(
                 layout_add_coordinate(aligned_box->y, aligned_box->height),

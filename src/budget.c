@@ -1,3 +1,4 @@
+#define TILEFINCH_BUDGET_IMPLEMENTATION 1
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 #include "diagnostic_trace.h"
@@ -569,16 +570,18 @@ void *budget_realloc_category(Budget *budget, BudgetCategory category,
         return NULL;
     }
     size_t new_charge = sizeof(AllocationHeader) + size;
-    if (new_charge > budget->limit - base) {
+    if (new_charge > old_charge
+        && (base > budget->limit
+            || new_charge > budget->limit - base)) {
         /* Ask for room for the growth only; the old block stays charged
            until realloc succeeds. */
-        if (new_charge <= old_charge
-            || !budget_admit_charge(budget, new_charge - old_charge)) {
+        if (!budget_admit_charge(budget, new_charge - old_charge)) {
             budget->failure_count++;
             return NULL;
         }
         base = budget->current - old_charge;
-        if (new_charge > budget->limit - base) {
+        if (base > budget->limit
+            || new_charge > budget->limit - base) {
             budget->failure_count++;
             return NULL;
         }

@@ -25,6 +25,68 @@ static bool psp_input_script_ever_ready;
 static bool psp_input_script_saw_exit;
 static uint32_t psp_input_script_previous_buttons;
 static uint16_t psp_input_script_last_press_step;
+static PspUiState psp_input_script_last_presented_ui;
+static bool psp_input_script_last_presented_valid;
+static struct {
+    uint64_t requested_us, sampled_us;
+    uint16_t buttons, step;
+    PspUiState before;
+} psp_input_script_response;
+
+uint64_t psp_input_script_request_time(uint64_t sampled_us)
+{
+    return psp_input_script.pressed_us != 0
+        ? psp_input_script.pressed_us : sampled_us;
+}
+
+static void psp_input_script_measure_edge(const PspUiInput *input,
+                                         uint16_t step, uint64_t sampled_us)
+{
+    if (input == NULL || input->pressed == 0
+        || psp_input_script.pressed_us == 0) return;
+    printf("tilefinch-input-request: step=%u buttons=0x%04x "
+           "requested-us=%llu sampled-us=%llu wait-us=%llu\n",
+           (unsigned) step, (unsigned) input->pressed,
+           (unsigned long long) psp_input_script.pressed_us,
+           (unsigned long long) sampled_us,
+           (unsigned long long) (sampled_us - psp_input_script.pressed_us));
+    if ((input->pressed & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_TOOLBAR)) == 0)
+        return; /* Page focus and scroll use their accepted-frame receipts. */
+    if (!psp_input_script_last_presented_valid) return;
+    if (psp_input_script_response.requested_us != 0)
+        printf("tilefinch-input-response: step=%u shown=0 reason=superseded\n",
+               (unsigned) psp_input_script_response.step);
+    psp_input_script_response.requested_us = psp_input_script.pressed_us;
+    psp_input_script_response.sampled_us = sampled_us;
+    psp_input_script_response.buttons = (uint16_t) input->pressed;
+    psp_input_script_response.step = step;
+    psp_input_script_response.before = psp_input_script_last_presented_ui;
+}
+
+void psp_input_script_measure_presented(const PspUiState *ui)
+{
+    if (ui == NULL) return;
+    bool changed = psp_input_script_response.requested_us != 0
+        && (((psp_input_script_response.buttons & PSP_UI_BUTTON_MENU) != 0
+             && ui->screen != psp_input_script_response.before.screen)
+            || ((psp_input_script_response.buttons & PSP_UI_BUTTON_TOOLBAR) != 0
+                && ui->chrome_visible
+                       != psp_input_script_response.before.chrome_visible));
+    if (changed) {
+        uint64_t presented_us = sceKernelGetSystemTimeWide();
+        printf("tilefinch-input-response: step=%u shown=1 elapsed-us=%llu "
+               "wait-us=%llu screen=%u chrome=%u\n",
+               (unsigned) psp_input_script_response.step,
+               (unsigned long long) (presented_us
+                    - psp_input_script_response.requested_us),
+               (unsigned long long) (psp_input_script_response.sampled_us
+                    - psp_input_script_response.requested_us),
+               (unsigned) ui->screen, (unsigned) ui->chrome_visible);
+        psp_input_script_response.requested_us = 0;
+    }
+    psp_input_script_last_presented_ui = *ui;
+    psp_input_script_last_presented_valid = true;
+}
 
 /* End-to-end Page-controls evidence. Script step counts prove only that the
    validation source emitted input; these counters sit at the Gamepad API
@@ -190,6 +252,8 @@ bool psp_input_script_begin(
     psp_input_script_saw_exit = false;
     psp_input_script_previous_buttons = 0;
     psp_input_script_last_press_step = 0;
+    psp_input_script_last_presented_valid = false;
+    memset(&psp_input_script_response, 0, sizeof(psp_input_script_response));
     psp_input_gamepad_connected_frames = 0;
     psp_input_gamepad_button_frames = 0;
     psp_input_gamepad_analog_frames = 0;
@@ -286,7 +350,7 @@ bool psp_input_script_running(void)
 unsigned psp_input_script_step_now(const char **kind)
 {
     static const char *const names[] = {
-        "wait", "hold", "press", "mark", "stick", "end", "until"
+        "wait", "hold", "press", "mark", "stick", "end", "until", "timed-press"
     };
     const PspInputScript *script = &psp_input_script;
     unsigned index = script->step;
@@ -319,10 +383,12 @@ bool psp_input_script_frame(
 {
     if (ready) psp_input_script_ever_ready = true;
     uint16_t frame_step = psp_input_script.step;
+    psp_input_script.now_us = sceKernelGetSystemTimeWide();
     bool driving = psp_input_script_advance_with_page(
         &psp_input_script, input, psp_input_script_previous_buttons,
         ready, page_ready);
     if (input != NULL) {
+        psp_input_script_measure_edge(input, frame_step, psp_input_script.now_us);
         psp_input_script_previous_buttons = input->held;
         if (input->pressed != 0) {
             psp_input_script_last_press_step = frame_step;
@@ -342,13 +408,18 @@ bool psp_input_script_frame(
 
 bool psp_input_script_busy_frame(PspUiInput *input)
 {
+    /* Do not request shutdown with authored presses still in the owner
+       FIFO. The main stepper is called only after those receivers drain. */
+    if (psp_input_script_eof_pending(&psp_input_script)) return false;
     /* The callback-thread supervisor may advance explicit live commands while
        the main thread is inside the receiver for its original press. Preserve
        that main-thread step attribution until the receiver returns. */
     uint16_t frame_step = psp_input_script.step;
+    psp_input_script.now_us = sceKernelGetSystemTimeWide();
     bool driving = psp_input_script_advance(
         &psp_input_script, input, psp_input_script_previous_buttons, false);
     if (input != NULL) {
+        psp_input_script_measure_edge(input, frame_step, psp_input_script.now_us);
         psp_input_script_previous_buttons = input->held;
         if (input->pressed != 0) {
             psp_input_script_last_press_step = frame_step;

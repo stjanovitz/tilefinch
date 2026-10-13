@@ -141,6 +141,57 @@ console.log(JSON.stringify([audit.summary(1),audit.summary(2),unexpected.summary
         self.assertFalse(unexpected["failures"][0]["expected"])
         self.assertEqual(old["failures"][0]["url"], "https://images.test/final")
 
+    def test_protocol_audit_includes_favicons_and_requires_replay_before_cancellation(self) -> None:
+        script = r'''
+const make=require(process.argv[1]).createRequestAudit;
+const audit=make(), root={}, child={_captureKey:"frame"};
+const begin=(a,s,id,url,redirect=false)=>a.networkBegin(s,{requestId:id,
+ request:{url,method:"GET"},type:"Other",...(redirect?{redirectResponse:{status:302}}:{})});
+begin(audit,root,"1","https://page.test/");audit.networkEnd(root,{requestId:"1"});
+begin(audit,root,"2","https://page.test/favicon.ico");audit.networkEnd(root,{requestId:"2"});
+begin(audit,child,"1","https://page.test/redirect");
+begin(audit,child,"1","https://page.test/result",true);
+audit.networkFulfilled(child,{networkId:"1"});
+audit.networkEnd(child,{requestId:"1",canceled:true,errorText:"net::ERR_ABORTED"},true);
+const unknown=make();begin(unknown,root,"3","https://page.test/unknown");
+unknown.networkEnd(root,{requestId:"3",canceled:true,errorText:"net::ERR_ABORTED"},true);
+const transport=make();begin(transport,root,"4","https://page.test/broken");
+transport.networkFulfilled(root,{networkId:"4"});
+transport.networkEnd(root,{requestId:"4",canceled:false,errorText:"net::ERR_FAILED"},true);
+console.log(JSON.stringify([audit.summary(4),unknown.summary(1),transport.summary(1)]));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        audit, unknown, transport = json.loads(result.stdout)
+        self.assertTrue(audit["ready"])
+        self.assertEqual(audit["observed"], 4)
+        self.assertEqual(audit["failures"][0]["reason"], "canceled-replayed-response")
+        self.assertFalse(unknown["ready"])
+        self.assertFalse(transport["ready"])
+
+    def test_oopif_completion_transfers_only_its_exact_document_ticket(self) -> None:
+        script = r'''
+const make=require(process.argv[1]).createRequestAudit;
+const parent={},child={_captureKey:"child",_captureTargetId:"frame-id"};
+const begin=(a,type,frameId)=>a.networkBegin(parent,{requestId:"shared-id",
+ request:{url:"https://page.test/frame",method:"GET"},type,frameId});
+const good=make();begin(good,"Document","frame-id");
+good.networkEnd(child,{requestId:"shared-id"});
+const wrongType=make();begin(wrongType,"Image","frame-id");
+wrongType.networkEnd(child,{requestId:"shared-id"});
+const wrongFrame=make();begin(wrongFrame,"Document","other-frame");
+wrongFrame.networkEnd(child,{requestId:"shared-id"});
+console.log(JSON.stringify([good.summary(1),wrongType.summary(1),wrongFrame.summary(1)]));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good, wrong_type, wrong_frame = json.loads(result.stdout)
+        self.assertTrue(good["ready"])
+        self.assertFalse(wrong_type["ready"])
+        self.assertFalse(wrong_frame["ready"])
+
     def test_frame_target_refusal_cannot_report_ready(self) -> None:
         script = r'''
 (async()=>{
@@ -244,6 +295,19 @@ console.log(JSON.stringify({summary:capture.summary(),failures}));
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(expected, completed.stderr)
+
+    def test_only_explicitly_excluded_unload_beacons_are_suppressed(self) -> None:
+        script = r'''
+const c=require(process.argv[1]);const blocked=c.parseBlockedOrigins("example.test/metrics/","fixture");
+console.log(JSON.stringify([
+c.isSuppressedTeardownBeacon("POST","beacon","https://example.test/metrics/close",blocked),
+c.isSuppressedTeardownBeacon("POST","fetch","https://example.test/metrics/close",blocked),
+c.isSuppressedTeardownBeacon("GET","beacon","https://example.test/metrics/close",blocked),
+c.isSuppressedTeardownBeacon("POST","beacon","https://example.test/unexpected",blocked)]));
+'''
+        result = subprocess.run((NODE, "-e", script, str(CAPTURE)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [True, False, False, False])
 
     def test_blocked_origins_accept_hosts_and_first_party_routes(self) -> None:
         script = (

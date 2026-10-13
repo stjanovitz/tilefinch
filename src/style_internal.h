@@ -42,6 +42,9 @@ enum {
 #include <ctype.h>
 #include <string.h>
 
+#undef budget_malloc
+#undef budget_calloc
+#undef budget_realloc
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_STYLE, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_STYLE, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_STYLE, (p), (s))
@@ -71,8 +74,10 @@ typedef struct {
 
 typedef struct {
     char name[STYLE_WEB_FONT_NAME_CAPACITY];
-    StyleWebFontFaceSource regular;
-    StyleWebFontFaceSource bold;
+    union {
+        struct { StyleWebFontFaceSource regular; StyleWebFontFaceSource bold; };
+        StyleWebFontFaceSource faces[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
+    };
 } StyleWebFontFamily;
 
 struct StyleWebFonts {
@@ -294,6 +299,8 @@ struct StyleMathProgram {
 
 #define STYLE_TEXT_DECORATION_OWN UINT16_C(0x0001)
 #define STYLE_TEXT_DECORATION_ANCESTOR UINT16_C(0x0002)
+/* Declaration-only CSS-wide value; resolved before publication. */
+#define STYLE_TEXT_DECORATION_INHERIT UINT16_C(0x1000)
 #define STYLE_TEXT_OFFSET_SHIFT 2
 #define STYLE_TEXT_OFFSET_MASK UINT16_C(0x007c)
 #define STYLE_ANCESTOR_TEXT_OFFSET_SHIFT 7
@@ -803,6 +810,8 @@ typedef struct {
 
 void style_match_subject_prepare(lxb_dom_node_t *node,
                                  StyleMatchSubject *subject);
+bool style_subject_tag_matches(const StyleMatchSubject *subject,
+                               const char *wanted, size_t length);
 bool style_rule_selector_matches_subject(
     const Stylesheet *sheet, size_t rule_index, lxb_dom_node_t *node,
     const StyleMatchSubject *subject);
@@ -999,8 +1008,11 @@ typedef struct StyleShadowScope {
     const lxb_dom_node_t *carrier;
 } StyleShadowScope;
 
+/* Reserve before parsing a shadow <style>: a refused scope must not leave
+   already-published rules applying to the whole document. */
+bool stylesheet_reserve_shadow_scope(Stylesheet *sheet);
 /* Records the rules [begin, end) just parsed from `element` as confined to
-   its shadow tree when it lies in a carrier. Refusal keeps them global. */
+   its shadow tree. The caller must have reserved a slot first. */
 void stylesheet_note_shadow_scope(Stylesheet *sheet,
                                   const lxb_dom_node_t *element,
                                   unsigned begin, unsigned end);
@@ -1459,7 +1471,7 @@ bool stylesheet_select_image_source_slot(Stylesheet *sheet, uint8_t slot);
 bool stylesheet_current_image_source_slot(Stylesheet *sheet, uint8_t *slot);
 void style_parse_transform_translation(Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 bool style_parse_text_underline_offset(const Stylesheet *sheet, const char *text, size_t length, unsigned *offset_code);
-bool style_parse_text_decoration_underline(const Stylesheet *sheet, const char *text, size_t length, bool *underline);
+bool style_parse_text_decoration_underline(const Stylesheet *sheet, const char *text, size_t length, bool *underline, bool *inherit);
 uint64_t style_parse_padding_box(Stylesheet *sheet, const char *text, size_t length, StyleEdges *edges);
 uint64_t style_parse_margin_box(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 int style_parse_line_height(const Stylesheet *sheet, const char *text, size_t length);

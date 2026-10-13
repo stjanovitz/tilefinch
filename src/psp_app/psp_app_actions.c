@@ -98,12 +98,6 @@ static void psp_app_finish_focus_action(
        clear page_dirty as though those changes had reached the screen.
        Spend one bounded input-priority slice; unfinished work stays dirty for
        the normal render scheduler, ahead of optional resource work. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_focus_feedback_begin(app->browser->engine, (int) intent->action,
-                             frame->replayed_press_us != 0
-                                 ? frame->replayed_press_us
-                                 : frame->ui_sample_us);
-#endif
     /* Over a live canvas this loop would render and present again after
        the page's animation callbacks: two compositions per move. Present
        the move now and skip this iteration's callbacks, unless the
@@ -111,8 +105,51 @@ static void psp_app_finish_focus_action(
        the move to the loop's own canvas frame. */
     bool single_composition = frame->canvas_live;
     if (single_composition && frame->runtime_deferred) return;
-    BrowserRenderJobStatus rendered = browser_engine_render_frame_bounded(
-        app->browser->engine, PSP_RENDER_JOB_BUDGET_US, 4u);
+    if (psp_navigation_cooperate_page_input_pending()) {
+        (void) psp_engine_views_refresh(app->views, app->browser->engine);
+        frame->defer_runtime = true;
+        return;
+    }
+    /* Focus dispatch may replace the render shell. Refresh borrowed views
+       before arming another scope; cache preparation keeps this framebuffer
+       unchanged and render-compose suppresses owner presents during writes. */
+    bool supervise_paint = !single_composition
+        && !psp_navigation_cooperate_active()
+        && !app->process->presentation.ui.page_gamepad_capture
+        && psp_engine_views_refresh(app->views, app->browser->engine)
+        && app->views->frame != NULL;
+    if (supervise_paint)
+        psp_runtime_cooperate_begin(&app->process->presentation.ui,
+            app->views->frame, &app->interactive->toolbar_input);
+    BrowserRenderJobStatus rendered = browser_engine_render_frame_bounded_cancelable(
+        app->browser->engine, PSP_RENDER_JOB_BUDGET_US,
+        single_composition ? 4u : 0u,
+        supervise_paint ? psp_navigation_cancellation() : NULL);
+    uint32_t observed_buttons = 0;
+    if (supervise_paint && psp_runtime_cooperate_end(&observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(observed_buttons);
+    if (rendered == BROWSER_RENDER_JOB_PENDING && !single_composition
+        && !psp_navigation_cooperate_page_input_pending()
+        && browser_engine_render_placeholder_frame(app->browser->engine, NULL)
+        && psp_engine_views_refresh(app->views, app->browser->engine)) {
+        /* The cache-only pass never waits on the first cold tile. Show the
+           selected position/indicator from resident pixels now; the job owns
+           all unfinished tiles and keeps running ahead of optional work. */
+        psp_sync_ui(&app->process->presentation.ui, app->browser->engine,
+                    app->browser->profile);
+        if (psp_present_internal(app->views->frame,
+                                &app->process->presentation.ui, true)) {
+            frame->focus_partial_presented = true;
+            frame->page_dirty = false;
+            frame->defer_runtime = true;
+            intent->visual_changed = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            printf("tilefinch-focus-preview: at-us=%llu action=%d\n",
+                   (unsigned long long) sceKernelGetSystemTimeWide(),
+                   (int) intent->action);
+#endif
+        }
+    }
     if (rendered != BROWSER_RENDER_JOB_COMPLETE
         || !psp_engine_views_refresh(app->views, app->browser->engine)) return;
     psp_sync_ui(
@@ -136,6 +173,12 @@ static void psp_app_dispatch_focus_action(
     PspApp *app, PspAppFrameState *frame, PspUiIntent *intent)
 {
     BrowserEngine *engine = app->browser->engine;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Arm before the pre-author native focus presentation, not only after
+       the potentially expensive event/layout dispatch has returned. */
+    psp_focus_feedback_begin(engine, (int) intent->action,
+        frame->replayed_press_us != 0 ? frame->replayed_press_us : frame->ui_sample_us);
+#endif
     bool supervise = !psp_navigation_cooperate_active()
         && app->views->frame != NULL
         && !app->process->presentation.ui.page_gamepad_capture;

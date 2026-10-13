@@ -1,3 +1,104 @@
+static int test_youtube_provider_layout_states(void)
+{
+    static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"channelId\":\"UCabcdefghijklmnopqrstuv\",\"title\":\"Big Buck Bunny - Official Short Film\","
+        "\"author\":\"Fixture studio\",\"lengthSeconds\":\"596\"}};</script>";
+    int title_height = 0;
+    for (unsigned signed_in = 0; signed_in < 2u; signed_in++) {
+        char fixture[128], error[256] = {0};
+        CHECK(write_document_replay(fixture,
+            "https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1",
+            watch, sizeof(watch)-1u, 200, "")
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
+        BrowserConfig config; browser_config_init(&config, &device);
+        config.resources.enabled = config.resources.web_fonts_enabled = false;
+        CHECK(browser_config_set_font_paths(&config,
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Oblique-Latin.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Bold-Latin.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Bold-Latin.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf",
+            TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Bold.ttf", 1536u * 1024u));
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine);
+        if (signed_in) CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+            "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+        CHECK(browser_engine_load_url(engine,
+            "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details", true));
+        while (!browser_engine_baseline_fonts_ready(engine)) CHECK(browser_engine_pump_baseline_fonts(engine));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+        const LayoutNodeBox *title = NULL;
+        for (size_t i = 0; i < nav->page.layout.node_box_count; i++)
+            if (nav->page.layout.node_boxes[i].node->local_name == LXB_TAG_H1)
+                title = &nav->page.layout.node_boxes[i];
+        CHECK(title && title->width > 200);
+        if (!signed_in) title_height = title->height;
+        else CHECK(title->height == title_height);
+        lxb_dom_node_t *actions = test_reader_find_id(root, "yt-watch-actions");
+        const LayoutNodeBox *box = layout_box_for_node(&nav->page.layout, actions);
+        CHECK(box && box->width >= 450 && box->y > title->y + title->height);
+        CHECK((test_reader_find_id(root, "yt-like-action") != NULL) == (signed_in != 0));
+        CHECK((test_reader_find_id(root, "yt-watch-signin") != NULL) == (signed_in == 0));
+        lxb_dom_node_t *offline = test_reader_find_id(root, "yt-offline-save");
+        const LayoutNodeBox *offline_box = layout_box_for_node(&nav->page.layout, offline);
+        CHECK(offline_box && offline_box->width == 40 && offline_box->height == 36);
+        size_t label_length = 0;
+        const char *label = document_attribute(offline, "aria-label", &label_length);
+        CHECK(label && label_length == strlen("Save video offline")
+            && !memcmp(label, "Save video offline", label_length));
+        size_t text_length = 0;
+        lxb_char_t *text = lxb_dom_node_text_content(
+            lxb_dom_interface_node(nav->page.document.html->body), &text_length);
+        CHECK(text && !strstr((const char *)text, "Select the thumbnail to retry"));
+        lxb_dom_document_destroy_text(root->owner_document, text);
+        if (!signed_in) {
+            const LayoutNodeBox *signin_box = layout_box_for_node(&nav->page.layout,
+                test_reader_find_id(root, "yt-watch-signin"));
+            CHECK(signin_box && abs((signin_box->y + signin_box->height / 2)
+                - (offline_box->y + offline_box->height / 2)) <= 1
+                && offline_box->x >= signin_box->x + signin_box->width + 8);
+        }
+        if (signed_in) {
+            CHECK(youtube_header_baselines_match(engine));
+            lxb_dom_node_t *menu = test_reader_find_id(root, "yt-watch-account");
+            lxb_dom_node_t *unlike = test_reader_find_id(root, "yt-unlike-action");
+            CHECK(menu && unlike && !layout_box_for_node(&nav->page.layout, unlike));
+            static const char *const primary_ids[] = {"yt-subscribe-action", "yt-like-action",
+                "yt-watch-later-add", "yt-playlist-save", "yt-offline-save"};
+            int previous_right = -1;
+            for (unsigned i = 0; i < 5u; i++) {
+                lxb_dom_node_t *node = test_reader_find_id(root, primary_ids[i]);
+                const LayoutNodeBox *action_box = layout_box_for_node(&nav->page.layout, node);
+                CHECK(action_box && action_box->y == offline_box->y
+                    && action_box->width == 40 && action_box->height == 36
+                    && action_box->x >= previous_right && action_box->x + action_box->width <= 470);
+                previous_right = action_box->x + action_box->width;
+                label = document_attribute(node, "aria-label", &label_length);
+                CHECK(label && label_length != 0);
+            }
+            const LayoutNodeBox *menu_box = layout_box_for_node(&nav->page.layout, menu->first_child);
+            CHECK(menu_box && menu_box->y == offline_box->y && menu_box->x >= previous_right);
+            ControllerAction action = {0};
+            CHECK(browser_engine_focus_node(engine, menu->first_child)
+                && browser_engine_activate(engine, &action)
+                && layout_box_for_node(&nav->page.layout, unlike)
+                && browser_engine_focus_node(engine, unlike));
+            CHECK(browser_engine_focus_node(engine, menu->first_child)
+                && browser_engine_activate(engine, &action)
+                && !layout_box_for_node(&nav->page.layout, unlike));
+        }
+        CHECK(browser_engine_render_frame(engine, NULL));
+        Budget *owned = browser_engine_budget(engine);
+        CHECK(browser_engine_shutdown(engine) && owned->current == 0);
+        browser_engine_destroy(engine); fetch_trace_end(); remove_google_identity_replay(fixture, 1u);
+    }
+    return 0;
+}
+
 static int test_youtube_filters_and_chapters(void)
 {
     static const char search[] = "<script>var ytInitialData='{\"contents\":["
@@ -35,8 +136,18 @@ static int test_youtube_filters_and_chapters(void)
         CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
             && youtube_lite_load_take_document(job, &document)
             && strstr(document.html, "id=yt-filter-panel") != NULL);
-        snprintf(selected, sizeof(selected), "<option value=%u selected>", date);
-        CHECK(strstr(document.html, selected));
+        static const char *const fields[] = {"tilefinch_date", "tilefinch_duration", "tilefinch_sort"};
+        unsigned values[] = {date, duration, sort};
+        for (unsigned field = 0; field < 3u; field++) {
+            char opening[64];
+            snprintf(opening, sizeof(opening), "<select id=%s ", fields[field]);
+            const char *start = strstr(document.html, opening);
+            CHECK(start);
+            const char *end = strstr(start, "</select>");
+            snprintf(selected, sizeof(selected), "<option value=%u selected>", values[field]);
+            const char *option = strstr(start, selected);
+            CHECK(end && option && option < end);
+        }
         if (i != 0) {
             char suffix[96];
             snprintf(suffix, sizeof(suffix), "tilefinch_date=%u&amp;tilefinch_duration=%u&amp;tilefinch_sort=%u&amp;tilefinch_token=fixture-next",
@@ -135,13 +246,28 @@ static int test_youtube_filters_and_chapters(void)
     NavigationSession *nav = browser_engine_navigation(engine);
     lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
     lxb_dom_node_t *panel = test_reader_find_id(root, "yt-filter-panel");
+    CHECK(panel && !lxb_dom_element_has_attribute(lxb_dom_interface_element(panel),
+        (const lxb_char_t *) "open", 4u));
+    ComputedStyle panel_style = style_for_node(&nav->page.stylesheet, panel, NULL);
+    CHECK(panel_style.padding.top >= 12 && panel_style.padding.left >= 12);
+    CHECK(!layout_box_for_node(&nav->page.layout,
+        test_reader_find_id(root, "tilefinch_date")));
     ControllerAction action = {0};
     CHECK(panel && browser_engine_focus_node(engine, panel->first_child)
         && browser_engine_activate(engine, &action)
         && action.type == CONTROLLER_ACTION_CONTROL);
     static const char *const select_ids[] = {"tilefinch_date", "tilefinch_duration", "tilefinch_sort"};
+    CHECK(browser_engine_focus_node(engine, panel->first_child)
+        && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
+    lxb_dom_node_t *first_field = controller_focused_node(browser_engine_controller(engine));
+    CHECK(first_field == test_reader_find_id(root, select_ids[0])
+        || first_field == test_reader_find_id(root, select_ids[1])
+        || first_field == test_reader_find_id(root, select_ids[2]));
     for (unsigned i = 0; i < 3; i++) {
         root = lxb_dom_interface_node(nav->page.document.html);
+        ComputedStyle field_style = style_for_node(&nav->page.stylesheet,
+            test_reader_find_id(root, select_ids[i]), NULL);
+        CHECK(field_style.padding.top >= 4 && field_style.padding.left >= 8);
         CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, select_ids[i]))
             && browser_engine_activate(engine, &action));
     }
@@ -153,6 +279,9 @@ static int test_youtube_filters_and_chapters(void)
         && strstr(action.url, "tilefinch_date=1")
         && strstr(action.url, "tilefinch_duration=1")
         && strstr(action.url, "tilefinch_sort=1"));
+    /* Compact filters now fit on the first screen. Explicitly scroll so the
+       history assertion still exercises a nonzero results position. */
+    CHECK(browser_engine_scroll_by(engine, 50));
     ControllerFocusKind results_focus_kind = browser_engine_controller(engine)->focus_kind;
     size_t results_focus_index = browser_engine_controller(engine)->focus_index;
     int results_scroll_y = navigation_current(nav)->scroll_y;
@@ -160,6 +289,9 @@ static int test_youtube_filters_and_chapters(void)
     CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-search"))
         && browser_engine_replace_text(engine, "edited fixture", 14u));
     CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-filter-apply")));
+    if (navigation_current(nav)->scroll_y != results_scroll_y)
+        CHECK(browser_engine_scroll_by(engine,
+            results_scroll_y - navigation_current(nav)->scroll_y));
     CHECK(browser_engine_commit_html(engine, watch_url, chapters.html, chapters.html_length, true));
     root = lxb_dom_interface_node(nav->page.document.html);
     panel = test_reader_find_id(root, "yt-chapters");
@@ -192,6 +324,65 @@ static int test_youtube_filters_and_chapters(void)
         && strstr(action.url, "tilefinch_duration=1")
         && strstr(action.url, "tilefinch_sort=1"));
     fetch_trace_end(); remove_google_identity_replay(fixture, 1u);
+    /* Exercise Apply through the native navigation receiver, not just its
+       serialized URL. Only the exact combined filter request can replay. */
+    CHECK(write_document_replay(fixture,
+        "https://m.youtube.com/results?search_query=fixture&sp=CAMSBAgCGAQ%3D",
+        search, strlen(search), 200, "")
+        && fetch_trace_replay_begin(fixture, error, sizeof(error))
+        && browser_engine_begin_navigation_action(engine, &action,
+            config.maximum_document_bytes, config.navigation_timeout_ms));
+    for (unsigned turn = 0; turn < 512u && browser_engine_navigation_pending(engine); turn++)
+        (void) browser_engine_pump_navigation(engine, NULL);
+    CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded
+        && nav->page.runtime == NULL && fetch_trace_replay_served_count() == 1u);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    panel = test_reader_find_id(root, "yt-filter-panel");
+    CHECK(panel && !lxb_dom_element_has_attribute(lxb_dom_interface_element(panel),
+        (const lxb_char_t *) "open", 4u)
+        && !layout_box_for_node(&nav->page.layout, test_reader_find_id(root, "tilefinch_date")));
+    static const char *const expected_selection[] = {"01000", "0100", "01"};
+    for (unsigned i = 0; i < 3u; i++) {
+        char state[8];
+        size_t count = controller_select_history(test_reader_find_id(root, select_ids[i]),
+            state, sizeof(state), false);
+        CHECK(count == strlen(expected_selection[i])
+            && !memcmp(state, expected_selection[i], count));
+    }
+    fetch_trace_end(); remove_google_identity_replay(fixture, 1u);
+    CHECK(browser_engine_focus_node(engine, panel->first_child)
+        && browser_engine_activate(engine, &action));
+    for (unsigned i = 0; i < 3u; i++) {
+        CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, select_ids[i])));
+        for (size_t cycle = 1u; cycle < strlen(expected_selection[i]); cycle++)
+            CHECK(browser_engine_activate(engine, &action)
+                && action.type == CONTROLLER_ACTION_CONTROL);
+    }
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-filter-apply"))
+        && browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT);
+    CHECK(write_document_replay(fixture,
+        "https://m.youtube.com/results?search_query=fixture",
+        search, strlen(search), 200, "")
+        && fetch_trace_replay_begin(fixture, error, sizeof(error))
+        && browser_engine_begin_navigation_action(engine, &action,
+            config.maximum_document_bytes, config.navigation_timeout_ms));
+    for (unsigned turn = 0; turn < 512u && browser_engine_navigation_pending(engine); turn++)
+        (void) browser_engine_pump_navigation(engine, NULL);
+    CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded
+        && fetch_trace_replay_served_count() == 1u);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    panel = test_reader_find_id(root, "yt-filter-panel");
+    CHECK(panel && !lxb_dom_element_has_attribute(lxb_dom_interface_element(panel),
+        (const lxb_char_t *) "open", 4u));
+    for (unsigned i = 0; i < 3u; i++) {
+        char state[8];
+        size_t count = controller_select_history(test_reader_find_id(root, select_ids[i]),
+            state, sizeof(state), false);
+        CHECK(count == strlen(expected_selection[i]) && state[0] == '1');
+        for (size_t option = 1; option < count; option++) CHECK(state[option] == '0');
+    }
+    fetch_trace_end(); remove_google_identity_replay(fixture, 1u);
     static const char select_fixture[] = "<form><select id=s multiple>"
         "<optgroup><option value=same selected>A</option>"
         "<option value=same disabled>B</option></optgroup>"
@@ -204,6 +395,7 @@ static int test_youtube_filters_and_chapters(void)
     char selected[128], observed[128];
     CHECK(controller_select_history(select, selected, sizeof(selected), false) == 3
         && !memcmp(selected, "101", 3));
+    CHECK(controller_select_history(select, selected, 3, true) == 0);
     memcpy(observed, "010", 3);
     CHECK(controller_select_history(select, observed, 2, true) == 0);
     CHECK(controller_select_history(select, observed, 3, true) == 3);

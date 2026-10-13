@@ -57,6 +57,16 @@ An allocation refusal or collection in that interval must not dereference NULL.
 `test_quickjs_oom --bind-refusal-only` refuses each allocation in turn, checks
 the exception, and verifies that the first successful bind remains callable.
 
+Context creation publishes to the runtime lists only after its prototype
+table and module list are initialized. Refusing that table must not leave a
+freed, unmarkable context for collection during runtime teardown. Creating
+the global object's hidden variable table can also fail; the initializer
+must return before treating that exception as an object pointer.
+`test_quickjs_oom --context-refusal-only` sweeps every raw/full context
+initialization allocation with both single and persistent refusal, checking
+guard bytes and complete release. The lab variants retain this fix, and their
+scope-OOM patch has anchored context so it cannot land in a neighboring function.
+
 Numeric primitive indexed writes to in-bounds Float32Array/Float64Array views
 run directly in the interpreter. Int32-to-float32 writes avoid an unnecessary
 intermediate double conversion on soft-float targets. Non-numeric values and

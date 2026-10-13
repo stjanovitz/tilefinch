@@ -194,6 +194,118 @@ teardown:
     return 0;
 }
 
+typedef struct {
+    size_t calls;
+    size_t metadata_checkpoints;
+    bool stop_before_first;
+} ImageAdmissionInputProbe;
+
+static bool image_admission_input_probe(void *opaque, const char *phase,
+                                        size_t completed)
+{
+    ImageAdmissionInputProbe *probe = opaque;
+    if (phase != NULL && strcmp(phase, "fetch-replay-prepare") == 0) {
+        probe->metadata_checkpoints++;
+        /* Input polling cannot turn a valid record into corrupt metadata.
+           The refusal is acted on at the next admission boundary. */
+        return false;
+    }
+    if (phase == NULL || strcmp(phase, "image-admission-boundary") != 0)
+        return true;
+    probe->calls++;
+    return !probe->stop_before_first && completed == 0;
+}
+
+int test_deferred_image_admission_yields_to_input(void)
+{
+    uint16_t *reference = NULL;
+    size_t reference_count = 0;
+    for (unsigned lane = 0; lane < 5; lane++) {
+        BrowserDeviceProfile profile;
+        browser_device_profile_psp3000(&profile);
+        BrowserConfig config;
+        browser_config_init(&config, &profile);
+        config.memory_limit = 24u * MIB;
+        config.javascript.enabled = true;
+        config.javascript.document_scripts_enabled = true;
+        config.resources.enabled = true;
+        config.resources.web_fonts_enabled = false;
+        config.resources.maximum_images = 12;
+        char error[256] = {0};
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
+            error, sizeof(error)));
+        CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        size_t attempts = nav->page.images.stats.attempted;
+        size_t failures = nav->page.images.stats.failed;
+        if (lane != 0) {
+            bool partial = lane == 2 || lane == 4;
+            ImageAdmissionInputProbe probe = {.stop_before_first = !partial};
+            TilefinchPlatformServices services = {
+                .context = &probe, .cooperate = image_admission_input_probe
+            };
+            tilefinch_platform_set_services(&services);
+            bool changed = false;
+            CHECK(browser_engine_run_deferred_image_work(engine, &changed));
+            CHECK(probe.calls == (partial ? 2u : 1u)
+                && !changed && nav->page.deferred_image_job != NULL
+                && nav->page.images.stats.attempted == attempts + (partial ? 1u : 0u)
+                && nav->page.images.stats.failed == failures
+                && nav->performance.background_image_failures == 0
+                && nav->page.deferred_image_targets[0].retry_count == 0);
+            if (partial) {
+                CHECK(nav->page.deferred_image_batch_count == 1u
+                    && probe.metadata_checkpoints != 0);
+            } else {
+                CHECK(probe.metadata_checkpoints == 0);
+                /* Repeated input deferral neither admits transport nor
+                   consumes retry attempts. The same job remains resumable. */
+                ImagePriorityLoadJob *job = nav->page.deferred_image_job;
+                for (unsigned repeat = 0; repeat < 3; repeat++)
+                    CHECK(browser_engine_run_deferred_image_work(engine, &changed)
+                        && nav->page.deferred_image_job == job
+                        && nav->page.images.stats.attempted == attempts
+                        && nav->page.images.stats.failed == failures);
+            }
+            tilefinch_platform_set_services(NULL);
+        }
+        if (lane < 3) {
+            for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 512; pump++) {
+                bool changed = false;
+                (void) browser_engine_run_deferred_image_work(engine, &changed);
+            }
+            CHECK(!nav->page.image_continuation_pending
+                && nav->performance.background_images_loaded == 3u
+                && nav->performance.background_image_failures == 0
+                && nav->page.images.stats.failed == failures
+                && browser_engine_render_frame(engine, NULL));
+            size_t count = 0;
+            const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+            CHECK(pixels != NULL && count != 0);
+            if (reference == NULL) {
+                reference = malloc(count * sizeof(*reference));
+                CHECK(reference != NULL);
+                memcpy(reference, pixels, count * sizeof(*reference));
+                reference_count = count;
+            } else {
+                CHECK(count == reference_count
+                    && memcmp(reference, pixels, count * sizeof(*reference)) == 0);
+            }
+        }
+        /* Lanes 3/4 retire never/partially admitted jobs instead of resuming. */
+        fetch_trace_end();
+        CHECK(browser_engine_shutdown(engine));
+        BrowserEngineMetrics metrics = {0};
+        CHECK(browser_engine_metrics(engine, &metrics)
+            && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+        browser_engine_destroy(engine);
+    }
+    free(reference);
+    return 0;
+}
+
 /* A batch whose resources are already committed must survive a publication
    relayout that rebuilds the image table. The rebuild reloads the batch like
    every eager image instead of excluding it; excluding it would present the

@@ -54,7 +54,10 @@ typedef enum {
     PSP_INPUT_SCRIPT_STEP_END,
     /* Idle frames that end early once the host reports the script's page
        condition met: a bounded wait for readiness instead of a fixed one. */
-    PSP_INPUT_SCRIPT_STEP_UNTIL
+    PSP_INPUT_SCRIPT_STEP_UNTIL,
+    /* A press due after delay_ms of wall time; late sampling retains its
+       original due time so response measurements include the polling gap. */
+    PSP_INPUT_SCRIPT_STEP_TIMED_PRESS
 } PspInputScriptStepKind;
 
 typedef struct {
@@ -64,6 +67,7 @@ typedef struct {
     bool advance_in_text_entry;
     uint16_t buttons;
     uint16_t ticks;
+    uint16_t delay_ms;
     uint8_t analog_x;
     uint8_t analog_y;
     char mark[PSP_INPUT_SCRIPT_MARK_CAPACITY];
@@ -90,6 +94,12 @@ typedef struct {
     /* Set by the host when the current `until` step's condition holds; the
        step then ends on its next frame. */
     bool condition_met;
+    /* Optional host clock for tap-after-live. Existing frame-based scripts
+       never consult it. pressed_us is nonzero only on the emitted edge. */
+    uint64_t now_us;
+    uint64_t step_due_us;
+    uint64_t next_step_due_us;
+    uint64_t pressed_us;
     /* Borrowed from the current step for exactly the frame it fires on. */
     const char *mark;
 } PspInputScript;
@@ -149,6 +159,10 @@ bool psp_input_script_advance(
 bool psp_input_script_advance_with_page(
     PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
     bool ready, bool page_ready);
+
+/* Finishing EOF belongs to the owner, after queued receiver actions drain.
+   A cooperation callback may drive live steps but must defer this boundary. */
+bool psp_input_script_eof_pending(const PspInputScript *script);
 
 /* Non-NULL only on the frame a `mark` step fires. */
 const char *psp_input_script_mark(const PspInputScript *script);

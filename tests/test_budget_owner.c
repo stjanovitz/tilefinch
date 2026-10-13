@@ -86,6 +86,24 @@ int main(void)
     budget_free(&budget, first.allocation);
     CHECK(budget.current == 0 && budget_owner_violations() == 2);
 
+    /* A tightened ceiling can leave unrelated live allocations above it.
+       Reallocating one small block must not wrap limit - base and admit
+       growth while the overall ledger is already over the new ceiling. */
+    void *retained = budget_malloc(&budget, 64);
+    void *resizable = budget_malloc(&budget, 16);
+    CHECK(retained != NULL && resizable != NULL);
+    size_t charged = budget.current;
+    budget.limit = 1;
+    CHECK(budget_realloc(&budget, resizable, 32) == NULL);
+    CHECK(budget.current == charged && budget_usable_size(resizable) == 16);
+    void *smaller = budget_realloc(&budget, resizable, 8);
+    CHECK(smaller != NULL && budget.current == charged - 8);
+    resizable = smaller;
+    budget.limit = 1024;
+    budget_free(&budget, resizable);
+    budget_free(&budget, retained);
+    CHECK(budget.current == 0);
+
     puts("budget owner checks: PASS");
     return 0;
 }

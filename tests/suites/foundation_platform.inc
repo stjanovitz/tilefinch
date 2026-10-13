@@ -1292,6 +1292,9 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         document.route == YOUTUBE_LITE_ROUTE_HOME
         && strstr(document.html, "public mobile-page data") == NULL
         && strstr(document.html, "Lightweight view") == NULL
+        && strstr(document.html, "Suggestions will load") == NULL
+        && strstr(document.html, "Refresh suggestions") == NULL
+        && strstr(document.html, "id=yt-feed-status") == NULL
         && strstr(
                document.html,
                "id=yt-search name=search_query type=search "
@@ -1567,6 +1570,9 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         fprintf(stderr, "youtube lite watch: %s\n", error);
         return false;
     }
+    const char *hero = strstr(document.html, "<section class=watch-hero>");
+    const char *hero_end = hero == NULL ? NULL : strstr(hero, "</section>");
+    const char *hero_svg = hero == NULL ? NULL : strstr(hero, "<svg");
     bool watch_ok =
         document.route == YOUTUBE_LITE_ROUTE_WATCH
         && document.result_count == 0
@@ -1594,7 +1600,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
          * The overlay badge is painted by the block decoration path, not
          * decoded as an image.  Pin the whole recipe -- 50x38 at radius 12 in
          * #25282b/76%, centred on left 50% / top 64px -- and pin that no
-         * inline <svg> comes back: an inline SVG only paints when the image
+         * inline <svg> comes back inside the play target: an inline SVG only paints when the image
          * pipeline runs, so it disappeared under an image cap.
          */
         && strstr(document.html,
@@ -1604,7 +1610,12 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
                   "background:rgba(37,40,43,.76);z-index:1}") != NULL
         && strstr(document.html,
                   "<span class=play-icon aria-hidden=true></span>") != NULL
-        && strstr(document.html, "<svg") == NULL
+        && hero_end != NULL && (hero_svg == NULL || hero_svg > hero_end)
+        /* Action vectors retain painted fallbacks independently of the
+           mandatory play badge above. */
+        && strstr(document.html, "aria-label=\"Save video offline\"") != NULL
+        && strstr(document.html, "class=\"action-icon icon-download\"") != NULL
+        && strstr(document.html, "<i class=a></i><i class=b></i><i class=c></i>") != NULL
         && strstr(document.html, "fill-opacity") == NULL
         && strstr(document.html,
                   "<span class=play-glyph aria-hidden=true>"
@@ -2636,13 +2647,23 @@ static int test_foundation(void)
         "matchMedia('(min-height:500px)').matches].join(':')</script></body>";
     NavigationSession dual_navigation;
     CHECK(navigation_init(&dual_navigation, &budget, 2));
-    navigation_enable_scripts(&dual_navigation, 2 * MIB, 1000);
+    /* This tests viewport semantics, not the bootstrap's minimum heap.
+       Leave room for lifecycle events in the expanded platform surface. */
+    navigation_enable_scripts(&dual_navigation, 3 * MIB, 1000);
     uint64_t dual_generation = navigation_begin(&dual_navigation);
-    CHECK(navigation_commit_html(
+    bool dual_committed = navigation_commit_html(
               &dual_navigation, dual_generation,
               "https://viewport.test/", dual_viewport_page,
-              strlen(dual_viewport_page), 480, NULL, NULL, true)
-          && dual_navigation.page.layout.width == 980
+              strlen(dual_viewport_page), 480, NULL, NULL, true);
+    if (!dual_committed || strcmp(dual_navigation.page.script_result.summary,
+            "980:556:480:272:980:556:0.489796:980:556:true:true") != 0)
+        fprintf(stderr, "dual viewport committed=%d width=%d height=%d summary=%s error=%s navigation=%s budget=%zu/%zu failures=%zu\n",
+            dual_committed, dual_navigation.page.layout.width,
+            dual_navigation.page.layout.viewport.css_height,
+            dual_navigation.page.script_result.summary,
+            dual_navigation.page.script_result.error, dual_navigation.last_error,
+            budget.current, budget.limit, budget.failure_count);
+    CHECK(dual_committed && dual_navigation.page.layout.width == 980
           && dual_navigation.page.layout.viewport.css_height == 556
           && dual_navigation.page.layout.viewport.device_width == 480
           && dual_navigation.page.layout.viewport.device_height == 272

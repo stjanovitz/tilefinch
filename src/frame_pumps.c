@@ -1,5 +1,12 @@
 #include "tilefinch/frame_pumps.h"
 
+bool frame_paint_progress_due(uint64_t now, uint64_t last,
+                              bool scrolled, bool progressed)
+{
+    return scrolled || (progressed
+        && (last == 0 || now < last || now - last >= UINT64_C(16000)));
+}
+
 #define PUMP(id) FRAME_PUMP_BIT(FRAME_PUMP_##id)
 
 /* Optional page work never competes with the surfaces the user is looking

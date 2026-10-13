@@ -41,6 +41,7 @@ typedef struct {
 
 typedef struct {
     const FontFace *face;
+    uint64_t face_serial;
     unsigned codepoint;
     int pixel_height;
     bool bold;
@@ -55,6 +56,7 @@ typedef struct {
 
 typedef struct {
     const void *identity;
+    uint64_t serial;
     unsigned char *pixels;
     int width;
     int height;
@@ -66,6 +68,7 @@ typedef struct {
 
 typedef struct {
     const void *identity;
+    uint64_t serial;
     unsigned char *pixels;
     int source_width;
     int source_height;
@@ -243,6 +246,7 @@ typedef struct {
     const LayoutDocument *source_layout;
     LayoutDocument visual_layout;
     bool owns_visual_layout;
+    bool retain_layout_rasters;
     /* Slots, allocated on first use. The first
        RENDER_TILE_BASE_CAPACITY behave as before; later ones hold paint-ahead
        and are allocated only with budget headroom and released first. */
@@ -324,6 +328,9 @@ typedef struct {
     struct RenderGradientCache *gradient_cache;
     size_t gradient_lut_hits;
     size_t gradient_lut_builds;
+    uint64_t gradient_span_pixels; /* Host/validation only; zero on ordinary PSP. */
+    uint64_t gradient_direct_pixels; /* Host/validation only; zero on ordinary PSP. */
+    uint64_t image_span_pixels; /* Host/validation only; zero on ordinary PSP. */
     bool overflow_cache_disabled;
     bool fast_text_raster;
     size_t overflow_cache_bytes;
@@ -436,6 +443,11 @@ typedef struct {
        frame: a cancel request persists to the caller's next checkpoint. */
     const char *raster_cooperate_phase;
     uint64_t raster_slice_started_us;
+    /* Cache/tiles may yield while the incumbent frame remains immutable.
+       Composition cannot: it overwrites that same authoritative buffer. */
+    size_t preparation_visits;
+    bool frame_composing;
+    bool preparation_polling;
     /* Bumped whenever which overflow content is baked into tiles may have
        changed: an overflow box scrolled, or the overflow cache was rebuilt
        or lost. */
@@ -509,7 +521,8 @@ bool tile_cache_canvas_frame_fast_eligible(
     const TileCache *cache, int scroll_y,
     int viewport_width, int viewport_height);
 /* maximum_units limits newly rasterized tiles, not resident cache hits.
-   Cached-tile checks remain deadline- and viewport-bounded. */
+   Zero permits a cache-only pass. Cached-tile checks remain deadline- and
+   viewport-bounded. */
 RenderFrameWorkResult tile_cache_prepare_frame_bounded(
     TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
     uint64_t budget_us, size_t maximum_units);

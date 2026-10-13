@@ -2353,6 +2353,217 @@ static bool test_stylesheet_pressure_omits_optional_sheet(void)
     return ok && clean;
 }
 
+static bool resource_publication_attempt(size_t refusal_after,
+                                         size_t *attempts)
+{
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet "
+        "href='https://fixture.test/layout.css'>"
+        "<body id=probe class=external-flex>readable</body>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool replaying = false;
+    bool ok = installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    if (ok) replaying = begin_layout_css_replay();
+    ok = ok && replaying;
+    if (ok) {
+        budget_inject_failure_after(&budget, refusal_after);
+        bool loaded = stylesheets_load_external_tracked(
+            &document, &stylesheet, &budget, "https://fixture.test/page",
+            4, 4096, 4096, 1000, NULL, NULL, &resources, &stats);
+        size_t counted = SIZE_MAX - budget.failure_injection_countdown;
+        size_t refusals = budget.injected_failure_count;
+        budget_clear_failure_injection(&budget);
+        lxb_dom_node_t *probe = document.html == NULL ? NULL
+            : find_element_id(lxb_dom_interface_node(document.html), "probe");
+        ok = probe != NULL;
+        if (loaded && ok) {
+            ComputedStyle style = style_for_node(&stylesheet, probe, NULL);
+            ok = style.display != DISPLAY_NONE;
+        }
+        if (refusal_after == SIZE_MAX) {
+            *attempts = counted;
+            ok = ok && loaded && stats.loaded == 1u && *attempts > 0u
+                && *attempts < 128u;
+        } else {
+            /* Optional resource refusal may report a usable, unstyled page
+               or fail the transaction; both must release all ownership. */
+            ok = ok && refusals == 1u;
+        }
+    }
+    if (replaying) fetch_trace_end();
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
+static bool test_fetched_stylesheet_publication_refusal_sweep(void)
+{
+    size_t attempts = 0u;
+    if (!resource_publication_attempt(SIZE_MAX, &attempts)) return false;
+    for (size_t point = 0u; point < attempts; point++) {
+        size_t ignored = 0u;
+        if (!resource_publication_attempt(point, &ignored)) {
+            fprintf(stderr, "resource publication refusal %zu/%zu failed\n",
+                    point, attempts);
+            return false;
+        }
+    }
+    /* A fresh publication after the entire refusal sweep must still work. */
+    size_t ignored = 0u;
+    return resource_publication_attempt(SIZE_MAX, &ignored);
+}
+
+static bool redirected_publication_attempt(const char *replay_directory,
+                                           size_t refusal_after,
+                                           size_t *attempts)
+{
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet "
+        "href='https://fixture.test/start.css'><body>retained</body>";
+    static const char page[] = "https://document.example/page";
+    static const char requested[] = "https://fixture.test/start.css";
+    static const char final[] = "https://cdn.example/final.css";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    bool replaying = false;
+    bool ok = installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480);
+    if (ok) {
+        char error[256] = {0};
+        replaying = fetch_trace_replay_begin(
+            replay_directory, error, sizeof(error));
+        ok = replaying;
+    }
+    if (ok) {
+        budget_inject_failure_after(&budget, refusal_after);
+        bool loaded = stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, page, page, "unsafe-url",
+            4u, 4096u, 4096u, 1000, NULL, NULL, &resources, &stats);
+        size_t counted = SIZE_MAX - budget.failure_injection_countdown;
+        size_t refusals = budget.injected_failure_count;
+        budget_clear_failure_injection(&budget);
+        if (refusal_after == SIZE_MAX) {
+            *attempts = counted;
+            ok = loaded && stats.loaded == 1u
+                && *attempts > 0u && *attempts < 128u;
+        } else {
+            ok = refusals == 1u;
+        }
+        for (size_t i = 0u; i < resources.count; i++) {
+            const StylesheetDocumentResource *entry = &resources.items[i];
+            if (entry->url == NULL || strcmp(entry->url, requested) != 0)
+                continue;
+            ok = ok && (entry->response_provenance_known
+                ? entry->response_url != NULL
+                  && strcmp(entry->response_url, final) == 0
+                  && strcmp(entry->response_referrer_policy,
+                            "no-referrer") == 0
+                : entry->response_url == NULL
+                  && entry->response_referrer_policy[0] == '\0');
+            if (refusal_after == SIZE_MAX)
+                ok = ok && entry->response_provenance_known;
+        }
+    }
+    if (replaying) fetch_trace_end();
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
+static bool test_redirected_publication_refusal_sweep(void)
+{
+    static const char page[] = "https://document.example/page";
+    static const StylesheetReplayRecord replay[] = {{
+        .url = "https://fixture.test/start.css",
+        .body = "body{color:#123456}",
+        .effective_url = "https://cdn.example/final.css",
+        .request_referer = page,
+        .request_sec_fetch_site = "cross-site",
+        .request_credential_origin = page,
+        .request_initiator_url = page,
+        .request_referrer_source = page,
+        .request_referrer_policy = "unsafe-url",
+        .response_referrer_policy = "no-referrer",
+        .response_cache_control = "max-age=3600",
+        .status = 200
+    }};
+    char replay_directory[128] = {0};
+    if (!write_stylesheet_replay(replay_directory, replay, 1u)) return false;
+    size_t attempts = 0u;
+    bool ok = redirected_publication_attempt(
+        replay_directory, SIZE_MAX, &attempts);
+    for (size_t point = 0u; ok && point < attempts; point++) {
+        size_t ignored = 0u;
+        ok = redirected_publication_attempt(replay_directory, point, &ignored);
+        if (!ok) fprintf(stderr, "redirected publication refusal %zu failed\n",
+                         point);
+    }
+    size_t ignored = 0u;
+    if (ok) ok = redirected_publication_attempt(
+        replay_directory, SIZE_MAX, &ignored);
+    remove_stylesheet_replay(replay_directory, 1u);
+    return ok;
+}
+
+static bool test_resource_ledger_url_and_provenance_refusals(void)
+{
+    static const char requested[] = "https://fixture.test/start.css";
+    static const char redirected[] = "https://cdn.example/final.css";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    StylesheetDocumentResources resources = {.budget = &budget};
+    budget_inject_failure_after(&budget, 0u);
+    bool retained = stylesheet_document_resources_retain(
+        &resources, requested, requested, "no-referrer", NULL, 0u,
+        false, TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+    bool ok = !retained && budget.injected_failure_count == 1u
+        && resources.count == 0u && budget.current == 0u;
+    budget_clear_failure_injection(&budget);
+    ok = ok && stylesheet_document_resources_retain(
+        &resources, requested, requested, "no-referrer", NULL, 0u,
+        false, TILEFINCH_CREDENTIALS_INCLUDE, NULL)
+        && resources.count == 1u
+        && resources.items[0].response_provenance_known;
+    budget_inject_failure_after(&budget, 0u);
+    retained = stylesheet_document_resources_retain(
+        &resources, requested, redirected, "no-referrer", NULL, 0u,
+        false, TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+    ok = ok && !retained && budget.injected_failure_count == 2u
+        && resources.count == 1u
+        && !resources.items[0].response_provenance_known
+        && resources.items[0].response_url == NULL
+        && resources.items[0].response_referrer_policy[0] == '\0';
+    budget_clear_failure_injection(&budget);
+    ok = ok && stylesheet_document_resources_retain(
+        &resources, requested, redirected, "no-referrer", NULL, 0u,
+        false, TILEFINCH_CREDENTIALS_INCLUDE, NULL)
+        && resources.items[0].response_provenance_known
+        && resources.items[0].response_url != NULL
+        && strcmp(resources.items[0].response_url, redirected) == 0;
+    stylesheet_document_resources_destroy(&resources);
+    return ok && budget.current == 0u;
+}
+
 /* Synthetic sheet shapes: many short rules, long selector lists sharing a
    declaration block, a :root block of custom properties (unused ones are
    dropped at parse), rules nested in matching @media blocks, and rules whose
@@ -3550,6 +3761,9 @@ int main(int argc, char **argv)
 } while (0)
     RUN_TEST(test_nonmatching_media_settles_without_applying);
     RUN_TEST(test_response_ledger_copy_is_transactional);
+    RUN_TEST(test_fetched_stylesheet_publication_refusal_sweep);
+    RUN_TEST(test_redirected_publication_refusal_sweep);
+    RUN_TEST(test_resource_ledger_url_and_provenance_refusals);
     RUN_TEST(test_rebuild_preserves_admitted_links);
     RUN_TEST(test_integrity_mismatch_rejects_stylesheet);
     RUN_TEST(test_integrity_is_scoped_to_each_link_element);

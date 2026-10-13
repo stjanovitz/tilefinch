@@ -45,6 +45,19 @@ class InteractiveUntilTest(unittest.TestCase):
         self.assertIn('loop-until matched=yes iterations=0 cap=100', result.stdout)
         self.assertIn('loop-js ok=yes value="0"', result.stdout)
 
+    def test_action_reports_separate_cpu_and_wall_clocks(self):
+        result = self.run_lab('focus-next\nquit\n')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        import re
+        row = re.search(r'interaction-latency command=focus-next total-us=(\d+) '
+                        r'cpu-us=(\d+) cpu-clock-valid=([01])', result.stdout)
+        self.assertIsNotNone(row, result.stdout)
+        self.assertGreater(int(row[1]), 0)
+        if row[3] == '1':
+            self.assertGreater(int(row[2]), 0)
+        else:
+            self.assertEqual(int(row[2]), 0)
+
     def test_exhaustion_refuses_a_success_report(self):
         result = self.run_lab('until 3 16 false\nquit\n')
         self.assertNotEqual(result.returncode, 0, result.stdout)

@@ -1,4 +1,5 @@
 #include "tilefinch/resources.h"
+#include "tilefinch_test_faults.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -3465,6 +3466,48 @@ bool fonts_external_loader_pending(const ExternalFontLoader *loader)
     return loader != NULL && loader->active;
 }
 
+_Static_assert(TILEFINCH_WEB_FONT_FAMILY_LIMIT <= 8
+    && TILEFINCH_WEB_FONT_FAMILY_LIMIT * TILEFINCH_WEB_FONT_WEIGHT_LIMIT
+        * STYLE_WEB_FONT_SOURCE_LIMIT <= 64, "font continuation masks must cover all sources");
+
+static bool font_loader_next(ExternalFontLoader *loader, const Stylesheet *sheet)
+{
+    size_t count = stylesheet_web_font_source_count(sheet);
+    for (size_t at = 0; at < count && at < 64; at++) {
+        StylesheetWebFontSource source = {0};
+        if ((loader->processed_sources & (UINT64_C(1) << at)) == 0
+            && (!loader->usage_filter
+                || (stylesheet_web_font_source(sheet, at, &source)
+                    && source.family_slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT
+                    && (loader->required_families & (1u << source.family_slot)) != 0))) {
+            loader->next_source = at;
+            return true;
+        }
+    }
+    loader->next_source = count;
+    return false;
+}
+
+void fonts_external_loader_set_usage(ExternalFontLoader *loader,
+    const Stylesheet *sheet, uint8_t required_families)
+{
+#ifndef __PSP__
+    if (tilefinch_test_faults()->legacy_web_font_work) return;
+#endif
+    if (loader == NULL || sheet == NULL || loader->cancelled
+        || loader->deadline_ms <= loader->started_ms
+        || (loader->usage_filter && loader->required_families == required_families)) return;
+    bool was_active = loader->active;
+    loader->usage_filter = true;
+    loader->required_families = required_families;
+    loader->active = loader->request_id != 0 || font_loader_next(loader, sheet);
+    if (!was_active && loader->active) {
+        double window = loader->deadline_ms - loader->started_ms;
+        loader->started_ms = resource_now_ms();
+        loader->deadline_ms = loader->started_ms + window;
+    }
+}
+
 void fonts_external_loader_cancel(ExternalFontLoader *loader,
                                   FetchScheduler *scheduler,
                                   ExternalFontStats *stats)
@@ -3477,6 +3520,7 @@ void fonts_external_loader_cancel(ExternalFontLoader *loader,
     }
     loader->request_id = 0;
     loader->active = false;
+    loader->cancelled = true;
     font_loader_update_elapsed(loader, stats);
 }
 
@@ -3502,8 +3546,8 @@ static bool font_loader_resolve_source(
     char resolved[4096])
 {
     if (!stylesheet_web_font_source(sheet, index, source)) return false;
-    *destination = stylesheet_web_font_face(
-        sheet, source->family_slot, source->bold);
+    *destination = stylesheet_web_font_face_at(
+        sheet, source->family_slot, source->face_slot);
     if (*destination == NULL) return false;
     const char *source_base = source->source_base_url != NULL
         ? source->source_base_url : document_base_url;
@@ -3574,9 +3618,8 @@ bool fonts_external_loader_step(
             (void) fetch_scheduler_discard(
                 scheduler, loader->request_id);
             loader->request_id = 0;
-            loader->next_source = loader->pending_source + 1u;
-            loader->active =
-                loader->next_source < stats->sources_discovered;
+            loader->processed_sources |= UINT64_C(1) << loader->pending_source;
+            loader->active = font_loader_next(loader, sheet);
             stats->failed++;
             font_loader_update_elapsed(loader, stats);
             return true;
@@ -3594,9 +3637,8 @@ bool fonts_external_loader_step(
         }
         size_t settled_index = loader->pending_source;
         loader->request_id = 0;
-        loader->next_source = settled_index + 1u;
-        loader->active =
-            loader->next_source < stats->sources_discovered;
+        loader->processed_sources |= UINT64_C(1) << settled_index;
+        loader->active = font_loader_next(loader, sheet);
         StylesheetWebFontSource source = {0};
         FontFace *destination = NULL;
         const char *referrer_source = NULL;
@@ -3662,11 +3704,22 @@ bool fonts_external_loader_step(
             (void) font_charge_encoded_bytes(
                 stats, additional_bytes, maximum_total_encoded_bytes);
         }
-        if (font_face_load_encoded(
+        bool shared = false;
+        const WebFontSet *loaded_fonts = stylesheet_web_font_set(sheet);
+        for (size_t family = 0; loaded_fonts != NULL && !shared
+             && family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
+            for (size_t face = 0; !shared && face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++)
+                shared = font_face_share_encoded(destination,
+                    &loaded_fonts->families[family].faces[face], budget,
+                    (const unsigned char *) fetched->data, fetched->length,
+                    maximum_face_backend_bytes);
+        }
+        if (shared || font_face_load_encoded(
                 destination, budget, (const unsigned char *) fetched->data,
                 fetched->length, maximum_face_backend_bytes)) {
             stats->loaded_faces++;
-            stats->retained_encoded_bytes += destination->data_length;
+            destination->authored_weight = source.weight;
+            if (!shared) stats->retained_encoded_bytes += destination->data_length;
             *face_loaded = true;
         } else {
             stats->failed++;
@@ -3677,12 +3730,25 @@ bool fonts_external_loader_step(
         return true;
     }
 
-    while (loader->next_source < stats->sources_discovered) {
+    while (loader->next_source < stats->sources_discovered
+           && loader->next_source < 64) {
         if (resource_now_ms() >= loader->deadline_ms) {
             font_loader_expire(loader, scheduler, stats);
             return true;
         }
         size_t index = loader->next_source;
+        if ((loader->processed_sources & (UINT64_C(1) << index)) != 0) {
+            loader->next_source++;
+            continue;
+        }
+        StylesheetWebFontSource candidate = {0};
+        if (loader->usage_filter && stylesheet_web_font_source(sheet, index, &candidate)
+            && (candidate.family_slot >= 8
+                || (loader->required_families & (1u << candidate.family_slot)) == 0)) {
+            loader->next_source++;
+            continue;
+        }
+        loader->processed_sources |= UINT64_C(1) << index;
         StylesheetWebFontSource source = {0};
         FontFace *destination = NULL;
         const char *referrer_source = NULL;
@@ -3762,6 +3828,7 @@ bool fonts_external_loader_step(
         FetchPreparedPageRequest *prepared = budget_malloc_category(
             budget, BUDGET_CATEGORY_RESOURCE, sizeof(*prepared));
         if (prepared == NULL) {
+            loader->processed_sources &= ~(UINT64_C(1) << index);
             font_loader_update_elapsed(loader, stats);
             return true;
         }
@@ -3781,6 +3848,7 @@ bool fonts_external_loader_step(
             scheduler, resolved, request, maximum, request_timeout);
         budget_free(budget, prepared);
         if (request_id == 0) {
+            loader->processed_sources &= ~(UINT64_C(1) << index);
             /* A shared page scheduler can be temporarily full. Preserve
                source order and retry this source during the next idle slice. */
             font_loader_update_elapsed(loader, stats);

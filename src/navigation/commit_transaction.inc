@@ -1,7 +1,3 @@
-static void navigation_prepare_layout_reuse(
-    NavigationSession *session, const ScriptMutationJournal *mutations,
-    bool full_rebuild);
-
 #define NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT 128u
 
 static bool navigation_replace_server_body_with_runtime(
@@ -533,7 +529,8 @@ static bool navigation_collect_layout_image_geometry(
 }
 
 static bool navigation_document_images_are_defer_safe(
-    const PocDocument *document, const Stylesheet *stylesheet)
+    const PocDocument *document, const Stylesheet *stylesheet,
+    const ImageResources *images)
 {
     if (document == NULL || document->html == NULL || stylesheet == NULL
         || stylesheet->image_url_count != 0) return false;
@@ -542,7 +539,14 @@ static bool navigation_document_images_are_defer_safe(
     for (lxb_dom_node_t *node = root; node != NULL
          && visited++ < NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT;) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (node_name_is(node, "svg")) return false;
+            if (node_name_is(node, "svg")) {
+                /* Already-published inline artwork needs no network or
+                   discovery in the eager pass. It must not force unrelated
+                   lazy <img> requests onto the commit path. An unprocessed
+                   or refused SVG keeps the existing conservative fallback. */
+                const ImageResource *image = images_find_node(images, node);
+                if (image == NULL || image->pixels == NULL) return false;
+            }
             if (node_name_is(node, "video")) {
                 size_t poster_length = 0;
                 if (document_attribute(node, "poster", &poster_length)
@@ -627,7 +631,7 @@ static bool navigation_plan_static_image_geometry(
         && session->page.images.count == 0
         && (images == NULL || images->count == 0)
         && navigation_document_images_are_defer_safe(
-               &session->page.document, &session->page.stylesheet)) {
+               &session->page.document, &session->page.stylesheet, images)) {
         session->page.layout = probe;
         memset(&probe, 0, sizeof(probe));
         *layout_ready = true;
@@ -2129,7 +2133,7 @@ static bool navigation_commit_document(
             && session->page.deferred_image_count != 0
             && !allow_runtime && streaming == NULL
             && navigation_document_images_are_defer_safe(
-                   &session->page.document, &session->page.stylesheet);
+                   &session->page.document, &session->page.stylesheet, &session->page.images);
         if (image_pipeline_refused) {
             budget_free(session->budget, session->page.deferred_image_targets);
             session->page.deferred_image_targets = NULL;

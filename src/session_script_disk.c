@@ -124,9 +124,11 @@ struct BrowserScriptDisk {
     size_t maximum_bytes;
     bool index_loaded;
     /* Structural changes (packs added or removed) are saved at the next
-       idle turn; last-use stamps only ride along with them. */
+       idle turn, or after a paced retry on Budget refusal. Last-use stamps
+       only ride along with them. */
     bool index_dirty;
     bool index_stamps_dirty;
+    unsigned index_retry_wait;
     uint32_t clock;
     size_t count;
     uint64_t total;
@@ -435,8 +437,9 @@ static void index_load(BrowserSession *session)
 }
 
 /* tmp + remove + rename (FAT does not rename over an existing file). */
-static bool index_save(BrowserSession *session)
+static bool index_save(BrowserSession *session, bool *allocation_refused)
 {
+    if (allocation_refused != NULL) *allocation_refused = false;
     BrowserScriptDisk *disk = session->script_disk;
     char path[SCRIPT_DISK_PATH], temporary[SCRIPT_DISK_PATH];
     if (!index_path(disk, "", path, sizeof(path))
@@ -447,7 +450,10 @@ static bool index_save(BrowserSession *session)
         + disk->count * SCRIPT_DISK_INDEX_ENTRY + SCRIPT_DISK_TRAILER;
     unsigned char *data = budget_malloc_category(
         session->budget, BUDGET_CATEGORY_SESSION, length);
-    if (data == NULL) return false;
+    if (data == NULL) {
+        if (allocation_refused != NULL) *allocation_refused = true;
+        return false;
+    }
     memcpy(data, SCRIPT_DISK_INDEX_MAGIC, 4);
     put_u32(data + 4, SCRIPT_DISK_VERSION);
     put_u32(data + 8, TILEFINCH_QUICKJS_BYTECODE_ABI);
@@ -522,7 +528,7 @@ static void disk_release(BrowserSession *session)
     /* Last-use stamps of a read-only session are not worth a write. */
     if (disk->write && disk->index_loaded
         && (disk->index_dirty || disk->index_stamps_dirty))
-        (void) index_save(session);
+        (void) index_save(session, NULL);
     budget_free(session->budget, disk);
     session->script_disk = NULL;
 }
@@ -1236,8 +1242,19 @@ bool browser_session_script_disk_maintenance(BrowserSession *session)
        crash is an orphan the next sweep removes). */
     if (session_writes(session) && job_start(session)) return true;
     if (disk->index_dirty) {
-        if (!index_save(session)) disk->stats.write_failures++;
-        disk->index_dirty = false;
+        if (disk->index_retry_wait != 0u) {
+            disk->index_retry_wait--;
+            return true;
+        }
+        bool allocation_refused = false;
+        if (!index_save(session, &allocation_refused)) {
+            disk->stats.write_failures++;
+            /* A temporary Budget refusal must not strand a published pack
+               without its index. Pace retries to avoid a per-tick OOM loop. */
+            disk->index_dirty = allocation_refused;
+            if (allocation_refused)
+                disk->index_retry_wait = SCRIPT_DISK_RETRY_FIRST;
+        }
         return true;
     }
     return false;
@@ -1308,6 +1325,6 @@ bool browser_session_script_disk_clear_site(BrowserSession *session,
         if (pack_remove_at(disk, i)) changed = true;
         else ok = false;
     }
-    if (changed) ok = index_save(session) && ok;
+    if (changed) ok = index_save(session, NULL) && ok;
     return ok;
 }

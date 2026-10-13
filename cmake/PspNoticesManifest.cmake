@@ -15,6 +15,7 @@ set(TILEFINCH_NOTICES_MANIFEST
     NOTICES/freetype/FTL.TXT
     NOTICES/freetype/LICENSE.TXT
     NOTICES/freetype/NOTICE-embedded.txt
+    NOTICES/brotli/LICENSE
     # MIT texts for QuickJS, stb, and the diagnostic QR encoder.
     NOTICES/quickjs/LICENSE
     NOTICES/stb/LICENSE

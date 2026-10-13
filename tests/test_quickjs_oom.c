@@ -2719,6 +2719,45 @@ static int run_function_compile_refusal(bool for_heads, size_t refuse_min,
     return failed;
 }
 
+static int run_context_creation_refusals(void)
+{
+    for (unsigned raw = 0; raw < 2; raw++) {
+        for (unsigned once = 0; once < 2; once++) {
+            bool reached = true;
+            size_t point;
+            for (point = 0; reached && point < 8192; point++) {
+                RegexpGuardState state = { .refuse_from = SIZE_MAX };
+                JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+                if (runtime == NULL) return 1;
+                size_t start = state.calls;
+                state.refuse_from = start + point;
+                state.refuse_count = once ? 1u : 0u;
+                fprintf(stderr, "context boundary raw=%u once=%u point=%zu\n",
+                        raw, once, point);
+                JSContext *context = raw ? JS_NewContextRaw(runtime) : JS_NewContext(runtime);
+                reached = state.calls > start + point;
+                state.refuse_from = SIZE_MAX;
+                bool okay = true;
+                if (context != NULL) {
+                    JSValue object = JS_NewObject(context);
+                    okay = !JS_IsException(object);
+                    JS_FreeValue(context, object);
+                    JS_FreeContext(context);
+                }
+                JS_FreeRuntime(runtime);
+                if (!okay || state.corrupted != 0 || state.live != 0) {
+                    fprintf(stderr, "context refusal raw=%u once=%u point=%zu live=%zu\n",
+                            raw, once, point, state.live);
+                    return 1;
+                }
+            }
+            if (reached) return 1;
+            printf("context-refusal raw=%u once=%u points=%zu\n", raw, once, point);
+        }
+    }
+    return 0;
+}
+
 static int run_bound_function_refusals(void)
 {
     bool reached = true;
@@ -2767,6 +2806,8 @@ static int run_bound_function_refusals(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--context-refusal-only") == 0)
+        return run_context_creation_refusals();
     if (argc == 2 && strcmp(argv[1], "--bind-refusal-only") == 0)
         return run_bound_function_refusals();
     if (argc == 2) {
@@ -2776,6 +2817,7 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_context_creation_refusals() != 0) return 1;
     if (run_bound_function_refusals() != 0) return 1;
     if (run_float_array_indexed_stores() != 0) return 1;
 

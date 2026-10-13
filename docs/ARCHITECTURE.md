@@ -381,6 +381,14 @@ consulted a container query, cached intrinsic sizes and table rows are not
 taken from the reuse cache. Partial display lists stay private to the job
 until `layout_build_job_take()` publishes a complete result.
 
+The bounded retained-selector cache can also serve container-query sheets.
+It retains DOM selector matches, including currently inactive conditional
+rules, but rechecks each rule's container condition against current geometry
+on every replay. Changed container geometry invalidates the small condition
+cache; unchanged geometry does not. Cheap property-name and selector-key
+rejections precede container consultations. Allocation refusal declines this
+optional cache and leaves ordinary style resolution available.
+
 #### Input during long scripts
 
 Post-load PSP runtime work arms a lazy, **owner-thread-only** cooperative UI
@@ -418,6 +426,11 @@ The engine uses several PSP-specific fast paths that do not change results:
   offscreen images from idle work one viewport-ranked request and one decode
   at a time, so input and navigation never wait on thumbnail I/O, and decoded
   images stay in the bounded RAM cache for repeat navigations;
+- script-free, fixed-size raster images retain native image slots before
+  decoding. A matching DOM/cascade generation permits paint-only publication
+  and resource-pointer rebinding, retaining unrelated tiles and the visual
+  display list. Intrinsic sizing, author runtimes, fixed/sticky layers and
+  expanding filters keep the full-layout fallback;
 - image discovery carries the computed parent style instead of rebuilding the
   cascade for each image;
 - repeated gradients, glyphs, and tiles use bounded caches with measured
@@ -1298,11 +1311,12 @@ responses and decoded images are not kept. Result cards commit with fixed
 thumbnail geometry, and their explicitly lazy images join the ordinary
 post-paint resource queue.
 
-YouTube detail expansions share this cache for a parsed snapshot of watch
+YouTube details and their expansions share this cache for a parsed snapshot of watch
 facts (at most 16 KiB per entry, never the raw response). The key is the
 mapped watch URL, and the request-cookie fingerprint, language, date format,
-two-minute age limit, and captive-portal exclusion must all match. A normal
-details navigation still fetches fresh data. Description can reuse the parsed
+two-minute age limit, and captive-portal exclusion must all match. Returning
+to details can reuse these facts; an explicit Reload fetches fresh data.
+Description can reuse the parsed
 description with no network job, while Comments fetches only its fresh API
 response. The comments token is discovered in bounded steps alongside the
 original build; unfinished discovery never delays that build and instead sends

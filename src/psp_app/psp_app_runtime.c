@@ -1957,6 +1957,7 @@ bool psp_present_internal(
             metrics->cursor_publish_max_us = publish;
     }
     psp_cadence_published(published);
+    if (published && !media_visible) psp_input_script_measure_presented(ui);
     if (published && !media_visible) psp_focus_feedback_published(frame, ui);
     if (published && media_visible) {
         psp_input_script_capture_media_present(
@@ -2641,7 +2642,12 @@ bool psp_platform_present(
     }
     /* Report the scanout outcome rather than the attempt: a present the
        display service refused is not a frame the user saw. */
-    bool shown = psp_present_internal(pixels, cooperate->ui, false);
+    /* Completion-time raster publication shares the owner supervisor's
+       latest menu/chrome state. The owner copy is adopted only on scope
+       exit; presenting it here would undo an already acknowledged Select. */
+    const PspUiState *shown_ui = cooperate->owner_thread_only
+        ? &cooperate->supervisor_ui : cooperate->ui;
+    bool shown = psp_present_internal(pixels, shown_ui, false);
     cooperate->last_present_us = sceKernelGetSystemTimeWide();
     if (shown) {
         cooperate->presentations++;
@@ -2759,6 +2765,7 @@ static struct {
     BrowserEngine *engine;
     bool completion;
     bool serving;
+    bool painting;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* The oldest press being served, and when its move was first shown,
        for tilefinch-scroll-feedback. */
@@ -2783,6 +2790,10 @@ void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
     psp_runtime_cooperate.engine = NULL;
     psp_runtime_cooperate.completion = false;
     psp_runtime_cooperate.serving = false;
+    psp_runtime_cooperate.painting = false;
+    /* A short render may never activate the lazy supervisor. Its caller
+       still needs a fresh cancellation token, not a prior scope's refusal. */
+    tilefinch_cancellation_init(&psp_navigation_cooperate.cancellation);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_runtime_cooperate.served_press_us = 0;
     psp_runtime_cooperate.served_visible_us = 0;
@@ -3400,6 +3411,12 @@ bool psp_navigation_cooperate_owner_present(const PspUiState *ui)
     return shown;
 }
 
+bool psp_navigation_cooperate_page_input_pending(void)
+{
+    /* The owner reads only the completed FIFO, after the scope fence. */
+    return psp_completed_supervisor_page_input_count != 0;
+}
+
 bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
                                               uint64_t *pressed_us)
 {
@@ -3543,13 +3560,17 @@ static void psp_work_ui_tick(bool owner_thread)
         priority_handled = psp_ui_update_priority_with_page_queue(
             &cooperate->supervisor_ui, &native_input,
             &cooperate->pending_page_input_count);
+        bool native_visual_changed = priority_handled;
         cooperate->pending_page_input_dropped +=
             queued_before - cooperate->pending_page_input_count;
         /* A held Triangle is consumed by the gesture, not replayed as a
            fresh press on return to the main loop. Reader dispatch waits for
            the page's borrowed state to be released. */
         priority_handled |= toolbar_tracking;
-        if (priority_handled) {
+        /* Tracking consumes Triangle without changing presentation. Do not
+           spend a framebuffer copy/vblank on the still-held button: the tap
+           toggles on release, and a hold dispatches Reader only afterward. */
+        if (native_visual_changed) {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             /* Include owner-checkpoint cursor samples, not just the main
                loop: omitting these makes a responsive supervised interval
@@ -3599,7 +3620,10 @@ static void psp_work_ui_tick(bool owner_thread)
                        < PSP_SUPERVISOR_PAGE_INPUT_LIMIT) {
                 cooperate->pending_page_input_us[
                     cooperate->pending_page_input_count] =
-                        sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                        scripted ? psp_input_script_request_time(now_us) :
+#endif
+                        (uint64_t) sceKernelGetSystemTimeWide();
                 cooperate->pending_page_input[
                     cooperate->pending_page_input_count++] = ui_pressed;
             }
@@ -3713,12 +3737,15 @@ static void psp_work_ui_tick(bool owner_thread)
             }
             cooperate->pending_page_input_us[
                 cooperate->pending_page_input_count] =
-                    sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                    scripted ? psp_input_script_request_time(now_us) :
+#endif
+                    (uint64_t) sceKernelGetSystemTimeWide();
             cooperate->pending_page_input[
                 cooperate->pending_page_input_count++] = ui_pressed;
             cooperate->input_acknowledgements++;
             acknowledgement_started_us = sceKernelGetSystemTimeWide();
-            if (owner_thread) {
+            if (owner_thread && !cooperate->page_input_yield_boundary) {
                 psp_ui_show_status(&cooperate->supervisor_ui,
                                   "PAGE UPDATE - INPUT QUEUED", 120);
                 urgent_present = true;
@@ -3750,6 +3777,15 @@ static void psp_work_ui_tick(bool owner_thread)
     }
 #endif
     now_us = sceKernelGetSystemTimeWide();
+    /* At a resumable boundary the queued action itself can provide feedback
+       as soon as this scope returns. A separate status publication would
+       block that receiver on vblank, even though no page work remains owed. */
+    if (!urgent_present && owner_thread
+        && cooperate->page_input_yield_boundary
+        && cooperate->pending_page_input_count != 0) {
+        cooperate->presenting = 0;
+        return;
+    }
     if (!urgent_present && !cooperate->periodic_present) {
         cooperate->presenting = 0;
         return;
@@ -3889,6 +3925,11 @@ static void psp_runtime_serve_completion_scroll(
     uint64_t progress_shown_us = now_us;
     while (browser_engine_completion_frame_pending(engine)
            && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
+        /* The tile boundary deliberately defers to queued focus/activation.
+           Spinning here cannot make progress while that same input waits
+           for the outer layout to return; resume filling after its receiver. */
+        if (cooperate->pending_page_input_count != 0
+            || psp_completed_supervisor_page_input_count != 0) break;
         uint64_t fill_now_us = sceKernelGetSystemTimeWide();
         if (fill_now_us - fill_started_us >= UINT64_C(500000)) break;
         /* A partial frame is a full recompose: show one every 50 ms. */
@@ -3929,6 +3970,20 @@ void psp_show_page_script_clock(PspUiState *ui, const BrowserEngine *engine)
     psp_ui_keep_progress_status(ui, text, 12u, 45u);
 }
 
+static void psp_runtime_cooperate_activate(PspNavigationCooperate *cooperate)
+{
+    if (cooperate->active) return;
+    psp_work_cooperate_begin_internal(
+        psp_runtime_cooperate.ui, psp_runtime_cooperate.frame,
+        psp_runtime_cooperate.ui->page_activation_busy,
+        true, false, "STOPPING PAGE UPDATE...",
+        "page-runtime", NULL, NULL, true);
+    /* Include work before the first checkpoint in gap accounting. */
+    cooperate->started_us = psp_runtime_cooperate.started_us;
+    cooperate->last_checkpoint_us = psp_runtime_cooperate.started_us;
+    cooperate->last_present_us = psp_runtime_cooperate.started_us;
+}
+
 bool psp_platform_cooperate(
     void *context, const char *phase, size_t completed_work_units)
 {
@@ -3940,7 +3995,23 @@ bool psp_platform_cooperate(
         if (sceKernelGetThreadId() != atomic_load_explicit(
                 &psp_runtime_cooperate.owner_thread, memory_order_relaxed))
             return true;
+        if (phase != NULL && strcmp(phase, "render-compose") == 0) {
+            psp_runtime_cooperate.painting = completed_work_units != 0;
+            return true;
+        }
+        if (psp_runtime_cooperate.painting) return true;
+        if (phase != NULL && strcmp(phase, "image-admission-boundary") == 0) {
+            /* Request setup can include synchronous cache/replay I/O.
+               Arm before it starts, not at an eight-millisecond checkpoint
+               that admission may never reach. Native menu/chrome/cursor
+               feedback uses the immutable incumbent; page input queues
+               until the next safe admission boundary. */
+            psp_runtime_cooperate_activate(cooperate);
+        }
         if (phase != NULL && strcmp(phase, "page-focus-feedback") == 0) {
+            /* This is often the first safe point of a focus move. The
+               ordinary eight-millisecond lazy arm has not fired yet. */
+            psp_runtime_cooperate_activate(cooperate);
             BrowserEngine *engine = psp_runtime_cooperate.engine;
             PspUiState *ui = psp_runtime_cooperate.ui;
             if (engine != NULL && ui != NULL
@@ -3975,6 +4046,23 @@ bool psp_platform_cooperate(
                         if (psp_present_internal(psp_supervisor_page_frame(cooperate),
                                                 shown_ui, false)) {
                             uint64_t now_us = sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                            /* This accepted frame already contains the new
+                               native focus ring, even though author styling
+                               has not rendered. Keep that latency distinct
+                               from the later complete-frame receipt. */
+                            if (psp_focus_feedback.engine == engine
+                                && psp_focus_feedback.generation == nav->generation
+                                && !psp_focus_feedback_page_action(psp_focus_feedback.action)
+                                && psp_focus_feedback.first_visible_us == 0) {
+                                psp_focus_feedback.first_visible_us = now_us;
+                                printf("tilefinch-focus-first-visible: action=%d "
+                                       "elapsed=%lluus native=1\n",
+                                       psp_focus_feedback.action,
+                                       (unsigned long long) (now_us
+                                           - psp_focus_feedback.started_us));
+                            }
+#endif
                             cooperate->last_present_us = now_us;
                             cooperate->owner_present_us = now_us;
                             cooperate->presentations++;
@@ -4015,29 +4103,46 @@ bool psp_platform_cooperate(
         uint64_t now = sceKernelGetSystemTimeWide();
         if (!cooperate->active
             && now - psp_runtime_cooperate.started_us >= UINT64_C(8000)) {
-            psp_work_cooperate_begin_internal(
-                psp_runtime_cooperate.ui, psp_runtime_cooperate.frame,
-                psp_runtime_cooperate.ui->page_activation_busy,
-                true, false, "STOPPING PAGE UPDATE...",
-                "page-runtime", NULL, NULL, true);
-            /* Include work before the first checkpoint in gap accounting. */
-            cooperate->started_us = psp_runtime_cooperate.started_us;
-            cooperate->last_checkpoint_us = psp_runtime_cooperate.started_us;
             /* The activation's acknowledgement was presented as it began,
                with the status this scope would show: the periodic present
                is due an interval after that, not at the first tick. */
-            cooperate->last_present_us = psp_runtime_cooperate.started_us;
+            psp_runtime_cooperate_activate(cooperate);
         }
+        /* Owner-only checkpoints borrow completed page pixels. Sample at
+           half a display interval so setup or Triangle release does not
+           consume an entire frame before native feedback. Author dispatch
+           remains deferred until the borrowed page work returns. */
+        uint64_t poll_interval_us = cooperate->owner_thread_only
+            ? UINT64_C(8000) : UINT64_C(16000);
         if (cooperate->active && cooperate->owner_thread_only
             && (psp_runtime_cooperate.last_poll_us == 0
-                || now - psp_runtime_cooperate.last_poll_us >= UINT64_C(16000))) {
+                || now - psp_runtime_cooperate.last_poll_us >= poll_interval_us)) {
             psp_runtime_cooperate.last_poll_us = now;
+            cooperate->page_input_yield_boundary = phase != NULL
+                && (strcmp(phase, "page-task-boundary") == 0
+                    || strcmp(phase, "render-input-boundary") == 0
+                    || strcmp(phase, "image-admission-boundary") == 0);
             psp_work_ui_tick(true);
+            cooperate->page_input_yield_boundary = false;
         }
         if (cooperate->active && psp_runtime_cooperate.completion
             && psp_runtime_cooperate.engine != NULL
-            && !psp_runtime_cooperate.serving)
+            && !psp_runtime_cooperate.serving
+            /* Cache preparation borrows the render shell. Never reenter
+               it to apply a scroll from one of its own checkpoints. */
+            && (phase == NULL || (strncmp(phase, "render-", 7u) != 0
+                && strcmp(phase, "style-prepare") != 0)))
             psp_runtime_serve_completion_scroll(cooperate, now);
+        if (phase != NULL
+            && (strcmp(phase, "page-task-boundary") == 0
+                || strcmp(phase, "render-input-boundary") == 0
+                || strcmp(phase, "image-admission-boundary") == 0)) {
+            /* These are resumable owner boundaries, not VM interrupts.
+               Leave jobs and prepared tiles intact; the main loop dispatches
+               queued focus only after the borrowed page work has returned. */
+            return cooperate->pending_page_input_count == 0
+                && psp_completed_supervisor_page_input_count == 0;
+        }
     }
     if (cooperate == NULL || !cooperate->active) return true;
     if (cooperate->engine != NULL)

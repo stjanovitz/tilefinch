@@ -405,6 +405,7 @@ typedef struct {
        from here, not from its replay. */
     uint64_t pending_page_input_us[4];
     uint8_t pending_page_input_count;
+    bool page_input_yield_boundary;
     uint8_t pending_page_input_dropped;
     /* Latest media command accepted by the callback-thread supervisor while
        the browser thread is inside one bounded decoder/range service. The
@@ -481,6 +482,7 @@ bool psp_navigation_cooperate_take_media_intent(
     PspUiMediaIntent *intent);
 bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
                                               uint64_t *pressed_us);
+bool psp_navigation_cooperate_page_input_pending(void);
 /* Browser loop, each frame of a supervised load: publish liveness and the
    page-screen state, and take the presses forwarded to it. */
 uint32_t psp_navigation_cooperate_owner_frame(bool page_screen);
@@ -1225,6 +1227,9 @@ typedef struct {
     /* A press the supervisor queued during page work: when it was made. */
     uint64_t replayed_press_us;
     bool page_dirty;
+    /* A focus placeholder reached scanout; keep its raster job, but avoid
+       another partial-frame publication until useful progress accumulates. */
+    bool focus_partial_presented;
     bool pointer_activation;
     /* The activation came from a cursor click on the loading page. */
     bool preview_pointer;
@@ -1356,6 +1361,8 @@ bool psp_input_script_frame(
 void psp_webgl_measurement_mark(const char *mark);
 void psp_webgl_measurement_main_frame(void);
 bool psp_input_script_busy_frame(PspUiInput *input);
+uint64_t psp_input_script_request_time(uint64_t sampled_us);
+void psp_input_script_measure_presented(const PspUiState *ui);
 bool psp_input_script_text_frame(PspUiInput *input);
 void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);

@@ -668,6 +668,82 @@ static int test_sliced_restore_retries_cancel(void)
     return 0;
 }
 
+static int test_index_and_pack_budget_refusals_retry(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+        && browser_session_script_disk_configure(&session, directory, true, 0));
+    CHECK(put_group(&session, 0, 64u * KIB,
+                    browser_session_module_bytecode_generation(&session)));
+    (void) idle(&session, 1000);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0u
+          && count_files(directory, ".tfsc", NULL, 0) == 1u);
+
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+        && browser_session_script_disk_configure(&session, directory, true, 0));
+    size_t failures = budget.injected_failure_count;
+    budget_inject_failure_after(&budget, 0u);
+    CHECK(!browser_session_script_disk_usage(&session, NULL, NULL)
+          && budget.injected_failure_count == failures + 1u);
+    budget_clear_failure_injection(&budget);
+    size_t files = 0;
+    CHECK(browser_session_script_disk_usage(&session, NULL, &files)
+          && files == 1u);
+
+    uint32_t generation = browser_session_module_bytecode_generation(&session);
+    failures = budget.injected_failure_count;
+    budget_inject_failure_after(&budget, 0u);
+    CHECK(!group_on_disk(&session, 0, generation)
+          && budget.injected_failure_count == failures + 1u);
+    budget_clear_failure_injection(&budget);
+    CHECK(group_on_disk(&session, 0, generation));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0u);
+    script_test_remove_tree(directory);
+    return 0;
+}
+
+static int test_index_write_budget_refusal_retries(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+        && browser_session_script_disk_configure(&session, directory, true, 0));
+    uint32_t generation = browser_session_module_bytecode_generation(&session);
+    CHECK(put_group(&session, 0, 64u * KIB, generation));
+    budget_inject_failure_after(&budget, 0u);
+    for (unsigned turn = 0u; turn < 1000u
+         && budget.injected_failure_count == 0u; turn++)
+        CHECK(browser_session_script_disk_maintenance(&session));
+    CHECK(budget.injected_failure_count == 1u);
+    budget_clear_failure_injection(&budget);
+    BrowserScriptDiskStats stats = {0};
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.writes == 1u && stats.index_writes == 0u
+        && stats.write_failures == 1u);
+    (void) idle(&session, 1000u);
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.index_writes == 1u && stats.files == 1u);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0u);
+
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+        && browser_session_script_disk_configure(&session, directory, false, 0)
+        && group_on_disk(&session, 0, generation));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0u);
+    script_test_remove_tree(directory);
+    return 0;
+}
+
 static int test_restore_io_failure_is_generation_bounded(void)
 {
     char directory[600];
@@ -1015,6 +1091,10 @@ int main(void)
     failed |= test_ceiling_and_lru();
     failed |= test_sliced_restore_retries_cancel();
     puts("script disk cache: sliced restore retries cancellation");
+    failed |= test_index_and_pack_budget_refusals_retry();
+    puts("script disk cache: index and pack Budget refusals retry");
+    failed |= test_index_write_budget_refusal_retries();
+    puts("script disk cache: index write Budget refusal retries");
     failed |= test_restore_io_failure_is_generation_bounded();
     puts("script disk cache: I/O failure reads once per generation");
     failed |= test_backup_index_survives_primary_refusal();

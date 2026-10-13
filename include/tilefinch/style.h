@@ -86,6 +86,8 @@ typedef struct {
     const char *source_referrer_policy;
     unsigned family_slot;
     bool bold;
+    uint8_t face_slot;
+    uint16_t weight;
 } StylesheetWebFontSource;
 
 typedef struct {
@@ -314,7 +316,9 @@ enum {
 typedef enum {
     PSEUDO_NONE,
     PSEUDO_BEFORE,
-    PSEUDO_AFTER
+    PSEUDO_AFTER,
+    PSEUDO_PLACEHOLDER,
+    PSEUDO_COUNT
 } PseudoElement;
 
 typedef uint8_t VerticalAlign;
@@ -1703,6 +1707,12 @@ static inline int computed_style_resolve_gap(int value, int basis)
     return basis > 0 ? (int) ((int64_t) basis * percent / 100) : 0;
 }
 
+static inline unsigned computed_style_font_weight(const ComputedStyle *style)
+{
+    return style == NULL ? 400u : (style->font_weight != 0
+        ? style->font_weight : (style->font_bold ? 700u : 400u));
+}
+
 static inline int computed_style_font_size_fixed(const ComputedStyle *style)
 {
     if (style == NULL) return 16 * 64;
@@ -1892,6 +1902,10 @@ typedef struct {
     uint8_t pseudo;
     uint8_t container_query;
     bool important;
+    /* Conservative rightmost selector key, as for retained declarations.
+       UINT8_MAX disables rejection for selectors without a safe key. */
+    uint8_t fast_key_suffix_bytes;
+    uint8_t fast_key_length;
     unsigned origin;
     unsigned layer;
     unsigned specificity;
@@ -2166,6 +2180,9 @@ typedef struct {
        (style_subject_has_class), allocated on first use. */
     struct StyleClassTokenCache *class_tokens;
     bool class_tokens_refused;
+    /* Sticky demand from font-relative geometry, including empty boxes.
+       Text-command admission alone must not omit these web families. */
+    uint8_t metric_web_font_families;
     /* Transient layout-owned cooperation state. Unlike resolve_scratch this
        is not saved/restored around nested property reparsing. */
     bool (*selector_cooperate)(
@@ -2208,10 +2225,10 @@ typedef struct {
     /* Rules without a stored fast key indexed under the key their matcher
        requires anyway (escaped or long utility classes and IDs). */
     size_t rule_index_derived_keys;
-    uint32_t rule_index_universal_ends[3];
+    uint32_t rule_index_universal_ends[PSEUDO_COUNT];
     /* Ends of the unscoped head of each universal range (see
        StyleRuleIndexBucket.unscoped), and whether any rule is scoped. */
-    uint32_t rule_index_universal_unscoped_ends[3];
+    uint32_t rule_index_universal_unscoped_ends[PSEUDO_COUNT];
     bool rule_index_scoped_split;
     size_t rule_index_bytes;
     StyleSelectorInstruction *selector_program;
@@ -2417,8 +2434,8 @@ typedef struct {
        carriers, ascending: their rules apply only within that shadow tree
        (and to its host through :host, its assigned light children through
        ::slotted), as shadow encapsulation confines them. Allocated only on
-       pages with such styles; bounded by STYLE_SHADOW_SCOPE_LIMIT, past
-       which a style keeps the old document-wide cascade. */
+       pages with such styles; bounded by STYLE_SHADOW_SCOPE_LIMIT. A shadow
+       style whose scope cannot be recorded is skipped, never made global. */
     struct StyleShadowScope *shadow_scopes;
     uint16_t shadow_scope_count;
     uint16_t shadow_scope_capacity;
@@ -2612,6 +2629,8 @@ bool stylesheet_web_font_source(const Stylesheet *sheet, size_t index,
                                 StylesheetWebFontSource *source);
 FontFace *stylesheet_web_font_face(Stylesheet *sheet, unsigned family_slot,
                                    bool bold);
+FontFace *stylesheet_web_font_face_at(Stylesheet *sheet, unsigned family_slot,
+                                     unsigned face_slot);
 const WebFontSet *stylesheet_web_font_set(const Stylesheet *sheet);
 bool stylesheet_web_font_stats(const Stylesheet *sheet,
                                StylesheetWebFontStats *stats);

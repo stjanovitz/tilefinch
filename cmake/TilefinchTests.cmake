@@ -56,6 +56,11 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;ui;storage" TIMEOUT 20)
     if(NOT PSP)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        add_test(NAME tilefinch-psp-hot-symbol-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psp_hot_symbol_sizes.py")
+        set_tests_properties(tilefinch-psp-hot-symbol-tests PROPERTIES
+            LABELS "tilefinch;unit;tooling;psp" TIMEOUT 30)
         tilefinch_add_test_binary(tilefinch-ui-language-layout-tests
             tests/test_ui_language_layout.c)
         target_link_libraries(tilefinch-ui-language-layout-tests PRIVATE tilefinch_psp_ui)
@@ -132,6 +137,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-native-tier-admission-report-tests PROPERTIES
             LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
         if(TARGET psp-browser-interactive-lab)
+            if(TARGET PkgConfig::TILEFINCH_FFMPEG)
+                add_test(NAME tilefinch-host-player-cleanup-tests
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_player_cleanup.py
+                        $<TARGET_FILE:psp-browser-interactive-lab>)
+                set_tests_properties(tilefinch-host-player-cleanup-tests PROPERTIES
+                    LABELS "tilefinch;unit;media;lifecycle" TIMEOUT 40)
+            endif()
             add_test(NAME tilefinch-interactive-until-tests
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_interactive_until.py
@@ -209,6 +222,11 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tilefinch-diagnostic-switch-registry-tests
             PROPERTIES LABELS "tilefinch;unit;architecture" TIMEOUT 20)
+        add_test(NAME tilefinch-budget-callsite-report-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_budget_callsite_report.py)
+        set_tests_properties(tilefinch-budget-callsite-report-tests
+            PROPERTIES LABELS "tilefinch;unit;allocator;tooling" TIMEOUT 20)
         add_test(NAME tilefinch-public-tree-hygiene-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_public_tree_hygiene.py
@@ -737,9 +755,15 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     tilefinch_add_test_binary(tilefinch-browser-engine-tests
         tests/test_browser_engine.c
+        src/screenshot_png.c
         tests/test_browser_engine_journeys.c
         tests/test_browser_engine_interruptions.c
         tests/test_browser_engine_cleanups.c)
+    tilefinch_add_test_binary(tilefinch-memory-pressure-tests tests/test_memory_pressure.c)
+    target_link_libraries(tilefinch-memory-pressure-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-memory-pressure-tests COMMAND tilefinch-memory-pressure-tests)
+    set_tests_properties(tilefinch-memory-pressure-tests PROPERTIES
+        LABELS "tilefinch;unit;allocator;lifecycle;sanitizer" TIMEOUT 600)
     target_link_libraries(tilefinch-browser-engine-tests PRIVATE tilefinch_core tilefinch_psp_ui)
     target_compile_definitions(tilefinch-browser-engine-tests PRIVATE
         TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1520,6 +1544,10 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     tilefinch_add_test_binary(tilefinch-web-font-tests tests/test_web_fonts.c)
     target_link_libraries(tilefinch-web-font-tests PRIVATE tilefinch_core)
+    if(TARGET tilefinch_brotli_test_encode)
+        target_link_libraries(tilefinch-web-font-tests PRIVATE tilefinch_brotli_test_encode)
+        target_compile_definitions(tilefinch-web-font-tests PRIVATE TILEFINCH_TEST_WOFF2=1)
+    endif()
     target_compile_definitions(tilefinch-web-font-tests PRIVATE
         TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     if(PSP_BROWSER_FREETYPE_AVAILABLE)
@@ -2240,7 +2268,7 @@ if(PSP_BROWSER_BUILD_TESTS)
             --no-loop-capture
             --output ${CMAKE_CURRENT_BINARY_DIR}/lab-psp-realistic-profile.ppm)
     set_tests_properties(lab-psp-realistic-profile-matches-app PROPERTIES
-        PASS_REGULAR_EXPRESSION "runtime-profile=realistic limit-mb=32 adaptive=yes history=4 session-cache=655360 tiles=24 navigation=transactional\nruntime-policy scripts=256 source-bytes=16777216 file-bytes=4194304 heap-bytes=5242880 stylesheets=24 css-bytes=2162688 css-file-bytes=786432"
+        PASS_REGULAR_EXPRESSION "runtime-profile=realistic limit-mb=32 adaptive=yes history=4 session-cache=655360 tiles=24 navigation=transactional\nruntime-policy scripts=256 source-bytes=16777216 file-bytes=4194304 heap-bytes=5242880 stylesheets=32 css-bytes=3145728 css-file-bytes=786432"
         TIMEOUT 30)
 
     # A top-level DataDome 403 (sanitized from a news-site capture) must

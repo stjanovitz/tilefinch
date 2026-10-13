@@ -51,13 +51,10 @@ static bool query_span_case_equal(const char *text, size_t length,
 static uint32_t query_name_bit(Stylesheet *sheet, const char *name,
                                size_t length)
 {
-    if (sheet == NULL || name == NULL || length == 0
+    /* The registering caller creates this table before parsing a name. */
+    if (sheet == NULL || sheet->conditional_queries == NULL
+        || name == NULL || length == 0
         || length >= STYLE_CONTAINER_NAME_CAPACITY) return 0;
-    if (sheet->conditional_queries == NULL) {
-        sheet->conditional_queries = budget_calloc(
-            sheet->budget, 1, sizeof(*sheet->conditional_queries));
-        if (sheet->conditional_queries == NULL) return 0;
-    }
     StyleConditionalQueries *queries = sheet->conditional_queries;
     for (size_t i = 0; i < queries->name_count; i++) {
         if (strlen(queries->names[i]) == length
@@ -275,20 +272,33 @@ static void container_state_store(Stylesheet *sheet, lxb_dom_node_t *node,
     StyleResolveScratch *scratch = sheet->resolve_scratch;
     size_t mask = scratch->container_state_capacity - 1u;
     size_t home = container_pointer_hash(node) & mask;
+    content_width = content_width < 0 ? 0 : content_width;
+    content_height = content_height < 0 ? 0 : content_height;
     for (size_t probe = 0; probe < 8; probe++) {
         StyleContainerState *state =
             &scratch->container_states[(home + probe) & mask];
         if (!state->occupied || state->node == node) {
+            if (state->occupied && state->name_bits == names
+                && state->type == type
+                && state->content_width == content_width
+                && state->content_height == content_height) return;
             if (!state->occupied) scratch->container_state_count++;
             *state = (StyleContainerState) {
                 .node = node,
                 .name_bits = names,
-                .content_width = content_width < 0 ? 0 : content_width,
-                .content_height = content_height < 0 ? 0 : content_height,
+                .content_width = content_width,
+                .content_height = content_height,
                 .type = type,
                 .occupied = true
             };
             sheet->container_state_generation++;
+            /* A cached result may select this container through any of its
+               ancestors or nested queries. The small bounded table is cheap
+               to clear; keeping a result across this change is not valid. */
+            if (scratch->container_match_cache != NULL)
+                memset(scratch->container_match_cache, 0,
+                    scratch->container_match_cache_capacity
+                        * sizeof(*scratch->container_match_cache));
             if (STYLE_TRACE(sheet, LAYOUT)) {
                 fprintf(stderr,
                         "style-container-state node=%p type=%u names=%08x "

@@ -971,14 +971,14 @@ static const StyleCustomRule *custom_rule_winner(
         if (candidates != NULL) (*candidates)++;
         const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
         if (rule->pseudo != (uint8_t) pseudo
-            || !style_container_query_matches(
-                sheet, rule->container_query, node)
             || rule->name_length != name_length
             || memcmp(rule->name, name, name_length) != 0
             || !retained_rule_fast_matches(sheet, rule, subject)
             || !style_adopted_rule_in_scope(
                    sheet, rule->order >> 8, rule->selector,
                    rule->selector_length, node, subject)
+            || !style_container_query_matches(
+                sheet, rule->container_query, node)
             || !style_selector_matches_profiled(
                 sheet, node, rule->selector, rule->selector_length)) continue;
         if (custom_rule_later(sheet, node, rule, winner)) winner = rule;
@@ -1460,30 +1460,47 @@ typedef struct {
     char inline_value[STYLE_RETAINED_VALUE_CAPACITY];
 } RetainedRuleWinner;
 
-static bool retained_rule_fast_matches(const Stylesheet *sheet,
-                                        const StyleCustomRule *rule,
-                                        const StyleMatchSubject *subject)
+static bool selector_fast_key_matches(
+    const Stylesheet *sheet, const char *selector, size_t selector_length,
+    uint8_t suffix_bytes, uint8_t key_length,
+    const StyleMatchSubject *subject)
 {
-    if (rule == NULL || subject == NULL
-        || rule->fast_key_suffix_bytes == UINT8_MAX
-        || rule->fast_key_length == 0) return true;
-    if (rule->fast_key_suffix_bytes > rule->selector_length
-        || rule->fast_key_length
-           > rule->selector_length - rule->fast_key_suffix_bytes)
+    if (selector == NULL || subject == NULL || suffix_bytes == UINT8_MAX
+        || key_length == 0) return true;
+    if (suffix_bytes > selector_length
+        || key_length > selector_length - suffix_bytes)
         return true;
-    size_t offset = rule->selector_length - rule->fast_key_suffix_bytes
-        - rule->fast_key_length;
-    const char *key = rule->selector + offset;
-    size_t key_length = rule->fast_key_length;
-    char marker = offset == 0 ? '\0' : rule->selector[offset - 1u];
+    size_t offset = selector_length - suffix_bytes - key_length;
+    const char *key = selector + offset;
+    char marker = offset == 0 ? '\0' : selector[offset - 1u];
     if (marker == '#') {
         return subject->id != NULL && subject->id_length == key_length
             && memcmp(subject->id, key, key_length) == 0;
     }
     if (marker == '.')
         return style_subject_has_class(sheet, subject, key, key_length);
-    return subject->tag != NULL && subject->tag_length == key_length
-        && memcmp(subject->tag, key, key_length) == 0;
+    return style_subject_tag_matches(subject, key, key_length);
+}
+
+static bool retained_rule_fast_matches(const Stylesheet *sheet,
+                                        const StyleCustomRule *rule,
+                                        const StyleMatchSubject *subject)
+{
+    return rule == NULL || selector_fast_key_matches(
+        sheet, rule->selector, rule->selector_length,
+        rule->fast_key_suffix_bytes, rule->fast_key_length, subject);
+}
+
+bool style_custom_rules_may_select_node(const Stylesheet *sheet,
+    const uint32_t *rules, size_t count, lxb_dom_node_t *node)
+{
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
+    for (size_t i = 0; i < count; i++)
+        if (rules[i] >= sheet->custom_rule_count
+            || retained_rule_fast_matches(sheet, &sheet->custom_rules[rules[i]],
+                                           &subject)) return true;
+    return false;
 }
 
 static void retained_rule_winner(
@@ -2608,13 +2625,19 @@ void stylesheet_rule_revert_mask(const Stylesheet *sheet,
     }
 }
 
+bool style_selector_reads_focus(const char *selector)
+{
+    return strstr(selector, ":focus") != NULL
+        || strstr(selector, "data-tilefinch-focus") != NULL;
+}
+
 bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL) return false;
     if (sheet->focus_rule_index_ready) return true;
     size_t count = 0;
     for (size_t i = 0; i < sheet->count; i++) {
-        if (strstr(sheet->rules[i].selector, ":focus") != NULL) count++;
+        if (style_selector_reads_focus(sheet->rules[i].selector)) count++;
     }
     if (count == 0) {
         budget_free(sheet->budget, sheet->focus_rule_indices);
@@ -2629,7 +2652,7 @@ bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet)
     sheet->focus_rule_indices = indices;
     sheet->focus_rule_count = 0;
     for (size_t i = 0; i < sheet->count; i++) {
-        if (strstr(sheet->rules[i].selector, ":focus") == NULL) continue;
+        if (!style_selector_reads_focus(sheet->rules[i].selector)) continue;
         sheet->focus_rule_indices[sheet->focus_rule_count++] = (uint32_t) i;
     }
     sheet->focus_rule_index_ready = true;
@@ -3295,7 +3318,14 @@ static void declarations_analyze_deferred_resolution(
                 }
                 if (span_case_equal(name, name_length, "font")
                     || span_case_equal(name, name_length, "font-family")) {
-                    analysis->font_family[slot] = true;
+                    /* Bare generic families cannot acquire a page font later.
+                       Quoted names and named fallback stacks can. */
+                    analysis->font_family[slot] =
+                        span_case_equal(name, name_length, "font")
+                        || !(span_case_equal(value, value_length, "sans-serif")
+                             || span_case_equal(value, value_length, "serif")
+                             || span_case_equal(value, value_length, "monospace")
+                             || span_case_equal(value, value_length, "system-ui"));
                 }
                 bool logical_property =
                     style_property_name_is_logical(name, name_length);

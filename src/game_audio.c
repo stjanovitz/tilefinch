@@ -327,7 +327,7 @@ bool tilefinch_game_audio_decode_wav(
             decoded[i] = (int16_t) read_u16(payload + i * 2u);
     } else {
         for (size_t i = 0; i < sample_count; i++)
-            decoded[i] = (int16_t) (((int) payload[i] - 128) << 8);
+            decoded[i] = (int16_t) (((int) payload[i] - 128) * 256);
     }
     GameAudioBuffer *buffer = &audio->buffers[slot];
     buffer->generation++;

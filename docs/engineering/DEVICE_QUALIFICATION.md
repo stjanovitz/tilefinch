@@ -123,6 +123,14 @@ scripts/run-ppsspp-input-script.sh \
 Temporal snapshots first enter a bounded RAM ring and are written after the
 run, so storage latency cannot shape the measured response.
 
+For an isolated emulator memory-pressure comparison, set
+`PPSSPP_TEST_LIMIT_MB=16` on `run-ppsspp-network.sh` with a captured replay.
+The harness validates 12–52 MiB and writes the override only into its
+disposable `boot.cfg`; it does not change the device or release preset.
+For captures made in a different execution environment,
+`PPSSPP_TEST_TRACE_KEYED=1` selects response-keyed replay without changing
+the default sequential replay mode.
+
 ### PSPLink runs
 
 The preferred physical-device loop serves the PRX, configuration, and logs

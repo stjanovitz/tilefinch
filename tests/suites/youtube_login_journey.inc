@@ -16,9 +16,12 @@ static int test_youtube_login_journey(void)
         CHECK(browser_engine_load_url(engine, "https://www.youtube.com/", true));
         NavigationSession *nav = browser_engine_navigation(engine);
         CHECK(nav->page.runtime == NULL);
+        lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+        CHECK(test_reader_find_id(root, "yt-feed-status") == NULL
+            && test_reader_find_id(root, "yt-feed-refresh") == NULL);
         CHECK(strstr(nav->page.layout.links[1].url, "https://accounts.google.com/ServiceLogin?") == nav->page.layout.links[1].url);
         CHECK(browser_engine_commit_html(engine, "https://accounts.google.com/tilefinch-test-signin", form, sizeof(form) - 1u, false));
-        lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+        root = lxb_dom_interface_node(nav->page.document.html);
         CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "user")));
         CHECK(browser_engine_replace_text(engine, "synthetic-user", 14));
         CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "password")));
@@ -71,6 +74,10 @@ static int test_youtube_login_journey(void)
             "https://m.youtube.com/", lane == 0u ? "SAPISID=account-a; Secure; Path=/" : "SAPISID=account-b; Secure; Path=/"));
         if (lane == 3u) CHECK(browser_session_cookie_set_http(session, "https://m.youtube.com/", "visitor=renewed; Secure; Path=/"));
         CHECK(browser_engine_load_url(engine, "https://www.youtube.com/", true));
+        NavigationSession *nav = browser_engine_navigation(engine);
+        lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+        CHECK(test_reader_find_id(root, "yt-feed-status") != NULL
+            && test_reader_find_id(root, "yt-feed-refresh") != NULL);
         CHECK(browser_engine_render_frame(engine, NULL));
         for (unsigned tick = 0; tick < 512u; tick++) {
             bool visual = false; (void) browser_engine_run_idle_work(engine, &visual);

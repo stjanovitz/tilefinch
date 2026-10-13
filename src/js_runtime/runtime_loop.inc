@@ -841,6 +841,11 @@ static bool runtime_task_slice_available(const ScriptRuntime *runtime,
                                          uint64_t started_ns,
                                          size_t remaining, size_t budget)
 {
+    /* This is a task boundary, after the preceding microtask checkpoint.
+       A frontend refusal means defer, not an author exception or watchdog
+       cancellation. Never interrupt an executing task to dispatch input. */
+    if (!tilefinch_platform_cooperate("page-task-boundary", budget - remaining))
+        return false;
     uint64_t limit = runtime->bridge.execution_policy.maximum_advance_time_us;
     /* Make at least one task's progress even when preparation itself is
        expensive. Subsequent tasks wait for another host turn, leaving input
@@ -1028,7 +1033,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     if (ok && !classic_continuation
         && !js_rt_runtime_checkpoint_pending(runtime)
         && runtime->page_visibility_queue_count != 0
-        && remaining != 0) {
+        && remaining != 0
+        && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                        remaining, callback_budget)) {
         ok = runtime_dispatch_page_visibility_edge(runtime);
         remaining--;
         if (ok) ok = js_rt_runtime_run_jobs(runtime);

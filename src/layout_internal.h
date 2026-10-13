@@ -13,6 +13,43 @@
 
 #include <limits.h>
 
+bool layout_node_name_is(lxb_dom_node_t *node, const char *wanted);
+
+/* DRAW_IMAGE does not use its text member. A fixed raster <img> may borrow
+   its node identity there (text_length stays zero), allowing allocation-free
+   resource rebinding after the image table moves. This is native metadata,
+   never an author DOM marker. Intrinsic sizing and alt text retain full flow. */
+static inline bool layout_fixed_image_slot(lxb_dom_node_t *node,
+                                           const ComputedStyle *style,
+                                           const ComputedStyle *parent)
+{
+    size_t alt_length = 0;
+    (void) document_attribute(node, "alt", &alt_length);
+    return layout_node_name_is(node, "img") && alt_length == 0
+        && style->has_width && style->has_height
+        && style->width > 0 && style->height > 0
+        && style->width <= STYLE_LENGTH_DIRECT_LIMIT
+        && style->height <= STYLE_LENGTH_DIRECT_LIMIT
+        && (!style->width_percent || (parent != NULL && parent->has_width
+            && parent->width > 0 && parent->width <= STYLE_LENGTH_DIRECT_LIMIT
+            && !parent->width_percent))
+        && (!style->height_percent || (parent != NULL && parent->has_height
+            && parent->height > 0 && parent->height <= STYLE_LENGTH_DIRECT_LIMIT
+            && !parent->height_percent))
+        && !style->width_max_content
+        && style->min_width >= 0 && style->min_height >= 0
+        && style->min_width <= STYLE_LENGTH_DIRECT_LIMIT
+        && style->min_height <= STYLE_LENGTH_DIRECT_LIMIT
+        && style->max_width >= 0 && style->max_height >= 0
+        && (style->max_width == STYLE_LENGTH_NONE
+            || style->max_width <= STYLE_LENGTH_DIRECT_LIMIT)
+        && (style->max_height == STYLE_LENGTH_NONE
+            || style->max_height <= STYLE_LENGTH_DIRECT_LIMIT);
+}
+
+#undef budget_malloc
+#undef budget_calloc
+#undef budget_realloc
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_LAYOUT, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_LAYOUT, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_LAYOUT, (p), (s))
@@ -324,6 +361,7 @@ struct LayoutReuseCache {
     const ImageResources *images;
     int viewport_width;
     uint64_t clock;
+    uint64_t style_build_clock;
     /* style_mask + 1 entries (a power of two), and the live entries the
        builds since the last fit evicted. */
     LayoutReuseStyleEntry *styles;
@@ -492,6 +530,11 @@ typedef struct {
     const Stylesheet *sheet;
     const FontSet *fonts;
     const WebFontSet *web_fonts;
+    /* Result of the most recently completed block, consumed immediately by
+       its inline parent. Transient, not per-node retained baseline storage. */
+    const lxb_dom_node_t *completed_baseline_node;
+    int completed_first_baseline;
+    int completed_last_baseline;
     const ImageResources *images;
     LayoutCounterEntry *counter_entries;
     struct LayoutCounterCursor *counter_cursor;
@@ -825,6 +868,9 @@ typedef struct {
        boxes on lines without text (CSS 2.1 10.8.1). Zero in quirks-mode
        documents, whose image-only lines have no strut. */
     int strut_baseline;
+    int first_baseline;
+    int last_baseline;
+    bool has_baseline;
     /* The block's atomic-inline stack and the depth this line owns from. */
     LineAtomicStack *atomics;
     size_t atomic_base;
@@ -848,6 +894,9 @@ typedef struct {
     TextAlign text_align;
     bool direction_rtl;
     PositionedBox positioned_box;
+    /* In-flow percentage heights use the immediate block's definite
+       content height, not the nearest positioned ancestor. Zero is auto. */
+    int containing_height;
     bool floats_enabled;
     bool first_inline_block_collapses_top;
     bool text_overflow_ended;
@@ -940,6 +989,8 @@ typedef struct {
     ComputedStyle parent_style;
     ComputedStyle style;
     bool anonymous_text;
+    PseudoElement generated_pseudo;
+    LayoutNodeBox *generated_box;
 } FlatItem;
 
 typedef struct {
@@ -949,12 +1000,15 @@ typedef struct {
     size_t capacity;
     bool active;
     int inline_values[4];
+    LayoutNodeBox *generated_boxes;
+    LayoutNodeBox inline_generated_boxes[2];
 } FlexOrderPlan;
 
 typedef struct {
     FlatItemIterator source;
     const FlexOrderPlan *plan;
     size_t order_index;
+    unsigned generated_phase;
 } FlexItemIterator;
 
 #define FLEX_ORDER_VALUE_LIMIT 32u
@@ -1203,6 +1257,8 @@ bool is_block_display(DisplayMode display);
 bool layout_add_control(LayoutDocument *layout, int x, int y, int width, int height, ControlType type, lxb_dom_node_t *node);
 ControlType layout_input_control_type(lxb_dom_node_t *node);
 int layout_control_default_width(lxb_dom_node_t *node);
+bool layout_control_text_style(LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, bool placeholder, DrawCommand *text);
 int layout_control_default_height(lxb_dom_node_t *node);
 /* A textarea's content height from an explicit rows attribute: rows lines
    of its used line-height, as HTML sizes it whatever its appearance. Zero
@@ -1226,8 +1282,14 @@ bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
                      size_t command_index, const char *url,
                      size_t url_length, lxb_dom_node_t *node);
 bool layout_anonymous_text(LayoutContext *context, const FlatItem *item, lxb_dom_node_t *container, int x, int y, int width, int *bottom);
+bool layout_generated_flex_item(LayoutContext *context, const FlatItem *item, int x, int y, int width, int percentage_basis, int containing_height, int *bottom);
+int layout_generated_flex_width(LayoutContext *context, const FlatItem *item, bool minimum);
+bool layout_generated_flex_in_flow(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style, PseudoElement pseudo);
+const LayoutNodeBox *flex_item_box(const LayoutDocument *layout, const FlatItem *item);
 bool layout_batch_checkpoint(LayoutContext *context, size_t at, size_t count, size_t *checkpoint_at);
 bool layout_batch_cooperate(LayoutContext *context, size_t work_units);
+/* Poll repeated index visits without changing the publication work quota. */
+bool layout_index_poll(LayoutContext *context, size_t work_units);
 bool layout_text_cooperate(LayoutContext *context, size_t work_units);
 bool layout_block(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, int x, int y, int width, int containing_height, bool assigned_width, const PositionedBox *positioned_box, int *bottom);
 bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
@@ -1253,28 +1315,6 @@ bool layout_positioned_command_escapes_clip(
     const LayoutNodeBox *clip_box);
 bool layout_tree_enter(LayoutContext *context, lxb_dom_node_t *node, const char *phase);
 bool node_effectively_disabled(lxb_dom_node_t *node);
-/* A row flex container's box-bearing generated item (see layout_block). */
-typedef struct {
-    bool active;
-    int width;
-    int height;
-    int margin_left;
-    int margin_right;
-    int margin_top;
-    int margin_bottom;
-    int outer_width;
-} LayoutFlexPseudo;
-LayoutFlexPseudo layout_flex_pseudo_item(LayoutContext *context,
-                                         lxb_dom_node_t *node,
-                                         const ComputedStyle *style,
-                                         PseudoElement pseudo,
-                                         int content_width);
-bool layout_flex_pseudo_paint(LayoutContext *context, lxb_dom_node_t *node,
-                              const ComputedStyle *style,
-                              const LayoutFlexPseudo *before,
-                              const LayoutFlexPseudo *after,
-                              int content_x, int content_width, int row_top,
-                              int row_bottom, size_t command_start);
 /* Paints a box-bearing or out-of-flow ::before/::after of `node` at the
    originating box (x, y, width, height). `containing` is the absolutely
    positioned containing block for an out-of-flow pseudo (the nearest
@@ -1349,8 +1389,10 @@ int constrain_border_box_width(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, const ComputedStyle *style,
     int containing_width, int candidate, bool *has_maximum);
-int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width);
-int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height);
+int root_scroll_width_after_clipping(LayoutDocument *layout, int viewport_width,
+                                     LayoutContext *context);
+int root_scroll_height_after_clipping(LayoutDocument *layout, int minimum_height,
+                                      LayoutContext *context);
 int style_content_height(const Stylesheet *sheet, const ComputedStyle *style, int width_reference, int containing_height);
 int style_minimum_width(const Stylesheet *sheet, const ComputedStyle *style, int containing_width);
 int style_pixel_height(const Stylesheet *sheet, const ComputedStyle *style, int reference);
@@ -1370,6 +1412,11 @@ uint32_t blend_color_over(uint32_t foreground, uint8_t alpha, uint32_t backgroun
 uint8_t draw_font_weight(const ComputedStyle *style);
 uint8_t text_decoration_bits(const ComputedStyle *style);
 void align_flex_row_items(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int stretch_free, size_t stretch_lines);
+void layout_mask_background_gradient(LayoutContext *context,
+                                      const ComputedStyle *style,
+                                      DrawCommand *command);
+void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
+                              int target_height);
 bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
                         size_t command_start, size_t link_start,
                         size_t control_start, const ComputedStyle *style,
@@ -1433,6 +1480,8 @@ void layout_transform_origin_twice(
 bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
                                      size_t end, int origin_y_twice,
                                      int16_t shear_q10);
+bool layout_rotate_solid_command_span(LayoutDocument *layout, size_t start,
+    size_t end, int origin_x_twice, int origin_y_twice, int16_t rotation_q6);
 void layout_transform_command_span(
     LayoutDocument *layout, size_t command_start, size_t command_end,
     int origin_x_twice, int origin_y_twice, uint8_t scale_q6,

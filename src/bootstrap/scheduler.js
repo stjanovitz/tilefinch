@@ -710,7 +710,9 @@
       if (!pending) return false;
       pending = false;
       hostState[HOST_SCROLL_PENDING] = 0;
-      globalThis.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
+      /* Viewport scrolling targets Document and bubbles to Window. Dispatching
+         directly on Window skips document listeners used by sticky controls. */
+      document.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll", { bubbles: true })));
       visualViewport.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
       return true;
     };

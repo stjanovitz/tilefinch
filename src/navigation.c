@@ -2,6 +2,7 @@
 #include "tilefinch/preview_policy.h"
 #include "diagnostic_trace.h"
 #include "tilefinch_test_faults.h"
+#include "tilefinch_compiler.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/declarative_refresh.h"
 #include "tilefinch/fetch.h"

@@ -219,7 +219,7 @@ static bool test_response_headers_precede_parser_script_and_viewport(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation.declared_css_width = 1024;
@@ -340,7 +340,7 @@ static bool test_frame_response_policy_precedes_child_execution(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 64 * 1024, 32 * 1024, 1000);
     }
@@ -751,7 +751,7 @@ static bool test_critical_ch_body_is_not_page_visible(void)
         && prior_page(&navigation) && critical_ch_replay_begin();
     if (!ready) return false;
     navigation_attach_browser_session(&navigation, &browser);
-    navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+    navigation_enable_scripts(&navigation, 3 * MIB, 1000);
     navigation_enable_document_scripts(
         &navigation, 4, 32 * 1024, 16 * 1024, 1000);
     navigation_set_stream_delivery(
@@ -878,7 +878,7 @@ static bool test_redirected_critical_ch_retries_final_origin(void)
         && redirected_critical_ch_replay_begin();
     if (!ready) return false;
     navigation_attach_browser_session(&navigation, &browser);
-    navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+    navigation_enable_scripts(&navigation, 3 * MIB, 1000);
     navigation_enable_document_scripts(
         &navigation, 4, 32 * 1024, 16 * 1024, 1000);
     snprintf(navigation.pending_navigation_referer,

@@ -88,6 +88,7 @@ struct BrowserProfile {
     BrowserTextEntryMode text_entry_mode;
     TilefinchGamepadFaceMapping gamepad_face_mapping;
     BrowserReaderFont reader_font;
+    WebFontMode web_font_mode;
     bool remember_reader_site_scale;
     bool reader_auto_mode;
     BrowserBasicFallbackMode basic_fallback_mode;
@@ -347,6 +348,7 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->budget = budget;
     profile->ui_scale = 1;
     profile->page_font_percent = 100;
+    profile->web_font_mode = WEB_FONTS_SMART;
     /* The default search path must return useful server-rendered results on
        the PSP. Google remains an explicit persisted choice, but no longer
        provides a basic-HTML results document to non-JavaScript clients. */
@@ -801,8 +803,9 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
             (unsigned) profile->basic_fallback_mode) > 0;
     }
     if (ok) {
-        /* Append-only: older builds ignore HEAVY and HS records. */
-        ok = fprintf(file, "HEAVY\t%u\n",
+        /* Append-only: older builds ignore WEB_FONTS, HEAVY and HS records. */
+        ok = fprintf(file, "WEB_FONTS\t%u\nHEAVY\t%u\n",
+                     (unsigned) profile->web_font_mode,
                      (unsigned) profile->heavy_pages_mode) > 0;
     }
     for (size_t i = 0; ok && i < profile->heavy_site_count; i++) {
@@ -1161,6 +1164,10 @@ static bool profile_load_internal(
                retain the safe default rather than granting an exception. */
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->javascript_default_allow_mask = (uint32_t) (first[0] - '0');
+        } else if (strcmp(line, "WEB_FONTS") == 0) {
+            if (first[0] >= '0' && first[0] < '0' + WEB_FONTS_MODE_COUNT
+                && first[1] == '\0')
+                loaded->web_font_mode = (WebFontMode) (first[0] - '0');
         } else if (strcmp(line, "HEAVY") == 0) {
             unsigned long mode = strtoul(first, NULL, 10);
             if (mode < (unsigned long) BROWSER_HEAVY_PAGES_MODE_COUNT)
@@ -1860,6 +1867,18 @@ bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
         if (strcmp(profile->heavy_sites[i], site) == 0) return true;
     }
     return false;
+}
+
+WebFontMode browser_profile_web_font_mode(const BrowserProfile *profile)
+{
+    return profile == NULL ? WEB_FONTS_SMART : profile->web_font_mode;
+}
+
+bool browser_profile_set_web_font_mode(BrowserProfile *profile, WebFontMode mode)
+{
+    if (profile == NULL || mode < WEB_FONTS_ON || mode >= WEB_FONTS_MODE_COUNT) return false;
+    profile->web_font_mode = mode;
+    return true;
 }
 
 BrowserBasicFallbackMode browser_profile_basic_fallback_mode(

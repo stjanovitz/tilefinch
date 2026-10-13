@@ -123,4 +123,11 @@ void frame_pumps_mark_ran(FramePumpFrame *frame, FramePumpId id);
 /* Structural validation of the table itself; false names the first defect. */
 bool frame_pumps_policy_valid(const char **defect);
 
+/* A changed scroll position is shown immediately. Subsequent partial tile
+   progress is coalesced for one display interval, without enlarging raster
+   slices or delaying input sampling between them. Complete frames bypass
+   this predicate. `last` names a successful publication, never an attempt. */
+bool frame_paint_progress_due(uint64_t now, uint64_t last,
+                              bool scrolled, bool progressed);
+
 #endif

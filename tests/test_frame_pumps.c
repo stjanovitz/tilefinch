@@ -312,6 +312,12 @@ static int test_resource_overlaps_are_pinned(void)
 
 int main(void)
 {
+    CHECK(frame_paint_progress_due(1000, 1000, true, false));
+    CHECK(frame_paint_progress_due(1000, 0, false, true));
+    CHECK(!frame_paint_progress_due(16999, 1000, false, true));
+    CHECK(frame_paint_progress_due(17000, 1000, false, true));
+    CHECK(frame_paint_progress_due(999, 1000, false, true));
+    CHECK(!frame_paint_progress_due(100000, 1000, false, false));
     if (test_policy_table() != 0) return 1;
     if (test_admission() != 0) return 1;
     if (test_order_is_observed() != 0) return 1;

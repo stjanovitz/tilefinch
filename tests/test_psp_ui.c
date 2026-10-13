@@ -6512,8 +6512,34 @@ static bool test_player_chapter_timeline_and_menu(void)
     return true;
 }
 
+static bool test_website_font_setting(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    CHECK(ui.web_font_mode == WEB_FONTS_SMART);
+    ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+    ui.options_selection = 51;
+#else
+    ui.options_selection = 49;
+#endif
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_RIGHT};
+    const WebFontMode modes[] = {WEB_FONTS_OFF, WEB_FONTS_ON, WEB_FONTS_SMART};
+    for (size_t at = 0; at < 3; at++) {
+        PspUiIntent intent = psp_ui_update(&ui, &input);
+        CHECK(intent.setting.id == PSP_UI_SETTING_WEB_FONTS
+              && intent.setting.value.web_font_mode == modes[at]
+              && ui.web_font_mode == modes[at]);
+    }
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.value.web_font_mode == WEB_FONTS_ON);
+    return true;
+}
+
 int main(void)
 {
+    if (!test_website_font_setting()) return 1;
     if (!test_player_chapter_timeline_and_menu()
         || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()

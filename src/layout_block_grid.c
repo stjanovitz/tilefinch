@@ -274,7 +274,7 @@ typedef struct {
 
 #define GRID_RESHARE_ITEM_LIMIT 32
 
-/* A row-spanning, end/center-aligned item whose rows were not yet final
+/* An end/center-aligned item whose content-sized rows were not yet final
    when it was laid out. */
 typedef struct {
     lxb_dom_node_t *node;
@@ -1468,12 +1468,10 @@ bool layout_block_grid_section(LayoutContext *context,
         }
         GridReshareItem reshare_items[GRID_RESHARE_ITEM_LIMIT];
         size_t reshare_count = 0;
-        /* Items that span several content-sized rows are laid out before
-           the later rows reach their final height, so their end/center
-           block alignment waits for the rows (CSS Grid 10.4). Guardian's
-           masthead menu button spans the logo and pillar rows and sits at
-           their bottom; aligned at the first row's top it covered the
-           edition picker. Bounded: further items keep start alignment. */
+        /* Content-sized rows reach their final height only after every
+           item has been laid out. Defer end/center alignment for single
+           rows as well as spanning areas (CSS Grid 10.4). Bounded: further
+           items retain their initial placement. */
         GridSpanAlignItem span_align[GRID_SPAN_ALIGN_LIMIT];
         size_t span_align_count = 0;
         bool reshare_possible = !inherited_grid_rows
@@ -1873,7 +1871,9 @@ bool layout_block_grid_section(LayoutContext *context,
                     }
                     item_dy = dy;
                     if (!definite_cell_height
-                        && item_placement.row_span > 1
+                        && (item_placement.row_span > 1
+                            || (!item->style.margin_top_auto
+                                && !item->style.margin_bottom_auto))
                         && (item_alignment == ALIGN_END
                             || item_alignment == ALIGN_CENTER)
                         && span_align_count < GRID_SPAN_ALIGN_LIMIT) {
@@ -1882,7 +1882,10 @@ bool layout_block_grid_section(LayoutContext *context,
                             .row = grid_row,
                             .span = item_placement.row_span,
                             .offset = item_box->y - row_top,
-                            .height = item_box->height,
+                            .height = item_box->height
+                                + (item_placement.row_span == 1
+                                   ? item->style.margin.top
+                                     + item->style.margin.bottom : 0),
                             .center = item_alignment == ALIGN_CENTER
                         };
                     }
@@ -1974,20 +1977,44 @@ bool layout_block_grid_section(LayoutContext *context,
                 declared_content_height, grid_row_origin,
                 explicit_grid_rows, declared_grid_rows,
                 second_implicit_row, reshare_items, reshare_count);
+        placement_state = placement_template;
+        flex_iterator_init(iterator, context, node, style, grid_order);
+        while (flex_iterator_next(iterator, item)) {
+            grid_resolve_item_placement(context, node, style, &item->style);
+            if (item->style.out_of_flow || item->style.fixed_position) continue;
+            GridItemPlacement final_placement;
+            if (!grid_place_item(&placement_state, &item->style, &final_placement)) continue;
+            int row = final_placement.row;
+            int last = row + final_placement.row_span - 1;
+            if (row < 0 || last >= initialized_rows || item->anonymous_text
+                || item->style.has_height || item->style.margin_top_auto
+                || item->style.margin_bottom_auto
+                || flex_item_alignment(style, &item->style) != ALIGN_STRETCH) continue;
+            int height = row_extents[last] - row_starts[row]
+                - item->style.margin.top - item->style.margin.bottom;
+            layout_stretch_grid_item(context, item, height);
+        }
         for (size_t i = 0; i < span_align_count; i++) {
             const GridSpanAlignItem *span = &span_align[i];
             int last = span->row + span->span - 1;
             if (last >= initialized_rows) last = initialized_rows - 1;
-            if (last <= span->row) continue;
+            if (last < span->row) continue;
             int area_height = row_extents[last] - row_starts[span->row];
             int free_space = area_height - span->height;
             if (free_space <= 0) continue;
             int target = span->center ? free_space / 2 : free_space;
             /* `offset` already holds the in-flow placement plus any
-               relative offset; only the alignment shift moves. */
-            if (target != 0) {
+               relative offset. Row resharing may have aligned this item
+               already; move to the final position, not by a second shift. */
+            const LayoutNodeBox *box = layout_box_for_node(
+                context->layout, span->node);
+            if (box == NULL) continue;
+            int desired = layout_add_coordinate(row_starts[span->row],
+                layout_add_coordinate(span->offset, target));
+            int shift = desired - box->y;
+            if (shift != 0) {
                 translate_node_subtree(context->layout, span->node, 0,
-                                       target);
+                                       shift);
             }
         }
         int grid_bottom = line->y;

@@ -44,6 +44,7 @@ typedef struct {
     const DrawCommand *command;
     uint64_t last_used;
     bool valid;
+    bool long_color_runs;
     int32_t step_x;
     int32_t step_y;
     int64_t origin;
@@ -113,6 +114,7 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
         size_t global = 0;
         while (local < local_end
                || global < cache->layout->spatial_global_count) {
+            render_prepare_checkpoint(cache);
             uint32_t local_order = local < local_end
                 ? cache->layout->spatial_band_orders[local] : UINT32_MAX;
             uint32_t global_order = global < cache->layout->spatial_global_count
@@ -165,6 +167,7 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
         }
     } else {
         for (size_t order = 0; order < cache->layout->count; order++) {
+            render_prepare_checkpoint(cache);
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
             if (cache->layout->command_flags != NULL
@@ -183,14 +186,14 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
     uint64_t elapsed = finished - started;
     cache->raster_us += elapsed;
     if (elapsed > cache->max_raster_us) cache->max_raster_us = elapsed;
-    if (cache->raster_cooperate_phase != NULL) {
+    if (!cache->frame_composing && cache->raster_cooperate_phase != NULL) {
         if (cache->raster_slice_started_us == 0
             || finished < cache->raster_slice_started_us) {
             cache->raster_slice_started_us = started;
         }
         if (finished - cache->raster_slice_started_us >= UINT64_C(8000)) {
-            (void) tilefinch_platform_cooperate(
-                cache->raster_cooperate_phase, cache->rasterized);
+            (void) render_platform_cooperate(
+                cache, cache->raster_cooperate_phase, cache->rasterized);
             cache->raster_slice_started_us = render_now_us();
         }
     }
@@ -375,6 +378,9 @@ bool tile_cache_init(TileCache *cache, Budget *budget,
     }
     memset(cache, 0, sizeof(*cache));
     cache->budget = budget;
+    cache->raster_cooperate_phase = "render-prepare";
+    cache->retain_layout_rasters =
+        tilefinch_lab_getenv("TILEFINCH_DISABLE_LAYOUT_RASTER_RETENTION") == NULL;
     if (!tile_cache_prepare_layout(cache, layout)) {
         memset(cache, 0, sizeof(*cache));
         return false;
@@ -915,6 +921,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     for (size_t order = 0; order < cache->layout->count; order++) {
         size_t i = cache->layout->paint_order_count == cache->layout->count
                    ? cache->layout->paint_order[order] : order;
+        render_prepare_checkpoint(cache);
         size_t range_index = fixed_command_owner(cache->layout, i);
         if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
@@ -1001,6 +1008,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     for (size_t order = 0; order < cache->layout->count; order++) {
         size_t i = cache->layout->paint_order_count == cache->layout->count
                    ? cache->layout->paint_order[order] : order;
+        render_prepare_checkpoint(cache);
         size_t range_index = fixed_command_owner(cache->layout, i);
         if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
@@ -1027,6 +1035,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         }
     }
     for (size_t y = 0; y < height; y++) {
+        render_prepare_checkpoint(cache);
         uint16_t first = UINT16_MAX;
         uint16_t last = 0;
         for (size_t x = 0; x < width; x++) {
@@ -3426,6 +3435,8 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
     uint64_t budget_us, size_t maximum_units,
     const TilefinchCancellation *cancellation)
 {
+    if (cache != NULL && cache->preparation_polling)
+        return RENDER_FRAME_WORK_PENDING;
     if (cache == NULL || cache->tiles == NULL || viewport_width <= 0
         || viewport_height <= 0 || scroll_y < 0) {
         return RENDER_FRAME_WORK_FAILED;
@@ -3453,7 +3464,7 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
         }
     }
     if (work->ready) return RENDER_FRAME_WORK_READY;
-    if (maximum_units == 0 || budget_us == 0) {
+    if (budget_us == 0) {
         return RENDER_FRAME_WORK_PENDING;
     }
 
@@ -3462,6 +3473,10 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
     size_t visits = 0;
     cache->frame_job_slices++;
     while (work->next_ordinal < work->end_ordinal) {
+        /* Tiles are coherent here and the composed frame is untouched. A
+           queued controller action gets the next owner turn, without
+           cancelling a render or discarding completed tile work. */
+        if (!render_platform_cooperate(cache, "render-input-boundary", units)) break;
         if (tilefinch_cancellation_requested(cancellation)) {
             tile_cache_cancel_frame_work(cache);
             return RENDER_FRAME_WORK_CANCELLED;
@@ -3521,6 +3536,7 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
                              int viewport_width, int viewport_height,
                              const char *output_path)
 {
+    if (cache != NULL && cache->preparation_polling) return false;
     if (cache == NULL || cache->tiles == NULL || viewport_width <= 0
         || viewport_height <= 0 || scroll_y < 0) return false;
     /* Tile composition may keep unchanged frame rows; give them the
@@ -3555,6 +3571,12 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     if (cache->layout->command_flags != NULL) {
         (void) overflow_cache_prepare(cache);
     }
+    bool fixed_cached = cache->layout->fixed_count != 0
+        && build_fixed_cache(cache, viewport_width, viewport_height);
+    /* All expensive reusable preparation precedes the first framebuffer
+       write. No cooperative presentation may sample a half-composed frame. */
+    (void) render_platform_cooperate(cache, "render-compose", 1u);
+    cache->frame_composing = true;
     uint64_t phase_started = render_now_us();
     uint64_t phase_elapsed = phase_started - started;
     cache->frame_setup_us += phase_elapsed;
@@ -3734,7 +3756,7 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     }
     phase_started = phase_finished;
     if (ok && cache->layout->fixed_count != 0) {
-        if (build_fixed_cache(cache, viewport_width, viewport_height)) {
+        if (fixed_cached) {
             bool bounded_first = false;
             (void) fixed_cache_composition_order(
                 cache->layout, &bounded_first);
@@ -3781,6 +3803,8 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
         cache->frame_io_us += render_now_us() - write_started;
     }
     if (temporary_frame) budget_free(cache->budget, frame);
+    cache->frame_composing = false;
+    (void) render_platform_cooperate(cache, "render-compose", 0u);
     uint64_t elapsed = render_now_us() - started;
     cache->frame_us += elapsed;
     if (elapsed > cache->max_frame_us) cache->max_frame_us = elapsed;
@@ -4133,10 +4157,10 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
         || command->type != DRAW_TEXT || command->text == NULL
         || *text_offset >= command->text_length) return false;
     bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_variant(
+    const FontFace *face = font_context_face_at_weight(
         cache->layout->fonts, cache->layout->web_fonts,
         draw_command_font_family(command), draw_command_font_italic(command),
-        bold_face);
+        bold_face, draw_command_font_weight(command));
     if (face == NULL) return false;
     unsigned codepoint = 0;
     const LayoutBidiCommand *bidi = NULL;
@@ -4170,6 +4194,7 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
     }
     unsigned weight = draw_font_weight(command);
     bool synthetic_bold = weight >= 550u
+        && (face == NULL || face->authored_weight != weight)
         && (weight < 650u
             || !font_context_face_is_bold(cache->layout->fonts,
                                           cache->layout->web_fonts, face));
@@ -4180,9 +4205,9 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
     if (pixel_height_fixed <= 0) return false;
     size_t misses_before = cache->glyph_cache_misses;
     bool synthetic_italic = draw_command_font_italic(command)
-        && face == font_context_face_variant(
+        && face == font_context_face_at_weight(
             cache->layout->fonts, cache->layout->web_fonts,
-            draw_command_font_family(command), false, bold_face);
+            draw_command_font_family(command), false, bold_face, draw_command_font_weight(command));
     unsigned humanist_profile = glyph_humanist_profile(
         cache->layout->fonts, face,
         font_context_metric_family(cache->layout->web_fonts,
@@ -4577,14 +4602,26 @@ bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
 {
     if (cache == NULL || cache->source_layout == NULL || cache->layout == NULL
         || cache->source_layout->count != cache->layout->count) return false;
+    /* Fixed-image arrivals share canvas's same-geometry publication seam.
+       The source image table may have moved: rebind the visual clone without
+       staging a new display list or discarding unrelated raster/tile caches. */
+    if (cache->owns_visual_layout) {
+        for (size_t i = 0; i < cache->visual_layout.count; i++) {
+            DrawCommand *command = &cache->visual_layout.commands[i];
+            if (command->type == DRAW_IMAGE)
+                command->image = cache->source_layout->commands[i].image;
+        }
+    }
     int visual_left = viewport_css_to_device(
         &cache->source_layout->viewport, left);
     int visual_top = viewport_css_to_device(
         &cache->source_layout->viewport, top);
     int visual_right = viewport_css_to_device(
-        &cache->source_layout->viewport, right) + 1;
+        &cache->source_layout->viewport, right);
     int visual_bottom = viewport_css_to_device(
-        &cache->source_layout->viewport, bottom) + 1;
+        &cache->source_layout->viewport, bottom);
+    if (visual_right < INT_MAX) visual_right++;
+    if (visual_bottom < INT_MAX) visual_bottom++;
     /* Overflow geometry and ordinary fixed overlays depend on layout, not on
        mutable canvas pixels. A backdrop-filter is the exception because its
        retained pixels sample the page underneath. */
@@ -4633,10 +4670,14 @@ void tile_cache_invalidate_image_identity(TileCache *cache,
     }
 }
 
-static void tile_cache_clear_layout_transients(TileCache *cache)
+static void tile_cache_clear_layout_transients(TileCache *cache, bool retain_images)
 {
-    scaled_image_clear(cache);
-    decoded_image_clear(cache);
+    for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
+        if (!retain_images || cache->scaled_images[i].serial == 0)
+            scaled_image_evict(cache, i);
+        if (!retain_images || cache->decoded_images[i].serial == 0)
+            decoded_image_evict(cache, i);
+    }
     budget_free(cache->budget, cache->gradient_cache);
     budget_free(cache->budget, cache->fixed_alpha);
     budget_free(cache->budget, cache->fixed_pixels);
@@ -4664,7 +4705,7 @@ size_t tile_cache_reclaim_optional(TileCache *cache)
      * it through the normal cancellation API.
      */
     tile_cache_cancel_idle_work(cache);
-    tile_cache_clear_layout_transients(cache);
+    tile_cache_clear_layout_transients(cache, false);
     canvas_overlay_cache_clear(cache);
     glyph_cache_clear(cache, true);
     cache->prefetch_done = false;
@@ -4701,8 +4742,6 @@ static void tile_cache_commit_layout(TileCache *cache,
     tile_cache_cancel_idle_work(cache);
     const FontSet *old_fonts = cache->source_layout != NULL
                                ? cache->source_layout->fonts : NULL;
-    const WebFontSet *old_web_fonts = cache->source_layout != NULL
-                                      ? cache->source_layout->web_fonts : NULL;
     overflow_cache_destroy(cache);
     cache->overflow_cache_disabled = false;
     tile_cache_cancel_frame_work(cache);
@@ -4720,12 +4759,10 @@ static void tile_cache_commit_layout(TileCache *cache,
         cache->layout = layout;
         cache->owns_visual_layout = false;
     }
-    tile_cache_clear_layout_transients(cache);
-    /* Page font storage is navigation-owned and may be freed and then reused
-       at the same address.  Never retain pointer-keyed glyphs across a layout
-       replacement involving web fonts, even when the pointer compares equal. */
-    if (old_fonts != layout->fonts || old_web_fonts != NULL
-        || layout->web_fonts != NULL) {
+    tile_cache_clear_layout_transients(cache, cache->retain_layout_rasters);
+    /* Face lifetime serials reject address reuse without discarding unchanged
+       glyphs. Entries own their raster, not the retired font or image body. */
+    if (!cache->retain_layout_rasters || old_fonts != layout->fonts) {
         glyph_cache_clear(cache, true);
     }
 }

@@ -54,6 +54,9 @@
 #define LAYOUT_STROKE_DOTTED UINT8_C(2)
 /* Solid stroke with stable identity for one retained, simple inset shadow. */
 #define LAYOUT_STROKE_FOCUS_INSET UINT8_C(3)
+/* Solid, same-color unequal sides: top/right in text_length, bottom/left
+   in font_size, two bounded unsigned 16-bit widths per word. */
+#define LAYOUT_STROKE_SIDES UINT8_C(4)
 /* A DRAW_SHADOW_RECT whose shadow rect is its element's border box (no
    offset or spread, uniform corners): it paints only outside that box. */
 #define LAYOUT_SHADOW_OUTSIDE_BOX UINT8_C(1)
@@ -99,6 +102,9 @@
 #define LAYOUT_TEXT_FIND_EXCLUDED (1 << 26)
 /* Glyph ink may overflow a zero-height CSS line box without advancing flow. */
 #define LAYOUT_TEXT_ZERO_LINE_HEIGHT (1 << 27)
+/* Retain the sixth family bit separately from the three compositing filter
+   bits. This is text-only metadata, not another display-list word. */
+#define LAYOUT_TEXT_FONT_FAMILY_HIGH (1 << 28)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
@@ -149,10 +155,16 @@ typedef enum {
     /* Solid parallelogram, using existing payload words: text_length and
        font_size retain local width/height, scale is horizontal Q10 shear,
        radius is the local top-left Q10 offset inside the painted bounds. */
-    DRAW_SHEARED_FILL
+    DRAW_SHEARED_FILL,
+    /* Rotated solid: text_length packs local uint16 width/height;
+       font_size packs signed Q14 cosine/sine; radius/scale locate its
+       original top-left in Q10 relative to the retained bounding box. */
+    DRAW_ROTATED_FILL
 } DrawCommandType;
 
 typedef struct {
+    /* DRAW_TEXT borrows UTF-8; fixed raster DRAW_IMAGE slots may instead
+       borrow native node identity here, with text_length zero. */
     const char *text;
     const ImageResource *image;
     uint32_t text_length;
@@ -259,6 +271,21 @@ static inline void draw_command_set_rotation_quadrants(
            & LAYOUT_COMMAND_ROTATION_MASK));
 }
 
+static inline unsigned draw_command_stroke_side(const DrawCommand *command,
+                                                unsigned side)
+{
+    uint32_t widths = side < 2 ? command->text_length
+                              : (uint32_t) command->font_size;
+    return (widths >> ((side & 1u) * 16u)) & 65535u;
+}
+
+static inline void draw_command_set_stroke_sides(DrawCommand *command,
+                                                const unsigned sides[4])
+{
+    command->text_length = sides[0] | (sides[1] << 16);
+    command->font_size = (int) (sides[2] | (sides[3] << 16));
+}
+
 static inline unsigned draw_command_blend_mode(const DrawCommand *command)
 {
     return command == NULL ? 0u
@@ -298,8 +325,28 @@ static inline FontFamily draw_command_font_family(
     const DrawCommand *command)
 {
     return command == NULL ? FONT_SANS
-        : (FontFamily) (command->font_family
-                        & LAYOUT_COMMAND_FONT_FAMILY_MASK);
+        : (FontFamily) ((command->font_family
+                         & LAYOUT_COMMAND_FONT_FAMILY_MASK)
+                        | (command->type == DRAW_TEXT
+                           ? ((unsigned) command->radius >> 23) & 32u
+                           : 0u));
+}
+
+_Static_assert(TILEFINCH_WEB_FONT_BASE
+                   + TILEFINCH_WEB_FONT_FAMILY_LIMIT
+                     * TILEFINCH_WEB_FONT_FAMILY_STRIDE <= 64,
+               "web-font families must fit the retained text encoding");
+
+/* Like the other text-payload setters, this requires a DRAW_TEXT command. */
+static inline void draw_command_set_text_font_family(
+    DrawCommand *command, FontFamily family)
+{
+    if (command == NULL) return;
+    command->font_family = (uint8_t) (
+        (command->font_family & LAYOUT_COMMAND_FILTER_MASK)
+        | (family & LAYOUT_COMMAND_FONT_FAMILY_MASK));
+    command->radius = (command->radius & ~LAYOUT_TEXT_FONT_FAMILY_HIGH)
+        | ((family & 32u) != 0 ? LAYOUT_TEXT_FONT_FAMILY_HIGH : 0);
 }
 
 static inline unsigned draw_command_filter_code(
@@ -327,6 +374,12 @@ static inline uint8_t draw_command_font_weight_code(
            : command->font_weight & LAYOUT_COMMAND_FONT_WEIGHT_MASK;
 }
 
+static inline unsigned draw_command_font_weight(const DrawCommand *command)
+{
+    unsigned code = draw_command_font_weight_code(command);
+    return code == 0 ? 400u : code * 10u;
+}
+
 static inline bool draw_command_has_positioned_phase(
     const DrawCommand *command)
 {
@@ -352,6 +405,29 @@ static inline void draw_command_set_fill_gradient(DrawCommand *command,
 {
     if (command == NULL) return;
     command->font_size = (int) slot + 1;
+}
+
+/* Image commands do not use text weight. A mask can reuse that byte for
+   its background gradient without growing the retained display command. */
+static inline bool draw_command_mask_gradient(const DrawCommand *command,
+                                              size_t *slot)
+{
+    if (command == NULL || command->type != DRAW_IMAGE
+        || draw_command_font_weight_code(command) == 0 || command->image == NULL
+        || !command->image->is_mask) return false;
+    if (slot != NULL) *slot = draw_command_font_weight_code(command) - 1u;
+    return true;
+}
+
+static inline void draw_command_set_mask_gradient(DrawCommand *command,
+                                                  size_t slot)
+{
+    _Static_assert(LAYOUT_GRADIENT_LIMIT < LAYOUT_COMMAND_FONT_WEIGHT_MASK,
+                   "mask gradient index fits the unused image byte");
+    if (command != NULL && slot < LAYOUT_GRADIENT_LIMIT)
+        command->font_weight = (uint8_t) (
+            (command->font_weight & LAYOUT_COMMAND_POSITIONED_PHASE)
+            | (slot + 1u));
 }
 
 /* radius and font_size are unused by DRAW_IMAGE; sprite commands retain
@@ -985,6 +1061,11 @@ typedef struct LayoutDocument {
        incomplete above-the-fold shell without retaining another flag on
        every node (which would be disproportionately expensive on PSP). */
     bool unresolved_external_visuals;
+    /* Fixed-image paint publication is valid only against this exact DOM
+       and cascade. No image-table pointer is retained across its growth. */
+    uint64_t image_content_generation;
+    uint64_t image_style_generation;
+    uint64_t image_sheet_generation;
     bool visual_priority_overflow;
     ImagePriorityTarget *visual_priority_targets;
     size_t visual_priority_count;

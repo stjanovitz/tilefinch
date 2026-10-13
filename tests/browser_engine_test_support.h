@@ -43,6 +43,7 @@ int test_module_dependency_prefetch(void);
 int test_script_free_browsing_journey(void);
 int test_background_interruption_journey(void);
 int test_deferred_startup_journey(void);
+int test_deferred_image_admission_yields_to_input(void);
 int test_deferred_image_publication_survives_rebuild(void);
 int test_deferred_images_skip_oversized_pages(void);
 

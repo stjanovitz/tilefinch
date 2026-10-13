@@ -253,9 +253,7 @@ void layout_tree_note_fallback(LayoutContext *context,
 
 static unsigned style_font_weight(const ComputedStyle *style)
 {
-    if (style == NULL) return 400;
-    if (style->font_weight != 0) return style->font_weight;
-    return style->font_bold ? 700 : 400;
+    return computed_style_font_weight(style);
 }
 
 bool style_uses_bold_face(const ComputedStyle *style)
@@ -270,6 +268,7 @@ bool style_uses_synthetic_weight(const FontSet *fonts,
 {
     unsigned weight = style_font_weight(style);
     return weight >= LAYOUT_SYNTHETIC_WEIGHT
+           && (face == NULL || face->authored_weight != weight)
            && (weight < LAYOUT_BOLD_FACE_WEIGHT
                || !font_context_face_is_bold(fonts, web_fonts, face));
 }
@@ -557,6 +556,7 @@ static void layout_reuse_clear_entries(LayoutReuseCache *cache)
                    * LAYOUT_REUSE_TABLE_ROW_CAPACITY);
     }
     cache->clock = 0;
+    cache->style_build_clock = 0;
 }
 
 static void layout_reuse_clear_sizing_entries(LayoutReuseCache *cache)
@@ -567,6 +567,22 @@ static void layout_reuse_clear_sizing_entries(LayoutReuseCache *cache)
         memset(cache->table_rows, 0,
                sizeof(*cache->table_rows)
                    * LAYOUT_REUSE_TABLE_ROW_CAPACITY);
+    }
+}
+
+static void layout_reuse_container_state_changed(LayoutReuseCache *cache)
+{
+    if (cache == NULL) return;
+    layout_reuse_clear_counters(cache);
+    layout_reuse_clear_sizing_entries(cache);
+    for (size_t i = 0; i <= cache->style_mask; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if ((entry->dependent & LAYOUT_REUSE_CONTAINER_DEPENDENT) != 0)
+            layout_reuse_drop_style(cache, entry);
+        else
+            /* A pseudo alone can have a container condition even when the
+               element's ordinary style does not consult one. */
+            entry->pseudo_absent = 0;
     }
 }
 
@@ -1733,15 +1749,22 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
                                        const lxb_dom_node_t *root)
 {
     if (cache == NULL || root == NULL) return;
-    /* Only elements own entries; a text or comment root (textContent
-       assignments discard one such child at a time) has nothing cached. */
-    if (root->type != LXB_DOM_NODE_TYPE_ELEMENT) return;
+    /* Computed-style reads also retain text/comment nodes. Retire every
+       node kind before destruction, including single textContent children. */
     lxb_dom_node_t *scope = (lxb_dom_node_t *) root;
-    for (size_t i = 0; i <= cache->style_mask; i++) {
-        LayoutReuseStyleEntry *entry = &cache->styles[i];
-        if (entry->node != NULL
-            && layout_node_is_within(entry->node, scope)) {
-            layout_reuse_drop_style(cache, entry);
+    if (root->type == LXB_DOM_NODE_TYPE_TEXT
+        || root->type == LXB_DOM_NODE_TYPE_COMMENT) {
+        /* These leaf nodes need only the bounded hash probe, not a full
+           style-table walk for every textContent child. Other cache families
+           and pending invalidations still retire below. */
+        layout_reuse_drop_element(cache, scope, false);
+    } else {
+        for (size_t i = 0; i <= cache->style_mask; i++) {
+            LayoutReuseStyleEntry *entry = &cache->styles[i];
+            if (entry->node != NULL
+                && layout_node_is_within(entry->node, scope)) {
+                layout_reuse_drop_style(cache, entry);
+            }
         }
     }
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
@@ -2003,9 +2026,46 @@ void layout_reuse_cache_invalidate_focus(
         return;
     }
     if (cache->selector_focus_has_sibling) {
-        /* A sibling of the focused element (or of an ancestor) can be
-           styled by it; nothing here scopes those. */
-        layout_reuse_cache_reset(cache);
+        /* Sibling focus rules can reach beyond this subtree, but only
+           focus-reading selectors change their matched answer. Keep other
+           lists and unrelated styles. Parent-style keys propagate inherited
+           changes; sizing and geometry still take the complete flow. */
+        uint32_t custom[64];
+        StyleRuleCandidatePlan plan;
+        size_t custom_count = 0;
+        bool bounded = true;
+        for (size_t i = 0; i < cache->sheet->custom_rule_count; i++) {
+            const StyleCustomRule *rule = &cache->sheet->custom_rules[i];
+            if (!style_selector_reads_focus(rule->selector)) continue;
+            /* Variable inheritance is not represented by the parent style
+               key. Keep its existing whole-cache invalidation. */
+            if (strncmp(rule->name, "--", 2) == 0 || custom_count == 64u) {
+                bounded = false;
+                break;
+            }
+            custom[custom_count++] = (uint32_t) i;
+        }
+        if (!bounded || !stylesheet_prepare_focus_rule_index(cache->sheet)
+            || !style_rule_candidate_plan(cache->sheet,
+                cache->sheet->focus_rule_indices,
+                cache->sheet->focus_rule_count, &plan)) {
+            layout_reuse_cache_reset(cache);
+            return;
+        }
+        layout_reuse_cache_flush_invalidations(cache);
+        layout_reuse_clear_counters(cache);
+        for (size_t i = 0; i <= cache->style_mask; i++) {
+            LayoutReuseStyleEntry *entry = &cache->styles[i];
+            if (entry->node != NULL && (style_rules_may_select_node(
+                    cache->sheet, cache->matches, &plan, entry->node)
+                || style_custom_rules_may_select_node(cache->sheet, custom,
+                    custom_count, entry->node)))
+                layout_reuse_drop_style(cache, entry);
+        }
+        layout_reuse_clear_sizing_entries(cache);
+        style_retained_matches_invalidate_rules(cache->matches, cache->sheet,
+            cache->sheet->focus_rule_indices, cache->sheet->focus_rule_count);
+        cache->stats.scoped_invalidations++;
         return;
     }
     /* A :has(:focus) answer moves like any other state a :has() reads, and
@@ -2623,6 +2683,7 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
 #endif
         ) layout_reuse_fit_styles(cache);
     cache->style_shortfall = 0;
+    cache->style_build_clock = cache->clock;
     uint64_t sheet_generation =
         sheet == NULL ? 0 : sheet->build_generation;
     bool matches_supported = style_retained_matches_supported(sheet);
@@ -2744,6 +2805,15 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
     if (cache->styles[replacement].node != NULL
         && cache->styles[replacement].node != node) {
         if (cache->font_publication_active) return;
+        /* At the hard ceiling, a document-order scan must not evict the
+           entries it has just used. A cyclic walk larger than this table
+           otherwise loses almost every hit on every subsequent build.
+           Decline optional admission; the freshly resolved style remains
+           authoritative in the current build. Old, unused entries can
+           still be replaced, and existing-node updates remain allowed. */
+        if (cache->style_mask + 1u == LAYOUT_REUSE_STYLE_CAPACITY_LIMIT
+            && cache->styles[replacement].stamp > cache->style_build_clock)
+            return;
         cache->style_shortfall++;
 #ifndef TILEFINCH_NO_TRACE
         cache->stats.style_evictions++;
@@ -2786,9 +2856,9 @@ static void layout_resolve_canonical_style(
     *font_dependent = (result->filter_code & STYLE_FONT_CH_PENDING) != 0;
     if ((result->filter_code & STYLE_FONT_CH_PENDING) != 0
         && sheet != NULL && sheet->resolve_scratch != NULL) {
-        const FontFace *face = font_context_face_variant(
+        const FontFace *face = font_context_face_at_weight(
             fonts, web_fonts, result->font_family,
-            result->font_italic, style_uses_bold_face(result));
+            result->font_italic, style_uses_bold_face(result), computed_style_font_weight(result));
         FontFamily metric_family = font_context_metric_family(
             web_fonts, result->font_family, face);
         int width_fixed = font_text_width_for_family_at_size_fixed(
@@ -3693,13 +3763,16 @@ void trace_flex_sizing(LayoutContext *context, const char *phase,
 }
 
 static bool layout_work_cooperate(LayoutContext *context,
-                                  size_t work_units, const char *phase)
+                                  size_t work_units, const char *phase,
+                                  bool account_work)
 {
     if (context == NULL || work_units == 0) return true;
-    if (work_units <= SIZE_MAX - context->layout->layout_work_units) {
-        context->layout->layout_work_units += work_units;
-    } else {
-        context->layout->layout_work_units = SIZE_MAX;
+    /* Index/ancestor revisits need safe points, but are not new page work
+       for the existing optional-resource publication ceiling. */
+    if (account_work) {
+        if (work_units <= SIZE_MAX - context->layout->layout_work_units)
+            context->layout->layout_work_units += work_units;
+        else context->layout->layout_work_units = SIZE_MAX;
     }
     context->slice_units = work_units;
     context->slice_last_node = NULL;
@@ -3713,12 +3786,17 @@ static bool layout_work_cooperate(LayoutContext *context,
 
 bool layout_batch_cooperate(LayoutContext *context, size_t work_units)
 {
-    return layout_work_cooperate(context, work_units, "layout-index");
+    return layout_work_cooperate(context, work_units, "layout-index", true);
+}
+
+bool layout_index_poll(LayoutContext *context, size_t work_units)
+{
+    return layout_work_cooperate(context, work_units, "layout-index", false);
 }
 
 bool layout_text_cooperate(LayoutContext *context, size_t work_units)
 {
-    return layout_work_cooperate(context, work_units, "layout-text");
+    return layout_work_cooperate(context, work_units, "layout-text", true);
 }
 
 bool layout_batch_checkpoint(LayoutContext *context, size_t at,
@@ -3883,6 +3961,9 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->container_live = job->container_log;
     memset(layout, 0, sizeof(*layout));
     layout->retain_container_padding = job->retain_container_padding;
+    layout->image_content_generation = job->document->content_generation;
+    layout->image_style_generation = document_style_generation();
+    layout->image_sheet_generation = job->stylesheet->build_generation;
     layout_read_trace_environment(layout);
     layout->budget = job->budget;
     layout->width = job->viewport_width;
@@ -4420,10 +4501,12 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     case LAYOUT_JOB_FINISH:
         layout_finish_work_slice(job->context);
         job->layout.scroll_width = root_scroll_width_after_clipping(
-            &job->layout, job->viewport_width);
+            &job->layout, job->viewport_width, job->context);
+        if (job->context->cancelled) { okay = false; break; }
         job->layout.height = root_scroll_height_after_clipping(
             &job->layout, job->bottom < job->viewport_height
-                ? job->viewport_height : job->bottom);
+                ? job->viewport_height : job->bottom, job->context);
+        if (job->context->cancelled) { okay = false; break; }
         job->preview_truncated = job->context->preview_truncated;
         tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
@@ -4490,7 +4573,10 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
             return job->status;
         }
         layout_destroy(&job->layout);
-        layout_reuse_cache_reset(job->reuse);
+        /* The DOM and installed cascade are unchanged between the probe
+           and final pass. Keep exact styles which never consulted container
+           state; refresh dependent styles, pseudo discovery and all sizing. */
+        layout_reuse_container_state_changed(job->reuse);
         job->body = NULL;
         job->fingerprint_at = 0;
         job->text_fingerprint = UINT64_C(1469598103934665603);
@@ -4988,6 +5074,18 @@ bool layout_clone_visual(LayoutDocument *visual,
                 command->font_size, numerator, denominator);
             command->radius = viewport_scale_floor(
                 command->radius, numerator, denominator);
+        } else if (command->type == DRAW_ROTATED_FILL) {
+            unsigned w = (unsigned) viewport_scale_ceil(
+                (int) (command->text_length & 65535u), numerator, denominator);
+            unsigned h = (unsigned) viewport_scale_ceil(
+                (int) (command->text_length >> 16), numerator, denominator);
+            if (w > 65535u) w = 65535u;
+            if (h > 65535u) h = 65535u;
+            command->text_length = w | (h << 16);
+            command->radius = viewport_scale_floor(
+                command->radius, numerator, denominator);
+            command->scale = viewport_scale_floor(
+                command->scale, numerator, denominator);
         } else if (command->type == DRAW_IMAGE) {
             /* Replaced images pack object-position into radius/font_size.
                Preserve each percentage and scale only its signed CSS-pixel

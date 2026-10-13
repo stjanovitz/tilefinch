@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 from visual_scenario import trace_digest
+from native_visual_trace import prepare_native_visual_trace
 
 VIEWS = (0, 25, 50, 75, 100)
 MAX_LOG_BYTES = 64 * 1024 * 1024
@@ -229,6 +230,11 @@ def validate_native_capture(output: Path, exit_code: int,
 def _run_attempt(arguments: list[str], output: Path, height_estimate: int,
                  sweep_ticks: int, tick_ms: int, timeout_seconds: int) -> dict:
     output.mkdir(parents=True, exist_ok=False)
+    arguments = list(arguments)
+    trace_at = arguments.index('--replay-http-response-keyed') + 1
+    adaptation = prepare_native_visual_trace(Path(arguments[trace_at]), output / 'logical-visual-trace')
+    adaptation['trace_sha256'] = trace_digest(Path(adaptation['trace']))
+    arguments[trace_at] = adaptation['trace']
     commands = output / 'commands.txt'
     commands.write_text(build_five_view_commands(output, height_estimate, sweep_ticks, tick_ms))
     command = arguments + ['--viewport-css-width', '480', '--viewport-css-height', '272',
@@ -249,7 +255,8 @@ def _run_attempt(arguments: list[str], output: Path, height_estimate: int,
             code = 124
     (output / 'invocation.json').write_text(json.dumps(
         {'args': command, 'exit': code, 'height_estimate': height_estimate,
-         'extra_clock_turns': sweep_ticks, 'tick_ms': tick_ms}, indent=2) + '\n')
+         'extra_clock_turns': sweep_ticks, 'tick_ms': tick_ms,
+         'visual_trace_adapter': adaptation}, indent=2) + '\n')
     return validate_native_capture(output, code)
 
 

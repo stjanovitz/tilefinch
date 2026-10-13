@@ -10,6 +10,9 @@ static Budget *svg_budget;
 static unsigned svg_allocations;
 static bool svg_allocation_failed;
 static uint64_t svg_slice_started_us;
+static void svg_raster_shape(void *shape, int width, int height, float scale);
+static bool svg_raster_coverage(void *rasterizer, unsigned char *coverage,
+                                 int first, int last, int row);
 
 bool image_svg_decode_busy(void)
 {
@@ -66,6 +69,9 @@ static void svg_free(void *pointer)
 #endif
 #define NANOSVG_IMPLEMENTATION
 #include <nanosvg.h>
+#define NANOSVG_RASTER_SHAPE(shape, w, h, scale) svg_raster_shape(shape, w, h, scale)
+#define NANOSVG_RASTER_COVERAGE(r, coverage, first, last, row) \
+    svg_raster_coverage(r, coverage, first, last, row)
 #define NANOSVGRAST_IMPLEMENTATION
 #include <nanosvgrast.h>
 #if defined(__clang__)
@@ -167,6 +173,7 @@ unsigned char *image_svg_decode_bounded(
     previous_owner = budget_allocation_owner_enter(budget, scratch_owner);
     if (svg != NULL) nsvgDelete(svg);
     budget_allocation_owner_leave(budget, previous_owner);
+    svg_clips = NULL;
     svg_budget = NULL;
     budget_rollback_owner_category(budget, scratch_owner,
                                    BUDGET_CATEGORY_RESOURCE);

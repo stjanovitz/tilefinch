@@ -402,7 +402,8 @@ typedef enum {
     PSP_UI_SETTING_YOUTUBE_TOPICS,
     PSP_UI_SETTING_UI_LANGUAGE,
     PSP_UI_SETTING_YOUTUBE_LOGIN,
-    PSP_UI_SETTING_ROTATE_HINT_ALWAYS
+    PSP_UI_SETTING_ROTATE_HINT_ALWAYS,
+    PSP_UI_SETTING_WEB_FONTS
 } PspUiSettingId;
 
 typedef union {
@@ -426,6 +427,7 @@ typedef union {
     ContentBlockerMode content_blocker_mode;
     BrowserBasicFallbackMode basic_fallback_mode;
     BrowserHeavyPagesMode heavy_pages_mode;
+    WebFontMode web_font_mode;
 } PspUiSettingValue;
 
 typedef struct {
@@ -851,6 +853,7 @@ typedef struct {
     uint8_t heavy_pages_mode : 2;
     uint8_t heavy_scripts_suggested : 1;
     uint8_t failure_recovery_heavy : 1;
+    uint8_t web_font_mode : 2;
     /* Uses alignment padding before the cursor coordinates. */
     bool save_playback_positions;
     int cursor_x_milli;

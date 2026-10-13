@@ -1,0 +1,26 @@
+--- a/src/nanosvgrast.h
++++ b/src/nanosvgrast.h
+@@ -1250,3 +1250,7 @@
+ 		if (xmax > r->width-1) xmax = r->width-1;
+ 		if (xmin <= xmax) {
++#ifdef NANOSVG_RASTER_COVERAGE
++            if (!NANOSVG_RASTER_COVERAGE(r, r->scanline, xmin, xmax, y))
++                continue;
++#endif
+ 			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
+@@ -1450,3 +1454,7 @@
+ 			continue;
+ 
++#ifdef NANOSVG_RASTER_SHAPE
++        NANOSVG_RASTER_SHAPE(shape, w, h, scale);
++#endif
++
+         for (j = 0; j < 3; j++) {
+--- a/src/nanosvg.h
++++ b/src/nanosvg.h
+@@ -1911,4 +1911,4 @@
+ 		attr->miterLimit = nsvg__parseMiterLimit(value);
+-	} else if (strcmp(name, "fill-rule") == 0) {
++	} else if (strcmp(name, "fill-rule") == 0 || strcmp(name, "clip-rule") == 0) {
+ 		attr->fillRule = nsvg__parseFillRule(value);
+ 	} else if (strcmp(name, "font-size") == 0) {

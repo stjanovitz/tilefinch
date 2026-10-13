@@ -890,6 +890,52 @@ static bool test_extension_reaching_the_end_queues_discovered_visuals(void)
     return ok && clean;
 }
 
+static bool test_relayout_damage_skips_unchanged_middle(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ".edge{position:absolute;left:420px;width:40px;height:30px;"
+        "background:red}.changed .edge{background:blue;outline:2px solid blue}"
+        "#last{top:180px}#middle{position:absolute;top:80px;left:0;"
+        "width:300px;height:60px;background:green}"
+        "</style><body><div class=edge></div><div id=middle></div>"
+        "<div id=last class=edge></div></body>";
+    Budget budget;
+    budget_init(&budget, 12 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    if (ready) navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://damage.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "document.body.className='changed'", "<separated-paint-damage>",
+        &navigation.page.script_result)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation);
+    ok = ok && navigation.relayout_damage_valid
+        && navigation.relayout_damage_left >= 418
+        && navigation.relayout_damage_right <= 462
+        && navigation.relayout_damage_top <= 0
+        && navigation.relayout_damage_bottom >= 210;
+    /* Removing the inserted outlines must retain the same narrow damage,
+       not repaint the unchanged middle commands when their indices shift. */
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "document.body.className=''", "<removed-paint-damage>",
+        &navigation.page.script_result)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation)
+        && navigation.relayout_damage_valid
+        && navigation.relayout_damage_left >= 418
+        && navigation.relayout_damage_right <= 462;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_relayout_damage_tracks_paint_only_fields(void)
 {
     static const char html[] =
@@ -908,7 +954,7 @@ static bool test_relayout_damage_tracks_paint_only_fields(void)
     bool navigation_ready = lexbor_installed
         && navigation_init(&navigation, &budget, 2);
     if (navigation_ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
     }
     uint64_t generation = navigation_ready
         ? navigation_begin(&navigation) : 0;

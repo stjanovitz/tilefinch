@@ -285,6 +285,92 @@
     stylesheet_destroy(&stretch_grid_sheet);
     document_destroy(&stretch_grid_document);
 
+    puts("test: content-sized grid rows stretch earlier percentage cards");
+    static const char final_row_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#cards{display:grid;grid-template-columns:100px 100px 100px 100px}"
+        ".card{display:flex;flex-direction:column;justify-content:space-between;"
+        "height:100%;min-height:150px;padding:8px 0 0;box-sizing:border-box;"
+        "position:relative;background:#eee}.caption{height:40px}"
+        ".picture{height:50px;margin-top:8px;flex-shrink:0}"
+        ".cover{position:absolute;inset:0}.tall{height:220px}"
+        "#start{align-self:start}#fixed{height:160px}"
+        ".pair{display:grid;grid-template-columns:100px 100px}"
+        ".short{height:20px}.long{height:40px}.last{order:2}.first{order:1}"
+        ".rev{flex-direction:column-reverse}.half{height:50%}"
+        ".limited{max-height:160px}</style><body>"
+        "<div id=cards><div id=early><div style='display:contents'>"
+        "<div id=card class=card><a id=cover class=cover href='/a'></a>"
+        "<div class=caption></div><div id=picture class=picture></div>"
+        "</div></div></div><div class=tall></div>"
+        "<div id=start><div class=card></div></div>"
+        "<div id=fixed></div></div>"
+        "<div class=pair><div><div class=card>"
+        "<div id=ordered-last class='short last'></div>"
+        "<div id=ordered-first class='long first'></div>"
+        "</div></div><div class=tall></div></div>"
+        "<div class=pair><div><div class='card rev'>"
+        "<div id=reverse-first class=short></div><div id=reverse-last class=long></div>"
+        "</div></div><div class=tall></div></div>"
+        "<div class=pair><div><div id=percent-card class=card>"
+        "<div id=half class=half></div><div id=after-half class=short></div>"
+        "</div></div><div class=tall></div></div>"
+        "<div class=pair><div id=limited class=limited></div>"
+        "<div class=tall></div></div></body>";
+    PocDocument final_row_document;
+    Stylesheet final_row_sheet;
+    LayoutDocument final_row_layout;
+    CHECK(document_parse(&final_row_document, &budget, final_row_page,
+                         strlen(final_row_page), 46)
+          && stylesheet_build(&final_row_sheet, &budget,
+                              &final_row_document, 480)
+          && layout_build(&final_row_layout, &budget, &final_row_document,
+                          &final_row_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *final_row_root = lxb_dom_interface_node(final_row_document.html);
+    const LayoutNodeBox *early_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "early"));
+    const LayoutNodeBox *card_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "card"));
+    const LayoutNodeBox *picture_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "picture"));
+    const LayoutNodeBox *cover_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "cover"));
+    const LayoutNodeBox *start_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "start"));
+    const LayoutNodeBox *fixed_box = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "fixed"));
+    CHECK(early_box && card_box && picture_box && cover_box && start_box && fixed_box);
+    CHECK(early_box->height == 220 && card_box->height == 220
+          && cover_box->height == 220 && start_box->height == 150
+          && fixed_box->height == 160
+          && picture_box->y + picture_box->height == card_box->y + 220);
+    const LayoutNodeBox *ordered_last = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "ordered-last"));
+    const LayoutNodeBox *ordered_first = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "ordered-first"));
+    const LayoutNodeBox *reverse_first = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "reverse-first"));
+    const LayoutNodeBox *reverse_last = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "reverse-last"));
+    const LayoutNodeBox *half = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "half"));
+    const LayoutNodeBox *after_half = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "after-half"));
+    const LayoutNodeBox *percent_card = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "percent-card"));
+    const LayoutNodeBox *limited = layout_box_for_node(&final_row_layout,
+        find_id(final_row_root, "limited"));
+    CHECK(ordered_first && ordered_last && reverse_first && reverse_last
+          && half && after_half && percent_card && limited);
+    CHECK(ordered_last->y - ordered_first->y == 192
+          && reverse_first->y - reverse_last->y == 192
+          && half->height == 106
+          && after_half->y + after_half->height == percent_card->y + 220
+          && limited->height == 160);
+    layout_destroy(&final_row_layout);
+    stylesheet_destroy(&final_row_sheet);
+    document_destroy(&final_row_document);
+
     puts("test: absolutely positioned grid item without column tracks");
     /* A rows-only grid whose sole child is absolutely positioned has no
        column tracks, so grid-column:1 names a line that does not exist and
@@ -352,7 +438,8 @@
         &implicit_grid_layout, find_id(implicit_grid_root, "grid"));
     CHECK(implicit_label != NULL && implicit_ref != NULL
           && shrink_grid_box != NULL);
-    CHECK(implicit_label->height == implicit_ref->height
+    CHECK(implicit_label->height == 24
+          && implicit_label->height >= implicit_ref->height
           && shrink_grid_box->width >= 24 + 8 + implicit_ref->width - 1);
     layout_destroy(&implicit_grid_layout);
     stylesheet_destroy(&implicit_grid_sheet);

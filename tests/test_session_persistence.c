@@ -14,6 +14,8 @@
 
 static const char persistence_path[] =
     "/tmp/tilefinch-session-persistence-test.bin";
+static const char refusal_path[] =
+    "/tmp/tilefinch-session-persistence-refusal-test.bin";
 
 static uint32_t test_hash_update(uint32_t hash, const void *data,
                                  size_t length)
@@ -770,6 +772,71 @@ static int test_oversized_live_body_streams_without_allocation(void)
     return 0;
 }
 
+static int test_storage_load_budget_refusal_preserves_target(void)
+{
+    static const char origin[] = "https://storage.test/";
+    Budget source_budget;
+    budget_init(&source_budget, 2u * 1024u * 1024u);
+    BrowserSession source;
+    CHECK(browser_session_init(&source, &source_budget, 64u * 1024u)
+        && browser_session_storage_set(
+            &source, origin, true, "theme", "new", 3u)
+        && browser_session_persistence_save(
+            &source, refusal_path, BROWSER_SESSION_PERSIST_LOCAL_STORAGE,
+            NULL) == BROWSER_SESSION_PERSISTENCE_OK);
+    browser_session_destroy(&source);
+    CHECK(source_budget.current == 0u);
+
+    size_t attempts = 0u;
+    for (size_t point = 0u;; point++) {
+        Budget budget;
+        budget_init(&budget, 2u * 1024u * 1024u);
+        BrowserSession target;
+        CHECK(browser_session_init(&target, &budget, 64u * 1024u)
+            && browser_session_storage_set(
+                &target, origin, true, "sentinel", "old", 3u));
+        budget_inject_failure_after(
+            &budget, point == 0u ? SIZE_MAX : point - 1u);
+        BrowserSessionPersistenceStatus status =
+            browser_session_persistence_load(
+                &target, refusal_path,
+                BROWSER_SESSION_PERSIST_LOCAL_STORAGE, NULL);
+        if (point == 0u) {
+            attempts = SIZE_MAX - budget.failure_injection_countdown;
+            CHECK(status == BROWSER_SESSION_PERSISTENCE_OK
+                && attempts > 2u && attempts < 128u);
+        } else {
+            CHECK(budget.injected_failure_count == 1u);
+        }
+        budget_clear_failure_injection(&budget);
+        if (status != BROWSER_SESSION_PERSISTENCE_OK) {
+            const char *value = NULL;
+            size_t length = 0u;
+            CHECK(status == BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY
+                && browser_session_storage_get(
+                    &target, origin, true, "sentinel", &value, &length)
+                && length == 3u && memcmp(value, "old", 3u) == 0
+                && !browser_session_storage_get(
+                    &target, origin, true, "theme", NULL, NULL));
+            CHECK(browser_session_persistence_load(
+                &target, refusal_path,
+                BROWSER_SESSION_PERSIST_LOCAL_STORAGE, NULL)
+                == BROWSER_SESSION_PERSISTENCE_OK);
+        }
+        const char *value = NULL;
+        size_t length = 0u;
+        CHECK(browser_session_storage_get(
+            &target, origin, true, "theme", &value, &length)
+            && length == 3u && memcmp(value, "new", 3u) == 0);
+        browser_session_destroy(&target);
+        CHECK(budget.current == 0u);
+        if (point == attempts) break;
+    }
+    CHECK(browser_session_persistence_remove(refusal_path)
+        == BROWSER_SESSION_PERSISTENCE_OK);
+    return 0;
+}
+
 int main(void)
 {
     (void) browser_session_persistence_remove(persistence_path);
@@ -777,6 +844,7 @@ int main(void)
     CHECK(test_transaction_limits_and_backup() == 0);
     CHECK(test_smaller_live_cache_and_truncated_input() == 0);
     CHECK(test_oversized_live_body_streams_without_allocation() == 0);
+    CHECK(test_storage_load_budget_refusal_preserves_target() == 0);
     puts("session persistence: bounded transactional round-trip passed");
     return 0;
 }

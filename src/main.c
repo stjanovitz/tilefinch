@@ -1674,10 +1674,11 @@ int main(int argc, char **argv)
            scripts.script_clones_started, scripts.script_clones_unstarted,
            scripts.script_clones_suppressed, scripts.script_clones_refused);
     printf("javascript-geometry queries=%zu retained-fast-paths=%zu "
-           "ancestor-visits=%zu synchronous-layouts=%zu\n",
+           "ancestor-visits=%zu synchronous-layouts=%zu snapshot-builds=%zu snapshot-hits=%zu\n",
            scripts.geometry_queries, scripts.geometry_retained_fast_paths,
            scripts.geometry_ancestor_visits,
-           scripts.geometry_synchronous_layouts);
+           scripts.geometry_synchronous_layouts,
+           scripts.geometry_snapshot_builds, scripts.geometry_snapshot_hits);
     printf("javascript-responsiveness work=%zu yields=%zu max-slice-us=%llu "
            "max-slice-work=%zu nonpreemptible-compiles=%zu "
            "max-compile-us=%llu max-compile-bytes=%zu "

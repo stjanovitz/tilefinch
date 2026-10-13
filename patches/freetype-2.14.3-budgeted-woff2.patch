@@ -1,0 +1,104 @@
+--- a/src/sfnt/sfwoff2.c
++++ b/src/sfnt/sfwoff2.c
+@@ -212,5 +212,7 @@
+ 
+ 
++  extern int tilefinch_font_woff2_cooperate( FT_ULong );
++
+   /* Extend memory of `dst_bytes' buffer and copy data from `src'. */
+   static FT_Error
+   write_buf( FT_Byte**  dst_bytes,
+@@ -244,5 +246,20 @@
+     /* Copy data. */
+-    ft_memcpy( dst + *offset, src, size );
++    *dst_bytes = dst; /* Keep ownership correct after a realloc/cancel. */
++    {
++      FT_ULong copied = 0;
++      while ( copied < size )
++      {
++        FT_ULong amount = size - copied;
++        if ( amount > 16384UL ) amount = 16384UL;
++        if ( !tilefinch_font_woff2_cooperate( copied ) )
++        {
++          error = FT_THROW( Invalid_Table );
++          goto Exit;
++        }
++        ft_memcpy( dst + *offset + copied, src + copied, amount );
++        copied += amount;
++      }
++    }
+ 
+     *offset += size;
+     /* Set pointer of `dst' to its correct value. */
+@@ -305,7 +322,14 @@
+ 
+ 
++  /* Tilefinch supplies capped allocation, streaming and cancellation. */
++  extern int tilefinch_font_woff2_decompress( FT_Memory, FT_Byte*,
++                                             FT_ULong, const FT_Byte*,
++                                             FT_ULong );
++  extern int tilefinch_font_woff2_cooperate( FT_ULong );
++
+   static FT_Error
+-  woff2_decompress( FT_Byte*        dst,
++  woff2_decompress( FT_Memory      memory,
++                    FT_Byte*        dst,
+                     FT_ULong        dst_size,
+                     const FT_Byte*  src,
+                     FT_ULong        src_size )
+@@ -316,10 +340,10 @@
+     BrotliDecoderResult  result;
+ 
+ 
+-    result = BrotliDecoderDecompress( src_size,
+-                                      src,
+-                                      &uncompressed_size,
+-                                      dst );
++    result = tilefinch_font_woff2_decompress( memory, dst, dst_size,
++                                             src, src_size ) == 0
++               ? BROTLI_DECODER_RESULT_SUCCESS
++               : BROTLI_DECODER_RESULT_ERROR;
+ 
+     if ( result != BROTLI_DECODER_RESULT_SUCCESS ||
+          uncompressed_size != dst_size           )
+@@ -428,4 +452,6 @@
+     for ( i = 0; i < n_points; ++i )
+     {
++      if ( ( i & 255U ) == 0 && !tilefinch_font_woff2_cooperate( i ) )
++        return FT_THROW( Invalid_Table );
+       FT_Byte  flag     = flags_in[i];
+       FT_Bool  on_curve = !( flag >> 7 );
+@@ -541,3 +567,5 @@
+     for ( i = 0; i < n_points; ++i )
+     {
++      if ( ( i & 255U ) == 0 && !tilefinch_font_woff2_cooperate( i ) )
++        return FT_THROW( Invalid_Table );
+       const WOFF2_PointRec  point = points[i];
+@@ -618,4 +646,6 @@
+     for ( i = 0; i < n_points; ++i )
+     {
++      if ( ( i & 255U ) == 0 && !tilefinch_font_woff2_cooperate( i ) )
++        return FT_THROW( Invalid_Table );
+       FT_Int  dx = points[i].x - last_x;
+       FT_Int  dy = points[i].y - last_y;
+@@ -941,5 +971,10 @@
+ 
+     for ( i = 0; i < num_glyphs; ++i )
+     {
++      if ( ( i & 31U ) == 0 && !tilefinch_font_woff2_cooperate( i ) )
++      {
++        error = FT_THROW( Invalid_Table );
++        goto Fail;
++      }
+       FT_ULong   glyph_size = 0;
+       FT_UShort  n_contours = 0;
+@@ -2265,7 +2300,8 @@
+       goto Exit;
+ 
+     /* Uncompress the stream. */
+-    error = woff2_decompress( uncompressed_buf,
++    error = woff2_decompress( memory,
++                              uncompressed_buf,
+                               woff2.uncompressed_size,
+                               stream->cursor,
+                               woff2.totalCompressedSize );

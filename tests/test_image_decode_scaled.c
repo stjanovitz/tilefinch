@@ -623,6 +623,59 @@ static int test_webp_accounting(Budget *budget)
     return 0;
 }
 
+/* A refused decoder allocation must not publish partial pixels, retain
+   scratch, or poison the same resource's next attempt. */
+static int test_decode_allocation_refusals(Budget *budget)
+{
+    const int width = 97, height = 65, tw = 49, th = 33;
+    Bytes encoded[] = {
+        png_synthetic(width, height, 8, 6, false),
+        jpeg_synthetic(width, height, 3, 85),
+        webp_solid(width, height, 200, 120, 40)
+    };
+    const char *const names[] = {"png", "jpeg", "webp"};
+    for (size_t format = 0; format < sizeof(encoded)/sizeof(encoded[0]); format++) {
+        budget_inject_failure_after(budget, SIZE_MAX);
+        DecodeRun control = decode_at(budget, &encoded[format], width, height,
+                                      tw, th);
+        CHECK(control.status == IMAGE_DECODE_SUCCEEDED && control.pixels != NULL);
+        size_t attempts = SIZE_MAX - budget->failure_injection_countdown;
+        budget_clear_failure_injection(budget);
+        size_t pixels_length = (size_t) tw * th * 4u;
+        unsigned char reference[49u * 33u * 4u];
+        memcpy(reference, control.pixels, pixels_length);
+        image_resource_free_decoded(budget, control.pixels);
+        CHECK(budget->current == 0 && attempts > 0 && attempts < 512);
+        for (size_t point = 0; point <= attempts; point++) {
+            budget_inject_failure_after(budget, point);
+            DecodeRun run = decode_at(budget, &encoded[format], width, height,
+                                      tw, th);
+            bool refused = !budget->failure_injection_enabled;
+            budget_clear_failure_injection(budget);
+            if (point < attempts) CHECK(refused);
+            if (run.status == IMAGE_DECODE_SUCCEEDED) {
+                CHECK(run.pixels != NULL
+                      && memcmp(run.pixels, reference, pixels_length) == 0);
+                image_resource_free_decoded(budget, run.pixels);
+            } else {
+                CHECK(refused && run.status == IMAGE_DECODE_TRANSIENT_FAILURE
+                      && run.pixels == NULL);
+            }
+            CHECK(budget->current == 0 && budget->accounting_repair_count == 0);
+            run = decode_at(budget, &encoded[format], width, height, tw, th);
+            CHECK(run.status == IMAGE_DECODE_SUCCEEDED && run.pixels != NULL
+                  && memcmp(run.pixels, reference, pixels_length) == 0);
+            image_resource_free_decoded(budget, run.pixels);
+            CHECK(budget->current == 0 && budget->accounting_repair_count == 0);
+        }
+        fprintf(stderr, "%s decoder refusal boundaries=%zu\n", names[format],
+                attempts + 1u);
+    }
+    for (size_t i = 0; i < sizeof(encoded)/sizeof(encoded[0]); i++)
+        free(encoded[i].data);
+    return 0;
+}
+
 #include "suites/image_decode_webp_alpha.inc"
 
 int main(int argc, char **argv)
@@ -640,6 +693,7 @@ int main(int argc, char **argv)
         {"jpeg", test_jpeg_scaled},
         {"jpeg-incomplete-header", test_jpeg_incomplete_header},
         {"webp", test_webp_accounting},
+        {"allocation-refusals", test_decode_allocation_refusals},
         {"webp-alpha", test_webp_alpha_byte_history},
         {"webp-alpha-filters", test_webp_alpha_filters},
     };

@@ -51,17 +51,22 @@ if(PSP_NO_FETCH_TRACE)
 endif()
 
 function(hot_symbol_size symbol out)
-    string(REGEX MATCH
-        "[0-9A-Fa-f]+[ \t]+([0-9A-Fa-f]+)[ \t]+[Tt][ \t]+${symbol}([\r\n]|$)"
-        row "${nm_output}")
-    if(NOT row)
+    string(REGEX MATCHALL
+        "[0-9A-Fa-f]+[ \t]+[0-9A-Fa-f]+[ \t]+[Tt][ \t]+${symbol}(\\.[^ \t\r\n]+)?([\r\n]|$)"
+        rows "${nm_output}")
+    if(NOT rows)
         message(FATAL_ERROR
             "PSP hot-symbol ratchet could not find ${symbol} in ${PSP_ELF}")
     endif()
-    string(REGEX REPLACE
-        ".*[ \t]([0-9A-Fa-f]+)[ \t]+[Tt][ \t]+${symbol}([\r\n]|$)"
-        "\\1" size_hex "${row}")
-    math(EXPR size "0x${size_hex}")
+    # Constant-propagation can replace a local function with a clone.
+    # Charge every variant, not just a convenient surviving base symbol.
+    set(size 0)
+    foreach(row IN LISTS rows)
+        string(REGEX REPLACE
+            "^[0-9A-Fa-f]+[ \t]+([0-9A-Fa-f]+).*"
+            "\\1" size_hex "${row}")
+        math(EXPR size "${size} + 0x${size_hex}")
+    endforeach()
     set(${out} ${size} PARENT_SCOPE)
 endfunction()
 

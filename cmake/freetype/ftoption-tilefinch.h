@@ -12,6 +12,10 @@
 
 #include <freetype/config/ftoption.h>
 
+/* Decoder calls are patched to use the face's capped FT_Memory allocator
+ * and the browser's bounded cooperative streaming entry point. */
+#define FT_CONFIG_OPTION_USE_BROTLI
+
 #undef FT_CONFIG_OPTION_POSTSCRIPT_NAMES
 #undef FT_CONFIG_OPTION_ADOBE_GLYPH_LIST
 

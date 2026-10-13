@@ -4,17 +4,17 @@ __attribute__((noinline))
 #endif
 static bool lite_html_account_action(YoutubeLiteHtml *html,
     YoutubeLiteAccountAction action, const char *target, const char *video,
-    const char *label, const char *control_id)
+    const char *label, const char *control_id, const char *icon)
 {
     bool channel = action == YOUTUBE_LITE_ACTION_SUBSCRIBE
         || action == YOUTUBE_LITE_ACTION_UNSUBSCRIBE;
     if (!lite_valid_account_id(target, channel)
         || (!channel && !lite_valid_video_id(video))) return false;
     return lite_html_format(html,
-        "<a id=\"%s\" class=comments-link data-yt-action=%u data-yt-target=\"%s\" "
-        "data-yt-video=\"%s\" href=\"#tilefinch-account-action\">",
-        control_id, (unsigned) action, target, channel ? "" : video)
-        && lite_html_escape(html, tilefinch_ui_logical_text(label))
+        "<a id=\"%s\" class=\"comments-link%s\" data-yt-action=%u data-yt-target=\"%s\" "
+        "data-yt-video=\"%s\" href=\"#tilefinch-account-action\" ",
+        control_id, icon ? " icon-action" : "", (unsigned) action, target, channel ? "" : video)
+        && lite_html_action_content(html, label, icon)
         && lite_html_text(html, "</a> ");
 }
 
@@ -23,9 +23,9 @@ static bool lite_html_subscribe(YoutubeLiteHtml *html, const char *channel)
     if (!lite_valid_account_id(channel, true)) return true;
     return lite_html_text(html, "<p>")
         && lite_html_account_action(html, YOUTUBE_LITE_ACTION_SUBSCRIBE,
-            channel, "", "Subscribe", "yt-subscribe-action")
+            channel, "", "Subscribe", "yt-subscribe-action", NULL)
         && lite_html_account_action(html, YOUTUBE_LITE_ACTION_UNSUBSCRIBE,
-            channel, "", "Unsubscribe", "yt-unsubscribe-action")
+            channel, "", "Unsubscribe", "yt-unsubscribe-action", NULL)
         && lite_html_text(html, "</p>");
 }
 
@@ -85,7 +85,7 @@ static bool lite_html_playlist_card(YoutubeLiteHtml *html,
         && lite_html_text(html, "</a>")
         && (save_video[0] == '\0' || lite_html_account_action(html,
             YOUTUBE_LITE_ACTION_PLAYLIST_ADD, record->playlist_id, save_video,
-            "Add to this playlist", ""))
+            "Add to this playlist", "", NULL))
         && lite_html_text(html, "</section>");
 }
 

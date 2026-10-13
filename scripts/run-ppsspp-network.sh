@@ -40,6 +40,29 @@ youtube_test_url=${TILEFINCH_YOUTUBE_TEST_URL:-}
 host_aliases=${TILEFINCH_PPSSPP_HOST_ALIASES:-}
 trace_source=${TILEFINCH_PPSSPP_TRACE_DIRECTORY:-}
 trace_name=none
+test_limit_mb=${PPSSPP_TEST_LIMIT_MB:-}
+test_trace_keyed=${PPSSPP_TEST_TRACE_KEYED:-0}
+
+case "$test_trace_keyed" in
+    0|1) ;;
+    *)
+        printf 'PPSSPP_TEST_TRACE_KEYED must be 0 or 1\n' >&2
+        exit 2
+        ;;
+esac
+
+if [ -n "$test_limit_mb" ]; then
+    case "$test_limit_mb" in
+        *[!0-9]*|'')
+            printf 'PPSSPP_TEST_LIMIT_MB must be an integer from 12 to 52\n' >&2
+            exit 2
+            ;;
+    esac
+    if [ "$test_limit_mb" -lt 12 ] || [ "$test_limit_mb" -gt 52 ]; then
+        printf 'PPSSPP_TEST_LIMIT_MB must be from 12 to 52\n' >&2
+        exit 2
+    fi
+fi
 
 usage() {
     printf '%s\n' \
@@ -56,6 +79,8 @@ usage() {
         "Live YouTube modes require TILEFINCH_YOUTUBE_TEST_URL; the public tree carries no real-video default." \
         "TILEFINCH_PPSSPP_HOST_ALIASES may contain newline-separated host=IPv4 mappings when PPSSPP's isolated DNS cannot reach the Internet." \
         "TILEFINCH_PPSSPP_TRACE_DIRECTORY replays a captured live session inside PPSSPP instead of using its network emulation." \
+        "PPSSPP_TEST_LIMIT_MB sets an isolated 12–52 MiB page Budget for memory-pressure runs." \
+        "PPSSPP_TEST_TRACE_KEYED=1 selects response-keyed replay for cross-device captures." \
         "--media-fixture-test runs deterministic embedded 240p/360p decoder qualification." \
         "--raster-fixture-test checks the PSP page/font raster and saves its atlas." \
         "--ge-present-probe draws synthetic video frames through the graphics engine and checks the pixels." \
@@ -678,6 +703,12 @@ fi
         "validation_update_auto=$update_e2e" \
         "validation_update_url=$update_e2e_url"
 } >"$config_path"
+if [ -n "$test_limit_mb" ]; then
+    printf 'limit_mb=%s\n' "$test_limit_mb" >>"$config_path"
+fi
+if [ "$test_trace_keyed" -eq 1 ]; then
+    printf 'trace_keyed=1\n' >>"$config_path"
+fi
 
 # PPSSPP hardware renderers keep graphics-engine output in a host framebuffer
 # object and never write it back into emulated PSP memory: with -d the log

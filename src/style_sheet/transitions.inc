@@ -315,6 +315,14 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
     const char *stored_value = stylesheet_store_selector(
         sheet, value, value_length);
     if (stored_selector == NULL || stored_value == NULL) return false;
+    StyleRule selector_metadata = {
+        .selector = stored_selector,
+        .selector_length = (uint16_t) selector_length
+    };
+    selector_assign_fast_key(&selector_metadata, stored_selector,
+                             selector_length);
+    size_t suffix_bytes = selector_length - selector_metadata.fast_key_offset
+        - selector_metadata.fast_key_length;
     sheet->transition_rules[sheet->transition_rule_count++] =
         (StyleTransitionRule) {
             .selector = stored_selector,
@@ -325,6 +333,10 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
             .pseudo = (uint8_t) pseudo,
             .container_query = sheet->current_container_query,
             .important = important,
+            .fast_key_suffix_bytes = selector_metadata.has_fast_key
+                    && suffix_bytes < UINT8_MAX
+                ? (uint8_t) suffix_bytes : UINT8_MAX,
+            .fast_key_length = selector_metadata.fast_key_length,
             .origin = sheet->current_origin,
             .layer = sheet->current_layer,
             .specificity = specificity,
@@ -379,9 +391,15 @@ bool style_transition_computed(
         Stylesheet *mutable_sheet = (Stylesheet *) sheet;
         stylesheet_prepare_rule_index(mutable_sheet);
         style_relative_selector_cache_begin(mutable_sheet);
+        StyleMatchSubject subject = {0};
+        style_match_subject_prepare(node, &subject);
         for (size_t i = 0; i < sheet->transition_rule_count; i++) {
             const StyleTransitionRule *rule = &sheet->transition_rules[i];
             if (rule->pseudo != (uint8_t) pseudo
+                || !selector_fast_key_matches(
+                       sheet, rule->selector, rule->selector_length,
+                       rule->fast_key_suffix_bytes, rule->fast_key_length,
+                       &subject)
                 || !style_container_query_matches(
                        sheet, rule->container_query, node)
                 || !style_adopted_rule_in_scope(

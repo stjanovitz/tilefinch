@@ -1,0 +1,26 @@
+# Open details and return, so the restored results need fresh visible tiles.
+# Exercise native menu/chrome and focus while those bounded slices are pending.
+# No playback, account changes, or saved session state.
+wait 1
+tap right
+tap cross
+wait 1
+tap circle
+wait 1
+tap rtrigger
+tap-after-live 1 select
+mark-live scroll-menu
+wait-live 2
+tap-live circle
+wait 1
+tap rtrigger
+tap-after-live 1 triangle
+wait-live 2
+tap-after-live 1 triangle
+wait 1
+mark scroll-filled
+tap rtrigger
+tap-after-live 1 down
+wait 1
+mark scroll-focus
+end

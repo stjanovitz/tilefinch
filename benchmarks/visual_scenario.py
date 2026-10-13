@@ -400,6 +400,8 @@ REFERENCE_PUBLICATION_FIELDS = {
     "browser_closed",
     "final_activity",
     "late_callbacks",
+    "late_binding_details",
+    "suppressed_teardown_beacons",
     "teardown_changes",
 }
 REFERENCE_ACQUISITION_FIELDS = {
@@ -1771,6 +1773,10 @@ def _validate_reference_environment(
         or publication.get("context_closed") is not True
         or publication.get("browser_closed") is not True
         or publication.get("teardown_changes") != []
+        or publication.get("late_binding_details") != []
+        or not _bounded_nonnegative(
+            publication.get("suppressed_teardown_beacons"), REPLAY_LEDGER_COUNT_LIMIT
+        )
         or publication.get("late_callbacks")
         != {
             "closing": 0,

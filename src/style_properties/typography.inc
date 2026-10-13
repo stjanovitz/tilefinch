@@ -306,10 +306,13 @@ static bool style_property_text_decoration(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask_high = parse->mask_high;
-            bool underline = false;
+        bool underline = false, inherit = false;
         if (style_parse_text_decoration_underline(
-                sheet, value, value_length, &underline)) {
+                sheet, value, value_length, &underline, &inherit)) {
             style_set_text_underline(style, underline);
+            style->text_decoration_state = (uint16_t) (
+                (style->text_decoration_state & ~STYLE_TEXT_DECORATION_INHERIT)
+                | (inherit ? STYLE_TEXT_DECORATION_INHERIT : 0));
             *mask_high |= S2_TEXT_DECORATION;
         }
     

@@ -982,13 +982,14 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
                               const char *sequence, size_t sequence_length)
 {
     bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_variant(
+    const FontFace *face = font_context_face_at_weight(
         layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), bold_face);
+        draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
     FontFamily family = font_context_metric_family(
         layout->web_fonts, draw_command_font_family(command), face);
     unsigned weight = (unsigned) draw_command_font_weight_code(command) * 10u;
     bool synthetic_bold = weight >= LAYOUT_SYNTHETIC_WEIGHT
+        && (face == NULL || face->authored_weight != weight)
         && (weight < LAYOUT_BOLD_FACE_WEIGHT
             || !font_context_face_is_bold(
                    layout->fonts, layout->web_fonts, face));

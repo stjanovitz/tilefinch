@@ -765,6 +765,272 @@ JSValue js_rt_module_compile_external(
     return compiled;
 }
 
+/* Import maps are private, immutable snapshots before first resolution.
+   No map property is exposed to author code or read through its prototypes.
+   Later maps need resolved-specifier bookkeeping and are not supported yet. */
+#define SCRIPT_IMPORT_MAP_ENTRIES 128u
+#define SCRIPT_IMPORT_MAP_BYTES (64u * 1024u)
+typedef struct ScriptImportMapEntry {
+    char *specifier;
+    char *address;
+    char *scope;
+} ScriptImportMapEntry;
+
+static void runtime_import_map_clear(ScriptRuntime *runtime)
+{
+    for (size_t i = 0; i < runtime->import_map_count; i++) {
+        budget_free(runtime->budget, runtime->import_map[i].specifier);
+        budget_free(runtime->budget, runtime->import_map[i].address);
+        budget_free(runtime->budget, runtime->import_map[i].scope);
+    }
+    budget_free(runtime->budget, runtime->import_map);
+    runtime->import_map = NULL;
+    runtime->import_map_count = 0;
+}
+
+static bool module_url_like(const char *name)
+{
+    return name[0] == '/' || strncmp(name, "./", 2) == 0
+        || strncmp(name, "../", 3) == 0 || strchr(name, ':') != NULL;
+}
+
+static JSValue import_map_own(JSContext *context, JSValueConst object,
+                              const char *name)
+{
+    JSAtom atom = JS_NewAtom(context, name);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
+    JSPropertyDescriptor descriptor;
+    int found = JS_GetOwnProperty(context, &descriptor, object, atom);
+    JS_FreeAtom(context, atom);
+    if (found <= 0) return found < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+    JS_FreeValue(context, descriptor.getter);
+    JS_FreeValue(context, descriptor.setter);
+    return descriptor.value;
+}
+
+static bool import_map_object(JSContext *context, JSValueConst value)
+{
+    return JS_IsObject(value) && !JS_IsArray(context, value);
+}
+
+static void import_map_names_free(JSContext *context,
+                                  JSPropertyEnum *names, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) JS_FreeAtom(context, names[i].atom);
+    js_free(context, names);
+}
+
+static bool import_map_add_set(ScriptRuntime *runtime, JSValueConst object,
+                               const char *base, const char *scope,
+                               size_t *retained)
+{
+    JSContext *context = runtime->context;
+    if (JS_IsUndefined(object)) return true;
+    if (!import_map_object(context, object)) return true;
+    JSPropertyEnum *names = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(context, &names, &count, object,
+                              JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
+        return false;
+    bool okay = count <= SCRIPT_IMPORT_MAP_ENTRIES;
+    for (uint32_t i = 0; okay && i < count; i++) {
+        JSValue key_value = JS_AtomToString(context, names[i].atom);
+        size_t key_bytes = 0;
+        const char *key = JS_ToCStringLen(context, &key_bytes, key_value);
+        JS_FreeValue(context, key_value);
+        JSValue value = JS_GetProperty(context, object, names[i].atom);
+        const char *address = NULL;
+        size_t address_length = 0;
+        if (JS_IsString(value))
+            address = JS_ToCStringLen(context, &address_length, value);
+        char normalized[2048], target[2048];
+        const char *specifier = key != NULL && memchr(key, 0, key_bytes) == NULL ? key : NULL;
+        if (key == NULL || JS_IsException(value)
+            || (JS_IsString(value) && address == NULL)) okay = false;
+        else if (specifier != NULL && key[0] != '\0') {
+            if (module_url_like(key)) {
+                if (!fetch_resolve_url(base, key, normalized, sizeof(normalized)))
+                    specifier = NULL;
+                else specifier = normalized;
+            }
+            bool mapped = address != NULL
+                && memchr(address, 0, address_length) == NULL
+                && fetch_resolve_url(base, address, target, sizeof(target));
+            size_t key_length = specifier == NULL ? 0 : strlen(specifier);
+            if (mapped && key_length != 0 && specifier[key_length - 1] == '/')
+                mapped = target[0] != 0 && target[strlen(target) - 1] == '/';
+            bool duplicate = false;
+            for (size_t at = 0; at < runtime->import_map_count; at++) {
+                const ScriptImportMapEntry *entry = &runtime->import_map[at];
+                if (specifier != NULL && strcmp(entry->specifier, specifier) == 0
+                    && ((scope == NULL && entry->scope == NULL)
+                        || (scope != NULL && entry->scope != NULL
+                            && strcmp(scope, entry->scope) == 0))) {
+                    duplicate = true; break;
+                }
+            }
+            if (specifier != NULL && !duplicate) {
+                size_t charge = key_length + 1u + (mapped ? strlen(target) + 1u : 0)
+                    + (scope == NULL ? 0 : strlen(scope) + 1u);
+                if (runtime->import_map_count == SCRIPT_IMPORT_MAP_ENTRIES
+                    || charge > SCRIPT_IMPORT_MAP_BYTES - *retained) okay = false;
+                else {
+                    ScriptImportMapEntry entry = {0};
+                    entry.specifier = budget_malloc(runtime->budget, key_length + 1);
+                    if (mapped) entry.address = budget_malloc(runtime->budget, strlen(target) + 1);
+                    if (scope != NULL) entry.scope = budget_malloc(runtime->budget, strlen(scope) + 1);
+                    okay = entry.specifier != NULL && (!mapped || entry.address != NULL)
+                        && (scope == NULL || entry.scope != NULL);
+                    if (okay) {
+                        memcpy(entry.specifier, specifier, key_length + 1);
+                        if (mapped) strcpy(entry.address, target);
+                        if (scope != NULL) strcpy(entry.scope, scope);
+                        runtime->import_map[runtime->import_map_count++] = entry;
+                        *retained += charge;
+                    } else {
+                        budget_free(runtime->budget, entry.specifier);
+                        budget_free(runtime->budget, entry.address);
+                        budget_free(runtime->budget, entry.scope);
+                    }
+                }
+            }
+        }
+        JS_FreeCString(context, address);
+        JS_FreeValue(context, value);
+        JS_FreeCString(context, key);
+    }
+    import_map_names_free(context, names, count);
+    return okay;
+}
+
+static bool runtime_import_map_parse(ScriptRuntime *runtime,
+                                     lxb_dom_node_t *node,
+                                     const char *base, size_t *retained)
+{
+    char *text = NULL;
+    size_t bytes = 0;
+    unsigned children = 0;
+    for (lxb_dom_node_t *child = node->first_child; child != NULL;
+         child = child->next) {
+        size_t length = 0;
+        (void) document_text_data(child, &length);
+        if (++children > 256 || length > SCRIPT_IMPORT_MAP_BYTES - bytes) return false;
+        bytes += length;
+    }
+    text = budget_malloc(runtime->budget, bytes + 1);
+    if (text == NULL) return false;
+    size_t at = 0;
+    for (lxb_dom_node_t *child = node->first_child; child != NULL;
+         child = child->next) {
+        size_t length = 0;
+        const char *part = document_text_data(child, &length);
+        if (part != NULL && length != 0) memcpy(text + at, part, length);
+        at += length;
+    }
+    text[bytes] = 0;
+    JSContext *context = runtime->context;
+    JSValue root = JS_ParseJSON(context, text, bytes, "<import-map>");
+    budget_free(runtime->budget, text);
+    bool okay = true;
+    if (import_map_object(context, root)) {
+        JSValue imports = import_map_own(context, root, "imports");
+        okay = !JS_IsException(imports)
+            && import_map_add_set(runtime, imports, base, NULL, retained);
+        JS_FreeValue(context, imports);
+        JSValue scopes = import_map_own(context, root, "scopes");
+        if (okay && import_map_object(context, scopes)) {
+            JSPropertyEnum *names = NULL;
+            uint32_t count = 0;
+            okay = JS_GetOwnPropertyNames(context, &names, &count, scopes,
+                JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0 && count <= 32;
+            for (uint32_t i = 0; okay && i < count; i++) {
+                JSValue key_value = JS_AtomToString(context, names[i].atom);
+                size_t key_bytes = 0;
+                const char *key = JS_ToCStringLen(context, &key_bytes, key_value);
+                JS_FreeValue(context, key_value);
+                char scope[2048];
+                JSValue entries = JS_GetProperty(context, scopes, names[i].atom);
+                okay = key != NULL && !JS_IsException(entries);
+                if (okay && memchr(key, 0, key_bytes) == NULL
+                    && fetch_resolve_url(base, key, scope, sizeof(scope)))
+                    okay = import_map_add_set(runtime, entries, base, scope, retained);
+                JS_FreeValue(context, entries);
+                JS_FreeCString(context, key);
+            }
+            import_map_names_free(context, names, count);
+        } else if (JS_IsException(scopes)) okay = false;
+        JS_FreeValue(context, scopes);
+    }
+    if (JS_IsException(root)) { JS_FreeValue(context, JS_GetException(context)); }
+    JS_FreeValue(context, root);
+    return okay;
+}
+
+static void runtime_import_map_prepare(ScriptRuntime *runtime)
+{
+    if (runtime->import_map_prepared) return;
+    runtime->import_map_prepared = true;
+    if (runtime->document == NULL || runtime->document->html == NULL) return;
+    const char *base = js_rt_bridge_calculated_base_url(&runtime->bridge);
+    if (base == NULL) return;
+    size_t retained = 0;
+    unsigned maps = 0;
+    lxb_dom_node_t *root = lxb_dom_interface_node(runtime->document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
+        size_t type_length = 0, tag_length = 0;
+        const char *tag = document_element_name(node, &tag_length);
+        const char *type = document_attribute(node, "type", &type_length);
+        if (node->ns == LXB_NS_HTML
+            && tag_length == 6 && tag != NULL && memcmp(tag, "script", 6) == 0
+            && type_length == 9 && type != NULL && strncasecmp(type, "importmap", 9) == 0
+            && !lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                (const lxb_char_t *) "src", 3)
+            && tilefinch_csp_allows_inline_script(
+                &runtime->document->content_security_policy, node)) {
+            if (++maps > 32) {
+                runtime_import_map_clear(runtime);
+                return;
+            }
+            if (runtime->import_map == NULL) runtime->import_map = budget_calloc(
+                runtime->budget, SCRIPT_IMPORT_MAP_ENTRIES, sizeof(*runtime->import_map));
+            if (runtime->import_map == NULL
+                || !runtime_import_map_parse(runtime, node, base, &retained)) {
+                runtime_import_map_clear(runtime);
+                JS_FreeValue(runtime->context, JS_GetException(runtime->context));
+                return;
+            }
+        }
+        if (node->first_child != NULL) node = node->first_child;
+        else {
+            unsigned depth = 0;
+            while (node != root && node->next == NULL && depth++ < 512) node = node->parent;
+            node = node == root || depth >= 512 ? NULL : node->next;
+        }
+    }
+    if (node != NULL) runtime_import_map_clear(runtime);
+}
+
+static const ScriptImportMapEntry *runtime_import_map_match(
+    ScriptRuntime *runtime, const char *specifier, const char *referrer)
+{
+    const ScriptImportMapEntry *best = NULL;
+    size_t best_scope = 0, best_key = 0;
+    for (size_t i = 0; i < runtime->import_map_count; i++) {
+        const ScriptImportMapEntry *entry = &runtime->import_map[i];
+        size_t scope = entry->scope == NULL ? 0 : strlen(entry->scope);
+        if (scope != 0 && strcmp(entry->scope, referrer) != 0
+            && (entry->scope[scope - 1] != '/' || strncmp(entry->scope, referrer, scope) != 0)) continue;
+        size_t key = strlen(entry->specifier);
+        if (strcmp(entry->specifier, specifier) != 0
+            && (entry->specifier[key - 1] != '/' || strncmp(entry->specifier, specifier, key) != 0)) continue;
+        if (best == NULL || scope > best_scope || (scope == best_scope && key > best_key)) {
+            best = entry; best_scope = scope; best_key = key;
+        }
+    }
+    return best;
+}
+
 static char *runtime_module_normalize(JSContext *context,
                                       const char *base_name,
                                       const char *module_name,
@@ -799,8 +1065,36 @@ static char *runtime_module_normalize(JSContext *context,
     snprintf(base, sizeof(base), "%s", selected_base);
     snprintf(policy, sizeof(policy), "%s", selected_policy);
     char resolved[2048];
-    if (!fetch_resolve_url(base, module_name, resolved, sizeof(resolved))) {
-        return js_strdup(context, module_name);
+    /* Frame contexts share the runtime's module loader, not its document
+       import map. Until they own separate snapshots, do not resolve a child
+       realm's bare names through the top document's declarations. */
+    bool document_map = context == runtime->context;
+    if (document_map) runtime_import_map_prepare(runtime);
+    bool url_like = module_url_like(module_name);
+    if (url_like && !fetch_resolve_url(base, module_name, resolved, sizeof(resolved))) {
+        JS_ThrowTypeError(context, "invalid module specifier URL");
+        return NULL;
+    }
+    const char *specifier = url_like ? resolved : module_name;
+    const ScriptImportMapEntry *mapping = document_map
+        ? runtime_import_map_match(runtime, specifier, base) : NULL;
+    if (mapping != NULL) {
+        size_t key = strlen(mapping->specifier);
+        char mapped[2048];
+        bool okay = mapping->address != NULL;
+        if (okay && mapping->specifier[key - 1] == '/') {
+            okay = fetch_resolve_url(mapping->address, specifier + key,
+                mapped, sizeof(mapped))
+                && strncmp(mapped, mapping->address, strlen(mapping->address)) == 0;
+        } else if (okay) snprintf(mapped, sizeof(mapped), "%s", mapping->address);
+        if (!okay) {
+            JS_ThrowTypeError(context, "module specifier blocked by import map");
+            return NULL;
+        }
+        snprintf(resolved, sizeof(resolved), "%s", mapped);
+    } else if (!url_like) {
+        JS_ThrowTypeError(context, "unmapped bare module specifier");
+        return NULL;
     }
     /* A request with no module parent comes from a classic script (or a
        host evaluation); its base URL is the request's referrer. */
@@ -997,6 +1291,7 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
 void js_rt_runtime_module_metadata_clear(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
+    runtime_import_map_clear(runtime);
     for (size_t i = 0; i < runtime->module_base_count; i++) {
         budget_free(runtime->budget, runtime->module_bases[i].response_url);
         budget_free(runtime->budget, runtime->module_bases[i].request_url);

@@ -356,6 +356,7 @@ typedef struct {
     size_t declaration_count;
     bool has_variable;
     bool has_logical;
+    bool has_font_shorthand;
 } StyleDeferredBlockInfo;
 
 static bool style_deferred_block_info(const char *text, size_t length,
@@ -380,6 +381,7 @@ static bool style_deferred_block_info(const char *text, size_t length,
             trim(&name, &name_length);
             info->has_logical = info->has_logical
                 || style_property_name_is_logical(name, name_length);
+            info->has_font_shorthand |= span_case_equal(name, name_length, "font");
             if (info->declaration_count == SIZE_MAX) return false;
             info->declaration_count++;
         }
@@ -390,7 +392,8 @@ static bool style_deferred_block_info(const char *text, size_t length,
 
 static bool style_deferred_program_scan(
     const char *text, size_t length, bool block_has_variable,
-    bool block_has_logical, StyleDeferredInstruction *instructions,
+    bool block_has_logical, bool block_has_font_shorthand,
+    StyleDeferredInstruction *instructions,
     size_t instruction_capacity, size_t *instruction_count)
 {
     if (text == NULL || instruction_count == NULL) return false;
@@ -427,7 +430,9 @@ static bool style_deferred_program_scan(
                retain an earlier declaration of the same property. Pure
                em/rem deferral can replay only its affected properties. */
             bool needs_runtime_basis =
-                block_has_variable || block_has_logical;
+                block_has_variable || block_has_logical || block_has_font_shorthand
+                || span_case_equal(name, name_length, "font-family")
+                || span_case_equal(name, name_length, "font");
             for (size_t i = 0; i < value_length; i++) {
                 if (i + 4 <= value_length
                     && memcmp(value + i, "var(", 4) == 0) {
@@ -549,7 +554,7 @@ bool style_compile_deferred_program(Stylesheet *sheet, const char *text,
     }
     size_t emitted = 0;
     if (!style_deferred_program_scan(
-            text, length, info.has_variable, info.has_logical,
+            text, length, info.has_variable, info.has_logical, info.has_font_shorthand,
             info.declaration_count == 0
                 ? NULL : sheet->deferred_instructions + offset,
             info.declaration_count, &emitted)

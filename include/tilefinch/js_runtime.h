@@ -168,6 +168,8 @@ typedef struct {
     size_t geometry_retained_fast_paths;
     size_t geometry_ancestor_visits;
     size_t geometry_synchronous_layouts;
+    size_t geometry_snapshot_builds;
+    size_t geometry_snapshot_hits;
     /* Native admission fact recorded immediately before a trusted event
        dispatcher enters JavaScript.  It deliberately precedes every
        author-observable property lookup so controller defaults can fail
@@ -2169,6 +2171,20 @@ void script_runtime_set_synchronous_layout_callback(
    or consume the pending mutation journal. Normal layout adoption releases it. */
 bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
                                           const ViewportContext *viewport);
+/* Called only when a fresh geometry snapshot is needed. The owner prepares
+   its existing cache against this unconsumed journal before lending it to
+   the build. Neither the callback nor the build may run author code. */
+typedef LayoutReuseCache *(*ScriptGeometryReuseCallback)(
+    void *opaque, const ScriptMutationJournal *mutations);
+bool script_runtime_flush_geometry_layout_reuse(
+    ScriptRuntime *runtime, const ViewportContext *viewport,
+    ScriptGeometryReuseCallback prepare, void *opaque);
+/* Owner-only move of a current complete geometry snapshot. The caller must
+   exclude resource-changing journals; failure leaves the snapshot owned by
+   the runtime. No author work runs during the move. */
+bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
+                                         const ViewportContext *viewport,
+                                         LayoutDocument *layout);
 /* Called with a detached subtree root immediately before the runtime frees
    it, while every node in it is still valid. A layout reuse cache that keys
    entries by node pointer evicts the subtree here, which lets removals and

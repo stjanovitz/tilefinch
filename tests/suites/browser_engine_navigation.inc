@@ -399,6 +399,10 @@ static bool record_provisional_phase(void *context, const char *phase,
                                      size_t completed_work_units)
 {
     ProvisionalPhaseRecorder *recorder = context;
+    /* These phases borrow the style/render shell, not an outer layout
+       completion checkpoint from which committed-page scrolling is safe. */
+    if (phase != NULL && (strncmp(phase, "render-", 7u) == 0
+        || strcmp(phase, "style-prepare") == 0)) return true;
     BrowserEngine *engine = recorder->page_during_completion;
     if (engine != NULL
         && browser_engine_layout_completion_running(engine)) {

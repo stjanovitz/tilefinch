@@ -1,0 +1,33 @@
+diff --git a/source/lexbor/html/parser.c b/source/lexbor/html/parser.c
+--- a/source/lexbor/html/parser.c
++++ b/source/lexbor/html/parser.c
+@@ -42,6 +42,8 @@ lxb_html_parser_init(lxb_html_parser_t *parser)
+     lxb_status_t status = lxb_html_tokenizer_init(parser->tkz);
+ 
+     if (status != LXB_STATUS_OK) {
++        /* Partial initialization has not acquired a reference yet. */
++        parser->tkz = lxb_html_tokenizer_destroy(parser->tkz);
+         return status;
+     }
+ 
+@@ -53,6 +55,8 @@ lxb_html_parser_init(lxb_html_parser_t *parser)
+     status = lxb_html_tree_init(parser->tree, parser->tkz);
+ 
+     if (status != LXB_STATUS_OK) {
++        /* Unref would skip a zero-refcount, partially initialized tree. */
++        parser->tree = lxb_html_tree_destroy(parser->tree);
+         return status;
+     }
+ 
+diff --git a/source/lexbor/html/interfaces/document.c b/source/lexbor/html/interfaces/document.c
+--- a/source/lexbor/html/interfaces/document.c
++++ b/source/lexbor/html/interfaces/document.c
+@@ -317,7 +317,7 @@ lxb_html_document_parser_prepare(lxb_html_document_t *document)
+         status = lxb_html_parser_init(doc->parser);
+ 
+         if (status != LXB_STATUS_OK) {
+-            lxb_html_parser_destroy(doc->parser);
++            doc->parser = lxb_html_parser_destroy(doc->parser);
+             return status;
+         }
+ 

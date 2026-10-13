@@ -20,6 +20,24 @@
 
 #define MIB (1024u * 1024u)
 
+/* ASan's stack redzones make each nested parser frame much larger. Keep the
+   closure/first-call comparison deep without crossing its 4 MiB JS stack
+   guard before the code under test runs. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define TILEFINCH_TEST_NESTING "20"
+#define TILEFINCH_TEST_NESTING_RESULT "1,20 12345"
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(TILEFINCH_TEST_NESTING)
+#define TILEFINCH_TEST_NESTING "20"
+#define TILEFINCH_TEST_NESTING_RESULT "1,20 12345"
+#endif
+#ifndef TILEFINCH_TEST_NESTING
+#define TILEFINCH_TEST_NESTING "40"
+#define TILEFINCH_TEST_NESTING_RESULT "1,40 12345"
+#endif
+
 static size_t test_stack_limit(void)
 {
 #if defined(__has_feature)
@@ -671,10 +689,10 @@ static const LazyCase cases[] = {
 
     { "deep nesting",
       "function build(n) { var s = ''; for (var i = 0; i < n; i++) s += 'function(){ var d' + (i + 1) + ' = ' + (i + 1) + '; return '; s += '[d1, d' + n + '].join()'; for (var j = 0; j < n; j++) s += '}()'; return s; }\n"
-      "var deep = (0, eval)('(function(){ return ' + build(40) + '; })');\n"
+      "var deep = (0, eval)('(function(){ return ' + build(" TILEFINCH_TEST_NESTING ") + '; })');\n"
       "function nested(a){return function(b){return function(c){return function(d){return function(e){return [a,b,c,d,e].join('')}}}}}\n"
       "deep() + ' ' + nested(1)(2)(3)(4)(5)",
-      "1,40 12345" },
+      TILEFINCH_TEST_NESTING_RESULT },
 
     { "long functions keep exact text",
       "var long = 'function longFn() { var s = \"' + 'x'.repeat(3000) + '\"; return s.length; }';\n"
