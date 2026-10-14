@@ -103,7 +103,7 @@ static int test_engine_lifecycle(void)
     static const char page[] =
         "<!doctype html><title>Engine</title>"
         "<style>body{margin:4px}#probe{height:24px}"
-        "</style><body><a href='#probe'>jump</a><input id=edit>"
+        "</style><body><a href='#probe' aria-label='Like' title='fallback'>jump</a><input id=edit>"
         "<input type=password value=secret>"
         "<input autocomplete='section-login one-time-code' value=123456>"
         "<div id=probe>ready</div>";
@@ -126,6 +126,29 @@ static int test_engine_lifecycle(void)
           && strcmp(view.url, "https://engine.test/") == 0
           && strcmp(view.title, "Engine") == 0
           && view.secure && !view.can_go_back && !view.can_go_forward);
+    const LayoutDocument *label_layout = &browser_engine_navigation(engine)->page.layout;
+    CHECK(browser_engine_focus_node(engine, label_layout->links[0].node)
+          && browser_engine_view_snapshot(engine, &view)
+          && !strcmp(view.focus_label, "Like"));
+    /* Explicit names only: never infer the action from private form values.
+       Read-only snapshots do not dispatch events or cause relayout. */
+    CHECK(browser_engine_focus_node(engine, label_layout->controls[1].node)
+          && browser_engine_view_snapshot(engine, &view)
+          && view.focus_label[0] == '\0');
+    static const char long_label[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀";
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(label_layout->links[0].node),
+        (const lxb_char_t *) "aria-label", 10, (const lxb_char_t *) long_label,
+        sizeof(long_label) - 1u) != NULL);
+    CHECK(browser_engine_focus_node(engine, label_layout->links[0].node)
+          && browser_engine_view_snapshot(engine, &view)
+          && strlen(view.focus_label) == 62u);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(label_layout->links[0].node),
+        (const lxb_char_t *) "aria-label", 10, (const lxb_char_t *) "Like\nvideo", 10) != NULL);
+    size_t label_relayouts = browser_engine_navigation(engine)->incremental_relayouts;
+    CHECK(browser_engine_view_snapshot(engine, &view)
+          && !strcmp(view.focus_label, "Like video")
+          && browser_engine_navigation(engine)->incremental_relayouts == label_relayouts);
     TileCache *render_shell = browser_engine_render_shell(engine);
     CHECK(render_shell->owns_visual_layout
           && render_shell->layout == &render_shell->visual_layout

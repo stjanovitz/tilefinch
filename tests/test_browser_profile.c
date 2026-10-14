@@ -249,13 +249,15 @@ int main(void)
           && BROWSER_GLYPH_LANGUAGE_ARABIC == 7
           && BROWSER_GLYPH_LANGUAGE_HEBREW == 8
           && BROWSER_GLYPH_LANGUAGE_DEVANAGARI == 9
-          && BROWSER_GLYPH_LANGUAGE_COUNT == 10);
+          && BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE == 10
+          && BROWSER_GLYPH_LANGUAGE_COUNT == 11);
     CHECK(glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_CYRILLIC)
           && glyph_language_roundtrips(
                  BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED)
           && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_ARABIC)
           && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_HEBREW)
-          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_DEVANAGARI));
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_DEVANAGARI)
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE));
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);

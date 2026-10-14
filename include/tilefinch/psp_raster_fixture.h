@@ -22,6 +22,9 @@ typedef struct {
 bool psp_raster_fixture_run(
     BrowserEngine *engine, PspRasterFixtureReport *report,
     char *error, size_t error_size);
+/* Independent, network/decoder-free validation of the native queue input. */
+bool psp_queue_shortcut_qualify(void);
+bool psp_queue_menu_profile(Budget *budget);
 bool psp_raster_fixture_rerender(
     BrowserEngine *engine, PspRasterFixtureReport *report,
     char *error, size_t error_size);

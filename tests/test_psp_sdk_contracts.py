@@ -5320,6 +5320,25 @@ int main(void) {
         self.assertIn("paused-frames=%zu", report)
         self.assertIn("media->advance_periods", report)
 
+    def test_stability_restart_preserves_playlist_end_policy(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        start = main.rindex("static TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(")
+        driver = main[start:main.index("static TILEFINCH_HOT_BOUNDARY void psp_loop_media_frame(", start)]
+        self.assertRegex(driver, r"if\s*\(browser->media\.playlist\s*==\s*NULL\s*&&\s*"
+                         r"browser->media\.ui\.ended\s*&&\s*browser->media\.playback\s*!=\s*NULL")
+        self.assertIn("tilefinch-media-stability: event=loop", driver)
+
+    def test_playlist_activation_preserves_initial_resume(self):
+        source = without_comments(psp_media_session_sources())
+        start = source.index("bool psp_media_open_playlist_route(")
+        activation = source[start:source.index("static bool psp_media_playlist_tick(", start)]
+        self.assertRegex(activation,
+            r"youtube_playlist_set_initial_start\(queue,\s*"
+            r"all\s*\?\s*0\s*:\s*youtube_watch_url_start_time_us\(url\)\)")
+        self.assertLess(activation.index("youtube_playlist_set_initial_start("),
+                        activation.index("media->playlist = queue;"))
+
     def test_validation_reports_do_not_perturb_live_playback(self):
         """The PSPLink host0 writer can stop the browser thread for hundreds
         of milliseconds. Playback retains cumulative counters and samples
@@ -8191,6 +8210,16 @@ int main(void) {
         self.assertIn("loop->fast_page_followup || queued_page_input", main)
         self.assertIn("queued_page_input ? 0 : psp_canvas_followup_wait(loop)", main)
 
+    def test_optional_images_yield_to_already_queued_input(self):
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        begin = 'if (strcmp(phase, "optional-image-publication") == 0'
+        self.assertIn(begin, runtime)
+        start = runtime.index(begin)
+        guard = runtime[start:runtime.index("return false;", start) + len("return false;")]
+        self.assertIn("cooperate->pending_page_input_count != 0", guard)
+        self.assertIn("psp_completed_supervisor_page_input_count != 0", guard)
+        self.assertLess(start, runtime.index("uint64_t now = sceKernelGetSystemTimeWide();", start))
+
     def test_toolbar_tracking_does_not_publish_an_unchanged_frame(self):
         runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
         native = runtime[runtime.index("bool toolbar_tracking ="):
@@ -8659,6 +8688,22 @@ int main(void) {
         setter = fetch[fetch.index("bool fetch_set_ca_bundle_path("):
                        fetch.index("const char *fetch_ca_bundle_path(")]
         self.assertIn("strcmp(fetch_ca_bundle, path) == 0", setter)
+
+    def test_psp_curl_upload_cleanup_releases_filters_after_request_flush(self):
+        name = "curl-8.22.0-http2-upload-lifetime.patch"
+        patch = (ROOT / "patches" / name).read_text(encoding="utf-8")
+        # Reconstruct the changed post-patch spans, not deleted old ordering.
+        after = "\n".join(line[1:] for line in patch.splitlines()
+                          if line.startswith((" ", "+")) and not line.startswith("+++"))
+        self.assertLess(after.index("Curl_req_done("), after.index("Curl_conn_ev_data_done("))
+        self.assertLess(after.index("Curl_conn_ev_data_done("), after.index("Curl_cpool_do_locked("))
+        self.assertLess(after.index("Curl_cpool_do_locked("), after.index("multi_schedule_pending("))
+        self.assertIn("if(data->multi)", after)
+        build = (ROOT / "cmake/PspOwnedTransport.cmake").read_text(encoding="utf-8")
+        self.assertEqual(build.count(name), 3)  # configure, patch, re-extraction dependency
+        curl = build[build.index("ExternalProject_Add(tilefinch_psp_curl"):
+                     build.index("ExternalProject_Add_Step(tilefinch_psp_curl user-config")]
+        self.assertIn(name, curl)
 
     def test_psp_curl_patch_retains_and_resets_verify_flags(self):
         patch = (ROOT / "patches/curl-8.22.0-psp.patch").read_text(

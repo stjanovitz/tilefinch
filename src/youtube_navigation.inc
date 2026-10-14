@@ -80,15 +80,31 @@ static bool lite_html_search_filters(YoutubeLiteHtml *html, const char *url, con
     static const char *const durations[] = {"Any duration", "Under 3 minutes", "3-20 minutes", "Over 20 minutes"};
     static const char *const sorts[] = {"Relevance", "Popularity"};
     YoutubeLiteFilters f = lite_search_filters(url);
-    return lite_html_ui_markup(html,
-        "<details id=yt-filter-panel class=search-filters><summary>{{Filters}}</summary>"
+    bool ok = lite_html_ui_markup(html,
+        "<details id=yt-filter-panel class=search-filters><summary>{{Filters}}");
+    const char *active[] = {f.date ? dates[f.date] : NULL,
+        f.duration ? durations[f.duration] : NULL, f.sort ? sorts[f.sort] : NULL};
+    for (unsigned at = 0; ok && at < 3; at++)
+        if (active[at]) ok = lite_html_text(html, " &middot; ")
+            && lite_html_escape(html, tilefinch_ui_logical_text(active[at]));
+    ok = ok && lite_html_ui_markup(html,
+        "</summary>"
         "<form action='https://www.youtube.com/results' method=get>"
         "<input type=hidden name=search_query value=\"")
         && lite_html_escape(html, query) && lite_html_text(html, "\"><div class=filter-fields>")
         && lite_html_filter_select(html, "tilefinch_date", "Upload date", dates, 5, f.date)
         && lite_html_filter_select(html, "tilefinch_duration", "Duration", durations, 4, f.duration)
         && lite_html_filter_select(html, "tilefinch_sort", "Sort by", sorts, 2, f.sort)
-        && lite_html_ui_markup(html, "</div><button id=yt-filter-apply type=submit>{{Apply filters}}</button></form></details>");
+        && lite_html_ui_markup(html, "</div><button id=yt-filter-apply type=submit>{{Apply filters}}</button>");
+    if (ok && (f.date || f.duration || f.sort)) {
+        char encoded[YOUTUBE_LITE_QUERY_LIMIT * 3u];
+        ok = lite_url_encode(query, encoded, sizeof(encoded))
+            && lite_html_text(html,
+                "<a id=yt-filter-reset class=filter-reset href=\"https://www.youtube.com/results?search_query=")
+            && lite_html_escape(html, encoded)
+            && lite_html_ui_markup(html, "\">{{Filters}}: {{Off}}</a>");
+    }
+    return ok && lite_html_text(html, "</form></details>");
 }
 
 static bool lite_chapter_number(const YoutubeLiteSpan *value, unsigned *number)

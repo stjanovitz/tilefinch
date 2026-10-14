@@ -8,6 +8,14 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.37 — 2026-10-14
+
+- Playlist playback with Next/Previous, an optional Auto next toggle, and a queue.
+- More responsive YouTube navigation and player menus, with clearer controls
+  and improved playback recovery.
+- Expanded interface language support.
+- Safer handling of interrupted HTTP/2 uploads.
+
 ## 0.1.36 — 2026-10-13
 
 - Expanded interface language support.

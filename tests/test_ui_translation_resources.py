@@ -15,17 +15,32 @@ import generate_ui_translations as generator
 class ResourceTests(unittest.TestCase):
     def test_new_locale_preserves_existing_resource_identity(self):
         manifest = generator.outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
-        old_languages = generator.CATALOGS[-2][1]
+        resources = ROOT / "_resource_identity_probe"
+        historical = hashlib.sha256()
+        for path, data in sorted(generator.outputs(resources).items()):
+            if path.is_relative_to(resources) and path.parent.name != "v10":
+                historical.update(path.relative_to(resources).as_posix().encode() + b"\0" + data)
+        # Fixed before v10: every previously published resource remains exact.
+        self.assertEqual(historical.hexdigest(),
+            "4d5ee67d4d2d0c381067921cde86afea008cc03403f5d6654dccbf8201760947")
+        old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            data = (f"TFUI1\t{code}\n" + "".join(
-                f"{row[0]}\t{row[column]}\n" for row in rows)).encode()
-            self.assertIn(f'"translations/ui/v7/{code}.tful"', manifest)
-            self.assertIn(hashlib.sha256(data).hexdigest(), manifest)
-        self.assertIn('"translations/ui/v8/pt.tful"', manifest)
-        portuguese = generator.read_rows(8, generator.CATALOGS[-1][1])
+            self.assertIn(f'"translations/ui/v10/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v10/pt.tful"', manifest)
+        portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
+        self.assertIn('"translations/ui/v10/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v10/as.tful"', manifest)
+
+    def test_build_resource_list_includes_each_immutable_download(self):
+        listed = subprocess.check_output([sys.executable, str(ROOT / "tools/generate_ui_translations.py"),
+                                          "--list-resources"], text=True).splitlines()
+        expected = [f"translations/ui/v{version}/{code}.tful"
+                    for version, languages in generator.CATALOGS for code, _, _ in languages]
+        self.assertEqual(listed, expected)
+        self.assertEqual(len(set(listed)), len(listed))
 
     def test_native_player_labels_have_translations(self):
         languages = generator.CATALOGS[-1][1]
@@ -36,7 +51,11 @@ class ResourceTests(unittest.TestCase):
             "X PLAY  TRI TRACKS", "X PAUSE  TRI MENU  L/R SEEK",
             "X PLAY  TRI MENU  L/R SEEK", "STICK/L/R SEEK  X PAUSE",
             "STICK/L/R SEEK  X PLAY", "X GO   O CANCEL",
-            "L/R  X SELECT  O BACK"}, keys)
+            "L/R  X SELECT  O BACK", "Queue", "Play all", "Play from here",
+            "Automatic next: On", "Automatic next: Off", "Retry queue",
+            "R Skip   Triangle Queue", "X PAUSE  TRI QUEUE  L/R VIDEO",
+            "X PLAY  TRI QUEUE  L/R VIDEO", "Loading playlist...",
+            "Playlist could not load"}, keys)
         header = (ROOT / "include/tilefinch/ui_language.h").read_text()
         bound = int(re.search(r"TILEFINCH_UI_TRANSLATION_ROWS (\d+)u", header).group(1))
         self.assertLessEqual(len(rows), bound)

@@ -489,15 +489,15 @@ bool tilefinch_glyph_provider_match(
     TilefinchGlyphProvider *provider, const char *text, size_t length,
     size_t *used, uint32_t *glyph_key, unsigned *source_width)
 {
-    if (provider == NULL || text == NULL || length == 0
+    if (provider == NULL || provider->pack_count == 0 || text == NULL || length == 0
         || used == NULL || glyph_key == NULL) return false;
     uint32_t first = 0;
     size_t first_bytes = utf8_next(text, length, &first);
     if (first_bytes == 0) return false;
-    /* Emoji and pre-shaped Indic clusters use sequence indexes. Keep
-       ordinary CJK and Latin at the O(1) codepoint lookup. */
+    /* Emoji, pre-shaped Indic clusters and voiced Kana use sequence indexes.
+       Keep ordinary Han and Latin at the O(1) codepoint lookup. */
     bool sequence_candidate = first == '#' || first == '*'
-        || (first >= 0x0900u && first <= 0x097fu)
+        || (first >= 0x0900u && first <= 0x09ffu)
         || (first >= 0xa8e0u && first <= 0xa8ffu)
         || (first >= '0' && first <= '9')
         || first == 0x00a9u || first == 0x00aeu
@@ -510,6 +510,15 @@ bool tilefinch_glyph_provider_match(
         || first == 0x3030u || first == 0x303du
         || first == 0x3297u || first == 0x3299u
         || (first >= 0x1f000u && first <= 0x1faffu);
+    if (((first >= 0x3040u && first <= 0x30ffu)
+         || (first >= 0xff66u && first <= 0xff9du))
+        && first_bytes < length) {
+        uint32_t following = 0;
+        if (utf8_next(text + first_bytes, length - first_bytes, &following) != 0
+            && (following == 0x3099u || following == 0x309au
+                || following == 0xff9eu || following == 0xff9fu))
+            sequence_candidate = true;
+    }
     if (sequence_candidate) {
         for (size_t pack = 0; pack < provider->pack_count; pack++) {
             uint32_t glyph = 0;

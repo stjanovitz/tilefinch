@@ -38,6 +38,7 @@ int main(void)
     navigation.history[5].scroll_y = 73;
     navigation.history[5].focus_kind = 2;
     navigation.history[5].focus_index = 4;
+    navigation.history[5].focus_identity = UINT64_C(1234567);
 
     size_t bytes_before_tabs = budget.current;
     for (size_t point = 0; point < 2u; point++) {
@@ -61,7 +62,8 @@ int main(void)
           && strcmp(first->history[3].url, "https://tabs.test/5") == 0
           && first->history[3].scroll_y == 73
           && first->history[3].focus_kind == 2
-          && first->history[3].focus_index == 4);
+          && first->history[3].focus_index == 4
+          && first->history[3].focus_identity == UINT64_C(1234567));
     size_t capture_allocations = budget.allocation_count;
     size_t capture_bytes = budget.current;
     budget_inject_failure_after(&budget, 0);

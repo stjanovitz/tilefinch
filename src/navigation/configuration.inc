@@ -110,6 +110,15 @@ void navigation_set_deferred_image_ready_hook(
     session->deferred_image_ready_opaque = callback == NULL ? NULL : opaque;
 }
 
+void navigation_set_image_table_moved_hook(
+    NavigationSession *session, NavigationImageTableMovedCallback callback,
+    void *opaque)
+{
+    if (session == NULL) return;
+    session->image_table_moved = callback;
+    session->image_table_moved_opaque = callback == NULL ? NULL : opaque;
+}
+
 bool navigation_set_progressive_preview_lookahead(
     NavigationSession *session, unsigned percent)
 {

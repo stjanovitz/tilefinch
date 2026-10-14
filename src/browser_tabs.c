@@ -191,6 +191,7 @@ bool browser_tabs_capture_active(
         tab_entry_set(
             &snapshot->history[index], source->url, source->title,
             source->scroll_y, source->focus_kind, source->focus_index);
+        snapshot->history[index].focus_identity = source->focus_identity;
     }
     tab_slot_title_from_snapshot(slot);
     return true;
@@ -771,7 +772,8 @@ bool browser_tab_history_records(
             .title = tab->history[index].title,
             .scroll_y = tab->history[index].scroll_y,
             .focus_kind = tab->history[index].focus_kind,
-            .focus_index = tab->history[index].focus_index
+            .focus_index = tab->history[index].focus_index,
+            .focus_identity = tab->history[index].focus_identity
         };
     }
     if (count != NULL) *count = tab->history_count;

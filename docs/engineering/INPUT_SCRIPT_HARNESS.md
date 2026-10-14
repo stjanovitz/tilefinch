@@ -57,6 +57,33 @@ ordinary scripted browsing/gameplay outcome.
 
 ### Portrait video seeking and cadence
 
+`youtube-playlist-player-journey.txt` starts at a native playlist and checks
+Play all, Next/Previous, the Queue menu, the Automatic next toggle, selection
+of an upcoming entry, and return to the retained playlist. Its companion
+predicate waits for actual playback after each selection. The host
+`tilefinch-youtube-playlist-tests` also covers repeated IDs, local/service
+page boundaries, bounded rewinds, stale selection refusal, allocation
+refusals, and unchanged document scroll/focus during native activation.
+
+`player-queue-shortcut.txt` is a network/decoder-free qualification of the
+same native queue input receiver and busy-player routing. Require
+`tilefinch-queue-shortcut: outcome=pass checked-states=4` and clean exit.
+It covers normal, resolving, buffering, and failed-player states, preserving
+selection and excluding lower-quality retry while the modal is open. The
+host UI tests additionally compare retained and uncached 208-pixel menus,
+all five upcoming hit targets and their boundaries in landscape and portrait,
+and both directions of the Square toggle.
+
+`player-queue-profile.txt` measures bounded batches of native menu preparation:
+cache hits, focus, Square, tab switching, cold opening, closing, CPU fallback
+copy, and full rasterization. Run with `--measure` and require
+`tilefinch-menu-profile: outcome=pass` plus clean exit. Its no-op blit excludes
+GE submission and presentation waits, so these are not press-to-visible
+latencies. Treat `cpu-valid=0` as unavailable thread CPU timing (as in PPSSPP),
+not zero CPU cost. Real-font host checks compare partial and full redraws
+pixel-for-pixel in every supported UI language; pending/refused glyphs retain
+the full-redraw recovery path.
+
 `youtube-chapter-player-journey.txt` checks a native provider detail page's
 chapter start, two chapter selections, portrait seeking, an audio-track change,
 caption selection, pause/resume, picker cancellation and return to the detail page. It needs
@@ -126,6 +153,14 @@ being prepared. Use a captured results/watch response set and the same
 explicit emulator clock. Require the menu mark, both chrome-toggle response
 receipts, a visible final focus, and clean completion. The scenario does not
 play media or write account/session state.
+
+`youtube-scroll-completion.txt` uses the same details/Back setup, but measures
+scrolling down and back up without opening a menu during painting. Use it
+alongside the interruption scenario: that scenario's completion interval
+includes the deliberate menu pause and is not a raster-cost measurement.
+Changed positions and final frames still publish immediately; subsequent
+partial progress is coalesced for 32 ms while the same bounded slices keep
+sampling input.
 
 `youtube-bbb.txt` measures first visible scroll movement separately from
 complete visible-tile publication. Partial publications use the same display

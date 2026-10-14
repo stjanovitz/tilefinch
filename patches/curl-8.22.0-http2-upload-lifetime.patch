@@ -1,0 +1,33 @@
+diff --git a/lib/multi.c b/lib/multi.c
+--- a/lib/multi.c
++++ b/lib/multi.c
+@@ -737,12 +737,6 @@ static CURLcode multi_done(struct Curl_easy *data,
+   /* Make sure that transfer client writes are really done now. */
+   result = Curl_1st_fatal(result, Curl_xfer_write_done(data, premature));
+ 
+-  /* Inform connection filters that this transfer is done */
+-  if(conn)
+-    Curl_conn_ev_data_done(data, premature);
+-
+-  multi_schedule_pending(data->multi); /* connection / multiplex */
+-
+   if(!result)
+     result = Curl_req_done(&data->req, data, premature);
+ 
+@@ -750,10 +744,17 @@ static CURLcode multi_done(struct Curl_easy *data,
+      * do with the transfer's connection. */
+     struct multi_done_ctx mdctx;
+ 
++    /* Request flushing must finish before filters release their references
++     * to data. The pool callback below owns detaching the connection. */
++    Curl_conn_ev_data_done(data, premature);
++
+     memset(&mdctx, 0, sizeof(mdctx));
+     mdctx.premature = premature;
+     Curl_cpool_do_locked(data, data->conn, multi_done_locked, &mdctx);
++
++    if(data->multi)
++      multi_schedule_pending(data->multi);
+   }
+ 
+   /* flush the netrc cache */

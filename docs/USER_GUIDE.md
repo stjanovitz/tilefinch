@@ -154,14 +154,44 @@ The panel also opens **Watch Later** and **Playlists**. Video details offer
 Watch Later add/remove actions, **Save to playlist**, and channel
 **Subscribe/Unsubscribe** controls. Playlist pages load a bounded set of
 entries at a time with **Load more**; editable lists also offer **Remove**.
+Choose **Play all** to start at the beginning, or select a video thumbnail to
+play from that entry, keeping the playlist order (including repeated videos).
+In the player, L/R select the previous/next video; the stick and Left/Right
+still seek within a video. Triangle opens **Queue**, with the current video,
+upcoming entries, and an **Automatic next** toggle, initially Off. Other
+player menus remain available with L/R while the menu is open.
+The Queue menu marks the playing entry and shows its playlist position.
+After the final video, it offers replaying that entry, returning to the
+previous video, or going back to the playlist.
+
+The Queue menu pins the current video above five upcoming entries and opens
+with the next video selected. Press Square while Queue is open to turn
+automatic-next playback on or off without moving that selection. Its state
+is shown at the bottom. L/R changes menu tabs; Circle returns to playback.
+
+The queue retains at most 36 entries in RAM and loads further pages only as
+needed. Revisiting older positions can reload earlier provider pages. A failed
+video offers **Retry**, R to **Skip**, or Circle to **Cancel** when those
+actions are available; an exhausted playlist request keeps its error visible
+and offers Cancel rather than a nonworking Retry. Failures never
+silently skip videos. Circle returns to the unchanged playlist page, retaining
+its scroll, focus, and entered text. No queue or playlist position is saved to
+the Memory Stick.
+
 Edits run in the background and show success only after YouTube confirms
 the selected video's or channel's state. A failed confirmation offers a
 manual retry. Navigating away cancels pending work, and these features add
 no local playlist or subscription files.
 
+With browser chrome visible, a focused icon's action name appears in the
+existing bottom hint bar. It uses the page's accessible label or title;
+moving focus does not open a tooltip, add a focus stop, or reflow the page.
+
 Search results offer a collapsible **Filters** panel for upload date,
 duration and relevance/popularity ordering. Select a row to cycle its choices,
-then **Apply filters**. Choosing the default on every row clears the filters;
+then **Apply filters**. The collapsed heading summarizes active choices;
+**Filters: Off** clears them while keeping the search text. Choosing the
+default on every row also clears the filters;
 **Load more results** keeps the current choices. Video details offer a
 collapsible **Chapters** list when the service declares chapters. Selecting a
 timestamp starts the same video at that point in the native player. Up to 24
@@ -212,8 +242,10 @@ video metadata and topic names.
 For the browser interface, open **Settings → Appearance → Language & emoji →
 Interface language**. Choose with Left/Right and press X to install. English,
 Spanish, French, German, Japanese, Russian, Ukrainian, Simplified Chinese,
-Korean, Hindi, Arabic and Portuguese are available. Languages needing extra glyphs also
-download their font pack. Restart to apply. This is separate from page fonts
+Korean, Hindi, Arabic, Portuguese, Bengali and Assamese are in the language catalog.
+Languages needing extra glyphs also download their font pack. New entries need
+published downloads and a compatible browser build before installation works.
+Restart to apply. This is separate from page fonts
 and preferred audio/subtitle languages; it does not translate websites or
 games. Advanced messages not yet translated stay in English. Translations and
 signed glyph packs are downloaded from

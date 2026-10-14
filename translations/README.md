@@ -2,7 +2,8 @@
 
 Settings → Appearance → Language & emoji → Interface language offers English,
 Spanish, French, German, Japanese, Russian, Ukrainian, Simplified Chinese and
-Korean, Hindi, Arabic and Portuguese. Left/Right selects; X installs. A second
+Korean, Hindi, Arabic, Portuguese, Bengali and Assamese. Left/Right selects;
+X installs. A second
 X during installation cancels.
 Restart to apply the saved selection.
 
@@ -10,8 +11,8 @@ Non-English selections download a small data-only translation file from
 [tilefinch-models](https://github.com/stjanovitz/tilefinch-models).
 Japanese, Chinese and Korean also install their existing signed
 glyph packs; Russian and Ukrainian install the Cyrillic pack, Hindi installs
-Devanagari, and Arabic uses the Arabic pack. Spanish, French
-German and Portuguese use the built-in font. Page fonts, preferred video
+Devanagari, Arabic uses the Arabic pack, and Bengali and Assamese share the
+Bengali-Assamese pack. Spanish, French, German and Portuguese use the built-in font. Page fonts, preferred video
 languages and HTTP language preferences remain independent.
 
 Common native navigation, settings labels and controls are translated. Advanced
@@ -52,9 +53,10 @@ The original languages remain at v1; Russian, Ukrainian, Chinese and Korean
 use v2; Hindi and Arabic use v3. The current catalog retains v7 for those ten
 downloadable languages, including native player controls, and adds Portuguese
 in v8. Portuguese uses European Portuguese wording and the built-in Latin
-font; it needs no additional glyph pack. V1–v7 remain immutable for existing
-releases. The v8 Portuguese file must be published to tilefinch-models before
-its in-app download is available. The file
+font; it needs no additional glyph pack. V9 adds Bengali and Assamese, using a
+shared bounded pre-shaped inventory for both interfaces. V1–v8 remain immutable
+for existing releases. New translation files and required signed packs must be
+published to tilefinch-models before their in-app downloads are available. The file
 format is unchanged, and the browser catalog pins each language's version.
 They become available when those files are published; local-only changes cannot
 be downloaded by a device. Existing releases reject changed files rather than

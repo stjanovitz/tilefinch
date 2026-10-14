@@ -86,6 +86,12 @@ Devanagari uses a bounded pre-shaped cluster inventory generated offline with
 HarfBuzz/FreeType, consumed by longest-sequence matching in the existing pack
 format. It covers current Hindi interface labels and common syllables, not
 every possible Indic shaping sequence. No runtime shaping stack is linked.
+The Bengali-Assamese development pack uses the same bounded sequence mechanism,
+including Assamese ra/wa, shared Indic punctuation and complete interface
+clusters. Both interface languages share a pack but retain separate catalog
+IDs. This does not claim arbitrary runtime Bengali or Assamese shaping; the
+fixed inventory's scalar fallback still applies outside its coverage. Existing
+Hindi inventories and published component versions remain unchanged.
 Downscaled monochrome pack cells average their source footprint at glyph
 creation so small vowel marks and thin strokes are not dropped by a nearest
 sample; retained painting still uses the same cached glyph bitmap.

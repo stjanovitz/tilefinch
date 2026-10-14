@@ -51,25 +51,9 @@ static void glyph_refresh_ui(
 static bool profile_language_uses_pack(
     const BrowserProfile *profile, TilefinchGlyphPack pack)
 {
-    BrowserGlyphLanguage language = browser_profile_glyph_language(profile);
-    return (language == BROWSER_GLYPH_LANGUAGE_JAPANESE
-            && pack == TILEFINCH_GLYPH_PACK_JAPANESE)
-        || (language == BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED
-            && pack == TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED)
-        || (language == BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL
-            && pack == TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL)
-        || (language == BROWSER_GLYPH_LANGUAGE_KOREAN
-            && pack == TILEFINCH_GLYPH_PACK_KOREAN)
-        || (language == BROWSER_GLYPH_LANGUAGE_CYRILLIC
-            && pack == TILEFINCH_GLYPH_PACK_CYRILLIC)
-        || (language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
-            && pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED)
-        || (language == BROWSER_GLYPH_LANGUAGE_ARABIC
-            && pack == TILEFINCH_GLYPH_PACK_ARABIC)
-        || (language == BROWSER_GLYPH_LANGUAGE_HEBREW
-            && pack == TILEFINCH_GLYPH_PACK_HEBREW)
-        || (language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
-            && pack == TILEFINCH_GLYPH_PACK_DEVANAGARI);
+    TilefinchGlyphPack selected;
+    return tilefinch_glyph_pack_for_language(
+        browser_profile_glyph_language(profile), &selected) && selected == pack;
 }
 
 /* ---- In-page language-pack offer (docs/TEXT_BIDI.md#glyph-components) */

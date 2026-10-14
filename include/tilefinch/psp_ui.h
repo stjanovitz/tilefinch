@@ -40,7 +40,7 @@ _Static_assert(sizeof(PSP_UI_STATUS_RELOAD_OFFER) - 1u
 #define PSP_UI_TEXT_ENTRY_CAPACITY 512
 #define PSP_UI_TEXT_SUGGESTION_LIMIT BROWSER_PROFILE_SUGGESTION_LIMIT
 #define PSP_UI_FIND_QUERY_LIMIT 96u
-#define PSP_UI_GLYPH_INSTALLED_MASK_BITS 10u
+#define PSP_UI_GLYPH_INSTALLED_MASK_BITS 11u
 
 /*
  * Native chrome surfaces (HOME and COLLECTIONS). Both read bounded views the
@@ -755,6 +755,7 @@ typedef struct {
     uint8_t has_focus : 1;
     uint8_t focus_editable : 1;
     uint8_t custom_homepage_enabled : 1;
+    uint8_t focus_label_valid : 1;
     /* Frame counters bounded below 1024 by their producers (toast_frames
        also has the timed form below). */
     uint16_t activity_frames;
@@ -865,6 +866,9 @@ typedef struct {
        bounded label storage keeps the per-frame UI state at its 1 KiB
        ratchet instead of charging every browsing frame for an SSID. */
     union {
+        /* Page-only action hint; other screens own the overlay strings.
+           Check focus_label_valid and screen before accessing this member. */
+        char focus_label[64];
         struct {
             char update_version[16];
             char update_status[64];
@@ -948,21 +952,32 @@ typedef enum {
     PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK,
     PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK,
     PSP_UI_MEDIA_ACTION_ROTATE,
-    PSP_UI_MEDIA_ACTION_CLOSE
+    PSP_UI_MEDIA_ACTION_CLOSE,
+    PSP_UI_MEDIA_ACTION_NEXT,
+    PSP_UI_MEDIA_ACTION_PREVIOUS,
+    PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT,
+    PSP_UI_MEDIA_ACTION_QUEUE_SELECT,
+    PSP_UI_MEDIA_ACTION_QUEUE_RETRY
 } PspUiMediaAction;
 
 typedef struct {
     PspUiMediaAction action;
     uint64_t seek_time_us;
+    /* AUTOMATIC_NEXT carries the desired boolean, not a relative toggle:
+       busy-player coalescing must preserve the last selected value. */
     uint8_t track_index;
     bool visual_changed;
 } PspUiMediaIntent;
 
 #define PSP_UI_MEDIA_TRACK_LIMIT 6u
+/* Legacy selection IDs reserve 0 for failure controls and 1 for current.
+   Normal queue navigation skips both; upcoming entries begin at ID 2. */
+#define PSP_UI_MEDIA_QUEUE_CONTROL_ROWS 1u
 #define PSP_UI_MEDIA_TRACK_LABEL_CAPACITY 48u
 #define PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY 160u
 #define PSP_UI_MEDIA_TRACK_MENU_WIDTH 352u
 #define PSP_UI_MEDIA_TRACK_MENU_HEIGHT 176u
+#define PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT 208u
 
 typedef struct {
     char label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
@@ -998,12 +1013,21 @@ typedef struct {
     PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
+    bool queue_active, queue_loading, queue_failed, queue_next, automatic_next;
+    bool queue_retry;
+    bool queue_terminal;
+    uint8_t queue_count;
+    uint32_t queue_position;
+    char queue_titles[6][128];
+    char queue_error[160];
 } PspUiMediaPresentation;
 
 typedef struct {
     uint32_t signature;
     uint32_t edram_epoch;
     bool valid;
+    uint8_t selection;
+    bool automatic_next;
 } PspUiMediaTrackMenuCache;
 
 /*
@@ -1021,11 +1045,11 @@ typedef struct {
     bool seek_in_progress;
     bool failed;
     /*
-     * A failure the process cannot retry: the firmware decoder was
-     * quarantined, so every later open is refused by the backend anyway.
-     * The failed panel then names the restart instead of drawing a Retry
-     * affordance that can only fail again. psp_ui_media_set_error clears it,
-     * so a caller which knows nothing about quarantine keeps the retry.
+     * The current failure cannot retry. For a quarantined firmware decoder
+     * the panel names the required restart. A terminal queue selection has
+     * no remaining request instead: queue_terminal suppresses that restart
+     * advice and leaves Cancel. psp_ui_media_set_error clears this bit so
+     * an ordinary recoverable error keeps its Retry affordance.
      */
     bool retry_unavailable;
     bool audio_only_recovery_available;
@@ -1473,9 +1497,15 @@ void psp_ui_media_composite_layers(
 void psp_ui_media_composite_without_track_menu(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride);
+unsigned psp_ui_media_track_menu_height(const PspUiMediaState *media);
 void psp_ui_media_raster_track_menu(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride);
+/* Update focus/footer in an otherwise unchanged retained Queue raster.
+   False requires a full repaint, including glyph-recovery cases. */
+bool psp_ui_media_raster_queue_update(const PspUiMediaState *media,
+    unsigned old_selection, bool old_automatic_next,
+    uint16_t *pixels, int width, int height, int stride);
 
 /*
  * The exact rectangles psp_ui_media_composite_with_preview may touch. They

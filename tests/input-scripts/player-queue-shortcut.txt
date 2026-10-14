@@ -1,0 +1,4 @@
+# Native queue receiver/routing qualification, no network or decoder.
+wait-page 30
+mark queue-shortcut
+end

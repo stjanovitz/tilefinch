@@ -45,6 +45,28 @@ static void write_u32(uint8_t *bytes, uint32_t value)
     bytes[3] = (uint8_t) value;
 }
 
+static bool test_empty_provider_match(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL);
+    size_t retained = budget.current;
+    const char *samples[] = {"Menu 123", "日本語", "한국어", "ক্ষি", "ৰ্কি", "कि", "➡", "Привет"};
+    for (size_t at = 0; at < sizeof(samples) / sizeof(samples[0]); at++) {
+        size_t consumed = 777;
+        uint32_t key = 888;
+        unsigned width = 999;
+        CHECK(!tilefinch_glyph_provider_match(provider, samples[at], strlen(samples[at]),
+            &consumed, &key, &width));
+        CHECK(consumed == 777 && key == 888 && width == 999);
+        CHECK(budget.current == retained);
+    }
+    tilefinch_glyph_provider_destroy(provider);
+    CHECK(budget.current == 0);
+    return true;
+}
+
 static bool write_fixture(char path[128], const char *component_id)
 {
     const size_t pages_offset = HEADER_BYTES + DIRECTORY_BYTES;
@@ -264,7 +286,9 @@ static bool test_pack_catalog(void)
         {"glyph-hebrew", "Hebrew", "tilefinch-glyph-hebrew-v1.tfgm",
          "tilefinch-glyph-hebrew-v1.tfgf"},
         {"glyph-devanagari", "Devanagari (Hindi)",
-         "tilefinch-glyph-devanagari-v1.tfgm", "tilefinch-glyph-devanagari-v1.tfgf"}
+         "tilefinch-glyph-devanagari-v1.tfgm", "tilefinch-glyph-devanagari-v1.tfgf"},
+        {"glyph-bengali-assamese", "Bengali-Assamese",
+         "tilefinch-glyph-bengali-assamese-v1.tfgm", "tilefinch-glyph-bengali-assamese-v1.tfgf"}
     };
     CHECK(TILEFINCH_GLYPH_PACK_JAPANESE == 0
           && TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED == 1
@@ -276,6 +300,7 @@ static bool test_pack_catalog(void)
           && TILEFINCH_GLYPH_PACK_ARABIC == 7
           && TILEFINCH_GLYPH_PACK_HEBREW == 8
           && TILEFINCH_GLYPH_PACK_DEVANAGARI == 9
+          && TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE == 10
           && TILEFINCH_GLYPH_PACK_COUNT
                  == sizeof(expected) / sizeof(expected[0]));
     for (TilefinchGlyphPack pack = 0;
@@ -309,7 +334,8 @@ static bool test_pack_catalog(void)
          TILEFINCH_GLYPH_PACK_LATIN_EXTENDED},
         {BROWSER_GLYPH_LANGUAGE_ARABIC, TILEFINCH_GLYPH_PACK_ARABIC},
         {BROWSER_GLYPH_LANGUAGE_HEBREW, TILEFINCH_GLYPH_PACK_HEBREW},
-        {BROWSER_GLYPH_LANGUAGE_DEVANAGARI, TILEFINCH_GLYPH_PACK_DEVANAGARI}
+        {BROWSER_GLYPH_LANGUAGE_DEVANAGARI, TILEFINCH_GLYPH_PACK_DEVANAGARI},
+        {BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE, TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE}
     };
     for (size_t at = 0;
          at < sizeof(language_packs) / sizeof(language_packs[0]); at++) {
@@ -331,7 +357,7 @@ static bool test_pack_catalog(void)
 }
 
 static bool render_authored_sample(TilefinchGlyphProvider *provider,
-                                   const char *sample)
+                                   const char *sample, size_t *ink_count)
 {
     uint8_t canvas[512u * 16u] = {0};
     size_t cursor = 0;
@@ -341,18 +367,20 @@ static bool render_authored_sample(TilefinchGlyphProvider *provider,
         uint32_t codepoint = 0;
         size_t used = font_utf8_next(sample + at, length - at, &codepoint);
         if (used == 0) return false;
-        at += used;
         if (codepoint < 0x80u) {
+            at += used;
             cursor += codepoint == ' ' ? 4u : 8u;
             continue;
         }
         uint32_t key = 0;
         unsigned width = 0;
-        if (!tilefinch_glyph_provider_has_codepoint(
-                provider, codepoint, &key, &width)) {
+        if (!tilefinch_glyph_provider_match(
+                provider, sample + at, length - at, &used, &key, &width)
+            || used == 0 || used > length - at) {
             fprintf(stderr, "sample missing U+%04X\n", (unsigned) codepoint);
             return false;
         }
+        at += used;
         TilefinchGlyphSource source = {0};
         for (size_t pump = 0;
              !tilefinch_glyph_provider_source(provider, key, &source)
@@ -368,7 +396,8 @@ static bool render_authored_sample(TilefinchGlyphProvider *provider,
         if (!tilefinch_glyph_provider_source(provider, key, &source)
             || source.kind != TILEFINCH_GLYPH_COMPONENT_MONO
             || source.pixels == NULL || source.width == 0
-            || source.height == 0 || source.height > 16u) {
+            || source.width > 16u || source.height == 0
+            || source.height > 16u) {
             fprintf(stderr, "sample source failed U+%04X\n",
                     (unsigned) codepoint);
             return false;
@@ -376,9 +405,14 @@ static bool render_authored_sample(TilefinchGlyphProvider *provider,
         if (cursor >= 512u) break;
         size_t drawable = source.width;
         if (cursor + drawable > 512u) drawable = 512u - cursor;
-        for (size_t y = 0; y < source.height; y++)
-            memcpy(canvas + y * 512u + cursor,
-                   source.pixels + y * source.width, drawable);
+        /* Mono pack cells are one-bit rows, not width*height byte images. */
+        size_t stride = (source.width + 7u) / 8u;
+        for (size_t y = 0; y < source.height; y++) {
+            for (size_t x = 0; x < drawable; x++)
+                canvas[y * 512u + cursor + x] =
+                    source.pixels[y * stride + x / 8u]
+                        & (0x80u >> (x & 7u)) ? 255u : 0u;
+        }
         cursor += width;
         glyphs++;
         if (cursor >= 512u) break;
@@ -386,7 +420,27 @@ static bool render_authored_sample(TilefinchGlyphProvider *provider,
     size_t ink = 0;
     for (size_t pixel = 0; pixel < sizeof(canvas); pixel++)
         if (canvas[pixel] != 0) ink++;
+    if (ink_count != NULL) *ink_count = ink;
     return glyphs >= 2u && ink >= glyphs * 8u;
+}
+
+static bool test_authored_sample_packed_pixels(void)
+{
+    char path[128];
+    CHECK(write_fixture(path, "glyph-ja"));
+    Budget budget;
+    budget_init(&budget, 512u * 1024u);
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(provider, path, "glyph-ja"));
+    size_t ink = 0;
+    CHECK(render_authored_sample(provider, "一一", &ink));
+    /* The fixture's first cell is 32 bytes of 0x31: three pixels per byte.
+       Counting bytes as pixels both produces the wrong ink and overreads. */
+    CHECK(ink == 2u * GLYPH_BYTES * 3u);
+    tilefinch_glyph_provider_destroy(provider);
+    CHECK(budget.current == 0 && unlink(path) == 0);
+    return true;
 }
 
 /*
@@ -432,19 +486,32 @@ static bool test_release_artifacts(void)
                && strcmp(stage_selection, "devanagari") == 0) {
         staged_language = BROWSER_GLYPH_LANGUAGE_DEVANAGARI;
         staged_pack = TILEFINCH_GLYPH_PACK_DEVANAGARI;
+    } else if (stage_selection != NULL
+               && (strcmp(stage_selection, "bengali-assamese") == 0
+                   || strcmp(stage_selection, "bengali") == 0
+                   || strcmp(stage_selection, "assamese") == 0)) {
+        staged_language = BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE;
+        staged_pack = TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE;
     }
-    static const unsigned probes[TILEFINCH_GLYPH_PACK_COUNT] = {
+    static const unsigned probes[] = {
         0x65e5u, 0x6c49u, 0x6f22u, 0xac00u, 0x1f600u,
-        0x0490u, 0x1ed9u, 0xfeb3u, 0x05e9u, 0x0939u
+        0x0490u, 0x1ed9u, 0xfeb3u, 0x05e9u, 0x0939u, 0x09f0u
     };
-    static const char *const samples[TILEFINCH_GLYPH_PACK_COUNT] = {
+    static const char *const samples[] = {
         NULL, NULL, NULL, NULL, NULL,
         "Привет мир Привіт, Україно",
         "Tiếng Việt",
         "مرحبا فارسی اردو",
         "שלום עולם",
-        "नमस्ते हिन्दी"
+        "नमस्ते हिन्दी",
+        "বাংলা অসমীয়া ৰ ৱ । ॥"
     };
+    _Static_assert(sizeof(probes) / sizeof(probes[0])
+                       == TILEFINCH_GLYPH_PACK_COUNT,
+                   "every release pack needs a nonzero glyph probe");
+    _Static_assert(sizeof(samples) / sizeof(samples[0])
+                       == TILEFINCH_GLYPH_PACK_COUNT,
+                   "every release pack needs an explicit sample entry");
     for (TilefinchGlyphPack pack = 0;
          pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
         const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
@@ -481,11 +548,16 @@ static bool test_release_artifacts(void)
         bool revised_hindi = pack == TILEFINCH_GLYPH_PACK_DEVANAGARI
             && (verified.manifest.release_sequence == 2u
                 || verified.manifest.release_sequence == 3u
-                || verified.manifest.release_sequence == 4u);
+                || verified.manifest.release_sequence == 4u
+                || verified.manifest.release_sequence == 5u);
         CHECK(revised_hindi || verified.manifest.release_sequence == 1u);
         CHECK(strcmp(verified.manifest.tag,
-                     revised_hindi
-                        ? (verified.manifest.release_sequence == 4u
+                     pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
+                        ? "glyph-bengali-assamese-v1"
+                        : revised_hindi
+                        ? (verified.manifest.release_sequence == 5u
+                            ? "components-v5"
+                            : verified.manifest.release_sequence == 4u
                             ? "components-v4"
                             : verified.manifest.release_sequence == 3u
                                 ? "components-v3" : "components-v2")
@@ -518,8 +590,21 @@ static bool test_release_artifacts(void)
         CHECK(tilefinch_glyph_provider_has_codepoint(
             provider, probes[pack], &key, &width));
         CHECK(width > 0u);
+        if (pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE) {
+            static const char *const clusters[] = {
+                "ক্ষি", "ৰ্কি", "ৱা", "ড়ো"
+            };
+            for (size_t row = 0;
+                 row < sizeof(clusters) / sizeof(clusters[0]); row++) {
+                size_t used = 0;
+                CHECK(tilefinch_glyph_provider_match(
+                    provider, clusters[row], strlen(clusters[row]),
+                    &used, &key, &width));
+                CHECK(used == strlen(clusters[row]) && width == 16u);
+            }
+        }
         if (samples[pack] != NULL
-            && !render_authored_sample(provider, samples[pack])) {
+            && !render_authored_sample(provider, samples[pack], NULL)) {
             fprintf(stderr, "authored sample failed for %s\n", spec->id);
             return false;
         }
@@ -586,6 +671,11 @@ static bool test_release_artifacts(void)
             browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_HINDI);
         else if (staged_language == BROWSER_GLYPH_LANGUAGE_ARABIC)
             browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_ARABIC);
+        else if (staged_language == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE)
+            browser_profile_set_ui_language(profile,
+                stage_selection != NULL && strcmp(stage_selection, "assamese") == 0
+                    ? TILEFINCH_UI_LANGUAGE_ASSAMESE
+                    : TILEFINCH_UI_LANGUAGE_BENGALI);
         browser_profile_set_color_emoji(profile, true);
         const char *bookmark_title = staged_language
                 == BROWSER_GLYPH_LANGUAGE_CYRILLIC
@@ -598,6 +688,8 @@ static bool test_release_artifacts(void)
                 ? "שלום עולם"
             : staged_language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
                 ? "नमस्ते हिन्दी"
+            : staged_language == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE
+                ? "বাংলা — অসমীয়া"
                 : "日本語  漢字  한국어  😀";
         CHECK(browser_profile_add_bookmark(
             profile, "https://example.com/", bookmark_title));
@@ -612,6 +704,58 @@ static bool test_release_artifacts(void)
         puts("glyph-component-tests ppsspp-stage=PASS");
     }
     puts("glyph-component-tests release-proof=PASS");
+    return true;
+}
+
+static bool test_script_sequence_matching(void)
+{
+    static const struct {
+        const char *id;
+        const char *text[2];
+        uint32_t codepoints[2][4];
+        uint8_t count[2];
+    } cases[] = {
+        {"glyph-ja", {"がx", "ｶﾞx"}, {{0x304b, 0x3099}, {0xff76, 0xff9e}}, {2, 2}},
+        {"glyph-bengali-assamese", {"কিx", "ৰ্কিx"},
+            {{0x0995, 0x09bf}, {0x09f0, 0x09cd, 0x0995, 0x09bf}}, {2, 4}}
+    };
+    for (size_t test = 0; test < sizeof(cases) / sizeof(cases[0]); test++) {
+        char path[128];
+        CHECK(write_fixture(path, cases[test].id));
+        FILE *file = fopen(path, "r+b");
+        CHECK(file != NULL);
+        uint8_t sequences[SEQUENCE_BYTES * 2u] = {0};
+        for (size_t row = 0; row < 2; row++) {
+            uint8_t *entry = sequences + row * SEQUENCE_BYTES;
+            entry[0] = cases[test].count[row];
+            write_u32(entry + 4, 2u + row);
+            for (size_t cp = 0; cp < cases[test].count[row]; cp++)
+                write_u32(entry + 8 + cp * 4, cases[test].codepoints[row][cp]);
+        }
+        CHECK(fseek(file, HEADER_BYTES + DIRECTORY_BYTES + PAGE_BYTES * 2u, SEEK_SET) == 0);
+        CHECK(fwrite(sequences, 1, sizeof(sequences), file) == sizeof(sequences));
+        CHECK(fclose(file) == 0);
+        Budget budget;
+        budget_init(&budget, 512u * 1024u);
+        TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+        CHECK(provider && tilefinch_glyph_provider_attach(provider, path, cases[test].id));
+        for (size_t row = 0; row < 2; row++) {
+            size_t used = 0;
+            uint32_t key = 0;
+            unsigned width = 0;
+            const char *text = cases[test].text[row];
+            size_t expected_bytes = strlen(text) - 1u;
+            CHECK(tilefinch_glyph_provider_match(provider, text, strlen(text),
+                                                &used, &key, &width));
+            CHECK(used == expected_bytes && width == 16u);
+            /* A partial UTF-8 mark cannot be consumed as a complete cluster. */
+            CHECK(!tilefinch_glyph_provider_match(provider, text, expected_bytes - 1u,
+                                                 &used, &key, &width));
+        }
+        tilefinch_glyph_provider_destroy(provider);
+        CHECK(budget.current == 0);
+        CHECK(unlink(path) == 0);
+    }
     return true;
 }
 
@@ -884,7 +1028,8 @@ static bool test_new_pack_store_lifecycle(void)
         TILEFINCH_GLYPH_PACK_CYRILLIC,
         TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
         TILEFINCH_GLYPH_PACK_ARABIC,
-        TILEFINCH_GLYPH_PACK_HEBREW
+        TILEFINCH_GLYPH_PACK_HEBREW,
+        TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
     };
     for (size_t at = 0; at < sizeof(packs) / sizeof(packs[0]); at++) {
         const TilefinchGlyphPack pack = packs[at];
@@ -1107,10 +1252,13 @@ int main(void)
     /* Before any test installs an optional provider: the offer checks
        the embedded faces alone. */
     if (!test_glyph_offer_detection()) return 1;
+    if (!test_empty_provider_match()) return 1;
     if (!test_glyph_offer_session_memory()) return 1;
     if (!test_glyph_offer_decline_persists()) return 1;
     if (!test_glyph_session_install_reattaches()) return 1;
     if (!test_pack_catalog()) return 1;
+    if (!test_authored_sample_packed_pixels()) return 1;
+    if (!test_script_sequence_matching()) return 1;
     if (!test_bounded_pack_provider()) return 1;
     if (!test_new_pack_store_lifecycle()) return 1;
     if (!test_phase_aware_install_faults()) return 1;

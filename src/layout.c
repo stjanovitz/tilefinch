@@ -867,31 +867,30 @@ void layout_reuse_cache_update_images(LayoutReuseCache *cache,
 }
 
 size_t layout_rebind_image_resources(LayoutDocument *layout,
-                                     const ImageResource *previous_items,
+                                     uintptr_t previous_base,
                                      size_t previous_count,
                                      const ImageResources *images)
 {
-    if (layout == NULL || previous_items == NULL || previous_count == 0
-        || images == NULL || images->items == NULL
-        || images->count < previous_count) return 0;
+    if (layout == NULL || previous_base == 0 || previous_count == 0
+        || images == NULL || (images->count != 0 && images->items == NULL)
+        || previous_count > SIZE_MAX / sizeof(*images->items)) return 0;
     size_t rebound = 0;
-    uintptr_t previous_base = (uintptr_t) previous_items;
-    size_t previous_bytes = previous_count * sizeof(*previous_items);
+    size_t previous_bytes = previous_count * sizeof(*images->items);
     for (size_t command_index = 0;
          command_index < layout->count; command_index++) {
         DrawCommand *command = &layout->commands[command_index];
         if (command->image == NULL) continue;
-        /* previous_items is deliberately retained, so its numeric address
-           range remains valid while this bounded display-list pass maps each
-           old entry to the same index in the replacement table. */
+        /* Append-only growth preserves indices. Compare numeric addresses
+           only, never dereference the retired table or its old entries. */
         uintptr_t address = (uintptr_t) command->image;
         if (address < previous_base) continue;
         uintptr_t offset = address - previous_base;
         if (offset >= previous_bytes
-            || offset % sizeof(*previous_items) != 0u) continue;
+            || offset % sizeof(*images->items) != 0u) continue;
         size_t image_index = (size_t) (
-            offset / sizeof(*previous_items));
-        command->image = &images->items[image_index];
+            offset / sizeof(*images->items));
+        command->image = image_index < images->count
+            ? &images->items[image_index] : NULL;
         rebound++;
     }
     return rebound;

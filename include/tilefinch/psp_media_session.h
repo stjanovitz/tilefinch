@@ -26,6 +26,7 @@
 #include "tilefinch/session.h"
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/youtube_subtitles.h"
+#include "tilefinch/youtube_playlist.h"
 
 typedef enum {
     PSP_MEDIA_JOB_NONE = 0,
@@ -99,6 +100,8 @@ typedef struct {
     YoutubeResolveJob *caption_resolver_job;
     bool caption_resolution_pending;
     YoutubeResolveJob *resolver_job;
+    YoutubePlaylistQueue *playlist;
+    bool playlist_end_handled;
     /* A focused result's resolver may already be complete or in flight when
        Play is pressed. It waits here until the open service has destroyed the
        previous pipeline, then becomes resolver_job without restarting. */
@@ -522,6 +525,8 @@ void psp_media_prepare_route(
     PspMediaSession *media, const char *url, uint64_t generation);
 bool psp_media_open_provider_route(
     PspMediaSession *media, const char *url, uint64_t backing_generation);
+bool psp_media_open_playlist_route(PspMediaSession *, const char *play_url,
+                                 const char *playlist_url, uint64_t generation);
 bool psp_media_open_provider_route_prepared(
     PspMediaSession *media, const char *url, uint64_t backing_generation,
     YoutubeResolveJob **prepared_resolver_job);

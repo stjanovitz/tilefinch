@@ -21,6 +21,8 @@ typedef enum {
     TILEFINCH_UI_LANGUAGE_HINDI,
     TILEFINCH_UI_LANGUAGE_ARABIC,
     TILEFINCH_UI_LANGUAGE_PORTUGUESE,
+    TILEFINCH_UI_LANGUAGE_BENGALI,
+    TILEFINCH_UI_LANGUAGE_ASSAMESE,
     TILEFINCH_UI_LANGUAGE_COUNT
 } TilefinchUiLanguage;
 
@@ -58,5 +60,8 @@ unsigned tilefinch_ui_translation_bound_language(void);
 const char *tilefinch_ui_text(const char *english);
 /* Logical text for HTML; the page renderer performs bidi/shaping itself. */
 const char *tilefinch_ui_logical_text(const char *english);
+/* Reuse a catalog name's already-shaped display bytes. Unknown author names
+   are unchanged; this bounded lookup is for cache misses, not each frame. */
+const char *tilefinch_ui_display_name(const char *logical);
 
 #endif

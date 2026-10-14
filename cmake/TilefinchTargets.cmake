@@ -741,7 +741,19 @@ if(PSP)
             # The fresh 0.1.35 release profile measures 4,859,608 bytes.
             # The user approved a measured 14 KiB increase for this engine
             # code-generation difference; page/font/cache limits stay fixed.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4860160)
+            # Playlist recovery, RAM-only semantic focus restoration and
+            # interruptible image publication measure 4,873,968 bytes.
+            # The user approved 5 KiB more code; provider coalescing keeps
+            # its deadline and step bounds, and image retries preserve the
+            # incumbent layout. Page, download and queue limits stay fixed.
+            # Native focus names and coalesced partial-frame progress
+            # measure 4,874,700 bytes. The user approved 1 KiB more code;
+            # names share page/menu storage within the existing 1 KiB UI
+            # snapshot, and raster slices/input polling are not enlarged.
+            # Retained Queue focus/footer painting measures 4,877,312 bytes.
+            # The user approved 1 KiB more code; cache metadata reuses padding
+            # and the menu keeps its existing surface and queue ceilings.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4877568)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

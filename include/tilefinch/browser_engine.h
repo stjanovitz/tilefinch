@@ -951,6 +951,8 @@ typedef struct {
     bool can_go_forward;
     bool has_focus;
     bool focus_has_authored_outline;
+    /* Explicit accessible name/title, never form contents or a DOM pointer. */
+    char focus_label[64];
     bool loading;
     int scroll_y;
     int maximum_scroll_y;

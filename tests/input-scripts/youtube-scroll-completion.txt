@@ -1,0 +1,21 @@
+# Measure cold result tiles without a menu pausing their completion.
+# No playback, live account mutations, or saved state.
+wait 1
+tap right
+tap cross
+wait 1
+tap circle
+wait 1
+tap rtrigger
+wait 1
+mark cold-scroll1
+tap rtrigger
+wait 1
+mark cold-scroll2
+tap ltrigger
+wait 1
+mark cold-return
+tap-after-live 1 down
+wait 1
+mark cold-focus
+end

@@ -315,7 +315,9 @@ int main(void)
     CHECK(frame_paint_progress_due(1000, 1000, true, false));
     CHECK(frame_paint_progress_due(1000, 0, false, true));
     CHECK(!frame_paint_progress_due(16999, 1000, false, true));
-    CHECK(frame_paint_progress_due(17000, 1000, false, true));
+    CHECK(!frame_paint_progress_due(17000, 1000, false, true));
+    CHECK(!frame_paint_progress_due(32999, 1000, false, true));
+    CHECK(frame_paint_progress_due(33000, 1000, false, true));
     CHECK(frame_paint_progress_due(999, 1000, false, true));
     CHECK(!frame_paint_progress_due(100000, 1000, false, false));
     if (test_policy_table() != 0) return 1;

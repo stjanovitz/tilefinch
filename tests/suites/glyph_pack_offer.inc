@@ -120,6 +120,33 @@ static bool test_glyph_offer_detection(void)
     CHECK(census.offer_mask == 0 && scripts == 0
           && !offer_for(&census, &probe, 0, &pack));
 
+    /* Danda and double danda are shared Indic punctuation, not evidence of
+       Hindi. Even a separate punctuation node must not introduce a second
+       language-pack hint or outrank Bengali/Assamese prose. */
+    static const struct {
+        const char *text;
+        uint16_t script;
+        TilefinchGlyphPack pack;
+    } indic[] = {
+        {"বাংলা ভাষা পড়ুন। ", DOCUMENT_GLYPH_SCRIPT_BENGALI_ASSAMESE,
+         TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE},
+        {"অসমীয়া ভাষা পঢ়ক॥ ", DOCUMENT_GLYPH_SCRIPT_BENGALI_ASSAMESE,
+         TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE},
+        {"हिन्दी भाषा पढ़ें। ", DOCUMENT_GLYPH_SCRIPT_DEVANAGARI,
+         TILEFINCH_GLYPH_PACK_DEVANAGARI}
+    };
+    for (size_t row = 0; row < sizeof(indic) / sizeof(indic[0]); row++) {
+        CHECK(offer_parse(&budget, "<span>।।॥॥</span>", indic[row].text,
+                          16u, "<span>।।॥॥</span>", &census, &scripts));
+        CHECK(scripts == indic[row].script
+              && census.offer_mask == indic[row].script
+              && offer_for(&census, &probe, 0, &pack)
+              && pack == indic[row].pack);
+    }
+    CHECK(offer_parse(&budget, "", "।॥ ", 48u, "", &census, &scripts));
+    CHECK(scripts == 0 && census.offer_mask == 0
+          && !offer_for(&census, &probe, 0, &pack));
+
     /* A single stray character does not: the lazy-attach hint still sees
        it, the offer census does not count it as use. */
     CHECK(offer_parse(&budget, "", offer_english, 4u, " Ж", &census,

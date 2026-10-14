@@ -823,6 +823,18 @@ grep -Eq 'tilefinch-input-script: outcome=(complete|exit-action)( |$)' \
 # property of the script, so a non-zero test belongs here while the exact
 # number must stay out of the goldened trace.
 telemetry_log="$result_dir/run-1/tilefinch-validation.txt"
+if [ "$scenario" = player-queue-profile ]; then
+    grep -q 'tilefinch-menu-profile: outcome=pass' "$telemetry_log" || {
+        printf 'FAIL: bounded native menu profile failed.\n' >&2
+        exit 1
+    }
+fi
+if [ "$scenario" = player-queue-shortcut ]; then
+    grep -q 'tilefinch-queue-shortcut: outcome=pass checked-states=4' "$telemetry_log" || {
+        printf 'FAIL: native queue shortcut qualification did not pass.\n' >&2
+        exit 1
+    }
+fi
 if grep -Eq '^[[:space:]]*(wait|tap|hold|press|mark)-live([[:space:]]|$)' \
         "$script_source"; then
     grep -Eq 'tilefinch-input-telemetry: .*busy-frames=[1-9][0-9]*' \

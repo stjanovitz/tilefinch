@@ -16,6 +16,11 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
     find_package(Threads REQUIRED)
+    tilefinch_add_test_binary(tilefinch-youtube-playlist-tests tests/test_youtube_playlist.c)
+    target_link_libraries(tilefinch-youtube-playlist-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-youtube-playlist-tests COMMAND tilefinch-youtube-playlist-tests)
+    set_tests_properties(tilefinch-youtube-playlist-tests PROPERTIES
+        LABELS "tilefinch;unit;provider;media;journey" TIMEOUT 30)
     if(NOT PSP)
         tilefinch_add_test_binary(tilefinch-youtube-feed-probe-tests tests/test_youtube_feed_probe.c)
         target_link_libraries(tilefinch-youtube-feed-probe-tests PRIVATE tilefinch_core)
@@ -76,6 +81,9 @@ if(PSP_BROWSER_BUILD_TESTS)
                 --check --resource-dir "${TILEFINCH_UI_RESOURCE_ROOT}")
         set_tests_properties(tilefinch-ui-translations-generated-check PROPERTIES
             LABELS "tilefinch;unit;ui;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-indic-sequence-tests
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_indic_sequences.py")
+        set_tests_properties(tilefinch-indic-sequence-tests PROPERTIES LABELS "tilefinch" TIMEOUT 30)
         add_test(NAME tilefinch-ui-translation-resources-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_translation_resources.py)

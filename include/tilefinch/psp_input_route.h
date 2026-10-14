@@ -92,7 +92,7 @@ typedef enum {
     /* The player's controls. */
     PSP_INPUT_ROUTE_MEDIA,
     /* Page the loading preview, or the committed page while its layout
-       completes (Up/Down/L/R). */
+       completes (L/R). D-pad Up/Down retains its ordinary focus intent. */
     PSP_INPUT_ROUTE_SCROLL,
     /* A cancellation is in flight: say it is still stopping. */
     PSP_INPUT_ROUTE_STILL_STOPPING,
@@ -103,10 +103,9 @@ typedef enum {
 } PspInputRoute;
 
 #define PSP_INPUT_ROUTE_SCROLL_BUTTONS \
-    (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_PAGE_UP \
-     | PSP_UI_BUTTON_PAGE_DOWN)
+    (PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN)
 #define PSP_INPUT_ROUTE_FORWARD_BUTTONS \
-    (PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_PAGE_DOWN)
+    (PSP_UI_BUTTON_PAGE_DOWN)
 #define PSP_INPUT_ROUTE_MEDIA_BUTTONS \
     (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_LEFT \
      | PSP_UI_BUTTON_RIGHT | PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN \
@@ -136,6 +135,11 @@ static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
         return PSP_INPUT_ROUTE_MEDIA;
     if ((c->pressed & PSP_UI_BUTTON_CANCEL) != 0 && !c->cancelling)
         return PSP_INPUT_ROUTE_CANCEL;
+    /* Square belongs to the modal chooser, not the page's reload or the
+       failed player's lower-quality recovery. Keep it live during decode. */
+    if (media && c->media_menu_open && !c->cancelling
+        && (c->pressed & PSP_UI_BUTTON_RELOAD) != 0)
+        return PSP_INPUT_ROUTE_MEDIA;
     if (media && (c->pressed & PSP_INPUT_ROUTE_MEDIA_BUTTONS) != 0
         && !c->cancelling)
         return PSP_INPUT_ROUTE_MEDIA;

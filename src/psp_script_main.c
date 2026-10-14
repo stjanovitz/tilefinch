@@ -3658,6 +3658,16 @@ void psp_webgl_measurement_main_frame(void)
 
 void psp_webgl_measurement_mark(const char *mark)
 {
+    if (mark != NULL && strcmp(mark, "queue-perf") == 0) {
+        bool passed = psp_webgl_measurement_navigation != NULL
+            && psp_queue_menu_profile(psp_webgl_measurement_navigation->budget);
+        printf("tilefinch-menu-profile: outcome=%s\n", passed ? "pass" : "fail");
+    }
+    if (mark != NULL && strcmp(mark, "queue-shortcut") == 0) {
+        bool passed = psp_queue_shortcut_qualify();
+        printf("tilefinch-queue-shortcut: outcome=%s checked-states=%u\n",
+            passed ? "pass" : "fail", passed ? 4u : 0u);
+    }
     if (mark != NULL && strcmp(mark, "copy-vfpu-on") == 0)
         psp_present_validation_vfpu_copy(true, false);
     else if (mark != NULL && strcmp(mark, "copy-vfpu-off") == 0)
@@ -7948,7 +7958,10 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(
            makes that rewind a full backend reopen, whose resume state is
            taken when the seek is requested -- so it must be asked for as
            playing then, not patched into job_resume_playing afterwards. */
-        if (browser->media.ui.ended && browser->media.playback != NULL
+        /* A playlist owns its end policy. The single-video soak must not
+           restart its incumbent before automatic-next can observe the end. */
+        if (browser->media.playlist == NULL
+            && browser->media.ui.ended && browser->media.playback != NULL
             && browser->media.job_phase == PSP_MEDIA_JOB_NONE
             && stability_elapsed_us
                    < loop->media_stability_target_us) {

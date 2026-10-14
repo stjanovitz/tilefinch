@@ -1,0 +1,4 @@
+# Warm native chrome, then profile bounded menu batches without networking.
+wait-page 30
+mark queue-perf
+end

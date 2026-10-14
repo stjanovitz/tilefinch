@@ -1312,6 +1312,13 @@ typedef struct {
 
 static uint16_t document_codepoint_glyph_script(unsigned codepoint)
 {
+    /* U+0964/U+0965 have Common script: Bengali, Assamese and other Indic
+       prose use them too. Let the surrounding script's letters select the
+       pack; punctuation alone must not hint or offer Devanagari. This also
+       works when markup splits the punctuation into its own text node. */
+    if (codepoint == 0x0964u || codepoint == 0x0965u) return 0;
+    if (codepoint >= 0x0980u && codepoint <= 0x09ffu)
+        return DOCUMENT_GLYPH_SCRIPT_BENGALI_ASSAMESE;
     if ((codepoint >= 0x0900u && codepoint <= 0x097fu)
         || (codepoint >= 0xa8e0u && codepoint <= 0xa8ffu)
         || (codepoint >= 0x11b00u && codepoint <= 0x11b09u)) {
@@ -1325,7 +1332,7 @@ static uint16_t document_codepoint_glyph_script(unsigned codepoint)
     }
     if ((codepoint >= 0x3040u && codepoint <= 0x30ffu)
         || (codepoint >= 0x31f0u && codepoint <= 0x31ffu)
-        || (codepoint >= 0xff66u && codepoint <= 0xff9du)) {
+        || (codepoint >= 0xff66u && codepoint <= 0xff9fu)) {
         return DOCUMENT_GLYPH_SCRIPT_JAPANESE;
     }
     if ((codepoint >= 0x1100u && codepoint <= 0x11ffu)

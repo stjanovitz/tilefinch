@@ -136,6 +136,18 @@ static int test_youtube_filters_and_chapters(void)
         CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
             && youtube_lite_load_take_document(job, &document)
             && strstr(document.html, "id=yt-filter-panel") != NULL);
+        CHECK((strstr(document.html, "id=yt-filter-reset") != NULL) == (i != 0));
+        if (i != 0) {
+            const char *reset = strstr(document.html, "id=yt-filter-reset");
+            const char *end = strstr(reset, "</a>");
+            const char *target = strstr(reset, "search_query=fixture\"");
+            CHECK(end && target && target < end);
+            const char *summary = strstr(document.html, "<summary>Filters");
+            CHECK(summary);
+            const char *separator = strstr(summary, " &middot; ");
+            const char *summary_end = strstr(summary, "</summary>");
+            CHECK(separator && summary_end && separator < summary_end);
+        }
         static const char *const fields[] = {"tilefinch_date", "tilefinch_duration", "tilefinch_sort"};
         unsigned values[] = {date, duration, sort};
         for (unsigned field = 0; field < 3u; field++) {
@@ -430,6 +442,43 @@ static int test_youtube_filters_and_chapters(void)
         && browser_engine_controller(engine)->focus_kind == CONTROLLER_FOCUS_CONTROL
         && browser_engine_controller(engine)->focus_index == 0
         && navigation_current(nav)->scroll_y == 200);
+    /* Hydration may insert links and serialize relative hrefs as absolute.
+       Back must prefer the resolved destination to an old link ordinal. */
+    static const char focus_original[] = "<a href='/first'>First</a>"
+        "<a href='/chosen?part=2'>Chosen</a><div style='height:900px'></div>";
+    static const char focus_hydrated[] = "<a href='/new'>New</a>"
+        "<a href='/first'>First</a><a href='https://focus-history.test/chosen?part=2'>Chosen</a>"
+        "<div style='height:900px'></div>";
+    CHECK(browser_engine_commit_html(engine, "https://focus-history.test/",
+        focus_original, sizeof(focus_original) - 1, true));
+    CHECK(browser_engine_focus_node(engine, nav->page.layout.links[1].node));
+    CHECK(browser_engine_commit_html(engine, "https://other-focus.test/",
+        "<p>Other", 8, true));
+    CHECK(navigation_back(nav, &local_entry));
+    CHECK(browser_engine_commit_history_html(engine, "https://focus-history.test/",
+        focus_hydrated, sizeof(focus_hydrated) - 1));
+    BrowserController *restored_controller = browser_engine_controller(engine);
+    CHECK(restored_controller->focus_kind == CONTROLLER_FOCUS_LINK);
+    CHECK(!strcmp(nav->page.layout.links[restored_controller->focus_index].url,
+        "https://focus-history.test/chosen?part=2"));
+    static const char focus_base_original[] =
+        "<base href='https://destination.test/folder/'>"
+        "<a href='first'>First</a><a href='../chosen?part=3'>Chosen</a>";
+    static const char focus_base_hydrated[] =
+        "<base href='https://destination.test/folder/'>"
+        "<a href='new'>New</a><a href='first'>First</a>"
+        "<a href='https://destination.test/chosen?part=3'>Chosen</a>";
+    CHECK(browser_engine_commit_html(engine, "https://base-focus.test/",
+        focus_base_original, sizeof(focus_base_original) - 1, true));
+    CHECK(browser_engine_focus_node(engine, nav->page.layout.links[1].node));
+    CHECK(browser_engine_commit_html(engine, "https://other-base.test/", "<p>Other", 8, true));
+    CHECK(navigation_back(nav, &local_entry));
+    CHECK(browser_engine_commit_history_html(engine, "https://base-focus.test/",
+        focus_base_hydrated, sizeof(focus_base_hydrated) - 1));
+    restored_controller = browser_engine_controller(engine);
+    CHECK(restored_controller->focus_kind == CONTROLLER_FOCUS_LINK
+        && !strcmp(nav->page.layout.links[restored_controller->focus_index].url,
+            "https://destination.test/chosen?part=3"));
     browser_engine_destroy(engine);
     youtube_lite_document_destroy(&filters); youtube_lite_document_destroy(&chapters);
     browser_session_destroy(&session);

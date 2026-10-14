@@ -157,6 +157,8 @@ typedef struct {
     int focus_kind;
     /* Semantic ordinal within focus_kind; independent of inline fragments. */
     size_t focus_index;
+    /* RAM-only identity; no href, input value or credentials are retained. */
+    uint64_t focus_identity;
     NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
     size_t control_count;
 } NavigationEntry;
@@ -167,6 +169,7 @@ typedef struct {
     int scroll_y;
     int focus_kind;
     size_t focus_index;
+    uint64_t focus_identity;
 } NavigationHistoryRecord;
 
 /* Consecutive refresh navigations (meta refresh or the Refresh header) that
@@ -300,6 +303,7 @@ typedef struct {
        with weak handles and source-generation checks across author turns.
        Its one active, at-most-two-target job is externally pumped. */
     bool image_continuation_pending;
+    bool visual_image_publication_pending;
     /* Display retargeting (images_retarget_display_step) runs from owner
        idle ticks once image loading is done, until a step finds nothing to
        change for the committed layout identified here. */
@@ -420,6 +424,12 @@ typedef bool (*NavigationProgressivePaintCallback)(
    omission and must leave the committed display list valid. */
 typedef void (*NavigationDeferredImageReadyCallback)(
     void *opaque, NavigationSession *session);
+
+/* The loader appended resources and moved its table. Rebind borrowed visual
+   clones before input can interrupt publication; the old table is not live. */
+typedef void (*NavigationImageTableMovedCallback)(
+    void *opaque, NavigationSession *session, uintptr_t previous_base,
+    size_t previous_count);
 
 typedef struct {
     size_t ordinal;
@@ -1016,6 +1026,8 @@ struct NavigationSession {
     int provisional_reader_y;
     NavigationDeferredImageReadyCallback deferred_image_ready;
     void *deferred_image_ready_opaque;
+    NavigationImageTableMovedCallback image_table_moved;
+    void *image_table_moved_opaque;
     /* Prepare content-shape Reader markers on a completed candidate DOM
        before its first authoritative stylesheet/layout pass. */
     bool prepare_reader_candidates;
@@ -1120,6 +1132,9 @@ bool navigation_set_progressive_paint_hook(
 void navigation_set_deferred_image_ready_hook(
     NavigationSession *session,
     NavigationDeferredImageReadyCallback callback, void *opaque);
+void navigation_set_image_table_moved_hook(
+    NavigationSession *session, NavigationImageTableMovedCallback callback,
+    void *opaque);
 /* Bounded CSS-height lookahead used only by a transient streaming preview.
    Fifty preserves the subsystem default; BrowserEngine uses one additional
    viewport so a handheld can expose one provisional page-down snapshot. */

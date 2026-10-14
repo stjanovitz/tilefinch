@@ -1423,10 +1423,11 @@ void layout_reuse_cache_invalidate_checked(
 void layout_reuse_cache_update_images(LayoutReuseCache *cache,
                                       const ImageResources *images);
 /* Rebind image pointers retained by an already-committed display list after
-   alias insertion moved the bounded ImageResources table. previous_items
-   must remain alive for the duration of this call. */
+   append-only growth moved the bounded ImageResources table. Capture the old
+   numeric base before growth; no access to the retired allocation is needed.
+   A rolled-back suffix is cleared, while prefix indices stay unchanged. */
 size_t layout_rebind_image_resources(LayoutDocument *layout,
-                                     const ImageResource *previous_items,
+                                     uintptr_t previous_base,
                                      size_t previous_count,
                                      const ImageResources *images);
 /* Rebinds an unchanged stylesheet after transactional struct ownership

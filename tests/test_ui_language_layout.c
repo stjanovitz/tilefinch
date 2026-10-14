@@ -32,7 +32,7 @@ static char *keys[TILEFINCH_UI_TRANSLATION_ROWS], *values[TILEFINCH_UI_TRANSLATI
 static size_t key_count, checked_frames, checked_labels;
 static const char *language_code;
 static const char *capture_directory;
-static const char *real_hindi_pack, *real_arabic_pack;
+static const char *real_hindi_pack, *real_arabic_pack, *real_bengali_pack;
 #include "ui_navigation_keys.inc"
 static size_t checked_navigation_labels;
 
@@ -109,14 +109,15 @@ static void put32(unsigned char *out, unsigned value)
 /* A conservative pack uses the production 16x16 mono metrics and fills the
    bitmap edges. It checks the widest possible ink, not substitute '?' tiles.
    All codepoints come from public catalogs; no downloaded fonts or network. */
-static bool make_metric_pack(char path[64])
+static bool make_metric_pack(char path[64], bool bengali)
 {
     unsigned sequences[4096][8] = {{0}};
     unsigned lengths[4096], sequence_count = 0;
     char sequence_path[1024];
+    unsigned locale = bengali ? TILEFINCH_UI_LANGUAGE_BENGALI : TILEFINCH_UI_LANGUAGE_HINDI;
     snprintf(sequence_path, sizeof(sequence_path),
-        "%s/translations/ui/v%u/hi.sequences", TILEFINCH_TEST_ROOT,
-        tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->version);
+        "%s/translations/ui/v%u/%s.sequences", TILEFINCH_TEST_ROOT,
+        tilefinch_ui_language_spec(locale)->version, bengali ? "bengali-assamese" : "hi");
     FILE *sequence_file = fopen(sequence_path, "r");
     CHECK(sequence_file);
     char line[128];
@@ -128,7 +129,8 @@ static bool make_metric_pack(char path[64])
         while (count < 8) {
             unsigned long cp = strtoul(cursor, &end, 16);
             if (end == cursor) break;
-            CHECK(cp >= 0x0900 && cp <= 0x097f);
+            CHECK((cp >= (bengali ? 0x0980u : 0x0900u)
+                   && cp <= (bengali ? 0x09ffu : 0x097fu)) || cp == 0x200cu || cp == 0x200du);
             sequences[sequence_count][count++] = (unsigned)cp;
             cursor = end;
         }
@@ -171,7 +173,8 @@ static bool make_metric_pack(char path[64])
     memcpy(bytes, "TFGFv1\0\0", 8);
     put16(bytes + 8, 1);
     bytes[10] = 1; bytes[11] = 16; bytes[12] = 16; bytes[13] = 64;
-    memcpy(bytes + 44, "glyph-ui-test", 13); bytes[14] = 13;
+    const char *id = bengali ? "glyph-ui-bn-test" : "glyph-ui-test";
+    memcpy(bytes + 44, id, strlen(id)); bytes[14] = (unsigned char)strlen(id);
     put32(bytes + 16, glyphs + sequence_count); put16(bytes + 20, pages);
     put16(bytes + 22, sequence_count);
     put32(bytes + 24, 80); put32(bytes + 28, pages_offset);
@@ -282,7 +285,8 @@ static bool paint(PspUiState *ui, TilefinchGlyphProvider *provider)
     for (unsigned pass = 0; pass < 64; pass++) {
         run_count = 0; run_overflow = false;
         for (size_t at = 0; at < sizeof(storage) / sizeof(storage[0]); at++) storage[at] = 0xa55a;
-        if (ui->screen == PSP_UI_SCREEN_PAGE && ui->page_gamepad_capture) {
+        if (ui->screen == PSP_UI_SCREEN_PAGE
+            && (ui->page_gamepad_capture || ui->focus_label_valid)) {
             /* The normal chrome cache paints separate local-coordinate
                surfaces. Observe the hint at final framebuffer coordinates. */
             draw_bottom_bar(ui, storage + 16, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
@@ -301,9 +305,13 @@ static bool paint(PspUiState *ui, TilefinchGlyphProvider *provider)
 
 static bool paint_failed_media(PspUiState *ui, TilefinchGlyphProvider *provider)
 {
+    PspUiMediaPresentation presentation = {0};
     PspUiMediaState media = {.visible = true, .failed = true, .controls_visible = true};
-    for (unsigned unavailable = 0; unavailable < 2; unavailable++) {
+    psp_ui_media_set_error_reason(&media, "PLAYLIST COULD NOT LOAD", "Connection timed out");
+    for (unsigned unavailable = 0; unavailable < 3; unavailable++) {
         media.retry_unavailable = unavailable != 0;
+        media.presentation = unavailable == 2 ? &presentation : NULL;
+        presentation.queue_active = presentation.queue_failed = presentation.queue_terminal = true;
         bool settled = false;
         for (unsigned pass = 0; pass < 64; pass++) {
             run_count = 0; run_overflow = false;
@@ -317,13 +325,15 @@ static bool paint_failed_media(PspUiState *ui, TilefinchGlyphProvider *provider)
             CHECK(validate_frame(ui));
             UiRect back = media_failed_back_rect(
                 media_failed_panel_rect(WIDTH, HEIGHT), media.retry_unavailable);
-            bool found = false;
+            bool found = false, headline = false;
             for (size_t at = 0; at < run_count; at++) {
-                if (strcmp(runs[at].text, tilefinch_ui_text("O Back"))) continue;
+                if (!strcmp(runs[at].text, tilefinch_ui_text("PLAYLIST COULD NOT LOAD")))
+                    headline = true;
+                if (strcmp(runs[at].text, tilefinch_ui_text(unavailable == 2 ? "O Cancel" : "O Back"))) continue;
                 CHECK(runs[at].left >= back.x && runs[at].right <= back.x + back.width);
                 found = true;
             }
-            CHECK(found);
+            CHECK(found && headline);
             settled = true;
             break;
         }
@@ -343,6 +353,46 @@ static bool player_has_text(const char *key)
 }
 
 static bool snapshot_geometry(const char *name, int width, int height, int stride);
+
+static bool queue_cache_matches_full(PspUiMediaState *media)
+{
+    static uint16_t scratch[WIDTH * HEIGHT], menu[352 * 208];
+    static uint32_t cached[WIDTH * HEIGHT], expected[WIDTH * HEIGHT];
+    PspUiMediaPresentation *p = media->presentation;
+    unsigned old_selection = p->track_menu_selection;
+    bool old_auto = p->automatic_next;
+    PspUiMediaTrackMenuCache cache = {0};
+    uint8_t saved_glyph_state = chrome_font_cache.loaded[0][0][0];
+    chrome_font_cache.loaded[0][0][0] = UI_CHROME_GLYPH_PENDING;
+    CHECK(!psp_ui_media_raster_queue_update(media, old_selection, old_auto,
+        menu, 352, 208, 352));
+    chrome_font_cache.loaded[0][0][0] = saved_glyph_state;
+    saved_glyph_state = chrome_font_cache.unicode[0].loaded;
+    chrome_font_cache.unicode[0].loaded = UI_CHROME_GLYPH_REFUSED_FIRST;
+    CHECK(!psp_ui_media_raster_queue_update(media, old_selection, old_auto,
+        menu, 352, 208, 352));
+    chrome_font_cache.unicode[0].loaded = saved_glyph_state;
+    for (unsigned step = 0; step < 16; step++) {
+        for (unsigned at = 0; at < WIDTH * HEIGHT; at++)
+            cached[at] = expected[at] = UINT32_C(0xff6284a6);
+        p->track_menu_selection = 2 + step % 5;
+        p->automatic_next = (step & 1) != 0;
+        run_count = 0; run_overflow = false;
+        psp_ui_media_composite_8888_cached(media, NULL, cached,
+            WIDTH, HEIGHT, WIDTH, scratch, menu, 352 * 208, 1, &cache, NULL, NULL);
+        psp_ui_media_composite_8888(media, NULL, expected, WIDTH, HEIGHT, WIDTH, scratch);
+        if (memcmp(cached, expected, sizeof(cached))) {
+            for (unsigned at = 0; at < WIDTH * HEIGHT; at++) if (cached[at] != expected[at]) {
+                fprintf(stderr, "queue-cache language=%s step=%u first-diff=%u,%u got=%08x expected=%08x\n",
+                    language_code, step, at % WIDTH, at / WIDTH, cached[at], expected[at]); break;
+            }
+        }
+        CHECK(!memcmp(cached, expected, sizeof(cached)) && !run_overflow);
+    }
+    p->track_menu_selection = (uint8_t) old_selection;
+    p->automatic_next = old_auto;
+    return true;
+}
 
 static bool test_player_language(const PspUiState *ui,
                                  TilefinchGlyphProvider *provider)
@@ -382,18 +432,29 @@ static bool test_player_language(const PspUiState *ui,
         presentation.rotation_suggested = portrait != 0;
         /* Open every category, including the first and last chapter pages;
            then paint playing, paused, seek-preview and live controls. */
-        for (unsigned lane = 0; lane < 13; lane++) {
-            presentation.track_menu_open = lane < 5;
-            presentation.track_menu_tab = lane < 3 ? lane : 2u;
+        for (unsigned lane = 0; lane < 21; lane++) {
+            presentation.queue_active = lane >= 13;
+            presentation.queue_count = lane >= 13 ? 6 : 0;
+            presentation.automatic_next = lane == 14;
+            presentation.queue_failed = lane == 15;
+            presentation.queue_retry = lane == 15;
+            presentation.queue_loading = lane == 16;
+            presentation.queue_position = lane == 20 ? 0 : 5;
+            media.ended = lane >= 19;
+            snprintf(presentation.queue_error, sizeof(presentation.queue_error), "Connection timed out");
+            for (unsigned at = 0; at < 6; at++)
+                snprintf(presentation.queue_titles[at], 128, "Upcoming video %u with a safely shortened title", at + 1);
+            presentation.track_menu_open = lane < 5 || (lane >= 13 && lane < 17) || lane >= 19;
+            presentation.track_menu_tab = lane >= 13 ? 3u : lane < 3 ? lane : 2u;
             presentation.track_menu_selection = lane == 3 ? 6u
-                : lane == 4 ? MEDIA_CHAPTER_LIMIT - 1u : 0u;
-            media.playing = lane != 6 && lane != 10 && lane != 12;
+                : lane == 4 ? MEDIA_CHAPTER_LIMIT - 1u : lane >= 13 ? 1u : 0u;
+            media.playing = lane != 6 && lane != 10 && lane != 12 && lane != 18;
             media.seek_preview_active = lane == 7;
             media.seek_preview_time_us = UINT64_C(8765000000);
             media.live = lane == 8 || lane == 11 || lane == 12;
-            presentation.audio_track_count = lane < 9 ? 2u : 0u;
-            presentation.subtitle_track_count = lane < 9 ? 2u : 0u;
-            presentation.chapter_count = lane < 9 ? MEDIA_CHAPTER_LIMIT : 0u;
+            presentation.audio_track_count = lane < 9 || lane >= 13 ? 2u : 0u;
+            presentation.subtitle_track_count = lane < 9 || lane >= 13 ? 2u : 0u;
+            presentation.chapter_count = lane < 9 || lane >= 13 ? MEDIA_CHAPTER_LIMIT : 0u;
             bool settled = false;
             for (unsigned pass = 0; pass < 64; pass++) {
                 run_count = 0;
@@ -408,11 +469,24 @@ static bool test_player_language(const PspUiState *ui,
                 if (read) continue;
                 CHECK(validate_frame_geometry(ui, width, height, stride));
                 if (presentation.track_menu_open) {
-                    CHECK(player_has_text("Audio") && player_has_text("Subtitles")
-                        && player_has_text("Chapters")
-                        && player_has_text("L/R  X SELECT  O BACK"));
+                    int edges[5];
+                    bool folded = media_menu_tab_edges(media_track_menu_rect(&media, width, height), edges, lane >= 13 ? 4u : 3u);
+                    CHECK((folded || (player_has_text("Audio") && player_has_text("Subtitles")
+                        && player_has_text("Chapters")))
+                        && player_has_text(lane == 15 ? "Connection timed out"
+                            : lane == 16 ? "Loading..." : "L/R  X SELECT  O BACK"));
+                    if (lane >= 19)
+                        CHECK(player_has_text("Queue") && player_has_text("X PLAY")
+                            && player_has_text("O Back")
+                            && (lane == 20 || player_has_text("Video")));
+                    else if (lane >= 13)
+                        CHECK(player_has_text("Queue")
+                            && player_has_text(lane == 15 ? "Retry queue"
+                                : lane == 14 ? "Automatic next: On" : "Automatic next: Off"));
                 } else {
-                    CHECK(player_has_text(lane == 7 ? "X GO   O CANCEL"
+                    CHECK(player_has_text(lane == 17 ? "X PAUSE  TRI QUEUE  L/R VIDEO"
+                        : lane == 18 ? "X PLAY  TRI QUEUE  L/R VIDEO"
+                        : lane == 7 ? "X GO   O CANCEL"
                         : lane == 12 ? "X PLAY"
                         : lane == 11 ? "X PAUSE"
                         : lane == 10 ? "STICK/L/R SEEK  X PLAY"
@@ -433,30 +507,44 @@ static bool test_player_language(const PspUiState *ui,
                 }
                 if (presentation.track_menu_open) {
                     unsigned saved_tab = presentation.track_menu_tab;
-                    static const char *const categories[] = {"Chapters", "Audio", "Subtitles"};
-                    for (unsigned column = 0; column < 3; column++) {
+                    int edges[5];
+                    UiRect box = media_track_menu_rect(&media, width, height);
+                    bool folded = media_menu_tab_edges(box, edges, lane >= 13 ? 4u : 3u);
+                    if (folded) {
+                        int x = box.x + 4, y = box.y + 18;
+                        PspUiMediaIntent intent = portrait
+                            ? psp_ui_media_activate_at(&media, WIDTH - 1 - y, x, WIDTH, HEIGHT)
+                            : psp_ui_media_activate_at(&media, x, y, WIDTH, HEIGHT);
+                        CHECK(intent.visual_changed && presentation.track_menu_tab == 2);
+                        presentation.track_menu_tab = (uint8_t)saved_tab;
+                    }
+                    static const char *const categories[] = {"Chapters", "Audio", "Subtitles", "Queue"};
+                    for (unsigned column = 0; !folded && column < (lane >= 13 ? 4u : 3u); column++) {
                         const TextRun *label = NULL;
                         for (size_t at = 0; at < run_count; at++)
                             if (!strcmp(runs[at].text, tilefinch_ui_text(categories[column])))
                                 label = &runs[at];
                         CHECK(label);
                         int x = label->left + 1;
-                        int y = media_track_menu_rect(width, height).y + 18;
+                        int y = media_track_menu_rect(&media, width, height).y + 18;
                         PspUiMediaIntent intent = portrait
                             ? psp_ui_media_activate_at(&media, WIDTH - 1 - y, x, WIDTH, HEIGHT)
                             : psp_ui_media_activate_at(&media, x, y, WIDTH, HEIGHT);
                         CHECK(intent.visual_changed
-                            && presentation.track_menu_tab == (column + 2u) % 3u);
+                            && presentation.track_menu_tab == (column == 3 ? 3u : (column + 2u) % 3u));
                     }
                     presentation.track_menu_tab = (uint8_t) saved_tab;
                 }
-                if (lane == 2 || lane == 7) {
+                if (lane == 2 || lane == 7 || lane == 13 || lane == 15 || lane == 19) {
                     char name[48];
                     snprintf(name, sizeof(name), "player-%s-%s",
                         portrait ? "portrait" : "landscape",
-                        lane == 2 ? "chapters" : "seek");
+                        lane == 2 ? "chapters" : lane == 7 ? "seek"
+                            : lane == 13 ? "queue" : lane == 19 ? "queue-ended" : "queue-failed");
                     CHECK(snapshot_geometry(name, width, height, stride));
                 }
+                if (!portrait && (lane == 13 || lane == 14 || lane == 16))
+                    CHECK(queue_cache_matches_full(&media));
                 settled = true;
                 break;
             }
@@ -799,10 +887,48 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
     return true;
 }
 
+static bool test_real_bengali_coverage(Budget *budget, const FontSet *fonts)
+{
+    if (!real_bengali_pack) return true;
+    /* This provider is deliberately not installed. Built-in face coverage
+       must not consult the synthetic all-language metric fallback. */
+    TilefinchGlyphProvider *proof = tilefinch_glyph_provider_create(budget);
+    CHECK(proof && tilefinch_glyph_provider_attach(proof, real_bengali_pack, "glyph-bengali-assamese"));
+    for (unsigned locale = TILEFINCH_UI_LANGUAGE_BENGALI;
+         locale <= TILEFINCH_UI_LANGUAGE_ASSAMESE; locale++) {
+        TilefinchUiTranslation *translation;
+        CHECK(load_catalog(budget, locale, &translation));
+        for (size_t row = 0; row < key_count; row++) {
+            const char *text = values[row];
+            size_t bytes = strlen(text);
+            for (size_t at = 0; at < bytes;) {
+                unsigned cp;
+                size_t used = font_utf8_next(text + at, bytes - at, &cp);
+                CHECK(used);
+                /* Square is native controller geometry, separately tested;
+                   it intentionally is not in the staged Latin subset. */
+                if (cp >= 128 && cp != 0x25a1u
+                    && !font_face_has_codepoint(font_set_face(fonts, FONT_SANS), cp)) {
+                    uint32_t key;
+                    if (!tilefinch_glyph_provider_match(proof, text + at, bytes - at, &used, &key, NULL)) {
+                        fprintf(stderr, "real pack missing locale=%u U+%04X\n", locale, cp);
+                        return false;
+                    }
+                }
+                at += used;
+            }
+        }
+        tilefinch_ui_translation_destroy(translation);
+    }
+    tilefinch_glyph_provider_destroy(proof);
+    return true;
+}
+
 static bool test_all_languages(void)
 {
-    char path[64];
-    CHECK(make_metric_pack(path));
+    char path[64], bengali_path[64] = {0};
+    CHECK(make_metric_pack(path, false));
+    if (!real_bengali_pack) CHECK(make_metric_pack(bengali_path, true));
     Budget budget;
     budget_init(&budget, 8u * 1024u * 1024u);
     TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
@@ -811,12 +937,18 @@ static bool test_all_languages(void)
         CHECK(tilefinch_glyph_provider_attach(provider, real_hindi_pack, "glyph-devanagari"));
     if (real_arabic_pack)
         CHECK(tilefinch_glyph_provider_attach(provider, real_arabic_pack, "glyph-arabic"));
+    CHECK(tilefinch_glyph_provider_attach(provider,
+        real_bengali_pack ? real_bengali_pack : bengali_path,
+        real_bengali_pack ? "glyph-bengali-assamese" : "glyph-ui-bn-test"));
     CHECK(tilefinch_glyph_provider_attach(provider, path, "glyph-ui-test")
         && font_optional_glyph_provider_install(provider));
     unsigned cluster_key = 0;
     size_t cluster_characters = 0;
     CHECK(ui_text_next_glyph("कि", strlen("कि"), &cluster_key, &cluster_characters)
               == strlen("कि")
+          && cluster_characters == 2 && cluster_key > 0x10ffffu);
+    CHECK(ui_text_next_glyph("কি", strlen("কি"), &cluster_key, &cluster_characters)
+              == strlen("কি")
           && cluster_characters == 2 && cluster_key > 0x10ffffu);
     FontSet fonts;
     CHECK(font_set_load(&fonts, &budget,
@@ -827,6 +959,9 @@ static bool test_all_languages(void)
         TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 2u * 1024u * 1024u));
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    CHECK(test_real_bengali_coverage(&budget, &fonts));
+    CHECK(font_optional_glyph_provider_install(provider));
     psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
         font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
     CHECK(test_square_button_symbol());
@@ -867,6 +1002,40 @@ static bool test_all_languages(void)
             ui.chrome_theme = theme ? BROWSER_CHROME_THEME_LIGHT : BROWSER_CHROME_THEME_FINCH;
             ui.ui_language = language;
             CHECK(test_player_language(&ui, provider));
+            ui.screen = PSP_UI_SCREEN_PAGE;
+            ui.chrome_visible = true;
+            ui.focus_label_valid = true;
+            static const char *const action_names[] = {
+                "Like", "Unlike", "Watch Later", "Remove from Watch Later",
+                "Subscribe", "Unsubscribe", "Save to playlist"
+            };
+            for (unsigned scale = 1; scale <= 2; scale++) {
+                ui.browser_ui_scale = scale;
+                for (size_t a = 0; a < sizeof(action_names) / sizeof(action_names[0]); a++) {
+                    const char *name = tilefinch_ui_logical_text(action_names[a]);
+                    CHECK(strlen(name) < sizeof(ui.focus_label));
+                    snprintf(ui.focus_label, sizeof(ui.focus_label), "%s", name);
+                    CHECK(paint(&ui, provider));
+                    bool named = false;
+                    for (size_t r = 0; r < run_count; r++) {
+                        if (!strcmp(runs[r].text, tilefinch_ui_text(action_names[a]))) {
+                            if (runs[r].missing_glyph || runs[r].truncated || runs[r].left < 7
+                                || runs[r].right > WIDTH - 92)
+                                fprintf(stderr, "focus hint locale=%s scale=%u key=%s ink=%d..%d missing=%u truncated=%u text=%s\n",
+                                    language_code, scale, action_names[a], runs[r].left, runs[r].right,
+                                    runs[r].missing_glyph, runs[r].truncated, runs[r].text);
+                            CHECK(!runs[r].missing_glyph && !runs[r].truncated
+                                  && runs[r].left >= 7 && runs[r].right <= WIDTH - 92);
+                            named = true;
+                        }
+                    }
+                    CHECK(named);
+                }
+            }
+            ui.focus_label[0] = '\0';
+            ui.focus_label_valid = false;
+            ui.browser_ui_scale = 1;
+            ui.chrome_visible = false;
             ui.screen = PSP_UI_SCREEN_OPTIONS;
             for (unsigned group = 0; group < UI_SETTINGS_GROUP_COUNT; group++) {
                 ui.options_group_selection = group;
@@ -1005,6 +1174,7 @@ static bool test_all_languages(void)
     CHECK(font_optional_glyph_provider_uninstall(provider));
     tilefinch_glyph_provider_destroy(provider);
     CHECK(unlink(path) == 0 && budget.current == 0);
+    if (bengali_path[0]) CHECK(unlink(bengali_path) == 0);
     CHECK(checked_frames > 2000 && checked_labels > 20000
           && checked_navigation_labels > 1000);
     printf("locale layout: %zu frames, %zu complete labels; no overlap or clipping\n", checked_frames, checked_labels);
@@ -1119,8 +1289,9 @@ static bool test_menu_metadata_equivalence(void)
 int main(int argc, char **argv)
 {
     if (argc > 1) capture_directory = argv[1];
-    if (argc > 2) real_hindi_pack = argv[2];
-    if (argc > 3) real_arabic_pack = argv[3];
+    if (argc > 2 && argv[2][0]) real_hindi_pack = argv[2];
+    if (argc > 3 && argv[3][0]) real_arabic_pack = argv[3];
+    if (argc > 4 && argv[4][0]) real_bengali_pack = argv[4];
     return test_menu_metadata_equivalence()
         && test_square_button_symbol() && test_all_languages() ? 0 : 1;
 }

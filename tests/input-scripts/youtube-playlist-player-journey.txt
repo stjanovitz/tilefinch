@@ -1,0 +1,19 @@
+# Start at a native playlist with at least two playable entries.
+# Play all is autofocus. Run with the companion @media-playing predicate.
+# Check each until-met mark and compare the retained page's final scroll/focus.
+wait-page 90
+tap-live cross
+until-live 2400
+tap-live rtrigger
+until-live 2400
+tap-live ltrigger
+until-live 2400
+tap-live triangle
+# Queue opens on the next entry. Square toggles without moving focus.
+tap-live square
+tap-live cross
+until-live 2400
+tap-live circle
+wait-page 90
+mark-live playlist-return
+end

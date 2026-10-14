@@ -251,3 +251,14 @@ unsigned tilefinch_ui_translation_bound_language(void)
 { return bound_translation ? bound_translation->language : TILEFINCH_UI_LANGUAGE_ENGLISH; }
 const char *tilefinch_ui_text(const char *english)
 { return tilefinch_ui_translation_text(bound_translation, english); }
+
+const char *tilefinch_ui_display_name(const char *logical)
+{
+    const TilefinchUiTranslation *t = bound_translation;
+    if (t != NULL && t->visual_text != NULL && logical != NULL)
+        for (size_t i = 0; i < t->count; i++)
+            if (t->rows[i].visual != UINT16_MAX
+                && !strcmp(logical, t->text + t->rows[i].value))
+                return t->visual_text + t->rows[i].visual;
+    return logical;
+}

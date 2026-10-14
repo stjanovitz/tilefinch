@@ -820,7 +820,7 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
 {
     static const char html[] =
         "<!doctype html><body><p>Привет Tiếng Việt 日本語 かな 한국어 漢 "
-        "مرحبا שלום नमस्ते</p>"
+        "مرحبا שלום नमस्ते বাংলা অসমীয়া ৰ ৱ</p>"
         "<script>const hidden='Ґ';</script><style>.x{content:'ộ'}</style>";
     PocDocument document = {0};
     const uint16_t expected = DOCUMENT_GLYPH_SCRIPT_HAN
@@ -828,7 +828,7 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
         | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
         | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
         | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW
-        | DOCUMENT_GLYPH_SCRIPT_DEVANAGARI;
+        | DOCUMENT_GLYPH_SCRIPT_DEVANAGARI | DOCUMENT_GLYPH_SCRIPT_BENGALI_ASSAMESE;
     bool ok = document_parse(
             &document, budget, html, sizeof(html) - 1u, 7u)
         && document.glyph_script_mask == expected;
@@ -837,6 +837,17 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
     if (!ok) fprintf(stderr, "glyph script mask=%04x expected=%04x\n",
                      document.glyph_script_mask, expected);
     document_destroy(&document);
+
+    /* Standalone half-width voice marks also identify Japanese text; a
+       decomposed spelling must not depend on a preceding base character. */
+    static const char *const kana[] = {
+        "<p>が ガ</p>", "<p>ｶﾞ ﾊﾟ</p>", "<p>ﾞﾟ</p>"
+    };
+    for (size_t row = 0; row < sizeof(kana) / sizeof(kana[0]); row++) {
+        ok = ok && document_parse(&document, budget, kana[row], strlen(kana[row]), 7u)
+            && document.glyph_script_mask == DOCUMENT_GLYPH_SCRIPT_JAPANESE;
+        document_destroy(&document);
+    }
 
     static const char hidden_only[] =
         "<!doctype html><body><script>Привет Tiếng Việt</script>"

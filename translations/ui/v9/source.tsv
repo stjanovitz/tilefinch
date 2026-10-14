@@ -1,0 +1,326 @@
+English	Bengali	Assamese
+X PAUSE	X বিরতি	X বিৰতি
+X PLAY	X চালান	X চলাওক
+Audio	অডিও	অডিঅ'
+Subtitles	সাবটাইটেল	উপশিৰোনাম
+Chapters	অধ্যায়	অধ্যায়
+LIVE	সরাসরি	সজীৱ
+SEEK	অবস্থান	অৱস্থান
+SELECT ROTATE	SELECT ঘোরান	SELECT ঘূৰাওক
+X PAUSE  TRI TRACKS	X বিরতি  TRI ট্র্যাক	X বিৰতি  TRI ট্ৰেক
+X PLAY  TRI TRACKS	X চালান  TRI ট্র্যাক	X চলাওক  TRI ট্ৰেক
+X PAUSE  TRI MENU  L/R SEEK	X বিরতি  TRI মেনু  L/R অবস্থান	X বিৰতি  TRI মেনু  L/R অৱস্থান
+X PLAY  TRI MENU  L/R SEEK	X চালান  TRI মেনু  L/R অবস্থান	X চলাওক  TRI মেনু  L/R অৱস্থান
+STICK/L/R SEEK  X PAUSE	STICK/L/R অবস্থান  X বিরতি	STICK/L/R অৱস্থান  X বিৰতি
+STICK/L/R SEEK  X PLAY	STICK/L/R অবস্থান  X চালান	STICK/L/R অৱস্থান  X চলাওক
+X GO   O CANCEL	X যান   O বাতিল	X যাওক   O বাতিল
+L/R  X SELECT  O BACK	L/R  X বাছুন  O ফিরুন	L/R  X বাছক  O উভতক
+Settings	সেটিংস	ছেটিংছ
+Appearance	চেহারা	ৰূপ
+Browsing & input	ব্রাউজিং ও ইনপুট	ব্ৰাউজিং আৰু ইনপুট
+Video	ভিডিও	ভিডিঅ'
+Privacy & security	গোপনীয়তা ও সুরক্ষা	গোপনীয়তা আৰু সুৰক্ষা
+Device & storage	ডিভাইস ও স্টোরেজ	ডিভাইচ আৰু সংৰক্ষণ
+Updates	আপডেট	আপডেট
+Language & emoji	ভাষা ও ইমোজি	ভাষা আৰু ইম'জি
+Interface language	ইন্টারফেসের ভাষা	ইণ্টাৰফেচৰ ভাষা
+Page glyphs	পৃষ্ঠার অক্ষর	পৃষ্ঠাৰ আখৰ
+Language	ভাষা	ভাষা
+Language pack	ভাষার প্যাক	ভাষাৰ পেক
+Emoji	ইমোজি	ইম'জি
+Color pack	রঙের প্যাক	ৰঙৰ পেক
+Embedded	অন্তর্ভুক্ত	অন্তৰ্ভুক্ত
+Built in	অন্তর্ভুক্ত	অন্তৰ্ভুক্ত
+Color emoji pack	রঙিন ইমোজি প্যাক	ৰঙীন ইম'জি পেক
+Offer language packs	ভাষার প্যাক প্রস্তাব	ভাষাৰ পেকৰ পৰামৰ্শ
+Reset declined offers	প্রত্যাখ্যান মুছুন	প্ৰত্যাখ্যান মচক
+On	চালু	চালু
+Off	বন্ধ	বন্ধ
+Ask	জিজ্ঞাসা করুন	সোধক
+Automatic	স্বয়ংক্রিয়	স্বয়ংক্ৰিয়
+Auto	স্বয়ংক্রিয়	স্বয়ংক্ৰিয়
+Default	ডিফল্ট	ডিফল্ট
+Active	সক্রিয়	সক্ৰিয়
+Not installed	ইনস্টল করা নেই	ইনষ্টল কৰা নাই
+Ready	প্রস্তুত	সাজু
+Checking	পরীক্ষা চলছে	পৰীক্ষা চলিছে
+Downloading	ডাউনলোড চলছে	ডাউনল'ড চলিছে
+Installing	ইনস্টল চলছে	ইনষ্টল চলিছে
+Error	ত্রুটি	ত্ৰুটি
+Cancel	বাতিল	বাতিল
+Retry	আবার চেষ্টা	পুনৰ চেষ্টা
+Back	ফিরুন	উভতক
+Close	বন্ধ করুন	বন্ধ কৰক
+Loading	লোড হচ্ছে	ল'ড হৈছে
+Search	খুঁজুন	সন্ধান
+Home	হোম	হ'ম
+Bookmarks	বুকমার্ক	বুকমাৰ্ক
+History	ইতিহাস	ইতিহাস
+Collections	সংগ্রহ	সংগ্ৰহ
+Tabs	ট্যাব	টেব
+Library	লাইব্রেরি	লাইব্ৰেৰী
+Reader	পাঠক	পাঠক
+Reader mode	পাঠ মোড	পঠন ম'ড
+Basic view	সরল দৃশ্য	সৰল দৃশ্য
+Find in page	পৃষ্ঠায় খুঁজুন	পৃষ্ঠাত সন্ধান
+Reload	আবার লোড	পুনৰ ল'ড
+Forward	এগোন	আগবাঢ়ক
+Address	ঠিকানা	ঠিকনা
+Search engine	সার্চ ইঞ্জিন	সন্ধান ইঞ্জিন
+Page text size	পৃষ্ঠার লেখার মাপ	পৃষ্ঠাৰ আখৰৰ আকাৰ
+Browser text size	ব্রাউজারের লেখার মাপ	ব্ৰাউজাৰৰ আখৰৰ আকাৰ
+Chrome theme	ইন্টারফেস থিম	ইণ্টাৰফেচ থীম
+Page colors	পৃষ্ঠার রং	পৃষ্ঠাৰ ৰং
+Dark	গাঢ়	গাঢ়
+Light	হালকা	পাতল
+Text entry	লেখা প্রবেশ	লিখনী প্ৰৱেশ
+Analog cursor	অ্যানালগ কার্সর	এনালগ কাৰ্চৰ
+JavaScript	JavaScript	JavaScript
+Audio & subtitles	অডিও ও সাবটাইটেল	অডিঅ' আৰু উপশিৰোনাম
+Audio language	অডিওর ভাষা	অডিঅ'ৰ ভাষা
+Subtitle language	সাবটাইটেলের ভাষা	উপশিৰোনামৰ ভাষা
+Alternate language	বিকল্প ভাষা	বিকল্প ভাষা
+Subtitle size	সাবটাইটেলের মাপ	উপশিৰোনামৰ আকাৰ
+Subtitle background	সাবটাইটেলের পটভূমি	উপশিৰোনামৰ পটভূমি
+Original	মূল	মূল
+None	কিছুই নয়	একো নাই
+Small	ছোট	সৰু
+Medium	মাঝারি	মজলীয়া
+Large	বড়	ডাঙৰ
+Shadow	ছায়া	ছাঁ
+Box	বাক্স	বাকচ
+Smooth	মসৃণ	মসৃণ
+Sharp	স্পষ্ট	স্পষ্ট
+Video scaling	ভিডিওর মাপ	ভিডিঅ'ৰ আকাৰ
+Save playback positions	প্লেব্যাক অবস্থান রাখুন	প্লেবেক অৱস্থান ৰাখক
+Clear playback positions	প্লেব্যাক অবস্থান মুছুন	প্লেবেক অৱস্থান মচক
+Network profile	নেটওয়ার্ক প্রোফাইল	নেটৱৰ্ক প্ৰ'ফাইল
+Wi-Fi diagnostics	Wi-Fi পরীক্ষা	Wi-Fi পৰীক্ষা
+Check for updates	আপডেট খুঁজুন	আপডেট বিচাৰক
+Check weekly	সাপ্তাহিক পরীক্ষা	সাপ্তাহিক পৰীক্ষা
+Update channel	আপডেট চ্যানেল	আপডেট চেনেল
+Stable	স্থিতিশীল	সুস্থিৰ
+Beta	বিটা	বিটা
+Clear cookies	কুকি মুছুন	কুকি মচক
+Clear history	ইতিহাস মুছুন	ইতিহাস মচক
+Clear cache	ক্যাশ মুছুন	কেচ মচক
+Left/Right choose   O Back	বাম/ডান বাছুন   O ফিরুন	বাওঁ/সোঁ বাছক   O উভতক
+X Download pack   O Back	X প্যাক আনুন   O ফিরুন	X পেক আনক   O উভতক
+X Cancel   O Back	X বাতিল   O ফিরুন	X বাতিল   O উভতক
+X Reset   O Back	X রিসেট   O ফিরুন	X ৰিছেট   O উভতক
+X Install language   O Back	X ভাষা ইনস্টল   O ফিরুন	X ভাষা ইনষ্টল   O উভতক
+UI LANGUAGE SAVED - RESTART TO APPLY	ভাষা রাখা হয়েছে - পুনরায় চালু করুন	ভাষা ৰখা হৈছে - পুনৰ আৰম্ভ কৰক
+LANGUAGE DOWNLOAD CANCELLED	ভাষা ডাউনলোড বাতিল	ভাষা ডাউনল'ড বাতিল
+LANGUAGE DOWNLOAD FAILED - TRY AGAIN	ভাষা আনা যায়নি - আবার চেষ্টা	ভাষা আনিব পৰা নগ'ল - পুনৰ চেষ্টা
+INSTALLING UI LANGUAGE	ইন্টারফেসের ভাষা ইনস্টল হচ্ছে	ইণ্টাৰফেচৰ ভাষা ইনষ্টল হৈছে
+Browser UI	ব্রাউজার ইন্টারফেস	ব্ৰাউজাৰ ইণ্টাৰফেচ
+Compact	সংক্ষিপ্ত	চুটি
+Extracted text	নিষ্কাশিত লেখা	উদ্ধাৰ কৰা লিখনী
+Web pages	ওয়েব পৃষ্ঠা	ৱেব পৃষ্ঠা
+Reader font	পাঠের ফন্ট	পঠন ফণ্ট
+Remember size	মাপ মনে রাখুন	আকাৰ মনত ৰাখক
+Per site	প্রতি সাইটে	প্ৰতি চাইটত
+Auto Reader	স্বয়ংক্রিয় পাঠক	স্বয়ংক্ৰিয় পাঠক
+Heavy pages	ভারী পৃষ্ঠা	গধুৰ পৃষ্ঠা
+Run	চালান	চলাওক
+Basic view fallback	সরল দৃশ্য বিকল্প	সৰল দৃশ্য বিকল্প
+Home page	হোম পৃষ্ঠা	হ'ম পৃষ্ঠা
+My links	আমার লিঙ্ক	মোৰ লিংক
+Built-in	অন্তর্ভুক্ত	অন্তৰ্ভুক্ত
+URL history	ঠিকানার ইতিহাস	ঠিকনাৰ ইতিহাস
+Restore page	পৃষ্ঠা ফিরিয়ে আনুন	পৃষ্ঠা ঘূৰাই আনক
+Hibernate tab	ট্যাব বিরত রাখুন	টেব বিৰত ৰাখক
+Experimental	পরীক্ষামূলক	পৰীক্ষামূলক
+Advanced & experimental	উন্নত ও পরীক্ষামূলক	উন্নত আৰু পৰীক্ষামূলক
+This site JS	এই সাইটের JS	এই চাইটৰ JS
+Global off	সর্বত্র বন্ধ	সকলোতে বন্ধ
+Keyboard	কীবোর্ড	কীব'ৰ্ড
+Game buttons	খেলার বোতাম	খেলৰ বুটাম
+Night mode	রাতের মোড	ৰাতিৰ ম'ড
+Theme	থিম	থীম
+Audio-only	শুধু অডিও	কেৱল অডিঅ'
+YouTube results	YouTube ফলাফল	YouTube ফলাফল
+Detailed	বিস্তারিত	বিস্তাৰিত
+Video start	ভিডিও শুরু	ভিডিঅ' আৰম্ভ
+Buffered	বাফার করা	বাফাৰ কৰা
+Immediate	এখনই	এতিয়াই
+Resume saves	সেভ আবার চালান	ছেভ পুনৰ চলাওক
+Save playback position	প্লেব্যাক অবস্থান রাখুন	প্লেবেক অৱস্থান ৰাখক
+Content blocker	বিষয়বস্তু ব্লকার	বিষয়বস্তু ব্লকাৰ
+Basic	সরল	সৰল
+Custom	নিজস্ব	নিজস্ব
+Hide page ads	বিজ্ঞাপন লুকান	বিজ্ঞাপন লুকুৱাওক
+Cookie notices	কুকির বিজ্ঞপ্তি	কুকিৰ জাননী
+Hidden	লুকানো	লুকুওৱা
+Shown	দেখানো	দেখুওৱা
+Allow site	সাইট অনুমোদন	চাইট অনুমোদন
+Yes	হ্যাঁ	হয়
+No	না	নহয়
+Load allowlist	অনুমোদন তালিকা আনুন	অনুমোদন তালিকা আনক
+Cookies & storage	কুকি ও স্টোরেজ	কুকি আৰু সংৰক্ষণ
+Allow	অনুমোদন	অনুমোদন
+Block	আটকান	বাধা দিয়ক
+TLS ticket saving	TLS টিকিট রাখা	TLS টিকট ৰখা
+Mixed HTTP (session)	মিশ্র HTTP (সেশন)	মিশ্ৰ HTTP (ছেচন)
+Third-party cookies	তৃতীয় পক্ষের কুকি	তৃতীয় পক্ষৰ কুকি
+Wi-Fi profile	Wi-Fi প্রোফাইল	Wi-Fi প্ৰ'ফাইল
+Diagnostic QR	পরীক্ষার QR	পৰীক্ষাৰ QR
+Save error reports	ত্রুটির রিপোর্ট রাখুন	ত্ৰুটিৰ প্ৰতিবেদন ৰাখক
+Verbose (RAM)	বিস্তারিত (RAM)	বিস্তাৰিত (RAM)
+YouTube home topics	YouTube হোমের বিষয়	YouTube হ'মৰ বিষয়
+Update check	আপডেট পরীক্ষা	আপডেট পৰীক্ষা
+Version and update	সংস্করণ ও আপডেট	সংস্কৰণ আৰু আপডেট
+New	নতুন	নতুন
+Site data & storage	সাইটের ডেটা ও স্টোরেজ	চাইটৰ ডেটা আৰু সংৰক্ষণ
+X Open   O Back	X খুলুন   O ফিরুন	X খোলক   O উভতক
+English	ইংরেজি	ইংৰাজী
+Spanish	স্প্যানিশ	স্পেনিছ
+French	ফরাসি	ফৰাচী
+German	জার্মান	জাৰ্মান
+Japanese	জাপানি	জাপানী
+Installed	ইনস্টল করা	ইনষ্টল কৰা
+Checking...	পরীক্ষা চলছে...	পৰীক্ষা চলিছে...
+Downloading...	ডাউনলোড চলছে...	ডাউনল'ড চলিছে...
+Installing...	ইনস্টল চলছে...	ইনষ্টল চলিছে...
+Try again	আবার চেষ্টা	পুনৰ চেষ্টা
+Extended Latin	বর্ধিত লাতিন	বিস্তাৰিত লেটিন
+Cyrillic	সিরিলিক	চিৰিলিক
+Korean	কোরিয়ান	কোৰিয়ান
+Arabic	আরবি	আৰবী
+Hebrew	হিব্রু	হিব্ৰু
+Page tools	পৃষ্ঠার সরঞ্জাম	পৃষ্ঠাৰ সঁজুলি
+Help & diagnostics	সাহায্য ও পরীক্ষা	সহায় আৰু পৰীক্ষা
+Exit to XMB	XMB-তে ফিরুন	XMB-লৈ উভতক
+Press X again to exit	বেরোতে আবার X চাপুন	ওলাবলৈ পুনৰ X টিপক
+X Open   O Back   Start Address	X খুলুন   O ফিরুন   Start ঠিকানা	X খোলক   O উভতক   Start ঠিকনা
+X Open or toggle   O Back	X খুলুন বা বদলান   O ফিরুন	X খোলক বা সলাওক   O উভতক
+Add/remove bookmark	বুকমার্ক যোগ/মুছুন	বুকমাৰ্ক যোগ/মচক
+Save article	নিবন্ধ রাখুন	প্ৰবন্ধ ৰাখক
+Save screenshot	স্ক্রিনশট রাখুন	স্ক্ৰীণশ্বট ৰাখক
+Site information	সাইটের তথ্য	চাইটৰ তথ্য
+Install offline app	অফলাইন অ্যাপ ইনস্টল	অফলাইন এপ ইনষ্টল
+Permissions & controls	অনুমতি ও নিয়ন্ত্রণ	অনুমতি আৰু নিয়ন্ত্ৰণ
+Content blocking	বিষয়বস্তু আটকানো	বিষয়বস্তু বাধা
+Always Reader	সর্বদা পাঠক	সদায় পাঠক
+Site storage	সাইটের স্টোরেজ	চাইটৰ সংৰক্ষণ
+Check Wi-Fi sign-in	Wi-Fi লগইন পরীক্ষা	Wi-Fi লগইন পৰীক্ষা
+Last error summary	শেষ ত্রুটির সারাংশ	শেষ ত্ৰুটিৰ সাৰাংশ
+Controls guide	নিয়ন্ত্রণের নির্দেশনা	নিয়ন্ত্ৰণৰ নিৰ্দেশনা
+Version & system	সংস্করণ ও সিস্টেম	সংস্কৰণ আৰু ছিষ্টেম
+Licences	লাইসেন্স	লাইচেঞ্চ
+Settings > Video > Audio & subtitles	সেটিংস > ভিডিও > অডিও ও সাবটাইটেল	ছেটিংছ > ভিডিঅ' > অডিঅ' আৰু উপশিৰোনাম
+Russian	রুশ	ৰুচ
+Ukrainian	ইউক্রেনীয়	ইউক্ৰেইনীয়
+Chinese (Simplified)	চীনা (সরল)	চীনা (সৰল)
+Chinese (Traditional)	চীনা (প্রচলিত)	চীনা (পৰম্পৰাগত)
+Hindi	হিন্দি	হিন্দী
+Devanagari (Hindi)	দেবনাগরী (হিন্দি)	দেৱনাগৰী (হিন্দী)
+X or Left/Right change   L/R category   O Back	X বা বাম/ডান বদলান   L/R বিভাগ   O ফিরুন	X বা বাওঁ/সোঁ সলাওক   L/R বিভাগ   O উভতক
+X Open / confirm   O Back	X খুলুন / নিশ্চিত   O ফিরুন	X খোলক / নিশ্চিত   O উভতক
+X Confirm   O Back	X নিশ্চিত   O ফিরুন	X নিশ্চিত   O উভতক
+X Choose   O Return	X বাছুন   O ফিরুন	X বাছক   O উভতক
+O Back	O ফিরুন	O উভতক
+X Open   Square Close   O Back	X খুলুন   □ বন্ধ   O ফিরুন	X খোলক   □ বন্ধ   O উভতক
+X Select   O Back	X বাছুন   O ফিরুন	X বাছক   O উভতক
+X Retry   O Back	X আবার চেষ্টা   O ফিরুন	X পুনৰ চেষ্টা   O উভতক
+X or Left/Right change   O Back	X বা বাম/ডান বদলান   O ফিরুন	X বা বাওঁ/সোঁ সলাওক   O উভতক
+X Open   Left/Right change   O Back	X খুলুন   বাম/ডান বদলান   O ফিরুন	X খোলক   বাওঁ/সোঁ সলাওক   O উভতক
+X Delete   O Back	X মুছুন   O ফিরুন	X মচক   O উভতক
+X Confirm clear   O Cancel	X মুছুন নিশ্চিত   O বাতিল	X মচা নিশ্চিত   O বাতিল
+X or Left/Right change   L/R section	X বা বাম/ডান বদলান   L/R অংশ	X বা বাওঁ/সোঁ সলাওক   L/R অংশ
+L/R CATEGORY   X SELECT   O BACK	L/R বিভাগ   X বাছুন   O ফিরুন	L/R বিভাগ   X বাছক   O উভতক
+X OPEN   START SEARCH   SELECT MENU	X খুলুন   START খুঁজুন   SELECT মেনু	X খোলক   START সন্ধান   SELECT মেনু
+X OPEN WHEN READY   SELECT MENU	প্রস্তুত হলে X   SELECT মেনু	সাজু হ'লে X   SELECT মেনু
+X opens or toggles.  O goes back.	X খুলে বা বদলায়। O ফিরিয়ে আনে।	X খোলে বা সলায়। O উভতাই আনে।
+Start opens Address.  Square reloads.	Start ঠিকানা খোলে। □ আবার লোড।	Start ঠিকনা খোলে। □ পুনৰ ল'ড।
+Select: menu.  L/R: page/category.	Select: মেনু। L/R: পৃষ্ঠা/বিভাগ।	Select: মেনু। L/R: পৃষ্ঠা/বিভাগ।
+Analog moves the pointer or scrolls.	অ্যানালগ কার্সর সরায় বা স্ক্রল করে।	এনালগে কাৰ্চৰ সলায় বা স্ক্ৰ'ল কৰে।
+Hold Start+Select for page controls.	পৃষ্ঠার নিয়ন্ত্রণ: Start+Select ধরে রাখুন।	পৃষ্ঠাৰ নিয়ন্ত্ৰণ: Start+Select ধৰি ৰাখক।
+PAGE CONTROLS  START+SELECT EXIT	পৃষ্ঠার নিয়ন্ত্রণ  START+SELECT বেরোন	পৃষ্ঠাৰ নিয়ন্ত্ৰণ  START+SELECT ওলাওক
+PAGE CONTROLS  HOLD START+SELECT TO EXIT	পৃষ্ঠার নিয়ন্ত্রণ  বেরোতে START+SELECT ধরে রাখুন	পৃষ্ঠাৰ নিয়ন্ত্ৰণ  ওলাবলৈ START+SELECT ধৰি ৰাখক
+Up/Down Part  O Back	উপর/নিচ অংশ  O ফিরুন	ওপৰ/তল অংশ  O উভতক
+Up/Down selects a menu item.	উপর/নিচে মেনুর আইটেম বাছুন।	ওপৰ/তলে মেনুৰ বস্তু বাছক।
+Account	অ্যাকাউন্ট	একাউণ্ট
+Sign in	লগইন	লগইন
+Sign out	লগআউট	লগআউট
+Subscriptions	সাবস্ক্রিপশন	চাবস্ক্ৰিপচন
+YouTube account	YouTube অ্যাকাউন্ট	YouTube একাউণ্ট
+Signed in on this device.	এই ডিভাইসে লগইন করা আছে।	এই ডিভাইচত লগইন কৰা আছে।
+Recommendations	সুপারিশ	পৰামৰ্শ
+Switch account	অ্যাকাউন্ট বদলান	একাউণ্ট সলাওক
+Select Account again to close.	বন্ধ করতে আবার অ্যাকাউন্ট বাছুন।	বন্ধ কৰিবলৈ পুনৰ একাউণ্ট বাছক।
+Refresh suggestions	সুপারিশ রিফ্রেশ	পৰামৰ্শ সতেজ কৰক
+Suggestions will load in the background.	পটভূমিতে সুপারিশ লোড হবে।	পটভূমিত পৰামৰ্শ ল'ড হ'ব।
+Search above or select Refresh.	উপরে খুঁজুন বা রিফ্রেশ বাছুন।	ওপৰত সন্ধান বা সতেজ কৰক বাছক।
+Reloading suggestions...	সুপারিশ রিফ্রেশ হচ্ছে...	পৰামৰ্শ সতেজ হৈছে...
+New suggestions ready - select Refresh.	নতুন সুপারিশ প্রস্তুত - রিফ্রেশ বাছুন।	নতুন পৰামৰ্শ সাজু - সতেজ কৰক বাছক।
+Suggestions up to date.	সুপারিশ আপডেট আছে।	পৰামৰ্শ নতুন হৈছে।
+Suggestions unavailable - try Refresh.	সুপারিশ নেই - রিফ্রেশ করুন।	পৰামৰ্শ নাই - সতেজ কৰক।
+Sign in to view your subscriptions.	সাবস্ক্রিপশন দেখতে লগইন করুন।	চাবস্ক্ৰিপচন চাবলৈ লগইন কৰক।
+Recommended for you	আপনার জন্য সুপারিশ	আপোনাৰ বাবে পৰামৰ্শ
+Your subscriptions	আপনার সাবস্ক্রিপশন	আপোনাৰ চাবস্ক্ৰিপচন
+Recently watched	সম্প্রতি দেখা	শেহতীয়াকৈ চোৱা
+Suggestions	সুপারিশ	পৰামৰ্শ
+Continue from	এখান থেকে চালান	ইয়াৰ পৰা চলাওক
+watched	দেখা হয়েছে	চোৱা হৈছে
+percent watched	শতাংশ দেখা হয়েছে	শতাংশ চোৱা হৈছে
+Explore YouTube	YouTube দেখুন	YouTube চাওক
+Watch YouTube on this device	এই ডিভাইসে YouTube দেখুন	এই ডিভাইচত YouTube চাওক
+Explore topics are unavailable. Search above to find videos.	বিষয় নেই। ভিডিও খুঁজতে উপরে লিখুন।	বিষয় নাই। ভিডিঅ' বিচাৰিবলৈ ওপৰত লিখক।
+Like	লাইক	লাইক
+Unlike	লাইক সরান	লাইক আঁতৰাওক
+Select Like or Unlike.	লাইক বা লাইক সরান বাছুন।	লাইক বা লাইক আঁতৰাওক বাছক।
+Saving like...	লাইক রাখা হচ্ছে...	লাইক ৰখা হৈছে...
+Removing like...	লাইক সরানো হচ্ছে...	লাইক আঁতৰোৱা হৈছে...
+Video liked.	ভিডিওতে লাইক দেওয়া হয়েছে।	ভিডিঅ'ত লাইক দিয়া হৈছে।
+Like removed.	লাইক সরানো হয়েছে।	লাইক আঁতৰোৱা হৈছে।
+Like failed - select Like to retry.	লাইক হয়নি - আবার লাইক বাছুন।	লাইক নহ'ল - পুনৰ লাইক বাছক।
+Unlike failed - select Unlike to retry.	লাইক সরেনি - আবার চেষ্টা করুন।	লাইক আঁতৰোৱা নগ'ল - পুনৰ চেষ্টা কৰক।
+Sign in to like this video.	লাইক দিতে লগইন করুন।	লাইক দিবলৈ লগইন কৰক।
+Sign in to unlike this video.	লাইক সরাতে লগইন করুন।	লাইক আঁতৰাবলৈ লগইন কৰক।
+No videos are available in this feed yet.	এই তালিকায় এখনো ভিডিও নেই।	এই তালিকাত এতিয়াও ভিডিঅ' নাই।
+Search YouTube	YouTube-এ খুঁজুন	YouTube-ত সন্ধান
+Search results	অনুসন্ধানের ফলাফল	সন্ধানৰ ফলাফল
+Description	বিবরণ	বিৱৰণ
+View full description	পুরো বিবরণ দেখুন	সম্পূৰ্ণ বিৱৰণ চাওক
+Back to video	ভিডিওতে ফিরুন	ভিডিঅ'লৈ উভতক
+View comments	মন্তব্য দেখুন	মন্তব্য চাওক
+Comments	মন্তব্য	মন্তব্য
+Load more comments	আরো মন্তব্য আনুন	অধিক মন্তব্য আনক
+Load more results	আরো ফলাফল আনুন	অধিক ফলাফল আনক
+Play video	ভিডিও চালান	ভিডিঅ' চলাওক
+Open video details	ভিডিওর তথ্য খুলুন	ভিডিঅ'ৰ তথ্য খোলক
+Save video offline	ভিডিও অফলাইনে রাখুন	ভিডিঅ' অফলাইন ৰাখক
+Up next	এরপর	ইয়াৰ পিছত
+Published	প্রকাশিত	প্ৰকাশিত
+Category	বিভাগ	বিভাগ
+Channel videos	চ্যানেলের ভিডিও	চেনেলৰ ভিডিঅ'
+Recent public uploads from this channel.	এই চ্যানেলের সাম্প্রতিক ভিডিও।	এই চেনেলৰ শেহতীয়া ভিডিঅ'।
+No public video entries were present in the bounded channel response.	চ্যানেলের উত্তরে কোনো ভিডিও নেই।	চেনেলৰ উত্তৰত কোনো ভিডিঅ' নাই।
+No public comments were returned within the bounded request.	অনুরোধে কোনো মন্তব্য ফেরেনি।	অনুৰোধত কোনো মন্তব্য ঘূৰি নাহিল।
+No playable video results were present in the bounded public response. Try another search.	চালানো যায় এমন ভিডিও নেই। অন্য কিছু খুঁজুন।	চলাব পৰা ভিডিঅ' নাই। আন কিবা সন্ধান কৰক।
+Select the thumbnail to retry playback. The player provides play, pause, seek, time, and exit controls.	আবার চালাতে ছবিটি বাছুন। প্লেয়ারে চালান, বিরতি, অবস্থান ও বেরোনোর নিয়ন্ত্রণ আছে।	পুনৰ চলাবলৈ ছবিখন বাছক। প্লেয়াৰত চলোৱা, বিৰতি, অৱস্থান আৰু ওলোৱাৰ নিয়ন্ত্ৰণ আছে।
+Watch Later	পরে দেখুন	পিছত চাওক
+Playlists	প্লেলিস্ট	প্লেলিষ্ট
+Playlist	প্লেলিস্ট	প্লেলিষ্ট
+Your playlists	আপনার প্লেলিস্ট	আপোনাৰ প্লেলিষ্ট
+No entries were returned. Sign in or try again.	ফলাফল নেই। লগইন বা আবার চেষ্টা করুন।	ফলাফল নাই। লগইন বা পুনৰ চেষ্টা কৰক।
+Save to playlist	প্লেলিস্টে রাখুন	প্লেলিষ্টত ৰাখক
+Subscribe	সাবস্ক্রাইব	চাবস্ক্ৰাইব
+Unsubscribe	সাবস্ক্রাইব বাতিল	চাবস্ক্ৰাইব বাতিল
+Select an action.	একটি কাজ বাছুন।	এটা কাম বাছক।
+Add to this playlist	এই প্লেলিস্টে যোগ করুন	এই প্লেলিষ্টত যোগ কৰক
+Load more	আরো আনুন	অধিক আনক
+Remove	সরান	আঁতৰাওক
+Updating...	আপডেট হচ্ছে...	আপডেট হৈছে...
+Added to playlist.	প্লেলিস্টে যোগ হয়েছে।	প্লেলিষ্টত যোগ হৈছে।
+Removed from playlist.	প্লেলিস্ট থেকে সরানো হয়েছে।	প্লেলিষ্টৰ পৰা আঁতৰোৱা হৈছে।
+Subscribed.	সাবস্ক্রাইব করা হয়েছে।	চাবস্ক্ৰাইব কৰা হৈছে।
+Unsubscribed.	সাবস্ক্রাইব বাতিল হয়েছে।	চাবস্ক্ৰাইব বাতিল হৈছে।
+Not confirmed. Select again to retry.	নিশ্চিত নয়। আবার বাছুন।	নিশ্চিত নহয়। পুনৰ বাছক।
+Sign in to use this action.	এই কাজের জন্য লগইন করুন।	এই কামৰ বাবে লগইন কৰক।
+Remove from Watch Later	পরে দেখুন থেকে সরান	পিছত চাওকৰ পৰা আঁতৰাওক
+Portuguese	পর্তুগিজ	পৰ্তুগীজ
+Bengali	বাংলা	বাংলা
+Assamese	অসমীয়া	অসমীয়া
+Bengali-Assamese	বাংলা-অসমীয়া	বাংলা-অসমীয়া

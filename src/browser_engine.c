@@ -37,6 +37,7 @@ typedef struct {
     int restore_scroll_y;
     int restore_focus_kind;
     size_t restore_focus_index;
+    uint64_t restore_focus_identity;
     NavigationHistoryControl restore_controls[
         NAVIGATION_HISTORY_CONTROL_LIMIT];
     size_t restore_control_count;
@@ -503,6 +504,9 @@ static bool browser_engine_youtube_status_paint(BrowserEngine *engine)
 static bool browser_engine_find_refresh(BrowserEngine *engine);
 static void browser_engine_deferred_reader_images_ready(
     void *opaque, NavigationSession *navigation);
+static void browser_engine_image_table_moved(
+    void *opaque, NavigationSession *navigation, uintptr_t previous_base,
+    size_t previous_count);
 
 static void copy_error(char *output, size_t capacity, const char *message)
 {
@@ -2023,6 +2027,8 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
     navigation_attach_browser_session(navigation, &engine->session);
     navigation_set_deferred_image_ready_hook(
         navigation, browser_engine_deferred_reader_images_ready, engine);
+    navigation_set_image_table_moved_hook(
+        navigation, browser_engine_image_table_moved, engine);
     if (!navigation_set_replacement_mode(
             navigation, engine->config.navigation_replacement_mode)
         || !navigation_set_replacement_hooks(
@@ -2864,10 +2870,12 @@ static void browser_engine_navigation_restore_history(
 }
 
 static lxb_dom_node_t *browser_engine_semantic_focus(
-    const BrowserEngine *engine, int kind, size_t ordinal)
+    const BrowserEngine *engine, int kind, size_t ordinal, size_t *raw_index)
 {
+    if (raw_index != NULL) *raw_index = SIZE_MAX;
     const LayoutDocument *layout = &engine->navigation.page.layout;
     if (kind == CONTROLLER_FOCUS_CONTROL) {
+        if (raw_index != NULL) *raw_index = ordinal;
         return ordinal < layout->control_count
             ? layout->controls[ordinal].node : NULL;
     }
@@ -2876,7 +2884,9 @@ static lxb_dom_node_t *browser_engine_semantic_focus(
     while (ordinal != 0 && ++i < layout->link_count) {
         if (layout->links[i].node != layout->links[i - 1u].node) ordinal--;
     }
-    return ordinal == 0 ? layout->links[i].node : NULL;
+    if (ordinal != 0) return NULL;
+    if (raw_index != NULL) *raw_index = i;
+    return layout->links[i].node;
 }
 
 static size_t browser_engine_focus_ordinal(const BrowserEngine *engine)
@@ -2892,12 +2902,78 @@ static size_t browser_engine_focus_ordinal(const BrowserEngine *engine)
     return ordinal;
 }
 
+static uint64_t browser_engine_focus_identity(
+    const NavigationSession *navigation, int kind, size_t raw_index)
+{
+    const LayoutDocument *layout = &navigation->page.layout;
+    lxb_dom_node_t *node = kind == CONTROLLER_FOCUS_LINK && raw_index < layout->link_count
+        ? layout->links[raw_index].node
+        : kind == CONTROLLER_FOCUS_CONTROL && raw_index < layout->control_count
+            ? layout->controls[raw_index].node : NULL;
+    if (node == NULL) return 0;
+    size_t length = 0;
+    const char *value = document_attribute(node, "id", &length);
+    char resolved[NAVIGATION_URL_LIMIT];
+    unsigned discriminator = 1;
+    if (value == NULL || length == 0) {
+        discriminator = kind == CONTROLLER_FOCUS_LINK ? 2 : 3;
+        if (kind == CONTROLLER_FOCUS_LINK) {
+            /* Hydration can change href spelling without changing its
+               destination. Resolve only the focused/common-ordinal item;
+               other candidates are visited only after that match fails. */
+            value = layout->links[raw_index].url;
+            const char *base = navigation->page.resource_base_url[0]
+                ? navigation->page.resource_base_url : navigation->page.document_url;
+            if (value != NULL && fetch_resolve_url(base, value, resolved, sizeof(resolved)))
+                value = resolved;
+            length = value == NULL ? 0 : strnlen(value, NAVIGATION_URL_LIMIT);
+        } else value = document_attribute(node, "name", &length);
+    }
+    if (value == NULL || length == 0 || length >= NAVIGATION_URL_LIMIT) return 0;
+    uint64_t hash = UINT64_C(14695981039346656037) ^ discriminator;
+    for (size_t i = 0; i < length; i++)
+        hash = (hash ^ (unsigned char) value[i]) * UINT64_C(1099511628211);
+    return hash ? hash : 1;
+}
+
+static lxb_dom_node_t *browser_engine_history_focus(
+    const BrowserEngine *engine, int kind, size_t ordinal, uint64_t identity)
+{
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    if (identity != 0) {
+        size_t raw_index;
+        lxb_dom_node_t *usual = browser_engine_semantic_focus(engine, kind, ordinal, &raw_index);
+        if (browser_engine_focus_identity(&engine->navigation, kind, raw_index) == identity) return usual;
+        size_t count = kind == CONTROLLER_FOCUS_LINK ? layout->link_count
+            : kind == CONTROLLER_FOCUS_CONTROL ? layout->control_count : 0;
+        lxb_dom_node_t *found = NULL, *previous = NULL;
+        size_t position = 0, best_distance = SIZE_MAX;
+        for (size_t i = 0; i < count; i++) {
+            lxb_dom_node_t *node = kind == CONTROLLER_FOCUS_LINK
+                ? layout->links[i].node : layout->controls[i].node;
+            if (node == previous) continue;
+            previous = node;
+            if (browser_engine_focus_identity(&engine->navigation, kind, i) == identity) {
+                size_t distance = position > ordinal ? position - ordinal : ordinal - position;
+                if (distance < best_distance) { found = node; best_distance = distance; }
+                /* Later ordinals cannot be closer once a matching item at
+                   or beyond the saved ordinal has been examined. */
+                if (position >= ordinal) break;
+            }
+            position++;
+        }
+        if (found != NULL) return found;
+    }
+    return browser_engine_semantic_focus(engine, kind, ordinal, NULL);
+}
+
 static void browser_engine_navigation_restore_view(
     BrowserEngine *engine, const BrowserEngineNavigationWork *work)
 {
     if (engine == NULL || work == NULL || !work->history_move) return;
-    lxb_dom_node_t *focus = browser_engine_semantic_focus(
-        engine, work->restore_focus_kind, work->restore_focus_index);
+    lxb_dom_node_t *focus = browser_engine_history_focus(
+        engine, work->restore_focus_kind, work->restore_focus_index,
+        work->restore_focus_identity);
     if (focus != NULL) (void) controller_focus_node(&engine->controller, focus);
     /* Focus notifications may relayout or reveal. History owns the exact
        viewport, so apply its saved position after those side effects. */
@@ -2928,6 +3004,8 @@ static void browser_engine_store_current_focus(BrowserEngine *engine)
     if (entry == NULL) return;
     entry->focus_kind = (int) engine->controller.focus_kind;
     entry->focus_index = browser_engine_focus_ordinal(engine);
+    entry->focus_identity = browser_engine_focus_identity(
+        &engine->navigation, entry->focus_kind, engine->controller.focus_index);
 }
 
 static lxb_dom_node_t *browser_engine_history_walk_next(
@@ -3792,6 +3870,7 @@ typedef struct {
     int scroll_y;
     int focus_kind;
     size_t focus_index;
+    uint64_t focus_identity;
     NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
     size_t control_count;
 } BrowserHistoryRestore;
@@ -3815,6 +3894,7 @@ static bool browser_engine_prepare_history(BrowserEngine *engine, bool forward,
     restore->scroll_y = entry->scroll_y;
     restore->focus_kind = entry->focus_kind;
     restore->focus_index = entry->focus_index;
+    restore->focus_identity = entry->focus_identity;
     restore->control_count = entry->control_count;
     if (restore->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
         restore->control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
@@ -3840,8 +3920,8 @@ static BrowserHistoryRestoreStatus browser_engine_restore_history_document(
     }
     if (!browser_engine_settle_same_document_events(engine))
         return HISTORY_RESTORE_SETTLE_FAILED;
-    lxb_dom_node_t *focus = browser_engine_semantic_focus(
-        engine, restore->focus_kind, restore->focus_index);
+    lxb_dom_node_t *focus = browser_engine_history_focus(
+        engine, restore->focus_kind, restore->focus_index, restore->focus_identity);
     if (focus != NULL && !controller_focus_node(&engine->controller, focus))
         return HISTORY_RESTORE_INPUT_FAILED;
     if (!navigation_set_scroll(&engine->navigation, restore->scroll_y)
@@ -3885,6 +3965,7 @@ bool browser_engine_begin_navigation_history(
             .restore_scroll_y = scroll_y,
             .restore_focus_kind = focus_kind,
             .restore_focus_index = focus_index,
+            .restore_focus_identity = restore.focus_identity,
             .started_us = tilefinch_platform_monotonic_time_us(),
             .history_move = true,
             .history_forward = forward
@@ -3918,6 +3999,7 @@ bool browser_engine_begin_navigation_history(
         &engine->navigation.history[engine->navigation.history_index];
     target_entry->focus_kind = focus_kind;
     target_entry->focus_index = focus_index;
+    target_entry->focus_identity = restore.focus_identity;
     target_entry->control_count = restore_control_count;
     memcpy(target_entry->controls, restore_controls,
            restore_control_count * sizeof(*restore_controls));
@@ -3932,6 +4014,7 @@ bool browser_engine_begin_navigation_history(
     work->restore_scroll_y = scroll_y;
     work->restore_focus_kind = focus_kind;
     work->restore_focus_index = focus_index;
+    work->restore_focus_identity = restore.focus_identity;
     work->restore_control_count = restore_control_count;
     memcpy(work->restore_controls, restore_controls,
            restore_control_count * sizeof(*restore_controls));
@@ -4703,6 +4786,7 @@ bool browser_engine_commit_history_html(BrowserEngine *engine, const char *url,
     work->restore_scroll_y = entry->scroll_y;
     work->restore_focus_kind = entry->focus_kind;
     work->restore_focus_index = entry->focus_index;
+    work->restore_focus_identity = entry->focus_identity;
     work->restore_control_count = entry->control_count;
     if (work->restore_control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
         work->restore_control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
@@ -4943,7 +5027,7 @@ bool browser_engine_history_move(BrowserEngine *engine, bool forward)
         return false;
     }
     lxb_dom_node_t *focus_node =
-        browser_engine_semantic_focus(engine, focus_kind, focus_index);
+        browser_engine_history_focus(engine, focus_kind, focus_index, restore.focus_identity);
     if (focus_node != NULL)
         (void) controller_focus_node(&engine->controller, focus_node);
     return navigation_set_scroll(&engine->navigation, scroll_y);
@@ -4979,7 +5063,7 @@ bool browser_engine_restore_view(
     if (!browser_engine_input_ready(engine)) return false;
     browser_engine_cancel_idle_work(engine);
     lxb_dom_node_t *focus = browser_engine_semantic_focus(
-        engine, focus_kind, focus_index);
+        engine, focus_kind, focus_index, NULL);
     if (focus != NULL)
         (void) controller_focus_node(&engine->controller, focus);
     if (!navigation_set_scroll(&engine->navigation, scroll_y)) return false;
@@ -7267,6 +7351,21 @@ bool browser_engine_view_snapshot(
             snapshot->focus_height = bottom - snapshot->focus_y;
             snapshot->focus_has_authored_outline =
                 engine->controller.has_authored_focus_outline;
+            lxb_dom_node_t *node = controller_focused_node(&engine->controller);
+            size_t length = 0;
+            const char *label = document_attribute(node, "aria-label", &length);
+            if (label == NULL || length == 0)
+                label = document_attribute(node, "title", &length);
+            if (label != NULL) {
+                size_t n = length < sizeof(snapshot->focus_label) - 1u
+                    ? length : sizeof(snapshot->focus_label) - 1u;
+                /* Do not split a multibyte label at the fixed snapshot bound. */
+                while (n < length && n != 0 && ((unsigned char) label[n] & 0xc0u) == 0x80u) n--;
+                for (size_t i = 0; i < n; i++)
+                    snapshot->focus_label[i] = (unsigned char) label[i] < 0x20u
+                        || label[i] == 0x7f ? ' ' : label[i];
+                snapshot->focus_label[n] = '\0';
+            }
         }
     }
     return true;
@@ -7479,7 +7578,7 @@ static void browser_engine_rebind_reader_visual_images(
         || cache->source_layout != source_layout
         || cache->layout != &cache->visual_layout) return;
     (void) layout_rebind_image_resources(
-        &cache->visual_layout, alias_result->previous_items,
+        &cache->visual_layout, (uintptr_t) alias_result->previous_items,
         alias_result->previous_count, images);
 }
 
@@ -7498,7 +7597,7 @@ static void browser_engine_alias_reader_images(
                 engine->config.resources.maximum_images);
         if (alias_result.previous_items != NULL) {
             (void) layout_rebind_image_resources(
-                &page->layout, alias_result.previous_items,
+                &page->layout, (uintptr_t) alias_result.previous_items,
                 alias_result.previous_count, &page->images);
             /* A scaled viewport keeps a cloned display list. Relocate only
                caches tied to this exact source layout; an in-flight candidate
@@ -7528,6 +7627,23 @@ static void browser_engine_alias_reader_images(
            publication changes only the resource table, so it does not need
            another document fingerprint scan. */
         (void) navigation_accept_native_resource_fingerprint(navigation);
+    }
+}
+
+static void browser_engine_image_table_moved(
+    void *opaque, NavigationSession *navigation, uintptr_t previous_base,
+    size_t previous_count)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || navigation == NULL) return;
+    TileCache *caches[] = {&engine->render, &engine->candidate_render};
+    for (size_t i = 0; i < sizeof(caches) / sizeof(caches[0]); i++) {
+        TileCache *cache = caches[i];
+        if (cache->owns_visual_layout
+            && cache->source_layout == &navigation->page.layout
+            && cache->layout == &cache->visual_layout)
+            (void) layout_rebind_image_resources(&cache->visual_layout,
+                previous_base, previous_count, &navigation->page.images);
     }
 }
 

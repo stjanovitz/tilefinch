@@ -549,6 +549,11 @@ const char *psp_media_action_name(PspUiMediaAction action)
             return "media-select-subtitle-track";
         case PSP_UI_MEDIA_ACTION_ROTATE: return "media-rotate";
         case PSP_UI_MEDIA_ACTION_CLOSE: return "media-close";
+        case PSP_UI_MEDIA_ACTION_NEXT: return "media-next";
+        case PSP_UI_MEDIA_ACTION_PREVIOUS: return "media-previous";
+        case PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT: return "media-automatic-next";
+        case PSP_UI_MEDIA_ACTION_QUEUE_SELECT: return "media-queue-select";
+        case PSP_UI_MEDIA_ACTION_QUEUE_RETRY: return "media-queue-retry";
         case PSP_UI_MEDIA_ACTION_NONE:
         default: return "media-none";
     }
@@ -772,6 +777,14 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     psp_ui_set_page(ui, view.title, view.url, view.secure);
     psp_ui_set_history(ui, view.can_go_back, view.can_go_forward);
     psp_ui_set_scroll(ui, view.scroll_y, view.maximum_scroll_y);
+    _Static_assert(sizeof(ui->focus_label) == sizeof(view.focus_label),
+                   "focus labels must fit the native snapshot");
+    ui->focus_label_valid = ui->screen == PSP_UI_SCREEN_PAGE
+        && view.focus_label[0] != '\0';
+    if (ui->focus_label_valid) {
+        memcpy(ui->focus_label, view.focus_label, sizeof(ui->focus_label));
+        ui->network_profile_label_valid = false;
+    }
     if (profile != NULL) {
         const BrowserSession *security_session =
             browser_engine_session_view(engine);

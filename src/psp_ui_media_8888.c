@@ -33,6 +33,9 @@
 
 #include "psp_media_pixels.h"
 
+_Static_assert(sizeof(PspUiMediaTrackMenuCache) == 12,
+               "menu focus metadata must use existing cache padding");
+
 /*
  * The narrowing is the same one the software scaler performs on a decoded
  * pixel, and the widening is its inverse with the low bits replicated so a
@@ -197,14 +200,39 @@ static uint32_t ui_media_menu_signature(
         hash = ui_media_menu_hash_byte(hash, palette[at]);
     if (presentation == NULL) return hash;
     hash = ui_media_menu_hash_byte(hash, presentation->track_menu_tab);
-    hash = ui_media_menu_hash_byte(hash, presentation->track_menu_selection);
     hash = ui_media_menu_hash_byte(hash, presentation->audio_track_count);
     hash = ui_media_menu_hash_byte(hash, presentation->subtitle_track_count);
     hash = ui_media_menu_hash_byte(hash, presentation->chapter_count);
+    hash = ui_media_menu_hash_byte(hash, presentation->queue_active);
+    /* Counts/capabilities affect the tab bar, but only the active catalog's
+       contents affect this opaque raster. Hidden feeds must not repaint it. */
+    hash = ui_media_menu_hash_byte(hash, media->seek_enabled);
+    hash = ui_media_menu_hash_byte(hash, media->live);
+    hash = ui_media_menu_hash_byte(hash, media->duration_us != 0);
+    uintptr_t face = (uintptr_t) presentation->title_font;
+    for (unsigned byte = 0; byte < sizeof(face); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (face >> (byte * 8u)));
+    if (presentation->track_menu_tab == 3 && presentation->queue_active) {
+        hash = ui_media_menu_hash_byte(hash, presentation->queue_count);
+        hash = ui_media_menu_hash_byte(hash, presentation->queue_loading);
+        hash = ui_media_menu_hash_byte(hash, presentation->queue_failed);
+        hash = ui_media_menu_hash_byte(hash, presentation->queue_retry);
+        hash = ui_media_menu_hash_byte(hash, media->ended);
+        if (presentation->queue_failed)
+            hash = ui_media_menu_hash_string(hash, presentation->queue_error, sizeof(presentation->queue_error));
+        hash = ui_media_menu_hash_byte(hash, presentation->queue_next);
+        for (unsigned byte = 0; byte < 4; byte++)
+            hash = ui_media_menu_hash_byte(hash, (unsigned char) (presentation->queue_position >> (byte * 8)));
+        for (unsigned i = 0; i < presentation->queue_count && i < 6u; i++)
+            hash = ui_media_menu_hash_string(hash, presentation->queue_titles[i], sizeof(presentation->queue_titles[i]));
+        if (presentation->queue_count == 0)
+            hash = ui_media_menu_hash_string(hash, media->title, sizeof(media->title));
+    }
     unsigned current_chapter = 0;
     uint64_t time = media->seek_preview_active
         ? media->seek_preview_time_us : media->current_time_us;
-    for (size_t at = 0; at < presentation->chapter_count; at++) {
+    for (size_t at = 0; presentation->track_menu_tab == 2
+         && at < presentation->chapter_count && at < MEDIA_CHAPTER_LIMIT; at++) {
         uint32_t seconds = presentation->chapters[at].seconds;
         if ((uint64_t) seconds * 1000000u <= time) current_chapter = (unsigned) at + 1u;
         for (unsigned byte = 0; byte < 4u; byte++)
@@ -214,14 +242,14 @@ static uint32_t ui_media_menu_signature(
     }
     if (presentation->track_menu_tab == 2)
         hash = ui_media_menu_hash_byte(hash, (unsigned char) current_chapter);
-    hash = ui_media_menu_hash_byte(
-        hash, (unsigned char) (presentation->selected_audio_track + 1));
-    hash = ui_media_menu_hash_byte(
-        hash, (unsigned char) (presentation->selected_subtitle_track + 1));
+    if (presentation->track_menu_tab == 0)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (presentation->selected_audio_track + 1));
+    if (presentation->track_menu_tab == 1)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (presentation->selected_subtitle_track + 1));
     size_t audio_count = presentation->audio_track_count;
     if (audio_count > PSP_UI_MEDIA_TRACK_LIMIT)
         audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
-    for (size_t at = 0; at < audio_count; at++) {
+    for (size_t at = 0; presentation->track_menu_tab == 0 && at < audio_count; at++) {
         hash = ui_media_menu_hash_string(
             hash, presentation->audio_tracks[at].label,
             sizeof(presentation->audio_tracks[at].label));
@@ -229,7 +257,7 @@ static uint32_t ui_media_menu_signature(
     size_t subtitle_count = presentation->subtitle_track_count;
     if (subtitle_count > PSP_UI_MEDIA_TRACK_LIMIT)
         subtitle_count = PSP_UI_MEDIA_TRACK_LIMIT;
-    for (size_t at = 0; at < subtitle_count; at++) {
+    for (size_t at = 0; presentation->track_menu_tab == 1 && at < subtitle_count; at++) {
         hash = ui_media_menu_hash_string(
             hash, presentation->subtitle_tracks[at].label,
             sizeof(presentation->subtitle_tracks[at].label));
@@ -246,14 +274,15 @@ void psp_ui_media_composite_8888_cached(
 {
     const PspUiMediaPresentation *presentation = media == NULL
         ? NULL : media->presentation;
-    size_t required = (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
-        * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT;
+    int menu_height = (int) psp_ui_media_track_menu_height(media);
+    int top = 48 - (menu_height - (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) / 2;
+    size_t required = (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH * (size_t) menu_height;
     if (presentation == NULL || presentation->clockwise
         || !presentation->track_menu_open
         || menu_pixels == NULL || menu_pixel_capacity < required
         || menu_cache == NULL
         || width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
-        || height < 48 + (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) {
+        || height < top + menu_height) {
         psp_ui_media_composite_8888(
             media, preview, pixels, width, height, stride, scratch);
         return;
@@ -265,31 +294,41 @@ void psp_ui_media_composite_8888_cached(
         media, preview, pixels, width, height, stride,
         scratch, false, true);
     uint32_t signature = ui_media_menu_signature(media);
-    bool source_changed = !menu_cache->valid
+    bool content_changed = !menu_cache->valid
         || menu_cache->signature != signature
         || menu_cache->edram_epoch != edram_epoch;
+    bool source_changed = content_changed
+        || menu_cache->selection != presentation->track_menu_selection
+        || (presentation->track_menu_tab == 3
+            && menu_cache->automatic_next != presentation->automatic_next);
     if (source_changed) {
-        memset(menu_pixels, 0, required * sizeof(*menu_pixels));
-        psp_ui_media_raster_track_menu(
-            media, menu_pixels,
-            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
-            (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT,
-            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH);
+        /* The painter fills the entire opaque rectangle before any ink;
+           clearing it first was a redundant 124–143 KiB memory pass. */
+        if (content_changed || !psp_ui_media_raster_queue_update(media,
+                menu_cache->selection, menu_cache->automatic_next,
+                menu_pixels, (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+                menu_height, (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH))
+            psp_ui_media_raster_track_menu(
+                media, menu_pixels,
+                (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+                menu_height,
+                (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH);
         menu_cache->signature = signature;
         menu_cache->edram_epoch = edram_epoch;
         menu_cache->valid = true;
+        menu_cache->selection = presentation->track_menu_selection;
+        menu_cache->automatic_next = presentation->automatic_next;
     }
     int left = width / 2 - (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH / 2;
-    int top = 48;
     if (menu_blit != NULL && menu_blit(
             menu_blit_context, menu_pixels,
             (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
-            (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT,
+            menu_height,
             (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH, source_changed,
             pixels, stride, left, top)) {
         return;
     }
-    for (int y = 0; y < (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT; y++) {
+    for (int y = 0; y < menu_height; y++) {
         const uint16_t *source = menu_pixels
             + (size_t) y * PSP_UI_MEDIA_TRACK_MENU_WIDTH;
         uint32_t *destination = pixels

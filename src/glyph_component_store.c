@@ -58,7 +58,11 @@ static const TilefinchGlyphPackSpec glyph_specs[TILEFINCH_GLYPH_PACK_COUNT] = {
     {"glyph-devanagari", "Devanagari (Hindi)",
      "tilefinch-glyph-devanagari-v1.tfgm",
      "tilefinch-glyph-devanagari-v1.tfgf", DOCUMENT_GLYPH_SCRIPT_DEVANAGARI,
-     284u}
+     284u},
+    {"glyph-bengali-assamese", "Bengali-Assamese",
+     "tilefinch-glyph-bengali-assamese-v1.tfgm",
+     "tilefinch-glyph-bengali-assamese-v1.tfgf",
+     DOCUMENT_GLYPH_SCRIPT_BENGALI_ASSAMESE, 284u}
 };
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(
@@ -98,6 +102,9 @@ bool tilefinch_glyph_pack_for_language(
             return true;
         case BROWSER_GLYPH_LANGUAGE_DEVANAGARI:
             *pack = TILEFINCH_GLYPH_PACK_DEVANAGARI;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE:
+            *pack = TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE;
             return true;
         case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:

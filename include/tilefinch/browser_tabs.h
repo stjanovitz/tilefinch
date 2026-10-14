@@ -21,6 +21,8 @@ typedef struct {
     int scroll_y;
     int focus_kind;
     size_t focus_index;
+    /* RAM-only; hibernation/session files deliberately omit this hint. */
+    uint64_t focus_identity;
 } BrowserTabHistoryEntry;
 
 typedef struct {

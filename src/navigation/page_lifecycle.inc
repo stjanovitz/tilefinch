@@ -849,6 +849,7 @@ static void navigation_attach_layout(NavigationSession *session)
             &session->page.stylesheet, required);
     }
     if (session != NULL) {
+        session->page.visual_image_publication_pending = false;
         session->page.layout_provisional =
             session->page.layout.content_limit_y != 0;
         if (!session->page.layout_provisional)

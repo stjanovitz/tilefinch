@@ -52,7 +52,7 @@ int main(void)
     CHECK(route(loading, on_page, PSP_UI_BUTTON_PAGE_DOWN, false)
           == PSP_INPUT_ROUTE_SCROLL);
     CHECK(route(loading, on_page, PSP_UI_BUTTON_UP, false)
-          == PSP_INPUT_ROUTE_SCROLL);
+          == PSP_INPUT_ROUTE_FORWARD);
     CHECK(route(loading, on_page, PSP_UI_BUTTON_CANCEL, false)
           == PSP_INPUT_ROUTE_CANCEL);
     CHECK(route(loading, on_page, PSP_UI_BUTTON_RIGHT, false)
@@ -105,6 +105,11 @@ int main(void)
     highlighted.media_preview_active = false;
     highlighted.media_menu_open = true;
     CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    highlighted.pressed = PSP_UI_BUTTON_RELOAD;
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_MEDIA);
+    highlighted.media_menu_open = false;
+    CHECK(psp_input_route(&highlighted) == PSP_INPUT_ROUTE_BUSY);
+    highlighted.media_menu_open = true;
     const uint32_t menu_buttons[] = {PSP_UI_BUTTON_UP, PSP_UI_BUTTON_DOWN,
         PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_MENU};
     for (size_t at = 0; at < sizeof(menu_buttons) / sizeof(menu_buttons[0]); at++) {
@@ -150,7 +155,7 @@ int main(void)
     };
     CHECK(psp_input_route(&awaited) == PSP_INPUT_ROUTE_QUEUE_PAGE);
     awaited.pressed = PSP_UI_BUTTON_DOWN;
-    CHECK(psp_input_route(&awaited) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    CHECK(psp_input_route(&awaited) == PSP_INPUT_ROUTE_YIELD);
     awaited.pressed = PSP_UI_BUTTON_PAGE_UP;
     CHECK(psp_input_route(&awaited) == PSP_INPUT_ROUTE_YIELD);
     awaited.pressed = PSP_UI_BUTTON_CANCEL;
@@ -175,7 +180,7 @@ int main(void)
     };
     CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
     served.pressed = PSP_UI_BUTTON_UP;
-    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
     served.pressed = PSP_UI_BUTTON_CONFIRM;
     CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
     served.pressed = PSP_UI_BUTTON_PAGE_DOWN | PSP_UI_BUTTON_MENU;
@@ -187,7 +192,7 @@ int main(void)
        page; up is served. */
     served.analog_active = false;
     served.forward_awaited = true;
-    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_YIELD);
     served.pressed = PSP_UI_BUTTON_PAGE_UP;
     CHECK(psp_input_route(&served) == PSP_INPUT_ROUTE_SCROLL);
     /* A provisional relayout's build is kept, not optional: page presses
@@ -198,6 +203,8 @@ int main(void)
     };
     CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_SCROLL);
     relayout.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_QUEUE_PAGE);
+    relayout.pressed = PSP_UI_BUTTON_UP;
     CHECK(psp_input_route(&relayout) == PSP_INPUT_ROUTE_QUEUE_PAGE);
     relayout.pressed = PSP_UI_BUTTON_DOWN;
     relayout.analog_active = true;

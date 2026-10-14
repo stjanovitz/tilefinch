@@ -120,7 +120,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_transport_mbedtls_config}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-http2-upload-lifetime.patch")
 
 # The bignum patch is applied unconditionally so the extracted tree is the
 # same whichever way the option is set; the block it adds is inert unless
@@ -245,6 +246,12 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
         "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+        COMMAND
+        "${CMAKE_COMMAND}"
+        "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-http2-upload-lifetime.patch"
+        "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
     CMAKE_ARGS
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
@@ -364,6 +371,7 @@ ExternalProject_Add_Step(tilefinch_psp_curl user-config
 ExternalProject_Add_Step(tilefinch_psp_curl patch-file
     COMMAND "${CMAKE_COMMAND}" -E true
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-http2-upload-lifetime.patch"
     DEPENDERS download
     INDEPENDENT TRUE)
 

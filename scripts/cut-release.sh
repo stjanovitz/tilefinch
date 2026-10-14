@@ -358,10 +358,15 @@ python3 "$root/tools/tilefinch_update_tool.py" pack \
     printf 'commit:           %s\n' "$commit"
     printf 'updater:          %s\n' \
         "$([ "$update_root_choice" = root ] \
-            && printf 'enabled (root: %s)' "$update_root" \
+            && printf 'enabled (trust root embedded)' \
             || printf 'disabled (no trust root embedded)')"
     printf 'built:            %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 } > "$dist/RELEASE-INFO.txt"
+if grep -Fq "$root" "$dist/RELEASE-INFO.txt" \
+    || { [ -n "${HOME:-}" ] \
+         && grep -Fq "$HOME" "$dist/RELEASE-INFO.txt"; }; then
+    fail "release metadata contains a local filesystem path"
+fi
 
 step "Artifacts"
 cat "$dist/RELEASE-INFO.txt"

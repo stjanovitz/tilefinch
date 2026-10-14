@@ -11,6 +11,7 @@
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/ui_language.h"
 
 #define printf psp_log_printf
 #define KIB 1024u
@@ -1244,6 +1245,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
 void psp_media_shutdown(PspMediaSession *media)
 {
     if (media == NULL) return;
+    youtube_playlist_destroy(media->playlist); media->playlist = NULL;
     psp_media_dispatch(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_CLOSE,
         .retain_pipeline = false
@@ -1719,6 +1721,10 @@ void psp_media_prepare_route(
         if (media->generation == generation) return;
         media->provider_direct_route = false;
     }
+    if (media != NULL && media->playlist && media->generation != generation) {
+        youtube_playlist_destroy(media->playlist); media->playlist = NULL;
+        media->ui_presentation.queue_active = false;
+    }
     /* A committed watch document is not itself a play activation. Results
        and watch pages mark their explicit native-player links; only that
        controller action may enter the provider video route. */
@@ -1761,6 +1767,102 @@ bool psp_media_open_provider_route(
 {
     return psp_media_open_provider_route_prepared(
         media, url, backing_generation, NULL);
+}
+
+static void psp_media_playlist_projection(PspMediaSession *media)
+{
+    PspUiMediaPresentation *p = &media->ui_presentation;
+    YoutubePlaylistEntry entries[YOUTUBE_PLAYLIST_VIEW_LIMIT];
+    p->queue_active = media->playlist != NULL;
+    p->queue_count = (uint8_t) youtube_playlist_view(media->playlist, entries, YOUTUBE_PLAYLIST_VIEW_LIMIT);
+    p->queue_position = (uint32_t) youtube_playlist_position(media->playlist);
+    p->queue_next = youtube_playlist_has_next(media->playlist);
+    p->queue_loading = youtube_playlist_loading(media->playlist);
+    p->queue_failed = youtube_playlist_failed(media->playlist);
+    p->queue_retry = youtube_playlist_can_retry(media->playlist);
+    p->queue_terminal = youtube_playlist_selecting(media->playlist)
+        && p->queue_failed && !p->queue_retry;
+    if (youtube_playlist_selecting(media->playlist) && p->queue_failed)
+        media->ui.retry_unavailable = p->queue_terminal;
+    for (size_t i = 0; i < p->queue_count; i++)
+        memcpy(p->queue_titles[i], entries[i].title, sizeof(p->queue_titles[i]));
+    snprintf(p->queue_error, sizeof(p->queue_error), "%s", youtube_playlist_error(media->playlist));
+}
+
+bool psp_media_open_playlist_route(PspMediaSession *media, const char *url,
+                                  const char *playlist_url, uint64_t generation)
+{
+    size_t index; bool all;
+    char expected[YOUTUBE_VIDEO_ID_CAPACITY];
+    if (!media || !generation || media->system_suspended
+        || !youtube_lite_playlist_selection(url, &index, &all)
+        || !youtube_watch_url_video_id(url, expected)) return false;
+    YoutubePlaylistQueue *queue = youtube_playlist_begin(media->budget, media->session,
+        playlist_url, index, all, all ? NULL : expected);
+    if (!queue) return false;
+    youtube_playlist_set_initial_start(queue,
+        all ? 0 : youtube_watch_url_start_time_us(url));
+    media->provider_direct_route = true; /* A queue never retains an unrelated pipeline. */
+    psp_media_close(media);
+    media->playlist = queue;
+    media->provider_direct_route = true;
+    media->generation = generation;
+    media->playlist_end_handled = false;
+    media->ui_presentation.automatic_next = false;
+    psp_ui_media_set_resolving(&media->ui, tilefinch_ui_text("Loading playlist..."));
+    psp_media_playlist_projection(media);
+    return true;
+}
+
+static bool psp_media_playlist_tick(PspMediaSession *media)
+{
+    if (!media->playlist || !media->ui.visible || media->system_suspended) return false;
+    bool changed = false;
+    if (media->ui.ended && !media->playlist_end_handled) {
+        media->playlist_end_handled = true;
+        if (media->ui_presentation.automatic_next && youtube_playlist_has_next(media->playlist))
+            changed = youtube_playlist_step(media->playlist, 1);
+        else if (!youtube_playlist_has_next(media->playlist)) {
+            /* At the actual end, keep recovery and return discoverable rather
+               than leaving a stopped picture with no next video. */
+            media->ui_presentation.track_menu_open = true;
+            media->ui_presentation.track_menu_tab = 3;
+            media->ui_presentation.track_menu_selection = 0;
+            psp_ui_media_show_controls(&media->ui);
+            changed = true;
+        }
+    }
+    FetchPumpQuota quota = {.maximum_time_us = 1500, .maximum_body_callbacks = 2, .maximum_body_bytes = 16384};
+    /* Metadata prefetch is optional during active decode. Start only near
+       the tail of the retained window; one bounded provider pump per turn. */
+    if (youtube_playlist_selecting(media->playlist)
+        || (media->have_frame && !media->ui.resolving
+            && !media->ui.buffering && !media->ui.ended))
+        changed = youtube_playlist_pump(media->playlist, &quota) || changed;
+    char url[NAVIGATION_URL_LIMIT];
+    if (youtube_playlist_take_video(media->playlist, url, sizeof(url))) {
+        YoutubePlaylistQueue *queue = media->playlist;
+        bool automatic = media->ui_presentation.automatic_next;
+        media->playlist = NULL;
+        psp_media_close(media); /* Also handles consecutive duplicate IDs. */
+        media->playlist = queue;
+        (void) psp_media_open_provider_route(media, url, media->generation);
+        media->playlist_end_handled = false;
+        media->ui_presentation.automatic_next = automatic;
+        changed = true;
+    }
+    if (changed) psp_media_playlist_projection(media);
+    if (youtube_playlist_selecting(media->playlist) && youtube_playlist_failed(media->playlist) && !media->ui.failed) {
+        psp_media_raise_error(media, "PLAYLIST COULD NOT LOAD",
+                             youtube_playlist_error(media->playlist));
+        psp_media_playlist_projection(media);
+        changed = true;
+    } else if (youtube_playlist_selecting(media->playlist) && !media->ui.resolving && !media->ui.failed) {
+        if (media->playback) media_playback_set_playing(media->playback, false);
+        psp_ui_media_set_resolving(&media->ui, tilefinch_ui_text("Loading playlist..."));
+        changed = true;
+    }
+    return changed;
 }
 
 static bool psp_media_open_page_source_kind(
@@ -1881,6 +1983,9 @@ bool psp_media_open_page_hls(
 void psp_media_close(PspMediaSession *media)
 {
     if (media == NULL) return;
+    youtube_playlist_destroy(media->playlist); media->playlist = NULL;
+    media->ui_presentation.queue_active = false;
+    media->ui_presentation.track_menu_open = false;
     psp_media_session_checkpoint(media, "close-begin");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     const uint32_t *gates = media->subtitle_gate_counts;
@@ -2138,11 +2243,54 @@ static bool psp_media_continuation_intent(PspMediaSession *media,
     }
 }
 
+static __attribute__((noinline)) bool psp_media_playlist_intent(PspMediaSession *media, PspUiMediaIntent intent)
+{
+    if (media->playlist) {
+        if (intent.action == PSP_UI_MEDIA_ACTION_RETRY && youtube_playlist_selecting(media->playlist)
+            && youtube_playlist_failed(media->playlist)) {
+            youtube_playlist_retry(media->playlist);
+            if (!youtube_playlist_failed(media->playlist))
+                psp_ui_media_set_resolving(&media->ui, tilefinch_ui_text("Loading playlist..."));
+            psp_media_playlist_projection(media);
+            return true;
+        }
+        bool queue_action = true;
+        bool changing_video = false;
+        switch (intent.action) {
+            case PSP_UI_MEDIA_ACTION_NEXT: changing_video = youtube_playlist_step(media->playlist, 1); break;
+            case PSP_UI_MEDIA_ACTION_PREVIOUS: changing_video = youtube_playlist_step(media->playlist, -1); break;
+            case PSP_UI_MEDIA_ACTION_QUEUE_SELECT:
+                if (intent.track_index < media->ui_presentation.queue_count)
+                    changing_video = youtube_playlist_select(media->playlist,
+                        youtube_playlist_position(media->playlist) + intent.track_index);
+                break;
+            case PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT:
+                media->ui_presentation.automatic_next = intent.track_index != 0; break;
+            case PSP_UI_MEDIA_ACTION_QUEUE_RETRY:
+                youtube_playlist_retry(media->playlist);
+                if (youtube_playlist_selecting(media->playlist)
+                    && !youtube_playlist_failed(media->playlist))
+                    psp_ui_media_set_resolving(&media->ui, tilefinch_ui_text("Loading playlist..."));
+                break;
+            default: queue_action = false; break;
+        }
+        if (queue_action) {
+            if (changing_video) {
+                if (media->playback) media_playback_set_playing(media->playback, false);
+                psp_ui_media_set_resolving(&media->ui, tilefinch_ui_text("Loading playlist..."));
+            }
+            psp_media_playlist_projection(media); return true;
+        }
+    }
+    return false;
+}
+
 void psp_media_execute_intent(PspMediaSession *media,
                                      PspUiMediaIntent intent)
 {
     if (media == NULL) return;
     if (psp_media_continuation_intent(media, intent)) return;
+    if (psp_media_playlist_intent(media, intent)) return;
     switch (intent.action) {
         case PSP_UI_MEDIA_ACTION_ROTATE:
             if (media->ui_presentation.rotation_available
@@ -2799,7 +2947,8 @@ bool psp_media_advance(
      */
     psp_media_present_release_claimed_surface(media);
     psp_media_present_emit_after_release(media);
-    bool changed = false;
+    bool changed = !tilefinch_cancellation_requested(cancellation)
+        && psp_media_playlist_tick(media);
     uint64_t advance_started_us = psp_media_now_us(media);
     /* A closed player may retain a complete paused pipeline for an immediate
        replay, and an internal provider view may temporarily hide one. Neither
@@ -2808,6 +2957,7 @@ bool psp_media_advance(
     /* A terminal error retains the pipeline only for Retry/normal close.
        Advancing it could publish an old frame and erase the failure panel. */
     if (!media->ui.visible || media->ui.failed) return changed;
+    if (media->playlist && youtube_playlist_selecting(media->playlist)) return changed;
     bool open_work = psp_media_open_work_pending(media);
     if (open_work) {
         (void) psp_media_open_pump(media, cancellation);

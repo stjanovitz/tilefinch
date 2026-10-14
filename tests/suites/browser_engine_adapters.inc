@@ -99,6 +99,22 @@ static const char *test_watch_reuse_language(void *context)
     return context;
 }
 
+typedef struct { uint64_t ns; unsigned checkpoints; } ReadyPhaseProbe;
+static uint64_t test_ready_phase_clock(void *context)
+{
+    ReadyPhaseProbe *probe = context;
+    probe->ns += UINT64_C(20000);
+    return probe->ns;
+}
+static bool test_ready_phase_cancel(void *context, const char *phase, size_t work)
+{
+    (void) work;
+    ReadyPhaseProbe *probe = context;
+    if (strcmp(phase, "youtube-ready-phase") != 0) return true;
+    probe->checkpoints++;
+    return false;
+}
+
 static int test_watch_metadata_reuse(void)
 {
     static const char watch[] = "https://www.youtube.com/watch?v=TFTEST00001";
@@ -126,13 +142,43 @@ static int test_watch_metadata_reuse(void)
     CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
         &metrics, "cold-watch") == 0 && metrics.requests_started == 1);
     YoutubeLiteDocument reused_watch = {0};
+    TestCpuPacedClock ready_clock;
+    test_cpu_paced_clock_install(&ready_clock);
     CHECK(test_watch_reuse_load(&budget, &session, watch, false, &reused_watch,
         &metrics, "warm-watch") == 0 && metrics.requests_started == 0
         && metrics.body_bytes == 0 && metrics.document_cache_hits == 1
+        /* Ready emission phases share a bounded pump instead of paying a
+           frame between every header, intro and footer transition. */
+        && metrics.pump_calls <= 2u
         && reused_watch.html_length == document.html_length
         && !memcmp(reused_watch.html, document.html, document.html_length));
+    tilefinch_platform_set_services(NULL);
     youtube_lite_document_destroy(&reused_watch);
     youtube_lite_document_destroy(&document);
+    /* Ready work still obeys its caller's deadline and interruption. A tiny
+       deterministic clock budget permits one unit per turn, not eight. */
+    for (unsigned cancel = 0; cancel < 2; cancel++) {
+        char ready_error[256] = {0};
+        size_t owned = budget.current;
+        YoutubeLiteLoadJob *ready = youtube_lite_load_begin(&budget, &session,
+            watch, 1u * MIB, 2000, ready_error, sizeof(ready_error));
+        CHECK(ready != NULL);
+        ReadyPhaseProbe probe = {.ns = tilefinch_platform_monotonic_time_ns()};
+        TilefinchPlatformServices services = {.context = &probe};
+        if (cancel) services.cooperate = test_ready_phase_cancel;
+        else services.monotonic_time_ns = test_ready_phase_clock;
+        tilefinch_platform_set_services(&services);
+        FetchPumpQuota quota = {.maximum_time_us = cancel ? 10000u : 1u};
+        YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+        unsigned turns = 0;
+        while (status == YOUTUBE_LITE_LOAD_PENDING && turns++ < 32u)
+            status = youtube_lite_load_pump(ready, &quota);
+        tilefinch_platform_set_services(NULL);
+        if (cancel) CHECK(status == YOUTUBE_LITE_LOAD_CANCELLED && probe.checkpoints == 1u);
+        else CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED && turns >= 6u);
+        youtube_lite_load_destroy(ready);
+        CHECK(budget.current == owned);
+    }
     size_t retained = 0;
     for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
         if (session.site_adapter_document_cache[i].valid)
@@ -460,8 +506,49 @@ static int test_search_video_journey(void)
 
 #include "tilefinch/screenshot_png.h"
 
+typedef struct {
+    NavigationSession *navigation;
+    unsigned mode, begins;
+} VisualPublicationProbe;
+
+static bool test_visual_publication_cooperate(void *opaque,
+                                              const char *phase, size_t work)
+{
+    VisualPublicationProbe *probe = opaque;
+    if (strcmp(phase, "optional-image-publication") != 0) return true;
+    if (work == 0) {
+        budget_clear_failure_injection(probe->navigation->budget);
+        return true;
+    }
+    probe->begins++;
+    if (probe->mode == 0) return false;
+    if (probe->mode == 1)
+        tilefinch_test_faults()->cancel_next_layout_cooperate = true;
+    else budget_inject_failure_after(probe->navigation->budget, 0);
+    return true;
+}
+
 static int test_fixed_image_publication(void)
 {
+    ImageResource previous[3] = {{0}}, replacement[2] = {{0}};
+    DrawCommand rebound_commands[3] = {
+        {.type = DRAW_IMAGE, .image = &previous[0]},
+        {.type = DRAW_IMAGE, .image = &previous[1]},
+        {.type = DRAW_IMAGE, .image = &previous[2]}};
+    LayoutDocument rebound_layout = {.commands = rebound_commands, .count = 3};
+    ImageResources rebound_images = {.items = replacement, .count = 2};
+    CHECK(layout_rebind_image_resources(&rebound_layout,
+        (uintptr_t) previous, 3, &rebound_images) == 3
+        && rebound_commands[0].image == &replacement[0]
+        && rebound_commands[1].image == &replacement[1]
+        && rebound_commands[2].image == NULL
+        && layout_rebind_image_resources(&rebound_layout, (uintptr_t) previous,
+            SIZE_MAX, &rebound_images) == 0);
+    rebound_commands[0].image = &previous[0];
+    rebound_images.items = NULL;
+    rebound_images.count = 0;
+    CHECK(layout_rebind_image_resources(&rebound_layout, (uintptr_t) previous,
+        3, &rebound_images) == 1 && rebound_commands[0].image == NULL);
     char path[] = "/tmp/tilefinch-fixed-png-XXXXXX";
     int fd = mkstemp(path);
     CHECK(fd >= 0 && close(fd) == 0);
@@ -614,6 +701,86 @@ static int test_fixed_image_publication(void)
     size_t reference_count = 0;
     const uint16_t *reference = browser_engine_framebuffer(engine, &reference_count);
     CHECK(reference_count == count && actual == frame_checksum(reference, reference_count));
+    /* CSS masks need flow, not the document-image paint proof. Interrupt their
+       publication before and during flow, including table growth with an
+       already-retained image, and prove a later idle retry paints exactly. */
+    static const char visual_html[] =
+        "<!doctype html><title>Visual publication</title><h1>Icons</h1>"
+        "<img id=kept width=32 height=32 src='https://i.ytimg.com/vi/TFTEST00001/mqdefault.jpg'>"
+        "<div id=m1 style='width:24px;height:24px;background:red;mask-image:url(https://i.ytimg.com/vi/TFTEST00002/mqdefault.jpg)'></div>"
+        "<div id=m2 style='width:24px;height:24px;background:blue;mask-image:url(https://i.ytimg.com/vi/TFTEST00003/mqdefault.jpg)'></div>"
+        "<div id=m3 style='width:24px;height:24px;background:green;mask-image:url(https://i.ytimg.com/vi/TFTEST00004/mqdefault.jpg)'></div>";
+    for (unsigned mode = 0; mode < 3; mode++) {
+        fetch_trace_end();
+        CHECK(fetch_trace_replay_begin_response_keyed(replay, error, sizeof(error)));
+        /* This fixture seeds one incumbent resource itself; only its later
+           idle mask batch may use the replay transport. */
+        nav->external_resources_enabled = false;
+        CHECK(browser_engine_commit_html(engine, "https://i.ytimg.com/fixture/",
+            visual_html, sizeof(visual_html) - 1u, true));
+        nav = browser_engine_navigation(engine);
+        CHECK(nav->page.images.count == 0);
+        lxb_dom_node_t *kept = test_reader_find_id(
+            lxb_dom_interface_node(nav->page.document.html), "kept");
+        CHECK(kept != NULL && images_reserve_capacity(&nav->page.images, nav->budget, 1));
+        unsigned char *rgba = budget_malloc(nav->budget, 4u * 4u * 4u);
+        CHECK(rgba != NULL);
+        memset(rgba, 255, 4u * 4u * 4u);
+        nav->page.images.items[0] = (ImageResource) {
+            .node = kept, .pixels = rgba, .width = 4, .height = 4,
+            .source_width = 4, .source_height = 4, .owns_pixels = true};
+        nav->page.images.count = 1;
+        nav->page.images.stats.loaded = 1;
+        CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+        const DrawCommand *retained_commands = nav->page.layout.commands;
+        navigation_enable_external_resources(nav, 16, 2u * MIB, 512u * 1024u,
+            24, 4u * MIB, MIB, 4u * MIB, 1000);
+        nav->page.resource_scheduler = fetch_scheduler_create_in_domain(nav->page.fetch_domain, 4, 4u * MIB);
+        CHECK(nav->page.resource_scheduler != NULL);
+        nav->page.visual_batch_targets = budget_calloc(nav->budget, 3, sizeof(ImagePriorityTarget));
+        CHECK(nav->page.visual_batch_targets != NULL);
+        for (size_t i = 0; i < 3; i++) {
+            char id[3] = {'m', (char) ('1' + i), '\0'};
+            lxb_dom_node_t *node = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), id);
+            CHECK(node != NULL);
+            ComputedStyle mask_style = style_for_node(&nav->page.stylesheet, node, NULL);
+            CHECK(mask_style.mask_image != NULL);
+            nav->page.visual_batch_targets[i] = (ImagePriorityTarget) {
+                .node = node, .source = mask_style.mask_image,
+                .kind = IMAGE_PRIORITY_KIND_MASK};
+        }
+        nav->page.visual_batch_count = 3;
+        VisualPublicationProbe probe = {.navigation = nav, .mode = mode};
+        TilefinchPlatformServices services = {.context = &probe, .cooperate = test_visual_publication_cooperate};
+        tilefinch_platform_set_services(&services);
+        NavigationBackgroundWorkOutcome outcome = navigation_run_background_resources(nav);
+        tilefinch_platform_set_services(NULL);
+        fprintf(stderr, "visual-publication mode=%u begins=%u loaded=%d retained=%d images=%zu targets=%p outcome=%d pending=%d cancelled=%d\n",
+            mode, probe.begins, nav->page.loaded, nav->page.layout.commands == retained_commands,
+            nav->page.images.count, (void *) nav->page.visual_batch_targets, outcome,
+            nav->page.visual_image_publication_pending, nav->layout_build_cancelled);
+        CHECK(probe.begins == 1 && nav->page.loaded
+            && nav->page.layout.commands == retained_commands
+            && nav->page.images.count == 4 && nav->page.visual_batch_targets == NULL);
+        CHECK(outcome == (mode == 2 ? NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL : NAVIGATION_BACKGROUND_WORK_SUCCESS));
+        CHECK(nav->page.visual_image_publication_pending == (mode != 2));
+        const LayoutDocument *shown = browser_engine_render_metrics_view(engine)->layout;
+        for (size_t i = 0; i < shown->count; i++)
+            if (shown->commands[i].type == DRAW_IMAGE && shown->commands[i].image != NULL)
+                CHECK(shown->commands[i].image == &nav->page.images.items[0]);
+        CHECK(browser_engine_render_frame(engine, NULL));
+        if (mode != 2) {
+            CHECK(navigation_background_resources_pending(nav)
+                && navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS
+                && !nav->page.visual_image_publication_pending);
+        } else CHECK(navigation_relayout(nav));
+        CHECK(browser_engine_render_frame(engine, NULL));
+        actual_pixels = browser_engine_framebuffer(engine, &count);
+        actual = frame_checksum(actual_pixels, count);
+        CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+        reference = browser_engine_framebuffer(engine, &reference_count);
+        CHECK(reference_count == count && actual == frame_checksum(reference, reference_count));
+    }
     fetch_trace_end();
     for (size_t i = 0; i < 4; i++) {
         char file[256];

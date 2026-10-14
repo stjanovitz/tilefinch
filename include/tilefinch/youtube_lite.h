@@ -26,6 +26,18 @@ typedef enum {
     YOUTUBE_LITE_ROUTE_PLAYLIST
 } YoutubeLiteRoute;
 
+#define YOUTUBE_PLAYLIST_TITLE_BYTES 128u
+typedef struct {
+    char video_id[32];
+    char title[YOUTUBE_PLAYLIST_TITLE_BYTES];
+} YoutubePlaylistEntry;
+typedef struct {
+    size_t first;
+    size_t count;
+    YoutubePlaylistEntry entries[YOUTUBE_LITE_MAXIMUM_RESULTS];
+    char next_url[2048];
+} YoutubePlaylistPage;
+
 typedef struct {
     Budget *budget;
     char *html;
@@ -36,7 +48,18 @@ typedef struct {
     long status_code;
     char server[64];
     char cf_mitigated[32];
+    YoutubePlaylistPage *playlist; /* Budget-owned, playlist routes only. */
 } YoutubeLiteDocument;
+
+/* Native, bounded playlist facts; no page script or DOM marker is trusted.
+   Cache access uses the same cookie/request authority as the provider. */
+bool youtube_lite_copy_playlist(BrowserSession *, const char *url,
+                               YoutubePlaylistPage *page);
+/* Explicit Retry discards only this playlist page's cached document/facts. */
+void youtube_lite_forget_playlist_page(BrowserSession *, const char *url);
+bool youtube_lite_playlist_selection(const char *url, size_t *index,
+                                    bool *all);
+bool youtube_lite_playlist_root_url(const char *url, char *output, size_t capacity);
 
 typedef struct YoutubeLiteLoadJob YoutubeLiteLoadJob;
 

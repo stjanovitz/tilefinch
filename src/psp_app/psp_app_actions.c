@@ -960,11 +960,17 @@ static void psp_app_dispatch_heavy_action(
                     bool offered_prepared_resolver =
                         prepared_resolver != NULL
                         && *prepared_resolver != NULL;
-                    bool opened = entry != NULL
-                        && psp_media_open_provider_route_prepared(
+                    size_t queue_index; bool queue_all;
+                    bool playlist = entry != NULL
+                        && youtube_lite_route(entry->url) == YOUTUBE_LITE_ROUTE_PLAYLIST
+                        && youtube_lite_playlist_selection(action.url, &queue_index, &queue_all);
+                    bool opened = entry != NULL && (playlist
+                        ? psp_media_open_playlist_route(&app->browser->media, action.url,
+                            entry->url, app->views->navigation->generation)
+                        : psp_media_open_provider_route_prepared(
                             &app->browser->media, action.url,
                             app->views->navigation->generation,
-                            prepared_resolver);
+                            prepared_resolver));
                     if (opened && offered_prepared_resolver
                         && prepared_resolver != NULL
                         && *prepared_resolver == NULL) {

@@ -160,12 +160,13 @@ bool psp_glyph_component_session_attach_hinted(
     requested &= (uint16_t) ~(session->attached_mask
                              | session->lazy_attempted_mask
                              | pack_bit(TILEFINCH_GLYPH_PACK_COLOR_EMOJI));
-    _Static_assert(TILEFINCH_GLYPH_PACK_COUNT == 10u,
+    _Static_assert(TILEFINCH_GLYPH_PACK_COUNT == 11u,
                    "list a new language pack in the lazy preference");
     static const TilefinchGlyphPack preference[] = {
         TILEFINCH_GLYPH_PACK_ARABIC,
         TILEFINCH_GLYPH_PACK_HEBREW,
         TILEFINCH_GLYPH_PACK_DEVANAGARI,
+        TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE,
         TILEFINCH_GLYPH_PACK_CYRILLIC,
         TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
         TILEFINCH_GLYPH_PACK_JAPANESE,

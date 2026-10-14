@@ -4,6 +4,7 @@ import argparse
 import hashlib
 from pathlib import Path
 from devanagari_sequences import encoded as hindi_sequences
+from indic_sequences import encoded as indic_sequences
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOGS = [(1, [("es", "Spanish", "EMBEDDED"), ("fr", "French", "EMBEDDED"),
@@ -23,7 +24,14 @@ CATALOGS.append((5, CATALOGS[-1][1]))
 CATALOGS.append((6, CATALOGS[-1][1]))
 CATALOGS.append((7, CATALOGS[-1][1]))
 CATALOGS.append((8, [("pt", "Portuguese", "EMBEDDED")]))
-ACTIVE_VERSION = 8
+CATALOGS.append((9, [("bn", "Bengali", "BENGALI_ASSAMESE"),
+                     ("as", "Assamese", "BENGALI_ASSAMESE")]))
+latest_languages = {}
+for _, languages in CATALOGS:
+    for language in languages:
+        latest_languages[language[0]] = language
+CATALOGS.append((10, list(latest_languages.values())))
+ACTIVE_VERSION = 10
 
 def read_rows(version, languages):
     source = ROOT / f"translations/ui/v{version}/source.tsv"
@@ -59,6 +67,11 @@ def outputs(resource_dir=None):
         if base_keys is not None and not base_keys <= keys:
             raise ValueError("new locales must translate every existing key")
         base_keys = keys
+        if any(glyphs == "BENGALI_ASSAMESE" for _, _, glyphs in languages):
+            labels = [row[column] for row in rows for column, (_, _, glyphs)
+                      in enumerate(languages, 1) if glyphs == "BENGALI_ASSAMESE"]
+            result[ROOT / f"translations/ui/v{version}/bengali-assamese.sequences"] = \
+                indic_sequences(labels, "bn")
         for column, (code, label, glyphs) in enumerate(languages, 1):
             data = (f"TFUI1\t{code}\n" + "".join(
                 f"{r[0]}\t{r[column]}\n" for r in rows)).encode("utf-8")
@@ -68,7 +81,7 @@ def outputs(resource_dir=None):
             if resource_dir is not None:
                 result[resource_dir / resource_key] = data
             if version <= ACTIVE_VERSION:
-                minimum_glyph_sequence = (4 if version >= 7 else 3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else 1
+                minimum_glyph_sequence = (5 if version >= 10 else 4 if version >= 7 else 3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else 1
                 active[code] = (f'    {{"{code}", "{label}", BROWSER_GLYPH_LANGUAGE_{glyphs}, '
                                 f'"{hashlib.sha256(data).hexdigest()}", {version}, {minimum_glyph_sequence}, '
                                 f'"{resource_key}"}},')
@@ -88,7 +101,14 @@ if __name__ == "__main__":
                         help="export download/test data outside the source tree")
     parser.add_argument("--resources-only", action="store_true",
                         help="export resources but only verify committed pins/sequences")
+    parser.add_argument("--list-resources", action="store_true",
+                        help="list generated resource keys for build dependencies")
     args = parser.parse_args()
+    if args.list_resources:
+        for version, languages in CATALOGS:
+            for code, _, _ in languages:
+                print(f"translations/ui/v{version}/{code}.tful")
+        raise SystemExit(0)
     if args.resources_only and args.resource_dir is None:
         parser.error("--resources-only requires --resource-dir")
     if args.resource_dir is not None:

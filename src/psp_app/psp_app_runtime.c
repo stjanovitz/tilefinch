@@ -449,7 +449,7 @@ static PspUiMediaTrackMenuCache psp_media_track_menu_cache;
 _Static_assert(
     PSP_DISPLAY_VIDEO_AUX_BYTES
         >= (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
-             * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT * sizeof(uint16_t),
+             * (size_t) PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT * sizeof(uint16_t),
     "the bounded video EDRAM tail must hold the retained track menu");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 /* Only so the mode line is printed once rather than once a frame. */
@@ -4077,13 +4077,20 @@ bool psp_platform_cooperate(
             && strcmp(phase, "optional-layout-completion") == 0);
         if (phase != NULL
             && (completion
-                || strcmp(phase, "optional-font-publication") == 0)) {
+                || strcmp(phase, "optional-font-publication") == 0
+                || strcmp(phase, "optional-image-publication") == 0)) {
             psp_runtime_cooperate.optional_preemptible = completed_work_units != 0;
             psp_runtime_cooperate.forward_awaited =
                 awaited && completed_work_units != 0;
             psp_runtime_cooperate.completion =
                 completion && completed_work_units != 0;
             if (completed_work_units == 0) return true;
+            /* A press can have been queued during the preceding decode.
+               Do not require a second physical edge to interrupt flow. */
+            if (strcmp(phase, "optional-image-publication") == 0
+                && (cooperate->pending_page_input_count != 0
+                    || psp_completed_supervisor_page_input_count != 0))
+                return false;
         }
         uint64_t now = sceKernelGetSystemTimeWide();
         if (!cooperate->active

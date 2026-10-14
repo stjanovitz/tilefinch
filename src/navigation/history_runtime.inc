@@ -187,6 +187,7 @@ bool navigation_replace_history(
             source->scroll_y < 0 ? 0 : source->scroll_y;
         staged[index].focus_kind = source->focus_kind;
         staged[index].focus_index = source->focus_index;
+        staged[index].focus_identity = source->focus_identity;
     }
     for (size_t index = 0; index < session->history_count; index++)
         entry_destroy(session->budget, &session->history[index]);
@@ -3845,6 +3846,7 @@ bool navigation_image_retarget_pending(const NavigationSession *session)
 {
     return session != NULL && session->page.loaded
         && !session->page.image_continuation_pending
+        && !session->page.visual_image_publication_pending
         && session->page.visual_batch_targets == NULL
         && session->page.images.count != 0
         && session->page.layout.count != 0
@@ -3987,6 +3989,7 @@ bool navigation_background_resources_pending(
             || fonts_external_loader_pending(
                 &session->page.external_font_loader)
             || session->page.image_continuation_pending
+            || session->page.visual_image_publication_pending
             || session->page.visual_batch_targets != NULL);
 }
 
@@ -4468,6 +4471,47 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
     return true;
 }
 
+static void navigation_rebind_appended_images(NavigationSession *session,
+                                             uintptr_t previous_base,
+                                             size_t previous_count)
+{
+    if (previous_base == (uintptr_t) session->page.images.items
+        && previous_count <= session->page.images.count) return;
+    (void) layout_rebind_image_resources(&session->page.layout,
+        previous_base, previous_count, &session->page.images);
+    if (session->image_table_moved != NULL)
+        session->image_table_moved(session->image_table_moved_opaque,
+            session, previous_base, previous_count);
+}
+
+static NavigationBackgroundWorkOutcome navigation_publish_visual_images(
+    NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    if (!page->visual_image_publication_pending)
+        return NAVIGATION_BACKGROUND_WORK_SUCCESS;
+    /* No author mutation is part of this static resource publication. New
+       input can abandon its replacement layout, keeping both the incumbent
+       and decoded resources for the next idle turn. Masks and backgrounds
+       still require full flow; the fixed-image proof does not cover them. */
+    bool optional = page->runtime == NULL && !session->style_rebuild_required;
+    bool allowed = !optional
+        || tilefinch_platform_cooperate("optional-image-publication", 1);
+    bool adopted = allowed && navigation_relayout(session);
+    if (optional)
+        (void) tilefinch_platform_cooperate("optional-image-publication", 0);
+    if (!page->loaded) return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    if (!allowed || (!adopted && page->loaded && session->layout_build_cancelled))
+        return NAVIGATION_BACKGROUND_WORK_SUCCESS;
+    page->visual_image_publication_pending = false;
+    if (!adopted) {
+        session->performance.background_image_failures++;
+        return NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
+    }
+    session->performance.background_image_relayouts++;
+    return NAVIGATION_BACKGROUND_WORK_SUCCESS;
+}
+
 static bool navigation_run_deferred_image(NavigationSession *session)
 {
     NavigationPage *page = &session->page;
@@ -4584,9 +4628,12 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     }
 
     size_t loaded_before = page->images.stats.loaded;
+    uintptr_t image_base = (uintptr_t) page->images.items;
+    size_t image_count = page->images.count;
     session->performance.background_image_batches++;
     ImagePriorityLoadStatus status = images_priority_load_pump(
         page->deferred_image_job);
+    navigation_rebind_appended_images(session, image_base, image_count);
     size_t admitted_batch = images_priority_load_target_count(
         page->deferred_image_job);
     if (admitted_batch != 0
@@ -4704,6 +4751,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
 {
     if (session == NULL || !session->page.loaded)
         return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    if (session->page.visual_image_publication_pending)
+        return navigation_publish_visual_images(session);
     NavigationBackgroundWorkOutcome outcome =
         navigation_run_web_font_memory_work(session);
     if (fonts_external_loader_pending(
@@ -4794,6 +4843,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         page->visual_batch_targets = NULL;
         page->visual_batch_count = 0;
         size_t loaded_before = page->images.stats.loaded;
+        uintptr_t image_base = (uintptr_t) page->images.items;
+        size_t image_count = page->images.count;
         bool loaded = images_load_external_priority_targets(
             &page->document, &page->stylesheet, &page->images, targets,
             count, session->budget, page->resource_base_url,
@@ -4804,17 +4855,15 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             session->resource_timeout_ms, page->resource_scheduler,
             session->browser_session);
         budget_free(session->budget, targets);
+        navigation_rebind_appended_images(session, image_base, image_count);
         session->images = &page->images;
         navigation_ensure_layout_reuse(session);
         layout_reuse_cache_update_images(page->layout_reuse, &page->images);
         if (loaded && page->images.stats.loaded > loaded_before) {
             session->performance.background_images_loaded +=
                 page->images.stats.loaded - loaded_before;
-            if (!navigation_relayout(session)) {
-                session->performance.background_image_failures++;
-                return NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
-            }
-            session->performance.background_image_relayouts++;
+            page->visual_image_publication_pending = true;
+            return navigation_publish_visual_images(session);
         } else if (!loaded) {
             session->performance.background_image_failures++;
         }
@@ -4827,6 +4876,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
     }
     ImageResources *images = &session->page.images;
     size_t loaded_before = images->stats.loaded;
+    uintptr_t image_base = (uintptr_t) images->items;
+    size_t image_count = images->count;
     session->performance.background_image_batches++;
     navigation_ensure_layout_reuse(session);
     bool loaded = images_load_external_reusing_layout_styles(
@@ -4839,6 +4890,7 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         session->resource_timeout_ms, session->page.resource_scheduler,
         session->browser_session, session->page.layout_reuse,
         session->fonts, session->viewport.css_width);
+    navigation_rebind_appended_images(session, image_base, image_count);
     if (!loaded) {
         session->page.image_continuation_pending = false;
         session->performance.background_image_failures++;

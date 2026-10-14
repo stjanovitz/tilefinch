@@ -24,17 +24,22 @@ int main(void)
         == BROWSER_GLYPH_LANGUAGE_KOREAN);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->glyphs
         == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 4);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 5);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->minimum_glyph_sequence == 1);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->glyphs
         == BROWSER_GLYPH_LANGUAGE_ARABIC);
     CHECK(TILEFINCH_UI_LANGUAGE_ARABIC == 10);
     CHECK(TILEFINCH_UI_LANGUAGE_PORTUGUESE == 11);
+    CHECK(TILEFINCH_UI_LANGUAGE_BENGALI == 12 && TILEFINCH_UI_LANGUAGE_ASSAMESE == 13);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_BENGALI)->glyphs
+        == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ASSAMESE)->glyphs
+        == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE);
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 8);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 7);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 10);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 10);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -68,6 +73,11 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Portuguese"), "Português"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Sign in"), "Entrar"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
+        }
+        if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
+            CHECK(tilefinch_ui_language_spec(language)->version == 10);
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
             /* Arabic labels are shaped and visually ordered exactly once. */

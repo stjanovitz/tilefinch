@@ -31,7 +31,8 @@ static bool test_menu_blit(
 {
     (void) context;
     if (source_width == (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
-        && source_height == (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) {
+        && (source_height == (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT
+            || source_height == (int) PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT)) {
         menu_blit_calls++;
         if (source_changed) menu_blit_source_changes++;
     }
@@ -105,6 +106,37 @@ static bool test_page_activation_activity(void)
     CHECK(ui.toast_frames == 180 && strcmp(ui.status, "REQUEST FAILED") == 0);
     CHECK(!psp_ui_finish_page_activation(&ui, receipt));
     CHECK(!psp_ui_finish_page_activation(NULL, receipt));
+    return true;
+}
+
+static bool test_focused_action_hint(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t ordinary[W * H], named[W * H], changed[W * H];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    ui.chrome_visible = true;
+    ui.focus_label_valid = true;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui.browser_ui_scale = scale;
+        ui.focus_label[0] = '\0';
+        memset(ordinary, 0, sizeof(ordinary));
+        psp_ui_composite(&ui, ordinary, W, H, W);
+        snprintf(ui.focus_label, sizeof(ui.focus_label), "Like");
+        memset(named, 0, sizeof(named));
+        psp_ui_composite(&ui, named, W, H, W);
+        CHECK(memcmp(ordinary, named, sizeof(ordinary)) != 0);
+        CHECK(memcmp(ordinary, named, W * 240u * sizeof(uint16_t)) == 0);
+        snprintf(ui.focus_label, sizeof(ui.focus_label), "Watch Later");
+        memset(changed, 0, sizeof(changed));
+        psp_ui_composite(&ui, changed, W, H, W);
+        CHECK(memcmp(named, changed, sizeof(named)) != 0);
+        ui.focus_label[0] = '\0';
+        memset(changed, 0, sizeof(changed));
+        psp_ui_composite(&ui, changed, W, H, W);
+        CHECK(memcmp(ordinary, changed, sizeof(ordinary)) == 0);
+    }
     return true;
 }
 
@@ -909,6 +941,7 @@ static bool test_input_mapping_and_menu(void)
         BROWSER_GLYPH_LANGUAGE_ARABIC,
         BROWSER_GLYPH_LANGUAGE_HEBREW,
         BROWSER_GLYPH_LANGUAGE_DEVANAGARI,
+        BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE,
         BROWSER_GLYPH_LANGUAGE_EMBEDDED
     };
     for (size_t glyph = 0;
@@ -921,9 +954,9 @@ static bool test_input_mapping_and_menu(void)
     }
     input.pressed = PSP_UI_BUTTON_LEFT;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_DEVANAGARI
+    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE
           && intent.setting.value.glyph_language
-                 == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
+                 == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
@@ -6558,12 +6591,235 @@ static bool test_website_font_setting(void)
     return true;
 }
 
+static bool test_playlist_player_controls(void)
+{
+    PspUiMediaState media; PspUiMediaPresentation presentation = {0};
+    psp_ui_media_init(&media); media.presentation = &presentation;
+    psp_ui_media_set(&media, true, true, false, 0, 60000000, "Queue fixture");
+    presentation.queue_active = presentation.queue_next = true;
+    presentation.queue_position = 5; presentation.queue_count = 3;
+    for (unsigned i = 0; i < 3; i++) snprintf(presentation.queue_titles[i], 128, "Entry %u", i + 6);
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_TOOLBAR};
+    PspUiMediaIntent intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_NONE && presentation.track_menu_open
+        && presentation.track_menu_tab == 3 && presentation.track_menu_selection == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 1u);
+    input.pressed = PSP_UI_BUTTON_DOWN; (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM; intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT && intent.track_index == 2);
+    input.pressed = PSP_UI_BUTTON_PAGE_UP; intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PREVIOUS);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN; intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_NEXT);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR; (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_RELOAD; intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT && presentation.track_menu_open);
+    input.pressed = PSP_UI_BUTTON_CANCEL; (void) psp_ui_media_update(&media, &input);
+    psp_ui_media_set_error(&media, "Fixture loading failure");
+    const char *reason = "Video unavailable\nTry again or skip this entry";
+    psp_ui_media_set_error(&media, reason);
+    CHECK(strcmp(media.status, reason) == 0);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_RETRY);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_NEXT);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR; (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_open && presentation.track_menu_tab == 3);
+    presentation.queue_failed = presentation.queue_retry = true;
+    presentation.track_menu_selection = 0;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_QUEUE_RETRY
+        && presentation.track_menu_open);
+    input.pressed = PSP_UI_BUTTON_CANCEL; (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    /* A terminal continuation cannot retry: its only control exits rather
+       than replacing the real error with an unscheduled loading screen. */
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    presentation.queue_retry = false;
+    presentation.track_menu_selection = 0;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_CLOSE);
+
+    /* Final-video choices use existing translated controls and never select
+       an upcoming row which does not exist. X restarts the current entry. */
+    psp_ui_media_set(&media, true, false, true, 60000000, 60000000, NULL);
+    presentation.queue_failed = presentation.queue_loading = presentation.queue_next = false;
+    presentation.queue_count = 1;
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_selection == 0);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT && intent.track_index == 0);
+    presentation.track_menu_open = true;
+    presentation.track_menu_selection = 1;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_PREVIOUS);
+    presentation.track_menu_open = true;
+    presentation.track_menu_selection = 2;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    presentation.queue_position = 0;
+    presentation.track_menu_open = true;
+    presentation.track_menu_selection = 1;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    presentation.track_menu_open = true;
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_CLOSE);
+    return true;
+}
+
+static bool test_queue_square_is_modal(void)
+{
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 1000000, 60000000, "Queue");
+    p.queue_active = p.queue_next = p.track_menu_open = true;
+    p.queue_count = 6; p.track_menu_tab = 3; p.track_menu_selection = 2;
+    PspUiInput square = {.pressed = PSP_UI_BUTTON_RELOAD};
+    for (unsigned state = 0; state < 4; state++) {
+        media.resolving = state == 1;
+        media.buffering = state == 2;
+        media.failed = state == 3;
+        media.lower_quality_recovery_available = true;
+        PspUiMediaIntent intent = psp_ui_media_update(&media, &square);
+        CHECK(intent.action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT);
+        CHECK(p.automatic_next == (state % 2u == 0u)
+            && intent.track_index == p.automatic_next);
+        CHECK(p.track_menu_open && p.track_menu_selection == 2);
+        CHECK(media.current_time_us == 1000000 && !media.seek_preview_active);
+    }
+    p.track_menu_tab = 0;
+    CHECK(psp_ui_media_update(&media, &square).action == PSP_UI_MEDIA_ACTION_NONE);
+    CHECK(p.track_menu_open);
+    p.track_menu_open = false;
+    CHECK(psp_ui_media_update(&media, &square).action == PSP_UI_MEDIA_ACTION_LOWER_QUALITY);
+    return true;
+}
+
+static bool test_menu_cache_only_tracks_visible_catalogs(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t scratch[W * H], menu[352 * 208];
+    static uint32_t pixels[W * H], expected[W * H];
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 0, 60000000, "Current");
+    p.queue_active = p.queue_next = p.track_menu_open = true;
+    p.queue_count = 6; p.track_menu_tab = 3; p.track_menu_selection = 2;
+    p.audio_track_count = p.chapter_count = 1;
+    p.chapters[0].seconds = 10;
+    for (unsigned at = 0; at < 6; at++) snprintf(p.queue_titles[at], 128, "Video %u", at);
+    PspUiMediaTrackMenuCache cache = {0};
+    menu_blit_calls = menu_blit_source_changes = 0; menu_blit_valid = true;
+    for (unsigned pass = 0; pass < 4; pass++) {
+        for (unsigned at = 0; at < W * H; at++) pixels[at] = expected[at] = UINT32_C(0xff24689a);
+        /* Poison the source only when it must be freshly rasterized. */
+        if (pass == 0 || pass == 3) memset(menu, 0xa5, sizeof(menu));
+        psp_ui_media_composite_8888_cached(&media, NULL, pixels, W, H, W,
+            scratch, menu, 352 * 208, 1, &cache, test_menu_blit, NULL);
+        psp_ui_media_composite_8888(&media, NULL, expected, W, H, W, scratch);
+        CHECK(!memcmp(pixels, expected, sizeof(pixels)) && menu_blit_valid);
+        CHECK(menu_blit_source_changes == (pass == 3 ? 2u : 1u));
+        if (pass == 0) {
+            strcpy(p.audio_tracks[0].label, "Changed hidden audio label");
+            p.selected_audio_track = -1;
+            strcpy(p.chapters[0].title, "Changed hidden chapter title");
+            p.chapters[0].seconds = 20;
+        } else if (pass == 1) media.current_time_us = 30000000;
+        else if (pass == 2) strcpy(p.queue_titles[1], "Changed visible video title");
+    }
+    return true;
+}
+
+static bool test_queue_taller_cache_and_selection(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t scratch[W * H];
+    static uint16_t menu[PSP_UI_MEDIA_TRACK_MENU_WIDTH * PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT];
+    static uint32_t plain[W * H], cached[W * H];
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 0, 60000000, "Current");
+    p.queue_active = p.queue_next = true; p.queue_count = 6;
+    for (unsigned at = 0; at < 6; at++) snprintf(p.queue_titles[at], 128, "Video %u", at + 1);
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_TOOLBAR};
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(psp_ui_media_track_menu_height(&media) == 208);
+    CHECK(p.track_menu_selection == 2);
+    input.pressed = PSP_UI_BUTTON_UP;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(p.track_menu_selection == 6);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(p.track_menu_selection == 2);
+    PspUiMediaTrackMenuCache cache = {0};
+    for (unsigned pass = 0; pass < 3; pass++) {
+        for (unsigned at = 0; at < W * H; at++) plain[at] = cached[at] = UINT32_C(0xff325476);
+        psp_ui_media_composite_8888(&media, NULL, plain, W, H, W, scratch);
+        psp_ui_media_composite_8888_cached(&media, NULL, cached, W, H, W,
+            scratch, menu, sizeof(menu) / sizeof(menu[0]), 1, &cache, NULL, NULL);
+        CHECK(cache.valid && !memcmp(plain, cached, sizeof(plain)));
+        CHECK(cached[31 * W + 64] == UINT32_C(0xff325476));
+        CHECK(cached[32 * W + 64] != UINT32_C(0xff325476));
+        CHECK(cached[239 * W + 64] != UINT32_C(0xff325476));
+        CHECK(cached[240 * W + 64] == UINT32_C(0xff325476));
+        input.pressed = PSP_UI_BUTTON_RELOAD;
+        CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT);
+    }
+    /* Pinned title and section caption cannot activate/restart the video. */
+    CHECK(psp_ui_media_activate_at(&media, 140, 80, W, H).action == PSP_UI_MEDIA_ACTION_NONE);
+    /* Independent expected coordinates: each 18-pixel hit cell starts at
+       logical y=119. Verify both edges and the label in both orientations. */
+    for (unsigned portrait = 0; portrait < 2; portrait++) {
+        p.clockwise = portrait != 0;
+        for (unsigned row = 0; row < 5; row++) {
+            const int sample_y[] = {119, 130, 136};
+            for (unsigned sample = 0; sample < 3; sample++) {
+                int logical_y = sample_y[sample] + (int) row * 18;
+                int x = portrait ? W - 1 - logical_y : 140;
+                int y = portrait ? 140 : logical_y;
+                p.track_menu_open = true;
+                PspUiMediaIntent intent = psp_ui_media_activate_at(&media, x, y, W, H);
+                CHECK(intent.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+                    && intent.track_index == row + 1u);
+            }
+        }
+        /* The pinned title and the gap after the last row are inert. */
+        const int inert_y[] = {80, 118, 209};
+        for (unsigned sample = 0; sample < 3; sample++) {
+            p.track_menu_open = true;
+            int x = portrait ? W - 1 - inert_y[sample] : 140;
+            int y = portrait ? 140 : inert_y[sample];
+            CHECK(psp_ui_media_activate_at(&media, x, y, W, H).action == PSP_UI_MEDIA_ACTION_NONE);
+        }
+        p.track_menu_open = true;
+        CHECK(psp_ui_media_activate_at(&media, portrait ? W - 1 - 229 : 140,
+            portrait ? 140 : 229, W, H).action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT);
+    }
+    p.clockwise = false;
+    p.track_menu_open = true;
+    CHECK(psp_ui_media_activate_at(&media, 140, 229, W, H).action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT);
+    /* No upcoming entry: the pinned current title is still not a focus stop,
+       but the Queue tab and its shortcut remain available. */
+    p.queue_count = 1;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_NONE);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    CHECK(psp_ui_media_update(&media, &input).action == PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT);
+    return true;
+}
+
 int main(void)
 {
+    if (!test_queue_square_is_modal()) return 1;
+    if (!test_queue_taller_cache_and_selection()) return 1;
+    if (!test_menu_cache_only_tracks_visible_catalogs()) return 1;
+    if (!test_playlist_player_controls()) return 1;
     if (!test_website_font_setting()) return 1;
     if (!test_player_chapter_timeline_and_menu()
         || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()
+        || !test_focused_action_hint()
         || !test_every_interface_language_fits_the_ui_state()
         || !test_priority_menu_during_page_work()
         || !test_input_mapping_and_menu()
