@@ -70,16 +70,6 @@ const CanvasGePresenterStats *psp_present_canvas_ge_stats(void)
     return &psp_present_canvas_ge.stats;
 }
 
-#define PSP_CERTIFICATE_YOUTUBE_HEAD "YouTube page fetch failed"
-#define PSP_CERTIFICATE_GENERIC_HEAD "Secure page fetch failed"
-_Static_assert(
-    sizeof(PSP_CERTIFICATE_YOUTUBE_HEAD) - 1u
-        <= PSP_UI_LARGE_TOAST_CHARACTER_LIMIT,
-    "YouTube certificate headline must fit the large PSP toast");
-_Static_assert(
-    sizeof(PSP_CERTIFICATE_GENERIC_HEAD) - 1u
-        <= PSP_UI_LARGE_TOAST_CHARACTER_LIMIT,
-    "generic certificate headline must fit the large PSP toast");
 const char *psp_user_visible_error(
     const char *detail, long tls_verify_result,
     bool tls_verify_result_available, bool tls_verification_failed,
@@ -89,22 +79,17 @@ const char *psp_user_visible_error(
     if (detail == NULL) detail = "";
     if (tls_guidance != NULL) *tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
     if (summary == NULL || summary_size == 0
-        || !tls_verification_failed) {
+        || (!tls_verification_failed
+            && !tilefinch_error_is_certificate_verification_failure(detail))) {
         return detail;
     }
     PspTimeStatus clock_status = psp_time_read_utc(NULL);
     /* Keep the useful route-level context, but move the recovery action onto
        its own full-width line. The unabridged backend sentence remains in the
        failure report rather than being clipped into an unreadable toast. */
-    const char *headline = strstr(
-            detail, "YouTube page fetch failed") != NULL
-        ? PSP_CERTIFICATE_YOUTUBE_HEAD
-        : PSP_CERTIFICATE_GENERIC_HEAD;
-    if (tls_guidance != NULL) {
-        *tls_guidance = tilefinch_tls_verification_guidance(
-            (uint32_t) tls_verify_result,
-            tls_verify_result_available, clock_status);
-    }
+    const char *headline = tilefinch_tls_verification_summary(
+        detail, (uint32_t) tls_verify_result,
+        tls_verify_result_available, clock_status, tls_guidance);
     snprintf(summary, summary_size, "%s", headline);
     return summary;
 }

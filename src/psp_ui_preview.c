@@ -105,9 +105,10 @@ int main(int argc, char **argv)
     memset(&fonts, 0, sizeof(fonts));
     TilefinchUiTranslation *translation = NULL;
     if (strcmp(mode, "glyph-options-es") == 0 || strcmp(mode, "glyph-options-fr") == 0
-        || strcmp(mode, "glyph-options-de") == 0) {
+        || strcmp(mode, "glyph-options-de") == 0 || strcmp(mode, "glyph-options-pt") == 0) {
         unsigned language = strcmp(mode, "glyph-options-es") == 0 ? 1u
-            : strcmp(mode, "glyph-options-fr") == 0 ? 2u : 3u;
+            : strcmp(mode, "glyph-options-fr") == 0 ? 2u
+            : strcmp(mode, "glyph-options-de") == 0 ? 3u : TILEFINCH_UI_LANGUAGE_PORTUGUESE;
         char source[1024];
         snprintf(source, sizeof(source), "%s/%s", TILEFINCH_UI_RESOURCE_ROOT,
                  tilefinch_ui_language_spec(language)->resource_key);
@@ -550,6 +551,7 @@ int main(int argc, char **argv)
                || strcmp(mode, "glyph-options-es") == 0
                || strcmp(mode, "glyph-options-fr") == 0
                || strcmp(mode, "glyph-options-de") == 0
+               || strcmp(mode, "glyph-options-pt") == 0
                || strcmp(mode, "glyph-options-offers") == 0
                || strcmp(mode, "glyph-options-reset") == 0) {
         ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
@@ -718,12 +720,18 @@ int main(int argc, char **argv)
             ui.browser_ui_scale = 2;
         psp_ui_show_status(&ui, PSP_UI_STATUS_RELOAD_OFFER, 600);
         ui.toast_entry_frames = 0;
-    } else if (strcmp(mode, "tls-error") == 0) {
+    } else if (strcmp(mode, "tls-error") == 0
+               || strcmp(mode, "tls-clock-recovery") == 0) {
         ui.browser_ui_scale = 2;
-        psp_ui_show_status(
-            &ui, "YouTube page fetch failed\n"
-                 "Try correcting PSP date/time, then retry", 300);
+        psp_ui_show_tls_status(
+            &ui, "Certificate not yet valid", TILEFINCH_TLS_GUIDANCE_TIME, 300);
         ui.toast_entry_frames = 0;
+        if (strcmp(mode, "tls-clock-recovery") == 0) {
+            psp_ui_show_failure_recovery_actions(
+                &ui, "Certificate not yet valid", 0u);
+            ui.toast_frames = 0;
+            ui.overlay_animation_frames = 0;
+        }
     } else if (strcmp(mode, "bot-wall") == 0) {
         /* The notice over a bot-protection wall (navigation_bot_wall);
            the optional fourth argument names the site, the fifth the

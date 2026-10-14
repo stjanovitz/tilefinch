@@ -13,6 +13,20 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
+    def test_new_locale_preserves_existing_resource_identity(self):
+        manifest = generator.outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
+        old_languages = generator.CATALOGS[-2][1]
+        rows = generator.read_rows(7, old_languages)
+        for column, (code, label, glyphs) in enumerate(old_languages, 1):
+            data = (f"TFUI1\t{code}\n" + "".join(
+                f"{row[0]}\t{row[column]}\n" for row in rows)).encode()
+            self.assertIn(f'"translations/ui/v7/{code}.tful"', manifest)
+            self.assertIn(hashlib.sha256(data).hexdigest(), manifest)
+        self.assertIn('"translations/ui/v8/pt.tful"', manifest)
+        portuguese = generator.read_rows(8, generator.CATALOGS[-1][1])
+        self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
+        self.assertEqual(dict(portuguese)["Portuguese"], "Português")
+
     def test_native_player_labels_have_translations(self):
         languages = generator.CATALOGS[-1][1]
         rows = generator.read_rows(generator.ACTIVE_VERSION, languages)

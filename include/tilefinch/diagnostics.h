@@ -114,4 +114,11 @@ TilefinchTlsGuidance tilefinch_tls_verification_guidance(
     uint32_t verification_flags, bool verification_flags_available,
     PspTimeStatus clock_status);
 
+/* Presentation only, for a failed certificate verification. The returned
+   headline is static; the original transport error stays in diagnostics. */
+const char *tilefinch_tls_verification_summary(
+    const char *detail, uint32_t verification_flags,
+    bool verification_flags_available, PspTimeStatus clock_status,
+    TilefinchTlsGuidance *guidance);
+
 #endif

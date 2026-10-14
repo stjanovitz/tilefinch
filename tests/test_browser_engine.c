@@ -629,6 +629,8 @@ int main(int argc, char **argv)
               "TLS certificate is not correctly signed")
           && tilefinch_error_is_certificate_verification_failure(
               "X.509 certificate is not yet valid")
+          && tilefinch_error_is_certificate_verification_failure(
+              "The certificate validity starts in the future")
           && !tilefinch_error_is_certificate_verification_failure(
               "page mentions a certificate")
           && !tilefinch_error_is_certificate_verification_failure(
@@ -695,6 +697,40 @@ int main(int argc, char **argv)
           && tilefinch_tls_verification_guidance(
                  TILEFINCH_TLS_VERIFY_BAD_KEY, true, PSP_TIME_OK)
               == TILEFINCH_TLS_GUIDANCE_UNSUPPORTED);
+    TilefinchTlsGuidance tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "YouTube page fetch failed: mbedTLS error",
+              TILEFINCH_TLS_VERIFY_FUTURE, true, PSP_TIME_OK,
+              &tls_guidance), "Certificate not yet valid") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "The certificate validity starts in the future", 0, false,
+              PSP_TIME_OK, &tls_guidance), "Certificate not yet valid") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "X.509 certificate is not yet valid", 0, true,
+              PSP_TIME_OK, &tls_guidance), "Certificate not yet valid") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "certificate verification failed", 0, false,
+              PSP_TIME_UNREADABLE, &tls_guidance), "PSP clock unavailable") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              NULL, 0, false, PSP_TIME_INVALID_FIELDS, NULL),
+              "PSP clock unavailable") == 0);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              NULL, 0, false, PSP_TIME_OUT_OF_TIME_T_RANGE, &tls_guidance),
+              "PSP clock unavailable") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "YouTube page fetch failed: request deadline expired", 0, false,
+              PSP_TIME_OK, &tls_guidance), "YouTube page fetch failed") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_DETAILS);
+    CHECK(strcmp(tilefinch_tls_verification_summary(
+              "The certificate validity starts in the future",
+              TILEFINCH_TLS_VERIFY_HOSTNAME, true, PSP_TIME_OK, &tls_guidance),
+              "Secure page fetch failed") == 0
+          && tls_guidance == TILEFINCH_TLS_GUIDANCE_REDIRECTED);
     puts("tilefinch-browser-engine-tests: all checks passed");
     return 0;
 }

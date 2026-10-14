@@ -212,7 +212,7 @@ video metadata and topic names.
 For the browser interface, open **Settings → Appearance → Language & emoji →
 Interface language**. Choose with Left/Right and press X to install. English,
 Spanish, French, German, Japanese, Russian, Ukrainian, Simplified Chinese,
-Korean, Hindi and Arabic are available. Languages needing extra glyphs also
+Korean, Hindi, Arabic and Portuguese are available. Languages needing extra glyphs also
 download their font pack. Restart to apply. This is separate from page fonts
 and preferred audio/subtitle languages; it does not translate websites or
 games. Advanced messages not yet translated stay in English. Translations and

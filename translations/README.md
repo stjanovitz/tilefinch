@@ -2,7 +2,8 @@
 
 Settings → Appearance → Language & emoji → Interface language offers English,
 Spanish, French, German, Japanese, Russian, Ukrainian, Simplified Chinese and
-Korean, Hindi and Arabic. Left/Right selects; X installs. A second X during installation cancels.
+Korean, Hindi, Arabic and Portuguese. Left/Right selects; X installs. A second
+X during installation cancels.
 Restart to apply the saved selection.
 
 Non-English selections download a small data-only translation file from
@@ -10,8 +11,8 @@ Non-English selections download a small data-only translation file from
 Japanese, Chinese and Korean also install their existing signed
 glyph packs; Russian and Ukrainian install the Cyrillic pack, Hindi installs
 Devanagari, and Arabic uses the Arabic pack. Spanish, French
-and German use the built-in font. Page fonts, preferred video languages and
-HTTP language preferences remain independent.
+German and Portuguese use the built-in font. Page fonts, preferred video
+languages and HTTP language preferences remain independent.
 
 Common native navigation, settings labels and controls are translated. Advanced
 diagnostics and messages not yet translated remain in English. Missing or
@@ -42,16 +43,18 @@ Sources and generation tools remain in the browser repository. Host builds
 generate test resources in their build directory; public-clone tests need no
 network or optional-download checkout. The generated-file test checks their
 exact identity. The browser accepts only
-the SHA-256-pinned bytes, with a 32 KiB / 320-row limit. Values are display text,
+the SHA-256-pinned bytes, with a 32 KiB / 336-row limit. Values are display text,
 not executable code or formatting programs.
 
 Downloads use tilefinch-models' `main` branch and versioned
 `translations/ui/vN/` path.
 The original languages remain at v1; Russian, Ukrainian, Chinese and Korean
-use v2; Hindi and Arabic use v3. The current catalog uses v6 for all ten
-downloadable languages, adding playlist and subscription controls to the
-YouTube labels introduced in v5 and navigation instructions from v4. V1–v5
-remain immutable for existing releases. The file
+use v2; Hindi and Arabic use v3. The current catalog retains v7 for those ten
+downloadable languages, including native player controls, and adds Portuguese
+in v8. Portuguese uses European Portuguese wording and the built-in Latin
+font; it needs no additional glyph pack. V1–v7 remain immutable for existing
+releases. The v8 Portuguese file must be published to tilefinch-models before
+its in-app download is available. The file
 format is unchanged, and the browser catalog pins each language's version.
 They become available when those files are published; local-only changes cannot
 be downloaded by a device. Existing releases reject changed files rather than
@@ -93,6 +96,5 @@ files likewise become downloadable only when their versioned paths are public.
 For a new catalog, rebuild the Hindi pack from the active version's
 `hi.sequences` before publishing the catalog: older packs may not contain the
 new navigation instructions' syllable clusters.
-The v6 Hindi catalog uses the same cluster inventory as v5 and requires
-signed Devanagari revision 3; selecting Hindi
+The v7 Hindi catalog requires signed Devanagari revision 4; selecting Hindi
 updates an older pack before reporting installation complete.

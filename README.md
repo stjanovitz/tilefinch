@@ -206,8 +206,8 @@ Open **Settings → Appearance → Language & emoji → Interface language**.
 Choose with Left/Right, press X to install, then restart Tilefinch to apply.
 English is built in; downloadable translations are available for Spanish,
 French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
-Hindi and Arabic. Choosing a language also downloads its required glyph pack
-if it is not already installed. Advanced messages not yet translated remain
+Hindi, Arabic and Portuguese. Choosing a language also downloads its required
+glyph pack if it is not already installed. Advanced messages not yet translated remain
 in English, and English stays available if a download fails.
 
 This changes Tilefinch's menus—not the text of websites, games, or subtitles.

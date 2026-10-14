@@ -30,14 +30,27 @@ exiting clears it.
 Check the PSP's date and time under **Settings → Date & Time Settings**, then
 retry. HTTPS certificates are valid only for a stated date range, so a PSP
 whose clock has reset to an old date can make a valid site look untrusted.
-Tilefinch keeps the page's failure on the first line of the message and adds
-**Try correcting PSP date/time, then retry** on a second line, rather than
-showing a clipped error from the TLS library.
+
+**“The certificate validity starts in the future”**, **“certificate is not
+yet valid”**, or **“Certificate not yet valid”** means the certificate's start
+date is later than the date Tilefinch is using. The usual cause is an old or
+incorrect PSP clock, not a Wi-Fi password problem. Exit to the PSP's XMB and
+open **Settings → Date & Time Settings**. Check the **year**, month, day, time,
+and time zone against the current date and local time, then reopen Tilefinch
+and retry. A clock that is ahead can instead cause a certificate-expired error.
+
+Tilefinch now shows **Certificate not yet valid** with **Make sure date/time
+in XMB Settings is correct**, rather than only the TLS library's error sentence.
+**PSP clock unavailable** means the clock could not be read or converted to a
+supported date; check it in XMB too. Older builds may show only the original
+Mbed TLS error.
 
 Tilefinch never bypasses certificate checks and never sets the clock from an
 unauthenticated network source. If the clock is right and the error persists,
 open **Help & diagnostics → Diagnostic QR** and share every QR page; the
 report includes the exact clock value and the original certificate error.
+A site's certificate can also genuinely be dated in the future; if your
+clock is correct, do not keep changing it just to make the page load.
 
 ## A page won't finish loading
 

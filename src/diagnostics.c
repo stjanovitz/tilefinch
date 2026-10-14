@@ -115,6 +115,8 @@ bool tilefinch_error_is_certificate_verification_failure(
         || diagnostic_contains_ascii_folded(detail, "verification failed")
         || diagnostic_contains_ascii_folded(detail, "verify failed")
         || diagnostic_contains_ascii_folded(detail, "not yet valid")
+        || diagnostic_contains_ascii_folded(
+               detail, "validity starts in the future")
         || diagnostic_contains_ascii_folded(detail, "expired");
     return certificate && verification;
 }
@@ -139,4 +141,30 @@ TilefinchTlsGuidance tilefinch_tls_verification_guidance(
         return TILEFINCH_TLS_GUIDANCE_UNSUPPORTED;
     }
     return TILEFINCH_TLS_GUIDANCE_DETAILS;
+}
+
+const char *tilefinch_tls_verification_summary(
+    const char *detail, uint32_t flags, bool flags_available,
+    PspTimeStatus clock_status, TilefinchTlsGuidance *guidance)
+{
+    TilefinchTlsGuidance recovery = tilefinch_tls_verification_guidance(
+        flags, flags_available, clock_status);
+    /* Some transport versions provide the certificate error sentence but no
+       verification flags. Recognize date failures without guessing from an
+       unrelated timeout, and never change the verification decision. */
+    bool future = flags_available
+        && (flags & TILEFINCH_TLS_VERIFY_FUTURE) != 0;
+    if ((!flags_available || flags == 0)
+        && tilefinch_error_is_certificate_verification_failure(detail)
+        && (diagnostic_contains_ascii_folded(detail, "not yet valid")
+            || diagnostic_contains_ascii_folded(
+                   detail, "validity starts in the future"))) {
+        future = true;
+        recovery = TILEFINCH_TLS_GUIDANCE_TIME;
+    }
+    if (guidance != NULL) *guidance = recovery;
+    if (clock_status != PSP_TIME_OK) return "PSP clock unavailable";
+    if (future) return "Certificate not yet valid";
+    return detail != NULL && strstr(detail, "YouTube page fetch failed") != NULL
+        ? "YouTube page fetch failed" : "Secure page fetch failed";
 }

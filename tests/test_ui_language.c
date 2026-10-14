@@ -28,6 +28,13 @@ int main(void)
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->minimum_glyph_sequence == 1);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->glyphs
         == BROWSER_GLYPH_LANGUAGE_ARABIC);
+    CHECK(TILEFINCH_UI_LANGUAGE_ARABIC == 10);
+    CHECK(TILEFINCH_UI_LANGUAGE_PORTUGUESE == 11);
+    CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
+        == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 8);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 7);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -56,6 +63,12 @@ int main(void)
         bytes[length] = 0;
         TilefinchUiTranslation *t = tilefinch_ui_translation_create(&budget, language, bytes, length);
         CHECK(t);
+        if (language == TILEFINCH_UI_LANGUAGE_PORTUGUESE) {
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Settings"), "Definições"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Portuguese"), "Português"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Sign in"), "Entrar"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
+        }
         if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
             /* Arabic labels are shaped and visually ordered exactly once. */
             const char *settings = tilefinch_ui_translation_text(t, "Settings");

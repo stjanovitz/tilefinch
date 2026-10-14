@@ -836,6 +836,23 @@ static bool test_all_languages(void)
         CHECK(load_catalog(&budget, language, &translation));
         tilefinch_ui_translation_bind(translation);
         language_code = tilefinch_ui_language_spec(language)->code;
+        if (language == TILEFINCH_UI_LANGUAGE_PORTUGUESE) {
+            /* Test the shipped faces directly: the synthetic optional pack
+               must not conceal a missing Portuguese accent. */
+            for (size_t row = 0; row < key_count; row++) {
+                size_t bytes = strlen(values[row]);
+                for (size_t at = 0; at < bytes;) {
+                    unsigned cp;
+                    size_t used = font_utf8_next(values[row] + at, bytes - at, &cp);
+                    CHECK(used);
+                    at += used;
+                    if (cp < 128 || cp >= 0x250) continue;
+                    CHECK(font_face_has_codepoint(font_set_face(&fonts, FONT_SANS), cp));
+                    CHECK(font_face_has_codepoint(font_set_face_variant(&fonts, FONT_SANS, false, true), cp));
+                    CHECK(font_face_has_codepoint(font_set_face(&fonts, FONT_SERIF), cp));
+                }
+            }
+        }
         CHECK(test_provider_language(&fonts, provider));
         if (language != TILEFINCH_UI_LANGUAGE_ENGLISH) {
             for (size_t key = 0; key < sizeof(navigation_keys) / sizeof(navigation_keys[0]); key++) {
@@ -994,10 +1011,116 @@ static bool test_all_languages(void)
     return true;
 }
 
+static bool test_menu_metadata_equivalence(void)
+{
+    static const uint8_t groups[] = {
+        [UI_OPTION_WEB_FONTS] = 0,
+        [UI_OPTION_CUSTOM_HOMEPAGE] = 1, [UI_OPTION_HISTORY] = 1,
+        [UI_OPTION_RESTORE_LAST_PAGE] = 1, [UI_OPTION_TAB_HIBERNATION] = 1,
+        [UI_OPTION_TEXT_ENTRY] = 1, [UI_OPTION_ANALOG_CURSOR] = 1,
+        [UI_OPTION_GAMEPAD_FACE_MAPPING] = 1, [UI_OPTION_JAVASCRIPT] = 1,
+        [UI_OPTION_SEARCH_ENGINE] = 1, [UI_OPTION_BASIC_FALLBACK] = 1,
+        [UI_OPTION_HEAVY_PAGES] = 1,
+        [UI_OPTION_VIDEO_SCALING] = 2, [UI_OPTION_ROTATE_HINT] = 2,
+        [UI_OPTION_YOUTUBE_QUALITY] = 2, [UI_OPTION_VIDEO_LANGUAGE] = 2,
+        [UI_OPTION_YOUTUBE_AUDIO_ONLY] = 2, [UI_OPTION_YOUTUBE_RESULTS] = 2,
+        [UI_OPTION_VIDEO_STARTUP_BUFFERING] = 2, [UI_OPTION_YOUTUBE_TOPICS] = 2,
+        [UI_OPTION_YOUTUBE_LOGIN] = 2, [UI_OPTION_RESUME_DOWNLOADS] = 2,
+        [UI_OPTION_SAVE_PLAYBACK_POSITIONS] = 2, [UI_OPTION_CLEAR_PLAYBACK_POSITIONS] = 2,
+        [UI_OPTION_CONTENT_BLOCKER] = 3, [UI_OPTION_COSMETIC_HIDING] = 3,
+        [UI_OPTION_LOAD_ALLOWLIST] = 3, [UI_OPTION_SITE_DATA_ALLOWED] = 3,
+        [UI_OPTION_TLS_SESSION_PERSISTENCE] = 3,
+        [UI_OPTION_NETWORK_PROFILE] = 4, [UI_OPTION_WIFI_DIAGNOSTICS] = 4,
+        [UI_OPTION_SITE_DATA] = 4, [UI_OPTION_SAVE_DIAGNOSTIC_REPORTS] = 4,
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+        [UI_OPTION_POWER_TEST] = 4, [UI_OPTION_MEDIA_TEST] = 4,
+#endif
+        [UI_OPTION_UPDATE_CHECK] = 5, [UI_OPTION_UPDATE] = 5,
+        [UI_OPTION_EXPERIMENTAL] = 6,
+        [UI_OPTION_SITE_JAVASCRIPT] = UI_SETTINGS_GROUP_COUNT,
+        [UI_OPTION_COOKIE_BANNERS] = UI_SETTINGS_GROUP_COUNT,
+        [UI_OPTION_ALLOW_SITE] = UI_SETTINGS_GROUP_COUNT,
+        [UI_OPTION_MIXED_CONTENT_SITE] = UI_SETTINGS_GROUP_COUNT,
+        [UI_OPTION_THIRD_PARTY_COOKIES_SITE] = UI_SETTINGS_GROUP_COUNT,
+        [UI_OPTION_DIAGNOSTIC_QR] = UI_SETTINGS_GROUP_COUNT
+    };
+    for (size_t option = 0; option < sizeof(groups); option++)
+        CHECK(ui_option_group_index((UiOptionId)option) == groups[option]);
+    CHECK(ui_option_group_index((UiOptionId)-1) == 0);
+    CHECK(ui_option_group_index((UiOptionId)(UI_OPTION_WEB_FONTS + 1)) == 0);
+
+    static const unsigned flags[] = {
+        PSP_UI_FAILURE_BASIC_VIEW, PSP_UI_FAILURE_RELOAD_BASIC,
+        PSP_UI_FAILURE_READER, PSP_UI_FAILURE_WIFI,
+        PSP_UI_FAILURE_DISABLE_JAVASCRIPT, PSP_UI_FAILURE_AUDIO_ONLY,
+        PSP_UI_FAILURE_LOWER_QUALITY
+    };
+    static const char *const labels[] = {
+        "Show Basic view", "Reload in Basic view", "Try Reader mode",
+        "Open Wi-Fi sign-in", "Disable JavaScript for this site",
+        "Use audio-only", "Lower video quality"
+    };
+    static const PspUiAction actions[] = {
+        PSP_UI_ACTION_RECOVERY_BASIC, PSP_UI_ACTION_RECOVERY_RELOAD_BASIC,
+        PSP_UI_ACTION_RECOVERY_READER, PSP_UI_ACTION_CHECK_WIFI_SIGN_IN,
+        PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT,
+        PSP_UI_ACTION_RECOVERY_AUDIO_ONLY, PSP_UI_ACTION_RECOVERY_LOWER_QUALITY
+    };
+    for (unsigned heavy = 0; heavy < 2; heavy++) {
+        for (unsigned mask = 0; mask < 256; mask++) {
+            PspUiState ui;
+            psp_ui_init(&ui);
+            ui.screen = PSP_UI_SCREEN_FAILURE_RECOVERY;
+            ui.failure_recovery_heavy = heavy;
+            ui.failure_actions = mask;
+            const char *expected[9];
+            PspUiAction expected_actions[9];
+            size_t count = 0;
+            if (!heavy) {
+                expected[count] = "Retry";
+                expected_actions[count++] = PSP_UI_ACTION_RELOAD;
+            }
+            for (size_t at = 0; at < sizeof(flags) / sizeof(flags[0]); at++) {
+                if (mask & flags[at]) {
+                    expected[count] = labels[at];
+                    expected_actions[count++] = actions[at];
+                }
+            }
+            expected[count] = "Return to the last usable page";
+            expected_actions[count++] = PSP_UI_ACTION_RECOVERY_RETURN;
+            for (size_t capacity = 0; capacity <= 10; capacity++) {
+                const char *actual[12];
+                for (size_t at = 0; at < 12; at++) actual[at] = "untouched";
+                size_t wanted = count < capacity ? count : capacity;
+                CHECK(psp_ui_menu_failure_labels(&ui, actual, capacity) == wanted);
+                CHECK(psp_ui_menu_failure_labels(&ui, NULL, capacity) == wanted);
+                for (size_t at = 0; at < wanted; at++)
+                    CHECK(!strcmp(actual[at], expected[at]));
+                for (size_t at = wanted; at < 12; at++)
+                    CHECK(!strcmp(actual[at], "untouched"));
+            }
+            for (size_t selected = 0; selected < count; selected++) {
+                PspUiState copy = ui;
+                copy.menu_selection = selected;
+                PspUiIntent intent = {0};
+                CHECK(psp_ui_menu_update(&copy, PSP_UI_BUTTON_CONFIRM, &intent));
+                CHECK(intent.action == expected_actions[selected]);
+            }
+            PspUiIntent intent = {0};
+            CHECK(psp_ui_menu_update(&ui, PSP_UI_BUTTON_UP, &intent));
+            CHECK(ui.menu_selection == count - 1);
+            CHECK(psp_ui_menu_update(&ui, PSP_UI_BUTTON_DOWN, &intent));
+            CHECK(ui.menu_selection == 0);
+        }
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) capture_directory = argv[1];
     if (argc > 2) real_hindi_pack = argv[2];
     if (argc > 3) real_arabic_pack = argv[3];
-    return test_square_button_symbol() && test_all_languages() ? 0 : 1;
+    return test_menu_metadata_equivalence()
+        && test_square_button_symbol() && test_all_languages() ? 0 : 1;
 }

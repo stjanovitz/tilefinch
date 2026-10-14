@@ -22,7 +22,8 @@ CATALOGS = [(1, [("es", "Spanish", "EMBEDDED"), ("fr", "French", "EMBEDDED"),
 CATALOGS.append((5, CATALOGS[-1][1]))
 CATALOGS.append((6, CATALOGS[-1][1]))
 CATALOGS.append((7, CATALOGS[-1][1]))
-ACTIVE_VERSION = 7
+CATALOGS.append((8, [("pt", "Portuguese", "EMBEDDED")]))
+ACTIVE_VERSION = 8
 
 def read_rows(version, languages):
     source = ROOT / f"translations/ui/v{version}/source.tsv"
@@ -48,6 +49,10 @@ def outputs(resource_dir=None):
                 'static const TilefinchUiLanguageSpec ui_languages[] = {',
                 '    {"en", "English", BROWSER_GLYPH_LANGUAGE_EMBEDDED, NULL, 1, 0, NULL},']
     base_keys = None
+    # Keep the newest resource for each language in its original registration
+    # order. Adding a locale must not renumber saved settings or republish the
+    # immutable catalogs used by existing languages.
+    active = {}
     for version, languages in CATALOGS:
         rows = read_rows(version, languages)
         keys = {r[0].lower() for r in rows}
@@ -62,14 +67,15 @@ def outputs(resource_dir=None):
             resource_key = f"translations/ui/v{version}/{code}.tful"
             if resource_dir is not None:
                 result[resource_dir / resource_key] = data
-            if version == ACTIVE_VERSION:
+            if version <= ACTIVE_VERSION:
                 minimum_glyph_sequence = (4 if version >= 7 else 3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else 1
-                manifest.append(f'    {{"{code}", "{label}", BROWSER_GLYPH_LANGUAGE_{glyphs}, '
+                active[code] = (f'    {{"{code}", "{label}", BROWSER_GLYPH_LANGUAGE_{glyphs}, '
                                 f'"{hashlib.sha256(data).hexdigest()}", {version}, {minimum_glyph_sequence}, '
                                 f'"{resource_key}"}},')
             if code == "hi":
                 result[ROOT / f"translations/ui/v{version}/hi.sequences"] = \
                     hindi_sequences(r[column] for r in rows)
+    manifest += list(active.values())
     manifest += ['};', '_Static_assert(sizeof(ui_languages) / sizeof(ui_languages[0])',
                  '    == TILEFINCH_UI_LANGUAGE_COUNT, "locale catalog mismatch");', '']
     result[ROOT / "src/generated/ui_languages.inc"] = "\n".join(manifest).encode()

@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.36 — 2026-10-13
+
+- Expanded interface language support.
+- Clearer guidance for certificate errors and correcting the PSP’s date and time.
+
 ## 0.1.35 — 2026-10-13
 
 - More responsive scrolling, focus navigation, and browser controls while pages load.

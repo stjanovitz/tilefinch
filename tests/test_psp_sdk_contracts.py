@@ -8684,8 +8684,9 @@ int main(void) {
         runtime = without_comments(
             (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
                 encoding="utf-8"))
+        self.assertIn("tilefinch_tls_verification_summary(", runtime)
         self.assertIn("tls_verify_result_available, clock_status", runtime)
-        self.assertNotIn(
+        self.assertIn(
             "tilefinch_error_is_certificate_verification_failure(detail)",
             runtime)
         report = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")

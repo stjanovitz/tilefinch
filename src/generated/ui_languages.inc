@@ -11,6 +11,7 @@ static const TilefinchUiLanguageSpec ui_languages[] = {
     {"ko", "Korean", BROWSER_GLYPH_LANGUAGE_KOREAN, "8b92f783a4dc84cf35b3b73b0240a8559b68d840eea5bc0f63d41f115635d5b4", 7, 1, "translations/ui/v7/ko.tful"},
     {"hi", "Hindi", BROWSER_GLYPH_LANGUAGE_DEVANAGARI, "f70217cbcff21a478ae9d43df9b5690f8b802eb653aa2828bb01e06e9b248603", 7, 4, "translations/ui/v7/hi.tful"},
     {"ar", "Arabic", BROWSER_GLYPH_LANGUAGE_ARABIC, "c20b766a188cdbc62b86439c4bbb6e8b06b9a52b9e66009afc76f22ca804a473", 7, 1, "translations/ui/v7/ar.tful"},
+    {"pt", "Portuguese", BROWSER_GLYPH_LANGUAGE_EMBEDDED, "92771348c6f9f6b71485a9dcf4862adc503e15ace20d7cd936d5234684860acc", 8, 1, "translations/ui/v8/pt.tful"},
 };
 _Static_assert(sizeof(ui_languages) / sizeof(ui_languages[0])
     == TILEFINCH_UI_LANGUAGE_COUNT, "locale catalog mismatch");

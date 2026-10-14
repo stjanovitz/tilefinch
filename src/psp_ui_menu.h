@@ -55,4 +55,9 @@ bool psp_ui_menu_update(
    correct row without duplicating the option-order table. */
 size_t psp_ui_menu_option_first_in_group(size_t group);
 
+/* The painter and controller consume the same ordered recovery choices.
+   A null labels array asks only for the bounded row count. */
+size_t psp_ui_menu_failure_labels(
+    const PspUiState *ui, const char **labels, size_t capacity);
+
 #endif

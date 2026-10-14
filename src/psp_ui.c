@@ -340,7 +340,7 @@ static UiOptionId ui_option_id(size_t selection)
         selection < UI_OPTIONS_ITEM_COUNT ? selection : 0u];
 }
 
-static const char *ui_option_group(UiOptionId option)
+static size_t ui_option_group_index(UiOptionId option)
 {
     switch (option) {
         case UI_OPTION_BROWSER_UI_SCALE:
@@ -352,7 +352,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_CHROME_THEME:
         case UI_OPTION_LANGUAGE_AND_EMOJI:
         case UI_OPTION_WEB_FONTS:
-            return "APPEARANCE";
+            return 0u;
         case UI_OPTION_CUSTOM_HOMEPAGE:
         case UI_OPTION_HISTORY:
         case UI_OPTION_RESTORE_LAST_PAGE:
@@ -364,7 +364,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_SEARCH_ENGINE:
         case UI_OPTION_BASIC_FALLBACK:
         case UI_OPTION_HEAVY_PAGES:
-            return "BROWSING & INPUT";
+            return 1u;
         case UI_OPTION_VIDEO_SCALING:
         case UI_OPTION_ROTATE_HINT:
         case UI_OPTION_YOUTUBE_QUALITY:
@@ -377,19 +377,19 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_RESUME_DOWNLOADS:
         case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
         case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
-            return "VIDEO";
+            return 2u;
         case UI_OPTION_CONTENT_BLOCKER:
         case UI_OPTION_COSMETIC_HIDING:
         case UI_OPTION_LOAD_ALLOWLIST:
         case UI_OPTION_SITE_DATA_ALLOWED:
         case UI_OPTION_TLS_SESSION_PERSISTENCE:
-            return "PRIVACY & SECURITY";
+            return 3u;
         case UI_OPTION_SITE_JAVASCRIPT:
         case UI_OPTION_COOKIE_BANNERS:
         case UI_OPTION_ALLOW_SITE:
         case UI_OPTION_MIXED_CONTENT_SITE:
         case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-            return "SITE";
+            return UI_SETTINGS_GROUP_COUNT;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
         case UI_OPTION_MEDIA_TEST:
@@ -398,16 +398,16 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_WIFI_DIAGNOSTICS:
         case UI_OPTION_SITE_DATA:
         case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
-            return "DEVICE & STORAGE";
+            return 4u;
         case UI_OPTION_UPDATE_CHECK:
         case UI_OPTION_UPDATE:
-            return "UPDATES";
+            return 5u;
         case UI_OPTION_DIAGNOSTIC_QR:
-            return "HELP";
+            return UI_SETTINGS_GROUP_COUNT;
         case UI_OPTION_EXPERIMENTAL:
-            return "ADVANCED & EXPERIMENTAL";
+            return 6u;
     }
-    return "";
+    return 0u;
 }
 
 static const char *ui_option_group_at(size_t group)
@@ -418,21 +418,6 @@ static const char *ui_option_group_at(size_t group)
         "Advanced & experimental"
     };
     return tilefinch_ui_text(groups[group < UI_SETTINGS_GROUP_COUNT ? group : 0u]);
-}
-
-static size_t ui_option_group_index(UiOptionId option)
-{
-    const char *group = ui_option_group(option);
-    if (strcmp(group, "BROWSING & INPUT") == 0) return 1u;
-    if (strcmp(group, "VIDEO") == 0) return 2u;
-    if (strcmp(group, "PRIVACY & SECURITY") == 0) return 3u;
-    if (strcmp(group, "DEVICE & STORAGE") == 0) return 4u;
-    if (strcmp(group, "UPDATES") == 0) return 5u;
-    if (strcmp(group, "ADVANCED & EXPERIMENTAL") == 0) return 6u;
-    /* SITE and HELP are routed through dedicated surfaces. */
-    if (strcmp(group, "SITE") == 0 || strcmp(group, "HELP") == 0)
-        return UI_SETTINGS_GROUP_COUNT;
-    return 0u;
 }
 
 size_t psp_ui_menu_option_first_in_group(size_t group)
@@ -2556,6 +2541,10 @@ void psp_ui_show_failure_recovery_actions(
     PspUiState *ui, const char *detail, uint8_t available_actions)
 {
     if (ui == NULL) return;
+    /* Preserve guidance for the same failure, not for a later unrelated
+       recovery sheet that did not first raise its own status. */
+    if (detail == NULL || detail[0] == '\0' || strcmp(ui->status, detail) != 0)
+        ui->tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
     ui->base_screen = (uint8_t) (psp_ui_screen_is_native_surface(ui->screen)
         ? ui->screen : PSP_UI_SCREEN_PAGE);
     _Static_assert(PSP_UI_FAILURE_RELOAD_BASIC < (1u << 7),
@@ -5553,30 +5542,17 @@ static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
               box.x + box.width - 16, muted, 1, false);
 }
 
-static size_t ui_failure_labels(
-    const PspUiState *ui, const char **labels, size_t capacity)
+static const char *ui_tls_guidance_text(unsigned guidance)
 {
-    size_t count = 0;
-#define ADD_FAILURE_LABEL(text_) \
-    do { if (count < capacity) labels[count++] = (text_); } while (0)
-    if (!ui->failure_recovery_heavy) ADD_FAILURE_LABEL("Retry");
-    if (ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW)
-        ADD_FAILURE_LABEL("Show Basic view");
-    if (ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC)
-        ADD_FAILURE_LABEL("Reload in Basic view");
-    if (ui->failure_actions & PSP_UI_FAILURE_READER)
-        ADD_FAILURE_LABEL("Try Reader mode");
-    if (ui->failure_actions & PSP_UI_FAILURE_WIFI)
-        ADD_FAILURE_LABEL("Open Wi-Fi sign-in");
-    if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT)
-        ADD_FAILURE_LABEL("Disable JavaScript for this site");
-    if (ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY)
-        ADD_FAILURE_LABEL("Use audio-only");
-    if (ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY)
-        ADD_FAILURE_LABEL("Lower video quality");
-    ADD_FAILURE_LABEL("Return to the last usable page");
-#undef ADD_FAILURE_LABEL
-    return count;
+    static const char *const text[] = {
+        "",
+        "Make sure date/time in XMB Settings is correct",
+        "Try another Wi-Fi or update Tilefinch",
+        "Secure connection was redirected. Try another Wi-Fi network",
+        "Secure connection unsupported. Update Tilefinch",
+        "Open Help & diagnostics for details"
+    };
+    return guidance <= TILEFINCH_TLS_GUIDANCE_DETAILS ? text[guidance] : "";
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
@@ -5594,11 +5570,18 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
     draw_text_with_font(
         pixels, width, height, stride, box.x + 15, box.y + 48,
         ui->status, 64, box.x + box.width - 15, muted, 1, NULL, false);
+    bool clock_hint = ui->tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_TIME;
+    if (clock_hint) {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 15, box.y + 64,
+            ui_tls_guidance_text(ui->tls_toast_guidance), 64,
+            box.x + box.width - 15, muted, 1, NULL, false);
+    }
     const char *labels[9] = {0};
-    size_t count = ui_failure_labels(ui, labels, 9u);
-    int top = box.y + 70;
+    size_t count = psp_ui_menu_failure_labels(ui, labels, 9u);
+    int top = box.y + (clock_hint ? 86 : 70);
     /* Rows share the space between the detail and the hint bar. */
-    int available = box.height - 70 - 22;
+    int available = box.height - (top - box.y) - 22;
     int row_height = count > 6u ? 23 : 25;
     if (count != 0u && row_height * (int) count > available)
         row_height = available / (int) count;
@@ -8227,17 +8210,9 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
         char *extra_line = strchr(embedded_second_line, '\n');
         if (extra_line != NULL) *extra_line = ' ';
     }
-    static const char *const tls_guidance[] = {
-        "",
-        "Try correcting PSP date/time, then retry",
-        "Try another Wi-Fi or update Tilefinch",
-        "Secure connection was redirected. Try another Wi-Fi network",
-        "Secure connection unsupported. Update Tilefinch",
-        "Open Help & diagnostics for details"
-    };
     if (ui->tls_toast_guidance > TILEFINCH_TLS_GUIDANCE_NONE
         && ui->tls_toast_guidance <= TILEFINCH_TLS_GUIDANCE_DETAILS) {
-        second_line = tls_guidance[ui->tls_toast_guidance];
+        second_line = ui_tls_guidance_text(ui->tls_toast_guidance);
     }
     if (ui->captive_portal_suggested)
         second_line = "X Open Wi-Fi sign-in  O Cancel";

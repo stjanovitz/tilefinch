@@ -3402,14 +3402,13 @@ static bool test_large_toast_uses_full_psp_width(void)
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
     psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL, 1u);
-    psp_ui_show_status(
-        &ui, "YouTube page fetch failed\n"
-             "Try correcting PSP date/time, then retry", 60);
+    psp_ui_show_tls_status(
+        &ui, "Certificate not yet valid", TILEFINCH_TLS_GUIDANCE_TIME, 60);
     ui.toast_entry_frames = 0;
     psp_ui_composite(&ui, certificate_hint, WIDTH, HEIGHT, WIDTH);
     psp_ui_show_status(
-        &ui, "YouTube page fetch failed\n"
-             "Try correcting PSP date/time, then      ", 60);
+        &ui, "Certificate not yet valid\n"
+             "Make sure date/time in XMB Settings is        ", 60);
     ui.toast_entry_frames = 0;
     psp_ui_composite(
         &ui, certificate_hint_without_tail, WIDTH, HEIGHT, WIDTH);
@@ -3418,6 +3417,12 @@ static bool test_large_toast_uses_full_psp_width(void)
        otherwise-identical frames become equal. */
     CHECK(memcmp(certificate_hint, certificate_hint_without_tail,
                  sizeof(certificate_hint)) != 0);
+    psp_ui_show_status(
+        &ui, "Certificate not yet valid\n"
+             "Make sure date/time in XMB Settings is correct", 60);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, redirect_hint, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(certificate_hint, redirect_hint, sizeof(certificate_hint)) == 0);
     psp_ui_show_tls_status(
         &ui, "Secure page fetch failed",
         TILEFINCH_TLS_GUIDANCE_REDIRECTED, 60);
@@ -3432,6 +3437,22 @@ static bool test_large_toast_uses_full_psp_width(void)
     CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
           && memcmp(redirect_hint, redirect_hint_without_tail,
                     sizeof(redirect_hint)) != 0);
+    /* The recovery sheet covers page toasts. Clock guidance must also live
+       in that sheet, even after the temporary toast has expired. */
+    psp_ui_show_tls_status(
+        &ui, "Certificate not yet valid", TILEFINCH_TLS_GUIDANCE_TIME, 60);
+    psp_ui_show_failure_recovery_actions(&ui, "Certificate not yet valid", 0u);
+    ui.toast_frames = 0;
+    ui.overlay_animation_frames = 0;
+    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    psp_ui_composite(&ui, certificate_hint, WIDTH, HEIGHT, WIDTH);
+    ui.tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    psp_ui_composite(&ui, certificate_hint_without_tail, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(certificate_hint, certificate_hint_without_tail,
+                 sizeof(certificate_hint)) != 0);
+    ui.tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_TIME;
+    psp_ui_show_failure_recovery_actions(&ui, "Connection timed out", 0u);
+    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_NONE);
     psp_ui_clear_chrome_font();
     font_set_destroy(&fonts);
     CHECK(budget.current == 0 && budget_categories_reconcile(&budget));

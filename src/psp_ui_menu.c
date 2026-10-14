@@ -410,48 +410,56 @@ static void menu_update_page_information(
     }
 }
 
-static size_t menu_failure_action_count(const PspUiState *ui)
+static const struct {
+    uint8_t flag;
+    PspUiAction action;
+    const char *label;
+} menu_failure_choices[] = {
+    {0x80u, PSP_UI_ACTION_RELOAD, "Retry"},
+    {PSP_UI_FAILURE_BASIC_VIEW, PSP_UI_ACTION_RECOVERY_BASIC, "Show Basic view"},
+    {PSP_UI_FAILURE_RELOAD_BASIC, PSP_UI_ACTION_RECOVERY_RELOAD_BASIC, "Reload in Basic view"},
+    {PSP_UI_FAILURE_READER, PSP_UI_ACTION_RECOVERY_READER, "Try Reader mode"},
+    {PSP_UI_FAILURE_WIFI, PSP_UI_ACTION_CHECK_WIFI_SIGN_IN, "Open Wi-Fi sign-in"},
+    {PSP_UI_FAILURE_DISABLE_JAVASCRIPT, PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT, "Disable JavaScript for this site"},
+    {PSP_UI_FAILURE_AUDIO_ONLY, PSP_UI_ACTION_RECOVERY_AUDIO_ONLY, "Use audio-only"},
+    {PSP_UI_FAILURE_LOWER_QUALITY, PSP_UI_ACTION_RECOVERY_LOWER_QUALITY, "Lower video quality"},
+    {0u, PSP_UI_ACTION_RECOVERY_RETURN, "Return to the last usable page"}
+};
+
+static unsigned menu_failure_mask(const PspUiState *ui)
 {
-    /* Retry and return; a page too heavy for the PSP would only fail the
-       same way again, so its sheet has no Retry. */
-    size_t count = ui->failure_recovery_heavy ? 1u : 2u;
-    if (ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_READER) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_WIFI) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY) count++;
-    if (ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY) count++;
+    /* Bit 7 is local to this table, never a saved failure action. Heavy
+       pages omit Retry; Return is always present through its zero mask. */
+    return (ui->failure_actions & 0x7fu)
+        | (ui->failure_recovery_heavy ? 0u : 0x80u);
+}
+
+size_t psp_ui_menu_failure_labels(
+    const PspUiState *ui, const char **labels, size_t capacity)
+{
+    unsigned mask = menu_failure_mask(ui);
+    size_t count = 0;
+    for (size_t row = 0; row < sizeof(menu_failure_choices)
+                                    / sizeof(menu_failure_choices[0]); row++) {
+        unsigned flag = menu_failure_choices[row].flag;
+        if (flag != 0u && (mask & flag) == 0u) continue;
+        if (count == capacity) break;
+        if (labels != NULL) labels[count] = menu_failure_choices[row].label;
+        count++;
+    }
     return count;
 }
 
 static PspUiAction menu_failure_action(
     const PspUiState *ui, size_t selected)
 {
-    if (!ui->failure_recovery_heavy && selected-- == 0u)
-        return PSP_UI_ACTION_RELOAD;
-    if ((ui->failure_actions & PSP_UI_FAILURE_BASIC_VIEW) != 0u) {
-        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_BASIC;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_RELOAD_BASIC) != 0u) {
-        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_RELOAD_BASIC;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_READER) != 0u) {
-        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_READER;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_WIFI) != 0u) {
-        if (selected-- == 0u) return PSP_UI_ACTION_CHECK_WIFI_SIGN_IN;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) != 0u) {
-        if (selected-- == 0u)
-            return PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY) != 0u) {
-        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_AUDIO_ONLY;
-    }
-    if ((ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY) != 0u) {
-        if (selected-- == 0u)
-            return PSP_UI_ACTION_RECOVERY_LOWER_QUALITY;
+    unsigned mask = menu_failure_mask(ui);
+    for (size_t row = 0; row < sizeof(menu_failure_choices)
+                                    / sizeof(menu_failure_choices[0]); row++) {
+        unsigned flag = menu_failure_choices[row].flag;
+        if (flag == 0u || (mask & flag) != 0u) {
+            if (selected-- == 0u) return menu_failure_choices[row].action;
+        }
     }
     return PSP_UI_ACTION_RECOVERY_RETURN;
 }
@@ -459,7 +467,13 @@ static PspUiAction menu_failure_action(
 static void menu_update_failure_recovery(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
-    size_t count = menu_failure_action_count(ui);
+    /* Count the seven optional bits directly, rather than walking display
+       labels on every Up/Down press. Pairwise sums fit in each byte. */
+    unsigned bits = ui->failure_actions & 0x7fu;
+    bits -= (bits >> 1) & 0x55u;
+    bits = (bits & 0x33u) + ((bits >> 2) & 0x33u);
+    size_t count = ((bits + (bits >> 4)) & 0x0fu)
+        + (ui->failure_recovery_heavy ? 1u : 2u);
     if (pressed & PSP_UI_BUTTON_UP) {
         ui->menu_selection = (uint8_t) (
             (ui->menu_selection + count - 1u) % count);
