@@ -81,6 +81,12 @@ static bool browser_preview_view_live(BrowserPreviewView view)
 /* Largest url-encoded body a script form submission may send. */
 #define BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT (64u * 1024u)
 
+typedef enum {
+    YOUTUBE_SIGNIN_IDLE, YOUTUBE_SIGNIN_ACCOUNT, YOUTUBE_SIGNIN_RECOVERING,
+    YOUTUBE_SIGNIN_HANDOFF, YOUTUBE_SIGNIN_VERIFYING, YOUTUBE_SIGNIN_VERIFIED,
+    YOUTUBE_SIGNIN_FAILED, YOUTUBE_SIGNIN_CANCELLED, YOUTUBE_SIGNIN_MANUAL
+} YoutubeSigninState;
+
 struct BrowserEngine {
     BrowserConfig config;
     Budget budget;
@@ -170,6 +176,15 @@ struct BrowserEngine {
     bool youtube_topics;
     uint64_t youtube_login_verified;
     unsigned youtube_login_events;
+    bool youtube_signin_diagnostics;
+    unsigned youtube_signin_retries;
+    YoutubeSigninState youtube_signin_state;
+    YoutubeLiteFeedDiagnostics youtube_signin_feed;
+    long youtube_handoff_http_status;
+    bool youtube_handoff_service_origin;
+    unsigned youtube_feed_build_outcome, youtube_feed_publication_outcome;
+    bool youtube_header_dirty;
+    unsigned youtube_header_attempts;
     bool youtube_topics_attempted;
     uint64_t youtube_topics_generation;
     YoutubeLiteLoadJob *youtube_topics_job;
@@ -200,6 +215,7 @@ struct BrowserEngine {
     lxb_dom_node_t *youtube_signout_node;
     uint64_t youtube_like_node_generation;
     YoutubeLiteDocument youtube_feed_pending;
+    uint64_t youtube_feed_pending_identity;
     BrowserYoutubeFeedState youtube_feed_state;
     uint64_t youtube_browsing_generation;
     bool youtube_browsing;
@@ -305,6 +321,7 @@ static void browser_engine_clear_youtube_work(BrowserEngine *engine)
     if (engine->youtube_like_state == BROWSER_YOUTUBE_FEED_LOADING)
         engine->youtube_like_state = BROWSER_YOUTUBE_FEED_FAILED;
     youtube_lite_document_destroy(&engine->youtube_feed_pending);
+    engine->youtube_feed_pending_identity = 0;
     if (engine->youtube_feed_state == BROWSER_YOUTUBE_FEED_LOADING
         || engine->youtube_feed_state == BROWSER_YOUTUBE_FEED_READY)
         engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_FAILED;
@@ -2576,7 +2593,13 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
                     image_resource_backing_identity(image));
             }
         }
-        if (tile_cache_sync_canvas_paint(
+        /* The fixed-image proof only admits script-free pages. Runtime canvas
+           updates retain their unrelated overlay caches on every frame. */
+        bool (*sync_pixels)(TileCache *, int, int, int, int) =
+            engine->navigation.page.runtime == NULL
+                ? tile_cache_sync_document_image_paint
+                : tile_cache_sync_canvas_paint;
+        if (sync_pixels(
                 &engine->render,
                 engine->navigation.relayout_damage_left,
                 engine->navigation.relayout_damage_top,
@@ -2788,6 +2811,135 @@ unsigned browser_engine_take_youtube_login_events(BrowserEngine *engine)
     unsigned events = engine->youtube_login_events;
     engine->youtube_login_events = 0;
     return events;
+}
+
+bool browser_engine_youtube_login_verified(const BrowserEngine *engine)
+{
+    if (engine == NULL || engine->youtube_login_verified == 0) return false;
+    return engine->youtube_login_verified == youtube_lite_session_login_identity(
+        (BrowserSession *) &engine->session);
+}
+
+uint64_t browser_engine_youtube_login_identity(const BrowserEngine *engine)
+{
+    return browser_engine_youtube_login_verified(engine) ? engine->youtube_login_verified : 0;
+}
+
+static bool browser_engine_youtube_signin_pending(const BrowserEngine *engine)
+{
+    return engine->youtube_signin_state >= YOUTUBE_SIGNIN_ACCOUNT
+        && engine->youtube_signin_state <= YOUTUBE_SIGNIN_VERIFYING;
+}
+
+void browser_engine_set_youtube_signin_diagnostics(BrowserEngine *engine, bool enabled)
+{
+    if (engine == NULL) return;
+    engine->youtube_signin_diagnostics = enabled;
+    engine->youtube_signin_feed = (YoutubeLiteFeedDiagnostics) {0};
+    engine->youtube_handoff_http_status = 0;
+    engine->youtube_handoff_service_origin = false;
+    engine->youtube_feed_build_outcome = engine->youtube_feed_publication_outcome = 0;
+    engine->session.cookie_diagnostics = (BrowserCookieDiagnostics) {.enabled = enabled};
+}
+
+bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out, size_t capacity)
+{
+    if (out == NULL || capacity == 0) return false;
+    out[0] = '\0';
+    if (engine == NULL || !engine->youtube_signin_diagnostics) return false;
+    const YoutubeLiteFeedDiagnostics *feed = &engine->youtube_signin_feed;
+    const BrowserCookieDiagnostics *cookies = &engine->session.cookie_diagnostics;
+    uint64_t identity = youtube_lite_session_login_identity((BrowserSession *) &engine->session);
+    /* Only enum/boolean/count fields, never generic errors or identity hashes. */
+    int n = snprintf(out, capacity,
+        "Tilefinch YouTube sign-in diagnostics v2\n"
+        "stage=%u recovery-attempts=%u scripts-enabled=%u runtime-present=%u degraded=%u\n"
+        "handoff-http-status=%ld handoff-service-origin=%u\n"
+        "dynamic-transport-failures=%zu dynamic-authority-failures=%zu dynamic-source-failures=%zu allocation-refusals=%zu\n"
+        "session-cookie-present=%u server-verified=%u feed-state=%u\n"
+        "parsed-results=%zu pending-publication=%u\n"
+        "build-outcome=%u publication-outcome=%u continue-available=%u\n"
+        "bootstrap-status=%ld api-status=%ld history-status=%ld failure-kind=%u\n"
+        "configuration-valid=%u clock-available=%u api-request-admitted=%u history-outcome=%u\n"
+        "feed-phase=%u http-status=%ld transported=%u same-origin=%u bootstrap-signed-in=%u auth-index-known=%u request-signed=%u api-authenticated=%u\n"
+        "transport-code=%ld transport-timed-out=%u tls-result-available=%u tls-result=%ld tls-failed=%u\n"
+        "cookie-refusals=%zu byte-refusals=%zu slot-refusals=%zu allocation-refusals=%zu policy-ignored=%zu evictions=%zu\n",
+        engine->youtube_signin_state, engine->youtube_signin_retries,
+        engine->navigation.scripts_enabled, engine->navigation.page.runtime != NULL,
+        engine->navigation.page.script_degradation_observed,
+        engine->youtube_handoff_http_status >= 100 && engine->youtube_handoff_http_status <= 599
+            ? engine->youtube_handoff_http_status : 0L, engine->youtube_handoff_service_origin,
+        engine->navigation.page.script_result.dynamic_script_transport_failures,
+        engine->navigation.page.script_result.dynamic_script_authority_failures,
+        engine->navigation.page.script_result.dynamic_script_source_failures,
+        engine->budget.failure_count,
+        identity != 0, identity != 0 && engine->youtube_login_verified == identity,
+        engine->youtube_feed_state,
+        feed->result_count, engine->youtube_feed_pending.html != NULL,
+        engine->youtube_feed_build_outcome, engine->youtube_feed_publication_outcome,
+        browser_engine_youtube_signin_continue_available(engine),
+        feed->bootstrap_status >= 100 && feed->bootstrap_status <= 599 ? feed->bootstrap_status : 0L,
+        feed->api_status >= 100 && feed->api_status <= 599 ? feed->api_status : 0L,
+        feed->history_status >= 100 && feed->history_status <= 599 ? feed->history_status : 0L,
+        feed->failure,
+        feed->configuration_valid, feed->clock_available, feed->request_admitted, feed->history_outcome,
+        feed->phase, feed->http_status >= 100 && feed->http_status <= 599 ? feed->http_status : 0L,
+        feed->transported, feed->same_origin, feed->bootstrap_signed_in,
+        feed->auth_user_known, feed->request_signed, feed->api_authenticated,
+        feed->transport_code, feed->transport_timed_out,
+        feed->tls_verify_result_available, feed->tls_verify_result, feed->tls_verification_failed,
+        cookies->refused, cookies->byte_refusals, cookies->slot_refusals,
+        cookies->allocation_refusals, cookies->policy_ignored, cookies->evictions);
+    if (n < 0 || (size_t) n >= capacity) { out[0] = '\0'; return false; }
+    return true;
+}
+
+static const char youtube_signin_entry[] =
+    "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
+
+static bool browser_engine_youtube_auth_origin(const char *url)
+{
+    return tilefinch_url_same_origin(url, "https://accounts.google.com/")
+        || tilefinch_url_same_origin(url, "https://support.google.com/")
+        || tilefinch_url_same_origin(url, "https://accounts.youtube.com/");
+}
+
+bool browser_engine_youtube_signin_continue_available(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation.page.loaded
+        && !browser_engine_navigation_pending(engine)
+        && (browser_engine_youtube_signin_pending(engine)
+            || engine->youtube_signin_state == YOUTUBE_SIGNIN_FAILED
+            || engine->youtube_signin_state == YOUTUBE_SIGNIN_MANUAL)
+        && browser_engine_youtube_auth_origin(engine->navigation.page.document_url);
+}
+
+const char *browser_engine_youtube_signin_continue_target(const BrowserEngine *engine)
+{
+    if (!browser_engine_youtube_signin_continue_available(engine)) return NULL;
+    /* Existing service cookies may belong to an earlier account or a revoked
+       session. Always finish the current account flow through its stable GET. */
+    return youtube_signin_entry;
+}
+
+static void browser_engine_note_youtube_signin_navigation(BrowserEngine *engine, const char *url)
+{
+    if (strcmp(url, "https://www.youtube.com/?tilefinch_signin=1") == 0
+        && browser_engine_youtube_signin_continue_available(engine)) {
+        engine->youtube_signin_state = YOUTUBE_SIGNIN_HANDOFF;
+    } else if (strcmp(url, youtube_signin_entry) == 0
+        || strcmp(url, "https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F") == 0) {
+        engine->youtube_signin_retries = 0;
+        engine->youtube_signin_state = YOUTUBE_SIGNIN_ACCOUNT;
+        engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_STARTED;
+        engine->youtube_handoff_http_status = 0;
+        engine->youtube_handoff_service_origin = false;
+    } else if (browser_engine_youtube_signin_pending(engine)) {
+        if (youtube_lite_signin_handoff_url(url)) engine->youtube_signin_state = YOUTUBE_SIGNIN_HANDOFF;
+        else if (!browser_engine_youtube_auth_origin(url)
+            && youtube_lite_route(url) == YOUTUBE_LITE_ROUTE_NONE)
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_IDLE;
+    }
 }
 
 static bool browser_engine_apply_focus_paint(BrowserEngine *engine)
@@ -3390,6 +3542,10 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
         SiteAdapterLoadMetrics adapter = {0};
         if (site_adapter_load_metrics(work->adapter, &adapter)) {
             browser_engine_copy_adapter_metrics(&work->metrics, &adapter);
+            if (engine->youtube_signin_diagnostics && adapter.handoff_http_status != 0) {
+                engine->youtube_handoff_http_status = adapter.handoff_http_status;
+                engine->youtube_handoff_service_origin = adapter.handoff_service_origin;
+            }
         }
     }
     uint64_t finished_us =
@@ -3466,6 +3622,9 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
             engine->navigation.loads_committed,
             engine->navigation.page.document.node_count);
     } else if (terminal == NAVIGATION_LOAD_CANCELLED) {
+        if (browser_engine_youtube_signin_pending(engine)) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_CANCELLED;
+        }
         work->status = BROWSER_NAVIGATION_JOB_CANCELLED;
         work->metrics.status = work->status;
         snprintf(engine->last_error, sizeof(engine->last_error), "%.255s",
@@ -3477,6 +3636,10 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
             TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_CANCELLED,
             "navigation-cancelled", engine->last_error, 0, 0);
     } else {
+        if (browser_engine_youtube_signin_pending(engine)) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+        }
         const char *message = engine->navigation.last_error[0] != '\0'
             ? engine->navigation.last_error
             : (engine->last_error[0] != '\0'
@@ -3498,26 +3661,11 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     return work->status;
 }
 
-/* A transactional navigation keeps the incumbent realm alive until the
-   candidate commits, so a failure can restore it. A large application realm
-   and its successor don't fit the PSP ceiling together: chatgpt.com's
-   ~10 MiB home realm starved its conversation page, whose modules were
-   refused. Retire a large incumbent realm when a navigation begins; a failed
-   navigation then restores the page without script. */
-#define BROWSER_ENGINE_RETIRE_INCUMBENT_REALM_BYTES (4u * 1024u * 1024u)
-
-static void browser_engine_retire_large_incumbent_realm(BrowserEngine *engine)
-{
-    if (engine->navigation.page.runtime != NULL
-        && script_runtime_heap_used(engine->navigation.page.runtime)
-               >= BROWSER_ENGINE_RETIRE_INCUMBENT_REALM_BYTES)
-        navigation_retire_current_page_scripts(&engine->navigation);
-}
-
 static bool browser_engine_begin_navigation_request(
     BrowserEngine *engine, const char *url, const char *method,
     const char *body, size_t body_length, const char *content_type,
-    size_t maximum_bytes, long timeout_ms, bool record_history)
+    size_t maximum_bytes, long timeout_ms, bool record_history,
+    bool signin_recovery)
 {
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready || url == NULL || method == NULL
@@ -3530,6 +3678,9 @@ static bool browser_engine_begin_navigation_request(
             "browser navigation job cannot be started");
     }
     /* Only the navigation that was refused may fall back. */
+    /* Internal recovery preserves its one-retry budget. Explicit Continue or
+       Sign in always starts a fresh attempt, even after a recovery page. */
+    if (!signin_recovery) browser_engine_note_youtube_signin_navigation(engine, url);
     browser_engine_clear_youtube_work(engine);
     site_identity_clear_google_fallback();
     browser_engine_store_current_focus(engine);
@@ -3552,7 +3703,7 @@ static bool browser_engine_begin_navigation_request(
        script fetches from the page whose link was just activated. */
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
-    browser_engine_retire_large_incumbent_realm(engine);
+    navigation_retire_large_incumbent_realm(&engine->navigation);
     /* A candidate navigation keeps the incumbent page alive. End any gesture
        against that page before input is suppressed, so a release after a
        cancelled navigation cannot turn into a stale click. */
@@ -3623,7 +3774,10 @@ static bool browser_engine_begin_navigation_request(
     if (site_adapter_handles_navigation(method, url)) {
         char error[256] = {0};
         SiteAdapterPreferences preferences = {
-            .youtube_compact_results = engine->youtube_compact_results
+            .youtube_compact_results = engine->youtube_compact_results,
+            .navigation_initiator = engine->navigation.page.loaded
+                ? engine->navigation.page.document_url : NULL,
+            .navigation_user_activated = engine->navigation.pending_navigation_user_activated
         };
         work->adapter = site_adapter_load_begin(
             &engine->budget, &engine->session, method, url, &preferences,
@@ -3803,7 +3957,7 @@ bool browser_engine_begin_navigation_url(
     if (engine != NULL) engine->script_navigation_attributed = false;
     return browser_engine_begin_navigation_request(
         engine, url, "GET", NULL, 0, NULL,
-        maximum_bytes, timeout_ms, record_history);
+        maximum_bytes, timeout_ms, record_history, false);
 }
 
 bool browser_engine_begin_navigation_action(
@@ -3857,7 +4011,7 @@ bool browser_engine_begin_navigation_action(
         action->body_length == 0 ? NULL : controller_action_body(action),
         action->body_length,
         action->content_type[0] == '\0' ? NULL : action->content_type,
-        maximum_bytes, timeout_ms, true);
+        maximum_bytes, timeout_ms, true, false);
     if (!began)
         engine->navigation.pending_navigation_user_activated = false;
     return began;
@@ -3988,7 +4142,7 @@ bool browser_engine_begin_navigation_history(
     }
     bool began = browser_engine_begin_navigation_request(
         engine, url, "GET", NULL, 0u, NULL,
-        maximum_bytes, timeout_ms, false);
+        maximum_bytes, timeout_ms, false, false);
     /* begin_navigation_request snapshots the currently indexed entry. During
        a history move the cursor already names the target while the incumbent
        DOM is still displayed, so restore the target metadata captured above
@@ -4041,7 +4195,7 @@ static BrowserNavigationJobStatus browser_engine_google_fallback(
     if (!browser_engine_begin_navigation_request(
             engine, url, "GET", NULL, 0, NULL,
             engine->config.maximum_document_bytes,
-            engine->config.navigation_timeout_ms, record_history))
+            engine->config.navigation_timeout_ms, record_history, false))
         return finished;
     return engine->navigation_work.status;
 }
@@ -4066,6 +4220,8 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
         SiteAdapterDocument document = {0};
         bool acquired = adapter_status == SITE_ADAPTER_LOAD_SUCCEEDED
             && site_adapter_load_take_document(work->adapter, &document);
+        if (acquired && youtube_lite_signin_handoff_url(work->url))
+            snprintf(work->url, sizeof(work->url), "%s", "https://www.youtube.com/");
         uint64_t parse_before = engine->navigation.performance.parse_us;
         uint64_t style_before = engine->navigation.performance.style_us;
         uint64_t resource_before = engine->navigation.performance.resource_us;
@@ -4213,6 +4369,7 @@ void browser_engine_cancel_navigation(BrowserEngine *engine,
     }
     (void) browser_engine_finish_navigation_work(
         engine, NAVIGATION_LOAD_CANCELLED);
+    if (browser_engine_youtube_signin_pending(engine)) engine->youtube_signin_state = YOUTUBE_SIGNIN_CANCELLED;
 }
 
 size_t browser_engine_cancel_network_work(
@@ -4657,7 +4814,7 @@ static bool browser_engine_run_load(BrowserEngine *engine,
     browser_engine_clear_youtube_work(engine);
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
-    browser_engine_retire_large_incumbent_realm(engine);
+    navigation_retire_large_incumbent_realm(&engine->navigation);
     engine->autofocus_pending = false;
     browser_engine_cancel_idle_work(engine);
     (void) emit_diagnostic(
@@ -4812,12 +4969,16 @@ static bool browser_engine_do_load_url(BrowserEngine *engine,
                                        uint64_t generation, void *opaque)
 {
     BrowserEngineUrlLoad *load = opaque;
+    browser_engine_note_youtube_signin_navigation(engine, load->url);
 #ifndef __PSP__
     if (site_adapter_handles_navigation("GET", load->url)) {
         SiteAdapterDocument document = {0};
         char error[256] = {0};
         SiteAdapterPreferences preferences = {
-            .youtube_compact_results = engine->youtube_compact_results
+            .youtube_compact_results = engine->youtube_compact_results,
+            .navigation_initiator = engine->navigation.page.loaded
+                ? engine->navigation.page.document_url : NULL,
+            .navigation_user_activated = engine->navigation.pending_navigation_user_activated
         };
         uint64_t started_ns = tilefinch_platform_monotonic_time_ns();
         bool acquired = site_adapter_load_sync(
@@ -4851,7 +5012,9 @@ static bool browser_engine_do_load_url(BrowserEngine *engine,
         snprintf(load->adapter_name, sizeof(load->adapter_name), "%s",
                  document.adapter);
         bool committed = navigation_commit_static_html(
-            &engine->navigation, generation, load->url,
+            &engine->navigation, generation,
+            youtube_lite_signin_handoff_url(load->url)
+                ? "https://www.youtube.com/" : load->url,
             document.html, document.html_length,
             engine->config.device.navigation_viewport_width,
             engine->fonts_ready ? &engine->fonts : NULL, NULL,
@@ -5647,6 +5810,7 @@ bool browser_engine_activate(BrowserEngine *engine,
         browser_engine_clear_youtube_work(engine);
         (void) browser_session_cookie_clear_domain(&engine->session, "https://youtube.com/");
         engine->youtube_login_verified = false;
+        engine->youtube_signin_state = YOUTUBE_SIGNIN_IDLE;
         engine->youtube_login_events = BROWSER_YOUTUBE_LOGIN_SIGNED_OUT;
         engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_IDLE;
         engine->youtube_like_state = BROWSER_YOUTUBE_FEED_IDLE;
@@ -5696,6 +5860,7 @@ bool browser_engine_activate(BrowserEngine *engine,
         && strchr(action->url, '#') != NULL
         && strcmp(strchr(action->url, '#'), "#tilefinch-refresh") == 0) {
         engine->youtube_refresh_confirmed = true;
+        engine->youtube_header_attempts = 0;
         if (engine->youtube_feed_pending.html == NULL && engine->youtube_feed_job == NULL
             && engine->youtube_topics_job == NULL) engine->youtube_topics_attempted = false;
         action->type = CONTROLLER_ACTION_CONTROL;
@@ -6403,6 +6568,99 @@ bool browser_engine_runnable_state(BrowserEngine *engine,
 }
 #endif
 
+/* Header and feed publications share one transactional receiver. A header
+   update retains the existing main body, entered search, scroll and focus. */
+static bool browser_engine_publish_youtube_home(BrowserEngine *engine,
+    YoutubeLiteDocument *document, bool preserve_focus)
+{
+    size_t search_length = 0;
+    lxb_dom_node_t *search_node = NULL;
+    for (size_t i = 0; i < engine->navigation.page.layout.control_count; i++) {
+        lxb_dom_node_t *node = engine->navigation.page.layout.controls[i].node;
+        size_t length = 0;
+        const char *id = document_attribute(node, "id", &length);
+        if (id != NULL && length == 9u && memcmp(id, "yt-search", 9u) == 0) {
+            search_node = node; break;
+        }
+    }
+    const char *search = search_node == NULL ? NULL : document_control_value(search_node, &search_length);
+    if (search == NULL && search_node != NULL) search = document_attribute(search_node, "value", &search_length);
+    if (!youtube_lite_home_set_search_value(document, search == NULL ? "" : search, search_length)) return false;
+    char focus_id[64] = {0};
+    if (preserve_focus) {
+        size_t length = 0;
+        const char *id = document_attribute(controller_focused_node(&engine->controller), "id", &length);
+        if (id != NULL && length < sizeof(focus_id)) memcpy(focus_id, id, length);
+    }
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int scroll = preserve_focus && entry != NULL ? entry->scroll_y : 0;
+    DocumentBacking previous = engine->backing;
+    char url[NAVIGATION_URL_LIMIT];
+    snprintf(url, sizeof(url), "%s", engine->navigation.page.document_url);
+    engine->youtube_topics_publishing = true;
+    document_backing_uninstall(&engine->navigation);
+    bool hooked = navigation_set_candidate_commit_hooks(&engine->navigation,
+        browser_engine_prepare_candidate_shell, browser_engine_abort_candidate_shell,
+        browser_engine_commit_candidate_shell, engine);
+    bool committed = hooked && navigation_commit_static_html(&engine->navigation,
+        engine->navigation.generation, url, document->html, document->html_length,
+        engine->config.device.navigation_viewport_width, engine->fonts_ready ? &engine->fonts : NULL,
+        NULL, false);
+    (void) navigation_set_candidate_commit_hooks(&engine->navigation, NULL, NULL, NULL, NULL);
+    engine->youtube_topics_publishing = false;
+    if (engine->candidate_shell_prepared || engine->candidate_render.budget != NULL)
+        browser_engine_abort_candidate_shell(engine);
+    if (!committed) {
+        engine->backing = previous;
+        (void) document_backing_install(&engine->backing, &engine->navigation);
+        clear_error(engine);
+        return false;
+    }
+    browser_engine_bind_youtube_controls(engine);
+    (void) browser_engine_bind_current_full_document(engine);
+    /* This publication is the same feed operation, not a fresh navigation
+       that should cancel its in-flight job or restart discovery. */
+    engine->youtube_topics_generation = engine->navigation.generation;
+    engine->youtube_browsing_generation = engine->navigation.generation;
+    navigation_set_scroll(&engine->navigation, scroll);
+    lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html), *node = root;
+    for (unsigned visited = 0; focus_id[0] != '\0' && node != NULL && visited < 8192;
+         visited++, node = browser_engine_history_walk_next(root, node)) {
+        size_t length = 0;
+        const char *id = document_attribute(node, "id", &length);
+        if (id != NULL && length == strlen(focus_id) && memcmp(id, focus_id, length) == 0) {
+            (void) browser_engine_focus_node(engine, node); break;
+        }
+    }
+    return true;
+}
+
+static bool browser_engine_refresh_youtube_header(BrowserEngine *engine, bool *visual_changed)
+{
+    if (!engine->youtube_header_dirty || engine->controller.pointer_down_active
+        || engine->youtube_header_attempts >= 2) return false;
+    bool signed_in = browser_engine_youtube_login_verified(engine);
+    if ((engine->youtube_signout_node != NULL) == signed_in) {
+        engine->youtube_header_dirty = false; return false;
+    }
+    engine->youtube_header_attempts++;
+    DocumentBodySnapshot body = {0};
+    YoutubeLiteDocument document = {0};
+    size_t class_length = 0;
+    const char *body_class = document_attribute(document_body_node(&engine->navigation.page.document), "class", &class_length);
+    bool compact = body_class != NULL && class_length == 15u && memcmp(body_class, "compact-results", 15u) == 0;
+    bool published = document_body_snapshot_capture(&engine->navigation.page.document, &body)
+        && youtube_lite_home_rebuild_header(&engine->budget, signed_in, compact, body.markup, body.length, &document)
+        && browser_engine_publish_youtube_home(engine, &document, true);
+    youtube_lite_document_destroy(&document);
+    document_body_snapshot_destroy(&body);
+    if (published) {
+        engine->youtube_header_dirty = false;
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    return true;
+}
+
 static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
                                              bool *visual_changed)
 {
@@ -6432,7 +6690,11 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
         bool authenticated = youtube_lite_session_signed_in(&engine->session);
         engine->youtube_topics_attempted = true;
         engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_LOADING;
-        if (authenticated) {
+        if (authenticated || browser_engine_youtube_signin_pending(engine)) {
+            engine->youtube_feed_build_outcome = 1;
+            engine->youtube_feed_publication_outcome = 0;
+            engine->youtube_signin_feed = (YoutubeLiteFeedDiagnostics) {0};
+            if (browser_engine_youtube_signin_pending(engine)) engine->youtube_signin_state = YOUTUBE_SIGNIN_VERIFYING;
 #ifndef __PSP__
             engine->youtube_history_metadata = 0u;
 #endif
@@ -6452,6 +6714,14 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
                 ? BROWSER_YOUTUBE_FEED_SIGN_IN_REQUIRED : authenticated
                 || engine->youtube_topics || engine->youtube_refresh_confirmed
                 ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_IDLE;
+        if ((authenticated || browser_engine_youtube_signin_pending(engine)) && engine->youtube_feed_job == NULL) {
+            engine->youtube_signin_feed.failure = YOUTUBE_FEED_FAILURE_ADMISSION;
+            engine->youtube_feed_build_outcome = 3;
+        }
+        if (browser_engine_youtube_signin_pending(engine) && engine->youtube_feed_job == NULL) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+        }
     }
     FetchPumpQuota quota = {
         .maximum_body_callbacks = 1, .maximum_body_bytes = 16u * KIB,
@@ -6462,7 +6732,30 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
         YoutubeLiteLoadStatus status = engine->youtube_feed_job != NULL
             ? youtube_lite_feed_pump(engine->youtube_feed_job, &quota)
             : youtube_lite_load_pump(engine->youtube_topics_job, &quota);
+        uint64_t authenticated_identity = youtube_lite_feed_authenticated_identity(engine->youtube_feed_job);
+        uint64_t rejected_identity = youtube_lite_feed_rejected_identity(engine->youtube_feed_job);
+        if (rejected_identity != 0 && engine->youtube_login_verified == rejected_identity) {
+            engine->youtube_login_verified = 0;
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+            engine->youtube_header_dirty = true;
+            engine->youtube_header_attempts = 0;
+        }
+        if (authenticated_identity != 0 && authenticated_identity
+                == youtube_lite_session_login_identity(&engine->session)) {
+            bool completing_attempt = browser_engine_youtube_signin_pending(engine);
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_VERIFIED;
+            if (completing_attempt || engine->youtube_login_verified != authenticated_identity) {
+                engine->youtube_login_verified = authenticated_identity;
+                engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_VERIFIED;
+                engine->youtube_header_dirty = true;
+                engine->youtube_header_attempts = 0;
+            }
+        }
+        if (engine->youtube_signin_diagnostics && engine->youtube_feed_job != NULL)
+            (void) youtube_lite_feed_diagnostics(engine->youtube_feed_job, &engine->youtube_signin_feed);
         if (status == YOUTUBE_LITE_LOAD_PENDING) {
+            (void) browser_engine_refresh_youtube_header(engine, visual_changed);
             if (browser_engine_youtube_status_paint(engine) && visual_changed != NULL)
                 *visual_changed = true;
             return true;
@@ -6473,13 +6766,9 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
                                                    &engine->youtube_feed_pending)
                 : youtube_lite_load_take_document(engine->youtube_topics_job,
                                                    &engine->youtube_feed_pending));
-        if (received && engine->youtube_feed_job != NULL) {
-            uint64_t identity = youtube_lite_session_login_identity(&engine->session);
-            if (identity != 0 && identity != engine->youtube_login_verified) {
-                engine->youtube_login_verified = identity;
-                engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_VERIFIED;
-            }
-        }
+        if (engine->youtube_feed_job != NULL)
+            engine->youtube_feed_build_outcome = received ? 2u : 3u;
+        if (received) engine->youtube_feed_pending_identity = authenticated_identity;
 #ifndef __PSP__
         engine->youtube_history_metadata = youtube_lite_feed_history_metadata(engine->youtube_feed_job);
 #endif
@@ -6489,70 +6778,39 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
         engine->youtube_topics_job = NULL;
         engine->youtube_feed_state = received ? BROWSER_YOUTUBE_FEED_READY
                                               : BROWSER_YOUTUBE_FEED_FAILED;
+        if (!received && browser_engine_youtube_signin_pending(engine)) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+        }
     }
     const NavigationEntry *current = navigation_current(&engine->navigation);
+    if (engine->youtube_feed_pending_identity != 0 && engine->youtube_feed_pending_identity
+        != youtube_lite_session_login_identity(&engine->session)) {
+        youtube_lite_document_destroy(&engine->youtube_feed_pending);
+        engine->youtube_feed_pending_identity = 0;
+        engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_FAILED;
+        engine->youtube_feed_publication_outcome = 3;
+        engine->youtube_signin_feed.failure = YOUTUBE_FEED_FAILURE_SESSION_CHANGED;
+    }
     if (current != NULL && current->scroll_y > 0)
         browser_engine_youtube_browsing(engine);
+    if (engine->youtube_feed_pending.html != NULL)
+        engine->youtube_feed_publication_outcome = engine->youtube_browsing ? 4u : 1u;
     if (engine->youtube_feed_pending.html != NULL
         && !engine->controller.pointer_down_active
         && (!engine->youtube_browsing || engine->youtube_refresh_confirmed)) {
         YoutubeLiteDocument *document = &engine->youtube_feed_pending;
-        size_t search_length = 0;
-        lxb_dom_node_t *search_node = NULL;
-        for (size_t i = 0; i < engine->navigation.page.layout.control_count; i++) {
-            lxb_dom_node_t *node = engine->navigation.page.layout.controls[i].node;
-            size_t length = 0;
-            const char *id = document_attribute(node, "id", &length);
-            if (id != NULL && length == 9u && memcmp(id, "yt-search", 9u) == 0) {
-                search_node = node;
-                break;
-            }
-        }
-        const char *search = search_node == NULL ? NULL
-            : document_control_value(search_node, &search_length);
-        if (search == NULL && search_node != NULL)
-            search = document_attribute(search_node, "value", &search_length);
-        bool prepared = youtube_lite_home_set_search_value(document,
-                    search == NULL ? "" : search, search_length);
-        if (prepared) {
-            DocumentBacking previous = engine->backing;
-            char url[NAVIGATION_URL_LIMIT];
-            snprintf(url, sizeof(url), "%s", engine->navigation.page.document_url);
-            engine->youtube_topics_publishing = true;
-            document_backing_uninstall(&engine->navigation);
-            bool hooked = navigation_set_candidate_commit_hooks(
-                &engine->navigation, browser_engine_prepare_candidate_shell,
-                browser_engine_abort_candidate_shell,
-                browser_engine_commit_candidate_shell, engine);
-            bool committed = hooked && navigation_commit_static_html(
-                &engine->navigation, generation, url, document->html,
-                document->html_length, engine->config.device.navigation_viewport_width,
-                engine->fonts_ready ? &engine->fonts : NULL, NULL, false);
-            (void) navigation_set_candidate_commit_hooks(
-                &engine->navigation, NULL, NULL, NULL, NULL);
-            engine->youtube_topics_publishing = false;
-            if (engine->candidate_shell_prepared || engine->candidate_render.budget != NULL)
-                browser_engine_abort_candidate_shell(engine);
-            if (committed) {
-                browser_engine_bind_youtube_controls(engine);
-                (void) browser_engine_bind_current_full_document(engine);
-                /* Explicit refresh is a conscious restart of the feed. */
-                navigation_set_scroll(&engine->navigation, 0);
-                engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_CURRENT;
-                if (visual_changed != NULL) *visual_changed = true;
-            } else {
-                engine->backing = previous;
-                (void) document_backing_install(&engine->backing, &engine->navigation);
-                clear_error(engine);
-                engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_FAILED;
-            }
-        } else engine->youtube_feed_state = BROWSER_YOUTUBE_FEED_FAILED;
+        bool committed = browser_engine_publish_youtube_home(engine, document, false);
+        engine->youtube_feed_publication_outcome = committed ? 2u : 3u;
+        engine->youtube_feed_state = committed ? BROWSER_YOUTUBE_FEED_CURRENT : BROWSER_YOUTUBE_FEED_FAILED;
+        if (committed && visual_changed != NULL) *visual_changed = true;
         youtube_lite_document_destroy(document);
+        engine->youtube_feed_pending_identity = 0;
         engine->youtube_refresh_confirmed = false;
     }
     if (browser_engine_youtube_status_paint(engine) && visual_changed != NULL)
         *visual_changed = true;
-    return working;
+    return browser_engine_refresh_youtube_header(engine, visual_changed) || working;
 }
 
 static bool browser_engine_run_youtube_account(BrowserEngine *engine, bool *visual_changed)
@@ -6646,6 +6904,51 @@ bool browser_engine_run_idle_work(
     if (visual_changed != NULL) *visual_changed = false;
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->render_ready) return false;
+    if (browser_engine_youtube_signin_pending(engine)
+        && !browser_engine_navigation_pending(engine) && engine->navigation.page.loaded
+        && browser_engine_youtube_auth_origin(engine->navigation.page.document_url)
+        && engine->navigation.scripts_enabled && engine->navigation.document_scripts_enabled
+        && engine->navigation.page.runtime == NULL
+        && engine->navigation.page.script_degradation_observed) {
+        if (engine->youtube_signin_retries != 0) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+            return false;
+        }
+        /* Never discard an identifier/password the user has already entered.
+           Inspect lengths only; no field contents enter diagnostics. */
+        for (size_t i = 0; i < engine->navigation.page.layout.control_count; i++) {
+            const ControlRegion *control = &engine->navigation.page.layout.controls[i];
+            if (control->type != CONTROL_INPUT && control->type != CONTROL_TEXTAREA
+                && control->type != CONTROL_EDITABLE) continue;
+            size_t length = 0;
+            if (document_control_value(control->node, &length) == NULL)
+                (void) document_attribute(control->node, "value", &length);
+            if (length != 0) {
+                engine->youtube_signin_state = YOUTUBE_SIGNIN_MANUAL;
+                engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+                return false;
+            }
+        }
+        /* Retry the stable GET entry once after the predecessor is gone.
+           Never replay a password POST, single-use URL, or saved input. */
+        engine->youtube_signin_retries++;
+        engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_RECOVERING;
+        engine->youtube_signin_state = YOUTUBE_SIGNIN_RECOVERING;
+        bool refused = false;
+#ifndef __PSP__
+        refused = tilefinch_test_faults()->refuse_youtube_signin_recovery;
+        tilefinch_test_faults()->refuse_youtube_signin_recovery = false;
+#endif
+        bool started = !refused && browser_engine_begin_navigation_request(engine, youtube_signin_entry,
+            "GET", NULL, 0, NULL, engine->config.maximum_document_bytes,
+            engine->config.navigation_timeout_ms, false, true);
+        if (!started) {
+            engine->youtube_signin_state = YOUTUBE_SIGNIN_FAILED;
+            engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+        }
+        return started;
+    }
     /* Discovery is optional: a slow response must not monopolize idle turns
        ahead of fonts, images or tile preparation. Keep pumping it once per
        turn, while still allowing the other bounded continuations to run. */

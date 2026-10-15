@@ -18,14 +18,13 @@ bool layout_node_name_is(lxb_dom_node_t *node, const char *wanted);
 /* DRAW_IMAGE does not use its text member. A fixed raster <img> may borrow
    its node identity there (text_length stays zero), allowing allocation-free
    resource rebinding after the image table moves. This is native metadata,
-   never an author DOM marker. Intrinsic sizing and alt text retain full flow. */
+   never an author DOM marker. Intrinsic sizing retains full flow; fallback
+   alt ink is a separate retained text command, retired on image arrival. */
 static inline bool layout_fixed_image_slot(lxb_dom_node_t *node,
                                            const ComputedStyle *style,
                                            const ComputedStyle *parent)
 {
-    size_t alt_length = 0;
-    (void) document_attribute(node, "alt", &alt_length);
-    return layout_node_name_is(node, "img") && alt_length == 0
+    return layout_node_name_is(node, "img")
         && style->has_width && style->has_height
         && style->width > 0 && style->height > 0
         && style->width <= STYLE_LENGTH_DIRECT_LIMIT

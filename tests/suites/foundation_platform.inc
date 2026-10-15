@@ -1,3 +1,18 @@
+/* Large motion scans now span owner turns; wait for complete publication,
+   not an arbitrary single tick. The small static/lifecycle tests below
+   still assert their existing microtask and event ordering. */
+static bool test_motion_settle(ScriptRuntime *runtime, ScriptResult *result)
+{
+    for (unsigned tick = 0; tick < 128; tick++) {
+        if (!script_runtime_advance(runtime, 1, 16, result)
+            || !script_runtime_evaluate_diagnostic(runtime,
+                "pocSummary=__tilefinchRootCensus.motionScanPending?'pending':'settled'",
+                "<motion-settle>", result)) return false;
+        if (strcmp(result->summary, "settled") == 0) return true;
+    }
+    return false;
+}
+
 static bool test_cancellation_callback(void *opaque)
 {
     return tilefinch_cancellation_requested(opaque);

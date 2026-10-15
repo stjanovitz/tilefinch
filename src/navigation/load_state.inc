@@ -343,6 +343,11 @@ static bool navigation_load_headers(void *opaque,
     /* A redirect from an ordinary sign-in page must not start parsing the
        full service application before the facade can select its provider. */
     if (site_adapter_handles_navigation("GET", effective)) {
+        /* This endpoint has already run through the ordinary redirect chain.
+           Do not resend its single-use parameters through the provider. */
+        if (youtube_lite_signin_handoff_url(effective))
+            snprintf(load->effective_history_url, sizeof(load->effective_history_url),
+                     "%s", "https://www.youtube.com/");
         load->adapter_redirect = true;
         return false;
     }

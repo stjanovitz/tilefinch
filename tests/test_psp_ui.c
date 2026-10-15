@@ -1130,6 +1130,20 @@ static bool test_input_mapping_and_menu(void)
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.rotate_hint_always && intent.setting.id == PSP_UI_SETTING_ROTATE_HINT_ALWAYS
           && !intent.setting.value.boolean);
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+    ui.options_selection = 52; /* Session-only sign-in diagnostics, appended. */
+#else
+    ui.options_selection = 50;
+#endif
+    CHECK(!ui.youtube_signin_diagnostics);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.youtube_signin_diagnostics
+          && intent.setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS
+          && intent.setting.value.boolean);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.youtube_signin_diagnostics
+          && intent.setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS
+          && !intent.setting.value.boolean);
     ui.screen = PSP_UI_SCREEN_OPTIONS;
     ui.options_group_selection = 3;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
@@ -2920,6 +2934,24 @@ static bool test_site_storage_screens(void)
     psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
     intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
     CHECK(intent.setting.value.unsigned_value == BROWSER_SITE_STORAGE_STICK);
+    return true;
+}
+
+static bool test_youtube_signin_continue_menu(void)
+{
+    PspUiState ui; psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.youtube_signin_continue = true;
+    ui.menu_selection = 7;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_DOWN, .analog_x = 128, .analog_y = 128};
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.menu_selection == 8);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE);
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.youtube_signin_continue = false;
+    ui.menu_selection = 8; /* Availability can change while a menu is open. */
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_OPEN_FIND);
     return true;
 }
 
@@ -6264,6 +6296,51 @@ static bool test_progress_status_updates_in_place(void)
    it must not be rebuilt for a binding that changes nothing, and a glyph the
    Budget refused under pressure must come back once pressure passes while a
    character the face lacks stays settled. */
+static bool test_media_progress_mixed_glyph_baseline(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t pixels[WIDTH * HEIGHT];
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    psp_ui_set_chrome_fonts(face, NULL, 2u);
+    FontGlyph zero = {0}, percent = {0};
+    CHECK(font_glyph_load(face, '0', 11, false, &zero));
+    CHECK(font_glyph_load(face, '%', 11, false, &percent));
+    int suffix_width = zero.advance + percent.advance;
+    font_glyph_destroy(face, &zero);
+    font_glyph_destroy(face, &percent);
+
+    /* The larger chrome is preloaded. Warm only "0%" at the smaller size,
+       then refuse the new "1" bitmap, as a busy supervisor does on a miss. */
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_set_resolving(&media, "Video");
+    psp_ui_media_set_resolving_progress(&media, "Loading...", 0u);
+    memset(pixels, 0, sizeof(pixels));
+    psp_ui_media_composite(&media, pixels, WIDTH, HEIGHT, WIDTH);
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    psp_ui_media_set_resolving_progress(&media, "Loading...", 100u);
+    memset(pixels, 0, sizeof(pixels));
+    psp_ui_media_composite(&media, pixels, WIDTH, HEIGHT, WIDTH);
+    int digit_left = WIDTH / 2 + 152 - 16 - suffix_width - 6;
+    int baseline = HEIGHT / 2 - 41 + 44 + 10;
+    uint16_t ground = pixels[(baseline - 12) * WIDTH + digit_left];
+    bool baseline_ink = false;
+    for (int x = digit_left; x < digit_left + 5; x++)
+        baseline_ink = baseline_ink || pixels[(baseline - 1) * WIDTH + x] != ground;
+    CHECK(baseline_ink);
+    budget.limit = limit;
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    return true;
+}
+
 static bool test_chrome_font_cache_binding_and_refusals(void)
 {
     Budget budget;
@@ -6731,6 +6808,92 @@ static bool test_menu_cache_only_tracks_visible_catalogs(void)
     return true;
 }
 
+static bool test_menu_feedback_reuses_only_covered_pixels(void)
+{
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 0, 60000000, "Feedback");
+    uint32_t closed = psp_ui_media_menu_feedback_key(&media);
+    CHECK(closed == 1u);
+    p.track_menu_open = true; p.track_menu_tab = 0;
+    uint32_t audio = psp_ui_media_menu_feedback_key(&media);
+    CHECK(psp_ui_media_menu_feedback_reuse(closed, audio));
+    CHECK(!psp_ui_media_menu_feedback_reuse(0, audio)
+        && !psp_ui_media_menu_feedback_reuse(audio, audio)
+        && !psp_ui_media_menu_feedback_reuse(audio, closed));
+    p.track_menu_selection = 1;
+    CHECK(psp_ui_media_menu_feedback_reuse(audio, psp_ui_media_menu_feedback_key(&media)));
+    p.track_menu_tab = 1;
+    CHECK(psp_ui_media_menu_feedback_reuse(audio, psp_ui_media_menu_feedback_key(&media)));
+    p.queue_active = true; p.queue_count = 6; p.track_menu_tab = 3;
+    uint32_t queue = psp_ui_media_menu_feedback_key(&media);
+    CHECK(psp_ui_media_menu_feedback_reuse(audio, queue)
+        && !psp_ui_media_menu_feedback_reuse(queue, audio));
+    p.automatic_next = true;
+    CHECK(psp_ui_media_menu_feedback_reuse(queue, psp_ui_media_menu_feedback_key(&media)));
+    p.clockwise = true;
+    CHECK(psp_ui_media_menu_feedback_key(&media) == 0); p.clockwise = false;
+    media.seek_in_progress = true;
+    CHECK(psp_ui_media_menu_feedback_key(&media) == 0); media.seek_in_progress = false;
+    media.seek_preview_active = true;
+    CHECK(psp_ui_media_menu_feedback_key(&media) == 0); media.seek_preview_active = false;
+    media.resolving = true;
+    CHECK(psp_ui_media_menu_feedback_key(&media) == 0); media.resolving = false;
+    media.failed = true;
+    CHECK(psp_ui_media_menu_feedback_key(&media) == 0);
+    return true;
+}
+
+static bool test_track_focus_retains_header_ink(void)
+{
+    enum {W = 480, H = 272, MW = PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+          MH = PSP_UI_MEDIA_TRACK_MENU_HEIGHT};
+    static uint16_t scratch[W * H], menu[MW * MH];
+    static uint32_t pixels[W * H], reference[W * H];
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 0, 60000000, "Tracks");
+    p.track_menu_open = true;
+    p.audio_track_count = p.subtitle_track_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    p.selected_audio_track = 2; p.selected_subtitle_track = 1;
+    for (unsigned i = 0; i < PSP_UI_MEDIA_TRACK_LIMIT; i++) {
+        snprintf(p.audio_tracks[i].label, sizeof(p.audio_tracks[i].label), "Audio %u", i);
+        snprintf(p.subtitle_tracks[i].label, sizeof(p.subtitle_tracks[i].label), "Subtitle %u", i);
+    }
+    for (unsigned tab = 0; tab < 2; tab++) {
+        PspUiMediaTrackMenuCache cache = {0}; p.track_menu_tab = tab;
+        unsigned count = PSP_UI_MEDIA_TRACK_LIMIT + tab;
+        for (unsigned step = 0; step < count * 2 + 2; step++) {
+            p.track_menu_selection = step < count ? step
+                : count - 1 - (step - count) % count;
+            for (unsigned i = 0; i < W * H; i++)
+                pixels[i] = reference[i] = UINT32_C(0xff24689a);
+            psp_ui_media_composite_8888_cached(&media, NULL, pixels, W, H, W,
+                scratch, menu, MW * MH, 1, &cache, NULL, NULL);
+            psp_ui_media_composite_8888(&media, NULL, reference, W, H, W, scratch);
+            CHECK(!memcmp(pixels, reference, sizeof(pixels)));
+        }
+        /* A focus-only turn must retain the tab bar, not rerasterize it. */
+        p.track_menu_selection = 0;
+        psp_ui_media_composite_8888_cached(&media, NULL, pixels, W, H, W,
+            scratch, menu, MW * MH, 1, &cache, NULL, NULL);
+        uint16_t original = menu[0]; menu[0] ^= UINT16_C(0xffff);
+        uint16_t sentinel = menu[0]; p.track_menu_selection = 1;
+        psp_ui_media_composite_8888_cached(&media, NULL, pixels, W, H, W,
+            scratch, menu, MW * MH, 1, &cache, NULL, NULL);
+        CHECK(menu[0] == sentinel); menu[0] = original;
+        /* Catalog and selected-track changes still require a complete paint. */
+        strcpy(p.audio_tracks[0].label, "Changed");
+        p.selected_audio_track = 0; p.selected_subtitle_track = -1;
+        for (unsigned i = 0; i < W * H; i++) pixels[i] = reference[i] = UINT32_C(0xff24689a);
+        psp_ui_media_composite_8888_cached(&media, NULL, pixels, W, H, W,
+            scratch, menu, MW * MH, 2, &cache, NULL, NULL);
+        psp_ui_media_composite_8888(&media, NULL, reference, W, H, W, scratch);
+        CHECK(!memcmp(pixels, reference, sizeof(pixels)));
+    }
+    return true;
+}
+
 static bool test_queue_taller_cache_and_selection(void)
 {
     enum { W = 480, H = 272 };
@@ -6812,6 +6975,8 @@ static bool test_queue_taller_cache_and_selection(void)
 int main(void)
 {
     if (!test_queue_square_is_modal()) return 1;
+    if (!test_menu_feedback_reuses_only_covered_pixels()) return 1;
+    if (!test_track_focus_retains_header_ink()) return 1;
     if (!test_queue_taller_cache_and_selection()) return 1;
     if (!test_menu_cache_only_tracks_visible_catalogs()) return 1;
     if (!test_playlist_player_controls()) return 1;
@@ -6846,6 +7011,7 @@ int main(void)
         || !test_theme_catalog_is_bounded_sorted_and_selectable()
         || !test_panels_draw_the_token_ground()
         || !test_page_tools_windows_last_row_above_hint()
+        || !test_youtube_signin_continue_menu()
         || !test_site_storage_screens()
         || !test_heavy_page_screens()
         || !test_exit_needs_a_second_press()
@@ -6880,6 +7046,7 @@ int main(void)
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()
         || !test_media_committed_seek_keeps_timeline_stable()
         || !test_chrome_font_cache_binding_and_refusals()
+        || !test_media_progress_mixed_glyph_baseline()
         || !test_kept_status_settles()
         || !test_progress_status_updates_in_place()
         || !test_media_open_status_dismissed_at_scope_end()

@@ -775,6 +775,7 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     BrowserViewSnapshot view;
     if (ui == NULL || !browser_engine_view_snapshot(engine, &view)) return;
     psp_ui_set_page(ui, view.title, view.url, view.secure);
+    ui->youtube_signin_continue = browser_engine_youtube_signin_continue_available(engine);
     psp_ui_set_history(ui, view.can_go_back, view.can_go_forward);
     psp_ui_set_scroll(ui, view.scroll_y, view.maximum_scroll_y);
     _Static_assert(sizeof(ui->focus_label) == sizeof(view.focus_label),

@@ -566,9 +566,7 @@ typedef struct {
     size_t *cookie_clock;
     const char (*third_party_cookie_allowed_sites)[BROWSER_ORIGIN_LIMIT];
     size_t third_party_cookie_allowed_site_count;
-#ifndef __PSP__
     BrowserCookieDiagnostics *diagnostics;
-#endif
 } BrowserCookieStore;
 
 static BrowserCookieStore browser_session_cookie_store(
@@ -589,9 +587,7 @@ static BrowserCookieStore browser_session_cookie_store(
             : session->third_party_cookie_allowed_sites
         , .third_party_cookie_allowed_site_count = session == NULL ? 0
             : session->third_party_cookie_allowed_site_count
-#ifndef __PSP__
         , .diagnostics = session == NULL ? NULL : &session->cookie_diagnostics
-#endif
     };
 }
 
@@ -1184,7 +1180,6 @@ static void cookie_clock_make_room(BrowserCookieStore *store)
 
 static void cookie_diagnostic_add(BrowserCookieStore *store, unsigned kind)
 {
-#ifndef __PSP__
     BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
     if (d == NULL || !d->enabled) return;
     size_t *counter = kind == 0 ? &d->byte_refusals
@@ -1192,10 +1187,6 @@ static void cookie_diagnostic_add(BrowserCookieStore *store, unsigned kind)
         : kind == 2 ? &d->allocation_refusals
         : kind == 3 ? &d->policy_ignored : &d->evictions;
     if (*counter != SIZE_MAX) (*counter)++;
-#else
-    (void) store;
-    (void) kind;
-#endif
 }
 
 static bool cookie_set_raw(BrowserCookieStore *store,
@@ -1551,7 +1542,6 @@ static bool cookie_set(BrowserCookieStore *store,
                        const char *cookie, bool from_http)
 {
     bool okay = cookie_set_raw(store, request, cookie, from_http);
-#ifndef __PSP__
     BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
     if (d != NULL && d->enabled) {
         size_t *attempts = from_http ? &d->http_attempts : &d->script_attempts;
@@ -1561,11 +1551,9 @@ static bool cookie_set(BrowserCookieStore *store,
             && *store->cookie_bytes > d->peak_value_bytes)
             d->peak_value_bytes = *store->cookie_bytes;
     }
-#endif
     return okay;
 }
 
-#ifndef __PSP__
 void browser_session_cookie_diagnostics(BrowserSession *session, bool enable,
                                         BrowserCookieDiagnostics *diagnostics)
 {
@@ -1576,7 +1564,6 @@ void browser_session_cookie_diagnostics(BrowserSession *session, bool enable,
     if (enable) session->cookie_diagnostics.enabled = true;
     if (diagnostics != NULL) *diagnostics = session->cookie_diagnostics;
 }
-#endif
 
 bool browser_session_cookie_set(BrowserSession *session, const char *url,
                                 const char *cookie)

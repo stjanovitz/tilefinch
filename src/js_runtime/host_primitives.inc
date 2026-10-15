@@ -120,6 +120,10 @@ static JSValue js_stylesheet_motion_source(
     (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
     const Stylesheet *sheet = bridge == NULL ? NULL : bridge->stylesheet;
+    /* The captured, non-author-visible capability also supplies content
+       identity without copying the optional source on a cache hit. */
+    if (argc > 0 && JS_ToBool(context, argv[0]))
+        return JS_NewInt64(context, sheet == NULL ? 0 : (int64_t) sheet->build_generation);
     /* An incomplete prefix cannot replace the DOM style fallback: later
        inline rules may be absent even though the normal cascade has them. */
     if (sheet == NULL || sheet->motion_css == NULL

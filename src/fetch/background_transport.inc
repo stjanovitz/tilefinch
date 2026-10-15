@@ -1317,18 +1317,13 @@ static void fetch_background_record_network_regression(CURLcode code)
         memory_order_release);
 }
 
-static void fetch_background_publish_complete(
-    FetchBackgroundSlot *slot, bool success, CURLcode code)
+static void fetch_background_record_terminal_security(
+    FetchBackgroundSlot *slot, CURLcode code)
 {
-    slot->result.transport_code = (long) code;
     if (slot->easy != NULL) {
         slot->result.tls_verify_result_available = curl_easy_getinfo(
             slot->easy, CURLINFO_SSL_VERIFYRESULT,
             &slot->result.tls_verify_result) == CURLE_OK;
-        slot->result.tls_verification_failed =
-            code == CURLE_PEER_FAILED_VERIFICATION
-            || (slot->result.tls_verify_result_available
-                && slot->result.tls_verify_result != 0);
         fetch_capture_tls_security(
             slot->easy,
             slot->result.tls_version,
@@ -1337,6 +1332,15 @@ static void fetch_background_publish_complete(
             sizeof(slot->result.tls_peer_issuer),
             code != CURLE_OK || slot->result.tls_verify_result != 0);
     }
+    fetch_background_terminal_tls_metadata(&slot->result, (long) code,
+        slot->result.tls_verify_result_available, slot->result.tls_verify_result,
+        code == CURLE_PEER_FAILED_VERIFICATION);
+}
+
+static void fetch_background_publish_complete(
+    FetchBackgroundSlot *slot, bool success, CURLcode code)
+{
+    fetch_background_record_terminal_security(slot, code);
     slot->result.success = success;
     slot->result.length = slot->streaming
         ? slot->total_length : slot->length;
@@ -1394,7 +1398,7 @@ static void fetch_background_finish_stream_if_drained(
                != FETCH_BACKGROUND_CHUNK_EMPTY) return;
     fetch_background_publish_complete(
         slot, slot->result.success,
-        slot->result.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK);
+        (CURLcode) slot->result.transport_code);
 }
 
 static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
@@ -1609,6 +1613,7 @@ static void fetch_background_finish_easy(
                            ? "background HTTP hop failed transport policy"
                            : "background response failed media URL policy"));
     }
+    fetch_background_record_terminal_security(slot, code);
     fetch_background_slot_release_curl(slot);
     if (slot->streaming) {
         slot->result.success = admitted;

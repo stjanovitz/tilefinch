@@ -8,6 +8,12 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.38 — 2026-10-14
+
+- More reliable YouTube sign-in, with clearer recovery and optional privacy-safe diagnostics.
+- Faster player menus and smoother page updates.
+- Improved memory handling and stability on script-heavy pages.
+
 ## 0.1.37 — 2026-10-14
 
 - Playlist playback with Next/Previous, an optional Auto next toggle, and a queue.

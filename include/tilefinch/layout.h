@@ -105,6 +105,9 @@
 /* Retain the sixth family bit separately from the three compositing filter
    bits. This is text-only metadata, not another display-list word. */
 #define LAYOUT_TEXT_FONT_FAMILY_HIGH (1 << 28)
+/* A replaced image's fallback text borrows its node identity in image.
+   Fixed-box image arrival can retire this ink without rebuilding flow. */
+#define LAYOUT_TEXT_IMAGE_ALT (1 << 29)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
@@ -166,6 +169,8 @@ typedef struct {
     /* DRAW_TEXT borrows UTF-8; fixed raster DRAW_IMAGE slots may instead
        borrow native node identity here, with text_length zero. */
     const char *text;
+    /* DRAW_TEXT + LAYOUT_TEXT_IMAGE_ALT borrows a DOM node here, never an
+       ImageResource. Image consumers must check DRAW_IMAGE before reading. */
     const ImageResource *image;
     uint32_t text_length;
     uint32_t color;
@@ -1066,6 +1071,7 @@ typedef struct LayoutDocument {
     uint64_t image_content_generation;
     uint64_t image_style_generation;
     uint64_t image_sheet_generation;
+    size_t image_resource_count;
     bool visual_priority_overflow;
     ImagePriorityTarget *visual_priority_targets;
     size_t visual_priority_count;

@@ -128,6 +128,15 @@ longer depend on them.
 15. `native-string-gc` — give bounded native Latin-1 producers the same
     pre-allocation cycle-collection opportunity as the engine's other large
     string builders.
+    Realloc-only string-buffer growth also uses the paced threshold, and
+    unused capacity is bounded by available heap headroom, including widening.
+    Large UTF-8 construction under pressure sizes its final representation
+    before allocation instead of first retaining a narrow intermediate.
+    `JS_NewStringLenUTF8RopePortable` lets author-visible DOM text reads reuse
+    the existing codepoint-aligned immutable source chunks under pressure;
+    one non-Latin character no longer widens all preceding ASCII text. Small
+    text and reads with ample headroom keep the ordinary path. Raw flat-string
+    callers continue using `JS_NewStringLen`.
 16. `module-bytecode-restore` (not a patch layer; part of the bounded
     baseline) — a module read from bytecode no longer outlives a failure.
     `JS_ReadObject` released only one of the two references a half-read

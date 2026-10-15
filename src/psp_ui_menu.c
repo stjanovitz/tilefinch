@@ -496,14 +496,15 @@ static void menu_update_failure_recovery(
 static void menu_update_page_tools(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
+    size_t count = psp_ui_page_tools_count(ui);
+    if (ui->menu_selection >= count) ui->menu_selection = 0;
     if (pressed & PSP_UI_BUTTON_UP) {
         ui->menu_selection = (uint8_t) (
-            (ui->menu_selection + UI_PAGE_TOOLS_ITEM_COUNT - 1u)
-            % UI_PAGE_TOOLS_ITEM_COUNT);
+            (ui->menu_selection + count - 1u) % count);
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_DOWN) {
         ui->menu_selection = (uint8_t) (
-            (ui->menu_selection + 1u) % UI_PAGE_TOOLS_ITEM_COUNT);
+            (ui->menu_selection + 1u) % count);
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
         switch (ui->menu_selection) {
@@ -520,6 +521,7 @@ static void menu_update_page_tools(
                 intent->visual_changed = true;
                 return;
             case 7: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
+            case 8: intent->action = PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE; break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         menu_close(ui);

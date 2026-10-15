@@ -4,15 +4,20 @@
 from-scratch layout engine, JavaScript, and hardware-assisted video, all
 running on the handheld itself.*
 
-| Wikipedia at PSP resolution | 360p video playback |
+| Wikipedia | 360p video playback |
 |---|---|
-| ![The English Wikipedia PlayStation Portable article rendered by Tilefinch](docs/wikipedia-on-psp.png) | ![Tilefinch's video overlay—Big Buck Bunny title, pause control, scrubber, and timestamps—over a Big Buck Bunny frame](docs/big-buck-bunny-player.png) |
+| ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![Host-rendered preview of Tilefinch's native player overlay over Sprite Fright, with chapter markers and playback controls](docs/sprite-fright-player.png) |
 
-| Reader mode | Dark mode |
+| YouTube support | Dark mode |
 |---|---|
-| ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![The Wikipedia PlayStation Portable article rendered with Tilefinch forced dark mode](docs/wikipedia-dark-mode.png) |
+| ![Sprite Fright in Tilefinch's native YouTube details page, with its thumbnail, title, metadata, and controls](docs/youtube-details.png) | ![The Wikipedia PlayStation Portable article rendered with Tilefinch forced dark mode](docs/wikipedia-dark-mode.png) |
+
 | WebGL games | Danzeff text entry |
+|---|---|
 | [![Treadline Arena on the PSP: the jade player tank in a close fight with blue, yellow, orange and purple bots, with the score, armor and loadout HUD drawn in the canvas](docs/treadline-on-psp.png)](examples/treadline-arena/README.md) | ![Tilefinch's Danzeff radial keyboard with bookmark and history suggestions](docs/danzeff-text-entry.png) |
+
+The video player image is a host-rendered preview using Tilefinch's production
+overlay and a decoded movie frame; the YouTube details image is a host capture.
 
 ## Why
 
@@ -431,8 +436,9 @@ and its marks are trademarks of the Wikimedia Foundation, shown only to
 identify browser compatibility; Tilefinch is not affiliated with the Wikimedia
 Foundation.
 
-The video screenshot shows a frame from *Big Buck Bunny*, copyright 2008
-Blender Foundation, licensed
-[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The film and its
-credits are available from the
-[Blender open-movie project](https://studio.blender.org/projects/big-buck-bunny/).
+The player and YouTube details images show *Sprite Fright*, copyright Blender
+Foundation, produced by Blender Studio. Film imagery is shared under Creative
+Commons Attribution, with attribution to Blender Foundation and
+[studio.blender.org](https://studio.blender.org/). These captures add Tilefinch's
+interface over the imagery; see the project's
+[licensing and attribution information](https://studio.blender.org/projects/sprite-fright/pages/about/).

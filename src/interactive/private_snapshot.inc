@@ -17,6 +17,19 @@ static const char *private_snapshot_error_kind(const char *message)
     return "other";
 }
 
+/* These booleans are classifications, not an export of the error. Pair them
+   with allocation/watchdog counters; author exceptions can mimic messages. */
+static unsigned private_snapshot_error_flags(const char *message)
+{
+    if (message == NULL) return 0;
+    unsigned flags = 0;
+    if (strstr(message, "out of memory") != NULL) flags |= 1u;
+    if (strstr(message, "interrupted") != NULL) flags |= 2u;
+    if (strstr(message, "not a function") != NULL || strstr(message, "not callable") != NULL) flags |= 4u;
+    if (strstr(message, "is not defined") != NULL) flags |= 8u;
+    return flags;
+}
+
 /* Match browser-owned failure prefixes only. Never serialize the message,
    which can contain a navigation target or an author exception. */
 static const char *private_snapshot_navigation_error_kind(const char *message)
@@ -62,6 +75,8 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
     size_t budget_current = navigation->budget->current;
     size_t budget_peak = navigation->budget->peak;
     size_t budget_failures = navigation->budget->failure_count;
+    size_t category_bytes[BUDGET_CATEGORY_COUNT];
+    for (size_t i = 0; i < BUDGET_CATEGORY_COUNT; i++) category_bytes[i] = navigation->budget->categories[i].current;
     const LayoutDocument *source = &navigation->page.layout;
     if (source->count > MAX_COMMANDS || source->control_count > 256) return false;
     LayoutDocument visual = {0};
@@ -200,6 +215,23 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         js->dynamic_script_transport_failures,
         js->dynamic_script_authority_failures,
         js->dynamic_script_source_failures) > 0;
+    ScriptHeapGrowth growth = {0};
+    script_runtime_heap_growth(navigation->page.runtime, &growth);
+    size_t old_bytes = 0, new_bytes = 0, live_bytes = 0;
+    script_runtime_last_allocation_refusal(navigation->page.runtime, &old_bytes, &new_bytes, &live_bytes);
+    ok = ok && fprintf(text,
+        "Memory diagnostics: current=%zu peak=%zu limit=%zu refusals=%zu heap-used=%zu "
+        "heap-limit=%zu heap-growth-refusals=%zu shortfall=%zu reason=%u "
+        "reject-old=%zu reject-new=%zu reject-live=%zu collections=%zu "
+        "script-flags=%u callback-flags=%u interrupted=%u\n",
+        budget_current, budget_peak, navigation->budget->limit, budget_failures,
+        script_runtime_heap_used(navigation->page.runtime), growth.limit, growth.refusals,
+        growth.refused_bytes, (unsigned) growth.refused_reason, old_bytes, new_bytes, live_bytes,
+        growth.collections, private_snapshot_error_flags(js->error),
+        private_snapshot_error_flags(js->last_uncaught_callback_error), js->interrupted) > 0;
+    ok = ok && fprintf(text, "Memory categories: other=%zu dom=%zu js=%zu style=%zu resource=%zu layout=%zu render=%zu session=%zu navigation=%zu\n",
+        category_bytes[0], category_bytes[1], category_bytes[2], category_bytes[3], category_bytes[4],
+        category_bytes[5], category_bytes[6], category_bytes[7], category_bytes[8]) > 0;
     ScriptSchedulerSnapshot scheduler = {0};
     bool scheduler_ok = script_runtime_scheduler_snapshot(
         navigation->page.runtime, &scheduler);
@@ -281,9 +313,23 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         rating.phase, rating.response_flags) > 0;
     ok = ok && fprintf(text, "YouTube provider diagnostics: state=%u rows=%zu\n",
         (unsigned) browser_engine_youtube_feed_state(engine), provider_rows) > 0;
-    ok = ok && fprintf(text, "YouTube session diagnostics: authenticated=%u history-flags=%u cookies=%zu\n",
+    ok = ok && fprintf(text, "YouTube session diagnostics: authenticated=%u history-flags=%u cookies=%zu server-verified=%u\n",
         youtube_lite_session_signed_in(browser_engine_session(engine)) ? 1u : 0u,
-        browser_engine_youtube_history_metadata(engine), youtube_usage.cookie_count) > 0;
+        browser_engine_youtube_history_metadata(engine), youtube_usage.cookie_count,
+        browser_engine_youtube_login_verified(engine)) > 0;
+    /* This native report contains only fixed labels and numeric fields. Do
+       not substitute generic page errors, response text or session values. */
+    char handoff[2048];
+    if (browser_engine_youtube_signin_report(engine, handoff, sizeof(handoff))) {
+        const char *line = strchr(handoff, '\n');
+        while (ok && line != NULL && *++line != '\0') {
+            const char *end = strchr(line, '\n');
+            if (end == NULL) break;
+            ok = fprintf(text, "YouTube handoff diagnostics: %.*s\n",
+                         (int) (end - line), line) > 0;
+            line = end;
+        }
+    }
     unsigned entered = script_runtime_private_probe(navigation->page.runtime, false);
     unsigned failed = script_runtime_private_probe(navigation->page.runtime, true);
     ok = ok && fprintf(text, "Local stage diagnostics: entered=%u failed=%u\n",

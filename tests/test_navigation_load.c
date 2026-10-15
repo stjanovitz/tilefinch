@@ -33,6 +33,7 @@
 
 static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
 static bool test_resumable_initial_layout_pressure(void);
+static bool test_runtime_navigation_releases_large_incumbent(void);
 /* Private deterministic seam implemented by navigation.c for this test
    executable; zero restores the production realm source-policy bound. */
 void navigation_test_set_parser_script_stage_work_limit(size_t limit);
@@ -4877,6 +4878,7 @@ typedef struct {
     const char *response_referrer_policy;
     const char *stylesheet_request_referrer;
     const char *stylesheet_request_policy;
+    bool non_user_navigation;
 } ReferrerNavigationReplay;
 
 static uint64_t referrer_navigation_body_hash(
@@ -4933,7 +4935,7 @@ static bool write_referrer_navigation_replay(
                 "request-extra-header-bytes=0\n"
                 "request-send-client-hints=0\n"
                 "request-send-low-client-hints=1\n"
-                "request-sec-fetch-user=1\nrequest-upgrade-insecure=1\n"
+                "request-sec-fetch-user=%u\nrequest-upgrade-insecure=1\n"
                 "status=200\nlength=%zu\neffective-url=%s\n"
                 "content-type=text/html; charset=utf-8\netag=\n"
                 "last-modified=\ncf-mitigated=\naccept-ch=\ncritical-ch=\n"
@@ -4941,7 +4943,8 @@ static bool write_referrer_navigation_replay(
                 "set-cookie-count=0\n"
                 "response-header-0=content-type: text/html; charset=utf-8\n"
                 "response-header-1=referrer-policy: %s\n",
-                fixture->document_url, body_length, fixture->document_url,
+                fixture->document_url, !fixture->non_user_navigation,
+                body_length, fixture->document_url,
                 fixture->response_referrer_policy) > 0;
         } else {
             ok = fprintf(
@@ -5029,6 +5032,80 @@ static void remove_referrer_navigation_replay(const char *directory)
         (void) unlink(path);
     }
     (void) rmdir(directory);
+}
+
+static bool test_runtime_navigation_releases_large_incumbent(void)
+{
+    bool all_ok = true;
+    for (unsigned mode = 0; mode < 3 && all_ok; mode++) {
+        ReferrerNavigationReplay fixture = {
+            .document_url = "https://replacement.test/next",
+            .stylesheet_url = "https://unused.test/style.css",
+            .html = "<title>Replacement</title><body><button>Continue</button>",
+            .css = "", .response_referrer_policy = "",
+            .stylesheet_request_policy = "", .non_user_navigation = true
+        };
+        char directory[128] = {0}, error[256] = {0};
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        NavigationSession navigation = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 4)
+            && write_referrer_navigation_replay(directory, &fixture)
+            && fetch_trace_replay_begin(directory, error, sizeof(error));
+        if (ready) {
+            navigation_enable_scripts(&navigation, 8 * MIB, 1000);
+            navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                                32 * 1024, 1000);
+        }
+        static const char incumbent[] =
+            "<title>Incumbent</title><body><button>Back</button>"
+            "<script>globalThis.ready=1</script>";
+        ready = ready && navigation_commit_html(
+            &navigation, navigation_begin(&navigation),
+            "https://replacement.test/previous", incumbent,
+            sizeof(incumbent) - 1, 480, NULL, NULL, true);
+        ScriptResult result = {0};
+        ready = ready && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            mode == 1
+                ? "globalThis.retained=new Uint8Array(5*1024*1024);"
+                  "setTimeout(function(){location.href='https://replacement.test/missing'},0)"
+                : "globalThis.retained=new Uint8Array(5*1024*1024);"
+                  "setTimeout(function(){location.href='https://replacement.test/next'},0)",
+            "<runtime-replacement>", &result)
+            && script_runtime_heap_used(navigation.page.runtime) >= 4 * MIB;
+        size_t original_limit = budget.limit;
+        if (ready) {
+            /* The incumbent fits; its successor's first layout context does
+               not. Releasing only the realm makes the replacement fit. */
+            budget.limit = budget.current + 128 * 1024u;
+            navigation.defer_script_navigation = mode == 2;
+        }
+        bool advanced = ready && navigation_advance_runtime(&navigation, 1, 8);
+        budget.limit = original_limit;
+        all_ok = ready && (mode == 0
+            ? advanced && navigation.page.loaded
+                && strcmp(navigation.page.document.title, "Replacement") == 0
+            : mode == 1
+                ? !advanced && navigation.page.loaded
+                    && navigation.page.runtime == NULL
+                    && strcmp(navigation.page.document.title, "Incumbent") == 0
+                : advanced && navigation.page.runtime != NULL
+                    && script_runtime_has_pending_navigation(navigation.page.runtime)
+                    && strcmp(navigation.page.document.title, "Incumbent") == 0);
+        if (!all_ok) fprintf(stderr,
+            "runtime replacement mode=%u ready=%u advanced=%u runtime=%u error=%s\n",
+            mode, ready, advanced, navigation.page.runtime != NULL,
+            navigation.last_error);
+        fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        all_ok = budget.current == 0 && budget_categories_reconcile(&budget)
+            && all_ok;
+        if (installed) all_ok = budget_uninstall_lexbor(&budget) && all_ok;
+        if (directory[0] != '\0') remove_referrer_navigation_replay(directory);
+    }
+    return all_ok;
 }
 
 static bool test_resumable_initial_layout_pressure(void)

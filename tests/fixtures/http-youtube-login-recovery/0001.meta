@@ -1,0 +1,13 @@
+psp-http-trace=1
+method=GET
+url=https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=138
+effective-url=https://accounts.google.com/v3/signin/complete
+content-type=text/html
+set-cookie-count=0

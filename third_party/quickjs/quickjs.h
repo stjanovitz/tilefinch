@@ -801,6 +801,10 @@ static inline JSValue JS_NewString(JSContext *ctx, const char *str)
 JSValue JS_NewAtomString(JSContext *ctx, const char *str);
 JSValue JS_ToString(JSContext *ctx, JSValueConst val);
 JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
+/* Large non-ASCII text under pressure uses bounded, codepoint-aligned chunks.
+   For host bindings returning author-visible text, not callers requiring a
+   flat JSString pointer. Contents and malformed UTF-8 handling are unchanged. */
+JSValue JS_NewStringLenUTF8RopePortable(JSContext *ctx, const char *text, size_t length);
 const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, JS_BOOL cesu8);
 static inline const char *JS_ToCStringLen(JSContext *ctx, size_t *plen, JSValueConst val1)
 {

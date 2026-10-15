@@ -879,7 +879,7 @@ size_t layout_rebind_image_resources(LayoutDocument *layout,
     for (size_t command_index = 0;
          command_index < layout->count; command_index++) {
         DrawCommand *command = &layout->commands[command_index];
-        if (command->image == NULL) continue;
+        if (command->type != DRAW_IMAGE || command->image == NULL) continue;
         /* Append-only growth preserves indices. Compare numeric addresses
            only, never dereference the retired table or its old entries. */
         uintptr_t address = (uintptr_t) command->image;
@@ -3963,6 +3963,7 @@ static bool layout_job_init(LayoutBuildJob *job)
     layout->image_content_generation = job->document->content_generation;
     layout->image_style_generation = document_style_generation();
     layout->image_sheet_generation = job->stylesheet->build_generation;
+    layout->image_resource_count = job->images == NULL ? 0 : job->images->count;
     layout_read_trace_environment(layout);
     layout->budget = job->budget;
     layout->width = job->viewport_width;

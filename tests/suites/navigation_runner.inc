@@ -18,6 +18,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--replacement-pressure-only") == 0) {
+        RUN_TEST(test_runtime_navigation_releases_large_incumbent);
         RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
         RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
         RUN_TEST(test_optional_image_layout_refusal_retains_page);
@@ -87,6 +88,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_optional_image_layout_refusal_retains_page);
     RUN_TEST(test_optional_initial_image_refusal_retains_page);
     RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
+    RUN_TEST(test_runtime_navigation_releases_large_incumbent);
     RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
     RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
     RUN_TEST(test_static_images_retry_after_transient_idle_failure);

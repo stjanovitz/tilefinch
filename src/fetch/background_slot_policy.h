@@ -12,6 +12,19 @@
 #define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
 #define FETCH_BACKGROUND_STREAM_PUBLICATION_MAX (48u * 1024u)
 
+/* The curl handle must still exist when these facts are sampled. Keep the
+   numeric error even if a streamed tail is published after handle cleanup. */
+static inline void fetch_background_terminal_tls_metadata(
+    FetchBackgroundResult *result, long code, bool verification_available,
+    long verification_result, bool peer_verification_failed)
+{
+    result->transport_code = code;
+    result->tls_verify_result_available = verification_available;
+    result->tls_verify_result = verification_result;
+    result->tls_verification_failed = peer_verification_failed
+        || (verification_available && verification_result != 0);
+}
+
 /* Every scheduled response is bounded by its byte reservation. The handoff
    buffer need not be larger than that reservation (notably a one-byte media
    range probe), while ordinary schedulers retain the 64 KiB ceiling. */

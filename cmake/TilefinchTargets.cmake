@@ -753,7 +753,18 @@ if(PSP)
             # Retained Queue focus/footer painting measures 4,877,312 bytes.
             # The user approved 1 KiB more code; cache metadata reuses padding
             # and the menu keeps its existing surface and queue ceilings.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4877568)
+            # Track-row repaint and safe retained-scanout menu feedback cut
+            # measured first feedback from 35.6 ms to 15.8 ms. The approved
+            # 2 KiB increase changes no page, download or surface ceilings.
+            # Header-only sign-in handoff, one stable-entry recovery and
+            # opt-in count-only diagnostics measured 3,088 bytes over this
+            # ceiling. The approved 4 KiB changes no resource quotas.
+            # Native sign-in continuation and credential-free outcome reporting:
+            # measured 4,885,320 bytes; approved 2 KiB, with page quotas unchanged.
+            # Session-safe sign-in recovery and independent native header
+            # publication measured 4,887,568 bytes. The approved 2 KiB
+            # increase changes no memory, cookie or download quotas.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4888832)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

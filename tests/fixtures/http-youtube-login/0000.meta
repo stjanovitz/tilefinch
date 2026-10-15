@@ -8,7 +8,7 @@ transport-timeout=0
 error=
 status=200
 length=143
-effective-url=https://www.youtube.com/
+effective-url=https://www.youtube.com/signin?token=synthetic-received-handoff
 content-type=text/html
 set-cookie-count=1
 set-cookie-0=SAPISID=synthetic-session; Secure; HttpOnly; Path=/; Domain=youtube.com

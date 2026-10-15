@@ -4373,10 +4373,10 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
     LayoutDocument *layout = &page->layout;
     if (page->runtime != NULL || page->layout_provisional
         || session->style_rebuild_required || layout->count == 0
-        || layout->fixed_count != 0 || layout->sticky_count != 0
         || layout->image_content_generation != page->document.content_generation
         || layout->image_style_generation != document_style_generation()
-        || layout->image_sheet_generation != page->stylesheet.build_generation)
+        || layout->image_sheet_generation != page->stylesheet.build_generation
+        || layout->image_resource_count > page->images.count)
         return false;
     /* Resource-table growth can move every ImageResource, not just the new
        images. Preflight the entire list without dereferencing old pointers.
@@ -4385,25 +4385,11 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
         const DrawCommand *command = &layout->commands[i];
         if (draw_command_filter_code(command) != 0
             || draw_command_backdrop_blur(command) != 0) return false;
-        if (command->type == DRAW_IMAGE
-            && (command->text == NULL || command->text_length != 0
-                || command->width <= 0 || command->height <= 0)) return false;
     }
-    for (size_t i = 0; i < layout->visual_priority_count; i++) {
-        const ImagePriorityTarget *target = &layout->visual_priority_targets[i];
-        if (target->kind != IMAGE_PRIORITY_KIND_DOCUMENT) return false;
-        bool found = false;
-        for (size_t j = 0; j < layout->count; j++) {
-            const DrawCommand *command = &layout->commands[j];
-            if (command->type == DRAW_IMAGE
-                && command->text == (const char *) target->node) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    for (size_t i = 0; i < page->images.count; i++) {
+    /* Already-laid-out intrinsic images and SVGs need no new proof. Only the
+       newly appended suffix can change geometry. Table moves are rebound by
+       navigation_rebind_appended_images before reaching this publication. */
+    for (size_t i = layout->image_resource_count; i < page->images.count; i++) {
         const ImageResource *image = &page->images.items[i];
         if (image->is_background || image->is_mask || image->is_canvas)
             return false;
@@ -4411,7 +4397,9 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
         for (size_t j = 0; j < layout->count; j++) {
             const DrawCommand *command = &layout->commands[j];
             if (command->type == DRAW_IMAGE
-                && command->text == (const char *) image->node) {
+                && command->text == (const char *) image->node
+                && command->text_length == 0
+                && command->width > 0 && command->height > 0) {
                 found = true;
                 break;
             }
@@ -4419,10 +4407,21 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
         if (!found) return false;
     }
     bool unresolved = false;
+    int alt_margin = 0;
     int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN;
     for (size_t i = 0; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
-        if (command->type != DRAW_IMAGE) continue;
+        if (command->type == DRAW_TEXT && command->opacity_scale != 0
+            && (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0
+            && image_resource_available(images_find_node(&page->images,
+                (lxb_dom_node_t *) command->image))) {
+            command->opacity_scale = 0;
+            command->radius |= LAYOUT_TEXT_FIND_EXCLUDED;
+            int margin = command->font_size > 0 ? command->font_size : command->height;
+            if (margin > alt_margin) alt_margin = margin;
+        }
+        if (command->type != DRAW_IMAGE || command->text == NULL
+            || command->text_length != 0) continue;
         const ImageResource *next = images_find_node(&page->images,
             (lxb_dom_node_t *) command->text);
         bool available = image_resource_available(next);
@@ -4439,17 +4438,34 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
         command->image = available ? next : NULL;
         if (!available) unresolved = true;
     }
+    for (size_t i = 0; i < layout->visual_priority_count; i++) {
+        const ImagePriorityTarget *target = &layout->visual_priority_targets[i];
+        if (target->kind != IMAGE_PRIORITY_KIND_DOCUMENT
+            || !image_resource_available(images_find_node(&page->images, target->node)))
+            unresolved = true;
+    }
     if (!layout->visual_priority_overflow)
         layout->unresolved_external_visuals = unresolved;
     /* The retained command boxes already include layout translations and
-       transforms. Fixed/sticky layers and expanding filters declined above.
+       transforms. Fixed/sticky images keep those boxes; the renderer rebinds
+       their resources and retires any fixed-image raster it previously built.
+       Expanding filters declined above.
        Keep unrelated tiles and the active frame job, not just flow geometry. */
+    /* Fallback glyph ink may overhang its advance box. Retire neighboring
+       tiles conservatively too, including large/italic authored alt fonts. */
+    if (alt_margin > 0 && right > left && bottom > top) {
+        left = left < INT_MIN + alt_margin ? INT_MIN : left - alt_margin;
+        top = top < INT_MIN + alt_margin ? INT_MIN : top - alt_margin;
+        right = right > INT_MAX - alt_margin ? INT_MAX : right + alt_margin;
+        bottom = bottom > INT_MAX - alt_margin ? INT_MAX : bottom + alt_margin;
+    }
     session->relayout_damage_valid = right > left && bottom > top;
     session->relayout_damage_left = session->relayout_damage_valid ? left : 0;
     session->relayout_damage_top = session->relayout_damage_valid ? top : 0;
     session->relayout_damage_right = session->relayout_damage_valid ? right : 0;
     session->relayout_damage_bottom = session->relayout_damage_valid ? bottom : 0;
     session->canvas_paint_damage_pending = true;
+    layout->image_resource_count = page->images.count;
     session->incremental_relayouts++;
     return true;
 }
@@ -4461,6 +4477,9 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
     page->deferred_image_publication_age = 0;
     if (session->deferred_image_ready != NULL)
         session->deferred_image_ready(session->deferred_image_ready_opaque, session);
+    /* A pending visual batch owns the next replacement flow. Let its short
+       coalescing window include this completed document-image batch. */
+    if (page->visual_image_publication_pending) return true;
     if (navigation_publish_fixed_image_paint(session)) return true;
     if (!navigation_relayout(session)) {
         session->performance.background_image_failures++;
@@ -4497,18 +4516,34 @@ static NavigationBackgroundWorkOutcome navigation_publish_visual_images(
     bool optional = page->runtime == NULL && !session->style_rebuild_required;
     bool allowed = !optional
         || tilefinch_platform_cooperate("optional-image-publication", 1);
-    bool adopted = allowed && navigation_relayout(session);
+    bool painted = allowed && navigation_publish_fixed_image_paint(session);
+    /* Masks and intrinsic images genuinely need flow. Give the existing
+       bounded document-image job at most two owner pumps to join that flow,
+       rather than laying the whole page out separately for adjacent arrivals.
+       A slow response never extends this window to its network deadline. */
+    if (allowed && !painted && optional && page->image_continuation_pending
+        && page->deferred_image_targets != NULL
+        && page->visual_image_publication_age++ < 2u) {
+        (void) navigation_run_deferred_image_work(session);
+        if (page->image_continuation_pending) {
+            (void) tilefinch_platform_cooperate("optional-image-publication", 0);
+            return page->loaded ? NAVIGATION_BACKGROUND_WORK_SUCCESS
+                : NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+        }
+    }
+    bool adopted = painted || (allowed && navigation_relayout(session));
     if (optional)
         (void) tilefinch_platform_cooperate("optional-image-publication", 0);
     if (!page->loaded) return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
     if (!allowed || (!adopted && page->loaded && session->layout_build_cancelled))
         return NAVIGATION_BACKGROUND_WORK_SUCCESS;
     page->visual_image_publication_pending = false;
+    page->visual_image_publication_age = 0;
     if (!adopted) {
         session->performance.background_image_failures++;
         return NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
     }
-    session->performance.background_image_relayouts++;
+    if (!painted) session->performance.background_image_relayouts++;
     return NAVIGATION_BACKGROUND_WORK_SUCCESS;
 }
 
@@ -5562,6 +5597,7 @@ bool navigation_advance_runtime(NavigationSession *session,
                    session->page.runtime))) {
         char refresh_url[NAVIGATION_URL_LIMIT];
         navigation_refresh_follow(session, refresh_url, sizeof(refresh_url));
+        navigation_retire_large_incumbent_realm(session);
         uint64_t generation = navigation_begin(session);
         return navigation_load_url(session, generation, refresh_url,
                                    4 * 1024 * 1024, 30000,
@@ -5855,6 +5891,7 @@ consume_script_navigation:
         }
         navigation_note_script_initiator(session, navigation_url,
                                          user_activated, replace);
+        navigation_retire_large_incumbent_realm(session);
         uint64_t generation = navigation_begin(session);
         session->performance.runtime_us += navigation_record_slice(
             session, NAVIGATION_SLICE_RUNTIME, runtime_started,

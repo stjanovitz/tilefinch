@@ -26,6 +26,32 @@ LAB = Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 else None
 
 
 class PrivateConsoleTests(unittest.TestCase):
+    @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_memory_and_callback_diagnostics_export_only_fixed_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "diagnostics.html"
+            fixture.write_text("<p>Diagnostic fixture</p><script>setTimeout(()=>{"
+                "throw new TypeError('not a function mock-private-diagnostic-secret')},0)</script>")
+            session = PRIVATE.PrivateLab(LAB, root, fixture=fixture)
+            try:
+                session.status(timeout=30)
+                session.send(b"pump 8 16\n")
+                self.assertTrue(PRIVATE.create_private_snapshot(session, root)[8])
+                text = (root / "redacted.ppm.txt").read_text()
+                self.assertRegex(text, r"Memory diagnostics: current=\d+ peak=\d+ limit=\d+ refusals=\d+ heap-used=\d+")
+                self.assertIn("callback-flags=4", text)
+                handoff = [line for line in text.splitlines()
+                           if line.startswith("YouTube handoff diagnostics:")]
+                self.assertTrue(handoff)
+                for line in handoff:
+                    self.assertRegex(line, r"^YouTube handoff diagnostics: (?:[a-z-]+=\d+ ?)+$")
+                self.assertRegex(text, r"YouTube session diagnostics: authenticated=0 history-flags=\d+ cookies=0 server-verified=0")
+                self.assertIn("transport-code=0 transport-timed-out=0 tls-result-available=0 tls-result=0 tls-failed=0", text)
+                self.assertNotIn("mock-private-diagnostic-secret", text)
+            finally:
+                session.close()
+
     def test_device_session_export_is_explicit_fixed_and_removed_on_close(self):
         commands = []
         class Session:

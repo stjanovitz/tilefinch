@@ -11,6 +11,8 @@
    */
   const STYLE_LIMIT = 64,
     STYLE_BYTES_LIMIT = 256 * 1024,
+    CACHE_STRING_UNITS = 32 * 1024,
+    CACHE_FRAME_PROPERTIES = 512,
     STYLE_NODE_LIMIT = 4096,
     KEYFRAME_LIMIT = 16,
     RULE_LIMIT = 128,
@@ -33,7 +35,14 @@
     retainedRules = 0,
     matchedElements = 0,
     transitionSnapshots = 0,
-    transitionSnapshotReads = 0;
+    transitionSnapshotReads = 0,
+    ruleParses = 0,
+    ruleCacheHits = 0,
+    scanYields = 0,
+    scanVersion = 0,
+    scanIterator = null,
+    scanRunning = false,
+    ruleCache = null;
   if (globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
       motionScans: { get: () => scans },
@@ -41,6 +50,12 @@
       motionKeyframes: { get: () => retainedKeyframes },
       motionRules: { get: () => retainedRules },
       motionElements: { get: () => matchedElements },
+      motionRuleParses: { get: () => ruleParses },
+      motionRuleCacheHits: { get: () => ruleCacheHits },
+      motionScanYields: { get: () => scanYields },
+      motionScanPending: { get: () => pending },
+      motionCachedStringUnits: { get: () => ruleCache?.units || 0 },
+      motionCachedFrameProperties: { get: () => ruleCache?.properties || 0 },
       transitionSnapshots: { get: () => transitionSnapshots },
       transitionSnapshotReads: { get: () => transitionSnapshotReads },
     });
@@ -56,23 +71,19 @@
   if (globalThis.AnimationEvent === undefined)
     globalThis.AnimationEvent = AnimationEvent;
 
-  const findBlockEnd = (text, open, limit = text.length) => {
+  const findBlockEnd = function* (text, open, limit = text.length) {
       let depth = 1,
         quote = "";
       for (let at = open + 1; at < limit; at++) {
+        if ((at & 4095) === 0) yield;
         const character = text[at];
         if (quote) {
           if (character === "\\") at++;
           else if (character === quote) quote = "";
         } else if (character === '"' || character === "'") quote = character;
         else if (character === "/" && text[at + 1] === "*") {
-          at += 2;
-          while (
-            at + 1 < limit &&
-            !(text[at] === "*" && text[at + 1] === "/")
-          )
-            at++;
-          at++;
+          const close = text.indexOf("*/", at + 2);
+          at = close < 0 || close + 1 >= limit ? limit : close + 1;
         } else if (character === "{") depth++;
         else if (character === "}" && --depth === 0) return at;
       }
@@ -141,7 +152,7 @@
         return "";
       }
     },
-    declarationMap = (text) => {
+    declarationMap = function* (text) {
       declarationParses++;
       const declarations = new Map();
       for (let at = 0; at < text.length; ) {
@@ -150,6 +161,7 @@
           depth = 0,
           quote = "";
         for (; end < text.length; end++) {
+          if ((end & 4095) === 0 && end !== 0) yield;
           const character = text[end];
           if (quote) {
             if (character === "\\") end++;
@@ -322,18 +334,20 @@
       if (!match) return null;
       return Math.max(0, Math.min(1, Number(match[1]) / 100));
     },
-    parseKeyframes = (text, begin, end) => {
+    parseKeyframes = function* (text, begin, end) {
       const frames = [];
       for (let at = begin; at < end && frames.length < FRAME_LIMIT; ) {
-        while (at < end && /\s/.test(text[at])) at++;
+        while (at < end && /\s/.test(text[at])) {
+          at++; if ((at & 4095) === 0) yield;
+        }
         const open = text.indexOf("{", at);
         if (open < 0 || open >= end) break;
-        const close = findBlockEnd(text, open, end);
+        const close = yield* findBlockEnd(text, open, end);
         if (close >= end) break;
         const offset = keyframeOffset(text.slice(at, open));
         if (offset !== null) {
           const frame = { offset };
-          for (const [name, value] of declarationMap(
+          for (const [name, value] of yield* declarationMap(
             text.slice(open + 1, close),
           )) {
             if (!name.startsWith("animation")) frame[name] = value;
@@ -346,7 +360,7 @@
       return frames;
     };
 
-  const parseRules = (
+  const parseRules = function* (
     text,
     begin,
     end,
@@ -355,28 +369,26 @@
     depth = 0,
     keyframeLimit = KEYFRAME_LIMIT,
     ruleLimit = RULE_LIMIT,
-  ) => {
+  ) {
     if (depth > 8) return;
     for (let at = begin; at < end && rules.length < ruleLimit; ) {
-      while (at < end && /\s/.test(text[at])) at++;
+      while (at < end && /\s/.test(text[at])) {
+        at++; if ((at & 4095) === 0) yield;
+      }
       if (at >= end) break;
       let delimiter = at,
         quote = "",
         round = 0;
       for (; delimiter < end; delimiter++) {
+        if ((delimiter & 4095) === 0 && delimiter !== 0) yield;
         const character = text[delimiter];
         if (quote) {
           if (character === "\\") delimiter++;
           else if (character === quote) quote = "";
         } else if (character === '"' || character === "'") quote = character;
         else if (character === "/" && text[delimiter + 1] === "*") {
-          delimiter += 2;
-          while (
-            delimiter + 1 < end &&
-            !(text[delimiter] === "*" && text[delimiter + 1] === "/")
-          )
-            delimiter++;
-          delimiter++;
+          const close = text.indexOf("*/", delimiter + 2);
+          delimiter = close < 0 || close + 1 >= end ? end : close + 1;
         } else if (character === "(") round++;
         else if (character === ")" && round) round--;
         else if (
@@ -390,7 +402,7 @@
         at = delimiter + 1;
         continue;
       }
-      const close = findBlockEnd(text, delimiter, end);
+      const close = yield* findBlockEnd(text, delimiter, end);
       if (close >= end) break;
       const header = text.slice(at, delimiter).trim(),
         lower = header.toLowerCase();
@@ -403,7 +415,7 @@
           if (name)
             keyframes.set(
               name,
-              parseKeyframes(text, delimiter + 1, close),
+              yield* parseKeyframes(text, delimiter + 1, close),
             );
         }
       } else if (lower.startsWith("@media ")) {
@@ -412,7 +424,7 @@
           matches = matchMedia(header.slice(7).trim()).matches;
         } catch {}
         if (matches)
-          parseRules(
+          yield* parseRules(
             text,
             delimiter + 1,
             close,
@@ -426,7 +438,7 @@
         lower.startsWith("@layer") ||
         lower.startsWith("@supports ")
       ) {
-        parseRules(
+        yield* parseRules(
           text,
           delimiter + 1,
           close,
@@ -443,7 +455,7 @@
            map. False positives (strings/comments/custom properties) still
            take the complete parser; no CSS matching or cascade is skipped. */
         if (/animation/i.test(body)) {
-          const config = animationConfig(declarationMap(body));
+          const config = animationConfig(yield* declarationMap(body));
           if (config) rules.push({ selector: header, config });
         }
       }
@@ -603,7 +615,7 @@
       nativeInline && typeof value === "number"
         ? globalThis.__tilefinchWrap(value)
         : value,
-    collectTreeRoots = (nativeInline) => {
+    collectTreeRoots = function* (nativeInline) {
       const roots = [document];
       /* Without any shadow root there is nothing to find among the
          document's elements (this query returned every element). */
@@ -627,6 +639,7 @@
         );
         inspected += count;
         for (let index = 0; index < count; index++) {
+          if (index !== 0 && (index & 63) === 0) yield;
           /* Native query results are handles. Shadow-root lookup accepts that
              identity directly, so discovering roots must not retain wrappers
              for thousands of unrelated hosts. */
@@ -641,8 +654,40 @@
       }
       return roots;
     },
-    scan = () => {
+    ruleCacheCost = (entry) => {
+      let units = 0, properties = 0;
+      for (const rule of entry.rules) {
+        units += rule.selector.length + rule.config.name.length
+          + rule.config.easing.length + rule.config.direction.length;
+        if (units > CACHE_STRING_UNITS) return null;
+      }
+      for (const [name, frames] of entry.keyframes) {
+        units += name.length;
+        for (const frame of frames) for (const property of Object.keys(frame)) {
+          properties++;
+          units += property.length;
+          if (typeof frame[property] === "string") units += frame[property].length;
+          if (units > CACHE_STRING_UNITS || properties > CACHE_FRAME_PROPERTIES) return null;
+        }
+      }
+      return { units, properties };
+    },
+    dropCachedRoot = (cache, root) => {
+      const entry = cache.entries.get(root);
+      if (!entry) return;
+      cache.units -= entry.cost.units;
+      cache.properties -= entry.cost.properties;
+      cache.entries.delete(root);
+    },
+    scanKey = () => [
+      nativeMotionSource?.(true) || 0,
+      globalThis.__tilefinchStyleSheetGeneration?.() || 0,
+      globalThis.innerWidth, globalThis.innerHeight,
+      matchMedia("(prefers-color-scheme: dark)").matches,
+    ].join(":"),
+    scan = function* () {
       scans++;
+      const selectionVersion = scanVersion;
       let retainedBytes = 0,
         retainedNodes = 0,
         retainedStyles = 0,
@@ -650,50 +695,87 @@
         totalRules = 0;
       const nativeInline = typeof globalThis.__tilefinchQueryAll === "function"
         && !globalThis.__tilefinchHasRemoteNodeWriter,
-        roots = collectTreeRoots(nativeInline),
+        roots = yield* collectTreeRoots(nativeInline),
         candidates = new Map(),
         candidateFrames = new Map();
-      const nativeSource = nativeMotionSource?.();
+      const key = scanKey();
+      if (ruleCache?.key !== key)
+        ruleCache = { key, entries: new Map(), units: 0, properties: 0 };
+      const cache = ruleCache;
+      for (const root of cache.entries.keys())
+        if (!roots.includes(root)) dropCachedRoot(cache, root);
+      let nativeSource;
       for (const root of roots) {
         if (retainedStyles >= STYLE_LIMIT) break;
-        const keyframes = new Map(),
-          rules = [],
-          nativeMotion = root === document && typeof nativeSource === "string",
-          styleNodes = nativeMotion ? [] : queryTree(
-            root, "style", STYLE_LIMIT - retainedStyles, nativeInline),
-          styleCount = Math.min(
-            STYLE_LIMIT - retainedStyles,
-            styleNodes.length,
-          );
-        retainedStyles += styleCount;
-        if (nativeMotion) {
-          retainedBytes += boundedUtf8Length(nativeSource);
-          parseRules(nativeSource, 0, nativeSource.length, keyframes, rules,
-            0, KEYFRAME_LIMIT - totalKeyframes, RULE_LIMIT - totalRules);
+        /* Prior roots' inline styles also spend the common admission budget.
+           Preserve that ordering rather than granting cached later roots
+           more source/rule capacity than an uncached walk would have. */
+        const input = [retainedBytes, retainedNodes, retainedStyles,
+          totalKeyframes, totalRules].join(":");
+        let entry = cache.entries.get(root);
+        if (entry?.input === input) {
+          ruleCacheHits++;
+          retainedBytes += entry.bytes;
+          retainedNodes += entry.nodes;
+          retainedStyles += entry.styles;
         }
-        for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
-          const style = styleNodes[styleIndex],
-            available = STYLE_BYTES_LIMIT - retainedBytes,
-            availableNodes = STYLE_NODE_LIMIT - retainedNodes;
-          if (available <= 0 || availableNodes <= 0) break;
-          const retained = styleTextPrefix(style, available, availableNodes);
-          retainedBytes += retained.bytes;
-          retainedNodes += retained.nodes;
-          if (/(?:animation|keyframes)/i.test(retained.text))
-            parseRules(
-              retained.text, 0, retained.text.length, keyframes, rules, 0,
-              KEYFRAME_LIMIT - totalKeyframes,
-              RULE_LIMIT - totalRules);
+        else {
+          dropCachedRoot(cache, root);
+          entry = { input, keyframes: new Map(), rules: [], bytes: 0, nodes: 0, styles: 0 };
+          const beforeBytes = retainedBytes, beforeNodes = retainedNodes;
+          if (root === document) nativeSource = nativeMotionSource?.();
+          const nativeMotion = root === document && typeof nativeSource === "string",
+            styleNodes = nativeMotion ? [] : queryTree(
+              root, "style", STYLE_LIMIT - retainedStyles, nativeInline),
+            styleCount = Math.min(STYLE_LIMIT - retainedStyles, styleNodes.length);
+          retainedStyles += styleCount;
+          entry.styles = styleCount;
+          ruleParses++;
+          if (nativeMotion) {
+            retainedBytes += boundedUtf8Length(nativeSource);
+            yield* parseRules(nativeSource, 0, nativeSource.length,
+              entry.keyframes, entry.rules, 0,
+              KEYFRAME_LIMIT - totalKeyframes, RULE_LIMIT - totalRules);
+            nativeSource = undefined;
+          }
+          for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
+            const available = STYLE_BYTES_LIMIT - retainedBytes,
+              availableNodes = STYLE_NODE_LIMIT - retainedNodes;
+            if (available <= 0 || availableNodes <= 0) break;
+            const retained = styleTextPrefix(styleNodes[styleIndex], available, availableNodes);
+            retainedBytes += retained.bytes;
+            retainedNodes += retained.nodes;
+            if (/(?:animation|keyframes)/i.test(retained.text))
+              yield* parseRules(retained.text, 0, retained.text.length,
+                entry.keyframes, entry.rules, 0,
+                KEYFRAME_LIMIT - totalKeyframes, RULE_LIMIT - totalRules);
+          }
+          entry.bytes = retainedBytes - beforeBytes;
+          entry.nodes = retainedNodes - beforeNodes;
+          /* Cache admission is optional. Large frame/property payloads keep
+             the same animation behavior via the bounded uncached iterator. */
+          const cost = ruleCacheCost(entry);
+          if (cost && cost.units <= CACHE_STRING_UNITS - cache.units
+              && cost.properties <= CACHE_FRAME_PROPERTIES - cache.properties) {
+            entry.cost = cost;
+            cache.units += cost.units;
+            cache.properties += cost.properties;
+            cache.entries.set(root, entry);
+          }
         }
+        const { keyframes, rules } = entry;
         totalKeyframes += keyframes.size;
         totalRules += rules.length;
+        let matchingWork = 0;
         for (const rule of rules) {
+          if (++matchingWork % 8 === 0) yield;
           if (candidates.size >= ELEMENT_LIMIT) {
             /* Admission is full, but later authored rules still override the
                retained set. Matching those 128 wrappers is bounded and avoids
                both new wrappers and a zero-length query that suppresses the
                cascade. */
             for (const element of candidates.keys()) {
+              if (++matchingWork % 16 === 0) yield;
               if (element.getRootNode() !== root) continue;
               let matches = false;
               try { matches = element.matches(rule.selector); } catch {}
@@ -705,6 +787,7 @@
             const elements = queryTree(
               root, rule.selector, ELEMENT_LIMIT, nativeInline);
             for (const value of elements) {
+              if (++matchingWork % 16 === 0) yield;
               const element = wrappedElement(value, nativeInline);
               if (!(element instanceof Element)) continue;
               if (!candidates.has(element)
@@ -726,6 +809,7 @@
           ? candidates.keys()
           : queryTree(root, "[style]", ELEMENT_LIMIT, nativeInline);
         for (const value of inlineElements) {
+          if (++matchingWork % 16 === 0) yield;
           if (revisitCandidates && value.getRootNode() !== root) continue;
           if (
             retainedBytes >= STYLE_BYTES_LIMIT ||
@@ -739,7 +823,7 @@
           retainedBytes += boundedUtf8Length(retained);
           retainedNodes++;
           const config = /animation/i.test(retained)
-            ? animationConfig(declarationMap(retained)) : null;
+            ? animationConfig(yield* declarationMap(retained)) : null;
           if (config) {
             const target = wrappedElement(value, nativeInline);
             if (!(target instanceof Element)) continue;
@@ -750,6 +834,10 @@
           }
         }
       }
+      /* Never publish matching results from a DOM or stylesheet snapshot
+         that changed while this job was suspended. Parsed rules can still
+         be reused on the next pass when only classes changed. */
+      if (scanVersion !== selectionVersion || scanKey() !== key) return false;
       for (const element of Array.from(active)) {
         if (!candidates.has(element)) {
           const state = applied.get(element);
@@ -785,7 +873,9 @@
           applyStaticFrame(element, frames, config, signature);
           continue;
         }
-        const animation = element.animate(frames, {
+        /* Page replacements of animate() must not gain mutable references
+           into the retained parsed-rule cache. */
+        const animation = element.animate(frames.map((frame) => ({ ...frame })), {
             duration: config.duration,
             delay: config.delay,
             iterations: config.iterations,
@@ -807,7 +897,7 @@
       retainedKeyframes = totalKeyframes;
       retainedRules = totalRules;
       matchedElements = candidates.size;
-      pending = false;
+      return true;
     },
     documentHasMotionHint = () => {
       try {
@@ -857,9 +947,36 @@
       return false;
     };
 
+  const advanceScan = () => {
+    scanRunning = true;
+    try {
+      scanIterator ||= scan();
+      const step = scanIterator.next();
+      if (step.done) {
+        scanIterator = null;
+        pending = false;
+        if (!step.value) globalThis.__tilefinchMotionRecheck();
+        return;
+      }
+      scanYields++;
+      /* A timer task, not another microtask: the owner gets an input/render
+         turn between bounded parsing/matching chunks. One reserved task is
+         live, so author timers cannot exhaust continuation admission. */
+      const handle = globalThis.__tilefinchScheduleReservedTask?.(advanceScan, 1);
+      if (!handle) { scanIterator = null; pending = false; }
+    } catch (error) {
+      scanIterator = null;
+      ruleCache = null;
+      pending = false;
+      throw error;
+    } finally { scanRunning = false; }
+  };
   globalThis.__tilefinchMotionRecheck = () => {
+    if (pending) {
+      if (scanIterator && !scanRunning) scanVersion++;
+      return;
+    }
     if (
-      pending ||
       (active.size === 0 && !documentHasMotionHint())
     )
       return;
@@ -869,12 +986,12 @@
        authoritative layout observes the final state without a timer or a
        follow-up relayout. */
     if (reducedMotion) {
-      queueMicrotask(scan);
+      queueMicrotask(advanceScan);
       return;
     }
     const schedule =
       globalThis.__tilefinchScheduleRenderFixup || queueMicrotask;
-    schedule(scan);
+    schedule(advanceScan);
   };
   const beginObserving = () => {
     if (

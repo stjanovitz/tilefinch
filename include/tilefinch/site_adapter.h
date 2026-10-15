@@ -23,6 +23,8 @@ typedef struct SiteAdapterLoad SiteAdapterLoad;
 
 typedef struct {
     bool youtube_compact_results;
+    const char *navigation_initiator;
+    bool navigation_user_activated;
 } SiteAdapterPreferences;
 
 typedef enum {
@@ -74,6 +76,8 @@ typedef struct {
     uint64_t maximum_pump_us;
     uint64_t maximum_transform_slice_us;
     uint64_t maximum_irreducible_unit_us;
+    long handoff_http_status;
+    bool handoff_service_origin;
 } SiteAdapterLoadMetrics;
 
 /*

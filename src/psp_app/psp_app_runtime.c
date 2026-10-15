@@ -446,6 +446,9 @@ _Static_assert(
 static PspMediaPresentRecord
     psp_media_present_records[PSP_DISPLAY_PAGE_BUFFER_COUNT];
 static PspUiMediaTrackMenuCache psp_media_track_menu_cache;
+static uint32_t psp_media_front_menu_key, psp_media_front_menu_epoch;
+static uint64_t psp_media_front_frame_epoch;
+static uint64_t psp_media_front_menu_generation;
 _Static_assert(
     PSP_DISPLAY_VIDEO_AUX_BYTES
         >= (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
@@ -465,6 +468,7 @@ static bool psp_media_present_last_skipped;
 
 void psp_media_present_forget_buffers(void)
 {
+    psp_media_front_menu_key = 0;
     psp_media_present_records_reset(
         psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
 }
@@ -582,6 +586,55 @@ static bool psp_present_thread_cpu(uint64_t *run_us)
         return false;
     *run_us = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
     return true;
+}
+
+static atomic_uint psp_media_menu_feedback_time;
+static atomic_uint psp_media_menu_feedback_key;
+
+void psp_media_menu_feedback_input(const PspUiMediaState *media,
+    bool was_open, unsigned old_tab, uint32_t started_us)
+{
+    const PspUiMediaPresentation *p = media == NULL ? NULL : media->presentation;
+    if (p == NULL || (was_open == p->track_menu_open
+        && (!p->track_menu_open || old_tab == p->track_menu_tab))) return;
+    atomic_store_explicit(&psp_media_menu_feedback_key,
+        p->track_menu_open ? p->track_menu_tab + 1u : 0u, memory_order_relaxed);
+    atomic_store_explicit(&psp_media_menu_feedback_time,
+        started_us, memory_order_release);
+}
+
+typedef struct {
+    uint64_t before, after, cpu;
+    bool valid;
+} PspMenuPhaseClock;
+
+static PspMenuPhaseClock psp_menu_phase_clock(void)
+{
+    PspMenuPhaseClock clock = {0};
+    clock.before = sceKernelGetSystemTimeWide();
+    clock.valid = psp_present_thread_cpu(&clock.cpu);
+    clock.after = sceKernelGetSystemTimeWide();
+    return clock;
+}
+
+static void psp_menu_phase_report(unsigned key, uint32_t input_us,
+    const PspMenuPhaseClock clocks[4])
+{
+    static const char *const phases[] = {"video", "overlay", "publish"};
+    uint64_t query_us = 0;
+    for (unsigned at = 0; at < 4; at++) query_us += clocks[at].after - clocks[at].before;
+    printf("tilefinch-menu-feedback: open=%u tab=%u elapsed=%uus clock-query=%lluus\n",
+        key != 0u, key == 0u ? 0u : key - 1u,
+        (unsigned) ((uint32_t) clocks[3].after - input_us), (unsigned long long) query_us);
+    for (unsigned at = 0; at < 3; at++) {
+        bool valid = clocks[at].valid && clocks[at + 1].valid
+            && clocks[at + 1].cpu >= clocks[at].cpu;
+        printf("tilefinch-menu-phase: phase=%s wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u\n",
+            phases[at],
+            (unsigned long long) (clocks[at + 1].before - clocks[at].after),
+            (unsigned long long) (clocks[at + 1].after - clocks[at].before),
+            (unsigned long long) (valid ? clocks[at + 1].cpu - clocks[at].cpu : 0), valid);
+    }
 }
 
 bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing)
@@ -1511,18 +1564,43 @@ static bool psp_present_video_surface(void)
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t presentation_started_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    unsigned menu_key = psp_active_media->ui_presentation.track_menu_open
+        ? psp_active_media->ui_presentation.track_menu_tab + 1u : 0u;
+    unsigned menu_input_us = atomic_load_explicit(
+        &psp_media_menu_feedback_time, memory_order_acquire);
+    bool measure_menu = menu_input_us != 0u
+        && atomic_load_explicit(&psp_media_menu_feedback_key, memory_order_relaxed) == menu_key
+        && (uint32_t) presentation_started_us - menu_input_us < 1000000u;
+    PspMenuPhaseClock menu_clocks[4] = {{0}};
+    if (measure_menu) menu_clocks[0] = psp_menu_phase_clock();
 #endif
     uint32_t *vram = psp_display_video_back_buffer(&psp_display);
     PspMediaPresentGeCost cost = {0, 0, 0};
+    uint32_t feedback_key = psp_ui_media_menu_feedback_key(&psp_active_media->ui);
+    uint32_t feedback_epoch = psp_display_edram_content_epoch();
+    /* The front is read-only; the hidden back is exclusively ours. Copy the
+       completed scanout and replace only the opaque chooser. Never redraw a
+       blended control on these already-composited pixels. A smaller chooser,
+       dismissal, seek, rotation or stream/EDRAM transition takes fresh video. */
+    bool menu_feedback = psp_media_front_menu_generation == psp_active_media->generation
+        && psp_media_front_menu_epoch == feedback_epoch
+        && psp_media_front_frame_epoch == psp_active_media->frame.epoch
+        && psp_ui_media_menu_feedback_reuse(psp_media_front_menu_key, feedback_key)
+        && psp_media_present_ge_stage_rows(vram,
+            psp_display_video_front_buffer(&psp_display),
+            PSP_VRAM_STRIDE, PSP_VRAM_STRIDE, PSP_SCREEN_HEIGHT);
+    if (menu_feedback)
+        psp_media_present_records[psp_display.back_buffer].valid = false;
     bool overlay_paints =
         psp_ui_media_overlay_paints(&psp_active_media->ui);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_media_present_last_skipped = false;
+    if (menu_feedback) psp_media_present_last_skipped = true;
 #endif
     if (vram == NULL
-        || !psp_present_media_frame_video(
+        || (!menu_feedback && !psp_present_media_frame_video(
                vram, &psp_active_media->frame,
-               overlay_paints, &cost)) {
+               overlay_paints, &cost))) {
         /* The engine refused after the surface was entered. Hand the panel
            back and let the next present run the software scaler; publishing a
            buffer nothing drew into would be a frame of noise. */
@@ -1530,6 +1608,9 @@ static bool psp_present_video_surface(void)
         psp_media_present_forget_buffers();
         return false;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (measure_menu) menu_clocks[1] = psp_menu_phase_clock();
+#endif
     PspUiMediaPreview preview = {
         .pixels = psp_active_media->seek_preview_pixels,
         .width = PSP_MEDIA_PREVIEW_WIDTH,
@@ -1546,20 +1627,34 @@ static bool psp_present_video_surface(void)
         psp_display_edram_content_epoch(), &psp_media_track_menu_cache,
         psp_media_track_menu_blit, NULL);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (measure_menu) menu_clocks[2] = psp_menu_phase_clock();
     psp_cadence_composed(presentation_started_us, false);
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     unsigned published_index = psp_display.back_buffer;
 #endif
     bool published = psp_display_publish(&psp_display);
+    if (published) {
+        psp_media_front_menu_key = feedback_key;
+        psp_media_front_menu_epoch = feedback_epoch;
+        psp_media_front_menu_generation = psp_active_media->generation;
+        if (!menu_feedback) psp_media_front_frame_epoch = psp_active_media->frame.epoch;
+    }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (measure_menu && published) {
+        menu_clocks[3] = psp_menu_phase_clock();
+        psp_menu_phase_report(menu_key, menu_input_us, menu_clocks);
+        atomic_compare_exchange_strong_explicit(&psp_media_menu_feedback_time,
+            &menu_input_us, 0u, memory_order_relaxed, memory_order_relaxed);
+    }
     psp_cadence_published(published);
-    psp_cadence_video_published(published, &psp_active_media->frame);
+    psp_cadence_video_published(published,
+        menu_feedback ? NULL : &psp_active_media->frame);
     if (published) {
         psp_input_script_capture_media_present(
             &psp_active_media->ui, NULL, vram, PSP_VRAM_STRIDE,
             true, published_index, psp_media_present_last_skipped, false,
-            &psp_active_media->frame, psp_media_present_records,
+            menu_feedback ? NULL : &psp_active_media->frame, psp_media_present_records,
             PSP_DISPLAY_PAGE_BUFFER_COUNT);
     }
 #endif
@@ -2924,6 +3019,11 @@ void psp_work_cooperate_begin_media_open(
     const PspUiMediaState *media_ui)
 {
     if (ui == NULL || media_ui == NULL) return;
+    /* Player labels use both chrome sizes regardless of the menu-scale
+       preference. Populate them on the owner before the loading supervisor
+       draws percentages or the first track chooser. */
+    psp_presentation_preload_chrome_scale(1u);
+    psp_presentation_preload_chrome_scale(2u);
     psp_ui_set_loading(ui, true, -1);
     psp_ui_show_status(ui, PSP_MEDIA_OPEN_STATUS, 600);
     psp_work_cooperate_begin(
@@ -3652,8 +3752,20 @@ static void psp_work_ui_tick(bool owner_thread)
                 .analog_y = 128,
                 .elapsed_ms = 16
             };
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            bool menu_was_open = cooperate->supervisor_media_ui.presentation != NULL
+                && cooperate->supervisor_media_ui.presentation->track_menu_open;
+            unsigned menu_old_tab = cooperate->supervisor_media_ui.presentation == NULL
+                ? 0u : cooperate->supervisor_media_ui.presentation->track_menu_tab;
+            uint32_t menu_pressed_us = (uint32_t) (scripted
+                ? psp_input_script_request_time(now_us) : (uint64_t) sceKernelGetSystemTimeWide());
+#endif
             supervisor_media_intent = psp_ui_media_update(
                 &cooperate->supervisor_media_ui, &media_input);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            psp_media_menu_feedback_input(&cooperate->supervisor_media_ui,
+                menu_was_open, menu_old_tab, menu_pressed_us);
+#endif
             if (supervisor_media_intent.action
                     != PSP_UI_MEDIA_ACTION_NONE) {
                 cooperate->pending_media_intent = supervisor_media_intent;

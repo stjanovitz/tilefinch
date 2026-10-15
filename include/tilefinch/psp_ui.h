@@ -272,7 +272,8 @@ typedef enum {
     PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
     PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
     PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW,
-    PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER
+    PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER,
+    PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE
 } PspUiAction;
 
 /* Stable diagnostic spelling shared by the operation journal and validation
@@ -403,7 +404,8 @@ typedef enum {
     PSP_UI_SETTING_UI_LANGUAGE,
     PSP_UI_SETTING_YOUTUBE_LOGIN,
     PSP_UI_SETTING_ROTATE_HINT_ALWAYS,
-    PSP_UI_SETTING_WEB_FONTS
+    PSP_UI_SETTING_WEB_FONTS,
+    PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS
 } PspUiSettingId;
 
 typedef union {
@@ -623,8 +625,10 @@ typedef struct {
     /* Native locale uses the spare cursor-status bits, keeping snapshots
        within the existing 1 KiB admission ceiling. */
     uint8_t ui_language : 4;
+    uint8_t youtube_signin_diagnostics : 1;
     uint8_t youtube_login_policy : 2;
     uint8_t rotate_hint_always : 1;
+    uint8_t youtube_signin_continue : 1;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -1358,6 +1362,7 @@ void psp_ui_show_storage_offer(
 void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
                              size_t script_bytes, uint32_t estimate_ms);
 void psp_ui_show_youtube_login_offer(PspUiState *ui);
+void psp_ui_dismiss_youtube_login_offer(PspUiState *ui);
 /* A page-scripts status that X answers with HEAVY_STOP_SCRIPTS and O
    dismisses while it shows. */
 void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
@@ -1503,6 +1508,9 @@ void psp_ui_media_raster_track_menu(
     int width, int height, int stride);
 /* Update focus/footer in an otherwise unchanged retained Queue raster.
    False requires a full repaint, including glyph-recovery cases. */
+bool psp_ui_media_raster_menu_update(const PspUiMediaState *media,
+    unsigned old_selection, bool old_automatic_next,
+    uint16_t *pixels, int width, int height, int stride);
 bool psp_ui_media_raster_queue_update(const PspUiMediaState *media,
     unsigned old_selection, bool old_automatic_next,
     uint16_t *pixels, int width, int height, int stride);
@@ -1576,6 +1584,11 @@ void psp_ui_media_composite_8888_cached(
     uint16_t *scratch, uint16_t *menu_pixels, size_t menu_pixel_capacity,
     uint32_t edram_epoch, PspUiMediaTrackMenuCache *menu_cache,
     PspUiMediaTrackMenuBlit menu_blit, void *menu_blit_context);
+
+/* Feedback may reuse a completed landscape scanout for one menu transition.
+ * Zero refuses reuse; a shrinking/closed chooser needs fresh video beneath it. */
+uint32_t psp_ui_media_menu_feedback_key(const PspUiMediaState *media);
+bool psp_ui_media_menu_feedback_reuse(uint32_t previous, uint32_t current);
 
 void psp_ui_media_composite_controls_8888(
     const PspUiMediaState *media, uint32_t *pixels,

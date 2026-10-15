@@ -21,7 +21,7 @@ static bool menu_profile_blit(void *opaque, const uint16_t *source,
 bool psp_queue_menu_profile(Budget *budget)
 {
     if (budget == NULL) return false;
-    enum { PIXELS = 480 * 272, MENU_PIXELS = 352 * 208, PHASES = 8, REPEATS = 3 };
+    enum { PIXELS = 480 * 272, MENU_PIXELS = 352 * 208, PHASES = 12, REPEATS = 3 };
     uint16_t *scratch = budget_malloc(budget, PIXELS * sizeof(uint16_t));
     uint16_t *menu = budget_malloc(budget, MENU_PIXELS * sizeof(uint16_t));
     uint32_t *picture = budget_malloc(budget, PIXELS * sizeof(uint32_t));
@@ -50,12 +50,14 @@ bool psp_queue_menu_profile(Budget *budget)
     psp_ui_media_composite_8888_cached(&media, NULL, picture, 480, 272, 480,
         scratch, menu, MENU_PIXELS, 1, &cache, menu_profile_blit, &redraws);
     static const char *const names[] = {"idle-cache", "focus", "auto-next", "tabs",
-        "open-cold", "close", "cpu-copy", "raster"};
+        "open-cold", "close", "cpu-copy", "raster", "audio-cold",
+        "subtitle-cold", "audio-focus", "subtitle-focus"};
     struct { uint64_t wall, cpu, query; unsigned calls, redraws; } rows[PHASES * REPEATS];
     bool valid = true;
     for (unsigned phase = 0; phase < PHASES; phase++) {
         for (unsigned repeat = 0; repeat < REPEATS; repeat++) {
             p.track_menu_tab = 3; p.track_menu_open = true; p.track_menu_selection = 2;
+            if (phase >= 8) p.track_menu_tab = phase % 2u;
             unsigned before_redraws = redraws;
             unsigned calls = phase == 0 || phase == 6 ? 128 : 64;
             SceKernelThreadRunStatus before = { .size = sizeof(before) }, after = { .size = sizeof(after) };
@@ -69,6 +71,8 @@ bool psp_queue_menu_profile(Budget *budget)
                 if (phase == 3) input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
                 if (phase == 4) { p.track_menu_open = false; cache.valid = false; input.pressed = PSP_UI_BUTTON_TOOLBAR; }
                 if (phase == 5) { p.track_menu_open = true; input.pressed = PSP_UI_BUTTON_CANCEL; }
+                if (phase == 8 || phase == 9) cache.valid = false;
+                if (phase == 10 || phase == 11) input.pressed = PSP_UI_BUTTON_DOWN;
                 if (input.pressed) (void) psp_ui_media_update(&media, &input);
                 if (phase == 7) psp_ui_media_raster_track_menu(&media, menu, 352, 208, 352);
                 else psp_ui_media_composite_8888_cached(&media, NULL, picture, 480, 272, 480,

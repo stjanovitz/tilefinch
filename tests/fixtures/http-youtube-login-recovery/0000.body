@@ -1,0 +1,1 @@
+<form method=post action='https://accounts.google.com/tilefinch-test-signin'><input id=user name=user><input id=password type=password name=password><button id=submit>Sign in</button></form>

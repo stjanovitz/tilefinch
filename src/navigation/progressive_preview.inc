@@ -63,7 +63,7 @@ static bool navigation_retained_preview_detach(
     size_t bytes = 0, image_count = 0;
     for (size_t i = 0; i < layout->count; i++) {
         const DrawCommand *command = &layout->commands[i];
-        if (command->image != NULL) image_count++;
+        if (command->type == DRAW_IMAGE && command->image != NULL) image_count++;
         if (command->type != DRAW_TEXT || command->text == NULL
             || command->text_length == 0) continue;
         uintptr_t address = (uintptr_t) command->text;
@@ -92,6 +92,12 @@ static bool navigation_retained_preview_detach(
     size_t used = 0, image = 0;
     for (size_t i = 0; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
+        /* Detached preview ink owns its text and cannot retain a DOM identity
+           for later alt-text retirement. It is never a paint-only candidate. */
+        if (command->type == DRAW_TEXT && (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0) {
+            command->image = NULL;
+            command->radius &= ~LAYOUT_TEXT_IMAGE_ALT;
+        }
         if (command->image != NULL) {
             uintptr_t address = (uintptr_t) command->image;
             size_t index = SIZE_MAX;

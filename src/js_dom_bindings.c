@@ -5343,6 +5343,15 @@ static lxb_dom_node_t *bridge_text_content_next(lxb_dom_node_t *at,
     return at == root ? NULL : at->next;
 }
 
+static JSValue bridge_text_string(JSContext *context, const char *text, size_t length)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    return JS_NewStringLenUTF8RopePortable(context, text, length);
+#else
+    return JS_NewStringLen(context, text, length);
+#endif
+}
+
 JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
                         int argc, JSValueConst *argv)
 {
@@ -5373,7 +5382,7 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
             return JS_ThrowInternalError(
                 context, "remote document text read failed");
         }
-        JSValue value = JS_NewStringLen(
+        JSValue value = bridge_text_string(
             context, read.value == NULL ? "" : read.value, read.length);
         js_rt_remote_node_read_result_destroy(bridge, &read);
         return value;
@@ -5393,7 +5402,7 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
         || text_node->type == LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION) {
         const lexbor_str_t *data =
             &lxb_dom_interface_character_data(text_node)->data;
-        return JS_NewStringLen(context,
+        return bridge_text_string(context,
             data->data == NULL ? "" : (const char *) data->data, data->length);
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
@@ -5402,7 +5411,7 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
         if (node->type == LXB_DOM_NODE_TYPE_ATTRIBUTE) {
             size_t length = 0;
             const lxb_char_t *text = lxb_dom_attr_value(lxb_dom_interface_attr(node), &length);
-            return JS_NewStringLen(context, text == NULL ? "" : (const char *) text, length);
+            return bridge_text_string(context, text == NULL ? "" : (const char *) text, length);
         }
         return JS_NewString(context, "");
     }
@@ -5433,7 +5442,7 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
         if (data->length != 0) memcpy(text + used, data->data, data->length);
         used += data->length;
     }
-    JSValue value = JS_NewStringLen(context, text, length);
+    JSValue value = bridge_text_string(context, text, length);
     if (text != local) budget_free(bridge->budget, text);
     return value;
 }

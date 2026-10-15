@@ -5797,17 +5797,29 @@
          checkpoints. Never advance readyState past a listener's pending
          promises. Sync send()/authored dispatchEvent() stay synchronous. */
       if (xhrPrivateState(xhr).async) {
+        let advancing = false, advanceAgain = false;
         const next = () => {
+          /* Listener-free events complete inline. Trampoline those steps
+             rather than nesting the full dispatcher for every response
+             state: sanitizer/PSP stacks must not lose loadend to an otherwise
+             recoverable stack refusal after readyState has reached DONE. */
+          if (advancing) { advanceAgain = true; return; }
+          advancing = true;
           try {
-            const step = xhrIteratorNext(iterator);
-            if (step.done) completed();
-            else {
+            for (let eventIndex = 0; eventIndex < 12; eventIndex++) {
+              advanceAgain = false;
+              const step = xhrIteratorNext(iterator);
+              if (step.done) { completed(); return; }
               const event = step.value;
               xhrEmitTarget(event[0], event[1], event[2], event[3], event[4], next);
+              if (!advanceAgain) return;
             }
+            throw new Error("XHR response event sequence exceeded its bound");
           } catch (error) {
             xhrIteratorReturn(iterator);
             xhrFail(xhr, error, "error", generation);
+          } finally {
+            advancing = false;
           }
         };
         next();

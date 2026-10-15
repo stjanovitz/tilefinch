@@ -460,8 +460,7 @@ typedef struct {
     bool digest_ready;
 } BrowserScriptBytecodeKey;
 
-#ifndef __PSP__
-/* Opt-in host diagnostics. Counts only; never retain cookie names, values,
+/* Opt-in diagnostics. Counts only; never retain cookie names, values,
    targets or credentials. Includes published jar operations, not speculative
    request-private overlay operations. */
 typedef struct {
@@ -476,7 +475,6 @@ typedef struct {
     size_t peak_value_bytes;
     bool enabled;
 } BrowserCookieDiagnostics;
-#endif
 
 typedef struct BrowserSession {
     Budget *budget;
@@ -500,9 +498,7 @@ typedef struct BrowserSession {
     size_t cache_bytes;
     size_t maximum_cookie_bytes;
     size_t maximum_cookie_long_path_bytes;
-#ifndef __PSP__
     BrowserCookieDiagnostics cookie_diagnostics;
-#endif
     size_t maximum_cache_bytes;
     size_t clock;
     size_t cookie_clock;
@@ -679,10 +675,8 @@ typedef struct {
 bool browser_session_site_data_usage(
     const BrowserSession *session, const char *url,
     BrowserSiteDataUsage *usage);
-#ifndef __PSP__
 void browser_session_cookie_diagnostics(BrowserSession *session, bool enable,
                                         BrowserCookieDiagnostics *diagnostics);
-#endif
 bool browser_session_clear_site_data(
     BrowserSession *session, const char *url);
 bool browser_session_storage_key(

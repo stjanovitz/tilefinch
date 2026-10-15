@@ -76,7 +76,8 @@ and both directions of the Square toggle.
 
 `player-queue-profile.txt` measures bounded batches of native menu preparation:
 cache hits, focus, Square, tab switching, cold opening, closing, CPU fallback
-copy, and full rasterization. Run with `--measure` and require
+copy, full rasterization, and cold/focus paths for the audio and subtitle tabs.
+Run with `--measure` and require
 `tilefinch-menu-profile: outcome=pass` plus clean exit. Its no-op blit excludes
 GE submission and presentation waits, so these are not press-to-visible
 latencies. Treat `cpu-valid=0` as unavailable thread CPU timing (as in PPSSPP),

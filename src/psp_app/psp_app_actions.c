@@ -220,6 +220,7 @@ typedef struct {
     TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
               [TILEFINCH_INSTALL_PATH_LIMIT];
+    char signin_report[1024];
 } PspDiagnosticPathSet;
 
 /* Keep the five long install paths and zlib/QR setup out of the already-large
@@ -230,6 +231,7 @@ static void psp_app_build_diagnostic_qr(
     PspApp *app, PspAppFrameState *frame)
 {
     if (app == NULL || frame == NULL) return;
+    bool signin_only = app->process->presentation.ui.youtube_signin_diagnostics;
     static const char *const names[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT] = {
         "tilefinch-last-error.txt",
         "tilefinch-validation.txt",
@@ -242,7 +244,7 @@ static void psp_app_build_diagnostic_qr(
        user-triggered export is the one place where paying a flush is useful:
        it makes the current file in the bundle match the latest completed
        diagnostic line. Shipping builds have no full validation stream. */
-    (void) psp_log_flush(false);
+    if (!signin_only) (void) psp_log_flush(false);
 #endif
     PspDiagnosticPathSet *paths = calloc(1u, sizeof(*paths));
     if (paths == NULL) {
@@ -253,7 +255,7 @@ static void psp_app_build_diagnostic_qr(
         return;
     }
     bool paths_valid = true;
-    for (size_t at = 0; at < TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT; at++) {
+    for (size_t at = 0; !signin_only && at < TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT; at++) {
         paths_valid = paths_valid && tilefinch_install_data_path(
             &app->process->install_paths, names[at],
             paths->paths[at], sizeof(paths->paths[at]));
@@ -261,7 +263,7 @@ static void psp_app_build_diagnostic_qr(
         paths->sources[at].path = paths->paths[at];
     }
     const char *wifi = psp_wifi_diagnostic_report();
-    if (wifi[0] != '\0') {
+    if (!signin_only && wifi[0] != '\0') {
         /* The current Wi-Fi failure takes priority over the oldest crash
            source. QR owns its bytes; this writes no Memory Stick file. */
         for (size_t at = TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT - 1u; at > 0; at--)
@@ -269,6 +271,14 @@ static void psp_app_build_diagnostic_qr(
         paths->sources[0] = (TilefinchDiagnosticSource) {
             .name = "tilefinch-wifi.txt", .memory = wifi,
             .memory_size = strlen(wifi)
+        };
+    }
+    if (signin_only) {
+        paths_valid = browser_engine_youtube_signin_report(app->browser->engine,
+            paths->signin_report, sizeof(paths->signin_report));
+        paths->sources[0] = (TilefinchDiagnosticSource) {
+            .name = "tilefinch-youtube-signin.txt", .memory = paths->signin_report,
+            .memory_size = strlen(paths->signin_report)
         };
     }
     if (!paths_valid) {
@@ -298,7 +308,7 @@ static void psp_app_build_diagnostic_qr(
     };
     char error[PSP_UI_STATUS_CAPACITY];
     app->process->diagnostic_qr = tilefinch_diagnostic_qr_build(
-        &metadata, paths->sources, TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT,
+        &metadata, paths->sources, signin_only ? 1u : TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT,
         error, sizeof(error));
     free(paths);
     if (app->process->diagnostic_qr == NULL) {
@@ -1659,6 +1669,16 @@ static void psp_app_dispatch_heavy_action(
                     &app->process->presentation.ui,
                     browser_engine_last_error(engine), 300);
             }
+            break;
+        }
+        case PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE: {
+            const char *target = browser_engine_youtube_signin_continue_target(engine);
+            if (target != NULL
+                && psp_begin_page_load(engine, &app->process->presentation.ui,
+                    profile, engine_frame, &app->process->text_input,
+                    target, true,
+                    PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS))
+                app->interactive->navigation_job_started_us = (uint64_t) sceKernelGetSystemTimeWide();
             break;
         }
         case PSP_UI_ACTION_RELOAD:

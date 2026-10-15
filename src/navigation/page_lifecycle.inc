@@ -1712,6 +1712,17 @@ void navigation_retire_current_page_scripts(NavigationSession *session)
     }
 }
 
+void navigation_retire_large_incumbent_realm(NavigationSession *session)
+{
+    /* A large application realm and its successor cannot coexist under the
+       page ceiling. Keep the existing 4 MiB admission policy identical for
+       frontend-owned and runtime-owned navigation; both retain static DOM
+       and pixels for rollback if the replacement fails. */
+    if (session != NULL && session->page.runtime != NULL
+        && script_runtime_heap_used(session->page.runtime) >= 4u * 1024u * 1024u)
+        navigation_retire_current_page_scripts(session);
+}
+
 static bool navigation_retire_exhausted_script_realms(
     NavigationSession *session, bool allocator_rejection_observed)
 {

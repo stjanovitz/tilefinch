@@ -524,7 +524,7 @@ static bool test_visual_publication_cooperate(void *opaque,
     if (probe->mode == 0) return false;
     if (probe->mode == 1)
         tilefinch_test_faults()->cancel_next_layout_cooperate = true;
-    else budget_inject_failure_after(probe->navigation->budget, 0);
+    else if (probe->mode == 2) budget_inject_failure_after(probe->navigation->budget, 0);
     return true;
 }
 
@@ -577,7 +577,19 @@ static int test_fixed_image_publication(void)
         && browser_engine_load_url(engine,
             "https://www.youtube.com/results?search_query=journey", true));
     NavigationSession *nav = browser_engine_navigation(engine);
+    for (size_t i = 0; i < nav->page.layout.count; i++) {
+        const DrawCommand *command = &nav->page.layout.commands[i];
+        if (command->type == DRAW_IMAGE && command->text != NULL)
+            CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(
+                (lxb_dom_node_t *) command->text), (const lxb_char_t *) "alt", 3,
+                (const lxb_char_t *) "Thumbnail fallback", 18) != NULL);
+    }
+    static const char layer_css[] =
+        "img[src*='TFTEST00001']{position:fixed;top:16px;left:28px;width:60px;height:40px}"
+        "img[src*='TFTEST00002']{position:sticky;top:0;width:60px;height:40px}";
+    CHECK(browser_engine_apply_user_css(engine, layer_css, sizeof(layer_css) - 1u));
     CHECK(nav->page.runtime == NULL && browser_engine_render_frame(engine, NULL));
+    CHECK(nav->page.layout.fixed_count > 0 && nav->page.layout.sticky_count > 0);
     const DrawCommand *retained_visual_commands = browser_engine_render_metrics_view(engine)->layout->commands;
     navigation_enable_external_resources(nav, 16, 2u * MIB, 512u * 1024u,
         24, 4u * MIB, MIB, 4u * MIB, 1000);
@@ -691,6 +703,23 @@ static int test_fixed_image_publication(void)
     }
     CHECK(nav->performance.background_images_loaded > 0);
     CHECK(nav->performance.background_image_relayouts == 0);
+    size_t retired_alt = 0;
+    for (size_t i = 0; i < nav->page.layout.count; i++) {
+        const DrawCommand *command = &nav->page.layout.commands[i];
+        if (command->type == DRAW_TEXT && (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0) {
+            if (image_resource_available(images_find_node(&nav->page.images,
+                    (lxb_dom_node_t *) command->image))) {
+                CHECK(command->opacity_scale == 0
+                    && (command->radius & LAYOUT_TEXT_FIND_EXCLUDED) != 0);
+                retired_alt++;
+            } else CHECK(command->opacity_scale != 0);
+        }
+    }
+    CHECK(retired_alt == nav->page.images.count && retired_alt != 0);
+    nav->page.visual_image_publication_pending = true;
+    CHECK(navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS
+        && !nav->page.visual_image_publication_pending
+        && nav->performance.background_image_relayouts == 0);
     CHECK(browser_engine_render_metrics_view(engine)->layout->commands == retained_visual_commands);
     CHECK(nav->page.layout.height == height);
     CHECK(browser_engine_render_frame(engine, NULL));
@@ -707,10 +736,11 @@ static int test_fixed_image_publication(void)
     static const char visual_html[] =
         "<!doctype html><title>Visual publication</title><h1>Icons</h1>"
         "<img id=kept width=32 height=32 src='https://i.ytimg.com/vi/TFTEST00001/mqdefault.jpg'>"
+        "<img id=next width=32 height=32 alt='Next image' src='https://i.ytimg.com/vi/TFTEST00004/mqdefault.jpg'>"
         "<div id=m1 style='width:24px;height:24px;background:red;mask-image:url(https://i.ytimg.com/vi/TFTEST00002/mqdefault.jpg)'></div>"
         "<div id=m2 style='width:24px;height:24px;background:blue;mask-image:url(https://i.ytimg.com/vi/TFTEST00003/mqdefault.jpg)'></div>"
         "<div id=m3 style='width:24px;height:24px;background:green;mask-image:url(https://i.ytimg.com/vi/TFTEST00004/mqdefault.jpg)'></div>";
-    for (unsigned mode = 0; mode < 3; mode++) {
+    for (unsigned mode = 0; mode < 4; mode++) {
         fetch_trace_end();
         CHECK(fetch_trace_replay_begin_response_keyed(replay, error, sizeof(error)));
         /* This fixture seeds one incumbent resource itself; only its later
@@ -750,6 +780,17 @@ static int test_fixed_image_publication(void)
                 .kind = IMAGE_PRIORITY_KIND_MASK};
         }
         nav->page.visual_batch_count = 3;
+        size_t before_image_relayouts = nav->performance.background_image_relayouts;
+        if (mode == 3) {
+            nav->page.deferred_image_targets = budget_calloc(nav->budget, 1, sizeof(ImagePriorityTarget));
+            CHECK(nav->page.deferred_image_targets != NULL);
+            nav->page.deferred_image_targets[0] = (ImagePriorityTarget) {
+                .node = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "next"),
+                .kind = IMAGE_PRIORITY_KIND_DOCUMENT, .retry_delay = 1};
+            CHECK(nav->page.deferred_image_targets[0].node != NULL);
+            nav->page.deferred_image_count = 1;
+            nav->page.image_continuation_pending = true;
+        }
         VisualPublicationProbe probe = {.navigation = nav, .mode = mode};
         TilefinchPlatformServices services = {.context = &probe, .cooperate = test_visual_publication_cooperate};
         tilefinch_platform_set_services(&services);
@@ -769,10 +810,23 @@ static int test_fixed_image_publication(void)
             if (shown->commands[i].type == DRAW_IMAGE && shown->commands[i].image != NULL)
                 CHECK(shown->commands[i].image == &nav->page.images.items[0]);
         CHECK(browser_engine_render_frame(engine, NULL));
+        if (mode == 3) {
+            CHECK(nav->performance.background_image_relayouts == before_image_relayouts
+                && nav->page.visual_image_publication_age == 1);
+            for (unsigned tick = 0; nav->page.visual_image_publication_pending && tick < 4; tick++)
+                CHECK(navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS);
+            CHECK(!nav->page.visual_image_publication_pending
+                && nav->performance.background_image_relayouts == before_image_relayouts + 1);
+            for (unsigned tick = 0; nav->page.image_continuation_pending && tick < 128; tick++)
+                CHECK(navigation_run_deferred_image_work(nav));
+            CHECK(!nav->page.image_continuation_pending && nav->page.images.count == 5
+                && nav->performance.background_image_relayouts == before_image_relayouts + 1);
+        }
         if (mode != 2) {
-            CHECK(navigation_background_resources_pending(nav)
-                && navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS
-                && !nav->page.visual_image_publication_pending);
+            if (mode != 3)
+                CHECK(navigation_background_resources_pending(nav)
+                    && navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS
+                    && !nav->page.visual_image_publication_pending);
         } else CHECK(navigation_relayout(nav));
         CHECK(browser_engine_render_frame(engine, NULL));
         actual_pixels = browser_engine_framebuffer(engine, &count);
@@ -5896,7 +5950,9 @@ static int test_youtube_personalized_home(void)
         }
         CHECK(browser_engine_render_frame(engine, NULL));
         NavigationSession *navigation = browser_engine_navigation(engine);
-        lxb_dom_node_t *search = navigation->page.layout.controls[0].node;
+        lxb_dom_node_t *search = test_reader_find_id(
+            lxb_dom_interface_node(navigation->page.document.html), "yt-search");
+        CHECK(search != NULL);
         CHECK(document_control_value_set(&navigation->page.document, search, "typed <&", 8));
         size_t base_links = navigation->page.layout.link_count;
         uint64_t generation = navigation->generation;
@@ -5907,8 +5963,16 @@ static int test_youtube_personalized_home(void)
             CHECK(test_reader_find_id(root, "yt-feed-status") == NULL
                 && test_reader_find_id(root, "yt-feed-refresh") == NULL);
         }
-        CHECK(strstr(navigation->page.layout.links[1].url, lane == 7 ? "/signin?" : "accounts.google.com/ServiceLogin?") != NULL);
-        CHECK(strstr(navigation->page.layout.links[2].url, "/feed/subscriptions") != NULL);
+        if (lane == 5 || lane == 7) {
+            CHECK(strstr(navigation->page.layout.links[1].url, lane == 7
+                ? "/signin?" : "accounts.google.com/ServiceLogin?") != NULL);
+        } else {
+            lxb_dom_node_t *root = lxb_dom_interface_node(navigation->page.document.html);
+            CHECK(test_reader_find_id(root, "yt-account-panel") != NULL
+                && test_reader_find_id(root, "yt-signout-action") != NULL);
+        }
+        CHECK(strstr(navigation->page.layout.links[lane == 5 || lane == 7 ? 2u : 1u].url,
+            "/feed/subscriptions") != NULL);
         if (lane == 1) CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
         if (lane == 6) {
             bool activate = false, changed = false;

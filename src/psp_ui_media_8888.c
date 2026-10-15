@@ -265,6 +265,26 @@ static uint32_t ui_media_menu_signature(
     return hash;
 }
 
+uint32_t psp_ui_media_menu_feedback_key(const PspUiMediaState *media)
+{
+    const PspUiMediaPresentation *p = media == NULL ? NULL : media->presentation;
+    if (p == NULL || !media->visible || p->clockwise || media->failed
+        || media->resolving || media->seek_in_progress || media->seek_preview_active)
+        return 0;
+    if (!p->track_menu_open) return 1u;
+    if (!media->controls_visible) return 0;
+    return ((uint32_t) psp_ui_media_track_menu_height(media) << 16)
+        | ((uint32_t) p->track_menu_tab << 10)
+        | ((uint32_t) p->track_menu_selection << 2)
+        | ((uint32_t) p->automatic_next << 1) | 1u;
+}
+
+bool psp_ui_media_menu_feedback_reuse(uint32_t previous, uint32_t current)
+{
+    return previous != 0 && current != previous && (current >> 16) != 0
+        && (current >> 16) >= (previous >> 16);
+}
+
 void psp_ui_media_composite_8888_cached(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
@@ -304,7 +324,7 @@ void psp_ui_media_composite_8888_cached(
     if (source_changed) {
         /* The painter fills the entire opaque rectangle before any ink;
            clearing it first was a redundant 124–143 KiB memory pass. */
-        if (content_changed || !psp_ui_media_raster_queue_update(media,
+        if (content_changed || !psp_ui_media_raster_menu_update(media,
                 menu_cache->selection, menu_cache->automatic_next,
                 menu_pixels, (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
                 menu_height, (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH))

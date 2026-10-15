@@ -65,6 +65,9 @@ typedef struct {
     bool fail_next_site_storage_compact_rename;
     /* Model FAT's refusal to rename over an existing credential file. */
     bool youtube_login_no_replace_rename;
+    bool refuse_next_youtube_feed_build;
+    bool expire_youtube_history;
+    bool refuse_youtube_signin_recovery;
     /* Stop the next compaction right after the original log is moved
        aside, as a power loss there would. */
     bool crash_next_site_storage_compact;
@@ -92,6 +95,8 @@ typedef struct {
     struct {
         char url[256];
         char user_agent[192];
+        bool cookie_present;
+        unsigned fetch_site; /* 0 unknown, 1 none, 2 origin, 3 site, 4 cross-site. */
     } replayed_requests[16];
     unsigned replayed_request_count;
 } TilefinchTestFaults;

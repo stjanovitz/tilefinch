@@ -15,6 +15,7 @@
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/ui_language.h"
 #include "youtube_internal.h"
+#include "tilefinch_test_faults.h"
 
 #define YOUTUBE_LITE_TITLE_LIMIT 256
 #define YOUTUBE_LITE_CHANNEL_LIMIT 128
@@ -131,6 +132,14 @@ static bool lite_path_is(const TilefinchUrl *url, const char *path)
     size_t length = strlen(path);
     return url->path_length == length
         && memcmp(url->value + url->path_offset, path, length) == 0;
+}
+
+bool youtube_lite_signin_handoff_url(const char *url)
+{
+    TilefinchUrl parsed;
+    return url != NULL && tilefinch_url_parse(url, &parsed)
+        && parsed.scheme == TILEFINCH_URL_SCHEME_HTTPS
+        && lite_youtube_host(&parsed) && lite_path_is(&parsed, "/signin");
 }
 
 YoutubeLiteRoute youtube_lite_route(const char *url)
@@ -1341,7 +1350,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "text-overflow:ellipsis}"
         ".hero{background:#181818;border-radius:10px;padding:18px;"
         "margin-top:8px}.watch-hero{display:flex;gap:12px;"
-        "align-items:flex-start;margin-bottom:10px}.watch-target{display:block;"
+        "align-items:flex-start;margin-bottom:4px}.watch-target{display:block;"
         "position:relative;overflow:hidden;background:#222;"
         "flex:0 0 48%;max-width:230px;border-radius:8px;"
         "color:#fff;text-decoration:none}.watch-target:focus{outline:3px solid "
@@ -1364,8 +1373,8 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "font-weight:normal;z-index:2}"
         ".watch-copy{flex:1;min-width:0}.watch-copy h1{font-size:17px;"
         "line-height:1.25;margin:0 0 8px}.watch-meta{line-height:1.45;"
-        "margin:0 0 8px}"
-        ".watch-actions{position:relative;margin:8px 0}.watch-actions p{margin:6px 0;line-height:36px}"
+        "margin:0}"
+        ".watch-actions{position:relative;margin:4px 0}.watch-actions p{margin:6px 0;line-height:36px}"
         ".watch-actions .comments-link{margin:0 6px 4px 0;line-height:18px}"
         ".watch-actions summary{line-height:28px;color:#ddd}";
     static const char action_style[] =
@@ -1465,7 +1474,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
             || lite_html_text(html, " class=compact-results"))
         && lite_html_text(html, header)
         && lite_html_ui_markup(html, signed_in
-            ? "<details id=yt-account-menu class=account-menu><summary id=yt-account-action class=account>{{Account}}</summary><section id=yt-account-panel class=account-panel><h2>{{YouTube account}}</h2><p>{{Signed in on this device.}}</p><a href=\"https://www.youtube.com/feed/recommended\">{{Recommendations}}</a><a href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a><a href=\"https://www.youtube.com/playlist?list=WL\">{{Watch Later}}</a><a href=\"https://www.youtube.com/feed/playlists\">{{Playlists}}</a><a href=\"https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Switch account}}</a><p>{{Select Account again to close.}}</p></section></details>"
+            ? "<details id=yt-account-menu class=account-menu><summary id=yt-account-action class=account>{{Account}}</summary><section id=yt-account-panel class=account-panel><h2>{{YouTube account}}</h2><a href=\"https://www.youtube.com/feed/recommended\">{{Recommendations}}</a><a href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a><a href=\"https://www.youtube.com/playlist?list=WL\">{{Watch Later}}</a><a href=\"https://www.youtube.com/feed/playlists\">{{Playlists}}</a><a href=\"https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Switch account}}</a><p>{{Select Account again to close.}}</p></section></details>"
             : "<a id=yt-account-action class=account href=\"https://accounts.google.com/ServiceLogin?service=youtube&amp;continue=https%3A%2F%2Fwww.youtube.com%2F\">{{Sign in}}</a>")
         && lite_html_ui_markup(html,
             "<a class=account href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a>")
@@ -2264,7 +2273,7 @@ static bool lite_build_document_with_comments_decoded(
     }
     bool ok = lite_html_header(
         &html, query, page_title, route == YOUTUBE_LITE_ROUTE_HOME,
-        compact_results, false, route == YOUTUBE_LITE_ROUTE_WATCH);
+        compact_results, signed_in, route == YOUTUBE_LITE_ROUTE_WATCH);
     if (ok && route == YOUTUBE_LITE_ROUTE_HOME) {
         YoutubeLiteTopic topics[YOUTUBE_LITE_MAXIMUM_TOPICS] = {0};
         size_t count = 0;
@@ -2284,7 +2293,8 @@ static bool lite_build_document_with_comments_decoded(
         }
         ok = (count != 0 || lite_html_ui_markup(
             &html, "<section class=hero><h1>{{Watch YouTube on this device}}</h1></section>"))
-            && lite_html_feed_notice(&html, false, signed_in)
+            && lite_html_feed_notice(&html, false, signed_in
+                || strcmp(url, "https://www.youtube.com/?tilefinch_signin=1") == 0)
             && (!lite_topics_requested(url)
                 || lite_html_topics(&html, topics, count));
     } else if (ok && route == YOUTUBE_LITE_ROUTE_SEARCH) {
@@ -2402,6 +2412,39 @@ bool youtube_lite_build_document_with_comments(
     return lite_build_document_with_comments_decoded(
         budget, url, source, source_length, comments_source,
         comments_length, document, error, error_size, NULL, 0, false);
+}
+
+bool youtube_lite_home_rebuild_header(Budget *budget, bool signed_in, bool compact,
+    const char *body_markup, size_t body_length, YoutubeLiteDocument *document)
+{
+    if (body_markup == NULL || body_length > YOUTUBE_LITE_MAXIMUM_HTML_BYTES
+        || memchr(body_markup, '\0', body_length + 1u) != body_markup + body_length)
+        return false;
+    const char *main = strstr(body_markup, "<main");
+    const char *end = main == NULL ? NULL : strstr(main, "</main>");
+    if (main == NULL || end == NULL) return false;
+    if (!lite_build_document_with_comments_decoded(budget,
+        compact ? "https://www.youtube.com/?tilefinch_signin=1&tilefinch_layout=compact"
+            : "https://www.youtube.com/?tilefinch_signin=1", NULL, 0, NULL, 0,
+        document, NULL, 0, NULL, 0, signed_in)) return false;
+    char *target = strstr(document->html, "<main");
+    if (target == NULL) { youtube_lite_document_destroy(document); return false; }
+    size_t prefix = (size_t) (target - document->html);
+    size_t length = (size_t) (end + 7 - main);
+    static const char tail[] = "</body></html>";
+    if (prefix > YOUTUBE_LITE_MAXIMUM_HTML_BYTES - sizeof(tail)
+        || length > YOUTUBE_LITE_MAXIMUM_HTML_BYTES - prefix - sizeof(tail)) {
+        youtube_lite_document_destroy(document); return false;
+    }
+    char *html = budget_malloc_category(budget, BUDGET_CATEGORY_RESOURCE, prefix + length + sizeof(tail));
+    if (html == NULL) { youtube_lite_document_destroy(document); return false; }
+    memcpy(html, document->html, prefix);
+    memcpy(html + prefix, main, length);
+    memcpy(html + prefix + length, tail, sizeof(tail));
+    budget_free(budget, document->html);
+    document->html = html;
+    document->html_length = prefix + length + sizeof(tail) - 1;
+    return true;
 }
 
 bool youtube_lite_build_document(
@@ -3457,6 +3500,12 @@ static void lite_accept_cookies(
 static bool lite_fetch_url(const char *url, YoutubeLiteRoute route,
                            char output[1024])
 {
+    if (youtube_lite_signin_handoff_url(url)) {
+        /* Preserve the single-use handoff parameters, not just its route. */
+        if (strlen(url) >= 1024u) return false;
+        strcpy(output, url);
+        return true;
+    }
     if (route == YOUTUBE_LITE_ROUTE_HOME) {
         snprintf(output, 1024, "https://m.youtube.com/");
         return true;
@@ -3690,6 +3739,10 @@ struct YoutubeLiteLoadJob {
     bool fallback_attempted;
     bool identity_available;
     bool document_taken;
+    bool signin_handoff;
+    bool signin_headers_accepted;
+    bool signin_user_activated, signin_initiator_opaque;
+    char signin_origin[BROWSER_ORIGIN_LIMIT];
     bool compact_results;
     bool watch_facts_reused;
     char url[TILEFINCH_URL_SERIALIZED_LIMIT];
@@ -4171,36 +4224,81 @@ static long lite_load_remaining_timeout_ms(const YoutubeLiteLoadJob *job)
     return remaining_ms - (long) elapsed_ms;
 }
 
+static TilefinchRequestContext lite_load_primary_context(const YoutubeLiteLoadJob *job)
+{
+    TilefinchRequestContext context = lite_primary_context(job->url, job->fetch_url);
+    if (job->signin_handoff) {
+        context.initiator_url = job->signin_origin[0] != '\0' ? job->signin_origin : NULL;
+        context.top_level_url = context.initiator_url != NULL ? context.initiator_url : job->url;
+        context.initiator_opaque = job->signin_initiator_opaque;
+        context.user_activated = job->signin_user_activated;
+    }
+    return context;
+}
+
+static bool lite_signin_headers(void *opaque, const FetchResult *metadata)
+{
+    YoutubeLiteLoadJob *job = opaque;
+    TilefinchUrl final;
+    const char *url = metadata->effective_url[0] != '\0'
+        ? metadata->effective_url : job->fetch_url;
+    /* Cookie effects obey ordinary response authority even when a further
+       account step prevents completion. Receipt still is not authentication. */
+    TilefinchRequestContext context = lite_load_primary_context(job);
+    lite_accept_cookies(job->session, &context, metadata, job->fetch_url);
+    job->metrics.handoff_http_status = metadata->status_code;
+    job->metrics.handoff_service_origin = tilefinch_url_parse(url, &final)
+        && final.scheme == TILEFINCH_URL_SCHEME_HTTPS && lite_youtube_host(&final);
+    if (metadata->status_code >= 200 && metadata->status_code < 300
+        && job->metrics.handoff_service_origin) {
+        job->signin_headers_accepted = true;
+    }
+    /* A header receipt is not authentication. The native feed verifies it.
+       Never retain or execute the redirected full application body. */
+    return false;
+}
+
+static bool lite_signin_body(void *opaque, const unsigned char *data, size_t length)
+{
+    (void) opaque; (void) data; (void) length;
+    return false; /* Header-only contract even if a transport misorders delivery. */
+}
+
 static bool lite_load_enqueue_primary(YoutubeLiteLoadJob *job)
 {
     TilefinchRequestContext context =
-        lite_primary_context(job->url, job->fetch_url);
+        lite_load_primary_context(job);
     char cookies[4096] = {0};
     (void) browser_session_cookie_header_context(
         job->session, &context, cookies, sizeof(cookies));
     FetchRequest request = {
         .method = "GET",
+        .cache_mode = job->signin_handoff ? FETCH_CACHE_NO_STORE : FETCH_CACHE_DEFAULT,
         .cookie = cookies,
         .accept = "text/html,application/xhtml+xml,application/xml;q=0.9,"
                   "*/*;q=0.8",
         .sec_fetch_dest = "document",
         .sec_fetch_mode = "navigate",
-        .sec_fetch_site = "none",
-        .sec_fetch_user = true,
+        .sec_fetch_site = job->signin_handoff ? tilefinch_request_fetch_site(&context) : "none",
+        .sec_fetch_user = context.user_activated,
         .upgrade_insecure_requests = true,
         .user_agent = YOUTUBE_LITE_MOBILE_UA,
         .credentials = FETCH_CREDENTIALS_INCLUDE,
         .credential_origin = job->fetch_url,
-        .initiator_url = job->fetch_url,
+        .initiator_url = job->signin_handoff ? context.initiator_url : job->fetch_url,
         .cookie_session = job->session,
         .cookie_context = &context
     };
     long remaining_ms = lite_load_remaining_timeout_ms(job);
     if (remaining_ms <= 0) return false;
     uint64_t request_started_us = tilefinch_platform_monotonic_time_us();
-    job->request_id = fetch_scheduler_enqueue(
-        job->scheduler, job->fetch_url, &request,
-        job->maximum_source_bytes, remaining_ms);
+    FetchStreamOptions stream = {
+        .on_headers = lite_signin_headers, .on_body = lite_signin_body, .opaque = job};
+    job->request_id = job->signin_handoff
+        ? fetch_scheduler_enqueue_stream(job->scheduler, job->fetch_url, &request,
+            64u * 1024u, remaining_ms, &stream)
+        : fetch_scheduler_enqueue(job->scheduler, job->fetch_url, &request,
+            job->maximum_source_bytes, remaining_ms);
     if (job->request_id == 0) return false;
     job->request_started_us = request_started_us;
     job->phase = YOUTUBE_LITE_JOB_PRIMARY;
@@ -4463,10 +4561,10 @@ static void lite_watch_facts_store(YoutubeLiteLoadJob *job)
     budget_free(job->budget, facts);
 }
 
-YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
+YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
     Budget *budget, BrowserSession *session, const char *url,
     bool compact_results, size_t maximum_source_bytes, long timeout_ms,
-    char *error, size_t error_size)
+    const char *initiator, bool user_activated, char *error, size_t error_size)
 {
     if (error != NULL && error_size != 0) error[0] = '\0';
     YoutubeLiteRoute route = youtube_lite_route(url);
@@ -4496,10 +4594,17 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     job->compact_results = compact_results;
     job->started_us = tilefinch_platform_monotonic_time_us();
     job->source.budget = budget;
+    job->signin_handoff = youtube_lite_signin_handoff_url(url);
+    if (job->signin_handoff) {
+        job->signin_user_activated = user_activated;
+        job->signin_initiator_opaque = initiator != NULL && initiator[0] != '\0'
+            && !tilefinch_url_origin(initiator, job->signin_origin, sizeof(job->signin_origin));
+    }
     snprintf(job->url, sizeof(job->url), "%s", url);
     snprintf(job->language, sizeof(job->language), "%s",
              lite_preferred_language());
-    if (route == YOUTUBE_LITE_ROUTE_HOME && !lite_topics_requested(url)) {
+    if (route == YOUTUBE_LITE_ROUTE_HOME && !lite_topics_requested(url)
+        && !job->signin_handoff) {
         /* The search form is local. Optional discovery gets a separate idle
            job after first paint; it must not delay entering a query. */
         if (!lite_build_document_with_comments_decoded(
@@ -4517,7 +4622,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         youtube_lite_load_destroy(job);
         return NULL;
     }
-    lite_apply_preference_cookies(job);
+    if (!job->signin_handoff) lite_apply_preference_cookies(job);
     job->supplemental_requested =
         route == YOUTUBE_LITE_ROUTE_WATCH
         && lite_comments_view_requested(url);
@@ -4528,7 +4633,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
             || route == YOUTUBE_LITE_ROUTE_PLAYLIST || route == YOUTUBE_LITE_ROUTE_PLAYLISTS)
          && lite_query_value(
              url, "tilefinch_token", search_token, sizeof(search_token)));
-    if (lite_document_cache_get(job)) return job;
+    if (!job->signin_handoff && lite_document_cache_get(job)) return job;
     bool reused_watch = lite_watch_facts_get(job);
     if (reused_watch && !job->supplemental_requested) return job;
     size_t reservation = maximum_source_bytes;
@@ -4582,6 +4687,15 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         return NULL;
     }
     return job;
+}
+
+YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
+    Budget *budget, BrowserSession *session, const char *url,
+    bool compact_results, size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size)
+{
+    return youtube_lite_load_begin_navigation(budget, session, url, compact_results,
+        maximum_source_bytes, timeout_ms, NULL, false, error, error_size);
 }
 
 YoutubeLiteLoadJob *youtube_lite_load_begin(
@@ -4911,6 +5025,19 @@ static YoutubeLiteLoadStatus lite_load_pump_step(
         ? request_finished_us - job->request_started_us : 0;
     lite_metrics_add_transport(&job->metrics, result, request_wall_us);
     job->request_started_us = 0;
+    if (job->signin_handoff) {
+        /* The stream deliberately stops at accepted headers. No retry of a
+           single-use URL, no source caching, and no website JS execution. */
+        bool okay = job->signin_headers_accepted
+            && lite_build_document_with_comments_decoded(job->budget,
+                "https://www.youtube.com/?tilefinch_signin=1", NULL, 0, NULL, 0, &job->document,
+                job->error, sizeof(job->error), NULL, 0,
+                youtube_lite_session_signed_in(job->session));
+        lite_probe_release(result);
+        if (okay) job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
+        else lite_load_job_fail(job, "YouTube sign-in handoff not completed");
+        return job->status;
+    }
     if (!fetched) {
         if (job->phase == YOUTUBE_LITE_JOB_SUPPLEMENTAL) {
             fprintf(stderr, "youtube-lite supplemental data unavailable: %s\n",
@@ -5185,6 +5312,10 @@ void youtube_lite_load_destroy(YoutubeLiteLoadJob *job)
     if (job->decoded != NULL) budget_free(job->budget, job->decoded);
     lite_build_work_destroy(job->build);
     youtube_lite_document_destroy(&job->document);
+    if (job->signin_handoff) {
+        lite_probe_wipe(job->url, sizeof(job->url));
+        lite_probe_wipe(job->fetch_url, sizeof(job->fetch_url));
+    }
     budget_free(budget, job);
 }
 

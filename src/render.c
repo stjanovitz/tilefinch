@@ -3884,7 +3884,7 @@ static bool prefetch_command_image(TileCache *cache,
                                    const DrawCommand *command,
                                    bool overflow)
 {
-    if (cache == NULL || command == NULL || command->image == NULL
+    if (cache == NULL || command == NULL || command->type != DRAW_IMAGE || command->image == NULL
         || !image_resource_available(command->image)
         || !idle_image_admitted(cache, command->image, command)) return false;
     size_t builds_before = cache->decoded_image_builds
@@ -3915,7 +3915,7 @@ static bool prefetch_overflow_image(
              & LAYOUT_COMMAND_OVERFLOW)) return false;
     const DrawCommand *command = &cache->layout->commands[index];
     int64_t command_bottom = (int64_t) command->y + command->height;
-    if (command->image == NULL
+    if (command->type != DRAW_IMAGE || command->image == NULL
         || command->y >= band_bottom
         || command_bottom <= band_top
         || !image_resource_available(command->image)) return false;
@@ -4597,8 +4597,9 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
     return true;
 }
 
-bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
-                                  int right, int bottom)
+static bool tile_cache_sync_image_pixels(TileCache *cache, int left, int top,
+                                         int right, int bottom,
+                                         bool document_images)
 {
     if (cache == NULL || cache->source_layout == NULL || cache->layout == NULL
         || cache->source_layout->count != cache->layout->count) return false;
@@ -4610,6 +4611,10 @@ bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
             DrawCommand *command = &cache->visual_layout.commands[i];
             if (command->type == DRAW_IMAGE)
                 command->image = cache->source_layout->commands[i].image;
+            else if (command->type == DRAW_TEXT && (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0) {
+                command->opacity_scale = cache->source_layout->commands[i].opacity_scale;
+                command->radius = cache->source_layout->commands[i].radius;
+            }
         }
     }
     int visual_left = viewport_css_to_device(
@@ -4636,8 +4641,10 @@ bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
             ? fixed->command_end : cache->layout->count;
         for (size_t i = fixed->command_start; i < end; i++) {
             const DrawCommand *command = &cache->layout->commands[i];
-            if (command->type == DRAW_IMAGE && command->image != NULL
-                && command->image->is_canvas) {
+            /* Same-geometry publication also admits newly decoded fixed
+               document images. Their raster must not retain the placeholder. */
+            if (command->type == DRAW_IMAGE && (document_images
+                || (command->image != NULL && command->image->is_canvas))) {
                 retained_overlay_samples_canvas = true;
                 break;
             }
@@ -4651,7 +4658,21 @@ bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
     tile_cache_invalidate_rect(
         cache, visual_left, visual_top, visual_right, visual_bottom);
     cache->canvas_paint_pending = true;
+    if (document_images && cache->canvas_overlay_ready)
+        canvas_overlay_cache_clear(cache);
     return true;
+}
+
+bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
+                                  int right, int bottom)
+{
+    return tile_cache_sync_image_pixels(cache, left, top, right, bottom, false);
+}
+
+bool tile_cache_sync_document_image_paint(TileCache *cache, int left, int top,
+                                          int right, int bottom)
+{
+    return tile_cache_sync_image_pixels(cache, left, top, right, bottom, true);
 }
 
 void tile_cache_invalidate_image_identity(TileCache *cache,

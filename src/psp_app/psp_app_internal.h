@@ -431,6 +431,8 @@ bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
+void psp_media_menu_feedback_input(const PspUiMediaState *media,
+    bool was_open, unsigned old_tab, uint32_t started_us);
 void psp_load_experience_report(const char *scope, BrowserEngine *engine,
                                 const BrowserNavigationJobMetrics *metrics);
 #endif
@@ -967,7 +969,7 @@ typedef struct {
     PspProfileStore profile_store;
     uint64_t youtube_login_restored;
     bool youtube_login_pending;
-    bool youtube_login_verified;
+    uint64_t youtube_login_offer_identity;
     PspOfflineStore offline_store;
     PspMediaSession media;
     PspYoutubePreresolve youtube_preresolve;

@@ -1635,6 +1635,17 @@ void psp_app_apply_setting(
             enabled ? "WI-FI DETAILS IN RAM - RETRY, THEN DIAGNOSTIC QR"
                     : "WI-FI DIAGNOSTICS OFF", 240);
     }
+    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS) {
+        bool enabled = intent->setting.value.boolean;
+        browser_engine_set_youtube_signin_diagnostics(engine, enabled);
+        psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
+        tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
+        app->process->diagnostic_qr = NULL;
+        /* Session-only: enabling collection never writes a profile or log. */
+        psp_ui_show_status(&app->process->presentation.ui,
+            enabled ? "SIGN-IN COUNTS IN RAM - RETRY, THEN DIAGNOSTIC QR"
+                    : "SIGN-IN DIAGNOSTICS CLEARED", 240);
+    }
     if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_TOPICS) {
         bool enabled = intent->setting.value.boolean;
         browser_profile_set_youtube_topics(profile, enabled);

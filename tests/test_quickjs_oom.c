@@ -1812,6 +1812,148 @@ static int run_retired_callable_contract(void)
     return failed;
 }
 
+static int run_utf8_pressure_sizing(void)
+{
+    const char *suffixes[] = {"\xe2\x82\xac", "\xf0\x9f\x98\x80", "\xff", "\xe0", "\x80\x80Z"};
+    int okay = 1;
+    for (size_t which = 0; which < sizeof(suffixes) / sizeof(suffixes[0]); ++which) {
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+        if (!pool) return 1;
+        JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+        if (!rt) return 1;
+        JSContext *ctx = JS_NewContext(rt);
+        if (!ctx) return 1;
+        char input[18008];
+        memset(input, 'a', 9000);
+        for (size_t i = 9000; i < 18000; i += 3) memcpy(input + i, "\xe2\x82\xac", 3);
+        size_t suffix = strlen(suffixes[which]);
+        memcpy(input + 18000, suffixes[which], suffix);
+        JSValue expected = JS_NewStringLen(ctx, input, 18000 + suffix);
+        okay &= !JS_IsException(expected);
+        JS_RunGC(rt);
+        JS_SetGCThreshold(rt, SIZE_MAX);
+        size_t live = budget_quickjs_pool_js_malloc_current(pool);
+        JS_SetMemoryLimit(rt, live + 24500u);
+        BudgetQuickJSActivity before, after;
+        budget_quickjs_pool_activity(pool, &before);
+        JSValue actual = JS_NewStringLen(ctx, input, 18000 + suffix);
+        budget_quickjs_pool_activity(pool, &after);
+        okay &= !JS_IsException(actual) && JS_StrictEq(ctx, actual, expected)
+            && after.reallocation_calls == before.reallocation_calls;
+        JS_FreeValue(ctx, actual);
+        JSValue chunked = JS_NewStringLenUTF8RopePortable(ctx, input, 18000 + suffix);
+        okay &= budget_quickjs_pool_js_malloc_current(pool) <= live + 22000u;
+        JS_SetMemoryLimit(rt, 4u * MIB);
+        okay &= !JS_IsException(chunked) && JS_StrictEq(ctx, chunked, expected);
+        JS_FreeValue(ctx, chunked);
+        JS_FreeValue(ctx, expected);
+        JS_SetMemoryLimit(rt, 4u * MIB);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        (void)budget_quickjs_pool_trim(pool, 0);
+        okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    }
+    if (!okay) fprintf(stderr, "UTF-8 pressure sizing/chunking changed output or retained a growth copy\n");
+    return okay ? 0 : 1;
+}
+
+static int run_string_buffer_growth_collection(void)
+{
+    int okay = 1;
+    for (unsigned wide = 0; wide < 2; ++wide) {
+        for (unsigned scenario = 0; scenario < 3u; ++scenario) {
+            bool garbage = scenario == 1;
+            bool spare_only = scenario == 2;
+            Budget budget;
+            budget_init(&budget, 8u * MIB);
+            BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+            if (!pool) return 1;
+            JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+            if (!rt) return 1;
+            JSContext *ctx = JS_NewContext(rt);
+            if (!ctx) return 1;
+            JS_SetGCThreshold(rt, SIZE_MAX);
+            const char *prepare = "globalThis.produce=()=>JSON.stringify(input);";
+            JSValue result = JS_Eval(ctx, prepare, strlen(prepare),
+                                    "<string-buffer-prepare>", JS_EVAL_TYPE_GLOBAL);
+            okay &= !JS_IsException(result);
+            JS_FreeValue(ctx, result);
+            JSValue global = JS_GetGlobalObject(ctx);
+            size_t input_length = wide ? 500000u : 1000000u;
+            char *input = malloc(input_length + 2u);
+            if (!input) return 1;
+            memset(input, 'a', input_length);
+            if (wide) { input[input_length] = (char)0xc4; input[input_length + 1] = (char)0x80; }
+            JSValue input_value = JS_NewStringLen(ctx, input, input_length + (wide ? 2u : 0u));
+            free(input);
+            okay &= !JS_IsException(input_value)
+                && JS_SetPropertyStr(ctx, global, "input", input_value) >= 0;
+            JSValue fn = JS_GetPropertyStr(ctx, global, "produce");
+            JS_FreeValue(ctx, global);
+            JS_RunGC(rt);
+            if (garbage) {
+                const char cycles[] =
+                    "(()=>{let a={buffer:new ArrayBuffer(2000000)};a.self=a;})()";
+                result = JS_Eval(ctx, cycles, sizeof(cycles) - 1,
+                                 "<string-buffer-garbage>", JS_EVAL_TYPE_GLOBAL);
+                okay &= !JS_IsException(result);
+                JS_FreeValue(ctx, result);
+            }
+            size_t live = budget_quickjs_pool_js_malloc_current(pool);
+            JS_SetMemoryLimit(rt, live + (spare_only ? 1050000u : 750000u));
+            JS_SetGCThreshold(rt, spare_only ? SIZE_MAX : live + 600000u);
+            uint64_t before = JS_GetGCRunCount(rt);
+            result = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+            if (garbage || spare_only) {
+                okay &= !JS_IsException(result)
+                    && (garbage ? JS_GetGCRunCount(rt) > before
+                                : JS_GetGCRunCount(rt) == before);
+                /* Verify the complete output, including the late wide code
+                   unit that forces a narrow buffer to change representation. */
+                JS_SetMemoryLimit(rt, 8u * MIB);
+                const char *text = JS_ToCString(ctx, result);
+                size_t count = wide ? 500000u : 1000000u;
+                okay &= text != NULL;
+                if (text) {
+                    okay &= text[0] == '"';
+                    for (size_t i = 1; i <= count; ++i) okay &= text[i] == 'a';
+                    okay &= wide
+                        ? strcmp(text + count + 1, "\xc4\x80\"") == 0
+                        : strcmp(text + count + 1, "\"") == 0;
+                    JS_FreeCString(ctx, text);
+                }
+            } else {
+                okay &= JS_IsException(result);
+            }
+            if (JS_IsException(result)) {
+                JSValue exception = JS_GetException(ctx);
+                okay &= !JS_IsNull(exception);
+                JS_FreeValue(ctx, exception);
+            }
+            JS_FreeValue(ctx, result);
+            JS_SetMemoryLimit(rt, 8u * MIB);
+            global = JS_GetGlobalObject(ctx);
+            okay &= JS_SetPropertyStr(ctx, global, "input", JS_NewString(ctx, "next")) >= 0;
+            JS_FreeValue(ctx, global);
+            result = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+            const char *next = JS_ToCString(ctx, result);
+            okay &= !JS_IsException(result) && next != NULL
+                && strcmp(next, "\"next\"") == 0;
+            JS_FreeCString(ctx, next);
+            JS_FreeValue(ctx, result);
+            JS_FreeValue(ctx, fn);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+            (void)budget_quickjs_pool_trim(pool, 0);
+            okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+        }
+    }
+    if (!okay) fprintf(stderr, "string buffer growth did not reclaim cycles safely\n");
+    return okay ? 0 : 1;
+}
+
 static int run_cstring_refusal_lifetime(void)
 {
     Budget budget;
@@ -2806,6 +2948,8 @@ static int run_bound_function_refusals(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--string-buffer-growth-only") == 0)
+        return run_string_buffer_growth_collection() || run_utf8_pressure_sizing();
     if (argc == 2 && strcmp(argv[1], "--context-refusal-only") == 0)
         return run_context_creation_refusals();
     if (argc == 2 && strcmp(argv[1], "--bind-refusal-only") == 0)
@@ -2878,6 +3022,8 @@ int main(int argc, char **argv)
     }
     if (run_sparse_bytecode_atoms() != 0) return 1;
     if (run_near_limit_array_growth() != 0) return 1;
+    if (run_string_buffer_growth_collection() != 0) return 1;
+    if (run_utf8_pressure_sizing() != 0) return 1;
     if (run_cstring_refusal_lifetime() != 0) return 1;
     if (run_source_snapshot_sharing() != 0) return 1;
     if (run_source_span_snapshot() != 0) return 1;

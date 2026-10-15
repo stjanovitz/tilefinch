@@ -8260,8 +8260,20 @@ static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
         psp_app_dispatch_deferred_media_intent(
             &browser->media, interactive)
         || media_visual_changed;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    bool menu_was_open = browser->media.ui.presentation != NULL
+        && browser->media.ui.presentation->track_menu_open;
+    unsigned menu_old_tab = browser->media.ui.presentation == NULL
+        ? 0u : browser->media.ui.presentation->track_menu_tab;
+    uint32_t menu_pressed_us = input->pressed == 0u ? 0u
+        : (uint32_t) psp_input_script_request_time(sceKernelGetSystemTimeWide());
+#endif
     PspUiMediaIntent media_intent =
         psp_ui_media_update(&browser->media.ui, input);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_media_menu_feedback_input(&browser->media.ui,
+        menu_was_open, menu_old_tab, menu_pressed_us);
+#endif
     uint32_t media_operation = 0;
     const char *media_action =
         psp_media_action_name(media_intent.action);

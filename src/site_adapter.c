@@ -66,10 +66,12 @@ static void *youtube_begin(
     size_t maximum_source_bytes, long timeout_ms,
     char *error, size_t error_size)
 {
-    return youtube_lite_load_begin_configured(
+    return youtube_lite_load_begin_navigation(
         budget, session, url,
         preferences != NULL && preferences->youtube_compact_results,
         maximum_source_bytes, timeout_ms,
+        preferences == NULL ? NULL : preferences->navigation_initiator,
+        preferences != NULL && preferences->navigation_user_activated,
         error, error_size);
 }
 
@@ -177,7 +179,9 @@ static bool youtube_metrics(
         .maximum_transform_slice_us =
             youtube.maximum_transform_slice_us,
         .maximum_irreducible_unit_us =
-            youtube.maximum_irreducible_unit_us
+            youtube.maximum_irreducible_unit_us,
+        .handoff_http_status = youtube.handoff_http_status,
+        .handoff_service_origin = youtube.handoff_service_origin
     };
     return true;
 }

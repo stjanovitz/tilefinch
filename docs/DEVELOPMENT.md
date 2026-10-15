@@ -251,6 +251,13 @@ These run one behavior in isolation; they do not replace the complete suite.
 - `tilefinch-style-index-tests --transition-candidates-only` compares
   conservative transition-selector rejection with the full matcher in the
   same sheet, including class changes and escaped/functional selectors;
+- `tilefinch-js-responsiveness-tests --motion-cache-only` checks bounded motion
+  parsing across owner turns, focus/promise progress, class-only cache reuse,
+  stylesheet/CSSOM invalidation, complete animation publication and teardown.
+- `tilefinch-js-responsiveness-tests --xhr-buffered-events-only` runs the
+  synthetic network queue and buffered XHR upload/response ordering in a fresh
+  realm, including listener-free states and final `loadend` delivery. Run this
+  under the sanitizer preset to guard against recursive dispatcher stack growth.
 - `tilefinch-js-responsiveness-tests --cssom-noop-only` checks that identical
   CSSOM writes avoid mutation/layout invalidation while changed values,
   newly authorized styles and ordinary DOM attribute writes still publish;

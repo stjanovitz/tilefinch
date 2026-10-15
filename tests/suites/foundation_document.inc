@@ -3646,8 +3646,7 @@
               "document.body.className='motion-scan-trigger';"
               "pocSummary='pending'",
               "<motion-override-start>", &motion_override_result)
-          && script_runtime_advance(
-              motion_override_runtime, 16, 16, &motion_override_result)
+          && test_motion_settle(motion_override_runtime, &motion_override_result)
           && script_runtime_evaluate_diagnostic(
               motion_override_runtime,
               "pocSummary=Number(document.getElementById('last').style.opacity)"
@@ -3670,10 +3669,7 @@
               "pocSummary='pending'",
               "<motion-override-below-start>", &motion_override_result);
     bool motion_override_below_advanced = motion_override_below_started
-          && script_runtime_advance(
-              motion_override_runtime, 32, 16, &motion_override_result)
-          && script_runtime_advance(
-              motion_override_runtime, 48, 16, &motion_override_result);
+          && test_motion_settle(motion_override_runtime, &motion_override_result);
     bool motion_override_below_checked = motion_override_below_advanced
           && script_runtime_evaluate_diagnostic(
               motion_override_runtime,
@@ -3751,9 +3747,7 @@
               "pocSummary='pending'",
               "<motion-inline-override-start>",
               &motion_inline_override_result)
-          && script_runtime_advance(
-              motion_inline_override_runtime, 16, 16,
-              &motion_inline_override_result)
+          && test_motion_settle(motion_inline_override_runtime, &motion_inline_override_result)
           && script_runtime_evaluate_diagnostic(
               motion_inline_override_runtime,
               "pocSummary=Number(document.getElementById('last').style.opacity)"
@@ -3780,9 +3774,7 @@
               "pocSummary='pending'",
               "<motion-inline-override-below-start>",
               &motion_inline_override_result)
-          && script_runtime_advance(
-              motion_inline_override_runtime, 32, 16,
-              &motion_inline_override_result)
+          && test_motion_settle(motion_inline_override_runtime, &motion_inline_override_result)
           && script_runtime_evaluate_diagnostic(
               motion_inline_override_runtime,
               "pocSummary=Number(document.getElementById('last').style.opacity)"

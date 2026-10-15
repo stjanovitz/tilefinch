@@ -1217,7 +1217,8 @@ static bool test_menu_metadata_equivalence(void)
     for (size_t option = 0; option < sizeof(groups); option++)
         CHECK(ui_option_group_index((UiOptionId)option) == groups[option]);
     CHECK(ui_option_group_index((UiOptionId)-1) == 0);
-    CHECK(ui_option_group_index((UiOptionId)(UI_OPTION_WEB_FONTS + 1)) == 0);
+    CHECK(ui_option_group_index(UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS) == 4);
+    CHECK(ui_option_group_index((UiOptionId)(UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS + 1)) == 0);
 
     static const unsigned flags[] = {
         PSP_UI_FAILURE_BASIC_VIEW, PSP_UI_FAILURE_RELOAD_BASIC,

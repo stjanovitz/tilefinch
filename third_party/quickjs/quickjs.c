@@ -4613,6 +4613,9 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
     }
 }
 
+static JSValue js_new_function_source_flat(JSContext *ctx, const char *source,
+                                          size_t length);
+
 typedef struct StringBuffer {
     JSContext *ctx;
     JSString *str;
@@ -4666,7 +4669,33 @@ static int string_buffer_set_error(StringBuffer *s)
     return s->error_status = -1;
 }
 
-static no_inline int string_buffer_widen(StringBuffer *s, int size)
+static int string_buffer_growth_size(StringBuffer *s, int size, int required, int wide)
+{
+    size_t old_bytes = sizeof(JSString)
+        + ((size_t)s->size << s->is_wide_char) + 1u - s->is_wide_char;
+    size_t required_bytes = sizeof(JSString)
+        + ((size_t)required << wide) + 1u - wide;
+    /* Raw character storage is not a partially mutated GC object; inputs
+       remain rooted by the caller. Realloc-only producers need the same
+       paced collection point as other native string producers. */
+    if (required_bytes > old_bytes)
+        js_trigger_gc(s->ctx->rt, required_bytes - old_bytes);
+    size_t new_bytes = sizeof(JSString) + ((size_t)size << wide) + 1u - wide;
+    size_t live = s->ctx->rt->malloc_ctx.malloc_state.malloc_size;
+    size_t limit = s->ctx->rt->malloc_ctx.malloc_state.malloc_limit;
+    size_t room = live < limit ? limit - live : 0;
+    if (new_bytes > old_bytes && new_bytes - old_bytes > room
+        && (required_bytes <= old_bytes || required_bytes - old_bytes <= room)) {
+        /* Unused capacity is optional, including when widening. Keep bounded
+           spare room rather than refusing characters that fit or reallocating
+           on every later write. The comparison also bounds old_bytes + room. */
+        size_t spare = (old_bytes + room - required_bytes) / 8u;
+        size = required + (int)(spare >> wide);
+    }
+    return size;
+}
+
+static no_inline int string_buffer_widen(StringBuffer *s, int size, int required)
 {
     JSString *str;
     size_t slack;
@@ -4675,9 +4704,12 @@ static no_inline int string_buffer_widen(StringBuffer *s, int size)
     if (s->error_status)
         return -1;
 
-    str = js_realloc2(s->ctx, s->str, sizeof(JSString) + (size << 1), &slack);
-    if (!str)
+    size = string_buffer_growth_size(s, size, required, 1);
+    size_t new_bytes = sizeof(JSString) + ((size_t)size << 1);
+    str = js_realloc2(s->ctx, s->str, new_bytes, &slack);
+    if (!str) {
         return string_buffer_set_error(s);
+    }
     size += slack >> 1;
     for(i = s->len; i-- > 0;) {
         str->u.str16[i] = str->u.str8[i];
@@ -4703,8 +4735,9 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
     }
     new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
     if (!s->is_wide_char && c >= 0x100) {
-        return string_buffer_widen(s, new_size);
+        return string_buffer_widen(s, new_size, new_len);
     }
+    new_size = string_buffer_growth_size(s, new_size, new_len, s->is_wide_char);
     new_size_bytes = sizeof(JSString) + (new_size << s->is_wide_char) + 1 - s->is_wide_char;
     new_str = js_realloc2(s->ctx, s->str, new_size_bytes, &slack);
     if (!new_str)
@@ -4726,7 +4759,7 @@ static no_inline int string_buffer_putc16_slow(StringBuffer *s, uint32_t c)
     } else if (c < 0x100) {
         s->str->u.str8[s->len++] = c;
     } else {
-        if (string_buffer_widen(s, s->size))
+        if (string_buffer_widen(s, s->size, s->len + 1))
             return -1;
         s->str->u.str16[s->len++] = c;
     }
@@ -4846,7 +4879,7 @@ static int string_buffer_write16(StringBuffer *s, const uint16_t *p, int len)
         if (string_buffer_realloc(s, s->len + len, c))
             return -1;
     } else if (!s->is_wide_char && c >= 0x100) {
-        if (string_buffer_widen(s, s->size))
+        if (string_buffer_widen(s, s->size, s->len + len))
             return -1;
     }
     if (s->is_wide_char) {
@@ -5040,6 +5073,16 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
         /* ASCII string */
         return js_new_string8_len(ctx, buf, buf_len);
     } else {
+        size_t live = ctx->rt->malloc_ctx.malloc_state.malloc_size;
+        size_t limit = ctx->rt->malloc_ctx.malloc_state.malloc_limit;
+        size_t room = live < limit ? limit - live : 0;
+        /* Under pressure, size the complete UTF-8 result before allocating.
+           A late wide character must not first allocate a large narrow copy,
+           then preserve byte-count capacity while doubling it. Reuse the
+           exact decoder, including its malformed-input consumption policy;
+           ordinary small or unconstrained construction stays single-pass. */
+        if (buf_len >= 8192u && buf_len > room / 2u)
+            return js_new_function_source_flat(ctx, buf, buf_len);
         if (string_buffer_init(ctx, b, buf_len))
             goto fail;
         string_buffer_write8(b, p_start, len1);
@@ -5121,7 +5164,13 @@ static JSValue js_new_function_source(JSContext *ctx, const char *source,
         while (p < end) {
             const uint8_t *start = p;
             do {
-                (void)js_source_codepoint(&p, end);
+                /* Skip ASCII runs in bulk while retaining the exact previous
+                   chunk boundary and malformed-codepoint consumption. */
+                size_t room = 4096u - (size_t)(p - start);
+                if (room > (size_t)(end - p)) room = end - p;
+                p += count_ascii(p, room);
+                if (p < end && (size_t)(p - start) < 4096u)
+                    (void)js_source_codepoint(&p, end);
             } while (p < end && (size_t)(p - start) < 4096);
             JSValue part = js_new_function_source_flat(ctx, (const char *)start, p - start);
             if (JS_IsException(part)) {
@@ -5174,6 +5223,19 @@ static JSValue js_new_function_source_flat(JSContext *ctx, const char *source,
     }
     if (!wide) str->u.str8[units] = '\0';
     return JS_MKPTR(JS_TAG_STRING, str);
+}
+
+JSValue JS_NewStringLenUTF8RopePortable(JSContext *ctx, const char *text, size_t length)
+{
+    size_t live = ctx->rt->malloc_ctx.malloc_state.malloc_size;
+    size_t limit = ctx->rt->malloc_ctx.malloc_state.malloc_limit;
+    size_t room = live < limit ? limit - live : 0;
+    /* Preserve the ordinary allocation/copy path while even a fully wide
+       result fits. Chunking is a pressure fallback, not extra work for every
+       otherwise unconstrained DOM text read. */
+    if (length < 8192u || length <= room / 2u)
+        return JS_NewStringLen(ctx, text, length);
+    return js_new_function_source(ctx, text, length);
 }
 
 static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,

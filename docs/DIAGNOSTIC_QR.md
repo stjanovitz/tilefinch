@@ -89,6 +89,55 @@ are present, contiguous, non-overlapping, and verified.
 
 ## Recovering logs on a computer
 
+### Credential-free YouTube sign-in report
+
+**Settings → Device & storage → YouTube sign-in diagnostics** is a
+session-only, default-off switch. It records bounded counts in RAM. While
+enabled, **Diagnostic QR** exports only `tilefinch-youtube-signin.txt` and
+ordinary public app/firmware metadata. It excludes every general log source,
+including Wi-Fi, validation and crash logs. Turning the switch off clears
+both the counters and any previously prepared QR bundle. No diagnostic file
+or profile setting is written by the switch.
+
+The report formatter accepts only fixed numeric, boolean and enum fields.
+It cannot accept an error string, account name, password, cookie value or
+hash, token, URL, header or response body. It reports the last native feed
+phase, handoff and feed HTTP status, transport/origin checks, session-cookie eligibility,
+server-confirmed authentication, script degradation and admission failures,
+cookie refusals/evictions and the bounded recovery count.
+Parsed result count and pending publication distinguish an empty feed from
+results waiting for the user's Refresh action. No titles or video IDs appear.
+
+Version 2 separates bootstrap, API and optional history HTTP statuses, fixed
+failure categories, configuration/signature/request admission, feed construction
+and publication outcomes. Authentication is independent of display success.
+Build/publication outcomes are 0 not attempted, 1 pending, 2 successful,
+3 refused/failed, and (publication only) 4 waiting for Refresh. Clock availability
+is a boolean, not a timestamp or proof that the clock is correctly set.
+Optional history outcomes are 0 not attempted, 1 pending, 2 complete,
+3 timed out, and 4 failed. Failure category 11 means the session changed
+before construction or publication completed. A definite server sign-out
+revokes confirmation; transport, parsing, allocation and display failures do not.
+
+The last completed feed hop also reports a numeric transport error, timeout
+flag, TLS verification result and whether that result was available. These
+fields contain no URL, certificate identity, cookie or response text. An
+unavailable TLS result is unknown, not evidence that verification succeeded.
+
+If an account step finishes without returning to the provider, **Page tools →
+Continue to YouTube** uses the stable account GET entry to complete the
+current handoff, even if cookies from an earlier session remain. The native
+provider then verifies the session. It never repeats a password submission
+or a single-use handoff URL, and never executes the full YouTube application.
+
+Sign-in stages: 0 idle; 1 account page; 2 stable-entry recovery; 3 session
+handoff; 4 native verification; 5 verified; 6 failed; 7 cancelled; 8 manual
+retry needed because entered text must be preserved. A successful handoff or
+cookie receipt is not a verified login. Recovery retries only the stable GET
+entry once; it never resubmits a password or repeats single-use parameters.
+
+### Decode a report
+
 Use any QR scanner to extract the text from each photograph, saving one page
 per text file if convenient. Then run:
 

@@ -585,6 +585,9 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
    those accelerators while invalidating tiles that retain the old pixels. */
 bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
                                   int right, int bottom);
+/* Decoded document images also replace placeholders in retained overlays. */
+bool tile_cache_sync_document_image_paint(TileCache *cache, int left, int top,
+                                          int right, int bottom);
 /* Drop decoded/scaled derivatives for one stable mutable image surface. */
 void tile_cache_invalidate_image_identity(TileCache *cache,
                                           const void *identity);

@@ -151,6 +151,20 @@ that site's. Deleting the `data/script-cache/` folder over USB does the same.
 
 ## A site forgets your settings, saved games, or logins
 
+If YouTube sign-in appears to do nothing, enable **Settings → Device &
+storage → YouTube sign-in diagnostics**, then try signing in again.
+Open **Help & diagnostics → Diagnostic QR** to share the report. While this
+option is on, that QR contains only the dedicated sign-in report—not browsing,
+Wi-Fi, crash, or validation logs.
+
+The option defaults off each launch. It keeps bounded counts and fixed status
+codes in RAM, writes no diagnostic file, and clears the report when disabled.
+It never includes usernames, passwords, cookie values or hashes, tokens,
+URLs, request/response headers, response bodies, or error-message text.
+YouTube must confirm the native account request before Tilefinch offers to save
+the login. A session cookie or successful account-page load alone is not that
+confirmation. Recovery never automatically resubmits a password.
+
 Tilefinch keeps what sites store (`localStorage`, `sessionStorage`, and site
 files) in RAM, and by default writes none of it to the Memory Stick. Unless
 you choose otherwise, a site starts fresh each time you start Tilefinch.

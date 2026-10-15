@@ -1716,8 +1716,10 @@ static bool run_command_loop(FILE *commands, bool interactive,
     if (!visual_evidence_record_frame(visual_frames, navigation)) goto failed;
     loop_print_status(controller, cache, frame_number++);
     size_t private_sequence = 0;
-    if (private_console_fd >= 0)
+    if (private_console_fd >= 0) {
         browser_session_cookie_diagnostics(browser_engine_session(engine), true, NULL);
+        browser_engine_set_youtube_signin_diagnostics(engine, true);
+    }
     if (private_console_fd >= 0 && navigation->page.runtime != NULL) {
         if (script_runtime_xhr_diagnostics(navigation->page.runtime, true, NULL))
             private_console_load_outcome_classifier(navigation);

@@ -118,6 +118,12 @@ int main(void)
     CHECK(press(&ui, PSP_UI_BUTTON_CANCEL).action == PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW);
     psp_ui_show_youtube_login_offer(&ui); ui.heavy_offer_arming = 0;
     CHECK(press(&ui, PSP_UI_BUTTON_MENU).action == PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW);
+    psp_ui_show_youtube_login_offer(&ui);
+    psp_ui_dismiss_youtube_login_offer(&ui);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE);
+    ui.screen = PSP_UI_SCREEN_MENU;
+    psp_ui_dismiss_youtube_login_offer(&ui);
+    CHECK(ui.screen == PSP_UI_SCREEN_MENU);
     CHECK(budget.current == 0);
     CHECK(youtube_login_remove(path)); (void) remove(victim); (void) remove(profile_path);
     char backup[260]; snprintf(backup, sizeof(backup), "%s.bak", profile_path); (void) remove(backup);

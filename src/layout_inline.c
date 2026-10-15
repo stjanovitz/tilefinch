@@ -3267,13 +3267,14 @@ bool layout_add_replaced_alt_text(
         .height = line_height,
         .color = style->color,
         .text = alt,
+        .image = (const ImageResource *) node,
         .text_length = prefix > UINT32_MAX ? UINT32_MAX : (uint32_t) prefix,
         .scale = style->font_scale,
         .font_size = style->font_size,
         .font_weight = draw_font_weight(style),
         .font_italic = style->font_italic,
         .letter_spacing = style->letter_spacing,
-        .radius = (int) style->font_size_fraction
+        .radius = LAYOUT_TEXT_IMAGE_ALT | (int) style->font_size_fraction
                   << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
                   | (computed_style_kerning_none(style)
                      ? LAYOUT_TEXT_KERNING_NONE : 0),
@@ -4975,6 +4976,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             }
             image_command = (size_t) (
                 stored - context->layout->commands);
+            if (!image_available && !layout_add_replaced_alt_text(
+                    context, node, &style, content_x, content_y, width, height))
+                return false;
         } else if (!canvas_element && !layout_add_replaced_alt_text(
                        context, node, &style, content_x, content_y,
                        width, height)) {

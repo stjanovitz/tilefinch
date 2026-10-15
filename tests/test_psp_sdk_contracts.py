@@ -136,6 +136,24 @@ def frame_pump_policy(name):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_signin_diagnostic_qr_excludes_general_logs_and_flushes(self):
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text())
+        qr = actions[actions.index("static void psp_app_build_diagnostic_qr("):
+                     actions.index("static void psp_app_step_diagnostic_qr(")]
+        self.assertIn("if (!signin_only) (void) psp_log_flush(false);", qr)
+        self.assertIn("!signin_only && at < TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT", qr)
+        self.assertIn("if (!signin_only && wifi[0] != '\\0')", qr)
+        self.assertIn("signin_only ? 1u : TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT", qr)
+        self.assertIn('.name = "tilefinch-youtube-signin.txt"', qr)
+        settings = without_comments(
+            (ROOT / "src/psp_app/psp_app_settings.c").read_text())
+        toggle = settings[settings.index("if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS)"):
+                          settings.index("if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_TOPICS)")]
+        self.assertIn("browser_engine_set_youtube_signin_diagnostics(engine, enabled)", toggle)
+        self.assertIn("tilefinch_diagnostic_qr_destroy", toggle)
+        self.assertNotIn("browser_profile_", toggle)
+
     def test_offline_history_reaches_the_authenticated_library_handler(self):
         actions = without_comments(
             (ROOT / "src/psp_app/psp_app_actions.c").read_text())
@@ -3840,7 +3858,7 @@ int main(void) {
             (ROOT / "src/youtube_lite.c").read_text(encoding="utf-8"))
         begin = source[
             source.index(
-                "YoutubeLiteLoadJob *youtube_lite_load_begin_configured("):
+                "YoutubeLiteLoadJob *youtube_lite_load_begin_navigation("):
             source.index("YoutubeLiteLoadStatus youtube_lite_load_pump(")]
         self.assertIn("fetch_scheduler_create_ex(", begin)
         self.assertIn(
@@ -3848,6 +3866,9 @@ int main(void) {
         self.assertLess(
             begin.index("fetch_scheduler_create_ex("),
             begin.index("fetch_scheduler_enable_background_transport("))
+        legacy = source[source.index("YoutubeLiteLoadJob *youtube_lite_load_begin_configured("):
+                        source.index("YoutubeLiteLoadJob *youtube_lite_load_begin(")]
+        self.assertIn("return youtube_lite_load_begin_navigation(", legacy)
 
     def test_home_preconnect_uses_dedicated_worker_descriptor(self):
         transport = without_comments(
@@ -7344,6 +7365,17 @@ int main(void) {
         session = without_comments(
             psp_media_session_sources())
         self.assertIn(".stream_publication_bytes = 16u * KIB", session)
+
+    def test_transport_captures_security_before_handle_release(self):
+        source = without_comments((ROOT / "src/fetch/background_transport.inc").read_text())
+        completion = source[source.index("bool admitted = !slot->private_network.blocked"):
+                            source.index("static void fetch_background_preconnect_release")]
+        self.assertLess(completion.index("fetch_background_record_terminal_security(slot, code)"),
+                        completion.index("fetch_background_slot_release_curl(slot)"))
+        drained = source[source.index("static void fetch_background_finish_stream_if_drained"):
+                         source.index("bool admitted = !slot->private_network.blocked")]
+        self.assertIn("(CURLcode) slot->result.transport_code", drained)
+        self.assertNotIn("slot->result.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK", drained)
 
     def test_media_transport_reserves_foreground_admission(self):
         background = without_comments(

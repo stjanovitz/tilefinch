@@ -124,6 +124,8 @@ typedef struct {
     uint64_t maximum_pump_us;
     uint64_t maximum_transform_slice_us;
     uint64_t maximum_irreducible_unit_us;
+    long handoff_http_status;
+    bool handoff_service_origin;
 } YoutubeLiteLoadMetrics;
 
 /*
@@ -132,6 +134,8 @@ typedef struct {
  * account actions never require executing the full service page.
  */
 YoutubeLiteRoute youtube_lite_route(const char *url);
+/* Only the service's HTTPS session handoff, never an executable feed page. */
+bool youtube_lite_signin_handoff_url(const char *url);
 
 /*
  * Converts the bounded data embedded in an ordinary mobile YouTube response
@@ -176,6 +180,10 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     Budget *budget, BrowserSession *session, const char *url,
     bool compact_results, size_t maximum_source_bytes, long timeout_ms,
     char *error, size_t error_size);
+YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
+    Budget *, BrowserSession *, const char *url, bool compact_results,
+    size_t maximum_source_bytes, long timeout_ms, const char *initiator,
+    bool user_activated, char *error, size_t error_size);
 YoutubeLiteLoadStatus youtube_lite_load_pump(
     YoutubeLiteLoadJob *job, const FetchPumpQuota *quota);
 YoutubeLiteLoadStatus youtube_lite_load_status(
@@ -196,6 +204,37 @@ void youtube_lite_document_destroy(YoutubeLiteDocument *document);
 /* RAM-only personalized feeds. The job uses the ordinary cookie authority,
    performs no sign-in and is advanced only in bounded idle pumps. */
 typedef struct YoutubeLiteFeedJob YoutubeLiteFeedJob;
+typedef enum {
+    YOUTUBE_FEED_FAILURE_NONE, YOUTUBE_FEED_FAILURE_TIMEOUT,
+    YOUTUBE_FEED_FAILURE_CONFIGURATION, YOUTUBE_FEED_FAILURE_AUTHORIZATION,
+    YOUTUBE_FEED_FAILURE_ADMISSION, YOUTUBE_FEED_FAILURE_TRANSPORT,
+    YOUTUBE_FEED_FAILURE_HTTP, YOUTUBE_FEED_FAILURE_ORIGIN,
+    YOUTUBE_FEED_FAILURE_JSON, YOUTUBE_FEED_FAILURE_AUTHENTICATION,
+    YOUTUBE_FEED_FAILURE_BUILD, YOUTUBE_FEED_FAILURE_SESSION_CHANGED
+} YoutubeLiteFeedFailure;
+/* Fixed fields only. Never export endpoint strings, bodies or auth material. */
+typedef struct {
+    unsigned phase;
+    long http_status;
+    long bootstrap_status, api_status, history_status;
+    YoutubeLiteFeedFailure failure;
+    unsigned history_outcome; /* 0 none, 1 pending, 2 complete, 3 timeout, 4 failed */
+    bool transported, same_origin, bootstrap_signed_in, auth_user_known;
+    bool request_signed, api_authenticated;
+    bool request_admitted, configuration_valid, clock_available;
+    size_t result_count;
+    /* Last completed hop, numeric backend facts only; never its error text. */
+    long transport_code, tls_verify_result;
+    bool tls_verify_result_available, tls_verification_failed, transport_timed_out;
+} YoutubeLiteFeedDiagnostics;
+bool youtube_lite_feed_diagnostics(const YoutubeLiteFeedJob *, YoutubeLiteFeedDiagnostics *);
+/* Authentication survives optional history and presentation refusals. Opaque,
+   session-local identity only; callers must compare it with the current jar. */
+uint64_t youtube_lite_feed_authenticated_identity(const YoutubeLiteFeedJob *);
+uint64_t youtube_lite_feed_rejected_identity(const YoutubeLiteFeedJob *);
+/* Rebuild only the native header, retaining the owned serialized main body. */
+bool youtube_lite_home_rebuild_header(Budget *, bool signed_in, bool compact,
+    const char *body_markup, size_t body_length, YoutubeLiteDocument *);
 bool youtube_lite_session_signed_in(BrowserSession *session);
 /* Opaque RAM-only identity for native login transitions. Never log it. */
 uint64_t youtube_lite_session_login_identity(BrowserSession *session);

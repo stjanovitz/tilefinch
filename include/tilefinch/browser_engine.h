@@ -1119,10 +1119,24 @@ Budget *browser_engine_budget(BrowserEngine *engine);
 BrowserSession *browser_engine_session(BrowserEngine *engine);
 enum {
     BROWSER_YOUTUBE_LOGIN_VERIFIED = 1u,
-    BROWSER_YOUTUBE_LOGIN_SIGNED_OUT = 2u
+    BROWSER_YOUTUBE_LOGIN_SIGNED_OUT = 2u,
+    BROWSER_YOUTUBE_LOGIN_FAILED = 4u,
+    BROWSER_YOUTUBE_LOGIN_RECOVERING = 8u,
+    BROWSER_YOUTUBE_LOGIN_STARTED = 16u
 };
 /* Native receipt after personalized API authentication, not DOM markers. */
 unsigned browser_engine_take_youtube_login_events(BrowserEngine *engine);
+bool browser_engine_youtube_login_verified(const BrowserEngine *);
+/* Native consent binding only. Never export or log this opaque identity. */
+uint64_t browser_engine_youtube_login_identity(const BrowserEngine *);
+/* Explicit native continuation; never submits account fields or repeats a
+   single-use handoff. The caller navigates to the fixed provider destination. */
+bool browser_engine_youtube_signin_continue_available(const BrowserEngine *);
+const char *browser_engine_youtube_signin_continue_target(const BrowserEngine *);
+/* Session-only opt-in: no files, URLs, identifiers or arbitrary text. Off
+   clears the bounded report. The formatter accepts no author strings. */
+void browser_engine_set_youtube_signin_diagnostics(BrowserEngine *, bool enabled);
+bool browser_engine_youtube_signin_report(const BrowserEngine *, char *, size_t);
 const BrowserSession *browser_engine_session_view(const BrowserEngine *engine);
 
 /* Transitional mutable accessors retained for tests and unmigrated tools. */

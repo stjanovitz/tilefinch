@@ -665,6 +665,16 @@ size_t script_runtime_heap_rejections(const ScriptRuntime *runtime)
         ? count - runtime->compile_heap_rejections_absorbed : 0;
 }
 
+void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,
+    size_t *old_bytes, size_t *new_bytes, size_t *live_bytes)
+{
+    BudgetQuickJSActivity activity = {0};
+    if (runtime != NULL) budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
+    if (old_bytes != NULL) *old_bytes = activity.rejected_old_bytes;
+    if (new_bytes != NULL) *new_bytes = activity.rejected_new_bytes;
+    if (live_bytes != NULL) *live_bytes = activity.rejected_live_bytes;
+}
+
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime)
 {
     return runtime != NULL && runtime->result.interrupted;

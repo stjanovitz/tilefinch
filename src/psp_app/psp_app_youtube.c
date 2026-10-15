@@ -23,15 +23,17 @@ void psp_app_youtube_login_boot(PspProcessResources *process, PspBrowserResource
 bool psp_app_youtube_login_clear(PspApp *app)
 {
     app->browser->youtube_login_pending = false;
+    app->browser->youtube_login_offer_identity = 0;
     app->browser->youtube_login_restored = false;
-    app->browser->youtube_login_verified = false;
     return youtube_login_remove(app->process->storage.youtube_login);
 }
 
 static bool psp_app_youtube_login_save(PspApp *app)
 {
     bool saved = app->process->persistent_site_data_available
-        && app->browser->youtube_login_verified
+        && app->browser->youtube_login_offer_identity != 0
+        && app->browser->youtube_login_offer_identity
+            == browser_engine_youtube_login_identity(app->browser->engine)
         && youtube_lite_session_signed_in(app->browser->session)
         && youtube_login_save(app->browser->session,
             app->process->storage.youtube_login, (int64_t) time(NULL));
@@ -43,8 +45,31 @@ static bool psp_app_youtube_login_save(PspApp *app)
 bool psp_app_youtube_login_poll(PspApp *app)
 {
     PspBrowserResources *browser = app->browser;
+    PspUiState *ui = &app->process->presentation.ui;
     unsigned events = browser_engine_take_youtube_login_events(browser->engine);
     bool changed = false;
+    /* Check the old offer before accepting a new verification receipt: never
+       silently rebind an already-visible consent prompt to another session. */
+    if ((events & BROWSER_YOUTUBE_LOGIN_STARTED)
+        || (browser->youtube_login_offer_identity != 0
+            && browser->youtube_login_offer_identity != browser_engine_youtube_login_identity(browser->engine))) {
+        browser->youtube_login_pending = false;
+        browser->youtube_login_offer_identity = 0;
+        if (ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN) {
+            psp_ui_dismiss_youtube_login_offer(ui);
+            changed = true;
+        }
+    }
+    if (events & BROWSER_YOUTUBE_LOGIN_STARTED) {
+        browser->youtube_login_restored = 0;
+    }
+    if (events & (BROWSER_YOUTUBE_LOGIN_FAILED | BROWSER_YOUTUBE_LOGIN_RECOVERING)) {
+        psp_ui_show_status(&app->process->presentation.ui,
+            events & BROWSER_YOUTUBE_LOGIN_FAILED
+                ? "YOUTUBE SIGN-IN NOT CONFIRMED - TRY SIGN IN AGAIN"
+                : "CONTINUING YOUTUBE SIGN-IN", 300);
+        changed = true;
+    }
     if (events & BROWSER_YOUTUBE_LOGIN_SIGNED_OUT) {
         bool removed = psp_app_youtube_login_clear(app);
         if (!removed) psp_ui_show_status(&app->process->presentation.ui,
@@ -52,20 +77,17 @@ bool psp_app_youtube_login_poll(PspApp *app)
         changed = true;
     }
     if (events & BROWSER_YOUTUBE_LOGIN_VERIFIED) {
-        browser->youtube_login_verified = true;
-        if (browser->youtube_login_restored != youtube_lite_session_login_identity(browser->session)) {
+        browser->youtube_login_offer_identity = browser_engine_youtube_login_identity(browser->engine);
+        if (browser->youtube_login_offer_identity != 0
+            && browser->youtube_login_restored != browser->youtube_login_offer_identity) {
             unsigned policy = browser_profile_youtube_login_policy(browser->profile);
             if (policy == YOUTUBE_LOGIN_ALWAYS) {
                 (void) psp_app_youtube_login_save(app); changed = true;
             } else if (policy == YOUTUBE_LOGIN_ASK) browser->youtube_login_pending = true;
         }
+        if (!browser->youtube_login_pending && ui->screen != PSP_UI_SCREEN_YOUTUBE_LOGIN)
+            browser->youtube_login_offer_identity = 0;
         browser->youtube_login_restored = false;
-    }
-    PspUiState *ui = &app->process->presentation.ui;
-    /* Cookie inspection is bounded but is not work for every rendered frame. */
-    if (browser->youtube_login_pending && !youtube_lite_session_signed_in(browser->session)) {
-        browser->youtube_login_pending = false;
-        browser->youtube_login_verified = false;
     }
     if (browser->youtube_login_pending && ui->screen == PSP_UI_SCREEN_PAGE
         && !browser_engine_navigation_pending(browser->engine)) {
@@ -98,6 +120,8 @@ void psp_app_youtube_login_action(PspApp *app, PspAppFrameState *frame,
     app->process->presentation.ui.youtube_login_policy = (uint8_t) policy;
     if (previous != policy)
         psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+    app->browser->youtube_login_pending = false;
+    app->browser->youtube_login_offer_identity = 0;
 }
 
 static void psp_youtube_preresolve_increment(unsigned *counter)

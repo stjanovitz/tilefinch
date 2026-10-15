@@ -33,6 +33,27 @@ static int failures;
             __FILE__, __LINE__, #value); failures++; \
 } } while (0)
 
+static void test_terminal_tls_metadata(void)
+{
+    FetchBackgroundResult result = {0};
+    fetch_background_terminal_tls_metadata(&result, 60, false, 0, true);
+    CHECK(result.transport_code == 60 && result.tls_verification_failed
+          && !result.tls_verify_result_available);
+    fetch_background_terminal_tls_metadata(&result, 60, true, 512, true);
+    CHECK(result.tls_verify_result_available && result.tls_verify_result == 512
+          && result.tls_verification_failed);
+    /* A drained streaming tail retains the captured error and certificate
+       facts instead of manufacturing a successful terminal code. */
+    fetch_background_terminal_tls_metadata(&result, result.transport_code,
+        result.tls_verify_result_available, result.tls_verify_result, true);
+    CHECK(result.transport_code == 60 && result.tls_verify_result == 512);
+    fetch_background_terminal_tls_metadata(&result, 56, true, 0, false);
+    CHECK(result.transport_code == 56 && !result.tls_verification_failed);
+    fetch_background_terminal_tls_metadata(&result, 0, true, 0, false);
+    CHECK(result.transport_code == 0 && result.tls_verify_result_available
+          && !result.tls_verification_failed);
+}
+
 static void test_fixed_slab_admission_and_refusal(void)
 {
     Budget budget;
@@ -537,6 +558,7 @@ static void test_stream_consumer_deadline(void)
 
 int main(void)
 {
+    test_terminal_tls_metadata();
     CHECK(fetch_background_scheduler_chunk_capacity(1u) == 1u);
     CHECK(fetch_background_scheduler_chunk_capacity(4096u) == 4096u);
     CHECK(fetch_background_scheduler_chunk_capacity(256u * 1024u)

@@ -83,9 +83,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_GLYPH_OPTION_ROWS 7u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 52u
+#define UI_OPTIONS_ITEM_COUNT 53u
 #else
-#define UI_OPTIONS_ITEM_COUNT 50u
+#define UI_OPTIONS_ITEM_COUNT 51u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -261,7 +261,8 @@ typedef enum {
     UI_OPTION_YOUTUBE_TOPICS,
     UI_OPTION_YOUTUBE_LOGIN,
     UI_OPTION_ROTATE_HINT,
-    UI_OPTION_WEB_FONTS
+    UI_OPTION_WEB_FONTS,
+    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -331,7 +332,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_YOUTUBE_TOPICS,
     UI_OPTION_YOUTUBE_LOGIN,
     UI_OPTION_ROTATE_HINT,
-    UI_OPTION_WEB_FONTS
+    UI_OPTION_WEB_FONTS,
+    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -396,6 +398,7 @@ static size_t ui_option_group_index(UiOptionId option)
 #endif
         case UI_OPTION_NETWORK_PROFILE:
         case UI_OPTION_WIFI_DIAGNOSTICS:
+        case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
         case UI_OPTION_SITE_DATA:
         case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
             return 4u;
@@ -556,6 +559,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Write failure details to the Memory Stick";
         case UI_OPTION_WIFI_DIAGNOSTICS:
             return "Keep connection details in RAM for Diagnostic QR";
+        case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
+            return "Session-only counts; QR excludes browsing logs";
         case UI_OPTION_YOUTUBE_TOPICS:
             return "Load Explore topics after the YouTube search box";
         case UI_OPTION_YOUTUBE_LOGIN:
@@ -1530,6 +1535,13 @@ static int draw_text_with_font(
     bool chrome_bold)
 {
     if (text == NULL) return x;
+    int baseline_offset = scale >= 2 ? 13 : 10;
+    /* A refused/off-owner glyph can share a line with retained font ink.
+       Anchor the built-in 5x7 replacement to that same baseline. Before a
+       font is bound, keep the boot bitmap's original top-based geometry. */
+    int bitmap_y = y + ((font != NULL
+        || chrome_font_cache.faces[chrome_bold ? 1u : 0u] != NULL)
+        ? baseline_offset - 7 * scale : 0);
 #ifdef TILEFINCH_UI_TEXT_OBSERVER
     const int original_x = x;
     int ink_left = x, ink_right = x, ink_top = y, ink_bottom = y;
@@ -1585,7 +1597,7 @@ static int draw_text_with_font(
             if (y + 2 + square_side > ink_bottom) ink_bottom = y + 2 + square_side;
 #endif
         } else if (glyph != NULL) {
-            int baseline = y + (scale >= 2 ? 13 : 10);
+            int baseline = y + baseline_offset;
 #ifdef TILEFINCH_UI_TEXT_OBSERVER
             if (x + glyph->x_offset < ink_left) ink_left = x + glyph->x_offset;
             if (x + glyph->x_offset + glyph->width > ink_right)
@@ -1599,9 +1611,10 @@ static int draw_text_with_font(
         } else if (codepoint <= 0x7fu) {
 #ifdef TILEFINCH_UI_TEXT_OBSERVER
             if (x + 5 * scale > ink_right) ink_right = x + 5 * scale;
-            if (y + 7 * scale > ink_bottom) ink_bottom = y + 7 * scale;
+            if (bitmap_y < ink_top) ink_top = bitmap_y;
+            if (bitmap_y + 7 * scale > ink_bottom) ink_bottom = bitmap_y + 7 * scale;
 #endif
-            draw_character(pixels, width, height, stride, x, y,
+            draw_character(pixels, width, height, stride, x, bitmap_y,
                            (char) codepoint, color, scale);
         } else {
 #ifdef TILEFINCH_UI_TEXT_OBSERVER
@@ -1632,14 +1645,14 @@ static int draw_text_with_font(
                 default: break;
             }
             if (fallback != '\0') {
-                draw_character(pixels, width, height, stride, x, y,
+                draw_character(pixels, width, height, stride, x, bitmap_y,
                                fallback, color, scale);
             } else if (codepoint == 0x2026) {
-                draw_character(pixels, width, height, stride, x, y,
+                draw_character(pixels, width, height, stride, x, bitmap_y,
                                '.', color, scale);
             } else {
                 draw_unicode_fallback(pixels, width, height, stride,
-                                      x, y, color, scale);
+                                      x, bitmap_y, color, scale);
             }
         }
         x += advance;
@@ -1648,9 +1661,9 @@ static int draw_text_with_font(
         for (int at = 0; at < 3 && x <= maximum_x - dot_advance; at++) {
             if (dot != NULL) {
                 draw_font_glyph(pixels, width, height, stride, x,
-                                y + (scale >= 2 ? 13 : 10), dot, color);
+                                y + baseline_offset, dot, color);
             } else {
-                draw_character(pixels, width, height, stride, x, y, '.',
+                draw_character(pixels, width, height, stride, x, bitmap_y, '.',
                                color, scale);
             }
             x += dot_advance;
@@ -2733,6 +2746,11 @@ void psp_ui_show_youtube_login_offer(PspUiState *ui)
     ui->cursor_visible = false;
     ui_open_overlay(ui, PSP_UI_SCREEN_YOUTUBE_LOGIN);
     ui->menu_selection = 2u; /* Not now: confirming a held button cannot opt in. */
+}
+
+void psp_ui_dismiss_youtube_login_offer(PspUiState *ui)
+{
+    if (ui != NULL && ui->screen == PSP_UI_SCREEN_YOUTUBE_LOGIN) ui_close_overlay(ui);
 }
 
 void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
@@ -4295,6 +4313,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.id = PSP_UI_SETTING_WIFI_DIAGNOSTICS;
                     intent.setting.value.boolean = ui->wifi_diagnostics;
                     break;
+                case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
+                    ui->youtube_signin_diagnostics = !ui->youtube_signin_diagnostics;
+                    intent.setting.id = PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS;
+                    intent.setting.value.boolean = ui->youtube_signin_diagnostics;
+                    break;
                 case UI_OPTION_VIDEO_STARTUP_BUFFERING:
                     ui->video_startup_buffering =
                         !ui->video_startup_buffering;
@@ -5339,18 +5362,18 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
-    static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT] = {
+    static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
         "Find in page", "Reader mode", "Basic view",
         "Add/remove bookmark", "Save article", "Save screenshot",
-        "Site information", "Install offline app"
+        "Site information", "Install offline app", "Continue to YouTube"
     };
-    const char *values[UI_PAGE_TOOLS_ITEM_COUNT] = {
+    const char *values[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
         ">", ui->reader_mode ? "On" : "Off",
-        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL
+        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">"
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
-        labels, values, UI_PAGE_TOOLS_ITEM_COUNT, ui->menu_selection,
+        labels, values, psp_ui_page_tools_count(ui), ui->menu_selection,
         accent, text, muted);
 }
 
@@ -6111,6 +6134,10 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_WIFI_DIAGNOSTICS:
             *label = "Wi-Fi diagnostics";
             *value = ui->wifi_diagnostics ? "Verbose (RAM)" : "Off";
+            break;
+        case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
+            *label = "YouTube sign-in diagnostics";
+            *value = ui->youtube_signin_diagnostics ? "On (RAM)" : "Off";
             break;
         case UI_OPTION_YOUTUBE_TOPICS:
             *label = "YouTube home topics";
@@ -10698,6 +10725,17 @@ static void draw_media_queue_toggle(const PspUiMediaPresentation *p,
         box.x + box.width - 16, PSP_THEME_TEXT_MUTED, 1, false);
 }
 
+static bool media_chrome_ink_complete(void)
+{
+    const unsigned char *loaded = (const unsigned char *) chrome_font_cache.loaded;
+    for (size_t at = 0; at < sizeof(chrome_font_cache.loaded); at++)
+        if (loaded[at] >= UI_CHROME_GLYPH_REFUSED_FIRST) return false;
+    for (size_t at = 0; at < UI_CHROME_UNICODE_GLYPH_LIMIT; at++)
+        if (chrome_font_cache.unicode[at].loaded >= UI_CHROME_GLYPH_REFUSED_FIRST)
+            return false;
+    return true;
+}
+
 bool psp_ui_media_raster_queue_update(const PspUiMediaState *media,
     unsigned old_selection, bool old_automatic_next,
     uint16_t *pixels, int width, int height, int stride)
@@ -10709,12 +10747,7 @@ bool psp_ui_media_raster_queue_update(const PspUiMediaState *media,
     /* A full repaint also retries pending/refused chrome glyphs. Keep that
        recovery behavior until the retained ink is complete; unused slots
        (zero) and permanently missing glyphs do not need a retry. */
-    const unsigned char *loaded = (const unsigned char *) chrome_font_cache.loaded;
-    for (size_t at = 0; at < sizeof(chrome_font_cache.loaded); at++)
-        if (loaded[at] >= UI_CHROME_GLYPH_REFUSED_FIRST) return false;
-    for (size_t at = 0; at < UI_CHROME_UNICODE_GLYPH_LIMIT; at++)
-        if (chrome_font_cache.unicode[at].loaded >= UI_CHROME_GLYPH_REFUSED_FIRST)
-            return false;
+    if (!media_chrome_ink_complete()) return false;
     const PspUiMediaPresentation *p = media->presentation;
     unsigned count = p->queue_count > 6 ? 6 : p->queue_count;
     unsigned first = PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 1u;
@@ -10769,6 +10802,104 @@ static inline __attribute__((always_inline)) void draw_media_queue_body(
     draw_media_queue_toggle(presentation, pixels, width, height, stride, box);
 }
 
+static void draw_media_track_row(
+    const PspUiMediaState *media, unsigned first, unsigned at,
+    uint16_t *pixels, int width, int height, int stride, UiRect box)
+{
+    const PspUiMediaPresentation *presentation = media->presentation;
+    unsigned row = at - first;
+    int y = box.y + 44 + (int) row * 16;
+    bool queue_ended = media_queue_ended(media);
+    bool selected = presentation->track_menu_tab == 0
+        ? presentation->selected_audio_track == (int) at
+        : presentation->track_menu_tab == 3 ? !queue_ended && at == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS
+        : presentation->track_menu_tab == 2
+            ? (int) at == media_current_chapter(media)
+            : (at == 0 ? presentation->selected_subtitle_track < 0
+                   : presentation->selected_subtitle_track
+                         == (int) at - 1);
+    if (at == presentation->track_menu_selection)
+        fill_round_rect(
+            pixels, width, height, stride,
+            (UiRect) {box.x + 10, y - 3, box.width - 20, 17},
+            4, PSP_THEME_SURFACE, 4);
+    const char *label = presentation->track_menu_tab == 0
+        ? presentation->audio_tracks[at].label
+        : presentation->track_menu_tab == 3
+            ? queue_ended ? tilefinch_ui_text(at == 0 ? "X PLAY"
+                : at == 1 && presentation->queue_position ? "Video" : "O Back")
+            : at == 0 ? tilefinch_ui_text(presentation->queue_retry ? "Retry queue" : "O Cancel")
+            : presentation->queue_titles[at - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS]
+        : presentation->track_menu_tab == 2 ? presentation->chapters[at].title
+        : (at == 0 ? tilefinch_ui_text("Off")
+                   : presentation->subtitle_tracks[at - 1u].label);
+    int label_x = box.x + 20;
+    if (presentation->track_menu_tab == 2) {
+        char time[24];
+        media_format_time((uint64_t) presentation->chapters[at].seconds * 1000000u,
+                          time, sizeof(time));
+        draw_text(pixels, width, height, stride, label_x, y, time, 10,
+                  PSP_THEME_TEXT_MUTED, 1);
+        label_x += 62;
+    } else if (presentation->track_menu_tab == 3
+        && ((queue_ended && at == 1 && presentation->queue_position)
+            || (!queue_ended && at >= PSP_UI_MEDIA_QUEUE_CONTROL_ROWS))) {
+        char number[16];
+        snprintf(number, sizeof(number), "%s%u.", queue_ended ? "L " : "",
+            queue_ended ? (unsigned) presentation->queue_position
+                : (unsigned) presentation->queue_position + at + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+        draw_text(pixels, width, height, stride, label_x, y, number, 8, PSP_THEME_TEXT_MUTED, 1);
+        label_x += queue_ended ? 58 : 42;
+    }
+    draw_text_with_font(
+        pixels, width, height, stride, label_x, y,
+        label, 42, box.x + box.width - 42,
+        at == presentation->track_menu_selection
+            ? PSP_THEME_TEXT : PSP_THEME_TEXT_MUTED,
+        1, presentation->title_font, false);
+    if (selected)
+        draw_text(pixels, width, height, stride,
+                  box.x + box.width - 30, y,
+                  presentation->track_menu_tab == 3 ? ">" : "X", 1,
+                  PSP_THEME_ACCENT_EMBER_HI, 1);
+}
+
+bool psp_ui_media_raster_menu_update(const PspUiMediaState *media,
+    unsigned old_selection, bool old_automatic_next,
+    uint16_t *pixels, int width, int height, int stride)
+{
+    if (media == NULL || media->presentation == NULL) return false;
+    const PspUiMediaPresentation *p = media->presentation;
+    if (p->track_menu_tab == 3)
+        return psp_ui_media_raster_queue_update(media, old_selection,
+            old_automatic_next, pixels, width, height, stride);
+    if (p->track_menu_tab > 1 || !p->track_menu_open || pixels == NULL
+        || width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        || height < (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT || stride < width
+        || !media_chrome_ink_complete()) return false;
+    unsigned count = media_menu_count(media, p->track_menu_tab);
+    unsigned first = media_menu_first(p);
+    unsigned old_first = old_selection > PSP_UI_MEDIA_TRACK_LIMIT
+        ? old_selection - PSP_UI_MEDIA_TRACK_LIMIT : 0u;
+    if (first != old_first || old_selection >= count
+        || p->track_menu_selection >= count) return false;
+    if (old_selection == p->track_menu_selection) return true;
+    unsigned choices[2] = {old_selection, p->track_menu_selection};
+    if (choices[0] > choices[1]) {
+        unsigned swap = choices[0]; choices[0] = choices[1]; choices[1] = swap;
+    }
+    UiRect box = {0, 0, PSP_UI_MEDIA_TRACK_MENU_WIDTH, PSP_UI_MEDIA_TRACK_MENU_HEIGHT};
+    /* Clear both before painting, then use global row order. Adjacent 17px
+       highlight rectangles overlap by one pixel on the 16px row cadence. */
+    for (unsigned i = 0; i < 2; i++)
+        fill_rect(pixels, width, height, stride,
+            (UiRect){10, 41 + (int) (choices[i] - first) * 16,
+                     box.width - 20, 17}, PSP_THEME_PANEL, 4);
+    for (unsigned i = 0; i < 2; i++)
+        draw_media_track_row(media, first, choices[i], pixels, width, height, stride, box);
+    return true;
+}
+
 static void draw_media_track_menu_box(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride, UiRect box)
@@ -10812,63 +10943,9 @@ static void draw_media_track_menu_box(
     unsigned count = media_menu_count(media, presentation->track_menu_tab);
     unsigned first = media_menu_first(presentation);
     for (unsigned row = 0; row < PSP_UI_MEDIA_TRACK_LIMIT + 1u && first + row < count;
-         row++) {
-        unsigned at = first + row;
-        int y = box.y + 44 + (int) row * 16;
-        bool queue_ended = media_queue_ended(media);
-        bool selected = presentation->track_menu_tab == 0
-            ? presentation->selected_audio_track == (int) at
-            : presentation->track_menu_tab == 3 ? !queue_ended && at == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS
-            : presentation->track_menu_tab == 2
-                ? (int) at == media_current_chapter(media)
-                : (at == 0 ? presentation->selected_subtitle_track < 0
-                       : presentation->selected_subtitle_track
-                             == (int) at - 1);
-        if (at == presentation->track_menu_selection)
-            fill_round_rect(
-                pixels, width, height, stride,
-                (UiRect) {box.x + 10, y - 3, box.width - 20, 17},
-                4, PSP_THEME_SURFACE, 4);
-        const char *label = presentation->track_menu_tab == 0
-            ? presentation->audio_tracks[at].label
-            : presentation->track_menu_tab == 3
-                ? queue_ended ? tilefinch_ui_text(at == 0 ? "X PLAY"
-                    : at == 1 && presentation->queue_position ? "Video" : "O Back")
-                : at == 0 ? tilefinch_ui_text(presentation->queue_retry ? "Retry queue" : "O Cancel")
-                : presentation->queue_titles[at - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS]
-            : presentation->track_menu_tab == 2 ? presentation->chapters[at].title
-            : (at == 0 ? tilefinch_ui_text("Off")
-                       : presentation->subtitle_tracks[at - 1u].label);
-        int label_x = box.x + 20;
-        if (presentation->track_menu_tab == 2) {
-            char time[24];
-            media_format_time((uint64_t) presentation->chapters[at].seconds * 1000000u,
-                              time, sizeof(time));
-            draw_text(pixels, width, height, stride, label_x, y, time, 10,
-                      PSP_THEME_TEXT_MUTED, 1);
-            label_x += 62;
-        } else if (presentation->track_menu_tab == 3
-            && ((queue_ended && at == 1 && presentation->queue_position)
-                || (!queue_ended && at >= PSP_UI_MEDIA_QUEUE_CONTROL_ROWS))) {
-            char number[16];
-            snprintf(number, sizeof(number), "%s%u.", queue_ended ? "L " : "",
-                queue_ended ? (unsigned) presentation->queue_position
-                    : (unsigned) presentation->queue_position + at + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
-            draw_text(pixels, width, height, stride, label_x, y, number, 8, PSP_THEME_TEXT_MUTED, 1);
-            label_x += queue_ended ? 58 : 42;
-        }
-        draw_text_with_font(
-            pixels, width, height, stride, label_x, y,
-            label, 42, box.x + box.width - 42,
-            at == presentation->track_menu_selection
-                ? PSP_THEME_TEXT : PSP_THEME_TEXT_MUTED,
-            1, presentation->title_font, false);
-        if (selected)
-            draw_text(pixels, width, height, stride,
-                      box.x + box.width - 30, y,
-                      presentation->track_menu_tab == 3 ? ">" : "X", 1,
-                      PSP_THEME_ACCENT_EMBER_HI, 1);
-    }
+         row++)
+        draw_media_track_row(media, first, first + row,
+            pixels, width, height, stride, box);
     draw_fitted_ui_text(pixels, width, height, stride,
               box.x + 16, box.y + box.height - 17,
               presentation->track_menu_tab == 3 && presentation->queue_failed && presentation->queue_error[0]

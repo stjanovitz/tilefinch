@@ -4375,6 +4375,189 @@ static int test_host_state_network_and_indexeddb_stats(void)
     return 0;
 }
 
+/* Shared deterministic queue and upload/response-event ordering probe. */
+static int test_synthetic_network_queue(ScriptRuntime *runtime,
+                                        ScriptResult *output)
+{
+    ScriptResult result = {0};
+    static const char network_queue_probe[] =
+        "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,"
+        "nativeCancel=globalThis.__tilefinchCancelNetwork,starts=[],cancels=[];"
+        "let nextNative=1000,deferNativeOnce=true;"
+        "globalThis.__tilefinchFetchAsync=(method,url)=>{url=String(url);"
+        "if(url.endsWith('/native-defer')&&deferNativeOnce){"
+        "deferNativeOnce=false;return 0;}starts.push(url);return nextNative++;};"
+        "globalThis.__tilefinchCancelNetwork=id=>{cancels.push(Number(id));"
+        "return true;};const raw={status:200,url:'https://example.test/ok',"
+        "contentType:'text/plain',headers:'content-type: text/plain\\n',"
+        "body:'ok'};const requests=[];for(let i=0;i<12;i++)requests.push("
+        "fetch('https://example.test/fifo/'+i).then(value=>value.text()));"
+        "const waitingAbort=new AbortController,waitingCancelled=fetch("
+        "'https://example.test/cancel-waiting',{signal:waitingAbort.signal})"
+        ".then(()=>'',error=>error.name);waitingAbort.abort();"
+        "let delivered=1000;while(delivered<1012){const end=nextNative;"
+        "while(delivered<end)__tilefinchDeliverNetwork(delivered++,true,raw);"
+        "await Promise.resolve();}const bodies=await Promise.all(requests),"
+        "cancelName=await waitingCancelled;const fifo=starts.length===12"
+        "&&starts.every((url,index)=>url==='https://example.test/fifo/'+index);"
+        "const abortControllers=[],abortPromises=[],abortStart=starts.length;"
+        "for(let i=0;i<5;i++){const controller=new AbortController;"
+        "abortControllers.push(controller);abortPromises.push(fetch("
+        "'https://example.test/abort-fifo/'+i,{signal:controller.signal})"
+        ".catch(()=>{}));}abortControllers[0].abort();await Promise.resolve();"
+        "const abortReleased=starts[abortStart+4]"
+        "==='https://example.test/abort-fifo/4';"
+        "for(const controller of abortControllers)controller.abort();"
+        "await Promise.all(abortPromises);"
+        "const controllers=[],quotaPromises=[];for(let i=0;i<129;i++){"
+        "const controller=new AbortController;controllers.push(controller);"
+        "quotaPromises.push(fetch('https://example.test/quota/'+i,{"
+        "signal:controller.signal}).then(()=>'',error=>error.name));}"
+        "await Promise.resolve();const countQuota=await quotaPromises[128];"
+        "let insideXhrSend=true,xhrQuotaError=false,xhrQuotaReentered=false;"
+        "const quotaXhr=new XMLHttpRequest;quotaXhr.open('GET',"
+        "'https://example.test/quota-xhr');quotaXhr.onerror=()=>{"
+        "xhrQuotaError=true;if(insideXhrSend)xhrQuotaReentered=true;};"
+        "quotaXhr.send();insideXhrSend=false;const xhrDeferred="
+        "!xhrQuotaError&&!xhrQuotaReentered;__tilefinchPumpTimers(0,4);"
+        "for(const controller of controllers)controller.abort();"
+        "await Promise.all(quotaPromises);const byteQuota=await fetch("
+        "'https://example.test/byte-quota',{method:'POST',"
+        "body:'x'.repeat(132000)}).then(()=>'',error=>error.name);"
+        "const blockers=[];for(let i=0;i<4;i++){const controller="
+        "new AbortController;blockers.push(controller);fetch("
+        "'https://example.test/timeout-blocker/'+i,{signal:controller.signal})"
+        ".catch(()=>{});}let timeoutEvent=false;const xhr=new XMLHttpRequest;"
+        "xhr.open('GET','https://example.test/queued-timeout');xhr.timeout=5;"
+        "xhr.ontimeout=()=>{timeoutEvent=true;};xhr.send();"
+        "const queuedBeforeTimeout=__tilefinchNetworkQueueStats.waiting===1;"
+        "__tilefinchPumpTimers(5,16);for(const controller of blockers)"
+        "controller.abort();await Promise.resolve();const uploadEvents=[],"
+        "uploadXhr=new XMLHttpRequest,recordUpload=label=>event=>uploadEvents."
+        "push([label,event.isTrusted,event instanceof ProgressEvent,"
+        "event.lengthComputable,event.loaded,event.total].join(':'));"
+        "for(const type of ['loadstart','progress','load','loadend'])"
+        "uploadXhr.upload.addEventListener(type,recordUpload('u-'+type));"
+        "uploadXhr.addEventListener('loadend',recordUpload('x-loadend'));"
+        "const uploadDone=new Promise(resolve=>uploadXhr.onloadend=resolve);"
+        "uploadXhr.open('POST','https://example.test/upload');"
+        "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
+        "__tilefinchDeliverNetwork(uploadNative,true,raw,true,100,200,300,"
+        "400,500,2,2,true,false,false,true,3,200,'text/plain');"
+        "await Promise.resolve();"
+        "const deferredPromise=fetch('https://example.test/native-defer')"
+        ".then(value=>value.text());const nativeDeferred="
+        "__tilefinchNetworkQueueStats.waiting===1;"
+        "__tilefinchPumpTimers(20,16);const deferredNative=nextNative-1;"
+        "__tilefinchDeliverNetwork(deferredNative,true,raw,true,110,210,310,"
+        "410,510,2,2,true,false,false,true,2,200,'text/plain');"
+        "const deferredBody=await deferredPromise;await uploadDone;"
+        "const xhrTiming=performance.getEntriesByName("
+        "'https://example.test/upload','resource')[0],fetchTiming="
+        "performance.getEntriesByName("
+        "'https://example.test/native-defer','resource')[0],timingOk="
+        "xhrTiming&&xhrTiming.initiatorType==='xmlhttprequest'&&"
+        "xhrTiming.nextHopProtocol==='h2'&&xhrTiming.responseStatus===200&&"
+        "xhrTiming.contentType==='text/plain'&&xhrTiming.encodedBodySize===2&&"
+        "fetchTiming&&fetchTiming.initiatorType==='fetch'&&"
+        "fetchTiming.nextHopProtocol==='http/1.1'&&"
+        "fetchTiming.responseStatus===200&&fetchTiming.contentType==="
+        "'text/plain'&&fetchTiming.encodedBodySize===2;"
+        "const progressShape=new ProgressEvent('shape',{lengthComputable:true,"
+        "loaded:3,total:5}),progressShapeOk=Object.getOwnPropertyNames("
+        "progressShape).join(',')==='isTrusted'&&Object.getOwnPropertyNames("
+        "ProgressEvent.prototype).join(',')==='lengthComputable,loaded,total,constructor'"
+        "&&progressShape.lengthComputable&&progressShape.loaded===3"
+        "&&progressShape.total===5;"
+        "const uploadOk=uploadEvents.join('|')==="
+        "'u-loadstart:true:true:true:0:5|u-progress:true:true:true:5:5|'"
+        "+'u-load:true:true:true:5:5|u-loadend:true:true:true:5:5|'"
+        "+'x-loadend:true:true:true:2:2';const stats="
+        "__tilefinchNetworkQueueStats;globalThis.__tilefinchFetchAsync=nativeFetch;"
+        "globalThis.__tilefinchCancelNetwork=nativeCancel;"
+        "globalThis.pocSummary=fifo&&bodies.every(value=>value==='ok')"
+        "&&cancelName==='AbortError'&&countQuota==='TypeError'"
+        "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
+        "&&abortReleased&&byteQuota==='TypeError'&&queuedBeforeTimeout&&timeoutEvent"
+        "&&uploadOk&&progressShapeOk&&timingOk&&nativeDeferred&&deferredBody==='ok'"
+        "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
+        "&&stats.rejected===3&&stats.rejectedBytes>=1"
+        "&&stats.cancelled===139&&stats.timedOut===1"
+        "&&stats.completed===14&&stats.launchFailed===0"
+        "&&stats.active===0&&stats.waiting===0"
+        "&&stats.currentCount===0&&cancels.length===13"
+        "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify({stats,"
+        "fifo,cancelName,countQuota,xhrDeferred,xhrQuotaError,xhrQuotaReentered,"
+        "abortReleased,byteQuota,queuedBeforeTimeout,timeoutEvent,uploadOk,"
+        "progressShapeOk,timingOk,nativeDeferred,deferredBody,uploadEvents});"
+        "})().catch(error=>{globalThis.pocSummary='NETWORK-QUEUE-ERROR:'+"
+        "String(error&&error.stack||error)});";
+    bool network_queue_ok = script_runtime_evaluate_diagnostic(
+        runtime, network_queue_probe, "<network-queue-probe>", &result);
+    for (size_t tick = 0; network_queue_ok && tick < 32
+         && strncmp(result.summary, "NETWORK-QUEUE-", 14) != 0; tick++) {
+        network_queue_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!network_queue_ok
+        || strcmp(result.summary, "NETWORK-QUEUE-OK") != 0) {
+        fprintf(stderr, "network queue probe: ok=%d summary=%s error=%s "
+                "admitted=%zu completed=%zu rejected=%zu cancelled=%zu "
+                "timedout=%zu peak=%zu peakbytes=%zu active=%zu pending=%zu\n",
+                network_queue_ok, result.summary, result.error,
+                result.async_network_logical_admitted,
+                result.async_network_logical_completed,
+                result.async_network_logical_rejected,
+                result.async_network_logical_cancelled,
+                result.async_network_logical_timed_out,
+                result.async_network_logical_peak,
+                result.async_network_logical_peak_bytes,
+                result.async_network_active_native,
+                result.async_network_pending_logical);
+    }
+    CHECK(network_queue_ok
+          && strcmp(result.summary, "NETWORK-QUEUE-OK") == 0
+          && result.async_network_logical_admitted == 153
+          && result.async_network_logical_completed == 14
+          && result.async_network_logical_rejected == 3
+          && result.async_network_logical_cancelled == 139
+          && result.async_network_logical_timed_out == 1
+          && result.async_network_logical_peak == 128
+          && result.async_network_logical_peak_bytes <= 256u * 1024u
+          && result.async_network_active_native == 0
+          && result.async_network_pending_logical == 0);
+    *output = result;
+    return 0;
+}
+
+static int test_buffered_xhr_event_stack(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    static const char html[] = "<!doctype html><body>Queue</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_PSP_STRICT, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true,
+        .allow_test_network_primitive_overrides = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 8000, "https://example.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    int failed = test_synthetic_network_queue(runtime, &result);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return failed;
+}
+
 /* The real scheduler behind the JavaScript queue, replayed from a fixture:
    more requests than the shared scheduler admits at once (two 1 MiB
    response reservations here) all start in FIFO order and all complete
@@ -5187,8 +5370,118 @@ static int test_diagnostic_probe_leaves_jobs_pending(void)
     return 0;
 }
 
+static int test_motion_rule_cache_and_yield(void)
+{
+    Budget budget; budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><head></head><body><input id=field><div id=box></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptRuntimeOptions options = {.defer_document_scripts = true};
+    CHECK(viewport_context_init(&options.viewport, 480, 272, 480, 272));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(&document, &budget,
+        8u * MIB, 2000, "https://motion.test/", &options, &result);
+    Stylesheet sheet = {0};
+    CHECK(runtime);
+    static const char setup[] =
+        "globalThis.motionStyle=document.createElement('style');"
+        "motionStyle.textContent='@keyframes pulse{from{opacity:.1}to{opacity:.6}}'"
+        "+'.probe,.changed{animation:pulse 1s linear}'"
+        "+'.irrelevant{color:black}'.repeat(2000);"
+        "document.head.appendChild(motionStyle);"
+        "document.getElementById('box').className='probe';"
+        "__tilefinchMaybeStartMotion();";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, setup, "<motion-cache-setup>", &result)
+        && script_runtime_advance(runtime, 0, 1, &result)
+        && script_runtime_evaluate_diagnostic(runtime,
+            "pocSummary=__tilefinchRootCensus.motionScanYields>0"
+            "&&__tilefinchRootCensus.motionScanPending"
+            "&&document.getElementById('box').style.opacity===''?'yielded':'blocked'",
+            "<motion-yield-check>", &result)
+        && !strcmp(result.summary, "yielded"));
+    /* A focus/promise task completes while the parser is unfinished. The
+       class change must invalidate matching, not publish a stale candidate. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "document.getElementById('field').focus();"
+        "document.getElementById('box').className='changed';"
+        "Promise.resolve().then(()=>pocSummary="
+        "document.activeElement.id==='field'&&__tilefinchRootCensus.motionScanPending"
+        "?'interactive':'blocked')", "<motion-input>", &result)
+        && script_runtime_advance(runtime, 0, 1, &result)
+        && !strcmp(result.summary, "interactive"));
+    for (unsigned phase = 0; phase < 6; phase++) {
+        bool settled = false;
+        for (unsigned tick = 0; tick < 128 && !settled; tick++) {
+            CHECK(script_runtime_advance(runtime, 16, 16, &result)
+                && script_runtime_evaluate_diagnostic(runtime,
+                    "pocSummary=__tilefinchRootCensus.motionScanPending?'pending':'settled'",
+                    "<motion-cache-settle>", &result));
+            settled = !strcmp(result.summary, "settled");
+        }
+        CHECK(settled);
+        const char *check = phase == 0
+            ? "globalThis.motionParses=__tilefinchRootCensus.motionRuleParses;"
+              "pocSummary=Number(document.getElementById('box').style.opacity)===.6"
+              "&&__tilefinchRootCensus.motionCachedStringUnits<=32768"
+              "&&__tilefinchRootCensus.motionCachedFrameProperties<=512?'ok':'bad';"
+              "document.getElementById('box').className='probe changed'"
+            : phase == 1
+            ? "pocSummary=__tilefinchRootCensus.motionRuleParses===motionParses"
+              "&&__tilefinchRootCensus.motionRuleCacheHits>0?'ok':'bad';"
+              "motionStyle.textContent=motionStyle.textContent.replace('opacity:.6','opacity:.8')"
+            : phase == 2
+            ? "pocSummary=Number(document.getElementById('box').style.opacity)===.8"
+              "&&__tilefinchRootCensus.motionRuleParses>motionParses?'ok':'bad';"
+              "motionStyle.sheet.insertRule('@keyframes second{from{opacity:0}to{opacity:.9}}',"
+              "motionStyle.sheet.cssRules.length);"
+              "motionStyle.sheet.insertRule('.changed{animation:second 1s linear}',"
+              "motionStyle.sheet.cssRules.length)"
+            : phase == 3
+            ? "pocSummary=Number(document.getElementById('box').style.opacity)===.9?'ok':'bad';"
+              "motionStyle.textContent='@keyframes huge{from{opacity:0}to{opacity:.7;'"
+              "+Array.from({length:600},(_,i)=>'--field'+i+':x;').join('')"
+              "+'}}.changed{animation:huge 1s linear}'"
+            : phase == 4
+            ? "pocSummary=Number(document.getElementById('box').style.opacity)===.7"
+              "&&__tilefinchRootCensus.motionCachedFrameProperties===0?'ok':'bad';"
+              "motionParses=__tilefinchRootCensus.motionRuleParses;"
+              "document.getElementById('box').className='changed other'"
+            : "pocSummary=Number(document.getElementById('box').style.opacity)===.7"
+              "&&__tilefinchRootCensus.motionRuleParses>motionParses?'ok':'bad'";
+        bool checked = script_runtime_evaluate_diagnostic(runtime, check, "<motion-cache-check>", &result);
+        if (!checked || strcmp(result.summary, "ok"))
+            fprintf(stderr, "motion cache phase=%u summary=%s error=%s\n",
+                phase, result.summary, result.error);
+        CHECK(checked && !strcmp(result.summary, "ok"));
+        if (phase == 2) {
+            /* CSSOM's text is a native override, not a rewrite of DOM text.
+               Publish the normal stylesheet rebuild before rechecking it. */
+            CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+            script_runtime_set_stylesheet(runtime, &sheet);
+            CHECK(script_runtime_evaluate_diagnostic(runtime,
+                "__tilefinchMaybeStartMotion()", "<motion-native-cssom>", &result));
+        }
+        if (phase == 3) {
+            script_runtime_set_stylesheet(runtime, NULL);
+            CHECK(script_runtime_evaluate_diagnostic(runtime,
+                "__tilefinchMaybeStartMotion()", "<motion-dom-fallback>", &result));
+        }
+    }
+    script_runtime_destroy(runtime); stylesheet_destroy(&sheet); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_active_allocations(&budget, NULL) == 0);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--xhr-buffered-events-only") == 0)
+        return test_buffered_xhr_event_stack();
+    CHECK(test_buffered_xhr_event_stack() == 0);
+    if (argc == 2 && strcmp(argv[1], "--motion-cache-only") == 0)
+        return test_motion_rule_cache_and_yield();
+    CHECK(test_motion_rule_cache_and_yield() == 0);
     if (argc == 2 && strcmp(argv[1], "--html-tag-case-only") == 0)
         return test_html_tag_query_case();
     CHECK(test_html_tag_query_case() == 0);
@@ -5428,6 +5721,18 @@ int main(int argc, char **argv)
        before source fallback. */
     ScriptResult unavailable_bytecode_result;
     ScriptResult disabled_bytecode_result;
+    /* This compares compile admission, not elapsed speed. Keep instrumented
+       source compilation from exhausting an unrelated wall-clock watchdog. */
+    HeldClock fallback_clock = {
+        .monotonic_ns = tilefinch_platform_monotonic_time_ns(),
+        .wall_ns = tilefinch_platform_wall_time_ns()
+    };
+    TilefinchPlatformServices fallback_services = {
+        .context = &fallback_clock,
+        .wall_time_ns = held_clock_wall_ns,
+        .monotonic_time_ns = held_clock_monotonic_ns
+    };
+    tilefinch_platform_set_services(&fallback_services);
     bool unavailable_fault_set = setenv(
         "TILEFINCH_TEST_BOOTSTRAP_BYTECODE_UNAVAILABLE", "1", 1) == 0;
     bool unavailable_bytecode_ran = unavailable_fault_set
@@ -5446,6 +5751,7 @@ int main(int argc, char **argv)
                &disabled_bytecode_result);
     bool disabled_bytecode_unset =
         unsetenv("TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE") == 0;
+    tilefinch_platform_set_services(NULL);
     if (!unavailable_bytecode_ran || !disabled_bytecode_ran) {
         fprintf(stderr,
                 "bootstrap fallback probe: unavailable=%d error=\"%s\" "
@@ -8167,152 +8473,7 @@ int main(int argc, char **argv)
        real scheduler.  This keeps the quota, FIFO, cancellation, and timeout
        assertions deterministic and makes teardown leaks visible to the
        budget check below. */
-    static const char network_queue_probe[] =
-        "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,"
-        "nativeCancel=globalThis.__tilefinchCancelNetwork,starts=[],cancels=[];"
-        "let nextNative=1000,deferNativeOnce=true;"
-        "globalThis.__tilefinchFetchAsync=(method,url)=>{url=String(url);"
-        "if(url.endsWith('/native-defer')&&deferNativeOnce){"
-        "deferNativeOnce=false;return 0;}starts.push(url);return nextNative++;};"
-        "globalThis.__tilefinchCancelNetwork=id=>{cancels.push(Number(id));"
-        "return true;};const raw={status:200,url:'https://example.test/ok',"
-        "contentType:'text/plain',headers:'content-type: text/plain\\n',"
-        "body:'ok'};const requests=[];for(let i=0;i<12;i++)requests.push("
-        "fetch('https://example.test/fifo/'+i).then(value=>value.text()));"
-        "const waitingAbort=new AbortController,waitingCancelled=fetch("
-        "'https://example.test/cancel-waiting',{signal:waitingAbort.signal})"
-        ".then(()=>'',error=>error.name);waitingAbort.abort();"
-        "let delivered=1000;while(delivered<1012){const end=nextNative;"
-        "while(delivered<end)__tilefinchDeliverNetwork(delivered++,true,raw);"
-        "await Promise.resolve();}const bodies=await Promise.all(requests),"
-        "cancelName=await waitingCancelled;const fifo=starts.length===12"
-        "&&starts.every((url,index)=>url==='https://example.test/fifo/'+index);"
-        "const abortControllers=[],abortPromises=[],abortStart=starts.length;"
-        "for(let i=0;i<5;i++){const controller=new AbortController;"
-        "abortControllers.push(controller);abortPromises.push(fetch("
-        "'https://example.test/abort-fifo/'+i,{signal:controller.signal})"
-        ".catch(()=>{}));}abortControllers[0].abort();await Promise.resolve();"
-        "const abortReleased=starts[abortStart+4]"
-        "==='https://example.test/abort-fifo/4';"
-        "for(const controller of abortControllers)controller.abort();"
-        "await Promise.all(abortPromises);"
-        "const controllers=[],quotaPromises=[];for(let i=0;i<129;i++){"
-        "const controller=new AbortController;controllers.push(controller);"
-        "quotaPromises.push(fetch('https://example.test/quota/'+i,{"
-        "signal:controller.signal}).then(()=>'',error=>error.name));}"
-        "await Promise.resolve();const countQuota=await quotaPromises[128];"
-        "let insideXhrSend=true,xhrQuotaError=false,xhrQuotaReentered=false;"
-        "const quotaXhr=new XMLHttpRequest;quotaXhr.open('GET',"
-        "'https://example.test/quota-xhr');quotaXhr.onerror=()=>{"
-        "xhrQuotaError=true;if(insideXhrSend)xhrQuotaReentered=true;};"
-        "quotaXhr.send();insideXhrSend=false;const xhrDeferred="
-        "!xhrQuotaError&&!xhrQuotaReentered;__tilefinchPumpTimers(0,4);"
-        "for(const controller of controllers)controller.abort();"
-        "await Promise.all(quotaPromises);const byteQuota=await fetch("
-        "'https://example.test/byte-quota',{method:'POST',"
-        "body:'x'.repeat(132000)}).then(()=>'',error=>error.name);"
-        "const blockers=[];for(let i=0;i<4;i++){const controller="
-        "new AbortController;blockers.push(controller);fetch("
-        "'https://example.test/timeout-blocker/'+i,{signal:controller.signal})"
-        ".catch(()=>{});}let timeoutEvent=false;const xhr=new XMLHttpRequest;"
-        "xhr.open('GET','https://example.test/queued-timeout');xhr.timeout=5;"
-        "xhr.ontimeout=()=>{timeoutEvent=true;};xhr.send();"
-        "const queuedBeforeTimeout=__tilefinchNetworkQueueStats.waiting===1;"
-        "__tilefinchPumpTimers(5,16);for(const controller of blockers)"
-        "controller.abort();await Promise.resolve();const uploadEvents=[],"
-        "uploadXhr=new XMLHttpRequest,recordUpload=label=>event=>uploadEvents."
-        "push([label,event.isTrusted,event instanceof ProgressEvent,"
-        "event.lengthComputable,event.loaded,event.total].join(':'));"
-        "for(const type of ['loadstart','progress','load','loadend'])"
-        "uploadXhr.upload.addEventListener(type,recordUpload('u-'+type));"
-        "uploadXhr.addEventListener('loadend',recordUpload('x-loadend'));"
-        "const uploadDone=new Promise(resolve=>uploadXhr.onloadend=resolve);"
-        "uploadXhr.open('POST','https://example.test/upload');"
-        "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
-        "__tilefinchDeliverNetwork(uploadNative,true,raw,true,100,200,300,"
-        "400,500,2,2,true,false,false,true,3,200,'text/plain');"
-        "await Promise.resolve();"
-        "const deferredPromise=fetch('https://example.test/native-defer')"
-        ".then(value=>value.text());const nativeDeferred="
-        "__tilefinchNetworkQueueStats.waiting===1;"
-        "__tilefinchPumpTimers(20,16);const deferredNative=nextNative-1;"
-        "__tilefinchDeliverNetwork(deferredNative,true,raw,true,110,210,310,"
-        "410,510,2,2,true,false,false,true,2,200,'text/plain');"
-        "const deferredBody=await deferredPromise;await uploadDone;"
-        "const xhrTiming=performance.getEntriesByName("
-        "'https://example.test/upload','resource')[0],fetchTiming="
-        "performance.getEntriesByName("
-        "'https://example.test/native-defer','resource')[0],timingOk="
-        "xhrTiming&&xhrTiming.initiatorType==='xmlhttprequest'&&"
-        "xhrTiming.nextHopProtocol==='h2'&&xhrTiming.responseStatus===200&&"
-        "xhrTiming.contentType==='text/plain'&&xhrTiming.encodedBodySize===2&&"
-        "fetchTiming&&fetchTiming.initiatorType==='fetch'&&"
-        "fetchTiming.nextHopProtocol==='http/1.1'&&"
-        "fetchTiming.responseStatus===200&&fetchTiming.contentType==="
-        "'text/plain'&&fetchTiming.encodedBodySize===2;"
-        "const progressShape=new ProgressEvent('shape',{lengthComputable:true,"
-        "loaded:3,total:5}),progressShapeOk=Object.getOwnPropertyNames("
-        "progressShape).join(',')==='isTrusted'&&Object.getOwnPropertyNames("
-        "ProgressEvent.prototype).join(',')==='lengthComputable,loaded,total,constructor'"
-        "&&progressShape.lengthComputable&&progressShape.loaded===3"
-        "&&progressShape.total===5;"
-        "const uploadOk=uploadEvents.join('|')==="
-        "'u-loadstart:true:true:true:0:5|u-progress:true:true:true:5:5|'"
-        "+'u-load:true:true:true:5:5|u-loadend:true:true:true:5:5|'"
-        "+'x-loadend:true:true:true:2:2';const stats="
-        "__tilefinchNetworkQueueStats;globalThis.__tilefinchFetchAsync=nativeFetch;"
-        "globalThis.__tilefinchCancelNetwork=nativeCancel;"
-        "globalThis.pocSummary=fifo&&bodies.every(value=>value==='ok')"
-        "&&cancelName==='AbortError'&&countQuota==='TypeError'"
-        "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
-        "&&abortReleased&&byteQuota==='TypeError'&&queuedBeforeTimeout&&timeoutEvent"
-        "&&uploadOk&&progressShapeOk&&timingOk&&nativeDeferred&&deferredBody==='ok'"
-        "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
-        "&&stats.rejected===3&&stats.rejectedBytes>=1"
-        "&&stats.cancelled===139&&stats.timedOut===1"
-        "&&stats.completed===14&&stats.launchFailed===0"
-        "&&stats.active===0&&stats.waiting===0"
-        "&&stats.currentCount===0&&cancels.length===13"
-        "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify({stats,"
-        "fifo,cancelName,countQuota,xhrDeferred,xhrQuotaError,xhrQuotaReentered,"
-        "abortReleased,byteQuota,queuedBeforeTimeout,timeoutEvent,uploadOk,"
-        "progressShapeOk,timingOk,nativeDeferred,deferredBody,uploadEvents});"
-        "})().catch(error=>{globalThis.pocSummary='NETWORK-QUEUE-ERROR:'+"
-        "String(error&&error.stack||error)});";
-    bool network_queue_ok = script_runtime_evaluate_diagnostic(
-        runtime, network_queue_probe, "<network-queue-probe>", &result);
-    for (size_t tick = 0; network_queue_ok && tick < 32
-         && strncmp(result.summary, "NETWORK-QUEUE-", 14) != 0; tick++) {
-        network_queue_ok = script_runtime_advance(
-            runtime, 0, 1024, &result);
-    }
-    if (!network_queue_ok
-        || strcmp(result.summary, "NETWORK-QUEUE-OK") != 0) {
-        fprintf(stderr, "network queue probe: ok=%d summary=%s error=%s "
-                "admitted=%zu completed=%zu rejected=%zu cancelled=%zu "
-                "timedout=%zu peak=%zu peakbytes=%zu active=%zu pending=%zu\n",
-                network_queue_ok, result.summary, result.error,
-                result.async_network_logical_admitted,
-                result.async_network_logical_completed,
-                result.async_network_logical_rejected,
-                result.async_network_logical_cancelled,
-                result.async_network_logical_timed_out,
-                result.async_network_logical_peak,
-                result.async_network_logical_peak_bytes,
-                result.async_network_active_native,
-                result.async_network_pending_logical);
-    }
-    CHECK(network_queue_ok
-          && strcmp(result.summary, "NETWORK-QUEUE-OK") == 0
-          && result.async_network_logical_admitted == 153
-          && result.async_network_logical_completed == 14
-          && result.async_network_logical_rejected == 3
-          && result.async_network_logical_cancelled == 139
-          && result.async_network_logical_timed_out == 1
-          && result.async_network_logical_peak == 128
-          && result.async_network_logical_peak_bytes <= 256u * 1024u
-          && result.async_network_active_native == 0
-          && result.async_network_pending_logical == 0);
+    CHECK(test_synthetic_network_queue(runtime, &result) == 0);
 
     static const char fetch_network_error_surface_probe[] =
         "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync;"

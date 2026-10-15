@@ -3,7 +3,9 @@ static int test_youtube_provider_layout_states(void)
     static const char watch[] = "<script>var ytInitialData='{}';</script>"
         "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
         "\"channelId\":\"UCabcdefghijklmnopqrstuv\",\"title\":\"Big Buck Bunny - Official Short Film\","
-        "\"author\":\"Fixture studio\",\"lengthSeconds\":\"596\"}};</script>";
+        "\"author\":\"Fixture studio\",\"lengthSeconds\":\"596\",\"viewCount\":\"9428016\"},"
+        "\"microformat\":{\"playerMicroformatRenderer\":{\"publishDate\":\"2021-10-29\","
+        "\"category\":\"Film & Animation\"}}};</script>";
     int title_height = 0;
     for (unsigned signed_in = 0; signed_in < 2u; signed_in++) {
         char fixture[128], error[256] = {0};
@@ -46,6 +48,12 @@ static int test_youtube_provider_layout_states(void)
         lxb_dom_node_t *offline = test_reader_find_id(root, "yt-offline-save");
         const LayoutNodeBox *offline_box = layout_box_for_node(&nav->page.layout, offline);
         CHECK(offline_box && offline_box->width == 40 && offline_box->height == 36);
+        printf("detail actions: signed-in=%u y=%d height=%d\n",
+            signed_in, offline_box->y, offline_box->height);
+        if (offline_box->y + offline_box->height > 266)
+            fprintf(stderr, "detail actions clipped: signed-in=%u y=%d height=%d\n",
+                signed_in, offline_box->y, offline_box->height);
+        CHECK(offline_box->y + offline_box->height <= 266);
         size_t label_length = 0;
         const char *label = document_attribute(offline, "aria-label", &label_length);
         CHECK(label && label_length == strlen("Save video offline")
@@ -54,6 +62,8 @@ static int test_youtube_provider_layout_states(void)
         lxb_char_t *text = lxb_dom_node_text_content(
             lxb_dom_interface_node(nav->page.document.html->body), &text_length);
         CHECK(text && !strstr((const char *)text, "Select the thumbnail to retry"));
+        CHECK(strstr((const char *)text, "Published")
+            && strstr((const char *)text, "Film & Animation"));
         lxb_dom_document_destroy_text(root->owner_document, text);
         if (!signed_in) {
             const LayoutNodeBox *signin_box = layout_box_for_node(&nav->page.layout,

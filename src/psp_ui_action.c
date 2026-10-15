@@ -7,6 +7,7 @@ const char *psp_ui_action_name(PspUiAction action)
 {
     switch (action) {
         case PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE: return "youtube-login-save";
+        case PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE: return "youtube-signin-continue";
         case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS: return "youtube-login-always";
         case PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW: return "youtube-login-not-now";
         case PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER: return "youtube-login-never";

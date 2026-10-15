@@ -1099,6 +1099,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (layout_add_command(context->layout, command) == NULL) {
                 return false;
             }
+            if (!image_available && !layout_add_replaced_alt_text(
+                    context, node, style, content_x, line->y, image_width, image_height))
+                return false;
         } else if (!canvas_element && !layout_add_replaced_alt_text(
                        context, node, style, content_x, line->y,
                        image_width, image_height)) {

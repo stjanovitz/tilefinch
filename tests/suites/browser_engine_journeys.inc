@@ -1343,6 +1343,10 @@ int test_text_content_does_not_retain_scratch(void)
         CHECK(text != NULL && lxb_dom_node_append_child(large,
             lxb_dom_interface_node(text)) == LXB_DOM_EXCEPTION_OK);
     }
+    lxb_dom_text_t *tail = lxb_dom_document_create_text_node(
+        &nav->page.document.html->dom_document, (const lxb_char_t *) "\xc4\x80", 2);
+    CHECK(tail != NULL && lxb_dom_node_append_child(large,
+        lxb_dom_interface_node(tail)) == LXB_DOM_EXCEPTION_OK);
     document_allocation_owner_leave(&nav->page.document, owner);
     free(source);
     owner = document_allocation_owner_enter(&nav->page.document);
@@ -1361,7 +1365,7 @@ int test_text_content_does_not_retain_scratch(void)
     uint64_t started = tilefinch_platform_monotonic_time_us();
     bool text_read_okay = script_runtime_evaluate_diagnostic(nav->page.runtime,
         "(()=>{for(let i=0;i<8;i++){const t=largeTextNode.textContent;"
-        "if(t.length!==327680||t[0]!=='x'||t[t.length-1]!=='x')throw Error('text');}"
+        "if(t.length!==327681||t[0]!=='x'||t.charCodeAt(t.length-1)!==256)throw Error('text');}"
         "if(wideTextNode.textContent.length!==33000)throw Error('truncated wide tree');"
         "const s=document.getElementById('small');"
         "if(s.textContent!=='a\u00e9c'||s.childNodes[1].textContent!=='excluded')"
@@ -1374,6 +1378,19 @@ int test_text_content_does_not_retain_scratch(void)
         part * 2u, before, after,
         (unsigned long long)(tilefinch_platform_monotonic_time_us() - started));
     CHECK(after == before);
+    (void)script_runtime_collect_and_trim(nav->page.runtime);
+    size_t heap_before = script_runtime_heap_used(nav->page.runtime);
+    JS_SetMemoryLimit(nav->page.runtime->runtime,
+        heap_before + part * 2u + 128u * 1024u);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "globalThis.heldText=largeTextNode.textContent;",
+        "<text-memory-retain>", &nav->page.script_result));
+    (void)script_runtime_collect_and_trim(nav->page.runtime);
+    size_t heap_after = script_runtime_heap_used(nav->page.runtime);
+    /* One late wide character must not double all preceding ASCII text.
+       Include ample fixed overhead for the bounded immutable chunk graph. */
+    CHECK(heap_after <= heap_before + part * 2u + 128u * 1024u);
+    JS_SetMemoryLimit(nav->page.runtime->runtime, nav->page.runtime->base_memory_limit);
     CHECK(browser_engine_shutdown(engine));
     BrowserEngineMetrics metrics = {0};
     CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0);

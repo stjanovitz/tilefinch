@@ -304,6 +304,7 @@ typedef struct {
        Its one active, at-most-two-target job is externally pumped. */
     bool image_continuation_pending;
     bool visual_image_publication_pending;
+    uint8_t visual_image_publication_age;
     /* Display retargeting (images_retarget_display_step) runs from owner
        idle ticks once image loading is done, until a step finds nothing to
        change for the committed layout identified here. */
@@ -1110,6 +1111,10 @@ void navigation_enable_scripts(NavigationSession *session,
    provenance is frozen before the handle table is destroyed, so an exact
    connected Reader or Basic root remains usable without an author VM. */
 void navigation_retire_current_page_scripts(NavigationSession *session);
+/* Before following a replacement, release a large incumbent author realm.
+   Its DOM and pixels remain the rollback page, without script. Call only
+   after the author task has returned and its navigation was copied out. */
+void navigation_retire_large_incumbent_realm(NavigationSession *session);
 /* Applies to subsequently-created page and frame runtimes.  To avoid a
    partially-applied policy, changing it while a page runtime is live fails. */
 bool navigation_set_script_execution_policy(

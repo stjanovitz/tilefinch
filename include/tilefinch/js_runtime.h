@@ -1408,6 +1408,9 @@ bool script_runtime_grow_heap_limit(ScriptRuntime *runtime,
 void script_runtime_refresh_result(ScriptRuntime *runtime,
                                    ScriptResult *result);
 size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
+/* Fixed numeric diagnostics only; never includes script or account text. */
+void script_runtime_last_allocation_refusal(const ScriptRuntime *runtime,
+    size_t *old_bytes, size_t *new_bytes, size_t *live_bytes);
 /* Let the realm's heap limit follow memory pressure instead of a fixed
    size: the limit set at creation becomes a floor, an allocation past it
    raises the limit while at least `page_reserve` bytes of the page Budget
