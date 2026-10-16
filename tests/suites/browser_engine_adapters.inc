@@ -730,7 +730,7 @@ static int test_fixed_image_publication(void)
     size_t reference_count = 0;
     const uint16_t *reference = browser_engine_framebuffer(engine, &reference_count);
     CHECK(reference_count == count && actual == frame_checksum(reference, reference_count));
-    /* CSS masks need flow, not the document-image paint proof. Interrupt their
+    /* Intrinsic/block masks still need flow. Interrupt their
        publication before and during flow, including table growth with an
        already-retained image, and prove a later idle retry paints exactly. */
     static const char visual_html[] =
@@ -834,6 +834,79 @@ static int test_fixed_image_publication(void)
         CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
         reference = browser_engine_framebuffer(engine, &reference_count);
         CHECK(reference_count == count && actual == frame_checksum(reference, reference_count));
+    }
+    /* Fixed empty inline masks reserve their final paint geometry before
+       download. Arrival (including a cancelled/retried publication) must
+       keep the incumbent commands and match a fresh full-flow raster. */
+    static const char fixed_mask_html[] =
+        "<!doctype html><title>Fixed inline icons</title><p>Before "
+        "<span id=m1 style='display:inline-block;width:24px;height:24px;background:red;mask-size:100% 100%;mask-image:url(https://i.ytimg.com/vi/TFTEST00002/mqdefault.jpg)'></span>"
+        "<span id=m2 style='display:inline-block;width:24px;height:24px;background:blue;mask-image:url(https://i.ytimg.com/vi/TFTEST00003/mqdefault.jpg)'></span>"
+        "<span id=m3 style='display:inline-block;width:24px;height:24px;background:green;mask-size:100% 100%;mask-image:url(https://i.ytimg.com/vi/TFTEST00004/mqdefault.jpg)'></span> after</p>";
+    for (unsigned cancel = 0; cancel < 2; cancel++) {
+        fetch_trace_end();
+        CHECK(fetch_trace_replay_begin_response_keyed(replay, error, sizeof(error)));
+        nav->external_resources_enabled = false;
+        CHECK(browser_engine_commit_html(engine, "https://i.ytimg.com/fixture/",
+            fixed_mask_html, sizeof(fixed_mask_html) - 1u, true));
+        nav = browser_engine_navigation(engine);
+        CHECK(nav->page.images.count == 0);
+        size_t slots = 0;
+        for (size_t i = 0; i < nav->page.layout.count; i++) {
+            const DrawCommand *command = &nav->page.layout.commands[i];
+            if (command->type == DRAW_IMAGE
+                && (command->font_family & LAYOUT_IMAGE_SLOT_MASK) != 0) {
+                CHECK(command->text != NULL && command->image == NULL
+                    && command->width == 24 && command->height == 24);
+                slots++;
+            }
+        }
+        CHECK(slots == 3);
+        const DrawCommand *commands = nav->page.layout.commands;
+        int retained_height = nav->page.layout.height;
+        size_t before_relayouts = nav->performance.background_image_relayouts;
+        navigation_enable_external_resources(nav, 16, 2u * MIB, 512u * 1024u,
+            24, 4u * MIB, MIB, 4u * MIB, 1000);
+        nav->page.resource_scheduler = fetch_scheduler_create_in_domain(nav->page.fetch_domain, 4, 4u * MIB);
+        CHECK(nav->page.resource_scheduler != NULL);
+        nav->page.visual_batch_targets = budget_calloc(nav->budget, 3, sizeof(ImagePriorityTarget));
+        CHECK(nav->page.visual_batch_targets != NULL);
+        for (size_t i = 0; i < 3; i++) {
+            char id[3] = {'m', (char) ('1' + i), '\0'};
+            lxb_dom_node_t *node = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), id);
+            ComputedStyle style = style_for_node(&nav->page.stylesheet, node, NULL);
+            CHECK(node != NULL && style.mask_image != NULL);
+            nav->page.visual_batch_targets[i] = (ImagePriorityTarget) {
+                .node = node, .source = style.mask_image, .kind = IMAGE_PRIORITY_KIND_MASK};
+        }
+        nav->page.visual_batch_count = 3;
+        VisualPublicationProbe probe = {.navigation = nav, .mode = 0};
+        TilefinchPlatformServices services = {.context = &probe, .cooperate = test_visual_publication_cooperate};
+        if (cancel) tilefinch_platform_set_services(&services);
+        CHECK(navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS);
+        tilefinch_platform_set_services(NULL);
+        CHECK(nav->page.images.count == 3 && nav->page.layout.commands == commands
+            && nav->page.visual_image_publication_pending == (cancel != 0));
+        if (cancel)
+            CHECK(probe.begins == 1
+                && navigation_run_background_resources(nav) == NAVIGATION_BACKGROUND_WORK_SUCCESS);
+        CHECK(!nav->page.visual_image_publication_pending
+            && nav->page.layout.commands == commands
+            && nav->page.layout.height == retained_height
+            && nav->performance.background_image_relayouts == before_relayouts);
+        for (size_t i = 0; i < nav->page.layout.count; i++) {
+            const DrawCommand *command = &nav->page.layout.commands[i];
+            if (command->type == DRAW_IMAGE
+                && (command->font_family & LAYOUT_IMAGE_SLOT_MASK) != 0)
+                CHECK(image_resource_available(command->image));
+        }
+        CHECK(browser_engine_render_frame(engine, NULL));
+        actual_pixels = browser_engine_framebuffer(engine, &count);
+        actual = frame_checksum(actual_pixels, count);
+        CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+        reference = browser_engine_framebuffer(engine, &reference_count);
+        CHECK(reference_count == count && actual == frame_checksum(reference, reference_count)
+            && nav->page.layout.height == retained_height);
     }
     fetch_trace_end();
     for (size_t i = 0; i < 4; i++) {
@@ -3329,8 +3402,8 @@ static int test_blank_reader_frontend_recovery(void)
     static const char bounded_suffix[] =
         "</article><script>throw new Error('bundle failed')</script>"
         "</body>";
-    /* More paragraphs than the largest (4,096-node) extraction bound. */
-    const size_t bounded_units = 4200u;
+    /* More paragraphs than the largest (8,192-node) extraction bound. */
+    const size_t bounded_units = 8300u;
     size_t bounded_length = sizeof(bounded_prefix) - 1u
         + bounded_units * (sizeof(bounded_unit) - 1u)
         + sizeof(bounded_suffix) - 1u;
@@ -4369,7 +4442,7 @@ static int test_basic_view_recovery_large_and_hidden_pages(void)
     CHECK(engine != NULL);
     browser_engine_test_set_recovery_time_us(UINT64_MAX);
 
-    size_t capacity = 160u * 1024u;
+    size_t capacity = 256u * 1024u;
     char *page = malloc(capacity);
     CHECK(page != NULL);
     size_t used = (size_t) snprintf(
@@ -4382,8 +4455,8 @@ static int test_basic_view_recovery_large_and_hidden_pages(void)
         "<script>throw new Error('vendor bundle failed');</script>"
         "</head><body><div class=app><h1>Front page</h1><p>The first story "
         "is server rendered.</p>");
-    /* Two emitted nodes per story: more than the 4,096-node ceiling. */
-    for (size_t i = 0; i < 2100u && used + 64u < capacity; i++)
+    /* Two emitted nodes per story: more than the 8,192-node ceiling. */
+    for (size_t i = 0; i < 4200u && used + 64u < capacity; i++)
         used += (size_t) snprintf(page + used, capacity - used,
                                   "<p><a href='/s/%zu'>Story %zu</a></p>",
                                   i, i);
@@ -4407,7 +4480,7 @@ static int test_basic_view_recovery_large_and_hidden_pages(void)
         && recovery == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
         && basic.kind == READER_PAGE_BASIC && basic.extraction_truncated
         && !basic.bounded_out && basic.extracted_nodes > 512u
-        && basic.extracted_nodes <= 4096u;
+        && basic.extracted_nodes <= 8192u;
     if (!ok) {
         fprintf(stderr, "basic large/hidden: links=%zu blank=%d recovery=%d "
                 "kind=%d truncated=%d bounded=%d nodes=%u summary=%s\n",

@@ -231,6 +231,10 @@ static ScaledImageCacheEntry *scaled_image_insert(
     return entry;
 }
 
+static ScaleStepper image_linear_stepper(int position, int source, int target);
+static void image_linear_pixel(const unsigned char *pixels, int width,
+    int height, int fx, int fy, unsigned char output[4]);
+
 static const unsigned char *image_pixels_for_command(
     TileCache *cache, const ImageResource *image, const DrawCommand *command,
     int *pixel_width, int *pixel_height,
@@ -238,6 +242,9 @@ static const unsigned char *image_pixels_for_command(
 {
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
+    /* Masks/sprites keep their original sampling semantics and cannot borrow
+       a smooth photo enlargement with the same immutable pixel backing. */
+    if (image->is_mask || image->is_background) identity = image;
     uint64_t serial = image_cache_serial(cache, image);
     int scaled_width = command->width;
     int scaled_height = command->height;
@@ -362,13 +369,22 @@ static const unsigned char *image_pixels_for_command(
             unsigned char *scaled = budget_malloc(cache->budget, bytes);
             if (scaled != NULL) {
                 uint64_t scale_started = render_now_us();
-                ScaleStepper source_y = scale_stepper(
-                    0, image->height, scaled_height);
+                bool linear = !image->is_mask && !image->is_background
+                    && (scaled_width > image->width || scaled_height > image->height)
+                    && image->width <= INT_MAX/256 && image->height <= INT_MAX/256
+                    && scaled_width <= INT_MAX/2 && scaled_height <= INT_MAX/2;
+                ScaleStepper source_y = linear
+                    ? image_linear_stepper(0,image->height,scaled_height)
+                    : scale_stepper(0, image->height, scaled_height);
                 for (int y = 0; y < scaled_height; y++) {
-                    ScaleStepper source_x = scale_stepper(
-                        0, image->width, scaled_width);
+                    ScaleStepper source_x = linear
+                        ? image_linear_stepper(0,image->width,scaled_width)
+                        : scale_stepper(0,image->width,scaled_width);
                     for (int x = 0; x < scaled_width; x++) {
-                        memcpy(scaled + ((size_t) y * scaled_width + x) * 4u,
+                        unsigned char *out=scaled + ((size_t) y * scaled_width + x) * 4u;
+                        if (linear) image_linear_pixel(source,image->width,image->height,
+                            source_x.value,source_y.value,out);
+                        else memcpy(out,
                                source + ((size_t) source_y.value * image->width
                                          + source_x.value) * 4u, 4u);
                         scale_stepper_advance(&source_x);
@@ -448,6 +464,48 @@ static __attribute__((noinline)) void rasterize_image_row(
             blend_at_index(target, index, ((uint32_t) pixel[0] << 16)
                 | ((uint32_t) pixel[1] << 8) | pixel[2], pixel[3]);
         }
+    }
+}
+
+static int raster_extent_to_int(int64_t value);
+
+/* Pixel-center mapping, stepped without a division in the pixel loop. */
+static ScaleStepper image_linear_stepper(int position, int source, int target)
+{
+    ScaleStepper step = scale_stepper(position * 2 + 1, source * 128, target);
+    step.value -= 128;
+    step.quotient = source * 256 / target;
+    step.remainder = source * 256 % target;
+    return step;
+}
+
+static __attribute__((noinline)) void image_linear_pixel(
+    const unsigned char *pixels, int width, int height, int fx, int fy,
+    unsigned char output[4])
+{
+    if (fx < 0) fx = 0;
+    if (fy < 0) fy = 0;
+    int x = fx / 256, y = fy / 256;
+    if (x >= width) x = width - 1;
+    if (y >= height) y = height - 1;
+    unsigned dx = (unsigned) fx & 255u, dy = (unsigned) fy & 255u;
+    const unsigned char *p[4];
+    p[0] = pixels + ((size_t) y * width + x) * 4u;
+    p[1] = p[0] + (x + 1 < width ? 4 : 0);
+    p[2] = p[0] + (y + 1 < height ? (size_t) width * 4u : 0u);
+    p[3] = p[2] + (x + 1 < width ? 4 : 0);
+    unsigned weights[4] = {(256u-dx)*(256u-dy), dx*(256u-dy),
+                           (256u-dx)*dy, dx*dy};
+    unsigned alpha = 0;
+    for (unsigned i = 0; i < 4; i++) alpha += weights[i] * p[i][3];
+    output[3] = (unsigned char) ((alpha + 32768u) >> 16);
+    bool opaque = alpha == 255u * 65536u;
+    for (unsigned c = 0; c < 3; c++) {
+        unsigned sum = 0;
+        for (unsigned i = 0; i < 4; i++)
+            sum += weights[i] * p[i][c] * (opaque ? 1u : p[i][3]);
+        output[c] = (unsigned char) (opaque ? (sum + 32768u) >> 16
+            : alpha != 0 ? (sum + alpha / 2u) / alpha : 0u);
     }
 }
 
@@ -770,7 +828,15 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
     }
     ScaleStepper source_y_step = scale_stepper(y0 - draw_y, source_height,
                                                 draw_height);
-    bool row_spans = source_width == draw_width && !image->is_mask
+    /* Smooth enlarged ordinary photos, not sprite coordinates, masks or
+       author canvas pixels. No extra retained surface or paint allocation. */
+    bool linear = !image->is_background && !image->is_mask && !image->is_canvas
+        && (source_width < draw_width || source_height < draw_height)
+        && source_width <= INT_MAX / 256 && source_height <= INT_MAX / 256
+        && draw_width <= INT_MAX / 2 && draw_height <= INT_MAX / 2;
+    ScaleStepper linear_y = {0};
+    if (linear) linear_y = image_linear_stepper(y0 - draw_y, source_height, draw_height);
+    bool row_spans = !linear && source_width == draw_width && !image->is_mask
         && command->opacity_scale == 256u && mask_gradient == NULL
         && target->filter_code == STYLE_FILTER_NONE && !target->forced_dark
         && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
@@ -788,6 +854,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
         if (!raster_target_span(target, y, x0, x1, &span_x0,
                                 &span_x1, &index, &rounded)) {
             scale_stepper_advance(&source_y_step);
+            if (linear) scale_stepper_advance(&linear_y);
             continue;
         }
         int unclipped_x0 = span_x0;
@@ -797,11 +864,14 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
                 command->width, command->height, image_clip_radius,
                 y, &span_x0, &span_x1)) {
             scale_stepper_advance(&source_y_step);
+            if (linear) scale_stepper_advance(&linear_y);
             continue;
         }
         index += (size_t) (span_x0 - unclipped_x0);
         ScaleStepper source_x_step = scale_stepper(
             span_x0 - draw_x, source_width, draw_width);
+        ScaleStepper linear_x = {0};
+        if (linear) linear_x = image_linear_stepper(span_x0 - draw_x, source_width, draw_width);
         int interior_start = span_x0, interior_end = span_x1;
         if (image_has_clip_radius)
             raster_rounded_interior(command, image_clip_radii, y,
@@ -833,6 +903,16 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
             const unsigned char *pixel = pixels
                 + ((size_t) source_y * (size_t) pixel_width
                    + (size_t) source_x) * 4u;
+            unsigned char interpolated[4];
+            if (linear) {
+                image_linear_pixel(pixels, pixel_width, pixel_height,
+                    raster_extent_to_int((int64_t) linear_x.value
+                        + (int64_t) source_x_offset * 256),
+                    raster_extent_to_int((int64_t) linear_y.value
+                        + (int64_t) source_y_offset * 256), interpolated);
+                pixel = interpolated;
+                scale_stepper_advance(&linear_x);
+            }
             uint32_t color = image->is_mask
                              ? command->color
                              : (((uint32_t) pixel[0] << 16)
@@ -855,6 +935,7 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
             scale_stepper_advance(&source_x_step);
         }
         scale_stepper_advance(&source_y_step);
+        if (linear) scale_stepper_advance(&linear_y);
     }
     image_resource_free_decoded(cache->budget, temporary_decoded);
 }
@@ -1474,17 +1555,26 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
        coverage computed exactly as its background fill computes it. Rows
        skip the box's fully covered interior, which holds the whole core. */
     bool outside_box = command->image_fit == LAYOUT_SHADOW_OUTSIDE_BOX;
+    int box_x = shadow_x, box_y = shadow_y;
+    int box_width = shadow_width, box_height = shadow_height;
+    int box_radius = radius;
+    if (outside_box) {
+        box_x = raster_extent_to_int((int64_t) shadow_x
+            - (int16_t) command->text_length);
+        box_y = raster_extent_to_int((int64_t) shadow_y
+            - (int16_t) (command->text_length >> 16));
+    }
     bool skip_interior = outside_box;
 #ifndef __PSP__
     skip_interior = skip_interior
         && !tilefinch_test_faults()->shadow_reference_raster;
 #endif
     int box_radii[4];
-    int64_t box_right = (int64_t) shadow_x + shadow_width;
-    int64_t box_bottom = (int64_t) shadow_y + shadow_height;
+    int64_t box_right = (int64_t) box_x + box_width;
+    int64_t box_bottom = (int64_t) box_y + box_height;
     if (outside_box)
         style_border_radius_resolve_corners(
-            radius, shadow_width, shadow_height, box_radii);
+            box_radius, box_width, box_height, box_radii);
     uint32_t sources[4];
     uint16_t resolved[4];
     for (int y = y0; y < y1; y++) {
@@ -1517,18 +1607,18 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
         /* The core columns carry one coverage on this row: write them as
            one run, with the same per-pixel choice as the loop below. */
         int interior_x0 = span_x1, interior_x1 = span_x1;
-        bool box_row = outside_box && y >= shadow_y && y < box_bottom;
+        bool box_row = outside_box && y >= box_y && y < box_bottom;
         if (box_row && skip_interior) {
             int left_inset = 0, right_inset = 0;
-            if (y < (int64_t) shadow_y + box_radii[0])
+            if (y < (int64_t) box_y + box_radii[0])
                 left_inset = box_radii[0];
             if (y >= box_bottom - box_radii[3] && box_radii[3] > left_inset)
                 left_inset = box_radii[3];
-            if (y < (int64_t) shadow_y + box_radii[1])
+            if (y < (int64_t) box_y + box_radii[1])
                 right_inset = box_radii[1];
             if (y >= box_bottom - box_radii[2] && box_radii[2] > right_inset)
                 right_inset = box_radii[2];
-            int64_t left = (int64_t) shadow_x + left_inset;
+            int64_t left = (int64_t) box_x + left_inset;
             int64_t right = box_right - right_inset;
             if (left < span_x0) left = span_x0;
             if (right > span_x1) right = span_x1;
@@ -1590,9 +1680,9 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
                     x, y, shadow_x, shadow_y, shadow_width, shadow_height,
                     radius, blur, alpha);
             if (blended == 0) continue;
-            if (box_row && x >= shadow_x && x < box_right) {
+            if (box_row && x >= box_x && x < box_right) {
                 unsigned covered = rounded_rect_coverage_quarters(
-                    x, y, shadow_x, shadow_y, shadow_width, shadow_height,
+                    x, y, box_x, box_y, box_width, box_height,
                     box_radii);
                 blended = (blended * (4u - covered) + 2u) / 4u;
                 if (blended == 0) continue;
@@ -1991,6 +2081,55 @@ static void rasterize_sheared_fill(RasterTarget *target,
     }
 }
 
+/* CSS triangles are four border wedges meeting at the zero-sized content
+   box. Sample only the clipped tile; no temporary surface or row commands. */
+__attribute__((noinline))
+static void rasterize_border_triangle(RasterTarget *target,
+                                      const DrawCommand *command)
+{
+    unsigned rotation = draw_command_rotation_quadrants(command);
+    int w = (rotation & 1u) ? command->height : command->width;
+    int h = (rotation & 1u) ? command->width : command->height;
+    if (w <= 0 || h <= 0 || w > 65535 || h > 65535
+        || command->text_length > (unsigned) w
+        || command->font_size < 0 || command->font_size > h
+        || command->image_fit > 3) return;
+    unsigned alpha = 255u * command->opacity_scale / 256u;
+    if (alpha == 0) return;
+    int ax = command->image_fit == 1 || command->image_fit == 2 ? w * 4 : 0;
+    int ay = command->image_fit >= 2 ? h * 4 : 0;
+    int bx = command->image_fit < 2 ? w * 4 : 0;
+    int by = command->image_fit == 0 || command->image_fit == 3 ? 0 : h * 4;
+    int cx = (int) command->text_length * 4, cy = command->font_size * 4;
+    int x0 = command->x > target->left ? command->x : target->left;
+    int y0 = command->y > target->top ? command->y : target->top;
+    int64_t far_x = (int64_t) command->x + command->width;
+    int64_t far_y = (int64_t) command->y + command->height;
+    int x1 = far_x < target->right ? (int) far_x : target->right;
+    int y1 = far_y < target->bottom ? (int) far_y : target->bottom;
+    for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
+        unsigned coverage = 0;
+        for (unsigned sample = 0; sample < 4; sample++) {
+            int dx = (int) (((int64_t) x - command->x) * 4)
+                + ((sample & 1u) ? 3 : 1);
+            int dy = (int) (((int64_t) y - command->y) * 4)
+                + ((sample & 2u) ? 3 : 1);
+            int px = rotation == 1 ? dy : (rotation == 2 ? w * 4 - dx
+                : (rotation == 3 ? w * 4 - dy : dx));
+            int py = rotation == 1 ? h * 4 - dx : (rotation == 2 ? h * 4 - dy
+                : (rotation == 3 ? dx : dy));
+            if ((int64_t) (bx - ax) * (py - ay) - (int64_t) (by - ay) * (px - ax) >= 0
+                && (int64_t) (cx - bx) * (py - by) - (int64_t) (cy - by) * (px - bx) >= 0
+                && (int64_t) (ax - cx) * (py - cy) - (int64_t) (ay - cy) * (px - cx) >= 0)
+                coverage++;
+        }
+        size_t index;
+        if (coverage != 0 && raster_target_index(target, x, y, &index))
+            blend_surface_at_index(target, index, command->color,
+                                   (alpha * coverage + 2u) / 4u);
+    }
+}
+
 static void rasterize_command(TileCache *cache, RasterTarget *target,
                               const DrawCommand *command)
 {
@@ -2016,6 +2155,12 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
     target->resolved_color_valid = true;
     if (!intersects(command, target->left, target->top,
                     target->right, target->bottom)) return;
+    if (command->type == DRAW_BORDER_TRIANGLE) {
+        target->forced_dark_role = FORCED_DARK_BORDER;
+        target->resolved_color_valid = false;
+        rasterize_border_triangle(target, command);
+        return;
+    }
     if (command->type == DRAW_SHEARED_FILL || command->type == DRAW_ROTATED_FILL) {
         rasterize_sheared_fill(target, command);
         return;
@@ -2175,7 +2320,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         }
         return;
     }
-    int fallback_scale = command->scale;
+    int fallback_scale = draw_command_text_scale(command);
     if (fallback_scale > TILEFINCH_BITMAP_FONT_SCALE_LIMIT) {
         fallback_scale = TILEFINCH_BITMAP_FONT_SCALE_LIMIT;
     }
@@ -2185,7 +2330,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         ? command->height : command->width;
     int fallback_source_height = (fallback_rotation & 1u) != 0
         ? command->width : command->height;
-    int pen_x = command->x;
+    int pen_x_fixed = draw_command_text_x_fixed(command);
     for (size_t character = 0; character < command->text_length;) {
         unsigned char glyph = '?';
         size_t advance = utf8_advance(command->text + character,
@@ -2195,6 +2340,8 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         glyph = (unsigned char) draw_command_transform_codepoint(
             command, glyph, character == advance);
         if (glyph >= sizeof(font5x7) / sizeof(font5x7[0])) glyph = '?';
+        int pen_x = pen_x_fixed >= 0 ? pen_x_fixed / 64
+            : (int) (-((-(int64_t) pen_x_fixed + 63) / 64));
         for (int row = 0; row < 7; row++) {
             uint8_t bits = font5x7[glyph][row];
             for (int column = 0; column < 5; column++) {
@@ -2233,9 +2380,9 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
                 }
             }
         }
-        pen_x += 6 * fallback_scale;
+        pen_x_fixed += 6 * fallback_scale * 64;
         if (character < command->text_length) {
-            pen_x += command->letter_spacing;
+            pen_x_fixed += draw_command_text_letter_spacing_fixed(command);
         }
     }
     rasterize_text_underline(cache, target, command);

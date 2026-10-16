@@ -3477,7 +3477,8 @@ static void browser_engine_census_page_fonts(BrowserEngine *engine)
            with sans-serif, never draws the other one. */
         if (draw_command_font_weight_code(command) >= 65u) {
             requested |= serif ? FONT_SET_FACE_SERIF_BOLD
-                : family == FONT_METRIC_SANS ? FONT_SET_FACE_METRIC_SANS_BOLD
+                : (family == FONT_METRIC_SANS || family == FONT_SYSTEM_SANS)
+                    ? FONT_SET_FACE_METRIC_SANS_BOLD
                 : FONT_SET_FACE_SANS_BOLD;
         }
     }
@@ -8066,9 +8067,11 @@ bool browser_engine_prepare_basic_view(
         return false;
     }
     ReaderDocumentAnalysis prepared = {0};
-    if (!reader_document_prepare_basic_complete_with_stylesheet(
+    if (!reader_document_prepare_basic_complete_with_layout(
             &engine->navigation.page.document,
-            &engine->navigation.page.stylesheet, &prepared)) {
+            &engine->navigation.page.stylesheet,
+            script_runtime_has_pending_mutations(engine->navigation.page.runtime)
+                ? NULL : &engine->navigation.page.layout, &prepared)) {
         if (analysis != NULL) *analysis = prepared;
         return false;
     }
@@ -8673,9 +8676,11 @@ BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
         return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
     }
     ReaderDocumentAnalysis prepared = {0};
-    if (!reader_document_prepare_basic_complete_with_stylesheet(
+    if (!reader_document_prepare_basic_complete_with_layout(
             &engine->navigation.page.document,
-            &engine->navigation.page.stylesheet, &prepared)) {
+            &engine->navigation.page.stylesheet,
+            script_runtime_has_pending_mutations(engine->navigation.page.runtime)
+                ? NULL : &engine->navigation.page.layout, &prepared)) {
         if (analysis != NULL) *analysis = prepared;
         return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
     }

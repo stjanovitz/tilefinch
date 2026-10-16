@@ -922,6 +922,46 @@ static bool style_property_border_color(const StylePropertyParse *parse)
     const char *value = parse->value;
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
+    if (span_equal(name, name_length, "border-color")) {
+        char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
+        if (!style_resolve_value(sheet, value, value_length, resolved,
+                                 sizeof(resolved), 0)) return true;
+        uint32_t colors[4];
+        uint8_t alphas[4];
+        size_t count = 0, at = 0, length = strlen(resolved);
+        while (at < length && count < 4) {
+            while (at < length && isspace((unsigned char) resolved[at])) at++;
+            if (at == length) break;
+            size_t end = at;
+            unsigned depth = 0;
+            while (end < length) {
+                if (resolved[end] == '(') depth++;
+                else if (resolved[end] == ')' && depth != 0) depth--;
+                if (depth == 0 && isspace((unsigned char) resolved[end])) break;
+                end++;
+            }
+            if (!style_parse_color_with_alpha(sheet, resolved + at, end - at,
+                                              &colors[count], &alphas[count]))
+                return true;
+            count++;
+            at = end;
+        }
+        while (at < length && isspace((unsigned char) resolved[at])) at++;
+        if (count == 0 || at != length) return true;
+        if (count == 1) {
+            style->border_color = colors[0];
+            style->border_alpha = alphas[0];
+            style->border_color_set = 0;
+        } else {
+            for (unsigned side = 0; side < 4; side++) {
+                unsigned index = side < count ? side : (side == 3 ? 1 : 0);
+                style_set_border_color(sheet, style, (StyleBorderSide) side,
+                                       colors[index], alphas[index]);
+            }
+        }
+        *parse->mask_high |= S2_BORDER_COLOR_ALL;
+        return true;
+    }
             uint32_t color = 0;
         uint8_t alpha = 255;
         if (style_parse_color_with_alpha(

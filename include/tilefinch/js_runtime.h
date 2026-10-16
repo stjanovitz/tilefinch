@@ -1139,6 +1139,8 @@ typedef enum {
    domains before callbacks. QuickJS watchdog polls never affect page-visible
    time. */
 #define SCRIPT_DETERMINISTIC_CLOCK_CONTRACT "dual-domain-ms-call-v2"
+#define SCRIPT_DETERMINISTIC_FIXED_WALL_CLOCK_CONTRACT \
+    "fixed-origin-wall-observed-monotonic-v1"
 #define SCRIPT_DETERMINISTIC_CLOCK_CALL_QUANTUM_MS UINT64_C(1)
 #define SCRIPT_DETERMINISTIC_CLOCK_MAX_HOST_ELAPSED_MS UINT64_C(60000000)
 #define SCRIPT_DETERMINISTIC_CLOCK_MAX_SOURCE_EVENTS UINT64_C(1000000)
@@ -1197,6 +1199,7 @@ typedef struct {
     uint64_t monotonic_observations;
     uint64_t monotonic_samples;
     ScriptDeterministicClockSourceCounts sources;
+    bool fixed_wall_clock;
 } ScriptDeterministicReplayDiagnostics;
 
 typedef struct {

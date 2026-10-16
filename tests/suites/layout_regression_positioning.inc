@@ -75,6 +75,41 @@
     document_destroy(&root_height_document);
     CHECK(budget.current == 0);
 
+    puts("test: inline ancestry preserves a definite percentage-height basis");
+    {
+        static const char page[] =
+            "<!doctype html><style>body{margin:0}"
+            ".host{height:60px;width:200px}figure{margin:0;height:100%}"
+            "#fill{display:block;height:100%}#atomic{display:inline-block;height:50%;width:10px}"
+            "#auto{height:auto}#auto figure{height:100%}"
+            "</style><body><div class=host><a href=#end><figure id=block>"
+            "<span id=fill></span></figure></a></div>"
+            "<div class=host><span><i id=atomic></i></span></div>"
+            "<div id=auto><a><figure id=indefinite><div style='height:12px'></div>"
+            "</figure></a></div><p id=end>End</p></body>";
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 41)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && layout_build(&layout, &budget, &document, &sheet,
+                              NULL, NULL, 480));
+        static const char *const ids[] = {"block", "fill", "atomic", "indefinite"};
+        static const int heights[] = {60, 60, 30, 12};
+        for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+            const LayoutNodeBox *box = layout_box_for_node(&layout,
+                find_id(lxb_dom_interface_node(document.html), ids[i]));
+            if (box == NULL || box->height != heights[i])
+                fprintf(stderr, "inline percentage height %s=%d expected=%d\n",
+                        ids[i], box == NULL ? -1 : box->height, heights[i]);
+            CHECK(box != NULL && box->height == heights[i]);
+        }
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: visible root overflow extends the document scroller");
     static const char root_overflow_page[] =
         "<!doctype html><style>html,body{height:100%;margin:0;padding:0}"

@@ -37,6 +37,7 @@ bool script_runtime_deterministic_replay_diagnostics(
     }
     *diagnostics = (ScriptDeterministicReplayDiagnostics) {
         .seed = runtime->bridge.replay_seed,
+        .fixed_wall_clock = runtime->bridge.fixed_wall_clock,
         .clock_origin_ms = runtime->bridge.clock_origin_ms,
         .host_elapsed_ms = runtime->bridge.clock_host_elapsed_ms,
         .wall_elapsed_ms = runtime->bridge.clock_wall_elapsed_ms,
@@ -135,7 +136,8 @@ bool script_runtime_task_runnable(ScriptRuntime *runtime)
     if (js_rt_runtime_checkpoint_pending(runtime)
         || js_rt_dynamic_classic_continuation_pending(runtime))
         return true;
-    if (runtime_task_due_in_ms(runtime) <= 0) return true;
+    if (runtime->image_load_pending != 0
+        || runtime_task_due_in_ms(runtime) <= 0) return true;
     return runtime_responses_ready(runtime) != 0;
 }
 
@@ -811,6 +813,34 @@ static bool runtime_dispatch_page_visibility_edge(ScriptRuntime *runtime)
     return ok;
 }
 
+static bool runtime_dispatch_image_load(ScriptRuntime *runtime, bool *dispatched)
+{
+    *dispatched = false;
+    for (size_t i = 0; i < runtime->image_load_state_count; i++) {
+        ScriptImageLoadState *state = &runtime->image_load_states[i];
+        if (!state->pending) continue;
+        state->pending = false;
+        runtime->image_load_pending--;
+        lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
+            runtime, state->handle);
+        const ImageResource *image = images_find_node(runtime->bridge.images, node);
+        if (node == NULL || !image_resource_available(image)
+            || image->source_hash != state->source_hash
+            || !image_resource_source_current(runtime->bridge.stylesheet, image))
+            continue;
+        state->delivered = true;
+        JSValue arguments[2] = {JS_NewInt64(runtime->context, state->handle),
+                                JS_NewString(runtime->context, "load")};
+        bool ok = runtime_call_captured(runtime, runtime->dispatch_handle,
+            "image load", 2, arguments, NULL);
+        JS_FreeValue(runtime->context, arguments[0]);
+        JS_FreeValue(runtime->context, arguments[1]);
+        *dispatched = true;
+        return ok;
+    }
+    return true;
+}
+
 static bool runtime_dispatch_game_audio_completion(ScriptRuntime *runtime,
                                                     bool *dispatched)
 {
@@ -948,12 +978,14 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             ? UINT64_MAX
             : runtime->bridge.clock_host_elapsed_ms
                   + (uint64_t) elapsed_ms;
-        runtime->bridge.clock_wall_elapsed_ms =
-            runtime->bridge.clock_wall_elapsed_ms
-                > UINT64_MAX - (uint64_t) elapsed_ms
-            ? UINT64_MAX
-            : runtime->bridge.clock_wall_elapsed_ms
-                  + (uint64_t) elapsed_ms;
+        if (!runtime->bridge.fixed_wall_clock) {
+            runtime->bridge.clock_wall_elapsed_ms =
+                runtime->bridge.clock_wall_elapsed_ms
+                    > UINT64_MAX - (uint64_t) elapsed_ms
+                ? UINT64_MAX
+                : runtime->bridge.clock_wall_elapsed_ms
+                      + (uint64_t) elapsed_ms;
+        }
         runtime->bridge.clock_monotonic_elapsed_ms =
             runtime->bridge.clock_monotonic_elapsed_ms
                 > UINT64_MAX - (uint64_t) elapsed_ms
@@ -1066,6 +1098,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             &ok);
     }
     size_t callbacks = 0;
+    bool image_task_ran = false;
     while (ok && remaining != 0
            && runtime_task_slice_available(runtime, task_slice_started_ns,
                                            remaining, callback_budget)
@@ -1091,6 +1124,19 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             continue;
         }
 
+        if (!classic_continuation
+            && (!image_task_ran || !runtime_timer_due(runtime))
+            && runtime->image_load_pending != 0) {
+            bool dispatched = false;
+            ok = runtime_dispatch_image_load(runtime, &dispatched);
+            if (!ok) break;
+            if (dispatched) {
+                image_task_ran = true;
+                remaining--;
+                ok = js_rt_runtime_run_jobs(runtime);
+                continue;
+            }
+        }
         if (classic_continuation || !runtime_timer_due(runtime)) break;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         /* The head of the sorted wheel is the task this pump runs (a
@@ -1106,6 +1152,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
 #endif
         ok = runtime_pump_timers(runtime, 0, 1, &timer_callbacks);
+        if (timer_callbacks != 0) image_task_ran = false;
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
         js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
 #endif

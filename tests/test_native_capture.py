@@ -2,6 +2,8 @@
 from pathlib import Path
 import sys
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -166,6 +168,37 @@ class NativeCaptureTests(unittest.TestCase):
         (self.output / 'stderr.log').write_text('loop command-failed="scroll-by"\n')
         with self.assertRaisesRegex(ValueError, 'failed commands'):
             self.validate()
+
+    @unittest.skipUnless(LAB, 'supply --lab for the native command integration check')
+    def test_offline_replay_never_opens_network_media_outside_the_trace(self):
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(404)
+                self.end_headers()
+            def log_message(self, *_args):
+                pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            fixture = self.output / 'media.html'
+            fixture.write_text('<!doctype html><p>Offline media guard</p>')
+            commands = self.output / 'media.commands'
+            commands.write_text('quit\n')
+            trace = Path(__file__).resolve().parents[1] / 'fixtures/http-fixed-wall-clock'
+            run = subprocess.run([str(LAB), '--fixture', str(fixture),
+                '--replay-http-response-keyed', str(trace),
+                '--media-url', f'http://127.0.0.1:{server.server_port}/video.mp4',
+                '--commands', str(commands), '--no-loop-capture'],
+                capture_output=True, text=True, timeout=20)
+            self.assertEqual(requests, [], 'media bypassed the hermetic HTTP replay')
+            self.assertIn('network media unavailable during HTTP replay', run.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
 
     @unittest.skipUnless(LAB, 'supply --lab for the native command integration check')
     def test_native_scroll_by_ignores_sticky_page_step_obstructions(self):

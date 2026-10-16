@@ -3068,8 +3068,7 @@ static bool count_style_layout_flush(void *opaque)
 }
 
 /* Names the computed-style getter answers without the element's cascade:
-   one nothing registers (the page reads scroll-margin-block-start; the
-   script falls back to the inline declaration) and custom properties,
+   one nothing registers (falling back to its inline declaration) and custom properties,
    which come from custom-property rules. Values are unchanged; the
    cascade miss counter proves no element was resolved. */
 static int test_computed_style_reads_without_cascade(void)
@@ -3084,14 +3083,14 @@ static int test_computed_style_reads_without_cascade(void)
         ".a{--gap: calc(var(--unit) * 2);--unit:4px}"
         ".a::before{--mark:'x';content:var(--mark)}"
         "p{color:var(--tone)}</style><body><div class=a>"
-        "<p id=x style='scroll-margin-block-start: 5px'>1</p>"
+        "<p id=x style='future-scroll-offset: 5px'>1</p>"
         "<svg><rect id=r fill=red width=1 height=1></rect></svg></div>");
     CHECK(runtime != NULL);
     size_t misses = runtime->bridge.computed_style_cache.misses;
     CHECK(var_cache_eval(runtime,
         "(()=>{const x=document.getElementById('x'),s=getComputedStyle(x),"
         "b=getComputedStyle(x.parentElement,'::before');"
-        "pocSummary=[s.getPropertyValue('scroll-margin-block-start'),"
+        "pocSummary=[s.getPropertyValue('future-scroll-offset'),"
         "s.getPropertyValue('--tone'),s.getPropertyValue('--gap'),"
         "s.getPropertyValue('--missing'),b.getPropertyValue('--mark'),"
         "s.getPropertyValue('no-such-property')].join('|')})()",

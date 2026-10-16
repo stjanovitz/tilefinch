@@ -1393,6 +1393,7 @@ static struct {
     char directory[2048];
     size_t sequence;
     uint64_t clock_origin_ms;
+    bool fixed_wall_clock;
     bool capture_raw_cookie_values;
     size_t top_level_request_ordinal;
     size_t top_level_requests_seen;

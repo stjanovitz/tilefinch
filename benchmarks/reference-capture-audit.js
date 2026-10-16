@@ -6,6 +6,21 @@ const MAX_IMAGES = 4096;
 const MAX_ANCESTORS = 256;
 const { EventEmitter } = require("node:events");
 
+/* Exact request shape for a retained, credential-free CORS permission check.
+   Browser-generated OPTIONS is admitted only for a read-only target method;
+   unknown shapes remain unmatched, never synthetic successful grants. */
+function preflightShape(headers) {
+  const origin = headers.origin, method = headers["access-control-request-method"];
+  const names = String(headers["access-control-request-headers"] || "");
+  if (typeof origin !== "string" || !["GET", "HEAD"].includes(method)
+      || origin.length > 2048 || names.length > 1024) return null;
+  try { if (new URL(origin).origin !== origin || !origin.startsWith("https://")) return null; }
+  catch (_) { return null; }
+  const fields = names === "" ? [] : names.split(",").map((name) => name.trim().toLowerCase());
+  if (fields.some((name) => !/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name))) return null;
+  return { origin, method, headers: [...new Set(fields)].sort().join(",") };
+}
+
 /* OOPIFs have separate Fetch domains. Use the documented non-flattened CDP
    target tunnel so every frame stays paused until hermetic routing is ready.
    This does not alter site isolation or rewrite cross-origin responses. */
@@ -23,7 +38,10 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
       session.on("Network.loadingFailed", (event) => audit.networkEnd(session, event, true));
       await runHost("request-audit-enable", () => session.send("Network.enable"));
     }
-    session.on("Fetch.requestPaused", (event) => onRequest(session, event));
+    session.on("Fetch.requestPaused", (event) => {
+      if (audit) audit.networkIntercepted(session, event);
+      onRequest(session, event);
+    });
     session.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
       const child = children.get(`${session._captureKey || "root"}\0${sessionId}`);
       if (!child) return;
@@ -153,19 +171,63 @@ function createRequestAudit() {
   const networks = new Map();
   const networkKey = (session, id) => `${session._captureKey || "root"}\0${id}`;
   const fulfilled = new Set();
+  const intercepted = new Set();
+  const deniedPreflightParents = new Map();
+  const abortedPreflights = new Map();
+  let preflightDeniedParents = 0;
+  const linkPreflight = (permissionKey, permission) => {
+    const ticket = abortedPreflights.get(permissionKey);
+    if (!ticket || !permission?.preflightParent || permission.method !== "OPTIONS"
+        || permission.url !== ticket.url) return;
+    ticket.permission = permission;
+    const parentKey = `${permissionKey.slice(0, permissionKey.lastIndexOf("\0") + 1)}${permission.preflightParent}`;
+    if (deniedPreflightParents.size >= MAX_REQUESTS && !deniedPreflightParents.has(parentKey)) {
+      overflow = true; return;
+    }
+    deniedPreflightParents.set(parentKey, ticket);
+  };
   const result = {
     networkBegin(session, event) {
       const key = networkKey(session, event.requestId);
       if (event.redirectResponse) {
         pending.delete(key);
         fulfilled.delete(key);
+        intercepted.delete(key);
       }
       if (!/^https?:/i.test(event.request.url)) return;
       observed += 1;
       if (networks.size >= MAX_REQUESTS && !networks.has(key)) { overflow = true; return; }
       networks.set(key, { url: event.request.url, method: event.request.method,
-        type: String(event.type || "other").toLowerCase(), frameId: event.frameId });
+        type: String(event.type || "other").toLowerCase(), frameId: event.frameId,
+        ...(event.initiator?.type === "preflight"
+          && typeof event.initiator.requestId === "string"
+          ? { preflightParent: event.initiator.requestId } : {}) });
       pending.add(key);
+      linkPreflight(key, networks.get(key));
+    },
+    networkIntercepted(session, event) {
+      if (!event.networkId) return;
+      if (intercepted.size >= MAX_REQUESTS) { overflow = true; return; }
+      intercepted.add(networkKey(session, event.networkId));
+    },
+    networkAborted(session, event, { declaredPolicy = false } = {}) {
+      if (!declaredPolicy || event.request?.method !== "OPTIONS" || !event.networkId) return;
+      const permissionKey = networkKey(session, event.networkId);
+      const headers = Object.fromEntries(Object.entries(event.request.headers || {})
+        .map(([name, value]) => [name.toLowerCase(), String(value)]));
+      /* Chromium reports the parent XHR/fetch as failed too, although it
+         never reaches Fetch interception after its preflight is refused.
+         Require CDP's exact initiator link, method, URL and frame; URL-only
+         failure tickets must not excuse an unrelated request. */
+      if (!/^[A-Z]+$/.test(headers["access-control-request-method"] || "")) return;
+      if (abortedPreflights.size >= MAX_REQUESTS) { overflow = true; return; }
+      /* Fetch.requestPaused can precede Network.requestWillBeSent. Retain
+         the exact denied ticket until its CDP initiator arrives. A preflight
+         may omit frameId; an ID it does supply must match the parent. */
+      abortedPreflights.set(permissionKey, { permissionKey,
+        url: event.request.url, method: headers["access-control-request-method"],
+        frameId: event.frameId, confirmed: false, final: false });
+      linkPreflight(permissionKey, networks.get(permissionKey));
     },
     networkFulfilled(session, event) {
       if (!event.networkId) { overflow = true; return; }
@@ -185,6 +247,17 @@ function createRequestAudit() {
         else if (candidates.length > 1) overflow = true;
       }
       if (!request) return; // Non-HTTP work is outside the replay ledger.
+      const deniedTicket = deniedPreflightParents.get(key);
+      if (deniedTicket && !deniedTicket.final) {
+        deniedTicket.parentEnd = { session, event, failed };
+        return;
+      }
+      const permissionTicket = abortedPreflights.get(key);
+      if (permissionTicket) {
+        permissionTicket.final = true;
+        permissionTicket.confirmed = failed && event.errorText === "net::ERR_BLOCKED_BY_CLIENT";
+        linkPreflight(key, request);
+      }
       pending.delete(key);
       if (failed) {
         const expectedKey = `${request.method}\0${request.url}`;
@@ -194,13 +267,28 @@ function createRequestAudit() {
            not a missing response. Unknown cancellations and transport errors
            still fail. Visual completeness remains independently mandatory. */
         const canceledReplay = event.canceled === true && fulfilled.has(key);
+        const permissionFrame = deniedTicket?.frameId ?? deniedTicket?.permission?.frameId;
+        const deniedParent = deniedTicket?.confirmed === true && !intercepted.has(key)
+          && deniedTicket.url === request.url && deniedTicket.method === request.method
+          && (permissionFrame === undefined || permissionFrame === request.frameId)
+          && event.errorText === "net::ERR_BLOCKED_BY_CLIENT";
+        if (deniedParent) preflightDeniedParents += 1;
         if (failures.length >= 512) overflow = true;
-        else failures.push({ ...request, expected: expected > 0 || canceledReplay,
-          reason: expected > 0 ? "declared-policy" : canceledReplay ? "canceled-replayed-response" : "unexpected",
+        else failures.push({ ...request, expected: expected > 0 || canceledReplay || deniedParent,
+          reason: expected > 0 ? "declared-policy" : canceledReplay ? "canceled-replayed-response"
+            : deniedParent ? "denied-preflight-parent" : "unexpected",
           error: String(event.errorText || "request failed").slice(0, 256) });
       }
       fulfilled.delete(key);
+      intercepted.delete(key);
+      if (deniedTicket) abortedPreflights.delete(deniedTicket.permissionKey);
+      deniedPreflightParents.delete(key);
       networks.delete(key);
+      if (permissionTicket?.parentEnd) {
+        const deferred = permissionTicket.parentEnd;
+        delete permissionTicket.parentEnd;
+        result.networkEnd(deferred.session, deferred.event, deferred.failed);
+      }
     },
   };
   return Object.assign(result, {
@@ -230,9 +318,12 @@ function createRequestAudit() {
       }
     },
     summary(intercepted) {
-      return { version: "browser-request-audit-v2", observed, intercepted,
+      return { version: preflightDeniedParents ? "browser-request-audit-v3" : "browser-request-audit-v2", observed, intercepted,
+        ...(preflightDeniedParents ? { preflight_denied_parents: preflightDeniedParents } : {}),
         pending: pending.size, overflow, failures: failures.slice(),
-        ready: !overflow && pending.size === 0 && observed === intercepted
+        ready: !overflow && pending.size === 0 && deniedPreflightParents.size === 0
+          && abortedPreflights.size === 0
+          && observed === intercepted + preflightDeniedParents
           && failures.every((failure) => failure.expected) };
     },
   });
@@ -265,10 +356,12 @@ function createOriginEvidence() {
 /* Runs in the page. Include only paintable images intersecting the viewport
    unless the caller explicitly captured the full document. Hidden/lazy content
    elsewhere is not made mandatory for ordinary checkpoint captures. */
-function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadings = true } = {}) {
+function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadings = true,
+  retainedFailures = [] } = {}) {
   const limit = Math.max(0, Math.min(4096, imageLimit));
   const all = document.images;
   const images = [];
+  const failures = new Set(retainedFailures.slice(0, 4096));
   let incomplete = 0;
   let truncated = all.length > limit;
   for (let index = 0; index < Math.min(all.length, limit); index += 1) {
@@ -293,8 +386,11 @@ function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadin
     if (right <= left || bottom <= top || !fullDocument
       && (right <= 0 || left >= innerWidth || bottom <= 0 || top >= innerHeight)) continue;
     const complete = image.complete && image.naturalWidth > 0 && image.naturalHeight > 0;
-    if (!complete) incomplete += 1;
-    images.push({ src: image.currentSrc || image.src, complete,
+    const src = image.currentSrc || image.src;
+    const retainedFailure = !complete && image.complete && failures.has(src);
+    if (!complete && !retainedFailure) incomplete += 1;
+    images.push({ src, complete, settled: complete || retainedFailure,
+      retained_http_failure: retainedFailure,
       x: rect.x, y: rect.y + scrollY, width: rect.width, height: rect.height });
   }
   const root = document.scrollingElement || document.documentElement;
@@ -327,10 +423,10 @@ function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadin
 /* Evaluate each document in its own realm; do not read cross-origin child DOM
    through the top page or move an iframe's scroll position. A full-page image
    contains only the child's current viewport, not its offscreen document. */
-async function collectVisualEvidence(page, { fullDocument = false } = {}, runHost) {
+async function collectVisualEvidence(page, { fullDocument = false, retainedFailures = [] } = {}, runHost) {
   const frames = page.frames();
   const main = page.mainFrame();
-  const result = await runHost("visual-main-frame", () => main.evaluate(visualEvidence, { fullDocument }));
+  const result = await runHost("visual-main-frame", () => main.evaluate(visualEvidence, { fullDocument, retainedFailures }));
   const childFrames = [];
   if (frames.length > 64) return { ...result, child_frames: childFrames, frame_overflow: true, ready: false };
   let remaining = Math.max(0, MAX_IMAGES - result.image_count);
@@ -366,12 +462,12 @@ async function collectVisualEvidence(page, { fullDocument = false } = {}, runHos
     }
     if (paintable && current !== main) throw new Error("visual frame exceeds ancestor bound");
     const evidence = paintable ? await runHost("visual-child-frame", () => frame.evaluate(visualEvidence,
-      { fullDocument: false, imageLimit: remaining, includeHeadings: false })) : null;
+      { fullDocument: false, imageLimit: remaining, includeHeadings: false, retainedFailures })) : null;
     if (evidence) remaining = Math.max(0, remaining - evidence.image_count);
     childFrames.push({ index, paintable, visual_evidence: evidence });
   }
   return { ...result, child_frames: childFrames, frame_overflow: false,
     ready: result.ready && childFrames.every((entry) => !entry.paintable || entry.visual_evidence.ready) };
 }
-module.exports = { installInterception, cdpRoute, createRequestAudit, createOriginEvidence, retainedUserAgent, visualEvidence, collectVisualEvidence,
+module.exports = { preflightShape, installInterception, cdpRoute, createRequestAudit, createOriginEvidence, retainedUserAgent, visualEvidence, collectVisualEvidence,
   MAX_REQUESTS, MAX_IMAGES, MAX_ANCESTORS };

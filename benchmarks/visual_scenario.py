@@ -46,6 +46,7 @@ REFERENCE_REPLAY_ENVIRONMENT = "deterministic-hermetic-v3"
 REFERENCE_CLOCK_VERSION = "playwright-clock-paused-v2"
 CANDIDATE_CLOCK_VERSION = "native-script-runtime-v2"
 REPLAY_CLOCK_CONTRACT = "dual-domain-ms-call-v2"
+REPLAY_FIXED_WALL_CLOCK_CONTRACT = "fixed-origin-wall-observed-monotonic-v1"
 REPLAY_CLOCK_SCOPE = "top-level-realm-v1"
 REPLAY_CLOCK_OBSERVATION_SOURCES = (
     "date_now",
@@ -741,7 +742,7 @@ def trace_digest(directory: Path) -> str:
     return digest.hexdigest()
 
 
-def trace_replay_origin_ms(directory: Path) -> int:
+def trace_replay_info(directory: Path) -> tuple[int, str]:
     """Return the exact stable replay seed from a complete retained trace."""
 
     root = directory.resolve(strict=True)
@@ -782,7 +783,19 @@ def trace_replay_origin_ms(directory: Path) -> int:
         raise ArtifactError(
             f"{metadata_path}: record-count does not match the exact retained sequence"
         )
-    return origin
+    wall_clock = metadata.get("wall-clock")
+    if wall_clock not in (None, "fixed-origin-v1"):
+        raise ArtifactError(f"{metadata_path}: unsupported wall-clock mode")
+    contract = REPLAY_FIXED_WALL_CLOCK_CONTRACT if wall_clock else REPLAY_CLOCK_CONTRACT
+    return origin, contract
+
+
+def trace_replay_origin_ms(directory: Path) -> int:
+    return trace_replay_info(directory)[0]
+
+
+def trace_replay_clock_contract(directory: Path) -> str:
+    return trace_replay_info(directory)[1]
 
 
 def replay_seed_sha256(origin_ms: int) -> str:
@@ -1259,6 +1272,7 @@ def _validate_replay_environment(
     state: dict[str, Any],
     side: str,
     expected_origin_ms: int | None = None,
+    expected_clock_contract: str | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     environment = state.get("replay_environment")
@@ -1282,7 +1296,10 @@ def _validate_replay_environment(
     )
     if environment.get("clock_version") != expected_clock_version:
         reasons.append(f"{side}-replay-environment-clock-version")
-    if environment.get("clock_contract") != REPLAY_CLOCK_CONTRACT:
+    clock_contract = environment.get("clock_contract")
+    if clock_contract not in (REPLAY_CLOCK_CONTRACT, REPLAY_FIXED_WALL_CLOCK_CONTRACT) or (
+        expected_clock_contract is not None and clock_contract != expected_clock_contract
+    ):
         reasons.append(f"{side}-replay-environment-clock-contract")
     if environment.get("clock_scope") != REPLAY_CLOCK_SCOPE:
         reasons.append(f"{side}-replay-environment-clock-scope")
@@ -1359,15 +1376,15 @@ def _validate_replay_environment(
         or isinstance(wall_observations, bool)
         or not isinstance(monotonic_observations, int)
         or isinstance(monotonic_observations, bool)
-        or wall_elapsed != host_elapsed + wall_observations
+        or wall_elapsed != (0 if clock_contract == REPLAY_FIXED_WALL_CLOCK_CONTRACT else host_elapsed + wall_observations)
         or monotonic_elapsed != host_elapsed + monotonic_observations
     ):
         reasons.append(f"{side}-replay-environment-domain-clock")
     if environment.get("performance_entries") != "normalized-empty-v1":
         reasons.append(f"{side}-replay-environment-performance-entries")
-    if environment.get("document_timeline") != REPLAY_CLOCK_CONTRACT:
+    if environment.get("document_timeline") != clock_contract:
         reasons.append(f"{side}-replay-environment-document-timeline")
-    if environment.get("animation_frame") != REPLAY_CLOCK_CONTRACT:
+    if environment.get("animation_frame") != clock_contract:
         reasons.append(f"{side}-replay-environment-animation-frame")
     if side == "candidate":
         requested = environment.get("requested_origin_ms")
@@ -1379,12 +1396,13 @@ def _validate_replay_environment(
 
 
 def validate_reference_replay_contract(
-    scenario: Scenario, state: dict[str, Any], expected_origin_ms: int
+    scenario: Scenario, state: dict[str, Any], expected_origin_ms: int,
+    expected_clock_contract: str = REPLAY_CLOCK_CONTRACT,
 ) -> list[str]:
     """Validate the cross-engine seed/clock contract before candidate launch."""
 
     return _validate_replay_environment(
-        scenario, state, "reference", expected_origin_ms
+        scenario, state, "reference", expected_origin_ms, expected_clock_contract
     )
 
 
@@ -2203,6 +2221,7 @@ def qualify(
 ) -> Eligibility:
     reasons: list[str] = []
     trace_origin_ms: int | None = None
+    trace_clock_contract: str | None = None
     if scenario.trace_sha256 == PENDING_DIGEST:
         reasons.append("trace-digest-pending")
     else:
@@ -2210,7 +2229,7 @@ def qualify(
             actual_digest = trace_digest(replay_directory)
             if actual_digest != scenario.trace_sha256:
                 reasons.append("replay-trace-mismatch")
-            trace_origin_ms = trace_replay_origin_ms(replay_directory)
+            trace_origin_ms, trace_clock_contract = trace_replay_info(replay_directory)
         except (OSError, ArtifactError) as error:
             reasons.append(f"replay-trace-unavailable:{error}")
 
@@ -2243,7 +2262,7 @@ def qualify(
             if side in validated:
                 reasons.extend(
                     _validate_replay_environment(
-                        scenario, validated[side], side, trace_origin_ms
+                        scenario, validated[side], side, trace_origin_ms, trace_clock_contract
                     )
                 )
     if "reference" in validated and "candidate" in validated:
@@ -2427,7 +2446,6 @@ def candidate_evidence_from_log(
     expected_constants = {
         "seed-source": REPLAY_SEED_SOURCE,
         "rng": REPLAY_RNG_CONTRACT,
-        "clock": REPLAY_CLOCK_CONTRACT,
         "clock-scope": REPLAY_CLOCK_SCOPE,
         "performance-entries": "normalized-empty-v1",
         "intl": REPLAY_INTL_CONTRACT,
@@ -2437,6 +2455,8 @@ def candidate_evidence_from_log(
     for name, expected in expected_constants.items():
         if values[name] != expected:
             raise ArtifactError(f"candidate evidence {name} contract mismatch")
+    if values["clock"] not in (REPLAY_CLOCK_CONTRACT, REPLAY_FIXED_WALL_CLOCK_CONTRACT):
+        raise ArtifactError("candidate evidence clock contract mismatch")
 
     status = _candidate_evidence_integer(values, "http-status", 599)
     stylesheets = _candidate_evidence_integer(
@@ -2500,7 +2520,7 @@ def candidate_evidence_from_log(
     ):
         raise ArtifactError("candidate evidence clock source totals are inconsistent")
     if (
-        wall_elapsed != host_elapsed + wall_observations
+        wall_elapsed != (0 if values["clock"] == REPLAY_FIXED_WALL_CLOCK_CONTRACT else host_elapsed + wall_observations)
         or monotonic_elapsed != host_elapsed + monotonic_observations
     ):
         raise ArtifactError("candidate evidence dual-domain clock is inconsistent")
@@ -2580,6 +2600,7 @@ def candidate_evidence_from_log(
         "active_native": active_native,
         "pending_logical": pending_logical,
         "seed": seed,
+        "clock_contract": values["clock"],
         "host_elapsed_ms": host_elapsed,
         "wall_elapsed_ms": wall_elapsed,
         "monotonic_elapsed_ms": monotonic_elapsed,
@@ -2661,7 +2682,7 @@ def candidate_state_from_log(
         "version": REFERENCE_REPLAY_ENVIRONMENT,
         "origin_ms": observed_origin,
         "clock_version": CANDIDATE_CLOCK_VERSION,
-        "clock_contract": REPLAY_CLOCK_CONTRACT,
+        "clock_contract": evidence["clock_contract"],
         "clock_scope": REPLAY_CLOCK_SCOPE,
         "rng_version": REPLAY_RNG_CONTRACT,
         "seed_source": REPLAY_SEED_SOURCE,
@@ -2682,8 +2703,8 @@ def candidate_state_from_log(
         "monotonic_samples": evidence["monotonic_samples"],
         "clock_sources": evidence["clock_sources"],
         "performance_entries": "normalized-empty-v1",
-        "document_timeline": REPLAY_CLOCK_CONTRACT,
-        "animation_frame": REPLAY_CLOCK_CONTRACT,
+        "document_timeline": evidence["clock_contract"],
+        "animation_frame": evidence["clock_contract"],
         "requested_origin_ms": origin_ms,
     }
     return {
@@ -2968,7 +2989,7 @@ def verify_reference_proof_binding(
     actual_trace_digest = trace_digest(replay_directory)
     if actual_trace_digest != proof_trace_digest:
         raise ArtifactError("reference proof trace digest differs from retained replay")
-    expected_origin_ms = trace_replay_origin_ms(replay_directory)
+    expected_origin_ms, expected_clock_contract = trace_replay_info(replay_directory)
     if proof.get("canonical_run") != REFERENCE_PROOF_CANONICAL_RUN:
         raise ArtifactError("reference proof canonical run is unsupported")
     if proof.get("comparison_run") != REFERENCE_PROOF_COMPARISON_RUN:
@@ -2981,6 +3002,7 @@ def verify_reference_proof_binding(
         {"replay_environment": proof_environment},
         "reference",
         expected_origin_ms,
+        expected_clock_contract,
     )
     if proof_environment_reasons:
         raise ArtifactError(

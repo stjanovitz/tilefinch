@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.39 — 2026-10-15
+
+- More responsive focus navigation and faster loading on complex pages.
+- Improved page layouts, text spacing, images, icons, and visual effects.
+- Better Basic and Reader views, with more complete long articles and preserved links.
+- Improved styling and reliability when memory is limited.
+
 ## 0.1.38 — 2026-10-14
 
 - More reliable YouTube sign-in, with clearer recovery and optional privacy-safe diagnostics.

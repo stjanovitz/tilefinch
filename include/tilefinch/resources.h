@@ -916,6 +916,9 @@ bool image_resource_materialize_native_canvas(ImageResource *image);
 bool images_release_canvas(ImageResources *images, Budget *budget,
                            lxb_dom_node_t *node);
 bool image_resource_available(const ImageResource *image);
+/* A decoded publication may briefly outlive an author source mutation. */
+bool image_resource_source_current(const Stylesheet *sheet,
+                                    const ImageResource *image);
 const void *image_resource_backing_identity(const ImageResource *image);
 /* Distinguishes corrupt/unsupported data, which is safe to negative-cache,
    from allocator pressure or a busy bounded decoder, which must be retried.

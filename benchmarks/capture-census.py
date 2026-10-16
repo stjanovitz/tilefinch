@@ -244,6 +244,8 @@ def capture_one(scenario, options, sources) -> dict:
                    "--python", sys.executable]
         if options.executable:
             command.extend(["--executable", str(options.executable)])
+        if getattr(options, "retained_preflights", False):
+            command.append("--retained-preflights")
         with (attempt / "stdout.log").open("w") as stdout, (attempt / "stderr.log").open("w") as stderr:
             # Browser operations close normally first; this outer bound also
             # contains startup/helper hangs and owns child cleanup.
@@ -293,6 +295,8 @@ def main() -> int:
     parser.add_argument("--settle-ms", type=int, default=100)
     parser.add_argument("--attempt-timeout-seconds", type=int, default=300)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--retained-preflights", action="store_true",
+                        help="replay exact retained read-only CORS preflights; unknown checks fail closed")
     options = parser.parse_args()
     if not 1000 <= options.timeout_ms <= 120000 or not 0 <= options.settle_ms <= 10000:
         parser.error("invalid bounded browser timeout or settle interval")
@@ -314,6 +318,7 @@ def main() -> int:
     try:
         options.executable, toolchain = toolchain_preflight(options.node, options.executable)
         sources = {"files": source_identity(options.manifest, options.node, options.executable),
+                   "retained_preflights": options.retained_preflights,
                    "toolchain": toolchain}
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
         parser.error(str(error))

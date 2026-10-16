@@ -2563,6 +2563,28 @@ static int test_retained_matches_reuse(Budget *budget)
         && keyed != NULL && keyed->color == 0xaabbcc);
     layout_destroy(&layout);
 
+    /* Pressure can discard large resolved styles without throwing away the
+       exact selector answers. Repeated reclamation is idempotent, and the
+       next build must still match both the layout and later invalidation. */
+    layout_reuse_cache_stats(reuse, &stats);
+    size_t owned_before = budget->current;
+    size_t released = layout_reuse_cache_reclaim_styles(reuse);
+    CHECK(released > 0 && budget->current <= owned_before - released);
+    CHECK(layout_reuse_cache_reclaim_styles(reuse) == 0);
+    layout_reuse_cache_stats(reuse, &again);
+    CHECK(again.retained_bytes == stats.retained_bytes - released
+        && again.matched_stores == stats.matched_stores);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &again);
+    CHECK(again.matched_hits > stats.matched_hits
+        && layout.text_fingerprint == fingerprint);
+    first = text_command(&layout, "t0001");
+    last = text_command(&layout, "t1399");
+    CHECK(first != NULL && first->color == 0x112233
+        && last != NULL && last->color == 0x778899);
+    layout_destroy(&layout);
+
     /* A journaled class change drops the changed element's list only. */
     lxb_dom_node_t *group = document_body_node(&document)->first_child;
     lxb_dom_node_t *span = group == NULL || group->first_child == NULL

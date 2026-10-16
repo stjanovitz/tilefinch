@@ -766,12 +766,69 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
     JS_FreeValue(runtime->context, global);
 }
 
+enum { SCRIPT_IMAGE_LOAD_LIMIT = 128 };
+static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *images)
+{
+    for (size_t i = 0; i < runtime->image_load_state_count;) {
+        ScriptImageLoadState *state = &runtime->image_load_states[i];
+        lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
+            runtime, state->handle);
+        if (node != NULL && (state->pending
+            || images_find_node(runtime->bridge.images, node) != NULL)) {
+            i++;
+        } else {
+            if (state->pending) runtime->image_load_pending--;
+            runtime->image_load_state_count--;
+            memmove(state, state + 1, (runtime->image_load_state_count - i)
+                * sizeof(*state));
+        }
+    }
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *image = &images->items[i];
+        if (image->is_canvas || image->is_mask || image->is_background
+            || image->source_hash == 0 || !image_resource_available(image)
+            || image->node == NULL || image->node->local_name != LXB_TAG_IMG)
+            continue;
+        long handle = script_runtime_node_weak_handle(runtime, image->node);
+        if (handle == 0) continue;
+        size_t at = 0;
+        while (at < runtime->image_load_state_count
+            && runtime->image_load_states[at].handle != handle) at++;
+        if (at == runtime->image_load_state_count) {
+            if (at == SCRIPT_IMAGE_LOAD_LIMIT) continue;
+            if (runtime->image_load_states == NULL) {
+                runtime->image_load_states = budget_calloc_category(
+                    runtime->budget, BUDGET_CATEGORY_JAVASCRIPT,
+                    SCRIPT_IMAGE_LOAD_LIMIT, sizeof(*runtime->image_load_states));
+                if (runtime->image_load_states == NULL) return;
+            }
+            runtime->image_load_state_count++;
+            runtime->image_load_states[at] = (ScriptImageLoadState) {.handle = handle};
+        }
+        ScriptImageLoadState *state = &runtime->image_load_states[at];
+        if (state->source_hash == image->source_hash
+            && (state->pending || state->delivered)) continue;
+        if (!image_resource_source_current(runtime->bridge.stylesheet, image)) continue;
+        if (!state->pending) runtime->image_load_pending++;
+        ScriptImageLoadState queued = {.handle = handle,
+            .source_hash = image->source_hash, .pending = true};
+        /* A replacement completion is a newly queued task, not the old source's
+           place in line. Preserve order when pruning or replacing records. */
+        memmove(state, state + 1,
+            (runtime->image_load_state_count - at - 1u) * sizeof(*state));
+        runtime->image_load_states[runtime->image_load_state_count - 1u] = queued;
+    }
+}
+
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images)
 {
     if (runtime == NULL) return;
     runtime->bridge.images = images;
     if (images == NULL) return;
+    /* Loading publishes pixels only. Author callbacks run later through
+       the ordinary task budget, never inside layout/resource adoption. */
+    runtime_queue_image_loads(runtime, images);
     /* A canvas can be drawn by an inline script before final layout attaches
        the page resource table. Retry that bounded dirty publication now; a
        failed pressure admission remains a soft visual degradation. */

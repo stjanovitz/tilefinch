@@ -568,6 +568,7 @@ typedef struct DomBridge {
     uint64_t entropy_state;
     uint64_t replay_seed;
     bool deterministic_clock;
+    bool fixed_wall_clock;
     bool wall_clock_timers;
     uint64_t clock_origin_ms;
     uint64_t clock_host_elapsed_ms;
@@ -759,6 +760,13 @@ typedef enum {
     SCRIPT_HOST_UPDATE_GAMEPAD,
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
+
+typedef struct ScriptImageLoadState {
+    long handle;
+    uint64_t source_hash;
+    bool pending;
+    bool delivered;
+} ScriptImageLoadState;
 
 /* Slots of ScriptRuntime.host_state, which scheduler.js sees as a
    Float64Array (its HOST_* constants): facts the event loop needs every
@@ -986,6 +994,11 @@ struct ScriptRuntime {
     /* Captured before author scripts run. Keeping the callable values here
        avoids a global lookup and prevents author replacement of private host
        bridge properties from intercepting native viewport updates. */
+    /* At most one source completion per tracked image; weak identities are
+       checked before touching DOM across author tasks. Allocated on demand. */
+    struct ScriptImageLoadState *image_load_states;
+    size_t image_load_state_count;
+    size_t image_load_pending;
     JSValue page_scroll_apply;
     JSValue page_scroll_flush;
     JSValue dispatch_at;

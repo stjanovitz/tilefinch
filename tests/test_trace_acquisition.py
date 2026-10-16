@@ -1153,6 +1153,38 @@ class TraceFormatDriftTests(unittest.TestCase):
 
 class RecorderPolicyTests(unittest.TestCase):
     @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_preflight_admission_is_read_only_and_explicit(self) -> None:
+        for method, origin, names, expected in (
+                ("GET", "https://page.invalid", "x-test", 1),
+                ("POST", "https://page.invalid", "x-test", 2),
+                ("GET", "null", "x-test", 2),
+                ("GET", "https://page.invalid", "bad:name", 2),
+                ("GET", "https://page.invalid", "x-test\nAuthorization: bad", 2)):
+            with self.subTest(method=method, origin=origin, names=names), tempfile.TemporaryDirectory() as root:
+                output = Path(root) / "trace"
+                result = subprocess.run([str(RECORDER_BINARY), "--method", "OPTIONS",
+                    "--url", "https://example.invalid/", "--origin", origin,
+                    "--preflight-method", method, "--preflight-headers", names,
+                    "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(output.exists(), expected == 1)
+
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_header_file_cannot_supply_credentials_or_transport_headers(self) -> None:
+        for header in ("Authorization: secret", "Cookie: name=value", "X-API-Key: secret",
+                       "X-Session-Token: secret", "Host: elsewhere.invalid", "X-Test: value\r\nOther: injected"):
+            with self.subTest(header=header), tempfile.TemporaryDirectory() as root:
+                headers = Path(root) / "headers"; headers.write_text(header + "\n")
+                output = Path(root) / "must-not-exist"
+                result = subprocess.run([str(RECORDER_BINARY), "--method", "GET",
+                    "--url", "https://example.invalid/", "--headers-file", str(headers),
+                    "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(output.exists())
+
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
     def test_host_recorder_rejects_noncanonical_origin_before_network(self) -> None:
         for origin in ("http://example.invalid", "https://example.invalid/",
                        "https://example.invalid/path", "https://example.invalid:443",

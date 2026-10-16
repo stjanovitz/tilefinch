@@ -432,7 +432,7 @@ bool font_face_share_encoded(FontFace *destination, const FontFace *source,
     FreeTypeWebFace *state = source->implementation;
     if (state->maximum_bytes != maximum_backend_bytes || state->references == 0
         || state->references >= TILEFINCH_WEB_FONT_FAMILY_LIMIT * TILEFINCH_WEB_FONT_WEIGHT_LIMIT
-        || memcmp(source->data, data, length) != 0) return false;
+        || (source->data != data && memcmp(source->data, data, length) != 0)) return false;
     state->references++;
     *destination = *source;
     destination->serial = font_next_generation();
@@ -583,7 +583,7 @@ void web_font_set_destroy(WebFontSet *fonts)
 bool font_family_web(unsigned slot, FontFamily fallback, FontFamily *family)
 {
     if (family == NULL || slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT
-        || fallback > FONT_HUMANIST_SANS) return false;
+        || fallback > FONT_SYSTEM_SANS) return false;
     *family = (FontFamily) (TILEFINCH_WEB_FONT_BASE
                + slot * TILEFINCH_WEB_FONT_FAMILY_STRIDE + (unsigned) fallback);
     return true;
@@ -701,7 +701,8 @@ bool font_context_face_is_bold(
 const FontFace *font_set_face(const FontSet *fonts, FontFamily family)
 {
     if (fonts == NULL) return NULL;
-    if (family == FONT_METRIC_SANS && fonts->metric_sans.loaded) {
+    if ((family == FONT_METRIC_SANS || family == FONT_SYSTEM_SANS)
+        && fonts->metric_sans.loaded) {
         return &fonts->metric_sans;
     }
     if (family == FONT_SERIF && fonts->serif.loaded) return &fonts->serif;
@@ -719,7 +720,8 @@ const FontFace *font_set_face_variant(const FontSet *fonts, FontFamily family,
                                       bool italic, bool bold)
 {
     if (fonts != NULL && bold && !italic) {
-        if (family == FONT_METRIC_SANS && fonts->metric_sans_bold.loaded) {
+        if ((family == FONT_METRIC_SANS || family == FONT_SYSTEM_SANS)
+            && fonts->metric_sans_bold.loaded) {
             return &fonts->metric_sans_bold;
         }
         if (family == FONT_SERIF && fonts->serif_bold.loaded) {
@@ -807,38 +809,6 @@ static FT_Int32 freetype_outline_load_flags(void)
 {
     return FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT | FT_LOAD_NO_BITMAP
            | FT_LOAD_NO_SVG;
-}
-
-static bool freetype_outline_is_axis_aligned_rectangle(
-    const FT_GlyphSlot slot)
-{
-    if (slot == NULL || slot->format != FT_GLYPH_FORMAT_OUTLINE
-        || slot->outline.n_contours != 1 || slot->outline.n_points != 4) {
-        return false;
-    }
-    FT_Pos minimum_x = slot->outline.points[0].x;
-    FT_Pos maximum_x = minimum_x;
-    FT_Pos minimum_y = slot->outline.points[0].y;
-    FT_Pos maximum_y = minimum_y;
-    for (short i = 0; i < 4; i++) {
-        if (FT_CURVE_TAG(slot->outline.tags[i]) != FT_CURVE_TAG_ON) {
-            return false;
-        }
-        FT_Pos x = slot->outline.points[i].x;
-        FT_Pos y = slot->outline.points[i].y;
-        if (x < minimum_x) minimum_x = x;
-        if (x > maximum_x) maximum_x = x;
-        if (y < minimum_y) minimum_y = y;
-        if (y > maximum_y) maximum_y = y;
-    }
-    if (minimum_x == maximum_x || minimum_y == maximum_y) return false;
-    for (short i = 0; i < 4; i++) {
-        FT_Pos x = slot->outline.points[i].x;
-        FT_Pos y = slot->outline.points[i].y;
-        if ((x != minimum_x && x != maximum_x)
-            || (y != minimum_y && y != maximum_y)) return false;
-    }
-    return true;
 }
 
 static int fixed_26_6_to_int(FT_Pos value)
@@ -2001,14 +1971,85 @@ static const uint16_t humanist_sans_bold_advances[95] = {
     1222, 1456, 1113, 1456, 1776
 };
 
+/* Independently measured modern system-sans advances in 2048-unit em
+   space at 13px and 22px. Reuse the existing metric-sans
+   outlines and Unicode fallback, as the humanist profile does. These are
+   advances, not font software; platform-specific outlines and non-ASCII
+   optical metrics remain with the existing fallback faces. */
+static const uint16_t system_sans_advances[2][95] = {
+    {
+        470,565,874,1239,1239,1744,1387,538,694,694,
+        865,1239,495,896,495,573,1241,904,1171,1222,
+        1252,1206,1259,1118,1242,1259,495,495,1239,1239,
+        1239,1001,1809,1314,1265,1410,1412,1149,1100,1462,
+        1450,478,1032,1262,1092,1720,1450,1513,1215,1513,
+        1255,1234,1217,1442,1310,1911,1319,1272,1282,694,
+        573,694,1239,1110,1000,1052,1169,1059,1169,1082,
+        654,1159,1128,438,436,1026,441,1686,1110,1121,
+        1160,1159,677,985,653,1110,1022,1498,989,1027,
+        1003,694,460,694,1239
+    }, {
+        439,662,1019,1315,1325,1940,1454,604,803,803,
+        930,1325,573,921,573,627,1347,990,1250,1304,
+        1340,1293,1342,1179,1348,1342,573,573,1325,1325,
+        1325,1092,1832,1432,1338,1463,1455,1197,1146,1497,
+        1522,570,1160,1368,1138,1783,1491,1550,1295,1550,
+        1339,1311,1265,1476,1407,1996,1422,1380,1311,803,
+        627,803,1325,1205,1000,1138,1251,1133,1250,1157,
+        755,1241,1219,514,513,1139,523,1811,1205,1194,
+        1243,1243,790,1080,759,1205,1110,1649,1108,1136,
+        1070,803,527,803,1325
+    }
+};
+
+static const uint16_t system_sans_small_advances[2][95] = {
+    {
+        564,625,966,1278,1278,1883,1445,596,770,770,
+        954,1278,596,954,596,612,1278,938,1224,1272,
+        1306,1254,1292,1154,1296,1292,596,596,1278,1278,
+        1278,1038,1868,1368,1334,1454,1476,1208,1160,1517,
+        1508,536,1090,1337,1151,1778,1508,1568,1289,1568,
+        1326,1293,1286,1498,1368,1970,1378,1330,1343,770,
+        612,770,1278,1183,1012,1118,1246,1134,1246,1158,
+        729,1236,1193,494,493,1100,506,1770,1183,1198,
+        1238,1236,768,1060,732,1183,1098,1574,1062,1100,
+        1092,770,518,770,1278
+    }, {
+        516,718,1153,1363,1363,2109,1513,700,866,866,
+        980,1363,700,980,700,673,1390,1036,1305,1358,
+        1395,1347,1388,1226,1409,1388,700,700,1363,1363,
+        1363,1129,1887,1488,1408,1506,1519,1262,1212,1545,
+        1592,640,1219,1441,1206,1845,1561,1599,1368,1599,
+        1410,1371,1340,1545,1465,2055,1482,1438,1372,866,
+        673,866,1363,1273,1012,1196,1322,1191,1322,1219,
+        824,1310,1283,576,576,1220,592,1897,1273,1257,
+        1313,1314,879,1148,833,1273,1182,1723,1177,1211,
+        1148,866,601,866,1363
+    }
+};
+
 static bool family_compatible_advance(FontFamily family, unsigned codepoint,
-                                      bool bold, unsigned *units)
+                                      int size_fixed, bool bold,
+                                      unsigned *units)
 {
-    if (family != FONT_HUMANIST_SANS || codepoint < 32
+    if ((family != FONT_HUMANIST_SANS && family != FONT_SYSTEM_SANS)
+        || codepoint < 32
         || codepoint > 126 || units == NULL) return false;
-    const uint16_t *advances = bold ? humanist_sans_bold_advances
-                                    : humanist_sans_regular_advances;
+    const uint16_t *advances = family == FONT_SYSTEM_SANS
+        ? system_sans_advances[bold ? 1 : 0]
+        : (bold ? humanist_sans_bold_advances
+                : humanist_sans_regular_advances);
     *units = advances[codepoint - 32];
+    if (family == FONT_SYSTEM_SANS && size_fixed < 22 * 64) {
+        unsigned small = system_sans_small_advances[bold ? 1 : 0]
+                                                  [codepoint - 32];
+        unsigned fraction = size_fixed <= 13 * 64 ? 0u
+            : (unsigned) (size_fixed - 13 * 64);
+        /* Optical sizing uses the same bounded interpolation for measuring
+           runs and positioning individual glyphs. All products fit uint32. */
+        *units = (small * (9 * 64 - fraction)
+                  + *units * fraction + 9 * 32) / (9 * 64);
+    }
     return true;
 }
 
@@ -2017,7 +2058,8 @@ int font_text_width_for_family_at_size_fixed_mode(
     const char *text, size_t length, int pixel_height_fixed,
     bool synthetic_bold, bool metric_bold, bool kerning)
 {
-    if (metric_family != FONT_HUMANIST_SANS) {
+    if (metric_family != FONT_HUMANIST_SANS
+        && metric_family != FONT_SYSTEM_SANS) {
         return font_text_width_at_size_fixed_mode(
             face, text, length, pixel_height_fixed, synthetic_bold, kerning);
     }
@@ -2030,7 +2072,7 @@ int font_text_width_for_family_at_size_fixed_mode(
     pixel_height_fixed = bounded_pixel_height_fixed(pixel_height_fixed);
     int units_per_em = stb_units_per_em(info);
     if (units_per_em <= 0) return -1;
-    /* Compatible Verdana metrics use a fixed 2048-unit em while native
+    /* Compatible Latin profiles use a fixed 2048-unit em while native
        kerning stays in the loaded face's em. Their bounded common
        denominator lets both accumulate without floating point. */
     int64_t denominator = (int64_t) units_per_em * 2048 * 5;
@@ -2064,7 +2106,8 @@ int font_text_width_for_family_at_size_fixed_mode(
         }
         unsigned compatible_units = 0;
         bool compatible = family_compatible_advance(
-            metric_family, codepoint, metric_bold, &compatible_units);
+            metric_family, codepoint, pixel_height_fixed, metric_bold,
+            &compatible_units);
         int glyph = kerning || !compatible
             ? stbtt_FindGlyphIndex(info, (int) codepoint) : 0;
         if (kerning && previous != 0) {
@@ -2122,7 +2165,8 @@ int font_glyph_advance_for_family_at_size_fixed(
 {
     unsigned compatible_units = 0;
     if (!family_compatible_advance(
-            metric_family, codepoint, metric_bold, &compatible_units)
+            metric_family, codepoint, pixel_height_fixed, metric_bold,
+            &compatible_units)
         || pixel_height_fixed <= 0) return native_advance_fixed;
     pixel_height_fixed = bounded_pixel_height_fixed(pixel_height_fixed);
     int64_t advance = (int64_t) compatible_units * pixel_height_fixed;
@@ -2411,27 +2455,9 @@ bool font_glyph_load_at_size_profile(const FontFace *face, unsigned codepoint,
                        > TILEFINCH_WEB_FONT_GLYPH_PIXEL_LIMIT
                          / predicted_height)) return false;
         FT_Pos advance = slot->advance.x + (bold ? 22 : 0);
-        if (freetype_outline_is_axis_aligned_rectangle(slot)) {
-            size_t width = predicted_width;
-            size_t height = predicted_height;
-            unsigned char *pixels = NULL;
-            if (width != 0 && height != 0) {
-                pixels = budget_malloc(face->budget, width * height);
-                if (pixels == NULL) return false;
-                memset(pixels, 255, width * height);
-            }
-            glyph->pixels = pixels;
-            glyph->budget = face->budget;
-            glyph->width = (int) width;
-            glyph->height = (int) height;
-            glyph->x_offset = fixed_26_6_to_int(
-                slot->metrics.horiBearingX) / 64;
-            glyph->y_offset = -fixed_26_6_to_int(
-                slot->metrics.horiBearingY) / 64;
-            glyph->advance_fixed = fixed_26_6_to_int(advance);
-            glyph->advance = (glyph->advance_fixed + 32) / 64;
-            return true;
-        }
+        /* Even rectangular stems have fractional edges. Use the same
+           bounded rasterizer and bitmap placement as every other glyph;
+           the glyph cache amortizes this work across later paints. */
         if (FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0) return false;
         size_t width = slot->bitmap.width;
         size_t height = slot->bitmap.rows;
@@ -2520,7 +2546,7 @@ bool font_glyph_load_at_size_profile(const FontFace *face, unsigned codepoint,
            bounded to qualified ASCII candidates; no warm glyph is refit. */
         if (target != NULL && target->right > target->left
             && family_compatible_advance(
-                   FONT_HUMANIST_SANS, codepoint,
+                   FONT_HUMANIST_SANS, codepoint, pixel_height_fixed,
                    (humanist_profile & 1u) == 0u, &compatible_advance)
             && stbtt_GetCodepointBox(info, (int) codepoint,
                                      &left, NULL, &right, NULL)

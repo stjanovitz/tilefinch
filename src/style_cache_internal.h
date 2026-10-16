@@ -4,6 +4,10 @@
 #include "tilefinch/style.h"
 
 bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet);
+bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *node,
+                                     bool outset);
+bool style_node_focus_outset_shadow(const Stylesheet *sheet, lxb_dom_node_t *node,
+    const ComputedStyle *parent, const ComputedStyle *style, StyleBoxShadow *output);
 bool style_selector_reads_focus(const char *selector);
 bool style_custom_rules_may_select_node(const Stylesheet *sheet,
     const uint32_t *rules, size_t count, lxb_dom_node_t *node);

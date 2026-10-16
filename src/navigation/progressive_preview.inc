@@ -94,9 +94,12 @@ static bool navigation_retained_preview_detach(
         DrawCommand *command = &layout->commands[i];
         /* Detached preview ink owns its text and cannot retain a DOM identity
            for later alt-text retirement. It is never a paint-only candidate. */
-        if (command->type == DRAW_TEXT && (command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0) {
+        if (command->type == DRAW_TEXT
+            && ((command->radius & LAYOUT_TEXT_IMAGE_ALT) != 0
+                || (command->image_fit & LAYOUT_TEXT_FOCUS_PSEUDO_MASK) != 0)) {
             command->image = NULL;
             command->radius &= ~LAYOUT_TEXT_IMAGE_ALT;
+            command->image_fit &= (uint8_t) ~LAYOUT_TEXT_FOCUS_PSEUDO_MASK;
         }
         if (command->image != NULL) {
             uintptr_t address = (uintptr_t) command->image;

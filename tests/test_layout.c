@@ -421,6 +421,38 @@ static int test_oversized_style_cache_scan(void)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-ratio-margin-only") == 0)
+        return test_grid_intrinsic_height_and_margin_alignment();
+    if (argc == 2 && strcmp(argv[1], "--flex-separator-only") == 0)
+        return test_generated_flex_intrinsic_separator();
+    CHECK(test_grid_intrinsic_height_and_margin_alignment() == 0);
+    CHECK(test_generated_flex_intrinsic_separator() == 0);
+    if (argc == 2 && strcmp(argv[1], "--clamp-box-only") == 0)
+        return test_clamp_requires_vertical_box();
+    if (argc == 2 && strcmp(argv[1], "--negative-float-margin-only") == 0)
+        return test_negative_margin_reaches_enclosing_floats();
+    if (argc == 2 && strcmp(argv[1], "--system-font-family-only") == 0)
+        return test_system_font_family_identity();
+    if (argc == 2 && strcmp(argv[1], "--percentage-image-auto-only") == 0)
+        return test_percentage_image_auto_height();
+    if (argc == 2 && strcmp(argv[1], "--floating-generated-marker-only") == 0)
+        return test_floating_generated_list_marker();
+    if (argc == 2 && strcmp(argv[1], "--compact-background-only") == 0)
+        return test_compact_background_geometry();
+    if (argc == 2 && strcmp(argv[1], "--intrinsic-floats-only") == 0)
+        return test_intrinsic_float_rows();
+    if (argc == 2 && strcmp(argv[1], "--border-triangles-only") == 0)
+        return test_border_color_triangles();
+    if (argc == 2 && strcmp(argv[1], "--fractional-tracking-only") == 0)
+        return test_fractional_tracking();
+    if (argc == 2 && strcmp(argv[1], "--nested-flex-baseline-only") == 0)
+        return test_nested_flex_baseline();
+    if (argc == 2 && strcmp(argv[1], "--css-replacement-image-only") == 0)
+        return test_css_replacement_image();
+    if (argc == 2 && strcmp(argv[1], "--button-content-centering-only") == 0)
+        return test_button_content_centering();
+    if (argc == 2 && strcmp(argv[1], "--unknown-media-dimensions-only") == 0)
+        return test_unknown_media_dimensions();
     if (argc == 2 && strcmp(argv[1], "--auto-grid-align-only") == 0)
         return test_auto_grid_block_alignment();
     if (argc == 2 && strcmp(argv[1], "--oversized-style-cache-only") == 0)

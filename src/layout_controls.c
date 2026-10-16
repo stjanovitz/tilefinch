@@ -24,7 +24,7 @@ bool layout_control_text_style(LayoutContext *context, lxb_dom_node_t *node,
     draw_command_set_text_font_family(text, style->font_family);
     text->font_weight = draw_font_weight(style);
     text->font_italic = style->font_italic;
-    text->letter_spacing = style->letter_spacing;
+    draw_command_set_text_letter_spacing_fixed(text, style->letter_spacing_fixed);
     text->radius |= (int) style->font_size_fraction << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
         | (computed_style_kerning_none(style) ? LAYOUT_TEXT_KERNING_NONE : 0);
     text->image_fit = text_decoration_bits(style);

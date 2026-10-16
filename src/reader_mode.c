@@ -2,10 +2,12 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/layout.h"
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/resources.h"
 
@@ -30,7 +32,7 @@
    bound scales with the page budget's free room. A preparation always gets
    the floor (512 nodes, 256 KiB: the fixed bound before scaling); beyond
    that, one more node per KiB of room left above a 4 MiB reserve, up to
-   4,096 nodes. The reserve covers what presenting any view costs whatever
+   8,192 nodes. The reserve covers what presenting any view costs whatever
    its size (restyling the raw page and laying out the view before the
    page's scripts are retired: about 2 MiB on en.wikipedia.org, up to
    3.3 MiB on the census) plus a margin, so the extra nodes never take the
@@ -39,7 +41,7 @@
    buffer grows on demand, so a small page never holds the whole byte bound.
    Both bounds are fixed when a preparation starts, so the same budget state
    always yields the same view. */
-#define READER_EXTRACT_NODE_CEILING 4096u
+#define READER_EXTRACT_NODE_CEILING 8192u
 #define READER_EXTRACT_NODE_COST 1024u
 #define READER_EXTRACT_RESERVE_BYTES (4u * 1024u * 1024u)
 #define READER_EXTRACT_BYTES_PER_NODE 256u
@@ -47,7 +49,7 @@
 #define READER_EXTRACT_INITIAL_BYTES (64u * 1024u)
 /* Reader walks only its article or listing root; this bounds its non-emitting
    wrappers and text at four source nodes per emitted node. */
-#define READER_EXTRACT_VISIT_LIMIT 16384u
+#define READER_EXTRACT_VISIT_LIMIT (READER_EXTRACT_NODE_CEILING * 4u)
 /* Basic view is bounded by what it emits, not by how much wrapper markup
    precedes the content: a news front page reaches its first story after
    thousands of layout wrappers (apnews.com: 24,585 nodes). The walk stops as
@@ -114,6 +116,7 @@ typedef struct {
 
 typedef struct {
     const PocDocument *document;
+    const LayoutDocument *source_layout;
     Budget *budget;
     char *data;
     size_t length;
@@ -1629,6 +1632,21 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
                 || !reader_extract_attribute(output, node, "srcset")
                 || !reader_extract_attribute(output, node, "sizes"))
                 goto append_failed;
+            const LayoutNodeBox *box = output->source_layout == NULL
+                ? NULL : layout_box_for_node(output->source_layout, node);
+            if (box != NULL && box->content_width > 0) {
+                /* Native simplified-view CSS keeps height auto and caps
+                   width at its viewport. Retain only the useful source
+                   inline size, not clipping, transforms or cropped height. */
+                char sizing[48];
+                int written = snprintf(sizing, sizeof(sizing),
+                                       "width:%dpx!important",
+                                       box->content_width);
+                if (written < 0 || (size_t) written >= sizeof(sizing)
+                    || !reader_extract_value_attribute(
+                           output, "style", sizing, (size_t) written))
+                    goto append_failed;
+            }
         } else if (strcmp(tag, "video") == 0
                    || strcmp(tag, "audio") == 0) {
             if (!reader_extract_attribute(output, node, "src")
@@ -2217,13 +2235,14 @@ static bool reader_heading_links_away(const ReaderNodeStat *stats,
 static bool reader_article_is_clear(const ReaderNodeStat *stats,
                                     size_t count, size_t root)
 {
-    if (root >= count) return false;
+    if (root >= count
+        || (stats[root].flags & READER_STAT_OWN_STYLE_HIDDEN) != 0) return false;
     size_t end = reader_subtree_end(stats, count, root);
     uint32_t prose = 0;
     size_t paragraphs = 0, prose_paragraphs = 0, headlines = 0, titles = 0;
     for (size_t i = root; i < end; i++) {
         const ReaderNodeStat *stat = &stats[i];
-        if ((stat->flags & READER_STAT_EXCLUDED) != 0) continue;
+        if ((stat->flags & (READER_STAT_EXCLUDED | READER_STAT_OWN_STYLE_HIDDEN)) != 0) continue;
         if (reader_name_is(stat->node, "h1")) titles++;
         if ((reader_name_is(stat->node, "h2")
              || reader_name_is(stat->node, "h3")
@@ -2726,6 +2745,11 @@ static bool reader_document_prepare_internal(
                 : stack[depth - 1u];
             if (hidden_depth != 0 || excluded_depth != 0)
                 stat->flags |= READER_STAT_EXCLUDED;
+            /* Hidden prose remains recoverable in manual Reader, but must
+               not make an unrelated visible landing page an auto article.
+               own_flags still records only this element for depth unwind. */
+            if (style_hidden_depth != 0)
+                stat->flags |= READER_STAT_OWN_STYLE_HIDDEN;
             if (hidden) stat->own_flags |= READER_STAT_OWN_HIDDEN;
             if (style_hidden)
                 stat->own_flags |= READER_STAT_OWN_STYLE_HIDDEN;
@@ -3105,9 +3129,9 @@ void reader_document_discard_exact_prepared_view(
 
 static bool reader_document_prepare_basic_internal(
     PocDocument *document, const Stylesheet *stylesheet,
+    const LayoutDocument *source_layout,
     ReaderDocumentAnalysis *analysis, bool install, bool require_complete)
 {
-    (void) stylesheet;
     if (analysis == NULL) return false;
     *analysis = (ReaderDocumentAnalysis) { .prepared = true };
     if (document == NULL || document->budget == NULL)
@@ -3119,6 +3143,11 @@ static bool reader_document_prepare_basic_internal(
         analysis->bounded_out = true;
         return true;
     }
+    if (source_layout != NULL && stylesheet != NULL
+        && source_layout->image_content_generation == document->content_generation
+        && source_layout->image_style_generation == document_style_generation()
+        && source_layout->image_sheet_generation == stylesheet->build_generation)
+        output.source_layout = source_layout;
     const MediaDeclaredVideo *declared_video =
         media_declared_video_cached(document);
     bool synthesize_declared_video = declared_video != NULL
@@ -3219,7 +3248,7 @@ bool reader_document_prepare_basic_with_stylesheet(
     ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_basic_internal(
-        document, stylesheet, analysis, true, false);
+        document, stylesheet, NULL, analysis, true, false);
 }
 
 bool reader_document_prepare_basic_complete_with_stylesheet(
@@ -3230,7 +3259,15 @@ bool reader_document_prepare_basic_complete_with_stylesheet(
        mutation. Complete admission can therefore validate and commit that
        same buffer once, rather than repeating the entire source traversal. */
     return reader_document_prepare_basic_internal(
-        document, stylesheet, analysis, true, true);
+        document, stylesheet, NULL, analysis, true, true);
+}
+
+bool reader_document_prepare_basic_complete_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const LayoutDocument *layout, ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_basic_internal(
+        document, stylesheet, layout, analysis, true, true);
 }
 
 bool reader_document_discard_prepared_view(

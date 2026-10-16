@@ -176,19 +176,18 @@ static bool style_property_letter_spacing(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
-        if (style_resolve_value(sheet, value, value_length, resolved,
-                          sizeof(resolved), 0)) {
-            int spacing = strstr(resolved, "normal") != NULL
-                          ? 0 : style_parse_length(
-                              sheet, resolved, strlen(resolved),
-                              0, NULL);
-            if (spacing < -128) spacing = -128;
-            if (spacing > 127) spacing = 127;
-            style->letter_spacing = (int8_t) spacing;
+    char resolved[48];
+    if (style_resolve_value(sheet, value, value_length, resolved,
+                            sizeof(resolved), 0)) {
+        int16_t spacing = 0;
+        if (strcmp(resolved, "normal") == 0
+            || style_parse_letter_spacing(sheet, resolved,
+                strlen(resolved), &spacing)) {
+            style->letter_spacing_fixed = spacing;
             *mask |= S_LETTER_SPACING;
         }
-    
+    }
+
     return true;
 }
 

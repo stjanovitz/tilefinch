@@ -48,6 +48,48 @@
     navigation_destroy(&navigation);
     CHECK(budget.current == 0);
 
+    {
+    puts("test: layout pressure retains exact selector results");
+    static char pressure_html[96 * 1024];
+    size_t pressure_length = (size_t) snprintf(pressure_html,
+        sizeof(pressure_html), "<!doctype html><style>span{display:block}"
+        ".item{color:#123456}");
+    for (unsigned i = 0; i < 70; i++)
+        pressure_length += (size_t) snprintf(pressure_html + pressure_length,
+            sizeof(pressure_html) - pressure_length, ".unused%u{margin:0}", i);
+    pressure_length += (size_t) snprintf(pressure_html + pressure_length,
+        sizeof(pressure_html) - pressure_length, "</style><body>");
+    for (unsigned i = 0; i < 1400; i++)
+        pressure_length += (size_t) snprintf(pressure_html + pressure_length,
+            sizeof(pressure_html) - pressure_length,
+            "<span class=item>row%u</span>", i);
+    CHECK(pressure_length < sizeof(pressure_html));
+    CHECK(navigation_init(&navigation, &budget, 2));
+    CHECK(navigation_commit_static_html(&navigation, navigation_begin(&navigation),
+        "https://pressure.test/", pressure_html, pressure_length,
+        480, NULL, NULL, true));
+    LayoutReuseStats pressure_before = {0}, pressure_after = {0};
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &pressure_before);
+    CHECK(pressure_before.matched_stores > 1000);
+    uint64_t pressure_fingerprint = navigation.page.layout.text_fingerprint;
+    int pressure_height = navigation.page.layout.height;
+    size_t pressure_remaining = budget_remaining(&budget);
+    CHECK(pressure_remaining > 768u * 1024u);
+    void *pressure_charge = budget_malloc(&budget,
+        pressure_remaining - 768u * 1024u);
+    CHECK(pressure_charge != NULL && navigation_relayout(&navigation));
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &pressure_after);
+    CHECK(navigation.performance.layout_reuse_pressure_evictions == 0
+        && pressure_after.matched_hits > pressure_before.matched_hits
+        && navigation.page.layout.text_fingerprint == pressure_fingerprint
+        && navigation.page.layout.height == pressure_height);
+    budget_free(&budget, pressure_charge);
+    CHECK(navigation_relayout(&navigation));
+    CHECK(navigation.page.layout.text_fingerprint == pressure_fingerprint);
+    navigation_destroy(&navigation);
+    CHECK(budget.current == 0);
+    }
+
     puts("test: repeated fresh documents retain Worker lifecycle invariants");
     static const char repeated_realm_page[] =
         "<!doctype html><title>Realm lifecycle</title><body>"
@@ -3149,6 +3191,328 @@
         CHECK(budget.current == 0);
     }
 
+    {
+        puts("test: boolean focus-within carriers do not invalidate unrelated controls");
+        static const char *const selectors[] = {
+            ".carrier:where([data-state]:focus-within) .target",
+            ".carrier:not([loaded],:focus-within) .target",
+            ".carrier:is(:where([data-state]:focus-within),.alternate) .target"
+        };
+        for (size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); i++) {
+            char page[1024];
+            int length = snprintf(page, sizeof(page),
+                "<!doctype html><style>%s{color:red}</style><body>"
+                "<button id=outside>Outside</button>"
+                "<section class=carrier data-state><button id=inside>Inside</button>"
+                "<span class=target>Target</span></section>", selectors[i]);
+            CHECK(length > 0 && (size_t) length < sizeof(page));
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4 * MIB, 1000);
+            CHECK(navigation_commit_html(&session, navigation_begin(&session),
+                "https://focus.test/boolean", page, (size_t) length,
+                480, NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller, find_id(root, "outside"))
+                  && session.incremental_relayouts == relayouts);
+            CHECK(controller_focus_node(&controller, find_id(root, "inside"))
+                  && session.incremental_relayouts == relayouts + 1u);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
+    }
+    {
+        puts("test: redundant retained focus values do not require layout");
+        static const char page[] = "<!doctype html><style>"
+            "html,html:focus-within{scroll-behavior:smooth}"
+            "button:focus-within{outline:2px solid blue}"
+            "button.changed:focus{scroll-behavior:auto}"
+            "</style><body><button id=plain>Plain</button>"
+            "<button class=changed id=changed>Changed</button>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/redundant", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t relayouts = session.incremental_relayouts;
+        CHECK(controller_focus_node(&controller, find_id(root, "plain"))
+              && session.incremental_relayouts == relayouts);
+        CHECK(controller_focus_node(&controller, find_id(root, "changed"))
+              && session.incremental_relayouts == relayouts + 1u);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
+    {
+        puts("test: focus-only punctuation visibility matches full layout without flow");
+        static const char page[] = "<!doctype html><style>body{margin:0}"
+            "h2{font-size:32px;line-height:40px;margin:0}"
+            "a{padding-right:20px}"
+            "a::after{content:'#';position:absolute;font-size:24px;margin-top:.3em;color:red}"
+            "a:not(:focus)::after,a:not(:focus)::before{visibility:hidden}"
+            "</style><h2 id=head><a id=one href=/one>One</a></h2>"
+            "<h2><a id=two href=/two>Two</a></h2>"
+            "<div id=other style='height:300px'></div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/visibility", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        CHECK(layout_box_for_node(&session.page.layout, find_id(root, "head"))->height == 40);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast != NULL && full != NULL);
+        for (unsigned move = 0; move < 4; move++) {
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller,
+                      find_id(root, move % 2 ? "two" : "one"))
+                  && session.incremental_relayouts == relayouts
+                  && session.focus_paint_damage_valid
+                  && tile_cache_sync_layout_paint(&fast_cache,
+                      session.focus_paint_damage_left, session.focus_paint_damage_top,
+                      session.focus_paint_damage_right, session.focus_paint_damage_bottom)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            tile_cache_destroy(&fast_cache);
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL)
+                  && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+            tile_cache_destroy(&full_cache);
+        }
+        budget_free(&budget, full);
+        budget_free(&budget, fast);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
+    {
+        puts("test: translated pseudo focus paint matches full layout in both directions");
+        static const char page[] = "<!doctype html><style>body{margin:0}"
+            "a{display:inline-block;position:relative;overflow:hidden;"
+            "width:80px;height:24px;outline:none}"
+            "a::after{content:'';display:block;position:absolute;left:0;right:0;"
+            "bottom:0;margin-bottom:-5px;height:5px;background:#cc0000}"
+            "a:focus::after{transform:translateY(-5px)}"
+            "a:focus{box-shadow:0 0 0 3px blue}"
+            "</style><body><a id=one href=/one>One</a><a id=two href=/two>Two</a>"
+            "<div id=other style='height:300px'></div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/pseudo", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast != NULL && full != NULL);
+        for (unsigned move = 0; move < 4; move++) {
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            size_t relayouts = session.incremental_relayouts;
+            bool moved = controller_focus_node(&controller, find_id(root, move % 2 ? "two" : "one"));
+            CHECK(moved
+                  && session.incremental_relayouts == relayouts
+                  && session.performance.focus_paint_relayout_skips == move + 1u);
+            ComputedStyle normal, focused;
+            StyleFocusPseudoTranslation translation;
+            lxb_dom_node_t *selected = find_id(root, move % 2 ? "two" : "one");
+            CHECK(style_focus_pseudo_change_classify(&session.page.stylesheet,
+                      selected, NULL, &normal, &focused, &translation)
+                      == STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY
+                  && layout_apply_focus_pseudo_translation(&session.page.layout,
+                      selected, &translation, true, false, NULL, NULL, NULL, NULL));
+            int width = session.page.layout.scroll_width;
+            const LayoutNodeBox *box = layout_box_for_node(&session.page.layout, find_id(root,"one"));
+            CHECK(box != NULL);
+            int content_height = box->content_height;
+            CHECK(session.focus_paint_damage_valid
+                  && tile_cache_sync_layout_paint(&fast_cache,
+                      session.focus_paint_damage_left, session.focus_paint_damage_top,
+                      session.focus_paint_damage_right, session.focus_paint_damage_bottom)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            tile_cache_destroy(&fast_cache);
+            char script[128];
+            snprintf(script, sizeof(script),
+                "document.getElementById('other').style.height='%upx'", 301u + move);
+            CHECK(script_runtime_evaluate_diagnostic(session.page.runtime, script,
+                      "<focus-paint-cache>", &session.page.script_result)
+                  && script_runtime_consume_relayout(session.page.runtime)
+                  && navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL)
+                  && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+            tile_cache_destroy(&full_cache);
+            int height = session.page.layout.height;
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && session.page.layout.height == height && session.page.layout.scroll_width == width
+                  && layout_box_for_node(&session.page.layout, find_id(root,"one"))->content_height == content_height
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL)
+                  && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+            tile_cache_destroy(&full_cache);
+        }
+        budget_free(&budget, full);budget_free(&budget, fast);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
+    {
+        puts("test: removing an offset shadow preserves cached paint and navigation");
+        for (unsigned stretched = 0; stretched < 2; stretched++) {
+        char page[1024];
+        int length = snprintf(page, sizeof(page), "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>body{margin:0;height:900px}button{display:block;width:100px;height:28px;"
+            "border:1px solid gray;border-radius:6px;background:white;box-shadow:0 1px 0 red}"
+            "button:focus{box-shadow:none;border-color:blue;outline:none}%s</style>"
+            "<section><button id=one>One</button><button id=two>Two</button></section>",
+            stretched ? "section{display:flex;height:80px}button{height:auto}" : "");
+        CHECK(length > 0 && (size_t) length < sizeof(page));
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/shadow-removal", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast && full);
+        TileCache cache = {0};
+        CHECK(tile_cache_init(&cache, &budget, &session.page.layout, 8)
+              && tile_cache_set_frame(&cache, fast, pixels)
+              && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+        size_t relayouts = session.incremental_relayouts;
+        for (unsigned move = 0; move < 4; move++) {
+            CHECK(controller_focus_node(&controller, find_id(root, move % 2 ? "two" : "one")));
+            CHECK(session.incremental_relayouts == relayouts);
+            CHECK(navigation_current(&session)->scroll_y == 0);
+            CHECK(tile_cache_sync_layout_paint(&cache,
+                      session.focus_paint_damage_left, session.focus_paint_damage_top,
+                      session.focus_paint_damage_right, session.focus_paint_damage_bottom)
+                  && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+        }
+        tile_cache_destroy(&cache);
+        int height = session.page.layout.height;
+        session.style_rebuild_required = true;
+        CHECK(navigation_relayout(&session) && session.page.layout.height == height
+              && navigation_current(&session)->scroll_y == 0
+              && tile_cache_init(&cache, &budget, &session.page.layout, 8)
+              && tile_cache_set_frame(&cache, full, pixels)
+              && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+              && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+        tile_cache_destroy(&cache);
+        budget_free(&budget, fast);budget_free(&budget, full);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+        }
+    }
+
+    {
+        puts("test: local focus layout retains unrelated cascade entries");
+        char page[16384];
+        size_t used = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<style>button{display:block;width:100px;height:28px}"
+            "button:focus{width:120px;outline:none}"
+            ".unrelated:focus+span{--accent:red;color:red}"
+            ".elsewhere:focus-within p{color:blue}</style><button id=target>Target</button>");
+        for (unsigned i = 0; i < 300; i++) {
+            int added = snprintf(page + used, sizeof(page) - used, "<p>Paragraph %u</p>", i);
+            CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+            used += (size_t) added;
+        }
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/local-layout", page, used, 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *target = find_id(lxb_dom_interface_node(session.page.document.html), "target");
+        CHECK(session.page.layout_reuse != NULL && style_focus_change_is_local(&session.page.stylesheet, target));
+        size_t resets = session.performance.layout_reuse_full_resets;
+        size_t relayouts = session.incremental_relayouts;
+        CHECK(controller_focus_node(&controller, target)
+              && session.incremental_relayouts == relayouts + 1u
+              && session.performance.layout_reuse_full_resets == resets
+              && layout_box_for_node(&session.page.layout, target)->width == 120
+              && navigation_current(&session)->scroll_y == 0);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
+    {
+        puts("test: unrelated and offscreen controls cannot exhaust visible focus ring slots");
+        for (unsigned variant = 0; variant < 2; variant++) {
+            char page[16384];
+            size_t used = (size_t) snprintf(page, sizeof(page),
+                "<!doctype html><meta name=viewport content='width=device-width'>"
+                "<style>body{margin:0;height:2400px}button{border:0;border-radius:0;"
+                "padding:6px;width:80px;height:30px}"
+                "button:focus{outline:2px solid var(--outline,blue);box-shadow:none}"
+                ".ring{display:inline-block}.ring:focus{box-shadow:inset 0 0 0 2px blue}"
+                "</style><body>%s",
+                variant ? "<div style='height:2000px'></div>" : "");
+            /* Large-page reuse owns the viewport admission hint (small pages
+               deliberately avoid that cache and keep full-layout fallback). */
+            for (unsigned i = 0; i < 300; i++) {
+                int added = snprintf(page + used, sizeof(page) - used,
+                    "<button class='%s'>Other %u</button>", variant ? "ring" : "", i);
+                CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+                used += (size_t) added;
+            }
+            int added = snprintf(page + used, sizeof(page) - used,
+                "<button class=ring id=visible>Visible</button>");
+            CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+            used += (size_t) added;
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4 * MIB, 1000);
+            CHECK(navigation_commit_html(&session, navigation_begin(&session),
+                "https://focus.test/admission", page, used, 480, NULL, NULL, true));
+            lxb_dom_node_t *visible = find_id(
+                lxb_dom_interface_node(session.page.document.html), "visible");
+            const LayoutNodeBox *visible_box = layout_box_for_node(&session.page.layout, visible);
+            CHECK(visible_box != NULL && navigation_set_scroll(&session, visible_box->y));
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller, visible)
+                  && session.incremental_relayouts == relayouts
+                  && session.performance.focus_paint_relayout_skips == 1u);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
+    }
+
     puts("test: relational and inherited focus dependencies force layout");
     {
         static const char *const refusals[] = {
@@ -3156,7 +3520,12 @@
             "button:focus{box-shadow:inset 0 0 2px 2px #36c}",
             "button:focus{box-shadow:inset 0 0 0 1px #36c,inset 0 0 0 2px #fff}",
             "body{opacity:.5}button:focus{box-shadow:inset 0 0 0 1px #36c}",
-            "button{background:red;border-color:transparent}button:focus{border-color:blue}"
+            "button{background:red;border-color:transparent}button:focus{border-color:blue}",
+            "button::after{content:'text'}button:focus::after{transform:translateY(-2px)}",
+            "button::after{content:'';position:absolute;width:10px;height:5px;background:red}"
+                "button:focus::after{width:20px}",
+            "body{height:600px}button::after{content:'';position:absolute;top:0;"
+                "width:10px;height:5px;background:red}button:focus::after{transform:translateY(128px)}"
         };
         for (size_t i = 0; i < sizeof(refusals) / sizeof(refusals[0]); i++) {
             char page[1024];

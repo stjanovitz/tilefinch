@@ -503,6 +503,7 @@ static void layout_reuse_drop_style(LayoutReuseCache *cache,
 static bool layout_reuse_admit_payload(LayoutReuseCache *cache,
                                        uint16_t *index)
 {
+    if (cache->style_pressure_trimmed) return false;
     if (cache->style_payload_free != 0) {
         *index = (uint16_t) (cache->style_payload_free - 1u);
         cache->style_payload_free =
@@ -651,6 +652,23 @@ static void layout_reuse_fit_styles(LayoutReuseCache *cache)
         fprintf(stderr, "layout-reuse-fit capacity=%zu->%zu wanted=%zu\n",
                 capacity, grown, wanted);
 #endif
+}
+
+size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache)
+{
+    if (cache == NULL) return 0;
+    layout_reuse_clear_styles(cache);
+    cache->style_pressure_trimmed = true;
+    size_t released = 0;
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_PAGE_COUNT; i++) {
+        if (cache->style_pages[i] == NULL) continue;
+        budget_free(cache->budget, cache->style_pages[i]);
+        cache->style_pages[i] = NULL;
+        released += LAYOUT_REUSE_STYLE_PAGE_SIZE
+            * sizeof(LayoutReuseStylePayload);
+    }
+    cache->stats.retained_bytes -= released;
+    return released;
 }
 
 void layout_reuse_cache_destroy(LayoutReuseCache *cache)
@@ -2017,11 +2035,24 @@ void layout_reuse_cache_invalidate_inline_style(
     cache->stats.inline_style_scoped++;
 }
 
+void layout_reuse_cache_set_focus_scroll(LayoutReuseCache *cache, int top)
+{
+    if (cache != NULL) cache->focus_scroll = top < 0 ? 0 : top;
+}
+
 void layout_reuse_cache_invalidate_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node)
 {
     if (cache == NULL || node == NULL) {
         layout_reuse_cache_reset(cache);
+        return;
+    }
+    /* Local focus can change geometry or complex paint without changing
+       unrelated selector answers. Keep full flow, but not a whole-page
+       cascade reset caused by an unrelated :has() or custom focus rule. */
+    if (style_focus_change_is_local(cache->sheet, node)) {
+        layout_reuse_drop_subtree(cache, node, true);
+        layout_reuse_cache_invalidate_measurements(cache, node);
         return;
     }
     if (cache->selector_focus_has_sibling) {
@@ -2675,6 +2706,10 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
 {
     if (cache == NULL) return;
     layout_reuse_cache_flush_invalidations(cache);
+    if (cache->style_pressure_trimmed
+        && !budget_pressure_required(cache->budget,
+                                     384u * 1024u, 512u * 1024u))
+        cache->style_pressure_trimmed = false;
     /* A few probe collisions are not a walk longer than the table. */
     if (cache->style_shortfall > (cache->style_mask + 1u) / 16u
 #ifndef TILEFINCH_NO_TRACE
@@ -3893,7 +3928,8 @@ static void layout_job_check_container_log(LayoutBuildJob *job)
             || x->width != y->width || x->height != y->height
             || x->color != y->color || x->image != y->image
             || x->text_length != y->text_length
-            || (x->text_length != 0 && x->text != NULL && y->text != NULL
+            || (x->type == DRAW_TEXT && x->text_length != 0
+                && x->text != NULL && y->text != NULL
                 && memcmp(x->text, y->text, x->text_length) != 0))
             mismatch = i;
     }
@@ -5027,12 +5063,10 @@ bool layout_clone_visual(LayoutDocument *visual,
                                    &command->width);
         viewport_css_box_to_device(&source->viewport, &command->y,
                                    &command->height);
-        if (command->letter_spacing != 0) {
-            int spacing = viewport_scale_floor(
-                command->letter_spacing, numerator, denominator);
-            if (spacing > INT8_MAX) spacing = INT8_MAX;
-            if (spacing < INT8_MIN) spacing = INT8_MIN;
-            command->letter_spacing = (int8_t) spacing;
+        if (command->type == DRAW_TEXT) {
+            draw_command_set_text_letter_spacing_fixed(command,
+                viewport_scale_floor(draw_command_text_letter_spacing_fixed(command),
+                    numerator, denominator));
         }
         int underline_offset = 0;
         if (command->type == DRAW_TEXT
@@ -5086,6 +5120,11 @@ bool layout_clone_visual(LayoutDocument *visual,
                 command->radius, numerator, denominator);
             command->scale = viewport_scale_floor(
                 command->scale, numerator, denominator);
+        } else if (command->type == DRAW_BORDER_TRIANGLE) {
+            command->text_length = (uint32_t) viewport_scale_ceil(
+                (int) command->text_length, numerator, denominator);
+            command->font_size = viewport_scale_ceil(
+                command->font_size, numerator, denominator);
         } else if (command->type == DRAW_IMAGE) {
             /* Replaced images pack object-position into radius/font_size.
                Preserve each percentage and scale only its signed CSS-pixel
@@ -5121,6 +5160,13 @@ bool layout_clone_visual(LayoutDocument *visual,
                 command->scale, numerator, denominator);
             if (command->scale < 1) command->scale = 1;
         }
+        if (command->type == DRAW_SHADOW_RECT
+            && command->image_fit == LAYOUT_SHADOW_OUTSIDE_BOX)
+            draw_command_set_shadow_offset(command,
+                viewport_scale_floor((int16_t) command->text_length,
+                                     numerator, denominator),
+                viewport_scale_floor((int16_t) (command->text_length >> 16),
+                                     numerator, denominator));
     }
     for (size_t i = 0; i < visual->link_count; i++) {
         viewport_css_box_to_device(&source->viewport, &visual->links[i].x,
@@ -5452,17 +5498,18 @@ bool layout_focus_for_node(const LayoutDocument *layout,
 
 bool layout_apply_focus_border_paint(
     LayoutDocument *layout, const Stylesheet *stylesheet,
-    lxb_dom_node_t *node, const ComputedStyle *style, bool inset_changed, bool dry_run,
+    lxb_dom_node_t *node, const ComputedStyle *style, StyleFocusChange change, bool dry_run,
     int *left, int *top, int *right, int *bottom)
 {
     int border_radius_code = stylesheet_border_radius_code(
         stylesheet, style);
-    if (layout == NULL || stylesheet == NULL || node == NULL || style == NULL
-        || style_border_radius_maximum(border_radius_code) <= 0
-        || style->border.top <= 0
-        || style->border.top != style->border.right
-        || style->border.top != style->border.bottom
-        || style->border.top != style->border.left) return false;
+    if (layout == NULL || stylesheet == NULL || node == NULL || style == NULL) return false;
+    bool inset_changed = change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY;
+    bool outset_changed = change == STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY;
+    bool border = style_border_radius_maximum(border_radius_code) > 0
+        && style->border.top > 0 && style->border.top == style->border.right
+        && style->border.top == style->border.bottom && style->border.top == style->border.left;
+    if (!border && !inset_changed && !outset_changed) return false;
     const LayoutNodeBox *box = layout_box_for_node(layout, node);
     if (box == NULL || box->width <= 0 || box->height <= 0
         || box->command_start > box->command_end
@@ -5471,7 +5518,7 @@ bool layout_apply_focus_border_paint(
     uint8_t alpha = 0;
     uint32_t color = stylesheet_border_color(
         stylesheet, style, STYLE_BORDER_TOP, &alpha);
-    for (unsigned side = 0; side < STYLE_BORDER_SIDE_COUNT; side++) {
+    for (unsigned side = 0; border && side < STYLE_BORDER_SIDE_COUNT; side++) {
         uint8_t side_alpha = 0;
         uint32_t side_color = stylesheet_border_color(
             stylesheet, style, (StyleBorderSide) side, &side_alpha);
@@ -5485,52 +5532,65 @@ bool layout_apply_focus_border_paint(
     size_t match = SIZE_MAX, inset = SIZE_MAX;
     for (size_t i = box->command_start; i < box->command_end; i++) {
         const DrawCommand *command = &layout->commands[i];
-        if (command->type == DRAW_STROKE_RECT
+        if (outset_changed && command->type == DRAW_SHADOW_RECT
+            && command->text == (const char *) node && command->scale == 0) {
+            if (inset != SIZE_MAX) return false;
+            inset = i;
+            continue;
+        }
+        if (inset_changed && command->type == DRAW_STROKE_RECT
             && command->image_fit == LAYOUT_STROKE_FOCUS_INSET
-            && command->x == box->x && command->y == box->y
-            && command->width == box->width && command->height == box->height
+            && command->text == (const char *) node
             && command->radius == border_radius_code) {
             if (inset != SIZE_MAX) return false;
             inset = i;
             continue;
         }
         if (command->type != DRAW_STROKE_RECT
-            || command->x != box->x || command->y != box->y
-            || command->width != box->width || command->height != box->height
+            || command->text != (const char *) node
             || command->scale != style->border.top
             || command->radius != border_radius_code
             || command->image_fit != LAYOUT_STROKE_SOLID) continue;
         if (match != SIZE_MAX) return false;
         match = i;
     }
-    if (match == SIZE_MAX) return false;
+    if (border && match == SIZE_MAX) return false;
     uint32_t inset_color = 0;
     uint8_t inset_alpha = 0;
     int inset_width = 1;
-    if (inset_changed) {
+    if (inset_changed || outset_changed) {
         if (inset == SIZE_MAX) return false;
         size_t count = stylesheet_box_shadow_count(stylesheet, style);
         if (count > 1) return false;
         if (count == 1) {
             const StyleBoxShadow *shadow = stylesheet_box_shadow(stylesheet, style, 0);
-            if (shadow == NULL || !style_box_shadow_is_inset(shadow)
-                || style_box_shadow_blur(shadow) != 0 || shadow->offset_x != 0
-                || shadow->offset_y != 0 || shadow->spread <= 0) return false;
+            if (shadow == NULL || style_box_shadow_is_inset(shadow) != inset_changed
+                || style_box_shadow_blur(shadow) != 0
+                || (inset_changed && (shadow->offset_x != 0
+                    || shadow->offset_y != 0 || shadow->spread <= 0))) return false;
             inset_color = style_box_shadow_uses_current_color(shadow)
                 ? style->color : shadow->argb & UINT32_C(0x00ffffff);
             inset_alpha = style_box_shadow_uses_current_color(shadow)
                 ? style->color_alpha : (uint8_t) (shadow->argb >> 24);
             inset_width = shadow->spread;
+            if (outset_changed) {
+                const DrawCommand *c = &layout->commands[inset];
+                /* Flex stretching can update the node box after decoration.
+                   The owned slot retains the formatter's exact shadow box;
+                   its admitted spread, not a reconstructed box, is the proof. */
+                if (c->font_size != inset_width || c->width <= 0 || c->height <= 0)
+                    return false;
+            }
         }
     }
     if (!dry_run) {
-        layout->commands[match].color = color;
+        if (border) layout->commands[match].color = color;
         /* Commands in the retained list are already normalized; UINT16_MAX
            is only an insertion-time transparent sentinel. */
-        layout->commands[match].opacity_scale = alpha == 0 ? 0 : alpha_opacity_scale(alpha);
-        if (inset_changed) {
+        if (border) layout->commands[match].opacity_scale = alpha == 0 ? 0 : alpha_opacity_scale(alpha);
+        if (inset_changed || outset_changed) {
             layout->commands[inset].color = inset_color;
-            layout->commands[inset].scale = inset_width;
+            if (inset_changed) layout->commands[inset].scale = inset_width;
             layout->commands[inset].opacity_scale = inset_alpha == 0
                 ? 0 : alpha_opacity_scale(inset_alpha);
         }
@@ -5539,6 +5599,133 @@ bool layout_apply_focus_border_paint(
     if (top != NULL) *top = box->y - style->border.top;
     if (right != NULL) *right = box->x + box->width + style->border.right;
     if (bottom != NULL) *bottom = box->y + box->height + style->border.bottom;
+    const size_t painted[2] = {match, inset};
+    for (unsigned i = 0; i < 2; i++) {
+        if (painted[i] == SIZE_MAX) continue;
+        const DrawCommand *c = &layout->commands[painted[i]];
+        if (left != NULL && c->x < *left) *left = c->x;
+        if (top != NULL && c->y < *top) *top = c->y;
+        if (right != NULL && c->x + c->width > *right) *right = c->x + c->width;
+        if (bottom != NULL && c->y + c->height > *bottom) *bottom = c->y + c->height;
+    }
+    return true;
+}
+
+bool layout_apply_focus_pseudo_translation(
+    LayoutDocument *layout, lxb_dom_node_t *node,
+    const StyleFocusPseudoTranslation *translation, bool focused, bool dry_run,
+    int *left, int *top, int *right, int *bottom)
+{
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL || translation == NULL || box->command_end > layout->count
+        || box->command_start > box->command_end) return false;
+    size_t slots[2] = {SIZE_MAX, SIZE_MAX};
+    for (size_t i = box->command_start; i < box->command_end; i++) {
+        const DrawCommand *c = &layout->commands[i];
+        if (c->type != DRAW_FILL_RECT || c->text != (const char *) node
+            || c->text_length < PSEUDO_BEFORE || c->text_length > PSEUDO_AFTER) continue;
+        unsigned p = c->text_length - PSEUDO_BEFORE;
+        if (slots[p] != SIZE_MAX) return false;
+        slots[p] = i;
+    }
+    int bounds[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+    for (unsigned p = 0; p < 2; p++) {
+        if (translation->dx[p] == 0 && translation->dy[p] == 0) continue;
+        if (slots[p] == SIZE_MAX) return false;
+        const DrawCommand *c = &layout->commands[slots[p]];
+        bool changed = c->font_weight != (unsigned) focused;
+        int dx = !changed ? 0 : focused ? translation->dx[p] : -translation->dx[p];
+        int dy = !changed ? 0 : focused ? translation->dy[p] : -translation->dy[p];
+        int64_t x = (int64_t) c->x + dx, y = (int64_t) c->y + dy;
+        if (x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX
+            || (int64_t)c->x + c->width > INT_MAX || x + c->width > INT_MAX
+            || (int64_t)c->y + c->height > INT_MAX || y + c->height > INT_MAX)
+            return false;
+        /* Preserve both spatial indices and the scroll extent. Moving a
+           retained fill between bands needs an authoritative rebuild. */
+        if (c->width <= 0 || c->height <= 0 || c->x < 0 || x < 0
+            || c->x + c->width > layout->scroll_width || x + c->width > layout->scroll_width
+            || c->y < 0 || y < 0 || c->y + c->height > layout->height
+            || y + c->height > layout->height
+            || c->y / LAYOUT_SPATIAL_BAND_HEIGHT != y / LAYOUT_SPATIAL_BAND_HEIGHT
+            || (c->y + c->height - 1) / LAYOUT_SPATIAL_BAND_HEIGHT
+               != (y + c->height - 1) / LAYOUT_SPATIAL_BAND_HEIGHT) return false;
+        int ox = c->x, oy = c->y, ow = c->width, oh = c->height;
+        int nx = (int) x, ny = (int) y, nw = ow, nh = oh;
+        viewport_css_box_to_device(&layout->viewport, &ox, &ow);
+        viewport_css_box_to_device(&layout->viewport, &oy, &oh);
+        viewport_css_box_to_device(&layout->viewport, &nx, &nw);
+        viewport_css_box_to_device(&layout->viewport, &ny, &nh);
+        if (oh <= 0 || nh <= 0
+            || oy / LAYOUT_SPATIAL_BAND_HEIGHT != ny / LAYOUT_SPATIAL_BAND_HEIGHT
+            || (oy + oh - 1) / LAYOUT_SPATIAL_BAND_HEIGHT
+               != (ny + nh - 1) / LAYOUT_SPATIAL_BAND_HEIGHT) return false;
+        int l = dx < 0 ? (int) x : c->x;
+        int t = dy < 0 ? (int) y : c->y;
+        int r = (dx > 0 ? (int) x : c->x) + c->width;
+        int b = (dy > 0 ? (int) y : c->y) + c->height;
+        if (l < bounds[0]) bounds[0] = l;
+        if (t < bounds[1]) bounds[1] = t;
+        if (r > bounds[2]) bounds[2] = r;
+        if (b > bounds[3]) bounds[3] = b;
+    }
+    if (bounds[0] == INT_MAX) return false;
+    if (!dry_run) for (unsigned p = 0; p < 2; p++) {
+        if (translation->dx[p] == 0 && translation->dy[p] == 0) continue;
+        if (layout->commands[slots[p]].font_weight == (unsigned) focused) continue;
+        layout->commands[slots[p]].x += focused ? translation->dx[p] : -translation->dx[p];
+        layout->commands[slots[p]].y += focused ? translation->dy[p] : -translation->dy[p];
+        layout->commands[slots[p]].font_weight = focused;
+    }
+    if (left) *left = bounds[0];
+    if (top) *top = bounds[1];
+    if (right) *right = bounds[2];
+    if (bottom) *bottom = bounds[3];
+    return true;
+}
+
+bool layout_apply_focus_pseudo_visibility(
+    LayoutDocument *layout, lxb_dom_node_t *node,
+    const StyleFocusPseudoTranslation *change, bool focused, bool dry_run,
+    int *left, int *top, int *right, int *bottom)
+{
+    if (layout == NULL || node == NULL || change == NULL
+        || !change->visibility_changed) return false;
+    size_t slots[2] = {SIZE_MAX, SIZE_MAX};
+    int bounds[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+    /* Ordinary inline links need not own a LayoutNodeBox. Their absolute
+       decorations retain native identity in the bounded display list. */
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *c = &layout->commands[i];
+        unsigned pseudo = c->image_fit & LAYOUT_TEXT_FOCUS_PSEUDO_MASK;
+        if (c->type != DRAW_TEXT || c->image != (const ImageResource *) node
+            || pseudo < PSEUDO_BEFORE || pseudo > PSEUDO_AFTER) continue;
+        unsigned p = pseudo - PSEUDO_BEFORE;
+        if (!(change->visibility_changed & (1u << p))) continue;
+        if (slots[p] != SIZE_MAX || c->width <= 0 || c->height <= 0
+            || (int64_t) c->x + c->width > INT_MAX
+            || (int64_t) c->y + c->height > INT_MAX) return false;
+        slots[p] = i;
+        if (c->x < bounds[0]) bounds[0] = c->x;
+        if (c->y < bounds[1]) bounds[1] = c->y;
+        if (c->x + c->width > bounds[2]) bounds[2] = c->x + c->width;
+        if (c->y + c->height > bounds[3]) bounds[3] = c->y + c->height;
+    }
+    for (unsigned p = 0; p < 2; p++)
+        if ((change->visibility_changed & (1u << p)) && slots[p] == SIZE_MAX)
+            return false;
+    if (!dry_run) {
+        unsigned hidden = focused ? change->focused_hidden : change->normal_hidden;
+        for (unsigned p = 0; p < 2; p++) {
+            if (slots[p] == SIZE_MAX) continue;
+            layout->commands[slots[p]].opacity_scale = hidden & (1u << p)
+                ? 0 : alpha_opacity_scale(change->visibility_alpha[p]);
+        }
+    }
+    if (left) *left = bounds[0];
+    if (top) *top = bounds[1];
+    if (right) *right = bounds[2];
+    if (bottom) *bottom = bounds[3];
     return true;
 }
 

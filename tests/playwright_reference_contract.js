@@ -11,6 +11,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const capture = require("../benchmarks/capture-reference.js");
+const auditTools = require("../benchmarks/reference-capture-audit.js");
+const executablePath = process.argv[2] || process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+let contractBrowser;
 
 const MANIFEST_FIELDS = [
   "scenario", "url", "replay_dir", "trace_sha256", "expected_http",
@@ -38,13 +41,19 @@ function writeTraceRecord(directory, index, record) {
     ...headers.map(([name, value], offset) => `response-header-${offset}=${name}: ${value}`),
     "set-cookie-count=0",
     `async-delay-pumps=${record.asyncDelayPumps || 1}`,
+    ...(record.preflight ? [
+      `request-origin=${record.preflight.origin}`,
+      `request-preflight-method=${record.preflight.method}`,
+      `request-preflight-headers=${record.preflight.headers}`,
+    ] : []),
   ];
   const stem = String(index).padStart(4, "0");
   fs.writeFileSync(path.join(directory, `${stem}.meta`), `${lines.join("\n")}\n`);
   fs.writeFileSync(path.join(directory, `${stem}.body`), body);
 }
 
-function runHermeticCapture({ scenario, url, title, marker, records }) {
+function runHermeticCapture({ scenario, url, title, marker, records,
+  retainedPreflights = false, fullDocument = false }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tilefinch-reference-contract-"));
   try {
     const traceRoot = path.join(root, "traces");
@@ -88,6 +97,9 @@ function runHermeticCapture({ scenario, url, title, marker, records }) {
       "--browser", "chromium",
       "--settle-ms", "50",
       "--timeout-ms", "10000",
+      ...(executablePath ? ["--executable", executablePath] : []),
+      ...(retainedPreflights ? ["--retained-preflights"] : []),
+      ...(fullDocument ? ["--full-document"] : []),
     ], {
       cwd: path.join(__dirname, ".."),
       env: process.env,
@@ -106,6 +118,7 @@ function runHermeticCapture({ scenario, url, title, marker, records }) {
     return {
       status: completed.status,
       state: JSON.parse(fs.readFileSync(statePath, "utf8")),
+      audit: JSON.parse(fs.readFileSync(path.join(outputRoot, scenario, "capture-audit.json"), "utf8")),
       stdout: completed.stdout,
       stderr: completed.stderr,
     };
@@ -116,7 +129,47 @@ function runHermeticCapture({ scenario, url, title, marker, records }) {
 
 async function main() {
   const { chromium } = require("playwright");
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true,
+    ...(executablePath ? {executablePath} : {}) });
+  contractBrowser = browser;
+  /* Chromium denies an actual parent fetch before Fetch interception when
+     its preflight fails. Verify the real CDP initiator linkage, without a
+     server, successful CORS grant, or any request reaching the network. */
+  const deniedContext = await browser.newContext({ serviceWorkers: "block" });
+  const deniedPage = await deniedContext.newPage();
+  const deniedSession = await deniedContext.newCDPSession(deniedPage);
+  const deniedAudit = auditTools.createRequestAudit();
+  const deniedOperations = [];
+  let deniedIntercepted = 0;
+  await auditTools.installInterception(deniedSession, (session, event) => {
+    deniedIntercepted += 1;
+    const route = auditTools.cdpRoute(session, event, (method, url) => {
+      deniedAudit.expectFailure(method, url);
+      deniedAudit.networkAborted(session, event, { declaredPolicy: true });
+    }, () => deniedAudit.networkFulfilled(session, event));
+    deniedOperations.push(event.request.url === "https://denied-origin.test/"
+      ? route.fulfill({ status: 200, headers: { "content-type": "text/html" },
+        body: "<!doctype html><title>Denied permission test</title>" })
+      : route.abort("blockedbyclient"));
+  }, async (_label, operation) => operation(), (operation) => deniedOperations.push(operation),
+  (error) => { throw error; }, deniedAudit);
+  await deniedPage.goto("https://denied-origin.test/");
+  await deniedPage.evaluate(async () => {
+    try {
+      await fetch("https://denied-resource.test/metadata", { headers: { "x-probe": "1" } });
+      throw new Error("denied preflight escaped");
+    } catch (error) {
+      if (error.name !== "TypeError") throw error;
+    }
+  });
+  await Promise.all(deniedOperations);
+  /* Flush the final Network.loadingFailed event on the same CDP session. */
+  await deniedSession.send("Runtime.evaluate", { expression: "0" });
+  const deniedSummary = deniedAudit.summary(deniedIntercepted);
+  assert.equal(deniedSummary.ready, true, JSON.stringify(deniedSummary));
+  assert.equal(deniedSummary.preflight_denied_parents, 1);
+  assert.equal(deniedSummary.failures.filter((f) => f.reason === "denied-preflight-parent").length, 1);
+  await deniedContext.close();
   const context = await browser.newContext({ locale: "en-US", timezoneId: "UTC" });
   const originMs = 1700000000042;
   await context.clock.install({ time: originMs });
@@ -155,16 +208,16 @@ async function main() {
     performance.timeOrigin, Date.now(), performance.now(),
   ]);
   await page.evaluate(() => globalThis.__tilefinchAdvanceReplayClock(16));
-  const timer = page.evaluate(() => new Promise((resolve) => {
+  await page.evaluate(() => { globalThis.__contractTimer = new Promise((resolve) => {
     setTimeout(() => {
       const values = [Date.now(), performance.now()];
       requestAnimationFrame((timestamp) => resolve([
         ...values, timestamp, Date.now(), performance.now(), document.timeline.currentTime,
       ]));
     }, 10);
-  }));
+  }); });
   await context.clock.runFor(16);
-  const vector = [...initial, ...await timer];
+  const vector = [...initial, ...await page.evaluate(() => globalThis.__contractTimer)];
   assert.deepEqual(vector, [
     1700000000042, 1700000000042, 0,
     1700000000059, 17, 18, 1700000000060, 18, 19,
@@ -441,6 +494,7 @@ async function main() {
   assert.deepEqual(capabilityRequests, [["document", "https://capability.test/contract"]]);
   await capabilityContext.close();
   await browser.close();
+  contractBrowser = null;
 
   /* In quirks mode documentElement.clientHeight can expose the full document
      instead of the layout viewport.  A tall legacy page such as Hacker News
@@ -466,20 +520,18 @@ async function main() {
     `${quirksViewport.stderr || quirksViewport.stdout}\n${JSON.stringify(quirksViewport.state, null, 2)}`,
   );
   assert.equal(quirksViewport.state.capture_ready, true);
-  assert.deepEqual(quirksViewport.state.viewport.observed, {
+  assert.deepEqual(quirksViewport.audit.observed_viewport, {
     width: 160, height: 120, device_pixel_ratio: 1,
   });
 
-  /* Playwright Chromium used to synthesize a successful 204 for an intercepted
-     CORS preflight before BrowserContext.route observed it. Cover the harder
-     redirect escape (same-origin request, retained cross-origin redirect),
-     malformed Content-Type values, and deprecated client-hint names. None may
-     reach Chromium routing or turn a hidden response into qualifying replay. */
+  /* Default mode denies non-simple cross-origin reads before a preflight.
+     Same-origin reads do not preflight. Redirected preflights are also
+     intercepted by the protocol router, independently of this early guard. */
   const preflightDocument = [
     "<!doctype html><title>Preflight Pending</title><body>preflight-pending<script>",
-    "const fetchProbe=(url,headers)=>fetch(url,{headers}).then(()=>false,()=>true);",
+    "const fetchProbe=(url,headers)=>fetch('https://redirect-target.test'+url,{headers}).then(()=>false,()=>true);",
     "const xhrProbe=(url,name,value)=>new Promise(resolve=>{const xhr=new XMLHttpRequest();",
-    "try{xhr.open('GET',url);xhr.setRequestHeader(name,value);",
+    "try{xhr.open('GET','https://redirect-target.test'+url);xhr.setRequestHeader(name,value);",
     "xhr.onload=()=>resolve(false);xhr.onerror=()=>resolve(false);xhr.send();}",
     "catch(_error){resolve(true);}});",
     "Promise.all([",
@@ -542,12 +594,68 @@ async function main() {
     true,
   );
 
+  const corsDocument = "<!doctype html><meta name=viewport content='width=device-width'><title>Retained CORS</title><body>pending<script>"
+    + "fetch('https://cors-data.test/data',{headers:{'X-Probe':'value'}})"
+    + ".then(r=>r.text()).then(t=>document.body.textContent=t,"
+    + "()=>document.body.textContent='cors-rejected')</script>";
+  const corsRecords = [
+    {url:"https://cors-origin.test/",contentType:"text/html",body:corsDocument},
+    {url:"https://cors-data.test/data",method:"OPTIONS",status:204,
+      preflight:{origin:"https://cors-origin.test",method:"GET",headers:"x-probe"},
+      headers:[["access-control-allow-origin","https://cors-origin.test"],
+        ["access-control-allow-methods","GET"],["access-control-allow-headers","x-probe"]]},
+    {url:"https://cors-data.test/data",contentType:"text/plain",body:"cors-complete",
+      headers:[["access-control-allow-origin","https://cors-origin.test"]]},
+  ];
+  const corsReplay = runHermeticCapture({scenario:"retained-cors",
+    url:"https://cors-origin.test/",title:"Retained CORS",marker:"cors-complete",
+    records:corsRecords,retainedPreflights:true});
+  assert.equal(corsReplay.status,0,JSON.stringify(corsReplay.state,null,2));
+  assert.equal(corsReplay.state.read_only_policy.preflight_policy,"cors-preflight-retained-only-v2");
+  assert.equal(corsReplay.state.read_only_policy.preflight_requests.length,1);
+  assert.equal(corsReplay.state.replay_ledger.served,3);
+  const wrongShape = runHermeticCapture({scenario:"retained-cors-wrong-shape",
+    url:"https://cors-origin.test/",title:"Retained CORS",marker:"cors-complete",
+    records:corsRecords.map(r=>r.preflight?{...r,preflight:{...r.preflight,headers:"x-other"}}:r),
+    retainedPreflights:true});
+  assert.equal(wrongShape.status,3,wrongShape.stderr || wrongShape.stdout);
+  assert.equal(wrongShape.state.capture_ready,false);
+  assert.equal(wrongShape.state.replay_ledger.unmatched,1);
+  assert.equal(wrongShape.state.replay_ledger.served,1);
+  const deniedCors = runHermeticCapture({scenario:"retained-cors-denied",
+    url:"https://cors-origin.test/",title:"Retained CORS",marker:"cors-rejected",
+    records:corsRecords.map(r=>r.preflight?{...r,headers:[]}:r),retainedPreflights:true});
+  assert.equal(deniedCors.status,3,deniedCors.stderr || deniedCors.stdout);
+  assert.equal(deniedCors.state.capture_ready,false);
+  assert.deepEqual(deniedCors.state.state_markers,["cors-rejected"]);
+  assert.equal(deniedCors.state.replay_ledger.served,2);
+
+  const brokenDocument = "<!doctype html><meta name=viewport content='width=device-width'><title>Retained broken image</title>"
+    + "<body style='height:700px'>retained-image-marker<img width=40 height=40 src='/broken.png'>";
+  const brokenImage = runHermeticCapture({scenario:"retained-image-error",
+    url:"https://broken-image.test/",title:"Retained broken image",marker:"retained-image-marker",
+    fullDocument:true,records:[
+      {url:"https://broken-image.test/",contentType:"text/html",body:brokenDocument},
+      {url:"https://broken-image.test/broken.png",status:403,contentType:"text/plain",body:"denied"},
+    ]});
+  assert.equal(brokenImage.status,0,brokenImage.stderr || brokenImage.stdout);
+  assert.equal(brokenImage.state.full_document.viewports[0].images[0].complete,false);
+  assert.equal(brokenImage.state.full_document.viewports[0].images[0].retained_http_failure,true);
+  const corruptImage = runHermeticCapture({scenario:"retained-image-corrupt",
+    url:"https://broken-image.test/",title:"Retained broken image",marker:"retained-image-marker",
+    fullDocument:true,records:[
+      {url:"https://broken-image.test/",contentType:"text/html",body:brokenDocument},
+      {url:"https://broken-image.test/broken.png",status:200,contentType:"image/png",body:"not a PNG"},
+    ]});
+  assert.equal(corruptImage.status,3,corruptImage.stderr || corruptImage.stdout);
+  assert.equal(corruptImage.state.capture_ready,false);
+
   /* Retained occurrences belong to method+URL, not to a resource-type
      substream. The first browser callback below is a script and the second is
      fetch; reversing their distinct responses makes the author marker fail. */
   const sharedUrl = "https://shared-resource.test/value";
   const occurrenceDocument = [
-    "<!doctype html><title>Occurrence Contract</title><body>occurrence-pending<script>",
+    "<!doctype html><meta name=viewport content='width=device-width'><title>Occurrence Contract</title><body>occurrence-pending<script>",
     "let scriptDone=false,fetchDone=false,fetched='';",
     "const finish=()=>{if(scriptDone&&fetchDone)document.body.textContent=",
     "String(globalThis.scriptRecord)+'|'+fetched;};",
@@ -605,7 +713,7 @@ async function main() {
      terminal failures through the same semantic boundary before the matched
      follow-up. Raw Playwright callback evidence remains explicit and exact. */
   const unifiedTerminalDocument = [
-    "<!doctype html><title>Unified Pending</title><body>unified-pending<script>",
+    "<!doctype html><meta name=viewport content='width=device-width'><title>Unified Pending</title><body>unified-pending<script>",
     "const failures=[];const missing=(url,label)=>fetch(url).catch(()=>{failures.push(label);});",
     "Promise.all([missing('/z-missing','z-missing'),missing('/a-missing','a-missing')])",
     ".then(()=>fetch('/matched')).then(response=>response.text()).then(value=>{",
@@ -675,4 +783,4 @@ async function main() {
 main().catch((error) => {
   process.stderr.write(`${error.stack || error}\n`);
   process.exitCode = 1;
-});
+}).finally(async () => { if (contractBrowser) await contractBrowser.close(); });

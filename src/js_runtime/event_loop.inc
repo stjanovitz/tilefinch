@@ -505,7 +505,8 @@ bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
        a finite quiescent state. A timer is deliberately conservative: it may
        be the page's bounded delayed hydration root. */
     return runtime != NULL
-        && (runtime->pending_timer_tasks != 0u
+        && (runtime->image_load_pending != 0u
+            || runtime->pending_timer_tasks != 0u
             || runtime->pending_network_tasks != 0u
             || runtime->bridge.async_fetch_count != 0u
             || script_runtime_has_pending_startup_scripts(runtime)
@@ -1543,7 +1544,8 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
     double timers = runtime->host_state[SCRIPT_HOST_STATE_TIMERS];
     runtime->pending_timer_tasks = timers >= 65535.0 ? 65535u
         : timers > 0 ? (size_t) timers : 0u;
-    runtime->result.pending_tasks = runtime->pending_timer_tasks;
+    runtime->result.pending_tasks = runtime->pending_timer_tasks
+        + runtime->image_load_pending;
     int64_t waiting = 0;
     if (JS_IsObject(runtime->host_network_queue_stats)) {
         JSValue value = JS_GetPropertyStr(

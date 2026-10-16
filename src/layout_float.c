@@ -97,10 +97,10 @@ void clear_line_floats(LineState *line, ClearMode clear)
 void make_float_slot(LineState *line)
 {
     if (line->float_count < ACTIVE_FLOAT_LIMIT) return;
-    /* Floats that end at or above the current position can no longer
-       exclude, clear or bound anything placed from here on. Retire them
-       first: a page header's floats must not use up the slots of a list
-       of floats far below it, which then lost its own exclusions. */
+    /* Recycle expired exclusions only when admitting a later float. A
+       negative-margin block can revisit them before then, whereas a later
+       float cannot be placed above its predecessors. Header floats must
+       not consume the bounded slots needed by a new row far below them. */
     size_t kept = 0;
     for (size_t i = 0; i < line->float_count; i++) {
         line->layout->performance.float_exclusion_probes++;

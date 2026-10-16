@@ -38,9 +38,18 @@ static unsigned layout_admit_backdrop_blur(
    layout_block_patch_decoration() once the content bottom is final. */
 bool layout_block_emit_decoration(
     LayoutContext *context, lxb_dom_node_t *node,
-    const ComputedStyle *style, int outer_x, int outer_y, int outer_width,
+    const ComputedStyle *style, const ComputedStyle *parent,
+    int outer_x, int outer_y, int outer_width,
     LayoutBlockPaintPlan *plan)
 {
+    /* Resolve optional focus geometry before borrowing any paint-stack
+       pointers: resolving a new focus value can intern another stack. */
+    StyleBoxShadow focus_shadow;
+    bool outset_slot = context->focus_inset_slot_count < 64u
+        && (node->local_name == LXB_TAG_A || node->local_name == LXB_TAG_BUTTON
+            || document_attribute(node, "tabindex", NULL) != NULL)
+        && style_node_focus_outset_shadow(context->sheet, node, parent, style, &focus_shadow);
+    if (outset_slot) context->focus_inset_slot_count++;
     const StylePaintStack *paint_stack = stylesheet_paint_stack(
         context->sheet, computed_style_paint_stack_id(style));
     unsigned backdrop_blur = paint_stack == NULL ? 0u
@@ -145,10 +154,9 @@ bool layout_block_emit_decoration(
        at most four commands per element.
 
        CSS clips an outer shadow to outside the border box. A layer with
-       no offset or spread on a box with uniform corners (a glow, the
-       common case) carries LAYOUT_SHADOW_OUTSIDE_BOX: its shadow rect is
-       the border box, so the rasteriser clips it exactly and skips the
-       covered interior. APPROXIMATION: other layers paint the full
+       uniform corner radius and zero spread carries LAYOUT_SHADOW_OUTSIDE_BOX; the unused
+       text length retains its bounded offsets so rasterization can recover
+       the original border box and skip the covered interior. Other layers paint the full
        silhouette and let the background cover it, which differs only
        where a translucent box sits over its own shadow.
 
@@ -174,9 +182,9 @@ bool layout_block_emit_decoration(
     size_t shadow_command_count = 0;
     size_t box_shadow_count = stylesheet_box_shadow_count(
         context->sheet, style);
-    for (size_t i = box_shadow_count; i-- > 0;) {
-        const StyleBoxShadow *shadow = stylesheet_box_shadow(
-            context->sheet, style, i);
+    for (size_t i = outset_slot ? 1u : box_shadow_count; i-- > 0;) {
+        const StyleBoxShadow *shadow = outset_slot && box_shadow_count == 0 ? &focus_shadow
+            : stylesheet_box_shadow(context->sheet, style, i);
         if (shadow == NULL) continue;
         if (style_box_shadow_is_inset(shadow)) continue;
         uint32_t color = shadow->argb & 0x00ffffffu;
@@ -185,7 +193,8 @@ bool layout_block_emit_decoration(
             color = style->color;
             alpha = style->color_alpha;
         }
-        if (alpha == 0) continue;
+        if (outset_slot && box_shadow_count == 0) alpha = 0;
+        if (alpha == 0 && !outset_slot) continue;
         int blur = style_box_shadow_blur(shadow);
         int spread = shadow->spread;
         int inflate = spread + blur;
@@ -197,13 +206,8 @@ bool layout_block_emit_decoration(
            the exact four-corner code. */
         int radius = style_border_radius_maximum(
             style_border_radius_adjust(border_radius_code, spread));
-        bool outside_box = shadow->offset_x == 0 && shadow->offset_y == 0
-            && spread == 0
-            && (!style_border_radius_is_packed(border_radius_code)
-                || (radius == style_border_radius_corner(border_radius_code, 0)
-                    && radius == style_border_radius_corner(border_radius_code, 1)
-                    && radius == style_border_radius_corner(border_radius_code, 2)
-                    && radius == style_border_radius_corner(border_radius_code, 3)));
+        bool outside_box = spread == 0
+            && !style_border_radius_is_packed(border_radius_code);
         /* A hard (unblurred), unspread shadow on a square box offset along
            one axis is visible only as the strip it sticks out by; the
            patch below turns it into that fill once the height is known.
@@ -215,6 +219,11 @@ bool layout_block_emit_decoration(
             && ((shadow->offset_x != 0) != (shadow->offset_y != 0));
         DrawCommand layer = {
             .type = DRAW_SHADOW_RECT,
+            .text = outset_slot || (box_shadow_count == 1 && blur == 0)
+                ? (const char *) node : NULL,
+            .font_size = spread,
+            .text_length = (uint16_t) (int16_t) shadow->offset_x
+                | ((uint32_t) (uint16_t) (int16_t) shadow->offset_y << 16),
             .x = outer_x + shadow->offset_x - inflate,
             .y = outer_y + shadow->offset_y - inflate,
             .width = width,
@@ -222,11 +231,14 @@ bool layout_block_emit_decoration(
             .color = color,
             .scale = blur,
             .radius = radius,
-            .opacity_scale = alpha_opacity_scale(alpha),
-            .image_fit = outside_box ? LAYOUT_SHADOW_OUTSIDE_BOX
-                         : strip ? LAYOUT_SHADOW_OFFSET_STRIP : 0
+            .opacity_scale = alpha == 0 ? UINT16_MAX : alpha_opacity_scale(alpha),
+            .image_fit = strip ? LAYOUT_SHADOW_OFFSET_STRIP
+                         : outside_box ? LAYOUT_SHADOW_OUTSIDE_BOX : 0
         };
-        if (layout_add_command(context->layout, layer) == NULL) return false;
+        if (layout_add_command(context->layout, layer) == NULL) {
+            if (outset_slot && alpha == 0) break;
+            return false;
+        }
         shadow_command_count++;
     }
     /* A rounded border is retained as one hollow stroke.  The old outer-fill
@@ -284,7 +296,7 @@ bool layout_block_emit_decoration(
     }
     if (rounded_border) {
         rounded_border_command = (DrawCommand) {
-            .type = DRAW_STROKE_RECT, .x = outer_x,
+            .type = DRAW_STROKE_RECT, .text = (const char *) node, .x = outer_x,
             .y = outer_y, .width = outer_width, .height = 0,
             .color = border_colors[STYLE_BORDER_TOP],
             .scale = style->border.left,
@@ -547,17 +559,23 @@ bool layout_block_emit_decoration(
     /* One extra command per eligible control, at most 64 per layout. Keeping
        its geometry even when transparent preserves spatial-index membership
        and command order across focus changes, without insertion at input time. */
-    plan->focus_inset_slot = rounded_border
-        && context->focus_inset_slot_count < 64u
+    int focus_top = context->reuse == NULL ? 0 : context->reuse->focus_scroll;
+    bool near_focus = outer_y >= focus_top
+        && outer_y - focus_top < context->layout->viewport.css_height;
+    plan->focus_inset_slot = !outset_slot && context->focus_inset_slot_count < 64u
+        && (near_focus || context->focus_inset_offscreen_slots < 16u)
         && (node->local_name == LXB_TAG_BUTTON || node->local_name == LXB_TAG_A
             || node->local_name == LXB_TAG_LABEL || node->local_name == LXB_TAG_INPUT
             || node->local_name == LXB_TAG_SELECT || node->local_name == LXB_TAG_TEXTAREA
             || node->local_name == LXB_TAG_SUMMARY
             || document_attribute(node, "tabindex", NULL) != NULL)
-        && stylesheet_prepare_focus_rule_index((Stylesheet *) context->sheet)
-        && context->sheet->focus_rule_count != 0
+        && (stylesheet_box_shadow_count(context->sheet, style) == 1
+            || style_node_focus_shadow_may_match(context->sheet, node, false))
         && stylesheet_box_shadow_count(context->sheet, style) <= 1;
-    if (plan->focus_inset_slot) context->focus_inset_slot_count++;
+    if (plan->focus_inset_slot) {
+        context->focus_inset_slot_count++;
+        if (!near_focus) context->focus_inset_offscreen_slots++;
+    }
     return true;
 }
 
@@ -566,7 +584,7 @@ bool layout_block_emit_decoration(
    own content so CSS paint order is preserved.  Both insertion cursors are
    advanced by the number of border commands inserted. */
 bool layout_block_patch_decoration(
-    LayoutContext *context, const ComputedStyle *style,
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style,
     const LayoutBlockPaintPlan *plan, int outer_x, int outer_y,
     int outer_width, int content_bottom, int border_height,
     bool collapsed_table_cell, size_t *insertion_index_io,
@@ -846,7 +864,7 @@ bool layout_block_patch_decoration(
         context->sheet, style);
     if (plan->focus_inset_slot) {
         decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
-            .type = DRAW_STROKE_RECT, .x = outer_x, .y = outer_y,
+            .type = DRAW_STROKE_RECT, .text = (const char *) node, .x = outer_x, .y = outer_y,
             .width = outer_width, .height = content_bottom - outer_y,
             .scale = 1, .radius = plan->border_radius_code,
             .opacity_scale = UINT16_MAX, .image_fit = LAYOUT_STROKE_FOCUS_INSET
@@ -869,6 +887,7 @@ bool layout_block_patch_decoration(
         size_t slot = plan->focus_inset_slot ? 0 : decoration_stroke_count++;
         decoration_strokes[slot] = (DrawCommand) {
             .type = DRAW_STROKE_RECT,
+            .text = plan->focus_inset_slot ? (const char *) node : NULL,
             .x = outer_x, .y = outer_y,
             .width = outer_width, .height = content_bottom - outer_y,
             .color = color, .scale = shadow->spread,
@@ -897,6 +916,11 @@ bool layout_block_patch_decoration(
             .opacity_scale = alpha_opacity_scale(
                 border_alphas[STYLE_BORDER_TOP])
         };
+        if (!collapsed_table_cell && computed_style_border_line(
+                style, STYLE_BORDER_TOP) == STYLE_BORDER_SOLID)
+            layout_border_triangle(&decoration_strokes[decoration_stroke_count - 1],
+                &style->border, STYLE_BORDER_TOP, outer_x, outer_y,
+                outer_width, content_bottom - outer_y);
     }
     if (!rounded_border && style->border.bottom > 0
         && computed_style_border_line(
@@ -920,6 +944,11 @@ bool layout_block_patch_decoration(
             .opacity_scale = alpha_opacity_scale(
                 border_alphas[STYLE_BORDER_BOTTOM])
         };
+        if (!collapsed_table_cell && computed_style_border_line(
+                style, STYLE_BORDER_BOTTOM) == STYLE_BORDER_SOLID)
+            layout_border_triangle(&decoration_strokes[decoration_stroke_count - 1],
+                &style->border, STYLE_BORDER_BOTTOM, outer_x, outer_y,
+                outer_width, content_bottom - outer_y);
     }
     if (!rounded_border && style->border.left > 0 && border_height > 0
         && computed_style_border_line(
@@ -935,6 +964,11 @@ bool layout_block_patch_decoration(
             .opacity_scale = alpha_opacity_scale(
                 border_alphas[STYLE_BORDER_LEFT])
         };
+        if (!collapsed_table_cell && computed_style_border_line(
+                style, STYLE_BORDER_LEFT) == STYLE_BORDER_SOLID)
+            layout_border_triangle(&decoration_strokes[decoration_stroke_count - 1],
+                &style->border, STYLE_BORDER_LEFT, outer_x, outer_y,
+                outer_width, content_bottom - outer_y);
     }
     if (!rounded_border && style->border.right > 0 && border_height > 0
         && computed_style_border_line(
@@ -952,6 +986,11 @@ bool layout_block_patch_decoration(
             .opacity_scale = alpha_opacity_scale(
                 border_alphas[STYLE_BORDER_RIGHT])
         };
+        if (!collapsed_table_cell && computed_style_border_line(
+                style, STYLE_BORDER_RIGHT) == STYLE_BORDER_SOLID)
+            layout_border_triangle(&decoration_strokes[decoration_stroke_count - 1],
+                &style->border, STYLE_BORDER_RIGHT, outer_x, outer_y,
+                outer_width, content_bottom - outer_y);
     }
     if (!layout_insert_commands(context, before_insertion_index,
                                 decoration_strokes,

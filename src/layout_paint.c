@@ -4,6 +4,24 @@
 
 #include "layout_internal.h"
 
+void layout_border_triangle(DrawCommand *command, const StyleEdges *borders,
+                            unsigned side, int x, int y, int width, int height)
+{
+    if (width <= 0 || height <= 0 || width > 65535 || height > 65535
+        || borders->left < 0 || borders->top < 0
+        || borders->right < 0 || borders->bottom < 0
+        || (int64_t) borders->left + borders->right != width
+        || (int64_t) borders->top + borders->bottom != height) return;
+    command->type = DRAW_BORDER_TRIANGLE;
+    command->x = x;
+    command->y = y;
+    command->width = width;
+    command->height = height;
+    command->text_length = (uint32_t) borders->left;
+    command->font_size = borders->top;
+    command->image_fit = (uint8_t) side;
+}
+
 void layout_mask_background_gradient(LayoutContext *context,
                                       const ComputedStyle *style,
                                       DrawCommand *command)
@@ -179,11 +197,9 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                     command, scale_dimension(
                         draw_command_text_shadow_blur(command), scale_q6));
             }
-            int letter_spacing = scale_around_center(
-                command->letter_spacing, 0, scale_q6);
-            if (letter_spacing < INT8_MIN) letter_spacing = INT8_MIN;
-            if (letter_spacing > INT8_MAX) letter_spacing = INT8_MAX;
-            command->letter_spacing = (int8_t) letter_spacing;
+            draw_command_set_text_letter_spacing_fixed(command,
+                scale_around_center(draw_command_text_letter_spacing_fixed(command),
+                    0, scale_q6));
             int underline_offset = 0;
             if (draw_command_text_underline_offset(
                     command, &underline_offset)) {
@@ -209,6 +225,11 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
             command->radius = scale_fixed_around_center(command->radius, 0, scale_q6);
             command->scale = scale_fixed_around_center(command->scale, 0, scale_q6);
         }
+        if (command->type == DRAW_BORDER_TRIANGLE) {
+            command->text_length = (uint32_t) scale_dimension(
+                (int) command->text_length, scale_q6);
+            command->font_size = scale_dimension(command->font_size, scale_q6);
+        }
         if (command->type == DRAW_STROKE_RECT
             && command->image_fit == LAYOUT_STROKE_SIDES) {
             unsigned sides[4];
@@ -222,14 +243,20 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
             || command->type == DRAW_STROKE_RECT
             || command->type == DRAW_SHADOW_RECT
             || command->type == DRAW_IMAGE) {
-            command->scale = command->type == DRAW_IMAGE
+            if (command->type == DRAW_TEXT) {
+                int scale = scale_dimension(draw_command_text_scale(command), scale_q6);
+                if (scale > TILEFINCH_BITMAP_FONT_SCALE_LIMIT)
+                    scale = TILEFINCH_BITMAP_FONT_SCALE_LIMIT;
+                draw_command_set_text_scale(command, scale);
+            } else command->scale = command->type == DRAW_IMAGE
                 ? layout_scale_radius_code(command->scale, scale_q6, 64)
                 : scale_dimension(command->scale, scale_q6);
-            if (command->type == DRAW_TEXT
-                && command->scale > TILEFINCH_BITMAP_FONT_SCALE_LIMIT) {
-                command->scale = TILEFINCH_BITMAP_FONT_SCALE_LIMIT;
-            }
         }
+        if (command->type == DRAW_SHADOW_RECT
+            && command->image_fit == LAYOUT_SHADOW_OUTSIDE_BOX)
+            draw_command_set_shadow_offset(command,
+                scale_around_center((int16_t) command->text_length, 0, scale_q6),
+                scale_around_center((int16_t) (command->text_length >> 16), 0, scale_q6));
     }
     for (size_t i = link_start; i < layout->link_count; i++) {
         LinkRegion *link = &layout->links[i];

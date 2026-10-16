@@ -58,6 +58,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--style-preload-only") == 0) {
+        RUN_TEST(test_image_load_tasks_follow_publication);
         RUN_TEST(test_style_preload_event_promotion);
         RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
         RUN_TEST(test_stylesheet_sources_insert_in_document_order);
@@ -182,6 +183,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_canvas_oversized_dimensions_are_bounded);
     RUN_TEST(test_canvas_surface_count_is_bounded);
     RUN_TEST(test_canvas_draw_image_accepts_loaded_html_image);
+    RUN_TEST(test_image_load_tasks_follow_publication);
     RUN_TEST(test_detached_canvas_publishes_when_inserted);
     RUN_TEST(test_script_frontier_snapshot_survives_author_mutation);
     RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);

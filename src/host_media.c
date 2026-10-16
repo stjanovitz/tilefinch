@@ -21,6 +21,7 @@
 #endif
 
 #include "tilefinch/document.h"
+#include "tilefinch/fetch.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/url.h"
 #include "tilefinch/youtube_resolver.h"
@@ -761,6 +762,16 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
     if (budget == NULL || source == NULL || source[0] == '\0'
         || maximum_width <= 0 || maximum_height <= 0) {
         media_error(error, error_size, "invalid host media request");
+        return NULL;
+    }
+    /* FFmpeg owns its transport, so it cannot consume the HTTP trace. Do not
+       let author media or an explicit player URL escape an offline replay.
+       Local media fixtures remain available for decoder qualification. */
+    TilefinchUrl replay_url;
+    if (fetch_trace_replay_active()
+        && tilefinch_url_parse(source, &replay_url)) {
+        media_error(error, error_size,
+                    "network media unavailable during HTTP replay");
         return NULL;
     }
     HostMediaPlayer *player = budget_calloc_category(

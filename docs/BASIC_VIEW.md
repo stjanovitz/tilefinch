@@ -71,7 +71,7 @@ content, and the bound scales with the memory the page has left:
 - Every preparation may emit at least 512 semantic nodes and 256 KiB of
   escaped markup (the fixed bound before October 2026).
 - Beyond that it may emit one more node for each KiB the page budget has
-  free above a 4 MiB reserve, up to 4,096 nodes. An emitted node costs about
+  free above a 4 MiB reserve, up to 8,192 nodes. An emitted node costs about
   1 KiB once shown: about 0.6 KiB for the parsed copy and 0.4 KiB for its
   layout, measured on the 55-page site census. The reserve covers what
   showing any view costs whatever its size (restyling the raw page and
@@ -80,6 +80,11 @@ content, and the bound scales with the memory the page has left:
 - The markup bound follows the node bound at 256 bytes per node, between
   256 KiB and 1 MiB. The markup buffer starts at 64 KiB and grows only as
   far as the page needs.
+
+The node ceiling permits long articles when the existing free-memory rule
+admits them; it does not reserve extra memory or increase the markup ceiling.
+Pages without that headroom still get the same smaller, explicitly shortened
+view. Source traversal and text copying keep their cooperative checkpoints.
 
 Both bounds are fixed when preparation starts, so the same page and memory
 state always give the same view. With the fixed 512-node bound, 15 of the 55

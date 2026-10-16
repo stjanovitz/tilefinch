@@ -8,16 +8,13 @@ running on the handheld itself.*
 |---|---|
 | ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![Host-rendered preview of Tilefinch's native player overlay over Sprite Fright, with chapter markers and playback controls](docs/sprite-fright-player.png) |
 
-| YouTube support | Dark mode |
+| YouTube support | ChatGPT |
 |---|---|
-| ![Sprite Fright in Tilefinch's native YouTube details page, with its thumbnail, title, metadata, and controls](docs/youtube-details.png) | ![The Wikipedia PlayStation Portable article rendered with Tilefinch forced dark mode](docs/wikipedia-dark-mode.png) |
+| ![Sprite Fright in Tilefinch's native YouTube details page, showing Account, Sign out, and the signed-in action icons](docs/youtube-details.png) | ![An anonymous ChatGPT conversation rendered in Tilefinch, replying to hi](docs/chatgpt-reply.png) |
 
 | WebGL games | Danzeff text entry |
 |---|---|
 | [![Treadline Arena on the PSP: the jade player tank in a close fight with blue, yellow, orange and purple bots, with the score, armor and loadout HUD drawn in the canvas](docs/treadline-on-psp.png)](examples/treadline-arena/README.md) | ![Tilefinch's Danzeff radial keyboard with bookmark and history suggestions](docs/danzeff-text-entry.png) |
-
-The video player image is a host-rendered preview using Tilefinch's production
-overlay and a decoded movie frame; the YouTube details image is a host capture.
 
 ## Why
 
@@ -405,40 +402,5 @@ describes the build and test expectations.
 
 ## License and independence
 
-Tilefinch is MIT licensed; see [LICENSE](LICENSE). Third-party components
-keep their own licenses and notices, listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The security policy and
-vulnerability reporting are in [SECURITY.md](SECURITY.md).
-
-The browser download contains no acoustic model or speech dictionary. If you
-request the optional voice component in the app, its signed package carries
-the Alpha Cephei and CMUdict license files alongside the model; the browser
-bundle itself carries the PocketSphinx license that its linked decoder
-requires.
-
-The optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic,
-Hebrew, Devanagari (Hindi), and color-emoji packs are likewise not part of the download. They are
-generated from Noto fonts, carry the complete SIL Open Font License notice
-and a digest of the source font, and are fetched only when you ask for one.
-Tilefinch does not read the PSP's proprietary firmware fonts.
-
-Tilefinch is an independent, unofficial homebrew project. It is not
-affiliated with, sponsored by, or endorsed by Sony Interactive Entertainment.
-PlayStation, PSP, and related marks belong to their respective owners. The
-project contains no proprietary Sony SDK material, firmware, artwork, or
-branding.
-
-The Wikipedia screenshots show the English article
-["PlayStation Portable"](https://en.wikipedia.org/wiki/PlayStation_Portable).
-Wikipedia text is licensed
-[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). Wikipedia
-and its marks are trademarks of the Wikimedia Foundation, shown only to
-identify browser compatibility; Tilefinch is not affiliated with the Wikimedia
-Foundation.
-
-The player and YouTube details images show *Sprite Fright*, copyright Blender
-Foundation, produced by Blender Studio. Film imagery is shared under Creative
-Commons Attribution, with attribution to Blender Foundation and
-[studio.blender.org](https://studio.blender.org/). These captures add Tilefinch's
-interface over the imagery; see the project's
-[licensing and attribution information](https://studio.blender.org/projects/sprite-fright/pages/about/).
+See [licensing, attribution, and independence](docs/LICENSING.md) for the project
+license, third-party notices, screenshot credits, and trademark information.

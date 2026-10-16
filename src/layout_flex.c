@@ -363,6 +363,7 @@ static bool intrinsic_cache_get(LayoutContext *context,
                                 unsigned kind, bool ignore_own_width,
                                 int *width)
 {
+    if (node == context->intrinsic_constraint_node) return false;
     size_t home = intrinsic_cache_home(
         node, limit, kind, ignore_own_width);
     for (size_t probe = 0; probe < LAYOUT_INTRINSIC_CACHE_PROBE_LIMIT;
@@ -410,6 +411,7 @@ static void intrinsic_cache_put(LayoutContext *context,
                                 unsigned kind, bool ignore_own_width,
                                 int width)
 {
+    if (node == context->intrinsic_constraint_node) return;
     size_t home = intrinsic_cache_home(
         node, limit, kind, ignore_own_width);
     size_t replacement = home;
@@ -476,10 +478,10 @@ static void intrinsic_cache_put(LayoutContext *context,
 
 static int intrinsic_replaced_width(
     LayoutContext *context, lxb_dom_node_t *node,
-    const ComputedStyle *style)
+    const ComputedStyle *parent, const ComputedStyle *style)
 {
     if (context == NULL || node == NULL || style == NULL) return 0;
-    const ImageResource *image = images_find_node(context->images, node);
+    const ImageResource *image = layout_replaced_image(context, node, style);
     int natural_width = image_resource_available(image)
         ? image_resource_intrinsic_width(image) : 0;
     int natural_height = image_resource_available(image)
@@ -509,10 +511,28 @@ static int intrinsic_replaced_width(
     /* A height-only replaced flex/grid item contributes its aspect-ratio
        width. Returning the decoded source width over-allocates the flex item
        even though the later paint path correctly scales the image. */
-    if (!style->has_width && style->has_height && !style->height_percent
+    bool fallback_dimensions = !image_resource_available(image)
+        && (layout_node_name_is(node, "video")
+            || layout_node_name_is(node, "iframe") || audio_controls)
+        && !(style->aspect_width > 0 && style->aspect_height > 0);
+    int height_basis = natural_width;
+    bool definite_height = !style->height_percent;
+    if (style->height_percent && parent != NULL
+        && parent->has_height && !parent->height_percent
+        && (parent->display == DISPLAY_GRID
+            || parent->display == DISPLAY_INLINE_GRID)) {
+        height_basis = style_pixel_height(context->sheet, parent, natural_width);
+        if (parent->box_sizing_border_box)
+            height_basis -= parent->padding.top + parent->padding.bottom
+                + parent->border.top + parent->border.bottom;
+        definite_height = height_basis > 0;
+    }
+    if (!fallback_dimensions && !style->has_width && style->has_height
+        && definite_height
         && natural_width > 0 && natural_height > 0) {
-        int height = style_pixel_height(
-            context->sheet, style, natural_width);
+        int height = style->height_percent
+            ? resolve_declared_length(context->sheet,style->height,true,height_basis)
+            : style_pixel_height(context->sheet,style,natural_width);
         if (style->box_sizing_border_box && height > 0) {
             height -= style->padding.top + style->padding.bottom
                       + style->border.top + style->border.bottom;
@@ -689,7 +709,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                 face, metric_family, text + at, end - at,
                 computed_style_font_size_fixed(parent),
                 synthetic_bold, metric_bold, parent->font_scale,
-                parent->letter_spacing, parent->text_transform,
+                parent->letter_spacing_fixed, parent->text_transform,
                 !computed_style_kerning_none(parent));
             if (pair_intrinsics) {
                 int minimum_word = 0;
@@ -707,7 +727,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                         segment_length,
                         computed_style_font_size_fixed(parent),
                         synthetic_bold, metric_bold, parent->font_scale,
-                        parent->letter_spacing,
+                        parent->letter_spacing_fixed,
                         parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
                             && segment_at != at ? TEXT_TRANSFORM_NONE
                             : parent->text_transform,
@@ -763,8 +783,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                     has_word
                         ? layout_fixed_add(
                               space_fixed,
-                              layout_fixed_from_integer(
-                                  parent->letter_spacing * 2))
+                              parent->letter_spacing_fixed * 2)
                         : 0,
                     word_fixed));
             has_word = true;
@@ -805,7 +824,8 @@ static int intrinsic_text_width_impl(LayoutContext *context,
        block-level descendant.  Restricting this to atomic inlines made
        width:max-content containers collapse around empty fixed-width flex
        children. */
-    if (style.has_width && !style.width_max_content
+    if (node != context->intrinsic_constraint_node
+        && style.has_width && !style.width_max_content
         && !style.width_percent) {
         int width = resolve_declared_length(
             context->sheet, style.width, style.width_percent, limit);
@@ -816,12 +836,12 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         return constrain_intrinsic_outer_width(
             context, node, parent, &style, limit, width);
     }
-    if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
+    if (style.generated_image || layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
         || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe")) {
         int replaced_width = intrinsic_replaced_width(
-            context, node, &style);
+            context, node, parent, &style);
         if (replaced_width > 0) {
             int width = replaced_width + style.padding.left
                         + style.padding.right
@@ -887,9 +907,11 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                             || style.display == DISPLAY_INLINE_FLEX)
                            && (style.flex_direction == FLEX_ROW
                                || style.flex_direction == FLEX_ROW_REVERSE);
+    bool before_block = false;
     int inline_width = generated_inline_pseudo_width(
-        context, node, &style, PSEUDO_BEFORE);
-    int block_width = 0;
+        context, node, &style, PSEUDO_BEFORE, &before_block);
+    int block_width = before_block ? inline_width : 0;
+    if (before_block) inline_width = 0;
     size_t horizontal_flex_items = 0;
     /* Flex layout promotes the children of display:contents wrappers to
        flex items. Intrinsic sizing must walk that same flattened sequence:
@@ -907,7 +929,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             }
             int item_width = item.generated_pseudo != PSEUDO_NONE
                 ? generated_inline_pseudo_width(context, node, &style,
-                                                 item.generated_pseudo)
+                                                 item.generated_pseudo, NULL)
                 : intrinsic_text_width(context, item.node, &item.parent_style, limit);
             /* An empty item has a zero max-content contribution, but it
                still occupies a position in the flex sequence and therefore
@@ -953,6 +975,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     bool pending_boundary_space = false;
     bool has_inline_text = false;
     bool previous_atomic = false;
+    int float_left_width = 0, float_right_width = 0;
     for (lxb_dom_node_t *child = document_flat_first_child(node);
          child != NULL; child = document_flat_next_sibling(child)) {
         if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
@@ -1012,6 +1035,23 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             }
         }
         bool child_has_unit = child_has_text || child_atomic;
+        if (child_style.clear_mode != CLEAR_NONE
+            && child->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            int row = layout_add_coordinate(float_left_width, float_right_width);
+            if (row > block_width) block_width = row;
+            if (child_style.clear_mode != CLEAR_RIGHT) float_left_width = 0;
+            if (child_style.clear_mode != CLEAR_LEFT) float_right_width = 0;
+        }
+        if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && child_style.float_mode != FLOAT_NONE
+            && !child_style.out_of_flow && !child_style.fixed_position) {
+            int *side = child_style.float_mode == FLOAT_LEFT
+                ? &float_left_width : &float_right_width;
+            *side = layout_add_coordinate(*side, child_width);
+            if (layout_add_coordinate(float_left_width, float_right_width) >= limit)
+                return limit;
+            continue;
+        }
         if (block) {
             if (inline_width > block_width) block_width = inline_width;
             inline_width = 0;
@@ -1051,10 +1091,10 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                             : layout_fixed_ceil(space_fixed);
                     }
                     inline_width += boundary_space_width
-                                    + style.letter_spacing * 2;
+                                    + layout_fixed_ceil(style.letter_spacing_fixed * 2);
                 } else if (has_inline_text && child_has_unit
                            && !(previous_atomic && child_atomic)) {
-                    inline_width += style.letter_spacing;
+                    inline_width += layout_fixed_ceil(style.letter_spacing_fixed);
                 }
                 pending_boundary_space = trailing_space;
             } else if (child->type == LXB_DOM_NODE_TYPE_TEXT
@@ -1067,14 +1107,22 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         }
         if (inline_width >= limit || block_width >= limit) return limit;
     }
+    bool after_block = false;
     int after_width = generated_inline_pseudo_width(
-        context, node, &style, PSEUDO_AFTER);
+        context, node, &style, PSEUDO_AFTER, &after_block);
+    if (after_block) {
+        if (after_width > block_width) block_width = after_width;
+        after_width = 0;
+    }
     if (has_inline_text && after_width > 0)
-        inline_width = layout_add_coordinate(inline_width, style.letter_spacing);
+        inline_width = layout_add_coordinate(inline_width,
+            layout_fixed_ceil(style.letter_spacing_fixed));
     if (first_line_indent_pending && after_width > 0) {
         inline_width = layout_add_coordinate(inline_width, first_line_indent);
     }
     inline_width += after_width;
+    inline_width = layout_add_coordinate(inline_width,
+        layout_add_coordinate(float_left_width, float_right_width));
     if (inline_width > block_width) block_width = inline_width;
     if (style.display != DISPLAY_CONTENTS
         && style.display != DISPLAY_TABLE_ROW_GROUP
@@ -1170,7 +1218,7 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                     face, metric_family, text + segment_at, segment_length,
                     computed_style_font_size_fixed(parent),
                     synthetic_bold, metric_bold, parent->font_scale,
-                    parent->letter_spacing,
+                    parent->letter_spacing_fixed,
                     parent->text_transform == TEXT_TRANSFORM_CAPITALIZE
                         && segment_at != at ? TEXT_TRANSFORM_NONE
                         : parent->text_transform,
@@ -1215,6 +1263,7 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
     if (layout_node_is_hidden_input(node)) return 0;
     ComputedStyle style = layout_style_for_node(context, node, parent);
     /* Match max-content: cyclic percentage padding contributes zero. */
+    if (node == context->intrinsic_constraint_node) ignore_own_width = true;
     resolve_padding(context->sheet, &style, 0);
     if (style.display == DISPLAY_NONE
         || style.display == DISPLAY_TABLE_COLUMN
@@ -1242,12 +1291,12 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
         return constrain_intrinsic_outer_width(
             context, node, parent, &style, limit, width);
     }
-    if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
+    if (style.generated_image || layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
         || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe")) {
         int replaced_width = intrinsic_replaced_width(
-            context, node, &style);
+            context, node, parent, &style);
         if (replaced_width > 0) {
             /* A percentage-sized HTML image has a cyclic inline-size while
                its containing block is being measured at min-content.  That
@@ -1307,8 +1356,12 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
         widest = 0;
         while (flex_iterator_next(&scan, &item)) {
             if (item.style.out_of_flow || item.style.fixed_position) continue;
+            /* A definite generated box contributes its specified inline
+               size, not its own (possibly zero) flex automatic minimum. */
             int contribution = item.generated_pseudo != PSEUDO_NONE
-                ? flex_child_row_minimum(context, &item, limit, false)
+                ? (item.style.has_width && !item.style.width_percent
+                    ? generated_inline_pseudo_width(context,node,&style,item.generated_pseudo,NULL)
+                    : flex_child_row_minimum(context, &item, limit, false))
                 : intrinsic_min_text_width_internal(
                     context, item.node, &item.parent_style, limit, false);
             if (contribution > widest) widest = contribution;
@@ -1316,6 +1369,19 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             total = layout_add_coordinate(total, contribution);
         }
         if (!style.flex_wrap) widest = total;
+    } else {
+        /* Definite generated decorations participate in min-content just
+           like real children. Without them an auto grid track can squeeze
+           an icon-only control down to its padding. */
+        for (unsigned i = 0; i < 2; i++) {
+            PseudoElement pseudo = i == 0 ? PSEUDO_BEFORE : PSEUDO_AFTER;
+            ComputedStyle generated = layout_style_for_pseudo(
+                context, node, pseudo, &style);
+            if (!generated.has_width || generated.width_percent) continue;
+            int contribution = generated_inline_pseudo_width(
+                context, node, &style, pseudo, NULL);
+            if (contribution > widest) widest = contribution;
+        }
     }
     if (style.display != DISPLAY_CONTENTS
         && style.display != DISPLAY_TABLE_ROW_GROUP
@@ -2649,7 +2715,7 @@ static int flex_child_minimum(LayoutContext *context, const FlatItem *item,
            content width. Replaced content with a known natural width keeps
            the usual min(content suggestion, specified suggestion) rule. */
         if (definite_width && replaced
-            && intrinsic_replaced_width(context, item->node, style) <= 0) {
+            && intrinsic_replaced_width(context, item->node, &item->parent_style, style) <= 0) {
             minimum = specified;
         }
         if (style->has_width && !style->width_max_content) {
@@ -2749,7 +2815,8 @@ static bool flex_item_baseline(LayoutContext *context, const FlatItem *item,
             draw_command_font_italic(command), draw_uses_bold_face(command), draw_command_font_weight(command));
         int ascent = font_ascent_at_size(
             face, draw_command_text_font_size_fixed(command));
-        if (ascent < 0) ascent = 6 * (command->scale > 0 ? command->scale : 1);
+        if (ascent < 0) ascent = 6 * (draw_command_text_scale(command) > 0
+            ? draw_command_text_scale(command) : 1);
         *baseline = command->y + ascent - origin;
         if (*baseline < 0) *baseline = 0;
         if (*baseline > height) *baseline = height;

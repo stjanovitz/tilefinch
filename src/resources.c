@@ -228,11 +228,10 @@ static size_t stylesheet_estimate_scale(size_t count, size_t unit)
    docs/engineering/MEMORY_EXPERIMENTS.md; a quarter is added for geometric
    array growth, plus a fixed allowance (ramped in for small sheets) for
    arrays and index tables that double on first use. */
-size_t stylesheet_source_cost_estimate(const char *css, size_t length)
+static void stylesheet_source_cost_counts(const char *css, size_t length,
+                                         size_t *blocks,
+                                         size_t *custom_properties)
 {
-    if (css == NULL || length == 0) return 0;
-    size_t blocks = 0;
-    size_t custom_properties = 0;
     bool declaration_start = false;
     for (size_t at = 0; at < length; at++) {
         unsigned char value = (unsigned char) css[at];
@@ -244,16 +243,21 @@ size_t stylesheet_source_cost_estimate(const char *css, size_t length)
             continue;
         }
         if (value == '{' || value == ';') {
-            if (value == '{') blocks++;
+            if (value == '{') (*blocks)++;
             declaration_start = true;
             continue;
         }
         if (value == ' ' || value == '\t' || value == '\n'
             || value == '\r' || value == '\f') continue;
         if (declaration_start && value == '-' && at + 1u < length
-            && css[at + 1u] == '-') custom_properties++;
+            && css[at + 1u] == '-') (*custom_properties)++;
         declaration_start = false;
     }
+}
+
+static size_t stylesheet_source_cost(size_t length, size_t blocks,
+                                     size_t custom_properties)
+{
     size_t cost = stylesheet_estimate_add(
         stylesheet_estimate_scale(blocks, STYLESHEET_ESTIMATE_BLOCK_BYTES),
         stylesheet_estimate_scale(custom_properties,
@@ -264,6 +268,14 @@ size_t stylesheet_source_cost_estimate(const char *css, size_t length)
     cost = stylesheet_estimate_add(cost, growth);
     return cost < STYLESHEET_ESTIMATE_MINIMUM_BYTES
         ? STYLESHEET_ESTIMATE_MINIMUM_BYTES : cost;
+}
+
+size_t stylesheet_source_cost_estimate(const char *css, size_t length)
+{
+    if (css == NULL || length == 0) return 0;
+    size_t blocks = 0, custom_properties = 0;
+    stylesheet_source_cost_counts(css, length, &blocks, &custom_properties);
+    return stylesheet_source_cost(length, blocks, custom_properties);
 }
 
 /* A response cut at its byte cap ends wherever the cap fell: inside a
@@ -419,10 +431,34 @@ static bool stylesheet_parse_admitted(ResourceContext *context,
                 (unsigned) STYLESHEET_LAYOUT_RESERVE);
     }
 #endif
-    context->stats->skipped_pressure++;
     budget_record_pressure(context->budget, BUDGET_PRESSURE_STYLESHEET,
                            working, 0);
     return false;
+}
+
+/* Under pressure retain a complete-rule prefix instead of losing every
+   rule. Count each statement once: repeated prefix estimates would make
+   this exceptional path quadratic on large atomic sheets. Never close an
+   unfinished @media, string or declaration just to fit the allowance. */
+static bool resource_work(ResourceContext *context, size_t units,
+                          bool force);
+
+static size_t stylesheet_pressure_prefix(ResourceContext *context,
+                                         const char *css, size_t length)
+{
+    size_t remaining = budget_remaining(context->budget);
+    if (remaining <= STYLESHEET_LAYOUT_RESERVE) return 0;
+    size_t available = remaining - STYLESHEET_LAYOUT_RESERVE;
+    size_t at = 0, kept = 0, blocks = 0, custom_properties = 0;
+    while (stylesheet_next_statement(css, length, &at, NULL)) {
+        if (!resource_work(context, 1, false)) return SIZE_MAX;
+        stylesheet_source_cost_counts(css + kept, at - kept,
+                                      &blocks, &custom_properties);
+        if (stylesheet_source_cost(at, blocks, custom_properties) > available)
+            break;
+        kept = at;
+    }
+    return kept;
 }
 
 /* The largest response one stylesheet request may reserve: the profile's
@@ -1343,30 +1379,25 @@ static bool apply_stylesheet_data(ResourceContext *context,
     }
     size_t parse_cost = stylesheet_source_cost_estimate(
         (const char *) css_data, css_length);
-    if (css_length > context->maximum_single_bytes
-        && budget_pressure_required(context->budget, parse_cost,
-                                    STYLESHEET_LAYOUT_RESERVE)
-        && !budget_make_room(context->budget, stylesheet_estimate_add(
-               parse_cost, STYLESHEET_LAYOUT_RESERVE))) {
-        /* Memory admitted this response past the per-file cap but no longer
-           holds its parse: keep what the cap alone would have kept, its
-           complete rules up to the cap, rather than refusing the sheet. */
-        size_t kept = stylesheet_complete_rules_prefix(
-            (const char *) css_data, context->maximum_single_bytes);
+    size_t source_length = css_length;
+    if (!stylesheet_parse_admitted(context, css_length, parse_cost)) {
+        /* Memory may have admitted the response above its ordinary file
+           cap. Once that room is gone, degradation must obey the cap too. */
+        size_t bounded_length = css_length < context->maximum_single_bytes
+            ? css_length : context->maximum_single_bytes;
+        size_t kept = stylesheet_pressure_prefix(
+            context, (const char *) css_data, bounded_length);
+        if (kept == SIZE_MAX) return false;
         if (kept == 0) {
             context->stats->skipped_pressure++;
-            budget_record_pressure(context->budget,
-                                   BUDGET_PRESSURE_STYLESHEET, parse_cost, 0);
             return true;
         }
-        stylesheet_note_truncated(context, resolved, css_length, kept);
         css_length = kept;
         parse_cost = stylesheet_source_cost_estimate(
             (const char *) css_data, css_length);
     }
-    if (!stylesheet_parse_admitted(context, css_length, parse_cost)) {
-        return true;
-    }
+    if (css_length < source_length)
+        stylesheet_note_truncated(context, resolved, source_length, css_length);
     /* Only retained author CSS consumes the aggregate source quota. A large
        sheet refused by the independent memory-pressure gate must not crowd
        out a later, small sheet that still fits and may carry critical mobile
@@ -2874,7 +2905,10 @@ static bool process_stylesheet_node(
                 stylesheet_source_cost_estimate(css, css_length));
         }
         if (!stylesheet_parse_admitted(context, inline_bytes,
-                                       inline_working)) return true;
+                                       inline_working)) {
+            context->stats->skipped_pressure++;
+            return true;
+        }
         /* A queued external sheet precedes this inline block in the
            document and must be parsed first. Consecutive links remain
            batched, preserving parallel fetch without changing the author
@@ -2935,7 +2969,10 @@ static bool process_adopted_sheets(ResourceContext *context,
             working = stylesheet_estimate_add(
                 working, stylesheet_source_cost_estimate(css, css_length));
         }
-        if (!stylesheet_parse_admitted(context, bytes, working)) continue;
+        if (!stylesheet_parse_admitted(context, bytes, working)) {
+            context->stats->skipped_pressure++;
+            continue;
+        }
         if (!flush_stylesheet_batch(context)
             || !stylesheet_add_adopted_sheet(
                    context->sheet, document, nodes[i], revisions[i]))

@@ -2771,7 +2771,18 @@ static bool test_stylesheet_admission_uses_parsed_cost(void)
     return ok && clean;
 }
 
-static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
+static bool cancel_pressure_prefix(void *opaque, const char *phase,
+                                   size_t work)
+{
+    bool *cancelled = opaque;
+    if (strcmp(phase, "resource") == 0 && work >= 32u) {
+        *cancelled = true;
+        return false;
+    }
+    return true;
+}
+
+static bool test_pressure_partial_sheet_preserves_later_byte_quota(void)
 {
     static const char page[] = "https://fixture.test/page";
     static const char large_url[] = "https://fixture.test/large.css";
@@ -2782,7 +2793,8 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
         "<link rel=stylesheet href='https://fixture.test/large.css'>"
         "<style></style>"
         "<link rel=stylesheet href='https://fixture.test/late.css'>"
-        "<body id=late>late rules remain eligible</body>";
+        "<body><div id=early>early rules survive</div>"
+        "<div id=late>late rules remain eligible</div></body>";
     enum { LARGE_BYTES = 20000 };
     Budget budget;
     budget_init(&budget, 8u * MIB);
@@ -2795,6 +2807,15 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
     unsigned char *large_bytes = budget_malloc(&budget, LARGE_BYTES);
     for (size_t i = 0; large_bytes != NULL && i < LARGE_BYTES; i++) {
         large_bytes[i] = (unsigned char) ".a{}"[i % 4u];
+    }
+    static const char early_css[] = "#early{display:flex}";
+    if (large_bytes != NULL)
+        memcpy(large_bytes, early_css, sizeof(early_css) - 1u);
+    static const char tail_css[] = "#early{display:block}";
+    if (large_bytes != NULL) {
+        memset(large_bytes + LARGE_BYTES - 32u, ' ', 32u);
+        memcpy(large_bytes + LARGE_BYTES - 32u,
+               tail_css, sizeof(tail_css) - 1u);
     }
     unsigned char *late_bytes = budget_malloc(&budget, sizeof(late_css) - 1u);
     if (late_bytes != NULL) {
@@ -2819,11 +2840,12 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
     browser_shared_body_release(large_body);
     browser_shared_body_release(late_body);
     size_t original_limit = budget.limit;
+    size_t pressure_limit = budget.current + 3u * MIB + 55u * 1024u;
     if (ok) {
-        /* The 20 KiB sheet's 5,000 rules need a multi-megabyte parse
-           allowance and are refused; the minimum 32 KiB allowance for the
-           tiny late sheet still fits. */
-        budget.limit = budget.current + 3u * MIB + 55u * 1024u;
+        /* The complete dense source cannot fit its parse allowance. A
+           complete-rule prefix must survive beside the unchanged layout
+           reserve, without spending the later sheet's byte quota. */
+        budget.limit = pressure_limit;
         ok = stylesheets_load_external_tracked(
             &document, &stylesheet, &budget, page, 4, LARGE_BYTES,
             LARGE_BYTES, 1000, NULL, NULL, &resources, &stats);
@@ -2833,8 +2855,14 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
         lxb_dom_interface_node(document.html), "late") : NULL;
     ComputedStyle style = late == NULL ? (ComputedStyle) {0}
         : style_for_node(&stylesheet, late, NULL);
-    ok = ok && stats.skipped_pressure == 1
-        && stats.bytes == sizeof(late_css) - 1u
+    lxb_dom_node_t *early = ok ? find_element_id(
+        lxb_dom_interface_node(document.html), "early") : NULL;
+    ComputedStyle early_style = early == NULL ? (ComputedStyle) {0}
+        : style_for_node(&stylesheet, early, NULL);
+    ok = ok && stats.skipped_pressure == 0 && stats.truncated == 1
+        && stats.loaded == 2 && stats.bytes < LARGE_BYTES
+        && stats.bytes > sizeof(late_css) - 1u
+        && early_style.display == DISPLAY_FLEX
         && style.display == DISPLAY_FLEX;
     if (!ok) {
         fprintf(stderr,
@@ -2846,6 +2874,34 @@ static bool test_pressure_skipped_sheet_preserves_later_byte_quota(void)
                 stats.retained_body_hits, stats.skipped_limit,
                 stats.skipped_pressure, stats.bytes, style.display,
                 budget.current, budget.limit);
+    }
+    /* The ledger must retain the full source, not freeze the pressure
+       prefix into future rebuilds after headroom returns. */
+    ok = ok && stylesheets_load_external_tracked(
+        &document, &stylesheet, &budget, page, 4,
+        LARGE_BYTES + sizeof(late_css), LARGE_BYTES,
+        1000, NULL, NULL, &resources, &stats);
+    if (ok) early_style = style_for_node(&stylesheet, early, NULL);
+    ok = ok && stats.loaded == 2 && stats.skipped_pressure == 0
+        && stats.bytes == LARGE_BYTES + sizeof(late_css) - 1u
+        && early_style.display == DISPLAY_BLOCK;
+    if (!ok) fprintf(stderr, "pressure restore loaded=%zu bytes=%zu display=%d\n",
+                     stats.loaded, stats.bytes, early_style.display);
+    bool cancelled = false;
+    TilefinchPlatformServices services = {
+        .context = &cancelled, .cooperate = cancel_pressure_prefix
+    };
+    if (ok) {
+        budget.limit = pressure_limit;
+        tilefinch_platform_set_services(&services);
+        bool completed = stylesheets_load_external_tracked(
+            &document, &stylesheet, &budget, page, 4, LARGE_BYTES,
+            LARGE_BYTES, 1000, NULL, NULL, &resources, &stats);
+        tilefinch_platform_set_services(NULL);
+        budget.limit = original_limit;
+        ok = !completed && cancelled;
+        if (!ok) fprintf(stderr, "pressure cancel completed=%d cancelled=%d work=%zu\n",
+                         completed, cancelled, stats.work_units);
     }
     stylesheet_document_resources_destroy(&resources);
     stylesheet_destroy(&stylesheet);
@@ -3793,7 +3849,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_cors_stylesheet_uses_partitioned_resource_cache);
     RUN_TEST(test_cors_stylesheet_reuses_document_preload);
     RUN_TEST(test_stylesheet_pressure_omits_optional_sheet);
-    RUN_TEST(test_pressure_skipped_sheet_preserves_later_byte_quota);
+    RUN_TEST(test_pressure_partial_sheet_preserves_later_byte_quota);
     RUN_TEST(test_stylesheet_cost_estimate_bounds_parsed_cost);
     RUN_TEST(test_stylesheet_admission_uses_parsed_cost);
     RUN_TEST(test_compiled_fragment_reuses_external_css_with_new_inline_css);

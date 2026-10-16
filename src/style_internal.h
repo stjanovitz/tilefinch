@@ -1425,6 +1425,8 @@ bool style_math_candidate(const Stylesheet *sheet, const char *text,
                           int em_basis, int rem_basis, int ch_basis);
 bool style_math_resolve_media_length(const char *text, size_t length,
                                       int width, int height, int32_t *pixels_q8);
+bool style_parse_letter_spacing(const Stylesheet *sheet, const char *text,
+                               size_t length, int16_t *fixed);
 int style_parse_length(const Stylesheet *sheet, const char *text,
                        size_t length, int fallback, bool *percent);
 
@@ -1549,6 +1551,8 @@ size_t style_append_css_codepoint(char *output, size_t length, size_t capacity, 
 
 /* style_properties.c */
 bool declaration_is_important(const char *value, size_t length);
+bool style_deferred_focus_shadow(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, bool outset);
 size_t declaration_value_length(const char *value, size_t length);
 size_t skip_css_space_and_comments(const char *text, size_t length,
                                    size_t at);

@@ -3,6 +3,7 @@
 #include "tilefinch/url.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -18,9 +19,43 @@
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --method GET|HEAD --url HTTPS_URL --output DIR "
-            "--max-bytes N --timeout-ms N [--origin HTTPS_ORIGIN]\n",
+            "usage: %s --method GET|HEAD|OPTIONS --url HTTPS_URL --output DIR "
+            "--max-bytes N --timeout-ms N [--origin HTTPS_ORIGIN] "
+            "[--headers-file FILE | --preflight-method GET|HEAD "
+            "--preflight-headers NAMES]\n",
             program);
+}
+
+static bool read_public_headers(const char *path, char *buffer, size_t capacity)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    size_t length = fread(buffer, 1, capacity, file);
+    bool valid = !ferror(file) && length < capacity;
+    fclose(file);
+    if (!valid) return false;
+    if (length != 0 && buffer[length - 1] == '\n') length--;
+    buffer[length] = '\0';
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char) buffer[i];
+        if (c != '\n' && c != '\t' && (c < 32 || c > 126)) return false;
+    }
+    for (const char *at = buffer; *at != '\0';) {
+        const char *end = strchr(at, '\n');
+        if (end == NULL) end = at + strlen(at);
+        const char *colon = memchr(at, ':', (size_t) (end - at));
+        char name[128];
+        if (colon == NULL || colon == at || (size_t) (colon - at) >= sizeof(name)) return false;
+        size_t n = (size_t) (colon - at);
+        for (size_t i = 0; i < n; i++) name[i] = (char) tolower((unsigned char) at[i]);
+        name[n] = '\0';
+        if (strstr(name, "authorization") || strstr(name, "cookie")
+            || strstr(name, "token") || strstr(name, "secret")
+            || strstr(name, "credential") || strstr(name, "api-key")
+            || strstr(name, "api_key") || strstr(name, "apikey")) return false;
+        at = *end == '\0' ? end : end + 1;
+    }
+    return true;
 }
 
 static bool parse_size(const char *value, size_t maximum, size_t *parsed)
@@ -135,6 +170,7 @@ int main(int argc, char **argv)
     const char *max_bytes_text = NULL;
     const char *timeout_text = NULL;
     const char *origin = NULL;
+    const char *headers_file = NULL, *preflight_method = NULL, *preflight_headers = NULL;
     for (int i = 1; i < argc; i++) {
         const char *option = argv[i];
         if (strcmp(option, "--help") == 0
@@ -161,6 +197,12 @@ int main(int argc, char **argv)
             timeout_text = value;
         } else if (strcmp(option, "--origin") == 0 && origin == NULL) {
             origin = value;
+        } else if (strcmp(option, "--headers-file") == 0 && headers_file == NULL) {
+            headers_file = value;
+        } else if (strcmp(option, "--preflight-method") == 0 && preflight_method == NULL) {
+            preflight_method = value;
+        } else if (strcmp(option, "--preflight-headers") == 0 && preflight_headers == NULL) {
+            preflight_headers = value;
         } else {
             usage(argv[0]);
             return 2;
@@ -170,9 +212,16 @@ int main(int argc, char **argv)
     size_t maximum_bytes = 0;
     long timeout_ms = 0;
     char normalized_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    bool preflight = method != NULL && strcmp(method, "OPTIONS") == 0;
+    char extra_headers[8192] = {0};
     if (method == NULL || url == NULL || output == NULL
         || max_bytes_text == NULL || timeout_text == NULL
-        || (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
+        || (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && !preflight)
+        || (preflight && (origin == NULL || headers_file != NULL || preflight_method == NULL
+            || (strcmp(preflight_method, "GET") != 0 && strcmp(preflight_method, "HEAD") != 0)
+            || preflight_headers == NULL || strlen(preflight_headers) > 1024
+            || strpbrk(preflight_headers, "\r\n") != NULL))
+        || (!preflight && (preflight_method != NULL || preflight_headers != NULL))
         || !exact_https_url(url)
         || (origin != NULL
             && (!tilefinch_url_origin(origin, normalized_origin,
@@ -186,9 +235,35 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
+    if (preflight) {
+        int length = snprintf(extra_headers, sizeof(extra_headers),
+            "Access-Control-Request-Method: %s%s%s", preflight_method,
+            preflight_headers[0] ? "\nAccess-Control-Request-Headers: " : "",
+            preflight_headers);
+        if (length < 0 || (size_t) length >= sizeof(extra_headers)) return 2;
+    } else if (headers_file != NULL
+               && !read_public_headers(headers_file, extra_headers, sizeof(extra_headers))) {
+        fprintf(stderr, "trace acquisition refuses invalid or credential-bearing headers\n");
+        return 2;
+    }
+    FetchRequest request = {
+        .method = method, .origin = origin, .allow_http_errors = true,
+        .extra_headers = extra_headers[0] ? extra_headers : NULL,
+        .cors_preflight = preflight, .enforce_cors = preflight,
+        .redirect_same_origin_only = preflight,
+        .credential_origin = preflight ? origin : NULL,
+        .initiator_url = preflight ? origin : NULL,
+        .credentials = preflight ? FETCH_CREDENTIALS_SAME_ORIGIN : FETCH_CREDENTIALS_INCLUDE
+    };
+    FetchRequestValidationError validation;
+    if (!fetch_request_validate(&request, &validation)) {
+        fprintf(stderr, "trace acquisition refuses invalid request policy\n");
+        return 2;
+    }
     /* Raw response-cookie values are forbidden even if a caller tries to
        opt into the general trace capture escape hatch. No Cookie, cookie jar,
-       Authorization, client certificate, or application header is supplied.
+       Authorization or client certificate is supplied. Application headers
+       require an explicit bounded file and cannot carry credentials.
        INCLUDE is intentional only so response Set-Cookie fields survive long
        enough for the trace writer to redact and retain their replay shape. */
     if (getenv("TILEFINCH_TRACE_RAW_COOKIES") != NULL) {
@@ -211,12 +286,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    FetchRequest request = {
-        .method = method,
-        .origin = origin,
-        .allow_http_errors = true,
-        .credentials = FETCH_CREDENTIALS_INCLUDE
-    };
     FetchResult result = {.budget = &budget};
     bool fetched = fetch_request_single_hop(
         &budget, url, &request, maximum_bytes, timeout_ms, &result);
@@ -225,6 +294,18 @@ int main(int argc, char **argv)
         && result.status_code <= 599
         && strcmp(result.effective_url, url) == 0
         && (strcmp(method, "HEAD") != 0 || result.length == 0);
+    if (valid && preflight) {
+        char metadata_path[4096];
+        int length = snprintf(metadata_path, sizeof(metadata_path), "%s/0000.meta", output);
+        FILE *metadata = length >= 0 && (size_t) length < sizeof(metadata_path)
+            ? fopen(metadata_path, "ab") : NULL;
+        valid = metadata != NULL;
+        if (metadata != NULL) {
+            valid = fprintf(metadata, "request-preflight-method=%s\nrequest-preflight-headers=%s\n",
+                            preflight_method, preflight_headers) >= 0;
+            if (fclose(metadata) != 0) valid = false;
+        }
+    }
     if (valid) valid = capture_authority_complete(output);
     if (valid) {
         printf("trace-acquire-ok status=%ld length=%zu\n",

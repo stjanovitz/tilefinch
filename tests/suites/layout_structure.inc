@@ -1440,9 +1440,9 @@ static int test_text_run_scan_reuse(Budget *budget)
     int raw = font_text_width_for_family_at_size_fixed_mode(&fonts.sans,
         FONT_SANS, "AAAA", 4, 16 * 64, false, false, true);
     CHECK(raw > 0 && measured_text_width_fixed_mode(&fonts.sans, FONT_SANS,
-        "AAAA", 4, 16 * 64, false, false, 2, -100, true) == raw / 4);
+        "AAAA", 4, 16 * 64, false, false, 2, -100 * 64, true) == raw / 4);
     CHECK(measured_text_width_fixed_mode(&fonts.sans, FONT_SANS,
-        "AAAA", 4, 16 * 64, false, false, 2, 2, true) == raw + 3 * 2 * 64);
+        "AAAA", 4, 16 * 64, false, false, 2, 2 * 64, true) == raw + 3 * 2 * 64);
     CHECK(measured_text_width_fixed_mode(NULL, FONT_SANS, "AAAA", 4,
         16 * 64, false, false, 2, 0, true) == 4 * 6 * 2 * 64);
     static const char html[] = "<!doctype html><body><p>ASCII words wrap safely</p>"
@@ -3568,6 +3568,7 @@ static int test_overflow_wrap_correctness(Budget *budget)
         "#overlong,#nowrap{width:40px;word-wrap:break-word}"
         "#nowrap{white-space:nowrap}"
         "#nowrap-group-line{width:80px}#nowrap-group{white-space:nowrap}"
+        ".inline-word{width:96px;font-size:16px}"
         ".minimum{display:flex;width:80px}"
         ".minimum>.target{display:block;flex:1 1 0}"
         ".minimum>.fixed{display:block;flex:0 0 40px;width:40px;min-width:0}"
@@ -3583,6 +3584,12 @@ static int test_overflow_wrap_correctness(Budget *budget)
         "<div id=nowrap class=wrap>DDDDDDDDDDDD</div>"
         "<div id=nowrap-group-line class=wrap>AAAA "
         "<span id=nowrap-group>BBBB GGGG</span></div>"
+        "<div id=split-punctuation class='wrap inline-word'>JJJJ "
+        "<span>(<a href='/word'><b>KKKK</b></a>)</span></div>"
+        "<div id=split-word class='wrap inline-word'>LLLL "
+        "<span>MM<em>NN</em>OO</span></div>"
+        "<div id=spaced-word class='wrap inline-word'>PPPP "
+        "<span>QQ <em>RR</em></span></div>"
         "<div class=minimum><span id=any-item class=target>EEEEE</span>"
         "<span class=fixed></span></div>"
         "<div class=minimum><span id=break-item class=target>FFFFF</span>"
@@ -3665,6 +3672,28 @@ static int test_overflow_wrap_correctness(Budget *budget)
           && group_prefix != NULL && group_first != NULL
           && group_first->x == nowrap_group_line_box->x
           && group_first->y > group_prefix->y);
+    const DrawCommand *word_prefix = text_command(&layout, "LLLL");
+    const DrawCommand *word_first = text_command(&layout, "MM");
+    const DrawCommand *word_middle = text_command(&layout, "NN");
+    const DrawCommand *word_last = text_command(&layout, "OO");
+    const DrawCommand *punctuation_prefix = text_command(&layout, "JJJJ");
+    const DrawCommand *punctuation_word = text_command(&layout, "KKKK");
+    const DrawCommand *punctuation_open = text_command(&layout, "(");
+    const DrawCommand *punctuation_close = text_command(&layout, ")");
+    const DrawCommand *spaced_prefix = text_command(&layout, "PPPP");
+    const DrawCommand *spaced_first = text_command(&layout, "QQ");
+    const DrawCommand *spaced_last = text_command(&layout, "RR");
+    CHECK(word_prefix != NULL && word_first != NULL && word_middle != NULL
+          && word_last != NULL && word_first->y > word_prefix->y
+          && word_first->y == word_middle->y && word_middle->y == word_last->y
+          && punctuation_prefix != NULL && punctuation_open != NULL
+          && punctuation_word != NULL && punctuation_close != NULL
+          && punctuation_open->y > punctuation_prefix->y
+          && punctuation_open->y == punctuation_word->y
+          && punctuation_word->y == punctuation_close->y
+          && spaced_prefix != NULL && spaced_first != NULL && spaced_last != NULL
+          && spaced_prefix->y == spaced_first->y
+          && spaced_first->y < spaced_last->y);
 
     size_t overlong_pieces = 0;
     bool overlong_contained = true;

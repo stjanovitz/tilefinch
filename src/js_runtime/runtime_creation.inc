@@ -2111,6 +2111,7 @@ static ScriptRuntime *script_runtime_create_internal(
 #endif
     host->bridge.deterministic_entropy = deterministic;
     host->bridge.deterministic_clock = deterministic;
+    host->bridge.fixed_wall_clock = deterministic && fetch_trace_fixed_wall_clock();
     host->bridge.wall_clock_timers =
         !deterministic && wall_clock_timers_enabled;
     host->bridge.replay_seed = replay_seed;

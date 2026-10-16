@@ -248,7 +248,7 @@ static JSValue js_date_now(JSContext *context, JSValueConst this_value,
                            > maximum_date_ms - bridge->clock_origin_ms
             ? maximum_date_ms
             : bridge->clock_origin_ms + bridge->clock_wall_elapsed_ms;
-        if (bridge->clock_wall_elapsed_ms
+        if (!bridge->fixed_wall_clock && bridge->clock_wall_elapsed_ms
                 <= UINT64_MAX
                    - SCRIPT_DETERMINISTIC_CLOCK_CALL_QUANTUM_MS) {
             bridge->clock_wall_elapsed_ms +=

@@ -796,6 +796,55 @@ class VisualScenarioTest(unittest.TestCase):
 
             self.assertEqual(result.status, "ELIGIBLE", result.details)
 
+    def test_fixed_wall_clock_is_declared_and_bound_to_both_engines(self) -> None:
+        fixed = "fixed-origin-wall-observed-monotonic-v1"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = self.make_trace(root)
+            info = trace / "trace.meta"
+            info.write_text(info.read_text() + "wall-clock=fixed-origin-v1\n")
+            item = scenario(trace_digest(trace))
+            reference = root / "reference"
+            candidate = root / "candidate"
+            reference.mkdir()
+            candidate.mkdir()
+            value = state_for(item, "reference", reference)
+            frames = candidate / "frames"
+            frames.mkdir()
+            for index in range(len(item.checkpoints)):
+                (frames / f"frame-{index:04d}.ppm").write_bytes(
+                    b"P6\n2 1\n255\n" + b"\x10\x20\x30" * 2)
+            for key in ("clock_contract", "document_timeline", "animation_frame"):
+                value["replay_environment"][key] = fixed
+            value["replay_environment"]["wall_elapsed_ms"] = 0
+            native = candidate_state_from_log(item, candidate_evidence_line(item, **{
+                "clock": fixed, "wall-elapsed-ms": "0",
+            }), frames, origin_ms=TRACE_ORIGIN_MS)
+            ref_path = reference / "state.json"
+            native_path = candidate / "state.json"
+            write_state(ref_path, value)
+            write_state(native_path, native)
+            result = qualify(item, trace, ref_path, native_path)
+            self.assertEqual(result.status, "ELIGIBLE", result.details)
+            value["replay_environment"]["wall_elapsed_ms"] = 1
+            write_state(ref_path, value)
+            self.assertEqual(qualify(item, trace, ref_path, native_path).status, "NOT_COMPARABLE")
+            value["replay_environment"]["wall_elapsed_ms"] = 0
+            write_state(ref_path, value)
+            info.write_text(info.read_text().replace("wall-clock=fixed-origin-v1\n", ""))
+            ordinary = replace(item, trace_sha256=trace_digest(trace))
+            for path in (ref_path, native_path):
+                state = load_state(path)
+                state["trace_sha256"] = ordinary.trace_sha256
+                write_state(path, state)
+            result = qualify(ordinary, trace, ref_path, native_path)
+            self.assertEqual(result.status, "NOT_COMPARABLE")
+            self.assertIn("reference-replay-environment-clock-contract", result.details)
+            self.assertIn("candidate-replay-environment-clock-contract", result.details)
+            info.write_text(info.read_text() + "wall-clock=unrecognized\n")
+            with self.assertRaises(ArtifactError):
+                trace_replay_origin_ms(trace)
+
     def test_candidate_state_requires_native_machine_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

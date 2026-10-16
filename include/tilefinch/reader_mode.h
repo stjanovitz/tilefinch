@@ -89,6 +89,13 @@ bool reader_document_prepare_basic_with_stylesheet(
 bool reader_document_prepare_basic_complete_with_stylesheet(
     PocDocument *document, const Stylesheet *stylesheet,
     ReaderDocumentAnalysis *analysis);
+/* Optional settled source geometry keeps small CSS-sized images from
+   expanding to their intrinsic size when layout wrappers are flattened.
+   The caller must not supply a layout with unpublished DOM mutations. */
+struct LayoutDocument;
+bool reader_document_prepare_basic_complete_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const struct LayoutDocument *layout, ReaderDocumentAnalysis *analysis);
 
 /* Remove the exact native extracted root most recently appended for `kind`
    and its body marker. This is the allocation-failure rollback used when the

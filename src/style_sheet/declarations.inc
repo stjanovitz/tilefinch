@@ -22,7 +22,9 @@ typedef struct {
     /* The custom properties resolving it read (itself, and those its
        declared value referenced): a hit reports them as read too. */
     uint64_t reads;
-    char name[STYLE_CUSTOM_NAME_CAPACITY];
+    /* Long authored names remain supported through the indexed cascade;
+       do not enlarge every hot cache slot just to retain rare long keys. */
+    char name[48];
     union {
         char text[STYLE_CUSTOM_SHORT_VALUE_CAPACITY];
         /* A longer value's NUL-terminated bytes in the cache's spill. */
@@ -1593,7 +1595,8 @@ static unsigned retained_box_tokens(
 
 bool style_retained_box_values(
     const Stylesheet *sheet, lxb_dom_node_t *node,
-    const char *shorthand, StyleRetainedBoxValues *output)
+    const char *shorthand, const char *const aliases[4],
+    StyleRetainedBoxValues *output)
 {
     if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL
         || shorthand == NULL || output == NULL) return false;
@@ -1621,6 +1624,21 @@ bool style_retained_box_values(
         retained_rule_winner(
             sheet, node, names[side], strlen(names[side]),
             &winners[side + 1]);
+        if (aliases != NULL) {
+            RetainedRuleWinner alias;
+            retained_rule_winner(sheet, node, aliases[side],
+                                 strlen(aliases[side]), &alias);
+            RetainedRuleWinner *physical = &winners[side + 1];
+            if (alias.rule != NULL
+                && custom_rule_later(sheet, node, alias.rule, physical->rule)) {
+                bool inline_rule = alias.rule == &alias.inline_rule;
+                *physical = alias;
+                if (inline_rule) {
+                    physical->rule = &physical->inline_rule;
+                    physical->inline_rule.value = physical->inline_value;
+                }
+            }
+        }
     }
 
     StyleResolveScratch *scratch = sheet->resolve_scratch;
@@ -2138,6 +2156,17 @@ static bool style_resolve_value_nested(const Stylesheet *sheet,
         memcpy(output + written, resolved, resolved_length);
         written += resolved_length;
         at = close + 1;
+        /* var() substitutes tokens, not characters. Preserve a boundary
+           when serializing a replacement beside a name/number: otherwise
+           a colour followed by a stop offset becomes one malformed hash,
+           or a number followed by "px" incorrectly becomes a dimension. */
+        if (written != 0 && at < length
+            && !isspace((unsigned char) output[written - 1])
+            && (name_character(text[at]) || text[at] == '.'
+                || text[at] == '%' || text[at] == '\\')) {
+            if (written + 1 >= output_size) return false;
+            output[written++] = ' ';
+        }
     }
     output[written] = '\0';
     return true;

@@ -626,7 +626,7 @@
     CHECK(font_rounded_style.font_size == 21
           && font_rounded_style.line_height == 25);
     CHECK(font_metric_style.font_family == FONT_METRIC_SANS);
-    CHECK(font_system_style.font_family == FONT_METRIC_SANS);
+    CHECK(font_system_style.font_family == FONT_SYSTEM_SANS);
     CHECK(font_humanist_style.font_family == FONT_HUMANIST_SANS);
     CHECK(computed_style_font_size_fixed(&font_points_style) == 939
           && font_points_style.margin.left == 16
@@ -1127,6 +1127,32 @@
     CHECK(font_set_face(&fonts, FONT_METRIC_SANS) == &fonts.metric_sans
           && font_set_face_variant(&fonts, FONT_METRIC_SANS, false, true)
                  == &fonts.metric_sans_bold);
+    CHECK(font_set_face(&fonts, FONT_SYSTEM_SANS) == &fonts.metric_sans
+          && font_set_face_variant(&fonts, FONT_SYSTEM_SANS, false, true)
+                 == &fonts.metric_sans_bold);
+    for (unsigned bold = 0; bold < 2; bold++) {
+        const FontFace *face = font_set_face_variant(
+            &fonts, FONT_SYSTEM_SANS, false, bold != 0);
+        static const int sizes[] = {9 * 64, 13 * 64, 17 * 64 + 21,
+                                    22 * 64, 40 * 64};
+        for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+            for (unsigned c = 32; c < 127; c++) {
+                char text = (char) c;
+                int run = font_text_width_for_family_at_size_fixed_mode(
+                    face, FONT_SYSTEM_SANS, &text, 1, sizes[s],
+                    false, bold != 0, false);
+                int glyph = font_glyph_advance_for_family_at_size_fixed(
+                    FONT_SYSTEM_SANS, c, sizes[s], false, bold != 0, 0);
+                CHECK(abs(run - glyph) <= 1 && glyph > 0);
+            }
+        }
+    }
+    int system_width = font_text_width_for_family_at_size_fixed(
+        &fonts.metric_sans_bold, FONT_SYSTEM_SANS,
+        "Modern system text", 18, 22 * 64, false, true);
+    int metric_width = font_text_width_at_size_fixed(
+        &fonts.metric_sans_bold, "Modern system text", 18, 22 * 64, false);
+    CHECK(system_width > 0 && system_width < metric_width);
     CHECK(font_set_face(&fonts, FONT_HUMANIST_SANS) == sans
           && font_set_face_style(&fonts, FONT_HUMANIST_SANS, true)
                  == &fonts.sans_italic
@@ -1620,7 +1646,7 @@
     CHECK(keep_style.word_break_mode == WORD_BREAK_KEEP_ALL
           && legacy_style.word_break_mode == WORD_BREAK_LEGACY);
     CHECK(font_basis_style.font_size == 20
-          && font_basis_style.letter_spacing == 20);
+          && font_basis_style.letter_spacing_fixed == 20 * 64);
     CHECK(percent_margin_box != NULL && percent_margin_box->x == 120);
     CHECK(computed_style_direction_rtl(&auto_dir_style));
     CHECK(cluster_first != NULL && cluster_second != NULL

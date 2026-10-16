@@ -110,6 +110,11 @@ the registry test verifies those paths without fragile source line numbers.
 
 These run one behavior in isolation; they do not replace the complete suite.
 
+- `build-preset-release/tilefinch-tests --filter web-runtime` includes focus
+  dependency checks for boolean selectors and retained values, plus exact
+  cached-paint/full-flow comparisons for translated pseudo decorations and
+  simple focus shadows. Geometry, complex effects and spatial-band changes
+  must retain full-layout fallback.
 - `build-preset-release/tilefinch-browser-engine-tests --youtube-account-actions-only`
   checks provider-supplied watched progress, exact resume links and deduplicated
   recent-history cards (including optional failure), plus
@@ -141,6 +146,19 @@ These run one behavior in isolation; they do not replace the complete suite.
   5 inline badge geometry, 6 generated mask sizing, or 7 rounded border sides.
 - `build-preset-release/tilefinch-layout-tests --auto-grid-align-only`
   checks center/end alignment after content-sized grid rows finish sizing.
+- `build-preset-release/tilefinch-layout-tests --fractional-tracking-only`
+  checks signed fractional tracking across inline boundaries and wrapping.
+- `build-preset-release/tilefinch-layout-tests --nested-flex-baseline-only`
+  checks first-item baseline propagation through an inline-block wrapper.
+- `build-preset-release/tilefinch-layout-tests --css-replacement-image-only`
+  checks ordinary-element `content:url()` sizing, painting, and replacement
+  of the original subtree through the budgeted image loader.
+- `build-preset-release/tilefinch-layout-tests --unknown-media-dimensions-only`
+  checks independent default video/frame dimensions without inventing an
+  intrinsic aspect ratio, while retaining canvas and authored ratios.
+- `build-preset-release/tilefinch-layout-tests --button-content-centering-only`
+  checks vertical centering of definite-height flow buttons without moving
+  positioned decorations or overriding flex/intrinsic-height alignment.
 - `build-preset-release/tilefinch-layout-tests --oversized-style-cache-only`
   checks scan-resistant retention at the style-cache ceiling and exact output
   after invalidation; it does not increase the cache's byte or entry limits.

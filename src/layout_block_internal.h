@@ -127,11 +127,12 @@ bool layout_block_flexrow_section(LayoutContext *context,
 
 bool layout_block_emit_decoration(
     LayoutContext *context, lxb_dom_node_t *node,
-    const ComputedStyle *style, int outer_x, int outer_y, int outer_width,
+    const ComputedStyle *style, const ComputedStyle *parent,
+    int outer_x, int outer_y, int outer_width,
     LayoutBlockPaintPlan *plan);
 
 bool layout_block_patch_decoration(
-    LayoutContext *context, const ComputedStyle *style,
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style,
     const LayoutBlockPaintPlan *plan, int outer_x, int outer_y,
     int outer_width, int content_bottom, int border_height,
     bool collapsed_table_cell, size_t *insertion_index_io,

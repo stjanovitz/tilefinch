@@ -2,6 +2,8 @@
 
 import hashlib
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,33 @@ class UpdateToolTests(unittest.TestCase):
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         return private, public
+
+    def test_emulator_rehearsal_browser_manifest(self):
+        root = TOOL.parents[1]
+        script = (root / "scripts/run-ppsspp-update-e2e.sh").read_text()
+        command = re.search(
+            r'python3 "\$root/tools/tilefinch_update_tool.py" manifest \\\n'
+            r'(?:.*\\\n)*.*--output "\$work/manifest.bin"', script)
+        self.assertIsNotNone(command)
+        header = (root / "include/tilefinch/swdec_component.h").read_text()
+        abi = re.search(r"TILEFINCH_SWDEC_COMPONENT_ABI_VERSION (\d+)u", header)
+        self.assertIsNotNone(abi)
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            slot = work / "slot"
+            slot.mkdir()
+            (slot / "EBOOT.PBP").write_bytes(b"rehearsal-browser")
+            (work / "origin").mkdir()
+            self.command("pack", "--directory", slot,
+                         "--output", work / "origin/tilefinch-update-v1.tfup")
+            (work / "notes.txt").write_text("Rehearsal.")
+            expanded = command.group().replace("$root", str(root)).replace(
+                "$work", str(work)).replace("$decoder_abi", abi.group(1))
+            arguments = shlex.split(expanded.replace("\\\n", ""))
+            subprocess.run([sys.executable, *arguments[1:]], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertIn(("Decoder ABI " + abi.group(1)).encode(),
+                          (work / "manifest.bin").read_bytes())
 
     def test_offline_package_and_low_s_envelope(self):
         with tempfile.TemporaryDirectory() as temporary:

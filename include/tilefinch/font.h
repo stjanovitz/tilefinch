@@ -23,7 +23,7 @@ typedef enum {
 #define TILEFINCH_BITMAP_FONT_SCALE_LIMIT 32
 #define TILEFINCH_WEB_FONT_FAMILY_LIMIT 8
 #define TILEFINCH_WEB_FONT_WEIGHT_LIMIT 4
-#define TILEFINCH_WEB_FONT_FAMILY_STRIDE 5
+#define TILEFINCH_WEB_FONT_FAMILY_STRIDE 6
 #define TILEFINCH_WEB_FONT_BASE 16
 #define TILEFINCH_WEB_FONT_GLYPH_PIXEL_LIMIT (64u * 1024u)
 
@@ -49,7 +49,10 @@ enum {
     /* Keep a separate family identity while reusing the bounded sans face so
        named Verdana stacks can apply compatible Latin advances without
        retaining another raster font on the PSP. */
-    FONT_HUMANIST_SANS
+    FONT_HUMANIST_SANS,
+    /* Modern system stacks reuse the metric sans outlines with their own
+       bounded Latin advances; no additional font data is retained. */
+    FONT_SYSTEM_SANS
 };
 
 _Static_assert(TILEFINCH_WEB_FONT_BASE

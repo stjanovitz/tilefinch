@@ -497,6 +497,7 @@ bool fetch_trace_clock_origin_ms(uint64_t *origin_ms)
     (void) origin_ms;
     return false;
 }
+bool fetch_trace_fixed_wall_clock(void) { return false; }
 
 FetchResult * fetch_result_create(Budget *budget)
 {

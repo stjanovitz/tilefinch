@@ -188,7 +188,7 @@ static int test_animated_canvas_follows_transactional_page_move(void)
    body grows even without scripts, whose checkpoints used to be the only
    retry; a header-only preview is repainted once real content arrives, and
    the first-present time stays that of the first paint. */
-static int test_provisional_preview_retries_and_refreshes(void)
+static int test_provisional_preview_retries_and_refreshes(bool focus_decoration)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -204,6 +204,13 @@ static int test_provisional_preview_retries_and_refreshes(void)
     BrowserEngine *engine = browser_engine_create(
         &config, error, sizeof(error));
     CHECK(engine != NULL);
+    /* Hidden focus decorations retain native identity in text commands.
+       Detaching a streaming preview must clear that identity rather than
+       treating it as an ImageResource or indexing an empty image table. */
+    static const char preview_css[] =
+        "h1::after{content:'#';position:absolute;visibility:hidden}";
+    if (focus_decoration)
+        CHECK(browser_engine_set_user_css(engine, preview_css, sizeof(preview_css)-1));
     ProvisionalPresentProbe present_probe = {0};
     TilefinchPlatformServices present_services = {
         .context = &present_probe,
@@ -235,6 +242,10 @@ static int test_provisional_preview_retries_and_refreshes(void)
     BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
     uint64_t first_present_at_first_paint = 0;
     size_t paints_before_commit = 0;
+    /* The original fixture must still refresh exactly twice. The separate
+       user-CSS variant qualifies detached identity ownership, not the same
+       preview admission schedule; its sheet is available before parsing. */
+    size_t minimum_paints = focus_decoration ? 1u : 2u;
     for (size_t pumps = 0;
          pumps < 1024 && status == BROWSER_NAVIGATION_JOB_PENDING;
          pumps++) {
@@ -247,7 +258,7 @@ static int test_provisional_preview_retries_and_refreshes(void)
     }
     (void) browser_engine_navigation_job_metrics(engine, &job);
     if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED
-        || paints_before_commit != 2
+        || paints_before_commit < minimum_paints || paints_before_commit > 2u
         || navigation->performance.streaming_preview_empty_raster_skips == 0
         || first_present_at_first_paint == 0
         || job.provisional_first_present_us
@@ -268,7 +279,7 @@ static int test_provisional_preview_retries_and_refreshes(void)
     CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
           && navigation->performance.streaming_preview_empty_raster_skips
                  >= 1
-          && paints_before_commit == 2
+          && paints_before_commit >= minimum_paints && paints_before_commit <= 2u
           && first_present_at_first_paint != 0
           && job.provisional_first_present_us
                  == first_present_at_first_paint

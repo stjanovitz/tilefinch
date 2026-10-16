@@ -1836,7 +1836,10 @@ bool layout_block_grid_section(LayoutContext *context,
                 if (item_box != NULL) {
                     int dx = 0;
                     int dy = 0;
-                    int inline_free = assigned_cell_width - item_box->width;
+                    ComputedStyle aligned = item->style;
+                    resolve_margin(context->sheet, &aligned, assigned_cell_width);
+                    int inline_free = assigned_cell_width - item_box->width
+                        - aligned.margin.left - aligned.margin.right;
                     if (inline_free > 0) {
                         if (item->style.margin_left_auto
                             && item->style.margin_right_auto) {

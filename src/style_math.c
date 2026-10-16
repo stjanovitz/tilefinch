@@ -767,6 +767,53 @@ static uint32_t style_math_hash(const StyleMathInstruction *instructions,
     return hash;
 }
 
+static __attribute__((noinline)) bool style_parse_letter_spacing_math(
+    const Stylesheet *sheet, const char *text, size_t length, int16_t *fixed)
+{
+    StyleMathParser parser;
+    StyleMathCandidate candidate;
+    int root = -1;
+    const StyleResolveScratch *scratch = sheet == NULL ? NULL : sheet->resolve_scratch;
+    int em = scratch != NULL && scratch->font_resolution_active
+        ? scratch->font_resolution_inherited : STYLE_DEFAULT_FONT_PX;
+    int rem = scratch != NULL && scratch->font_resolution_active
+        ? scratch->font_resolution_root : STYLE_DEFAULT_FONT_PX;
+    int ch = scratch != NULL && scratch->font_ch_basis_active
+        ? scratch->font_ch_basis : (em + 1) / 2;
+    if (fixed == NULL || !style_math_candidate(sheet, text, length, &parser,
+        &candidate, &root, em, rem, ch) || candidate.has_percent
+        || !parser.nodes[root].folded) return false;
+    int64_t value = parser.nodes[root].a;
+    value = value < 0 ? (value - 2) / 4 : (value + 2) / 4;
+    if (value < -128 * 64) value = -128 * 64;
+    if (value > 127 * 64 + 63) value = 127 * 64 + 63;
+    *fixed = (int16_t) value;
+    return true;
+}
+
+bool style_parse_letter_spacing(const Stylesheet *sheet, const char *text,
+                               size_t length, int16_t *fixed)
+{
+    /* Common pixel tracking needs no expression-parser stack or cascade
+       lookup: the declaration caller already substituted variables. */
+    if (text != NULL && fixed != NULL && length != 0 && length < 48) {
+        char value[48];
+        memcpy(value, text, length);
+        value[length] = '\0';
+        char *end = NULL;
+        double number = strtod(value, &end);
+        if (end != value && isfinite(number)
+            && (strcmp(end, "px") == 0 || (*end == '\0' && number == 0))) {
+            number *= 64;
+            if (number < -128 * 64) number = -128 * 64;
+            if (number > 127 * 64 + 63) number = 127 * 64 + 63;
+            *fixed = (int16_t) (number < 0 ? number - .5 : number + .5);
+            return true;
+        }
+    }
+    return style_parse_letter_spacing_math(sheet, text, length, fixed);
+}
+
 static bool style_math_intern(Stylesheet *sheet,
                               const StyleMathCandidate *candidate,
                               StyleLength *value)

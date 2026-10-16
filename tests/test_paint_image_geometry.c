@@ -237,11 +237,79 @@ static int test_gradient_mask_paint(Budget *budget)
     return 0;
 }
 
-int main(void)
+static int test_enlarged_photo_and_transparent_card(Budget *budget, bool photo_only)
+{
+    static const char page[] =
+        "<!doctype html><style>html,body{margin:0;background:white}"
+        "#card{position:absolute;left:8px;top:8px;width:24px;height:24px;"
+        "border-radius:4px;box-shadow:1px 2px 4px #0008}"
+        "img{display:block;width:8px;height:8px}"
+        "</style><div id=card><img id=photo></div>"
+        "<img id=alpha style='position:absolute;top:36px;left:0'>";
+    PocDocument document = {0}; Stylesheet sheet = {0};
+    LayoutDocument layout = {0}; TileCache cache = {0};
+    CHECK(document_parse(&document,budget,page,sizeof(page)-1,12)
+          && stylesheet_build(&sheet,budget,&document,48));
+    unsigned char pixels[] = {0,0,0,255, 255,255,255,255,
+                              0,0,0,255, 255,255,255,255};
+    unsigned char transparent[] = {255,0,0,255, 0,0,255,0,
+                                   255,0,0,255, 0,0,255,0};
+    ImageResource items[] = {
+        {.node=find_id(lxb_dom_interface_node(document.html),"photo"),
+         .pixels=pixels,.width=2,.height=2},
+        {.node=find_id(lxb_dom_interface_node(document.html),"alpha"),
+         .pixels=transparent,.width=2,.height=2}
+    };
+    ImageResources images = {.items=items,.count=2};
+    CHECK(layout_build(&layout,budget,&document,&sheet,NULL,&images,48));
+    uint16_t frame[48u*48u];
+    CHECK(tile_cache_init(&cache,budget,&layout,4)
+          && tile_cache_set_frame(&cache,frame,48u*48u)
+          && tile_cache_render_frame(&cache,0,48,48,NULL));
+    /* A transparent card never receives its own outer shadow. */
+    if (!photo_only) CHECK(frame[20u*48u+20u]==UINT16_C(0xffff));
+    /* Pixel-center interpolation creates intermediate greys, not blocks. */
+    unsigned left=(frame[10u*48u+11u]>>11)&31u;
+    unsigned right=(frame[10u*48u+12u]>>11)&31u;
+    CHECK(left>8u && left<16u && right>16u && right<24u);
+    /* Interpolate premultiplied color: invisible blue must not tint red. */
+    uint16_t alpha = frame[38u*48u+3u];
+    CHECK((alpha>>11)==31u && (alpha&31u)>8u && (alpha&31u)<16u);
+    tile_cache_destroy(&cache);layout_destroy(&layout);
+    stylesheet_destroy(&sheet);document_destroy(&document);
+    CHECK(budget->current==0u);
+    return 0;
+}
+
+static int test_shadow_offset_visual_clone(Budget *budget)
+{
+    DrawCommand shadow = {.type=DRAW_SHADOW_RECT,
+        .image_fit=LAYOUT_SHADOW_OUTSIDE_BOX,.x=8,.y=8,.width=32,.height=32,
+        .scale=4,.radius=4,.opacity_scale=256};
+    draw_command_set_shadow_offset(&shadow,6,-8);
+    LayoutDocument source = {.budget=budget,.commands=&shadow,.count=1,
+        .capacity=1,.width=96,.scroll_width=96,.height=96};
+    CHECK(viewport_context_init(&source.viewport,96,96,48,48));
+    LayoutDocument visual = {0};
+    CHECK(layout_clone_visual(&visual,&source));
+    CHECK((int16_t)visual.commands[0].text_length==3
+          && (int16_t)(visual.commands[0].text_length>>16)==-4);
+    layout_destroy(&visual);
+    CHECK(budget->current==0u);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     Budget budget;
     budget_init(&budget, 16u * MIB);
     budget_install_lexbor(&budget);
+    if(argc==2 && strcmp(argv[1],"--shadow-scale-only")==0)
+        return test_shadow_offset_visual_clone(&budget);
+    CHECK(test_shadow_offset_visual_clone(&budget)==0);
+    CHECK(test_enlarged_photo_and_transparent_card(&budget,
+        argc == 2 && strcmp(argv[1], "--photo-only") == 0)==0);
+    if (argc == 2) return 0;
     CHECK(test_svg_default_aspect_ratio(&budget) == 0);
     CHECK(test_scaled_background_geometry(&budget) == 0);
     CHECK(test_gradient_mask_paint(&budget) == 0);

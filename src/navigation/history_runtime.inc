@@ -757,8 +757,49 @@ typedef struct {
     ComputedStyle normal;
     ComputedStyle focused;
     StyleFocusChange change;
+    StyleFocusPseudoTranslation translation;
     bool focused_now;
+    bool paint;
 } NavigationFocusPaintCandidate;
+
+static bool navigation_focus_paint_candidate(
+    NavigationSession *session, const NavigationFocusPaintCandidate *candidate,
+    bool dry_run, int *left, int *top, int *right, int *bottom)
+{
+    const StyleFocusPseudoTranslation *t = &candidate->translation;
+    bool translated = t->dx[0] || t->dx[1] || t->dy[0] || t->dy[1];
+    bool valid = false;
+    for (unsigned pass = 0; pass < 3; pass++) {
+        int l, u, r, b;
+        if (pass == 0) {
+            if (!translated) continue;
+            if (!layout_apply_focus_pseudo_translation(&session->page.layout,
+                    candidate->node, t, candidate->focused_now, dry_run,
+                    &l, &u, &r, &b)) return false;
+        } else if (pass == 1) {
+            if (candidate->change != STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
+                && candidate->change != STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY
+                && candidate->change != STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY) continue;
+            if (!layout_apply_focus_border_paint(&session->page.layout,
+                    &session->page.stylesheet, candidate->node,
+                    candidate->focused_now ? &candidate->focused : &candidate->normal,
+                    candidate->change, dry_run, &l, &u, &r, &b)) return false;
+        } else {
+            if (!t->visibility_changed) continue;
+            if (!layout_apply_focus_pseudo_visibility(&session->page.layout,
+                    candidate->node, t, candidate->focused_now, dry_run,
+                    &l, &u, &r, &b)) return false;
+        }
+        if (!valid) { *left=l; *top=u; *right=r; *bottom=b; valid=true; }
+        else {
+            if (l < *left) *left = l;
+            if (u < *top) *top = u;
+            if (r > *right) *right = r;
+            if (b > *bottom) *bottom = b;
+        }
+    }
+    return valid;
+}
 
 static bool navigation_mutations_are_paint_only_focus(
     NavigationSession *session, const ScriptMutationJournal *mutations,
@@ -792,31 +833,33 @@ static bool navigation_mutations_are_paint_only_focus(
         bool parent_known = parent_of != NULL
             && parent_of == record->node->parent;
         if (!parent_known) parent_of = record->node->parent;
-        if ((!parent_known
+        if (!parent_known
              && !navigation_focus_parent_style(
                     &session->page.stylesheet, record->node,
-                    &parent, &has_parent))
-            || (candidates[i].change = style_focus_change_classify(
+                    &parent, &has_parent)) return false;
+        candidates[i].change = style_focus_change_classify(
                     &session->page.stylesheet, record->node,
                     has_parent ? &parent : NULL,
                     &candidates[i].normal,
-                    &candidates[i].focused))
-                   == STYLE_FOCUS_CHANGE_UNSAFE) {
-            return false;
-        }
+                    &candidates[i].focused);
+        if (candidates[i].change == STYLE_FOCUS_CHANGE_UNSAFE)
+            candidates[i].change = style_focus_pseudo_change_classify(
+                &session->page.stylesheet, record->node,
+                has_parent ? &parent : NULL, &candidates[i].normal,
+                &candidates[i].focused, &candidates[i].translation);
+        if (candidates[i].change == STYLE_FOCUS_CHANGE_UNSAFE) return false;
         candidates[i].node = record->node;
         size_t focus_length = 0;
         candidates[i].focused_now = document_attribute(
             record->node, "data-tilefinch-focus", &focus_length) != NULL;
-        if (candidates[i].change == STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
-            || candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY) {
-            const ComputedStyle *target = candidates[i].focused_now
-                ? &candidates[i].focused : &candidates[i].normal;
-            if (!layout_apply_focus_border_paint(
-                    &session->page.layout, &session->page.stylesheet,
-                    candidates[i].node, target,
-                    candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY, true,
-                    NULL, NULL, NULL, NULL)) return false;
+        candidates[i].paint = candidates[i].change != STYLE_FOCUS_CHANGE_OUTLINE_ONLY
+            || candidates[i].translation.visibility_changed
+            || candidates[i].translation.dx[0] || candidates[i].translation.dx[1]
+            || candidates[i].translation.dy[0] || candidates[i].translation.dy[1];
+        if (candidates[i].paint) {
+            int left, top, right, bottom;
+            if (!navigation_focus_paint_candidate(session, &candidates[i], true,
+                    &left, &top, &right, &bottom)) return false;
             has_border_paint = true;
         }
         if (candidates[i].focused_now) {
@@ -828,16 +871,11 @@ static bool navigation_mutations_are_paint_only_focus(
         bool damage_valid = false;
         int damage_left = 0, damage_top = 0, damage_right = 0, damage_bottom = 0;
         for (size_t i = 0; i < mutations->count; i++) {
-            if (candidates[i].change != STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
-                && candidates[i].change != STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY) continue;
-            const ComputedStyle *target = candidates[i].focused_now
-                ? &candidates[i].focused : &candidates[i].normal;
+            if (!candidates[i].paint) continue;
             int left = 0, top = 0, right = 0, bottom = 0;
-            if (!layout_apply_focus_border_paint(
-                    &session->page.layout, &session->page.stylesheet,
-                    candidates[i].node, target,
-                    candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY, false,
-                    &left, &top, &right, &bottom)) return false;
+            bool applied = navigation_focus_paint_candidate(session, &candidates[i], false,
+                &left, &top, &right, &bottom);
+            if (!applied) return false;
             if (!damage_valid) {
                 damage_left = left;
                 damage_top = top;
@@ -1725,6 +1763,14 @@ static void navigation_evict_layout_reuse_under_pressure(
     NavigationSession *session)
 {
     if (session == NULL || session->page.layout_reuse == NULL) return;
+    if (!budget_pressure_required(
+            session->budget, 384u * 1024u, 512u * 1024u)) return;
+    /* Selector results are much smaller than resolved ComputedStyles and
+       remain valid through this pressure decision. Reclaim values first;
+       destroying and immediately recreating both tables makes every update
+       repeat the expensive selector walk. Ordinary invalidation still owns
+       all DOM/stylesheet changes. */
+    (void) layout_reuse_cache_reclaim_styles(session->page.layout_reuse);
     if (!budget_pressure_required(
             session->budget, 384u * 1024u, 512u * 1024u)) return;
     layout_reuse_cache_destroy(session->page.layout_reuse);
@@ -2691,7 +2737,8 @@ static bool navigation_mutations_are_hidden_only(
     return true;
 }
 
-static bool navigation_relayout_body(NavigationSession *session);
+static bool navigation_relayout_body(NavigationSession *session,
+                                     StyleWebFonts **retained_fonts);
 
 /* These writes leave every node and text buffer borrowed by the incumbent
    intact. Structural/text mutations, dropped journal entries and resource
@@ -2736,7 +2783,10 @@ bool navigation_relayout(NavigationSession *session)
         census_started = navigation_now_us();
     }
 #endif
-    bool ok = navigation_relayout_body(session);
+    StyleWebFonts *retained_fonts = NULL;
+    bool ok = navigation_relayout_body(session, &retained_fonts);
+    if (retained_fonts != NULL)
+        stylesheet_release_web_fonts(session->budget, retained_fonts);
 #ifndef TILEFINCH_NO_TRACE
     if (census) {
         const NavigationPerformance *after = &session->performance;
@@ -2768,7 +2818,8 @@ bool navigation_relayout(NavigationSession *session)
     return ok;
 }
 
-static bool navigation_relayout_body(NavigationSession *session)
+static bool navigation_relayout_body(NavigationSession *session,
+                                     StyleWebFonts **retained_fonts)
 {
     if (session == NULL || !session->page.loaded) return false;
     tilefinch_platform_trace_step("relayout-prepare");
@@ -2776,6 +2827,8 @@ static bool navigation_relayout_body(NavigationSession *session)
     session->focus_outline_cache_node = NULL;
     uint64_t started = navigation_now_us();
     const NavigationEntry *entry = navigation_current(session);
+    layout_reuse_cache_set_focus_scroll(session->page.layout_reuse,
+        entry == NULL ? 0 : entry->scroll_y);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (session->page.document.node_count > 8192) {
         printf("tilefinch-large-page-relayout: begin nodes=%zu\n",
@@ -3235,6 +3288,12 @@ static bool navigation_relayout_body(NavigationSession *session)
         &session->page.external_font_loader,
         session->page.resource_scheduler, &session->page.external_fonts);
     layout_destroy(&session->page.layout);
+    /* Keep only the independently owned font registry, not the old rules or
+       layout. The wrapper releases it on every success/refusal path. */
+    if (session->web_fonts_enabled && session->web_font_mode != WEB_FONTS_OFF) {
+        *retained_fonts = session->page.stylesheet.web_fonts;
+        session->page.stylesheet.web_fonts = NULL;
+    }
     stylesheet_destroy(&session->page.stylesheet);
     FULL_RELAYOUT_STEP();
     if (!navigation_build_stylesheet(session)) {
@@ -3309,6 +3368,8 @@ static bool navigation_relayout_body(NavigationSession *session)
             return navigation_relayout_failed(session, true);
         }
         user_css_added = true;
+        stylesheet_share_unchanged_web_fonts(&session->page.stylesheet,
+            *retained_fonts, session->maximum_font_face_backend_bytes);
         navigation_ensure_layout_reuse(session);
         if (!images_load_external_reusing_layout_styles_excluding(
                 &session->page.document, &session->page.stylesheet,
@@ -3336,6 +3397,9 @@ static bool navigation_relayout_body(NavigationSession *session)
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
     }
+    if (!user_css_added)
+        stylesheet_share_unchanged_web_fonts(&session->page.stylesheet,
+            *retained_fonts, session->maximum_font_face_backend_bytes);
     if (session->web_fonts_enabled && rebuild_url != NULL
         && !navigation_load_web_fonts(session, rebuild_url)) {
         session->page.loaded = false;
@@ -3656,6 +3720,10 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     }
     if (okay && length != 0)
         okay = stylesheet_add_user_css(&next_sheet, copy, length);
+    if (okay && session->web_fonts_enabled
+        && session->web_font_mode != WEB_FONTS_OFF)
+        stylesheet_share_unchanged_web_fonts(&next_sheet,
+            session->page.stylesheet.web_fonts, session->maximum_font_face_backend_bytes);
     uint64_t started = navigation_now_us();
     if (okay) {
         okay = layout_build_context_reuse(
@@ -3894,6 +3962,29 @@ static TILEFINCH_OUT_OF_LINE bool navigation_fallback_web_fonts(NavigationSessio
 {
     if (script_runtime_has_pending_mutations(session->page.runtime)) return true;
     session->page.web_font_fallback_attempted = true;
+    /* Smart substitutes built-in text faces, but private-use icon runs have
+       no portable built-in replacement. Keep their already-admitted families;
+       explicit Off still drops every face. No new font is loaded here. */
+    uint8_t icon_families = 0;
+    if (session->web_font_mode == WEB_FONTS_SMART) {
+        for (size_t i = 0; i < session->page.layout.count; i++) {
+            const DrawCommand *command = &session->page.layout.commands[i];
+            if (command->type != DRAW_TEXT || command->text == NULL
+                || command->text_length > 4) continue;
+            FontFamily family = draw_command_font_family(command);
+            if (family < TILEFINCH_WEB_FONT_BASE) continue;
+            unsigned slot = (family - TILEFINCH_WEB_FONT_BASE)
+                / TILEFINCH_WEB_FONT_FAMILY_STRIDE;
+            if (slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT) continue;
+            unsigned codepoint = 0;
+            if (font_utf8_next(command->text, command->text_length, &codepoint)
+                    == command->text_length
+                && ((codepoint >= 0xe000u && codepoint <= 0xf8ffu)
+                    || (codepoint >= 0xf0000u && codepoint <= 0xffffdu)
+                    || (codepoint >= 0x100000u && codepoint <= 0x10fffdu)))
+                icon_families |= (uint8_t) (1u << slot);
+        }
+    }
     FontFace retained[TILEFINCH_WEB_FONT_FAMILY_LIMIT][TILEFINCH_WEB_FONT_WEIGHT_LIMIT] = {{{0}}};
     bool any = false;
     for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
@@ -3901,6 +3992,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_fallback_web_fonts(NavigationSessio
             FontFace *face = stylesheet_web_font_face_at(&session->page.stylesheet, family, slot);
             if (face == NULL) continue;
             retained[family][slot] = *face;
+            if ((icon_families & (1u << family)) != 0) continue;
             any |= face->loaded;
             memset(face, 0, sizeof(*face));
         }
@@ -3944,10 +4036,15 @@ static TILEFINCH_OUT_OF_LINE bool navigation_fallback_web_fonts(NavigationSessio
         ? session->page.layout.height : next.height;
     layout_destroy(&session->page.layout);
     session->page.layout = next;
-    for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++)
-        for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++)
-            font_face_destroy(&retained[family][slot]);
     session->page.external_fonts.retained_encoded_bytes = 0;
+    for (unsigned family = 0; family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++)
+        for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; slot++) {
+            FontFace *face = &retained[family][slot];
+            if ((icon_families & (1u << family)) == 0)
+                font_face_destroy(face);
+            else if (face->loaded)
+                session->page.external_fonts.retained_encoded_bytes += face->data_length;
+        }
     session->incremental_relayouts++;
     session->performance.fast_relayouts++;
     uint64_t elapsed = navigation_record_layout_slices(session, started, &next);
@@ -4391,15 +4488,26 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
        navigation_rebind_appended_images before reaching this publication. */
     for (size_t i = layout->image_resource_count; i < page->images.count; i++) {
         const ImageResource *image = &page->images.items[i];
-        if (image->is_background || image->is_mask || image->is_canvas)
+        if (image->is_background || image->is_canvas)
+            return false;
+        if (image->is_mask && (image->pseudo != PSEUDO_NONE
+            || image != images_find_mask_node(&page->images, image->node)))
             return false;
         bool found = false;
         for (size_t j = 0; j < layout->count; j++) {
             const DrawCommand *command = &layout->commands[j];
             if (command->type == DRAW_IMAGE
                 && command->text == (const char *) image->node
-                && command->text_length == 0
+                && (image->is_mask
+                    ? (command->font_family & LAYOUT_IMAGE_SLOT_MASK) != 0
+                    : command->text_length == 0
+                      && (command->font_family & LAYOUT_IMAGE_SLOT_MASK) == 0)
                 && command->width > 0 && command->height > 0) {
+                if (image->is_mask && command->image == NULL) {
+                    DrawCommand probe = *command;
+                    if (!layout_bind_fixed_mask_image(&page->stylesheet, &probe, image))
+                        return false;
+                }
                 found = true;
                 break;
             }
@@ -4420,10 +4528,12 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
             int margin = command->font_size > 0 ? command->font_size : command->height;
             if (margin > alt_margin) alt_margin = margin;
         }
-        if (command->type != DRAW_IMAGE || command->text == NULL
-            || command->text_length != 0) continue;
-        const ImageResource *next = images_find_node(&page->images,
-            (lxb_dom_node_t *) command->text);
+        if (command->type != DRAW_IMAGE || command->text == NULL) continue;
+        bool mask_slot = (command->font_family & LAYOUT_IMAGE_SLOT_MASK) != 0;
+        if (!mask_slot && command->text_length != 0) continue;
+        const ImageResource *next = mask_slot
+            ? images_find_mask_node(&page->images, (lxb_dom_node_t *) command->text)
+            : images_find_node(&page->images, (lxb_dom_node_t *) command->text);
         bool available = image_resource_available(next);
         if (command->image == NULL && available) {
             int r = command->x > INT_MAX - command->width
@@ -4435,13 +4545,21 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
             if (r > right) right = r;
             if (b > bottom) bottom = b;
         }
-        command->image = available ? next : NULL;
+        if (mask_slot && command->image == NULL && available) {
+            /* Preflight above proved the stable layer ID. Its decoded
+               intrinsic dimensions only affect paint, never this box. */
+            (void) layout_bind_fixed_mask_image(&page->stylesheet, command, next);
+        } else command->image = available ? next : NULL;
         if (!available) unresolved = true;
     }
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
         const ImagePriorityTarget *target = &layout->visual_priority_targets[i];
-        if (target->kind != IMAGE_PRIORITY_KIND_DOCUMENT
-            || !image_resource_available(images_find_node(&page->images, target->node)))
+        const ImageResource *image = target->kind == IMAGE_PRIORITY_KIND_MASK
+            ? images_find_mask_source(&page->images, target->node,
+                target->source, target->pseudo)
+            : target->kind == IMAGE_PRIORITY_KIND_DOCUMENT
+                ? images_find_node(&page->images, target->node) : NULL;
+        if (!image_resource_available(image))
             unresolved = true;
     }
     if (!layout->visual_priority_overflow)
@@ -4511,8 +4629,8 @@ static NavigationBackgroundWorkOutcome navigation_publish_visual_images(
         return NAVIGATION_BACKGROUND_WORK_SUCCESS;
     /* No author mutation is part of this static resource publication. New
        input can abandon its replacement layout, keeping both the incumbent
-       and decoded resources for the next idle turn. Masks and backgrounds
-       still require full flow; the fixed-image proof does not cover them. */
+       and decoded resources for the next idle turn. Intrinsic masks and
+       backgrounds still require full flow. */
     bool optional = page->runtime == NULL && !session->style_rebuild_required;
     bool allowed = !optional
         || tilefinch_platform_cooperate("optional-image-publication", 1);

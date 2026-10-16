@@ -4172,6 +4172,60 @@ const WebFontSet *stylesheet_web_font_set(const Stylesheet *sheet)
            ? NULL : &sheet->web_fonts->loaded;
 }
 
+void stylesheet_share_unchanged_web_fonts(Stylesheet *target,
+    const StyleWebFonts *source, size_t maximum_backend_bytes)
+{
+    if (target == NULL || source == NULL || target->web_fonts == source
+        || target->web_fonts == NULL) return;
+    for (size_t to = 0; to < target->web_fonts->family_count; to++) {
+        for (size_t from = 0; from < source->family_count; from++) {
+            if (strcmp(target->web_fonts->families[to].name,
+                       source->families[from].name) != 0) continue;
+            for (size_t tw = 0; tw < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; tw++) {
+                const StyleWebFontFaceSource *a = &target->web_fonts->families[to].faces[tw];
+                if (a->source_count == 0) continue;
+                for (size_t sw = 0; sw < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; sw++) {
+                    const StyleWebFontFaceSource *b = &source->families[from].faces[sw];
+                    const FontFace *face = &source->loaded.families[from].faces[sw];
+                    if (!face->loaded || a->source_count != b->source_count
+                        || target->web_fonts->loaded.families[to].weights[tw]
+                            != source->loaded.families[from].weights[sw]) continue;
+                    bool same = true;
+                    for (size_t i = 0; i < a->source_count; i++) {
+                        const char *ab = a->source_bases[i], *bb = b->source_bases[i];
+                        if (strcmp(a->references[i], b->references[i]) != 0
+                            || ((ab == NULL) != (bb == NULL))
+                            || (ab && strcmp(ab, bb) != 0)
+                            || strcmp(a->source_referrer_policies[i], b->source_referrer_policies[i]) != 0)
+                            same = false;
+                    }
+                    if (same && font_face_share_encoded(
+                        &target->web_fonts->loaded.families[to].faces[tw],
+                        face, target->budget, face->data, face->data_length,
+                        maximum_backend_bytes)) break;
+                }
+            }
+            break;
+        }
+    }
+}
+
+void stylesheet_release_web_fonts(Budget *budget, StyleWebFonts *fonts)
+{
+    if (fonts == NULL) return;
+    web_font_set_destroy(&fonts->loaded);
+    for (size_t slot = 0; slot < fonts->family_count; slot++) {
+        for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++) {
+            StyleWebFontFaceSource *selected = &fonts->families[slot].faces[face];
+            for (size_t source = 0; source < selected->source_count; source++) {
+                budget_free(budget, selected->source_bases[source]);
+                budget_free(budget, selected->references[source]);
+            }
+        }
+    }
+    budget_free(budget, fonts);
+}
+
 bool stylesheet_web_font_stats(const Stylesheet *sheet,
                                StylesheetWebFontStats *stats)
 {
@@ -4285,25 +4339,7 @@ void stylesheet_destroy(Stylesheet *sheet)
             budget_free(sheet->budget, sheet->image_sources->items);
             budget_free(sheet->budget, sheet->image_sources);
         }
-        if (sheet->web_fonts != NULL) {
-            web_font_set_destroy(&sheet->web_fonts->loaded);
-            for (size_t slot = 0;
-                 slot < sheet->web_fonts->family_count; slot++) {
-                for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
-                     face++) {
-                    StyleWebFontFaceSource *selected =
-                        &sheet->web_fonts->families[slot].faces[face];
-                    for (size_t source = 0;
-                         source < selected->source_count; source++) {
-                        budget_free(sheet->budget,
-                                    selected->source_bases[source]);
-                        budget_free(sheet->budget,
-                                    selected->references[source]);
-                    }
-                }
-            }
-            budget_free(sheet->budget, sheet->web_fonts);
-        }
+        stylesheet_release_web_fonts(sheet->budget, sheet->web_fonts);
     }
     memset(sheet, 0, sizeof(*sheet));
 }

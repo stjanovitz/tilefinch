@@ -6305,22 +6305,62 @@ static uint8_t sparse_modern_typography_mask(
     return 0;
 }
 
-static bool retained_scroll_box_shorthand(
+static void computed_style_scroll_start_sides(
+    const ComputedStyle *style, unsigned *block, unsigned *in_line)
+{
+    unsigned mode = computed_style_writing_mode(style);
+    bool rtl = computed_style_direction_rtl(style);
+    *block = mode == STYLE_WRITING_HORIZONTAL_TB ? 0u
+        : mode == STYLE_WRITING_VERTICAL_RL ? 1u : 3u;
+    *in_line = mode == STYLE_WRITING_HORIZONTAL_TB ? (rtl ? 1u : 3u)
+        : (rtl ? 2u : 0u);
+}
+
+static bool retained_scroll_box_value(
     const Stylesheet *stylesheet, lxb_dom_node_t *node,
+    const ComputedStyle *style,
     const char *name, size_t name_length, char *output, size_t capacity)
 {
-    if (!property_equal(name, name_length, "scroll-margin", 13)
-        && !property_equal(name, name_length, "scroll-padding", 14)) {
-        return false;
+    size_t base_length = name_length >= 13
+        && strncasecmp(name, "scroll-margin", 13) == 0 ? 13u
+        : name_length >= 14
+          && strncasecmp(name, "scroll-padding", 14) == 0 ? 14u : 0u;
+    if (base_length == 0) return false;
+    int side = -1;
+    if (name_length != base_length) {
+        if (name[base_length] != '-') return false;
+        static const char *const sides[] = {"top", "right", "bottom", "left"};
+        for (size_t i = 0; i < 4; i++) {
+            if (strcmp(name + base_length + 1u, sides[i]) == 0) side = (int) i;
+        }
+        if (side < 0) return false;
     }
     char shorthand[15];
-    if (name_length >= sizeof(shorthand)) return false;
-    memcpy(shorthand, name, name_length);
-    shorthand[name_length] = '\0';
+    memcpy(shorthand, name, base_length);
+    shorthand[base_length] = '\0';
+    unsigned block, in_line;
+    computed_style_scroll_start_sides(style, &block, &in_line);
+    const char *suffixes[4];
+    suffixes[block] = "block-start";
+    suffixes[block ^ 2u] = "block-end";
+    suffixes[in_line] = "inline-start";
+    suffixes[in_line ^ 2u] = "inline-end";
+    char alias_names[4][40];
+    const char *aliases[4];
+    for (size_t i = 0; i < 4; i++) {
+        snprintf(alias_names[i], sizeof(alias_names[i]), "%s-%s",
+                 shorthand, suffixes[i]);
+        aliases[i] = alias_names[i];
+    }
     StyleRetainedBoxValues values;
     if (!style_retained_box_values(
-            stylesheet, node, shorthand, &values)
-        || values.present_mask != 0x0fu) return false;
+            stylesheet, node, shorthand, aliases, &values)) return false;
+    if (side >= 0) {
+        if ((values.present_mask & (1u << side)) == 0) return false;
+        int written = snprintf(output, capacity, "%s", values.values[side]);
+        return written >= 0 && (size_t) written < capacity;
+    }
+    if (values.present_mask != 0x0fu) return false;
     const char *top = values.values[0], *right = values.values[1];
     const char *bottom = values.values[2], *left = values.values[3];
     int written;
@@ -7635,12 +7675,20 @@ enum {
     X(SCALE, "scale", true, CSP_SPARSE_MODERN) \
     X(SCROLL_BEHAVIOR, "scroll-behavior", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_MARGIN, "scroll-margin", false, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_BLOCK_END, "scroll-margin-block-end", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_BLOCK_START, "scroll-margin-block-start", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_MARGIN_BOTTOM, "scroll-margin-bottom", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_INLINE_END, "scroll-margin-inline-end", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_MARGIN_INLINE_START, "scroll-margin-inline-start", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_MARGIN_LEFT, "scroll-margin-left", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_MARGIN_RIGHT, "scroll-margin-right", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_MARGIN_TOP, "scroll-margin-top", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_PADDING, "scroll-padding", false, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_BLOCK_END, "scroll-padding-block-end", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_BLOCK_START, "scroll-padding-block-start", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_PADDING_BOTTOM, "scroll-padding-bottom", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_INLINE_END, "scroll-padding-inline-end", true, CSP_SPARSE_SCROLL) \
+    X(SCROLL_PADDING_INLINE_START, "scroll-padding-inline-start", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_PADDING_LEFT, "scroll-padding-left", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_PADDING_RIGHT, "scroll-padding-right", true, CSP_SPARSE_SCROLL) \
     X(SCROLL_PADDING_TOP, "scroll-padding-top", true, CSP_SPARSE_SCROLL) \
@@ -8009,6 +8057,32 @@ static bool computed_style_edge_is_fixed(StyleLength edge)
         && edge <= STYLE_LENGTH_DIRECT_LIMIT;
 }
 
+/* Sparse scroll lengths still need computed-value serialization: callers
+   commonly parse these values themselves rather than use scrollIntoView.
+   Reuse the bounded math parser without interning a program or allocating.
+   Percentages (padding only) and keywords retain their authored form. */
+static TILEFINCH_OUT_OF_LINE void computed_style_scroll_length(
+    const Stylesheet *sheet, const ComputedStyle *style,
+    char *value, size_t capacity)
+{
+    StyleMathParser parser;
+    StyleMathCandidate candidate;
+    int root = -1;
+    int em_fixed = computed_style_font_size_fixed(style);
+    int rem_fixed = computed_style_root_font_size_fixed(style);
+    /* This parser takes integral font bases. Keep the prior text rather
+       than silently round a fractional relative-unit calculation. */
+    if (((em_fixed | rem_fixed) & 63) != 0
+        && (strstr(value, "em") != NULL || strstr(value, "ch") != NULL))
+        return;
+    int em = em_fixed / 64;
+    int rem = rem_fixed / 64;
+    if (!style_math_candidate(sheet, value, strlen(value), &parser,
+            &candidate, &root, em, rem, (em + 1) / 2)
+        || candidate.has_percent || !parser.nodes[root].folded) return;
+    snprintf(value, capacity, "%.15gpx", parser.nodes[root].a / 256.0);
+}
+
 /* Used pixels of one edge, sharing the width resolved by the cascade walk. */
 static int computed_style_used_padding(
     DomBridge *bridge, int containing_width,
@@ -8164,9 +8238,8 @@ static TILEFINCH_OUT_OF_LINE bool computed_style_serialize_retained(
         snprintf(value, value_size, "%s",
                  at < sizeof(names) / sizeof(names[0]) ? names[at] : "normal");
     } else if (id == CSP_LETTER_SPACING) {
-        /* Retained as whole pixels; zero is the `normal` keyword. */
-        if (style->letter_spacing == 0) snprintf(value, value_size, "normal");
-        else snprintf(value, value_size, "%dpx", (int) style->letter_spacing);
+        if (style->letter_spacing_fixed == 0) snprintf(value, value_size, "normal");
+        else snprintf(value, value_size, "%.6gpx", style->letter_spacing_fixed / 64.0);
     } else if (id == CSP_WORD_SPACING) {
         snprintf(value, value_size, "%dpx", style->word_spacing);
     } else if (id == CSP_TEXT_DECORATION_LINE) {
@@ -8253,6 +8326,33 @@ static JSValue computed_style_string(JSContext *context, const char *text,
     return JS_NewString(context, text);
 }
 
+static ComputedStylePropertyId computed_style_scroll_physical_id(
+    ComputedStylePropertyId id, const ComputedStyle *style)
+{
+    bool padding = false, block = false, start = false;
+    switch (id) {
+    case CSP_SCROLL_PADDING_BLOCK_START: padding = true; /* fall through */
+    case CSP_SCROLL_MARGIN_BLOCK_START: block = true; start = true; break;
+    case CSP_SCROLL_PADDING_BLOCK_END: padding = true; /* fall through */
+    case CSP_SCROLL_MARGIN_BLOCK_END: block = true; break;
+    case CSP_SCROLL_PADDING_INLINE_START: padding = true; /* fall through */
+    case CSP_SCROLL_MARGIN_INLINE_START: start = true; break;
+    case CSP_SCROLL_PADDING_INLINE_END: padding = true; /* fall through */
+    case CSP_SCROLL_MARGIN_INLINE_END: break;
+    default: return id;
+    }
+    unsigned block_side, inline_side;
+    computed_style_scroll_start_sides(style, &block_side, &inline_side);
+    unsigned side = (block ? block_side : inline_side) ^ (start ? 0u : 2u);
+    static const ComputedStylePropertyId physical[2][4] = {
+        {CSP_SCROLL_MARGIN_TOP, CSP_SCROLL_MARGIN_RIGHT,
+         CSP_SCROLL_MARGIN_BOTTOM, CSP_SCROLL_MARGIN_LEFT},
+        {CSP_SCROLL_PADDING_TOP, CSP_SCROLL_PADDING_RIGHT,
+         CSP_SCROLL_PADDING_BOTTOM, CSP_SCROLL_PADDING_LEFT}
+    };
+    return physical[padding ? 1u : 0u][side];
+}
+
 static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
                                     lxb_dom_node_t *node, const char *name,
                                     size_t name_length, int argc,
@@ -8261,7 +8361,7 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
     *empty = false;
     /* The single lookup every later decision dispatches on. Names arrive
        dashed and lower-case (__tilefinchCssName). */
-    const ComputedStylePropertyId id = computed_style_property_find(name);
+    ComputedStylePropertyId id = computed_style_property_find(name);
     const bool custom_property = name_length >= 3 && name[0] == '-'
         && name[1] == '-';
     /* A name nothing resolves (not registered, not a custom property, not
@@ -8445,6 +8545,13 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
         JS_FreeCString(context, pseudo_name);
     }
     if (pseudo != PSEUDO_NONE) containing_width = content_width;
+    ComputedStylePropertyId physical_id =
+        computed_style_scroll_physical_id(id, &style);
+    if (physical_id != id) {
+        id = physical_id;
+        name = computed_style_properties[id].name;
+        name_length = strlen(name);
+    }
     /* The bounded grid-template-areas parser accepts up to 511 source
        bytes. Canonical row separators can add a few bytes, so retain enough
        local space to return the complete computed value rather than a
@@ -8470,12 +8577,19 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
     bool sparse_scroll = (property_flags & CSP_SPARSE_SCROLL) != 0;
     bool sparse_modern = (property_flags & CSP_SPARSE_MODERN) != 0;
     bool retained_scroll = sparse_scroll && pseudo == PSEUDO_NONE
-        && (retained_scroll_box_shorthand(
-                bridge->stylesheet, node, name, name_length,
+        && (retained_scroll_box_value(
+                bridge->stylesheet, node, &style, name, name_length,
                 value, sizeof(value))
             || style_retained_property_value(
                 bridge->stylesheet, node, name, name_length,
                 value, sizeof(value)));
+    if (retained_scroll
+        && ((id >= CSP_SCROLL_MARGIN_BOTTOM && id <= CSP_SCROLL_MARGIN_TOP)
+            || (id >= CSP_SCROLL_PADDING_BOTTOM
+                && id <= CSP_SCROLL_PADDING_TOP))) {
+        computed_style_scroll_length(bridge->stylesheet, &style,
+                                     value, sizeof(value));
+    }
     if (!retained_scroll
         && sparse_scroll
         && id == CSP_CURSOR) {
@@ -8725,6 +8839,8 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
     } else if (id == CSP_CONTENT) {
         if (!style.generated_content) {
             snprintf(value, sizeof(value), "none");
+        } else if (style.generated_image) {
+            snprintf(value, sizeof(value), "url(\"%s\")", style.generated_text);
         } else if (style.generated_text != NULL) {
             snprintf(value, sizeof(value), "\"%.*s\"",
                      (int) style.generated_text_length,

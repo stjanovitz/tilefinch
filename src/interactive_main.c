@@ -2222,11 +2222,6 @@ int main(int argc, char **argv)
             experimental_compressed_sections ? &experimental : NULL,
             &navigation, &controller, user_css,
             &post_interaction_remote_swap)) goto cleanup;
-    if (getenv("TILEFINCH_TRACE_FINAL_DOM") != NULL) {
-        size_t remaining = 240;
-        dump_probe_dom(lxb_dom_interface_node(navigation.page.document.html),
-                       0, &remaining);
-    }
     const NavigationEntry *pre_style_entry = navigation_current(&navigation);
     int pre_style_maximum = viewport_max_scroll_css(
         &navigation.viewport, navigation.page.layout.height);
@@ -2393,6 +2388,18 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
     }
+    if (getenv("TILEFINCH_TRACE_FINAL_DOM") != NULL) {
+        size_t remaining = 240;
+        dump_probe_dom(lxb_dom_interface_node(navigation.page.document.html),
+                       0, &remaining);
+        lxb_dom_node_t *extracted = navigation.page.reader_root;
+        if (extracted != NULL) {
+            /* The authored tree may exhaust the ordinary diagnostic bound
+               before the separately appended simplified view is reached. */
+            remaining = 240;
+            dump_probe_dom(extracted, 0, &remaining);
+        }
+    }
     bool loop_mode = interactive_loop || commands_path != NULL;
     if ((loop_mode
          && !loop_render(
@@ -2486,7 +2493,9 @@ int main(int argc, char **argv)
                    (unsigned long long) replay_diagnostics.seed,
                    replay_seed_source,
                    SCRIPT_DETERMINISTIC_ENTROPY_CONTRACT,
-                   SCRIPT_DETERMINISTIC_CLOCK_CONTRACT,
+                   replay_diagnostics.fixed_wall_clock
+                       ? SCRIPT_DETERMINISTIC_FIXED_WALL_CLOCK_CONTRACT
+                       : SCRIPT_DETERMINISTIC_CLOCK_CONTRACT,
                    (unsigned long long)
                        replay_diagnostics.host_elapsed_ms,
                    (unsigned long long)

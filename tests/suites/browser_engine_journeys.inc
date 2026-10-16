@@ -46,6 +46,8 @@ int test_deferred_startup_journey(void)
             && nav->page.image_continuation_pending);
         if (mutation == 0) {
             CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "globalThis.imageLoads=0;document.getElementById('hero')"
+                ".addEventListener('load',()=>globalThis.imageLoads++);"
                 "globalThis.startupTimer=setInterval(()=>{},1)",
                 "<startup-idle-priority>", &nav->page.script_result));
             CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
@@ -175,6 +177,18 @@ int test_deferred_startup_journey(void)
         CHECK(!nav->page.image_continuation_pending
             && image_resource_available(images_find_node(&nav->page.images, tail))
             && browser_engine_render_frame(engine, NULL));
+        if (mutation == 0) {
+            CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "globalThis.pocSummary=String(imageLoads)",
+                "<image-publication-not-a-task>", &nav->page.script_result)
+                && strcmp(nav->page.script_result.summary, "0") == 0);
+            for (unsigned turn = 0; turn < 3; turn++)
+                CHECK(browser_engine_advance_runtime(engine, 0, 4, NULL));
+            CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "globalThis.pocSummary=String(imageLoads)",
+                "<image-publication-task>", &nav->page.script_result)
+                && strcmp(nav->page.script_result.summary, "1") == 0);
+        }
         if (mutation == 1) {
             CHECK(test_reader_find_id(root, "hero") == NULL);
         } else {
@@ -836,7 +850,14 @@ int test_scroll_into_view_resolves_margin_math(void)
         "#u{height:40px;scroll-margin-top:clamp(2px,1rem,5px)}"
         "#s{height:200px;overflow:auto}</style><div id=s>"
         "<div style='height:600px'></div><div id=t>t</div>"
-        "<div id=u>u</div><div style='height:600px'></div></div>";
+        "<div id=u>u</div><div style='height:600px'></div></div>"
+        "<div id=r style='direction:rtl;scroll-margin:2px 3px 4px 5px;"
+        "scroll-padding:6px 7px 8px 9px;scroll-margin-inline-start:9px'></div>"
+        "<div id=v style='writing-mode:vertical-rl;"
+        "scroll-margin-block-start:19px;scroll-margin:2px 3px 4px 5px'></div>"
+        "<div id=w style='writing-mode:vertical-lr;direction:rtl;"
+        "scroll-margin:2px 3px 4px 5px'></div>"
+        "<div id=f style='font-size:20px;scroll-margin-top:calc(1em + .5px)'></div>";
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     CHECK(engine != NULL);
@@ -850,6 +871,22 @@ int test_scroll_into_view_resolves_margin_math(void)
         "rel=e=>Math.round(e.getBoundingClientRect().top"
         "-s.getBoundingClientRect().top);"
         "const t=document.getElementById('t');t.scrollIntoView();"
+        "const margin=getComputedStyle(t).scrollMarginTop;"
+        "if(margin!=='26px')throw Error('computed margin '+margin);"
+        "if(getComputedStyle(t).scrollMarginBlockStart!=='26px')"
+        "throw Error('logical scroll margin');"
+        "const edges=id=>{const x=getComputedStyle(document.getElementById(id));"
+        "return [x.scrollMarginBlockStart,x.scrollMarginBlockEnd,"
+        "x.scrollMarginInlineStart,x.scrollMarginInlineEnd].join(',')};"
+        "if(edges('r')!=='2px,4px,9px,5px'||"
+        "edges('v')!=='3px,5px,2px,4px'||edges('w')!=='5px,3px,4px,2px')"
+        "throw Error('logical mapping '+edges('r')+' / '+edges('v')+' / '+edges('w'));"
+        "const p=getComputedStyle(document.getElementById('r'));"
+        "if([p.scrollPaddingBlockStart,p.scrollPaddingBlockEnd,"
+        "p.scrollPaddingInlineStart,p.scrollPaddingInlineEnd].join(',')"
+        "!=='6px,8px,7px,9px')throw Error('logical padding');"
+        "if(getComputedStyle(document.getElementById('f')).scrollMarginTop"
+        "!=='20.5px')throw Error('relative fractional scroll margin');"
         "const a=rel(t);"
         "const u=document.getElementById('u');u.scrollIntoView();"
         "const b=rel(u);"

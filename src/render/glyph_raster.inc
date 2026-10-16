@@ -529,7 +529,7 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                 command, codepoint, word_start);
         word_start = false;
         if (bidi_command == NULL && previous != 0) {
-            pen_x_fixed += command->letter_spacing * 64;
+            pen_x_fixed += draw_command_text_letter_spacing_fixed(command);
         }
         if (bidi_command == NULL && !provider_sequence
             && !draw_command_text_kerning_none(command))

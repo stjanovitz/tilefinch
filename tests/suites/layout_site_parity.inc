@@ -44,6 +44,70 @@ static const LayoutNodeBox *parity_box(ParityPage *page, const char *id)
     return node == NULL ? NULL : layout_box_for_node(&page->layout, node);
 }
 
+static int test_grid_intrinsic_height_and_margin_alignment(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.row{display:flex;justify-content:center}"
+        "#logo{display:grid;height:18px}svg{width:auto;height:100%;max-width:248px}"
+        "#grid{display:grid;justify-items:center;width:480px}"
+        "#item{width:448px;height:20px;margin:0 16px}"
+        "#limit{width:448px}#fit{display:grid;width:100%;min-width:fit-content;"
+        "max-width:calc(100% - 32px)}#wide{width:480px;height:10px}"
+        "</style><div class=row><div id=logo>"
+        "<svg id=art width=208 height=54 viewBox='0 0 208 54'>"
+        "<rect width=208 height=54 fill=red/></svg></div></div>"
+        "<div id=grid><div id=item></div></div>"
+        "<div id=limit><div id=fit><div id=wide></div></div></div>";
+    ParityPage page;CHECK(parity_page_load(&page,html));
+    unsigned char pixels[208u*54u*4u]={0};
+    ImageResource image={.node=find_id(lxb_dom_interface_node(page.document.html),"art"),
+                         .pixels=pixels,.width=208,.height=54};
+    ImageResources images={.items=&image,.count=1};
+    layout_destroy(&page.layout);
+    CHECK(layout_build(&page.layout,&page.budget,&page.document,&page.sheet,
+                       NULL,&images,480));
+    const LayoutNodeBox *logo=parity_box(&page,"logo");
+    const LayoutNodeBox *item=parity_box(&page,"item");
+    CHECK(logo && logo->width>=69 && logo->width<=70 && logo->x>=205 && logo->x<=206);
+    CHECK(item && item->x==16 && item->width==448);
+    const LayoutNodeBox *fit=parity_box(&page,"fit");
+    CHECK(fit && fit->width==448);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_flex_intrinsic_separator(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.bar{display:flex;width:100px;overflow:hidden}"
+        ".crumb{display:flex}a{display:block;width:35px;height:24px;flex-shrink:0}"
+        ".crumb::after{content:'';display:block;width:20px;height:20px;"
+        "margin:0 4px;background:red}"
+        "#button{appearance:none;display:block;padding:11px;border:0;min-width:0}"
+        "#button::before{content:'';display:block;width:24px;height:24px;background:blue}"
+        "#nav{display:grid;grid-template-columns:1fr 80px min-content;gap:4px;width:480px}"
+        "#menu{appearance:none;display:block;padding:11px;border:0}"
+        "#menu::before{content:'';display:block;width:24px;height:24px;background:blue}"
+        "</style><div class=bar><div id=first class=crumb><a></a></div>"
+        "<div id=second class=crumb><a></a></div></div>"
+        "<div class=bar><button id=button></button></div>"
+        "<nav id=nav><div></div><div></div><button id=menu></button></nav>";
+    ParityPage page;CHECK(parity_page_load(&page,html));
+    const LayoutNodeBox *first=parity_box(&page,"first");
+    const LayoutNodeBox *second=parity_box(&page,"second");
+    CHECK(first && second && first->width==63 && second->x==63);
+    const LayoutNodeBox *button=parity_box(&page,"button");
+    CHECK(button && button->width==46);
+    const LayoutNodeBox *menu=parity_box(&page,"menu");
+    CHECK(menu && menu->width==46 && menu->x==434);
+    const DrawCommand *red=NULL;
+    for(size_t i=0;i<page.layout.count;i++)
+        if(page.layout.commands[i].type==DRAW_FILL_RECT
+            && page.layout.commands[i].color==0xff0000u){red=&page.layout.commands[i];break;}
+    CHECK(red && red->width==20);
+    CHECK(parity_page_destroy(&page));return 0;
+}
+
 /* The first solid fill of `color`, or NULL. */
 static const DrawCommand *parity_fill(const LayoutDocument *layout,
                                       uint32_t color, size_t nth)
@@ -774,6 +838,561 @@ static int test_parity_positioned_pseudo_static_margins(void)
     return 0;
 }
 
+static int test_percentage_image_auto_height(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.card{display:flex;flex-direction:column;width:448px}"
+        "figure{margin:0;min-height:137px;position:relative;overflow:hidden}"
+        "img{display:block;width:100%;height:100%;object-fit:cover}"
+        "</style><div class=card><figure id=figure><picture><img id=photo src=x></picture>"
+        "</figure><p>Caption</p></div>"));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(page.document.html), "photo");
+    static unsigned char pixels[4] = {255,255,255,255};
+    ImageResource image = {.node=node,.pixels=pixels,.width=343,.height=137};
+    ImageResources images = {.items=&image,.count=1};
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout,&page.budget,&page.document,
+        &page.sheet,NULL,&images,480);
+    CHECK(page.layout_ready);
+    const LayoutNodeBox *photo=parity_box(&page,"photo"),*figure=parity_box(&page,"figure");
+    CHECK(photo && figure);
+    CHECK(photo->width==448 && photo->height>=178 && photo->height<=179);
+    CHECK(figure->height==photo->height);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_floating_generated_list_marker(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}ul{list-style:none;padding:0;margin:0}"
+        "li{font:14px/19px sans-serif;overflow:hidden}a{display:block;padding:7px 0}"
+        "li::before{content:'*';display:block;float:left;font-size:10px;padding:7px 3px 7px 0}"
+        "</style><ul><li id=one><a>First item</a></li><li id=two><a>Second item</a></li></ul>"));
+    const LayoutNodeBox *one=parity_box(&page,"one"),*two=parity_box(&page,"two");
+    CHECK(one && two);
+    CHECK(one->height==33 && two->y-one->y==33);
+    const DrawCommand *first = text_command(&page.layout,"First");
+    CHECK(first && first->y-one->y<15);
+    CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}#box{width:200px;overflow:hidden}"
+        "#box::after{content:'';float:right;width:25%;height:9px;"
+        "padding:2px;border:1px solid red;margin:3px;background:#123456}"
+        "</style><div id=box></div>"));
+    const DrawCommand *marker = parity_fill(&page.layout, 0x123456u, 0);
+    const LayoutNodeBox *box = parity_box(&page, "box");
+    CHECK(marker && box && marker->width == 56 && marker->height == 15
+        && marker->x == 141 && marker->y == 3 && box->height == 21);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_compact_background_geometry(void)
+{
+    char html[32768];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}");
+    for (unsigned i = 0; i < 280; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+            ".p%u{background-position:%upx %upx}", i, i, i + 1);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    CHECK((size_t) snprintf(html + used, sizeof(html) - used,
+        "#a{background-position:7px 9px}"
+        "#a,#b{background-image:linear-gradient(red,blue)}"
+        "#b{background-position:11px 13px}"
+        "#c{background-position:right 3px bottom 4px;"
+        "background-image:linear-gradient(red,blue)}"
+        "#d{background-position:2px 3px,4px 5px;"
+        "background-image:linear-gradient(red,blue),linear-gradient(blue,red)}"
+        "#e{background-position:5px 8px;background-position-x:20%%;"
+        "background-position-y:30%%;background-image:linear-gradient(red,blue)}"
+        "#f{background-image:linear-gradient(red,blue);background-position:0%% 0%%}"
+        "div{height:20px}</style><div id=a></div><div id=b></div>"
+        "<div id=c></div><div id=d></div><div id=e></div><div id=f></div>"
+        "<div id=late style='background:linear-gradient(red,blue)'></div>")
+        < sizeof(html) - used);
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    CHECK(page.layout.gradient_count > 0);
+    const char *ids[] = {"a", "b", "c", "d", "late", "e", "f"};
+    for (unsigned i = 0; i < 7; i++) {
+        lxb_dom_node_t *node = find_id(
+            lxb_dom_interface_node(page.document.html), ids[i]);
+        ComputedStyle style = style_for_node(&page.sheet, node, NULL);
+        CHECK(style.background_image_kind == STYLE_BACKGROUND_IMAGE_GRADIENT);
+        const StylePaintStack *paint = stylesheet_paint_stack(
+            &page.sheet, computed_style_paint_stack_id(&style));
+        CHECK(paint && paint->background_count > 0);
+        if (i < 2) {
+            CHECK(paint->backgrounds[0].position_x == (i == 0 ? 7 : 11));
+            CHECK(paint->backgrounds[0].position_y == (i == 0 ? 9 : 13));
+        } else if (i == 2) {
+            CHECK(paint->backgrounds[0].position_x == 3
+                && paint->backgrounds[0].position_y == 4
+                && (paint->backgrounds[0].position_edges & 3u) == 3u);
+        } else if (i == 3) {
+            CHECK(paint->background_count == 2
+                && paint->backgrounds[1].position_x == 4
+                && paint->backgrounds[1].position_y == 5);
+        } else if (i >= 5) {
+            CHECK(paint->backgrounds[0].position_x == (i == 5 ? 20 : 0)
+                && paint->backgrounds[0].position_y == (i == 5 ? 30 : 0)
+                && paint->backgrounds[0].position_edges == 0);
+        }
+    }
+    CHECK(page.sheet.paint_storage->count < 32);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_intrinsic_float_rows(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.group{display:inline-block}"
+        ".item{width:10px;height:10px}.top{clear:both;margin:auto}"
+        ".left{float:left;margin-right:4px}.right{float:right}"
+        "</style><div class=group id=group><div class='item top'></div>"
+        "<div class='item left' id=left></div>"
+        "<div class='item right' id=right></div></div>"));
+    const LayoutNodeBox *group = parity_box(&page, "group");
+    const LayoutNodeBox *left = parity_box(&page, "left");
+    const LayoutNodeBox *right = parity_box(&page, "right");
+    CHECK(group && left && right);
+    CHECK(group->width == 24 && group->height == 20);
+    CHECK(left->y == right->y && right->x - left->x == 14);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_border_color_triangles(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;background:white}"
+        "#diamond{position:relative;width:0;height:0;border:10px solid;"
+        "border-color:transparent transparent rgb(255, 0, 0) transparent}"
+        "#diamond::after{content:'';position:absolute;left:-10px;top:10px;"
+        "width:0;height:0;border:10px solid transparent;border-top-color:red}"
+        "#two{border-color:red blue}#three{border-color:red blue green}"
+        "#invalid{border-color:red;border-color:blue green red black white}"
+        "</style><div id=diamond></div><div id=two></div>"
+        "<div id=three></div><div id=invalid></div>"));
+    const char *ids[] = {"diamond", "two", "three", "invalid"};
+    for (unsigned i = 0; i < 4; i++) {
+        ComputedStyle style = style_for_node(&page.sheet,
+            find_id(lxb_dom_interface_node(page.document.html), ids[i]), NULL);
+        for (unsigned side = 0; side < 4; side++) {
+            uint8_t alpha;
+            uint32_t color = stylesheet_border_color(&page.sheet, &style,
+                (StyleBorderSide) side, &alpha);
+            if (i == 0) CHECK(alpha == (side == 2 ? 255 : 0));
+            else if (i == 3) CHECK(color == 0xff0000u && alpha == 255);
+            else CHECK(color == ((side & 1u) ? 0x0000ffu
+                : (i == 2 && side == 2 ? 0x008000u : 0xff0000u)));
+        }
+    }
+    uint16_t pixels[480 * 40];
+    TileCache cache = {0};
+    CHECK(tile_cache_init(&cache, &page.budget, &page.layout, 8));
+    CHECK(tile_cache_set_frame(&cache, pixels, 480u * 40u));
+    CHECK(tile_cache_render_frame(&cache, 0, 480, 40, NULL));
+    CHECK(pixels[15 * 480 + 10] != pixels[15 * 480]);
+    CHECK(pixels[25 * 480 + 10] != pixels[25 * 480]);
+    CHECK(pixels[11 * 480 + 1] == pixels[11 * 480 + 30]);
+    CHECK(pixels[28 * 480 + 1] == pixels[28 * 480 + 30]);
+    tile_cache_destroy(&cache);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_variable_gradient_token_boundaries(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>:root{--light:initial;--dark: ;"
+        "--navigation-controls-gradient-fade-start-color-property:"
+        "var(--light,#fff)var(--dark,#111);"
+        "--navigation-controls-gradient-fade-middle-color-property:"
+        "var(--light,#ffffffb3)var(--dark,#111111b3)}"
+        "body{margin:0}#fade{width:56px;height:23px;"
+        "background:linear-gradient(270deg,"
+        "var(--navigation-controls-gradient-fade-start-color-property)52.47%,"
+        "var(--navigation-controls-gradient-fade-middle-color-property)76.79%,"
+        "transparent 87.29%)}"
+        "</style><div id=fade></div>"));
+    CHECK(page.layout.gradient_count == 1);
+    const StyleGradient *gradient = &page.layout.gradients[0];
+    CHECK(gradient->stop_count == 3 && gradient->angle == 270
+        && gradient->stop_argb[0] == 0xffffffffu
+        && gradient->stop_argb[1] == 0xb3ffffffu
+        && gradient->stop_position[0] == 134);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_positioned_percentage_height_after_flow(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:14px/14px sans-serif}"
+        ".outer{position:relative;width:448px}"
+        ".line{display:flex;height:23px}.next{display:flex;position:absolute;"
+        "top:0;right:0;width:56px;height:100%}"
+        "</style><div class=outer><div><div class=line>Row</div>"
+        "<div class=next id=next></div></div></div>"));
+    const LayoutNodeBox *next = parity_box(&page, "next");
+    CHECK(next && next->x == 392 && next->y == 0 && next->height == 23);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_button_content_centering(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}button{display:block;box-sizing:border-box;"
+        "height:30px;width:80px;padding:0;border:1px solid black;font-size:14px;line-height:20px}"
+        "#flex{display:flex;align-items:flex-start}#auto{height:auto;min-height:30px}"
+        "#fixed{position:absolute;top:2px;height:2px;width:2px}"
+        "</style><button id=plain>Plain</button><button id=nested><span>Nested</span></button>"
+        "<button id=flex>Start</button><button id=positioned style='position:relative'>"
+        "Positioned<i id=fixed></i></button><button id=auto>Auto</button>"));
+    const DrawCommand *plain = text_command(&page.layout, "Plain");
+    const DrawCommand *nested = text_command(&page.layout, "Nested");
+    const DrawCommand *start = text_command(&page.layout, "Start");
+    CHECK(plain && nested && start);
+    CHECK(plain->y - parity_box(&page, "plain")->y == 5
+        && nested->y - parity_box(&page, "nested")->y == 5
+        && start->y - parity_box(&page, "flex")->y == 1);
+    CHECK(parity_box(&page, "fixed")->y - parity_box(&page, "positioned")->y == 3);
+    CHECK(text_command(&page.layout, "Auto")->y - parity_box(&page, "auto")->y == 1);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_css_replacement_image(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ".icon{content:url('data:image/svg+xml,<svg width=\"16\" height=\"16\"><path d=\"M0 0h16v16H0Z\"/></svg>')}"
+        "#block{display:block;background-image:url('data:image/svg+xml,<svg width=\"8\" height=\"8\"><path d=\"M0 0h8v8H0Z\"/></svg>')}"
+        "#ordinary{content:none}</style>"
+        "<span id=icon class=icon>Hidden</span><span>1:23</span>"
+        "<div id=block class=icon>AlsoHidden</div>"
+        "<span id=ordinary class=icon>Visible</span>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    lxb_dom_node_t *root = lxb_dom_interface_node(page.document.html);
+    lxb_dom_node_t *icon = find_id(root, "icon");
+    ComputedStyle style = style_for_node(&page.sheet, icon, NULL);
+    CHECK(style.generated_image && style.generated_text != NULL);
+    CHECK(!style_for_node(&page.sheet, find_id(root, "ordinary"), NULL).generated_image);
+    ImageResources images = {0};
+    CHECK(images_load_external(&page.document, &page.sheet, &images,
+        &page.budget, "https://replacement.test/", "https://replacement.test/",
+        NULL, 8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL));
+    const ImageResource *image = images_find_background_source(
+        &images, icon, style.generated_text, PSEUDO_NONE);
+    CHECK(image_resource_available(image) && image->width == 16 && image->height == 16);
+    lxb_dom_node_t *block = find_id(root, "block");
+    ComputedStyle block_style = style_for_node(&page.sheet, block, NULL);
+    const ImageResource *background = images_find_background_source(
+        &images, block, block_style.background_image, PSEUDO_NONE);
+    CHECK(image_resource_available(background)
+        && background->width == 8 && background->height == 8);
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, NULL, &images, 480);
+    CHECK(page.layout_ready);
+    CHECK(parity_box(&page, "icon")->width == 16
+        && parity_box(&page, "icon")->height == 16
+        && parity_box(&page, "block")->width == 16
+        && parity_box(&page, "block")->height == 16);
+    CHECK(!text_command(&page.layout, "Hidden")
+        && !text_command(&page.layout, "AlsoHidden")
+        && text_command(&page.layout, "Visible"));
+    bool painted = false;
+    for (size_t i = 0; i < page.layout.count; i++)
+        if (page.layout.commands[i].type == DRAW_IMAGE
+            && page.layout.commands[i].image == image) painted = true;
+    CHECK(painted);
+    layout_destroy(&page.layout); page.layout_ready = false;
+    images_destroy(&images);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_unknown_media_dimensions(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.column{width:448px;display:flex;flex-direction:column}"
+        "video,iframe,canvas{display:block;width:100%;height:100%;vertical-align:top}"
+        "#ratio{aspect-ratio:16/9}#tall{width:auto;height:200px}</style>"
+        "<div class=column><div><video id=video></video></div></div>"
+        "<div class=column><div><iframe id=frame></iframe></div></div>"
+        "<div class=column><div><canvas id=canvas></canvas></div></div>"
+        "<div class=column><div><video id=ratio></video></div></div>"
+        "<video id=tall></video>"));
+    CHECK(parity_box(&page, "video")->width == 448
+        && parity_box(&page, "video")->height == 150);
+    CHECK(parity_box(&page, "frame")->width == 448
+        && parity_box(&page, "frame")->height == 150);
+    CHECK(parity_box(&page, "canvas")->width == 448
+        && parity_box(&page, "canvas")->height == 224);
+    CHECK(parity_box(&page, "ratio")->height == 252);
+    CHECK(parity_box(&page, "tall")->width == 300
+        && parity_box(&page, "tall")->height == 200);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_nested_flex_baseline(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        ".atomic{display:inline-block;width:200px}.flex{display:flex;flex-direction:column}"
+        ".label{font-size:12px;line-height:18px}.title{font-size:20px;line-height:26px}"
+        ".marker{display:inline-block;width:1px;height:1px}</style>"
+        "<div id=outer><span id=atomic class=atomic><span class=flex>"
+        "<span class=label>Label</span><span class=title>First line<br>Second line</span>"
+        "</span></span><span id=baseline class=marker></span></div>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    const LayoutNodeBox *atomic = parity_box(&page, "atomic");
+    const LayoutNodeBox *baseline = parity_box(&page, "baseline");
+    const DrawCommand *label = text_command(&page.layout, "Label");
+    CHECK(atomic && baseline && label);
+    int label_baseline = label->y + font_line_baseline_at_size(
+        &fonts.sans, 12 * 64, label->height);
+    if (baseline->y + baseline->height != label_baseline) fprintf(stderr,
+        "nested baseline: marker=%d/%d label=%d atomic-y=%d\n",
+        baseline->y, baseline->height, label_baseline, atomic->y);
+    CHECK(baseline->y + baseline->height == label_baseline && atomic->height == 70);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_fractional_tracking(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font-size:16px;line-height:20px}"
+        ".half{letter-spacing:.5px}.negative{letter-spacing:calc(-.25px - .25px)}"
+        "#wrap{width:50px;word-break:break-all}"
+        "#split,#negative{white-space:nowrap}</style>"
+        "<div id=wrap class=half>ABCD</div>"
+        "<div id=split class=half>R<span>S</span>T</div>"
+        "<div id=negative class=negative>U<span>V</span>W</div>"
+        "<div class=half><span>A</span><span>B</span><span>C</span><span>D</span></div>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *wrap = parity_box(&page, "wrap");
+    CHECK(wrap && wrap->height == 20);
+    const DrawCommand *r = text_command(&page.layout, "R");
+    const DrawCommand *s = text_command(&page.layout, "S");
+    const DrawCommand *t = text_command(&page.layout, "T");
+    const DrawCommand *u = text_command(&page.layout, "U");
+    const DrawCommand *v = text_command(&page.layout, "V");
+    const DrawCommand *w = text_command(&page.layout, "W");
+    CHECK(r && s && t && u && v && w);
+    CHECK(draw_command_text_letter_spacing_fixed(r) == 32
+        && draw_command_text_scale(r) == 2
+        && draw_command_text_x_fixed(s) - draw_command_text_x_fixed(r) == 12 * 64 + 32
+        && draw_command_text_x_fixed(t) - draw_command_text_x_fixed(s) == 12 * 64 + 32);
+    CHECK(draw_command_text_letter_spacing_fixed(u) == -32
+        && draw_command_text_x_fixed(v) - draw_command_text_x_fixed(u) == 12 * 64 - 32
+        && draw_command_text_x_fixed(w) - draw_command_text_x_fixed(v) == 12 * 64 - 32);
+    DrawCommand packed = *r;
+    for (int fixed = -128 * 64; fixed <= 127 * 64 + 63; fixed += 17) {
+        draw_command_set_text_letter_spacing_fixed(&packed, fixed);
+        CHECK(draw_command_text_letter_spacing_fixed(&packed) == fixed
+            && draw_command_text_scale(&packed) == 2
+            && packed.radius == r->radius && packed.image_fit == r->image_fit);
+    }
+    TileCache cache;
+    uint16_t *frame = budget_malloc(&page.budget, 480u * 80u * sizeof(*frame));
+    CHECK(frame && tile_cache_init(&cache, &page.budget, &page.layout, 4)
+        && tile_cache_set_frame(&cache, frame, 480u * 80u)
+        && tile_cache_render_frame(&cache, 0, 480, 80, NULL));
+    /* Independent split commands paint the same half-pixel glyph positions. */
+    CHECK(memcmp(frame, frame + 480u * 60u, 480u * 20u * sizeof(*frame)) == 0);
+    tile_cache_destroy(&cache);
+    budget_free(&page.budget, frame);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_flex_thumbnail_text_column(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.row{display:flex;width:448px}"
+        ".row>a{display:flex;width:100%}.row>a:first-child{flex:1}"
+        ".media{display:flex;flex-direction:column;min-width:95px;align-self:flex-start}"
+        ".picture{width:95px;height:95px}.text{display:inline-block;width:100%;"
+        "flex:75%;align-items:flex-start;margin-inline-start:12px}"
+        ".title{display:block}</style><div class=row>"
+        "<a><div class=media><div class=picture></div></div></a>"
+        "<a><div id=text class=text><span id=title class=title>"
+        "A long descriptive title for the adjacent story card</span></div></a></div>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    const LayoutNodeBox *text = parity_box(&page, "text");
+    const LayoutNodeBox *title = parity_box(&page, "title");
+    CHECK(text && title && text->x == 107 && text->width == 341
+        && title->x == 107 && title->width == 341);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_column_generated_ratio_spacer(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.media{display:flex;"
+        "flex-direction:column;position:relative;overflow:hidden;width:448px}"
+        ".media::after{content:'';display:block;padding-bottom:56.25%}"
+        "picture{width:100%}img{position:absolute;inset:0;width:100%;height:100%}"
+        "h2{margin:0}</style><div class=media id=media><picture>"
+        "<img id=image width=448 height=252></picture></div><h2 id=title>Title</h2>"));
+    const LayoutNodeBox *media = parity_box(&page, "media");
+    const LayoutNodeBox *image = parity_box(&page, "image");
+    const LayoutNodeBox *title = parity_box(&page, "title");
+    CHECK(media && image && title && media->height == 252
+        && image->height == 252 && title->y >= 252);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_positioned_flex_pseudo_static_alignment(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.row{position:relative;"
+        "display:flex;align-items:center;width:56px;height:23px}"
+        ".row::before{content:'';position:absolute;right:-12px;"
+        "width:32px;height:32px;background:#123456}"
+        ".row::after{content:'';display:inline-block;width:12px;height:12px}"
+        "</style><div class=row></div>"));
+    const DrawCommand *circle = parity_fill(&page.layout, 0x123456u, 0);
+    CHECK(circle && circle->x == 36 && circle->y == -4
+        && circle->width == 32 && circle->height == 32);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_negative_margin_reaches_enclosing_floats(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;width:480px}"
+        "header{height:44px}header i{float:left;width:176px;height:44px}"
+        "header b{float:right;width:80px;height:44px}"
+        "section{position:relative}section::before{content:'';display:table}"
+        "#strip{width:100%;height:64px;overflow:hidden;margin-top:-5px}"
+        "</style><header><i></i><b></b></header>"
+        "<section id=parent><div id=strip></div></section>"));
+    const LayoutNodeBox *parent = parity_box(&page, "parent");
+    const LayoutNodeBox *strip = parity_box(&page, "strip");
+    CHECK(parent && strip && parent->y == 44
+          && strip->y == 44 && strip->width == 480);
+    CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;width:480px}"
+        "header{height:44px}header i{float:left;width:60px;height:44px}"
+        "#box::after{content:'';display:table;clear:both}"
+        "#box b{float:left;width:200px;height:20px}"
+        "</style><header><i></i><i></i><i></i><i></i>"
+        "<i></i><i></i><i></i><i></i></header>"
+        "<section><div id=box><b></b><b></b><b></b>"
+        "<b></b><b></b><b></b></div></section>"));
+    const LayoutNodeBox *box = parity_box(&page, "box");
+    CHECK(box && box->y == 44 && box->height == 60);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_system_font_family_identity(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>#a{font-family:-apple-system,Arial}"
+        "#b{font-family:system-ui}#c{font-family:BlinkMacSystemFont}"
+        "#d{font-family:Arial}</style><div id=a>A</div>"
+        "<div id=b>B</div><div id=c>C</div><div id=d>D</div>"));
+    lxb_dom_node_t *root = lxb_dom_interface_node(page.document.html);
+    const char *ids[] = {"a", "b", "c", "d"};
+    for (size_t i = 0; i < 4; i++) {
+        ComputedStyle style = style_for_node(
+            &page.sheet, find_id(root, ids[i]), NULL);
+        CHECK(style.font_family == (i == 3
+              ? FONT_METRIC_SANS : FONT_SYSTEM_SANS));
+    }
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_clamp_requires_vertical_box(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:10px/12px monospace}"
+        ".text{width:42px;overflow:hidden;text-overflow:ellipsis;"
+        "-webkit-line-clamp:1;-webkit-box-orient:vertical}"
+        "#plain{display:block}#clamped{display:-webkit-box}"
+        "</style><div id=plain class=text>alpha beta gamma</div>"
+        "<div id=clamped class=text>alpha beta gamma</div>"));
+    const LayoutNodeBox *plain = parity_box(&page, "plain");
+    const LayoutNodeBox *clamped = parity_box(&page, "clamped");
+    CHECK(plain && clamped && plain->height == 36
+          && clamped->height == 12);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_atomic_nowrap(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:16px/22px sans-serif}"
+        ".item{width:60px;white-space:nowrap}.pre{white-space:pre}"
+        ".item span{display:inline-block;width:60px}"
+        ".item::after{content:'|';display:inline-block;padding:0 8px}"
+        "</style><div class=item><span>First</span></div>"
+        "<div class='item pre'><span>Second</span></div>"));
+    const DrawCommand *first = text_command(&page.layout, "First");
+    const DrawCommand *second = text_command(&page.layout, "Second");
+    const DrawCommand *bars[2] = {0};
+    size_t count = 0;
+    for (size_t i = 0; i < page.layout.count && count < 2; i++) {
+        const DrawCommand *command = &page.layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == 1
+            && command->text[0] == '|') bars[count++] = command;
+    }
+    CHECK(first && second && count == 2);
+    /* The font-free fallback places atomic text six pixels below the
+       sibling ink. Both still occupy the same 22-pixel line, not a second
+       line introduced at the generated item's overflow boundary. */
+    CHECK(bars[0]->y == first->y + 6 && bars[1]->y == second->y + 6);
+    CHECK(second->y == first->y + 22);
+    CHECK(bars[0]->x >= 60 && bars[1]->x >= 60);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 static int test_parity_generated_inline_spacing(void)
 {
     static const char html[] =
@@ -1267,6 +1886,25 @@ static int test_site_parity(void)
     CHECK(test_empty_inline_positioned_border_pseudo() == 0);
     CHECK(test_inline_replaced_percentage_height() == 0);
     CHECK(test_parity_generated_inline_spacing() == 0);
+    CHECK(test_generated_atomic_nowrap() == 0);
+    CHECK(test_clamp_requires_vertical_box() == 0);
+    CHECK(test_negative_margin_reaches_enclosing_floats() == 0);
+    CHECK(test_system_font_family_identity() == 0);
+    CHECK(test_variable_gradient_token_boundaries() == 0);
+    CHECK(test_compact_background_geometry() == 0);
+    CHECK(test_percentage_image_auto_height() == 0);
+    CHECK(test_floating_generated_list_marker() == 0);
+    CHECK(test_intrinsic_float_rows() == 0);
+    CHECK(test_border_color_triangles() == 0);
+    CHECK(test_positioned_percentage_height_after_flow() == 0);
+    CHECK(test_fractional_tracking() == 0);
+    CHECK(test_nested_flex_baseline() == 0);
+    CHECK(test_css_replacement_image() == 0);
+    CHECK(test_button_content_centering() == 0);
+    CHECK(test_unknown_media_dimensions() == 0);
+    CHECK(test_flex_thumbnail_text_column() == 0);
+    CHECK(test_column_generated_ratio_spacer() == 0);
+    CHECK(test_positioned_flex_pseudo_static_alignment() == 0);
     puts("test: bottom insets follow an auto-height containing block");
     CHECK(test_parity_bottom_inset_auto_height() == 0);
     puts("test: bottom insets follow growth beyond a minimum height");

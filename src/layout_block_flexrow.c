@@ -126,7 +126,11 @@ bool layout_block_flexrow_section(LayoutContext *context,
         int gaps = table_row ? 0 : layout_clamp_coordinate(
             (int64_t) style->gap * (int64_t) (flex_children - 1u));
         if (!table_row
-            && layout_add_coordinate(total_basis, gaps) > content_width) {
+            && layout_add_coordinate(total_hypothetical_basis, gaps)
+                   > content_width) {
+            /* A zero flex base can already be frozen at its content minimum.
+               Reserve that space before distributing shrink to its siblings,
+               even when the unclamped bases would fit the row. */
             total_basis = total_hypothetical_basis;
         }
         int remaining = layout_subtract_coordinate(

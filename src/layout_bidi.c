@@ -702,7 +702,7 @@ bool layout_bidi_measure_shaped_text(
             units[i].byte_offset == paragraph_byte, kerning);
         if (visible && !ignored) {
             advance = layout_fixed_add(
-                advance, layout_fixed_from_integer(letter_spacing));
+                advance, letter_spacing);
         }
         width = layout_fixed_add(width, advance);
         if (!ignored) visible = true;
@@ -749,7 +749,7 @@ bool layout_bidi_fitting_shaped_prefix(
             units[i].byte_offset == paragraph_byte, kerning);
         if (visible && !ignored) {
             advance = layout_fixed_add(
-                advance, layout_fixed_from_integer(letter_spacing));
+                advance, letter_spacing);
         }
         int next = layout_fixed_add(width, advance);
         size_t relative_end = (size_t) units[i].byte_offset
@@ -1012,7 +1012,7 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
                     draw_command_text_font_size_fixed(command)));
         }
         advance = layout_fixed_add(
-            advance, layout_fixed_from_integer(command->letter_spacing));
+            advance, draw_command_text_letter_spacing_fixed(command));
     }
     return advance;
 }

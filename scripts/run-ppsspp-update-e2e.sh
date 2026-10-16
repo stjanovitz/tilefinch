@@ -2,6 +2,13 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+decoder_abi=$(sed -n \
+    's/^#define TILEFINCH_SWDEC_COMPONENT_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' \
+    "$root/include/tilefinch/swdec_component.h")
+printf '%s\n' "$decoder_abi" | grep -Eq '^[1-9][0-9]*$' || {
+    printf '%s\n' 'could not derive the optional decoder ABI' >&2
+    exit 2
+}
 build_dir=${TILEFINCH_UPDATE_E2E_BUILD_DIR:-"$root/build-preset-psp-update-e2e"}
 timeout_seconds=180
 
@@ -119,6 +126,7 @@ python3 "$root/tools/tilefinch_update_tool.py" manifest \
     --root-version 1 --sequence 2 --expires 2000000000 \
     --version 0.1.1-e2e --tag v0.1.1-e2e \
     --asset tilefinch-update-v1.tfup --notes "$work/notes.txt" \
+    --decoder-abi "$decoder_abi" \
     --output "$work/manifest.bin"
 python3 "$root/tools/tilefinch_update_tool.py" envelope \
     --manifest "$work/manifest.bin" \

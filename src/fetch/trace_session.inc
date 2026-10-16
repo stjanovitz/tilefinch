@@ -152,7 +152,7 @@ static bool trace_replay_info_read(char *error, size_t error_size)
     FILE *info_file = fopen(info_path, "rb");
     char line[TRACE_INFO_LINE_CAPACITY];
     bool version = false, origin = false, replay_start = false;
-    bool completion_seen = false, count_seen = false;
+    bool completion_seen = false, count_seen = false, wall_clock_seen = false;
     size_t record_count = 0;
     bool valid = info_file != NULL;
     while (valid) {
@@ -174,6 +174,11 @@ static bool trace_replay_info_read(char *error, size_t error_size)
                 fetch_trace.clock_origin_ms = parsed;
                 origin = true;
             }
+        } else if (strncmp(line, "wall-clock=", 11) == 0) {
+            if (wall_clock_seen
+                || strcmp(line + 11, "fixed-origin-v1") != 0) valid = false;
+            else fetch_trace.fixed_wall_clock = true;
+            wall_clock_seen = true;
         } else if (strncmp(line, "replay-start=", 13) == 0) {
             if (replay_start
                 || strcmp(line + 13, "delayed-top-level-v1") != 0) {
@@ -784,6 +789,11 @@ bool fetch_trace_clock_origin_ms(uint64_t *origin_ms)
         || fetch_trace.clock_origin_ms == 0) return false;
     *origin_ms = fetch_trace.clock_origin_ms;
     return true;
+}
+
+bool fetch_trace_fixed_wall_clock(void)
+{
+    return fetch_trace.mode == FETCH_TRACE_REPLAY && fetch_trace.fixed_wall_clock;
 }
 
 static bool trace_request_is_top_level_document(const FetchRequest *request,

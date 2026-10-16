@@ -516,14 +516,20 @@
     CHECK(budget.current == 0);
 
     puts("test: bounded stylesheet capability diagnostics");
-    static const char diagnostic_page[] =
+    char oversized_name[STYLE_CUSTOM_NAME_CAPACITY + 1u];
+    memset(oversized_name, 'a', sizeof(oversized_name) - 1u);
+    oversized_name[0] = oversized_name[1] = '-';
+    oversized_name[sizeof(oversized_name) - 1u] = '\0';
+    char diagnostic_page[STYLE_CUSTOM_NAME_CAPACITY + 512u];
+    snprintf(diagnostic_page, sizeof(diagnostic_page),
         "<!doctype html><style>"
         "#diagnostic-probe{color:#123456;unsupported-visual:1;"
         "text-decoration:underline;"
-        "--this-custom-property-name-is-deliberately-longer-than-forty-eight-characters:red}"
+        "%s:red}"
         "@media (dynamic-range:high){#diagnostic-probe{display:none}}"
         "@supports (display:subgrid){#diagnostic-probe{display:none}}"
-        "</style><body><div id=diagnostic-probe>DIAGNOSTIC</div></body>";
+        "</style><body><div id=diagnostic-probe>DIAGNOSTIC</div></body>",
+        oversized_name);
     PocDocument diagnostic_document;
     Stylesheet diagnostic_stylesheet;
     CHECK(document_parse(&diagnostic_document, &budget, diagnostic_page,

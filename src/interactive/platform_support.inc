@@ -165,7 +165,7 @@ static int text_metrics_advance_fixed(const LayoutDocument *layout,
     }
     int64_t spaced = advance;
     if (characters > 1) {
-        spaced += (int64_t) command->letter_spacing * 64
+        spaced += (int64_t) draw_command_text_letter_spacing_fixed(command)
                   * (int64_t) (characters - 1);
     }
     return spaced > INT_MAX ? INT_MAX
@@ -246,14 +246,15 @@ static bool dump_text_metrics(const char *path, const LayoutDocument *layout)
                 "\"font_size\": %d, \"font_size_26_6\": %d, "
                 "\"font_family\": %u, "
                 "\"font_weight\": %u, \"font_italic\": %s, "
-                "\"letter_spacing\": %d, \"face_backend\": \"%s\"}",
+                "\"letter_spacing\": %.6g, \"face_backend\": \"%s\"}",
                 draw_command_text_x_fixed(command), command->y,
                 advance_fixed, command->width, command->height,
                 (long long) baseline, command->font_size,
                 draw_command_text_font_size_fixed(command),
                 (unsigned) draw_command_font_family(command), weight,
                 draw_command_font_italic(command) ? "true" : "false",
-                command->letter_spacing, text_metrics_backend_name(face)) < 0) {
+                draw_command_text_letter_spacing_fixed(command) / 64.0,
+                text_metrics_backend_name(face)) < 0) {
             ok = false;
             break;
         }

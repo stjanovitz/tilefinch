@@ -49,6 +49,9 @@
 #define LAYOUT_IMAGE_FIT_SPRITE_TILE_XY UINT8_C(6)
 #define LAYOUT_IMAGE_FIT_NONE UINT8_C(7)
 #define LAYOUT_IMAGE_FIT_SCALE_DOWN UINT8_C(8)
+/* Image commands do not use the text-family bits. One bit identifies an
+   empty, fixed-size inline mask's native paint-only publication slot. */
+#define LAYOUT_IMAGE_SLOT_MASK UINT8_C(1)
 #define LAYOUT_STROKE_SOLID UINT8_C(0)
 #define LAYOUT_STROKE_DASHED UINT8_C(1)
 #define LAYOUT_STROKE_DOTTED UINT8_C(2)
@@ -57,8 +60,8 @@
 /* Solid, same-color unequal sides: top/right in text_length, bottom/left
    in font_size, two bounded unsigned 16-bit widths per word. */
 #define LAYOUT_STROKE_SIDES UINT8_C(4)
-/* A DRAW_SHADOW_RECT whose shadow rect is its element's border box (no
-   offset or spread, uniform corners): it paints only outside that box. */
+/* A zero-spread, uniform-corner DRAW_SHADOW_RECT paints only outside its
+   element's border box. text_length packs its signed 16-bit x/y offsets. */
 #define LAYOUT_SHADOW_OUTSIDE_BOX UINT8_C(1)
 /* Layout-internal: a hard single-axis offset shadow that the decoration
    patch converts to the visible fill strip; never reaches the painter. */
@@ -66,6 +69,9 @@
 /* image_fit is otherwise unused by text commands, so the retained underline
    bit costs no display-list bytes on the PSP. */
 #define LAYOUT_TEXT_DECORATION_UNDERLINE UINT8_C(4)
+/* Text-only low bits identify a retained focus decoration's before/after
+   pseudo; image borrows its owner, never an ImageResource. */
+#define LAYOUT_TEXT_FOCUS_PSEUDO_MASK UINT8_C(3)
 /* The remaining text-only bits encode auto (zero) or an integer offset from
    -15px through +15px.  Image fit values never use these bits. */
 #define LAYOUT_TEXT_UNDERLINE_OFFSET_SHIFT 3
@@ -162,15 +168,30 @@ typedef enum {
     /* Rotated solid: text_length packs local uint16 width/height;
        font_size packs signed Q14 cosine/sine; radius/scale locate its
        original top-left in Q10 relative to the retained bounding box. */
-    DRAW_ROTATED_FILL
+    DRAW_ROTATED_FILL,
+    /* A zero-content CSS border side. The full border box is retained;
+       text_length/font_size locate the inner join, image_fit selects side. */
+    DRAW_BORDER_TRIANGLE
 } DrawCommandType;
 
 typedef struct {
     /* DRAW_TEXT borrows UTF-8; fixed raster DRAW_IMAGE slots may instead
-       borrow native node identity here, with text_length zero. */
+       borrow native node identity here, with text_length zero (document
+       image). Fixed empty inline masks also borrow their node here, marked
+       by LAYOUT_IMAGE_SLOT_MASK in the otherwise unused font-family bits.
+       While its image is NULL, text_length keeps the stable paint-stack ID;
+       after binding it contains the usual sprite geometry. A solid
+       generated-pseudo fill borrows its owner here, with text_length equal
+       to PSEUDO_BEFORE/AFTER, for exact paint-only focus translation.
+       Its otherwise unused font_weight records the painted focus state.
+       A single unblurred DRAW_SHADOW_RECT also borrows its owner identity
+       and retains its spread in font_size for paint-only focus changes.
+       Rounded borders and reserved inset DRAW_STROKE_RECT slots borrow
+       their owner too; their formatter geometry can precede flex stretching. */
     const char *text;
-    /* DRAW_TEXT + LAYOUT_TEXT_IMAGE_ALT borrows a DOM node here, never an
-       ImageResource. Image consumers must check DRAW_IMAGE before reading. */
+    /* DRAW_TEXT + LAYOUT_TEXT_IMAGE_ALT or FOCUS_PSEUDO_MASK borrows a DOM
+       node here, never an ImageResource. Image consumers must check
+       DRAW_IMAGE before reading. Detached previews clear these identities. */
     const ImageResource *image;
     uint32_t text_length;
     uint32_t color;
@@ -180,6 +201,9 @@ typedef struct {
     int height;
     int radius;
     int z_index;
+    /* Text uses the low 24 bits for the bitmap fallback scale, and six
+       high bits for fractional letter spacing. Other commands keep the
+       complete word for their own geometry. Use the text accessors. */
     int scale;
     int font_size;
     uint16_t opacity_scale;
@@ -192,6 +216,49 @@ typedef struct {
     int8_t letter_spacing;
     uint8_t image_fit;
 } DrawCommand;
+
+_Static_assert(sizeof(DrawCommand) == 2 * sizeof(void *) + 48,
+               "text tracking must not grow the retained command");
+
+static inline void draw_command_set_shadow_offset(DrawCommand *command,
+                                                  int x, int y)
+{
+    if (x < INT16_MIN) x = INT16_MIN;
+    if (x > INT16_MAX) x = INT16_MAX;
+    if (y < INT16_MIN) y = INT16_MIN;
+    if (y > INT16_MAX) y = INT16_MAX;
+    command->text_length = (uint16_t) (int16_t) x
+        | ((uint32_t) (uint16_t) (int16_t) y << 16);
+}
+
+static inline int draw_command_text_scale(const DrawCommand *command)
+{
+    return command->scale & 0x00ffffff;
+}
+
+static inline int draw_command_text_letter_spacing_fixed(
+    const DrawCommand *command)
+{
+    return (int) command->letter_spacing * 64
+        + (int) (((uint32_t) command->scale >> 24) & 63u);
+}
+
+static inline void draw_command_set_text_letter_spacing_fixed(
+    DrawCommand *command, int fixed)
+{
+    if (fixed < -128 * 64) fixed = -128 * 64;
+    if (fixed > 127 * 64 + 63) fixed = 127 * 64 + 63;
+    int whole = fixed / 64;
+    if (fixed < 0 && fixed % 64 != 0) whole--;
+    command->letter_spacing = (int8_t) whole;
+    command->scale = draw_command_text_scale(command)
+        | ((fixed - whole * 64) << 24);
+}
+
+static inline void draw_command_set_text_scale(DrawCommand *command, int scale)
+{
+    command->scale = (command->scale & 0x3f000000) | (scale & 0x00ffffff);
+}
 
 /* Sparse visual-order data exists only for commands in paragraphs that need
    bidi analysis. DrawCommand keeps logical UTF-8 and its stable PSP size;
@@ -1215,7 +1282,12 @@ bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout);
 void layout_build_job_cancel(LayoutBuildJob *job);
 void layout_build_job_destroy(LayoutBuildJob *job);
 LayoutReuseCache *layout_reuse_cache_create(Budget *budget);
+/* Optional slot admission only; off-window focus retains full-flow fallback. */
+void layout_reuse_cache_set_focus_scroll(LayoutReuseCache *cache, int top);
 void layout_reuse_cache_destroy(LayoutReuseCache *cache);
+/* Release bulky resolved values without discarding exact selector results.
+   Resolved-value storage resumes only after layout has working headroom. */
+size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache);
 void layout_reuse_cache_reset(LayoutReuseCache *cache);
 /* Allow the cache to retain each element's exact matched author rules across
    builds (and across the image traversal), sized for a whole document. Only
@@ -1428,6 +1500,11 @@ void layout_reuse_cache_invalidate_checked(
    an image. */
 void layout_reuse_cache_update_images(LayoutReuseCache *cache,
                                       const ImageResources *images);
+/* Complete paint geometry of a retained fixed inline mask. Requires an
+   unchanged stylesheet generation; does not allocate or change its box. */
+bool layout_bind_fixed_mask_image(const Stylesheet *sheet,
+                                  DrawCommand *command,
+                                  const ImageResource *image);
 /* Rebind image pointers retained by an already-committed display list after
    append-only growth moved the bounded ImageResources table. Capture the old
    numeric base before growth; no access to the retired allocation is needed.
@@ -1466,14 +1543,22 @@ bool layout_focus_for_node(const LayoutDocument *layout,
                            const lxb_dom_node_t *node,
                            bool *control, size_t *index);
 /*
- * Recolour a rounded border and its optional retained simple inset-shadow slot.
+ * Recolour a rounded border or its retained simple focus-shadow slot.
  * This is deliberately narrower than arbitrary paint mutation: callers must
  * first pass style_focus_change_classify(), and dry_run lets a multi-node
  * focus transition prove every patch before changing any command.
  */
 bool layout_apply_focus_border_paint(
     LayoutDocument *layout, const Stylesheet *stylesheet,
-    lxb_dom_node_t *node, const ComputedStyle *style, bool inset_changed, bool dry_run,
+    lxb_dom_node_t *node, const ComputedStyle *style, StyleFocusChange change, bool dry_run,
+    int *left, int *top, int *right, int *bottom);
+bool layout_apply_focus_pseudo_translation(
+    LayoutDocument *layout, lxb_dom_node_t *node,
+    const StyleFocusPseudoTranslation *translation, bool focused, bool dry_run,
+    int *left, int *top, int *right, int *bottom);
+bool layout_apply_focus_pseudo_visibility(
+    LayoutDocument *layout, lxb_dom_node_t *node,
+    const StyleFocusPseudoTranslation *change, bool focused, bool dry_run,
     int *left, int *top, int *right, int *bottom);
 bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
                         int scroll_x, int scroll_y);

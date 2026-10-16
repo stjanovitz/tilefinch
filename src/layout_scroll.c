@@ -184,7 +184,7 @@ static void scroll_container_style(
     int edges[4] = {0};
     StyleRetainedBoxValues box_values;
     if (style_retained_box_values(
-            sheet, box->node, "scroll-padding", &box_values)) {
+            sheet, box->node, "scroll-padding", NULL, &box_values)) {
         for (size_t side = 0; side < 4; side++) {
             if ((box_values.present_mask & (1u << side)) == 0) continue;
             int reference = side == 0 || side == 2
@@ -292,7 +292,7 @@ static bool scroll_add_candidate(LayoutDocument *layout,
     int edges[4] = {0};
     StyleRetainedBoxValues box_values;
     if (style_retained_box_values(
-            sheet, box->node, "scroll-margin", &box_values)) {
+            sheet, box->node, "scroll-margin", NULL, &box_values)) {
         for (size_t side = 0; side < 4; side++) {
             if ((box_values.present_mask & (1u << side)) == 0) continue;
             edges[side] = scroll_length(

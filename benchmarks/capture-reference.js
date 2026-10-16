@@ -49,6 +49,7 @@ const MAX_REPLAY_DOMAIN_ELAPSED_MS =
 const REPLAY_ENVIRONMENT_VERSION = "deterministic-hermetic-v3";
 const REPLAY_CLOCK_VERSION = "playwright-clock-paused-v2";
 const REPLAY_CLOCK_CONTRACT = "dual-domain-ms-call-v2";
+const REPLAY_FIXED_WALL_CLOCK_CONTRACT = "fixed-origin-wall-observed-monotonic-v1";
 const REPLAY_CLOCK_SCOPE = "top-level-realm-v1";
 const REPLAY_CLOCK_WALL_SOURCES = Object.freeze([
   "date_now", "date_function", "date_constructor",
@@ -72,6 +73,7 @@ const REPLAY_SEED_SOURCE = "trace-origin-ms-v1";
 const REPLAY_INTL_CONTRACT = "bounded-en-us-utc-v1";
 const READ_ONLY_POLICY_VERSION = "get-head-only-v3";
 const READ_ONLY_PREFLIGHT_POLICY = "cors-preflight-before-network-v1";
+const RETAINED_PREFLIGHT_POLICY = "cors-preflight-retained-only-v2";
 const OFFLINE_CAPABILITY_POLICY_VERSION = "offline-capabilities-v2";
 const OFFLINE_CAPABILITY_SURFACE_VERSION = "realm-entrypoints-unavailable-v1";
 const OFFLINE_CAPABILITY_SURFACE_EVIDENCE = Object.freeze({
@@ -152,6 +154,7 @@ function parseArguments(argv) {
     python: "python3",
     scriptFreeDiagnostic: false,
     fullDocument: false,
+    retainedPreflights: false,
   };
   const value = (option, index) => {
     if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
@@ -164,6 +167,7 @@ function parseArguments(argv) {
     if (option === "--help" || option === "-h") result.help = true;
     else if (option === "--script-free-diagnostic") result.scriptFreeDiagnostic = true;
     else if (option === "--full-document") result.fullDocument = true;
+    else if (option === "--retained-preflights") result.retainedPreflights = true;
     else if (option === "--inspect-trace") result.inspectTrace = value(option, i++);
     else if (option === "--manifest") result.manifest = value(option, i++);
     else if (option === "--scenario") result.scenario = value(option, i++);
@@ -198,6 +202,7 @@ function usage() {
     "       --output-root DIR [--manifest FILE] [--browser chromium]",
     "       [--text-metrics-output FILE]",
     "       [--full-document] (bounded lazy-resource sweep and five verified views)",
+    "       [--retained-preflights] (exact retained GET/HEAD CORS permission checks only)",
     "       [--script-free-diagnostic] (resource discovery only; never a qualified reference)",
     "",
     "Capture mode requires the Playwright package and a selected browser binary.",
@@ -267,7 +272,7 @@ function replayEnvironment(trace) {
   return {
     version: REPLAY_ENVIRONMENT_VERSION,
     clockVersion: REPLAY_CLOCK_VERSION,
-    clockContract: REPLAY_CLOCK_CONTRACT,
+    clockContract: trace.fixedWallClock ? REPLAY_FIXED_WALL_CLOCK_CONTRACT : REPLAY_CLOCK_CONTRACT,
     clockScope: REPLAY_CLOCK_SCOPE,
     rngVersion: REPLAY_RNG_VERSION,
     seedSource: REPLAY_SEED_SOURCE,
@@ -288,7 +293,8 @@ function installReplayEnvironment(configuration) {
   if (configuration.intlContract !== "bounded-en-us-utc-v1") {
     throw new Error("deterministic replay requires the bounded Intl contract");
   }
-  if (configuration.clockContract !== "dual-domain-ms-call-v2"
+  const fixedWallClock = configuration.clockContract === "fixed-origin-wall-observed-monotonic-v1";
+  if ((!fixedWallClock && configuration.clockContract !== "dual-domain-ms-call-v2")
       || configuration.clockScope !== "top-level-realm-v1") {
     throw new Error("deterministic replay requires the dual-domain clock contract");
   }
@@ -368,7 +374,7 @@ function installReplayEnvironment(configuration) {
     requireClockSource(source);
     const value = wallElapsedMs >= MAX_WALL_CLOCK_MS - originMs
       ? MAX_WALL_CLOCK_MS : originMs + wallElapsedMs;
-    wallElapsedMs += 1;
+    if (!fixedWallClock) wallElapsedMs += 1;
     wallObservations += 1;
     clockSources[source] += 1;
     return value;
@@ -1587,7 +1593,7 @@ function installReplayEnvironment(configuration) {
         throw new TypeError("deterministic replay clock advance must be a nonnegative integer");
       }
       hostElapsedMs += milliseconds;
-      wallElapsedMs += milliseconds;
+      if (!fixedWallClock) wallElapsedMs += milliseconds;
       monotonicElapsedMs += milliseconds;
     },
     configurable: false, writable: false, enumerable: false,
@@ -1607,8 +1613,8 @@ function installReplayEnvironment(configuration) {
    route handler remains a hard backstop: any non-GET/HEAD request that evades
    these web-platform shims is aborted and poisons qualification. */
 function installReadOnlyPolicy(configuration) {
-  if (!configuration || configuration.preflightPolicy
-      !== "cors-preflight-before-network-v1") {
+  if (!configuration || !["cors-preflight-before-network-v1",
+      "cors-preflight-retained-only-v2"].includes(configuration.preflightPolicy)) {
     throw new Error("read-only policy requires the CORS preflight boundary");
   }
   const reportBinding = globalThis.__tilefinchReadOnlyDenied;
@@ -1617,6 +1623,8 @@ function installReadOnlyPolicy(configuration) {
   }
   const methodName = (value) => String(value || "GET").toUpperCase();
   const safe = (method) => method === "GET" || method === "HEAD";
+  const retainedPreflights = configuration.preflightPolicy
+    === "cors-preflight-retained-only-v2";
   const descriptorOwner = (object, property) => {
     for (let current = object; current; current = Object.getPrototypeOf(current)) {
       if (Object.prototype.hasOwnProperty.call(current, property)) return current;
@@ -1715,7 +1723,7 @@ function installReadOnlyPolicy(configuration) {
             "non-read-only fetch blocked during offline capture",
           ));
         }
-        if (corsPreflightRequired(
+        if (!retainedPreflights && corsPreflightRequired(
           request.url, request.mode, request.headers, false,
         )) {
           return Promise.reject(rejectPreflight(method, "fetch", request.url));
@@ -1858,7 +1866,7 @@ function installReadOnlyPolicy(configuration) {
         let targetUrl = request.url;
         try { targetUrl = new URL(request.url, document.baseURI).href; }
         catch (_error) {}
-        if (corsPreflightRequired(
+        if (!retainedPreflights && corsPreflightRequired(
           targetUrl, "cors", request.headers, hasUploadListeners,
         )) {
           throw new DOMException(
@@ -3272,7 +3280,10 @@ function traceInfo(traceDirectory, expectedRecordCount = null) {
       || origin <= 0 || origin > MAX_DATE_MS) {
     throw new CaptureError(`${filename}: invalid replay clock origin`);
   }
-  return { originMs: origin, recordCount };
+  if (metadata["wall-clock"] !== undefined && metadata["wall-clock"] !== "fixed-origin-v1") {
+    throw new CaptureError(`${filename}: unsupported wall-clock mode`);
+  }
+  return { originMs: origin, recordCount, fixedWallClock: metadata["wall-clock"] === "fixed-origin-v1" };
 }
 
 function traceOriginMs(traceDirectory) {
@@ -3438,12 +3449,23 @@ function loadRecord(metaPath) {
     throw new CaptureError(`${metaPath}: unsafe content type`);
   }
   const headers = responseHeaders(metadata, metaPath);
+  const preflight = method === "OPTIONS" ? captureAudit.preflightShape({
+    origin: metadata["request-origin"],
+    "access-control-request-method": metadata["request-preflight-method"],
+    "access-control-request-headers": metadata["request-preflight-headers"],
+  }) : null;
+  if (method === "OPTIONS" && !preflight) {
+    throw new CaptureError(`${metaPath}: missing read-only preflight request shape`);
+  }
   const effectiveUrl = metadata["effective-url"]
     ? normalizeUrl(metadata["effective-url"], metaPath) : url;
   if (effectiveUrl !== url) {
     throw new CaptureError(`${metaPath}: collapsed redirect/effective URL cannot be replayed faithfully`);
   }
   const cookies = responseCookies(metadata, metaPath);
+  if (preflight && cookies.length) {
+    throw new CaptureError(`${metaPath}: preflight must not replay cookies`);
+  }
   const responseDateSeconds = responseCookieDateBaseline(headers, cookies, metaPath);
   const asyncDelayPumps = metadata["async-delay-pumps"] === undefined
     ? 0 : metadataInteger(metadata, "async-delay-pumps", metaPath);
@@ -3477,12 +3499,13 @@ function loadRecord(metaPath) {
   }
   const signature = crypto.createHash("sha256").update(JSON.stringify({
     success: metadata.success === "1", status, contentType,
-    headers, body_sha256: crypto.createHash("sha256").update(body).digest("hex"),
+    headers, ...(preflight ? {preflight} : {}),
+    body_sha256: crypto.createHash("sha256").update(body).digest("hex"),
     cookies, responseDateSeconds, asyncDelayPumps, externalCancel,
     transportTimeout, error: String(metadata.error || ""),
   })).digest("hex");
   return {
-    id: path.basename(metaPath, ".meta"), method, url,
+    id: path.basename(metaPath, ".meta"), method, url, preflight,
     success: metadata.success === "1", status, contentType,
     headers, body, cookies, responseDateSeconds, asyncDelayPumps,
     externalCancel, transportTimeout, cacheMode, signature,
@@ -3708,7 +3731,7 @@ function loadTrace(traceDirectory) {
     routes.set(key, selectRoute(candidates));
   }
   return {
-    root, records, routes, digest, originMs,
+    root, records, routes, digest, originMs, fixedWallClock: info.fixedWallClock,
     ambiguousRoutes: [...routes.values()].filter((route) => route.ambiguous).length,
   };
 }
@@ -3919,6 +3942,7 @@ function inspectTrace(traceDirectory) {
     route_selection_version: ROUTE_SELECTION_VERSION,
     response_cookies: trace.records.reduce((count, record) => count + record.cookies.length, 0),
     clock_origin_ms: trace.originMs,
+    ...(trace.fixedWallClock ? { clock_contract: REPLAY_FIXED_WALL_CLOCK_CONTRACT } : {}),
     urls: [...new Set([...trace.routes.keys()]
       .map((key) => key.slice(key.indexOf("\0") + 1)))].sort(),
   };
@@ -4071,7 +4095,10 @@ async function runScenarioClock(
   }
 }
 
-function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs) {
+function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs,
+  expectedContract = REPLAY_CLOCK_CONTRACT) {
+  const fixedWallClock = expectedContract === REPLAY_FIXED_WALL_CLOCK_CONTRACT;
+  if (!fixedWallClock && expectedContract !== REPLAY_CLOCK_CONTRACT) return false;
   const sources = clockEvidence && clockEvidence.clockSources;
   const sourceKeys = sources && typeof sources === "object"
     ? Object.keys(sources).sort() : [];
@@ -4093,13 +4120,13 @@ function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs) {
   return clockEvidence !== null && typeof clockEvidence === "object"
     && Number.isSafeInteger(hostElapsedMs)
     && hostElapsedMs >= 0 && hostElapsedMs <= MAX_REPLAY_HOST_ELAPSED_MS
-    && clockEvidence.contract === REPLAY_CLOCK_CONTRACT
+    && clockEvidence.contract === expectedContract
     && clockEvidence.scope === REPLAY_CLOCK_SCOPE
     && clockEvidence.originMs === originMs
     && clockEvidence.hostElapsedMs === hostElapsedMs
     && clockEvidence.playwrightElapsedMs === hostElapsedMs
     && Number.isSafeInteger(clockEvidence.wallElapsedMs)
-    && clockEvidence.wallElapsedMs >= hostElapsedMs
+    && (fixedWallClock ? clockEvidence.wallElapsedMs === 0 : clockEvidence.wallElapsedMs >= hostElapsedMs)
     && clockEvidence.wallElapsedMs <= MAX_REPLAY_DOMAIN_ELAPSED_MS
     && Number.isSafeInteger(clockEvidence.monotonicElapsedMs)
     && clockEvidence.monotonicElapsedMs >= hostElapsedMs
@@ -4116,7 +4143,7 @@ function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs) {
     && monotonicObservationTotal === clockEvidence.monotonicObservations
     && monotonicSampleTotal === clockEvidence.monotonicSamples
     && clockEvidence.wallElapsedMs
-      === hostElapsedMs + clockEvidence.wallObservations
+      === (fixedWallClock ? 0 : hostElapsedMs + clockEvidence.wallObservations)
     && clockEvidence.monotonicElapsedMs
       === hostElapsedMs + clockEvidence.monotonicObservations;
 }
@@ -4391,6 +4418,8 @@ async function captureReference(options) {
     throw new CaptureError(`trace digest mismatch: manifest=${scenario.digest} actual=${trace.digest}`);
   }
   const environment = replayEnvironment(trace);
+  const preflightPolicy = options.retainedPreflights
+    ? RETAINED_PREFLIGHT_POLICY : READ_ONLY_PREFLIGHT_POLICY;
   const documentUserAgent = captureAudit.retainedUserAgent(trace.records, scenario.url);
   const outputRoot = path.resolve(options.outputRoot);
   fs.mkdirSync(outputRoot, { recursive: true });
@@ -4503,6 +4532,17 @@ async function captureReference(options) {
   const capabilityDiagnostics = createRequestDiagnostics(MAX_POLICY_DENIALS);
   const blockedDiagnostics = createRequestDiagnostics(MAX_POLICY_DENIALS);
   let preflightPolicyDenials = 0;
+  const preflightRequests = new Map();
+  const preflightReads = new Map();
+  let preflightReadBytes = 0;
+  let preflightOverflow = false;
+  const visualOptions = (fullDocument) => ({ fullDocument,
+    retainedFailures: [...trace.routes.values()].filter((route) =>
+      route.candidates.every((record) => record.method === "GET"
+        && record.success && record.status >= 400)
+      && route.candidates.some((record) => ledger.claimed.has(record.id)))
+      .map((route) => route.candidates[0].url).slice(0, 4096),
+  });
   const activity = { value: 0 };
   const requestAudit = captureAudit.createRequestAudit();
   const originEvidence = captureAudit.createOriginEvidence();
@@ -4611,6 +4651,15 @@ async function captureReference(options) {
     }
 
     const requestMethod = request.method().toUpperCase();
+    const preflight = options.retainedPreflights && requestMethod === "OPTIONS"
+      ? captureAudit.preflightShape(request.headers()) : null;
+    if (preflight) {
+      const item = { url: requestUrl, ...preflight };
+      const key = JSON.stringify(item);
+      if (preflightRequests.size < 256 || preflightRequests.has(key))
+        preflightRequests.set(key, item);
+      else preflightOverflow = true;
+    }
     const resourceType = request.resourceType();
     ledger.requests += 1;
     ledger.active += 1;
@@ -4658,7 +4707,7 @@ async function captureReference(options) {
         await terminalAdmission(
           "invalid", "invalid", requestUrl, "invalid-url-abort", "invalid-url",
         );
-      } else if (!READ_ONLY_METHODS.has(requestMethod)) {
+      } else if (!READ_ONLY_METHODS.has(requestMethod) && !preflight) {
         const preflight = requestMethod === "OPTIONS"
           && request.headers()["access-control-request-method"] !== undefined;
         await terminalAdmission(
@@ -4668,12 +4717,42 @@ async function captureReference(options) {
           { preflight },
         );
       } else {
-        const selected = trace.routes.get(routeKey);
+        let selected = trace.routes.get(routeKey);
+        if (selected && preflight) {
+          const candidates = selected.candidates.filter((record) =>
+            JSON.stringify(record.preflight) === JSON.stringify(preflight));
+          selected = candidates.length ? selectRoute(candidates) : null;
+        }
         if (!selected) {
           originEvidence.record(requestMethod, normalized, request.headers().origin);
+          if (options.retainedPreflights && READ_ONLY_METHODS.has(requestMethod)) {
+            const checks = [...preflightRequests.values()].filter((item) =>
+              item.url === requestUrl && item.method === requestMethod);
+            for (const check of checks) {
+              const sensitive = (name) => /(?:authorization|cookie|api[-_]?key|token|credential|secret)/i.test(name);
+              const headers = Object.create(null), credentialHeaders = check.headers.split(",").some(sensitive);
+              for (const name of check.headers.split(",").filter(Boolean)) {
+                if (sensitive(name)) continue;
+                const value = request.headers()[name];
+                if (typeof value !== "string" || value.length > 2048) {
+                  preflightOverflow = true; continue;
+                }
+                headers[name] = value;
+              }
+              const item = {url: requestUrl, method: requestMethod,
+                origin: check.origin, headers, credential_headers: credentialHeaders};
+              const key = JSON.stringify(item);
+              if (!preflightReads.has(key)) {
+                const bytes = Buffer.byteLength(key);
+                if (preflightReads.size >= 256 || bytes > 8192
+                    || bytes > 131072 - preflightReadBytes) preflightOverflow = true;
+                else { preflightReadBytes += bytes; preflightReads.set(key,item); }
+              }
+            }
+          }
           await terminalAdmission(
             "unmatched", "unmatched", normalized,
-            "unmatched-route-abort", "unmatched",
+            "unmatched-route-abort", "unmatched", { preflight: !!preflight },
           );
         } else {
           await responseScheduler.enqueueAdmission(identity, () => {
@@ -4835,7 +4914,7 @@ async function captureReference(options) {
   await context.addInitScript(installReplayEnvironment, environment);
   await context.addInitScript(installReadOnlyPolicy, {
     version: READ_ONLY_POLICY_VERSION,
-    preflightPolicy: READ_ONLY_PREFLIGHT_POLICY,
+    preflightPolicy,
   });
   await context.addInitScript(installOfflineCapabilityPolicy, {
     version: OFFLINE_CAPABILITY_POLICY_VERSION,
@@ -4862,7 +4941,12 @@ async function captureReference(options) {
     }
     targetInterception = await captureAudit.installInterception(session, (target, event) => {
       dispatchRoute(captureAudit.cdpRoute(target, event,
-        (method, url) => requestAudit.expectFailure(method, url),
+        (method, url) => {
+          requestAudit.expectFailure(method, url);
+          requestAudit.networkAborted(target, event, {
+            declaredPolicy: blockedUrlMatches(url, scenario.blockedOrigins),
+          });
+        },
         () => requestAudit.networkFulfilled(target, event)));
     }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"), requestAudit);
   }
@@ -4954,7 +5038,7 @@ async function captureReference(options) {
         await runHost("document-view-settle", () => responseScheduler.driveUntilSettled(
           settleCapture(page, options.settleMs, () => ledger.active === 0), "document-view",
         ));
-        const evidence = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+        const evidence = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
         if (Math.abs(evidence.scroll_y - requested) > 2) {
           throw new CaptureError("full-document viewport shifted during settling");
         }
@@ -4968,7 +5052,7 @@ async function captureReference(options) {
         await runHost("document-view-normalize", () => normalizePng(
           raw, path.join(outputDirectory, name), scenario, options.python, options.timeoutMs,
         ));
-        const after = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+        const after = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
         const profileAfter = await runHost("document-view-input-after", inputProfile);
         for (const profile of [profileBefore, profileAfter]) {
           if (!profile.coarse || profile.touch !== 1
@@ -4992,7 +5076,7 @@ async function captureReference(options) {
          Enlarging its surface instead changes viewport units or omits
          offscreen content. Keep accurate viewport screenshots; never label
          a stitched scroll sequence as a coherent full-page image. */
-      const finalExtent = await captureAudit.collectVisualEvidence(page, { fullDocument: true }, runHost);
+      const finalExtent = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
       fullDocument.final_extent = { width: finalExtent.document_width, height: finalExtent.document_height,
         maximum: finalExtent.maximum, incomplete: finalExtent.incomplete, ready: finalExtent.ready };
       if (!finalExtent.ready) throw new CaptureError("full-document paintable images remain incomplete");
@@ -5053,7 +5137,7 @@ async function captureReference(options) {
           name: checkpoint.name, kind: checkpoint.kind, target: checkpoint.target,
           scroll_y: scrollY, frame: filename, format: "png-rgb8",
           width: scenario.deviceWidth, height: scenario.deviceHeight,
-          visual_evidence: await captureAudit.collectVisualEvidence(page, { fullDocument: false }, runHost),
+          visual_evidence: await captureAudit.collectVisualEvidence(page, visualOptions(false), runHost),
         });
       } catch (error) { failure = `checkpoint:${checkpoint.name}:${error.message}`; break; }
     }
@@ -5230,16 +5314,16 @@ async function captureReference(options) {
   const expectedVirtualMs = (scenario.ticks + fullDocument.clock_ticks) * scenario.tickMs;
   const clockEvidence = pageState.clockEvidence;
   const environmentReady = pageState.replayEnvironment === REPLAY_ENVIRONMENT_VERSION
-    && pageState.replayClock === REPLAY_CLOCK_CONTRACT
+    && pageState.replayClock === environment.clockContract
     && pageState.replayIntl === REPLAY_INTL_CONTRACT
     && pageState.performanceEntriesEmpty
     && pageState.performanceTimeOrigin === environment.originMs
     && replayClockEvidenceReady(
-      clockEvidence, environment.originMs, expectedVirtualMs,
+      clockEvidence, environment.originMs, expectedVirtualMs, environment.clockContract,
     );
   const readOnlyPolicyReady = pageState.readOnlyPolicy === READ_ONLY_POLICY_VERSION
-    && pageState.readOnlyPreflightPolicy === READ_ONLY_PREFLIGHT_POLICY
-    && preflightPolicyDenials === 0 && !policySummary.overflow;
+    && pageState.readOnlyPreflightPolicy === preflightPolicy
+    && preflightPolicyDenials === 0 && !policySummary.overflow && !preflightOverflow;
   const capabilityPolicyReady =
     pageState.capabilityPolicy === OFFLINE_CAPABILITY_POLICY_VERSION
     && offlineCapabilityEvidenceReady(pageState.capabilityEvidence)
@@ -5394,12 +5478,17 @@ async function captureReference(options) {
       monotonic_samples: clockEvidence && clockEvidence.monotonicSamples,
       clock_sources: clockEvidence && clockEvidence.clockSources,
       performance_entries: "normalized-empty-v1",
-      document_timeline: REPLAY_CLOCK_CONTRACT,
-      animation_frame: REPLAY_CLOCK_CONTRACT,
+      document_timeline: environment.clockContract,
+      animation_frame: environment.clockContract,
     },
     read_only_policy: {
       version: READ_ONLY_POLICY_VERSION,
-      preflight_policy: READ_ONLY_PREFLIGHT_POLICY,
+      preflight_policy: preflightPolicy,
+      ...(options.retainedPreflights ? {
+        preflight_requests: [...preflightRequests.values()],
+        preflight_reads: [...preflightReads.values()],
+        preflight_overflow: preflightOverflow,
+      } : {}),
       ready: readOnlyPolicyReady,
       denied_before_network: policySummary.total,
       preflight_denied_before_network: preflightPolicyDenials,

@@ -23,6 +23,7 @@ from visual_scenario import (
     summary_row,
     trace_digest,
     trace_replay_origin_ms,
+    trace_replay_clock_contract,
     validate_reference_replay_contract,
     verify_candidate_state_binding,
     verify_reference_proof_binding,
@@ -191,7 +192,7 @@ def main() -> int:
             try:
                 reference = load_state(reference_state)
                 contract_reasons = validate_reference_replay_contract(
-                    scenario, reference, origin_ms
+                    scenario, reference, origin_ms, trace_replay_clock_contract(replay)
                 )
             except ArtifactError as error:
                 contract_reasons = [f"reference-state-invalid:{error}"]

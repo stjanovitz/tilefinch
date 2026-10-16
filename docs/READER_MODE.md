@@ -57,8 +57,8 @@ Basic view retire the page's scripts, so the control could never open it
 there. Content hidden any other way stays out.
 
 The extracted tree shares [Basic view's emitted bounds](BASIC_VIEW.md#bounds-and-transactions):
-at least 512 nodes and 256 KiB of markup, and up to 4,096 nodes and 1 MiB
-when the page has the memory to show them. Reader walks at most 16,384 nodes
+at least 512 nodes and 256 KiB of markup, and up to 8,192 nodes and 1 MiB
+when the page has the memory to show them. Reader walks at most 32,768 nodes
 of its article or listing root. The classification and the DOM
 markers it produces are cached with the loaded page, so scrolling and
 repainting do not repeat the work. Marker installation is journaled: an
@@ -114,10 +114,10 @@ extracted root looks like one clear article:
 
 On the October 2026 census of 55 popular pages, the BBC and Guardian
 articles and an MDN reference page qualify, and no front page, product page,
-store, forecast or application page does. Wikipedia's PlayStation Portable
-article would qualify by shape, but its Reader view needs about 5,100 nodes,
-more than the 4,096-node bound, so it stays manual. A Wiktionary entry is
-made of lists rather than paragraphs and stays manual too.
+store, forecast or application page does. Long articles that previously
+exceeded the 4,096-node extraction ceiling can now qualify when the unchanged
+memory-admission rule permits their full tree. An entry made of lists rather
+than paragraphs stays manual.
 
 **Reader font** is a saved Sans or Serif choice. While Reader mode is active,
 the normal page text-size control adjusts Reader text. **Remember size** is

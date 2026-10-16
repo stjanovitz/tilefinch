@@ -27,6 +27,8 @@ void stylesheet_drop_selector_program(Stylesheet *sheet)
 }
 
 #define STYLE_SELECTOR_PROGRAM_BUDGET (320u * 1024u)
+#define STYLE_SELECTOR_INTERN_CAPACITY 8192u
+#define STYLE_SELECTOR_INTERN_PROBES 8u
 #define STYLE_COMPILED_FRAGMENT_MAGIC UINT32_C(0x54465346)
 #define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(3)
 #define STYLE_COMPILED_FRAGMENT_MAX_BYTES (256u * 1024u)
@@ -779,6 +781,34 @@ size_t stylesheet_compiled_fragment_apply(
     return seeded;
 }
 
+/* Programs use offsets into their own rule's selector, so byte-identical
+   selectors can share instructions without sharing cascade or scope state.
+   This optional construction table is bounded and released before return. */
+static size_t style_selector_intern_slot(const Stylesheet *sheet,
+    uint16_t *table, size_t index, size_t *previous)
+{
+    const StyleRule *rule = &sheet->rules[index];
+    *previous = SIZE_MAX;
+    if (rule->selector == NULL || rule->selector_length == 0) return 0;
+    uint32_t hash = UINT32_C(2166136261);
+    for (size_t i = 0; i < rule->selector_length; i++)
+        hash = (hash ^ (unsigned char) rule->selector[i]) * UINT32_C(16777619);
+    size_t home = hash & (STYLE_SELECTOR_INTERN_CAPACITY - 1u);
+    for (size_t probe = 0; probe < STYLE_SELECTOR_INTERN_PROBES; probe++) {
+        size_t at = (home + probe) & (STYLE_SELECTOR_INTERN_CAPACITY - 1u);
+        if (table[at] == 0) return at;
+        size_t known = (size_t) table[at] - 1u;
+        const StyleRule *candidate = &sheet->rules[known];
+        if (candidate->selector_length == rule->selector_length
+            && memcmp(candidate->selector, rule->selector,
+                       rule->selector_length) == 0) {
+            *previous = known;
+            return at;
+        }
+    }
+    return home;
+}
+
 void stylesheet_prepare_selector_program(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL
@@ -812,8 +842,20 @@ void stylesheet_prepare_selector_program(Stylesheet *sheet)
         stylesheet_release_fragment_seeds(sheet);
         return;
     }
+    uint16_t *intern = sheet->count >= 256u
+        && !budget_pressure_required(sheet->budget,
+            STYLE_SELECTOR_INTERN_CAPACITY * sizeof(uint16_t), 512u * 1024u)
+        ? budget_calloc(sheet->budget, STYLE_SELECTOR_INTERN_CAPACITY,
+                         sizeof(uint16_t)) : NULL;
     size_t wanted = 0;
     for (size_t i = 0; i < sheet->count; i++) {
+        size_t previous = SIZE_MAX;
+        size_t slot = intern == NULL ? 0
+            : style_selector_intern_slot(sheet, intern, i, &previous);
+        if (previous != SIZE_MAX) {
+            offsets[i] = 0; /* A prior identical selector owns its program. */
+            continue;
+        }
         const StyleRule *rule = &sheet->rules[i];
         size_t key = (size_t) rule->order * 2u
             + (rule->important ? 1u : 0u);
@@ -827,11 +869,13 @@ void stylesheet_prepare_selector_program(Stylesheet *sheet)
         if (count != 0 && count <= instruction_limit - wanted) {
             offsets[i] = (uint16_t) count;
             wanted += count;
+            if (intern != NULL) intern[slot] = (uint16_t) (i + 1u);
         } else {
             offsets[i] = UINT16_MAX;
         }
     }
     if (wanted == 0) {
+        budget_free(sheet->budget, intern);
         budget_free(sheet->budget, offsets);
         stylesheet_release_fragment_seeds(sheet);
         return;
@@ -839,14 +883,27 @@ void stylesheet_prepare_selector_program(Stylesheet *sheet)
     StyleSelectorInstruction *program = budget_malloc(
         sheet->budget, wanted * sizeof(*program));
     if (program == NULL) {
+        budget_free(sheet->budget, intern);
         budget_free(sheet->budget, offsets);
         stylesheet_release_fragment_seeds(sheet);
         return;
     }
     size_t at = 0;
     size_t compiled = 0;
+    if (intern != NULL)
+        memset(intern, 0, STYLE_SELECTOR_INTERN_CAPACITY * sizeof(*intern));
     for (size_t i = 0; i < sheet->count; i++) {
         size_t count = offsets[i];
+        if (count == UINT16_MAX) continue;
+        size_t previous = SIZE_MAX;
+        size_t slot = intern == NULL ? 0
+            : style_selector_intern_slot(sheet, intern, i, &previous);
+        if (count == 0) {
+            offsets[i] = previous == SIZE_MAX ? UINT16_MAX : offsets[previous];
+            if (offsets[i] != UINT16_MAX) compiled++;
+            continue;
+        }
+        if (intern != NULL) intern[slot] = (uint16_t) (i + 1u);
         if (count == UINT16_MAX || count > wanted - at) continue;
         const StyleRule *rule = &sheet->rules[i];
         size_t key = (size_t) rule->order * 2u
@@ -885,6 +942,7 @@ void stylesheet_prepare_selector_program(Stylesheet *sheet)
     sheet->selector_program_bytes = offset_bytes
         + wanted * sizeof(*program);
     sheet->selector_program_ready = compiled != 0;
+    budget_free(sheet->budget, intern);
     stylesheet_release_fragment_seeds(sheet);
 }
 

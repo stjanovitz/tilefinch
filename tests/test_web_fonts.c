@@ -21,6 +21,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
 #ifdef TILEFINCH_TEST_WOFF2
 #include <brotli/encode.h>
 #endif
@@ -300,7 +304,7 @@ static bool test_generated_icon_font_family(void)
        Exercise every admitted family/fallback without another command word. */
     for (unsigned slot = 0; slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT; slot++) {
         for (FontFamily fallback = FONT_SANS;
-             fallback <= FONT_HUMANIST_SANS; fallback++) {
+             fallback <= FONT_SYSTEM_SANS; fallback++) {
             FontFamily family = FONT_SANS;
             CHECK(font_family_web(slot, fallback, &family));
             for (unsigned filter = 0; filter < 8; filter++) {
@@ -1010,7 +1014,70 @@ static bool cancel_font_fallback(void *opaque, const char *phase, size_t work)
     return false;
 }
 
-static bool test_external_font_publication(bool refuse, bool smart)
+static bool test_presentation_font_source_identity(void)
+{
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+    static const char html[] = "<!doctype html><body>text";
+    static const char source_css[] =
+        "@font-face{font-family:Shared;src:url(face.ttf)}";
+    static const char reordered_css[] =
+        "@font-face{font-family:Other;src:url(other.ttf)}"
+        "@font-face{font-family:Shared;src:url(face.ttf)}";
+    static const char changed_css[] =
+        "@font-face{font-family:Shared;src:url(different.ttf)}";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet source = {0}, target = {0}, changed = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 13));
+    CHECK(stylesheet_build(&source, &budget, &document, 480)
+        && stylesheet_build(&target, &budget, &document, 480)
+        && stylesheet_build(&changed, &budget, &document, 480));
+    CHECK(stylesheet_add_css_from(&source, source_css, sizeof(source_css) - 1,
+                                  "https://font.test/style.css")
+        && stylesheet_add_css_from(&target, reordered_css, sizeof(reordered_css) - 1,
+                                   "https://font.test/style.css")
+        && stylesheet_add_css_from(&changed, changed_css, sizeof(changed_css) - 1,
+                                   "https://font.test/style.css"));
+    unsigned char *bytes = NULL;
+    size_t length = 0;
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf",
+                    &bytes, &length));
+    FontFace *original = stylesheet_web_font_face_at(&source, 0, 0);
+    CHECK(original && font_face_load_encoded(original, &budget, bytes, length, MIB));
+    StyleWebFonts *owned = source.web_fonts;
+    source.web_fonts = NULL;
+    stylesheet_destroy(&source);
+    size_t retained = budget.current;
+    budget_inject_failure_after(&budget, 0);
+    stylesheet_share_unchanged_web_fonts(&target, owned, MIB);
+    stylesheet_share_unchanged_web_fonts(&changed, owned, MIB);
+    budget_clear_failure_injection(&budget);
+    FontFace *copy = stylesheet_web_font_face_at(&target, 1, 0);
+    CHECK(copy && copy->loaded && copy->implementation == original->implementation
+        && !stylesheet_web_font_face_at(&target, 0, 0)->loaded
+        && !stylesheet_web_font_face_at(&changed, 0, 0)->loaded
+        && budget.current == retained);
+    stylesheet_release_web_fonts(&budget, owned);
+    CHECK(font_text_width(copy, "Still available", 15, 16, false) > 0);
+    stylesheet_destroy(&target);
+    stylesheet_destroy(&changed);
+    document_destroy(&document);
+    free(bytes);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+#endif
+    return true;
+}
+
+typedef enum {
+    EXTERNAL_FONT_STANDARD,
+    EXTERNAL_FONT_PRESENTATION,
+    EXTERNAL_FONT_ICON_PRESSURE
+} ExternalFontScenario;
+
+static bool test_external_font_publication(bool refuse, bool smart,
+                                            ExternalFontScenario scenario)
 {
     static const char prefix[] =
         "<!doctype html><style>"
@@ -1020,6 +1087,10 @@ static bool test_external_font_publication(bool refuse, bool smart)
         "</style><body><div id=metric></div>";
     char html[16384];
     size_t html_length = (size_t) snprintf(html, sizeof(html), "%s", prefix);
+    if (scenario == EXTERNAL_FONT_ICON_PRESSURE) {
+        html_length += (size_t) snprintf(html + html_length, sizeof(html) - html_length,
+            "<style>#metric::before{content:'\\e000'}</style>");
+    }
     for (unsigned row = 0; row < 300; row++) {
         int appended = snprintf(html + html_length, sizeof(html) - html_length,
             "<p>font-independent row %u</p>", row);
@@ -1088,12 +1159,53 @@ static bool test_external_font_publication(bool refuse, bool smart)
             void *pressure = budget_malloc(&budget, remaining - 1536u * KIB);
             CHECK(pressure != NULL);
             size_t old_memory = budget.current;
-            CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SUCCESS
-                  && navigation.page.web_font_pressure_fallback && !face->loaded
-                  && navigation.page.loaded && budget.current < old_memory);
+            CHECK(navigation_run_background_resources(&navigation)
+                  == NAVIGATION_BACKGROUND_WORK_SUCCESS);
+            CHECK(navigation.page.web_font_pressure_fallback && navigation.page.loaded);
+            if (scenario == EXTERNAL_FONT_ICON_PRESSURE) {
+                CHECK(face->loaded && budget.current <= old_memory);
+            } else CHECK(!face->loaded && budget.current < old_memory);
             budget_free(&budget, pressure);
             CHECK(!navigation_background_resources_pending(&navigation));
+            if (scenario == EXTERNAL_FONT_ICON_PRESSURE) {
+                static const char css[] = "body{color:#123456}";
+                NavigationUserCssTransaction *transaction = navigation_apply_user_css_begin(
+                    &navigation, css, sizeof(css) - 1);
+                CHECK(transaction != NULL);
+                navigation_apply_user_css_commit(&navigation, transaction);
+                face = stylesheet_web_font_face_at(&navigation.page.stylesheet, 0, 0);
+                CHECK(face && face->loaded);
+                size_t full_before = navigation.performance.full_relayouts;
+                navigation.style_rebuild_required = true;
+                CHECK(navigation_relayout(&navigation)
+                    && navigation.performance.full_relayouts == full_before + 1);
+                face = stylesheet_web_font_face_at(&navigation.page.stylesheet, 0, 0);
+                CHECK(face && face->loaded);
+                CHECK(navigation_set_web_font_mode(&navigation, WEB_FONTS_OFF));
+                CHECK(navigation_run_background_resources(&navigation)
+                      == NAVIGATION_BACKGROUND_WORK_SUCCESS && !face->loaded);
+            }
         } else {
+            if (scenario == EXTERNAL_FONT_PRESENTATION) {
+                static const char presentation[] = "body{color:#123456}";
+                NavigationUserCssTransaction *transaction = navigation_apply_user_css_begin(
+                    &navigation, presentation, sizeof(presentation) - 1);
+                CHECK(transaction != NULL);
+                FontFace *replacement = stylesheet_web_font_face_at(
+                    &navigation.page.stylesheet, 0, 0);
+                CHECK(replacement && replacement->loaded
+                      && replacement->implementation == face->implementation);
+                CHECK(navigation_apply_user_css_rollback(&navigation, transaction));
+                face = stylesheet_web_font_face_at(&navigation.page.stylesheet, 0, 0);
+                CHECK(face && face->loaded);
+                transaction = navigation_apply_user_css_begin(
+                    &navigation, presentation, sizeof(presentation) - 1);
+                CHECK(transaction != NULL);
+                navigation_apply_user_css_commit(&navigation, transaction);
+                face = stylesheet_web_font_face_at(&navigation.page.stylesheet, 0, 0);
+                CHECK(face && face->loaded);
+                goto teardown;
+            }
             CHECK(navigation_set_web_font_mode(&navigation, WEB_FONTS_OFF));
             budget_inject_failure_after(&budget, 0);
             CHECK(navigation_run_background_resources(&navigation) == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
@@ -1118,6 +1230,7 @@ static bool test_external_font_publication(bool refuse, bool smart)
         CHECK(navigation.relayout_damage_valid && navigation.relayout_damage_top == 0
               && navigation.relayout_damage_bottom >= navigation.page.layout.height);
     }
+teardown:
     navigation_destroy(&navigation);
     browser_session_destroy(&browser);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -1309,6 +1422,51 @@ static bool test_woff_truncation_boundaries(Budget *budget,
 }
 
 #ifdef TILEFINCH_TEST_HAVE_FREETYPE
+static bool test_web_glyph_coverage(const FontFace *face,
+                                     const unsigned char *bytes, size_t length)
+{
+    FT_Library library = NULL;
+    FT_Face reference = NULL;
+    CHECK(FT_Init_FreeType(&library) == 0
+          && FT_New_Memory_Face(library, bytes, (FT_Long) length,
+                                0, &reference) == 0);
+    static const unsigned codepoints[] = {'I', 'l', '|', 'A'};
+    for (int size = 12 * 64; size <= 20 * 64; size += 17) {
+        CHECK(FT_Set_Char_Size(reference, 0, size, 72, 72) == 0);
+        for (size_t at = 0; at < sizeof(codepoints) / sizeof(codepoints[0]); at++) {
+            FT_UInt index = FT_Get_Char_Index(reference, codepoints[at]);
+            CHECK(FT_Load_Glyph(reference, index, FT_LOAD_NO_HINTING
+                      | FT_LOAD_NO_AUTOHINT | FT_LOAD_NO_BITMAP | FT_LOAD_NO_SVG) == 0
+                  && FT_Render_Glyph(reference->glyph, FT_RENDER_MODE_NORMAL) == 0);
+            FontGlyph glyph = {0};
+            CHECK(font_glyph_load_at_size(face, codepoints[at], size, false, &glyph));
+            FT_GlyphSlot slot = reference->glyph;
+            bool same = glyph.width == (int) slot->bitmap.width
+                && glyph.height == (int) slot->bitmap.rows
+                && glyph.x_offset == slot->bitmap_left
+                && glyph.y_offset == -slot->bitmap_top
+                && glyph.advance_fixed == slot->advance.x;
+            for (int y = 0; same && y < glyph.height; y++) {
+                int pitch = slot->bitmap.pitch;
+                int row = pitch < 0 ? glyph.height - y - 1 : y;
+                const unsigned char *pixels = slot->bitmap.buffer
+                    + (size_t) row * (size_t) (pitch < 0 ? -pitch : pitch);
+                same = memcmp(glyph.pixels + (size_t) y * glyph.width,
+                              pixels, (size_t) glyph.width) == 0;
+            }
+            if (!same) fprintf(stderr, "glyph coverage U+%04x size=%d native=%dx%d@%d,%d reference=%ux%u@%d,%d\n",
+                               codepoints[at], size, glyph.width, glyph.height,
+                               glyph.x_offset, glyph.y_offset, slot->bitmap.width,
+                               slot->bitmap.rows, slot->bitmap_left, -slot->bitmap_top);
+            font_glyph_destroy(face, &glyph);
+            CHECK(same);
+        }
+    }
+    FT_Done_Face(reference);
+    FT_Done_FreeType(library);
+    return true;
+}
+
 typedef struct {
     int width;
     int metric_height;
@@ -1658,6 +1816,7 @@ static bool test_bounded_font_loader(void)
     CHECK(glyph.pixels != NULL && glyph.budget == &budget
           && glyph.width > 0 && glyph.height > 0);
     font_glyph_destroy(&face, &glyph);
+    CHECK(test_web_glyph_coverage(&face, bytes, length));
     CHECK(test_web_font_raster_retention(&budget, bytes, length,
         maximum_backend_bytes));
     font_face_destroy(&face);
@@ -1879,6 +2038,14 @@ static bool test_external_fonts_bypass_generic_cache(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--font-transaction-only") == 0)
+        return test_external_font_publication(false, false, EXTERNAL_FONT_PRESENTATION) ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--font-presentation-only") == 0)
+        return test_presentation_font_source_identity()
+            && test_external_font_publication(false, false, EXTERNAL_FONT_PRESENTATION)
+            && test_external_font_publication(false, true, EXTERNAL_FONT_ICON_PRESSURE) ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--font-icon-pressure-only") == 0)
+        return test_external_font_publication(false, true, EXTERNAL_FONT_ICON_PRESSURE) ? 0 : 1;
     if ((argc == 2 || argc == 3) && (strcmp(argv[1], "--font-perf-only") == 0
                      || strcmp(argv[1], "--legacy-font-perf-only") == 0)) {
         tilefinch_test_faults()->legacy_web_font_work =
@@ -1887,7 +2054,7 @@ int main(int argc, char **argv)
             return test_deferred_font_families_and_aliases() ? 0 : 1;
         if (argc == 3 && strcmp(argv[2], "advances") == 0)
             return test_exact_cached_web_font_advances() ? 0 : 1;
-        return test_external_font_publication(false, false)
+        return test_external_font_publication(false, false, EXTERNAL_FONT_STANDARD)
             && test_deferred_font_families_and_aliases()
             && test_exact_cached_web_font_advances() ? 0 : 1;
     }
@@ -1899,9 +2066,12 @@ int main(int argc, char **argv)
         || !test_async_font_loader_is_fallback_first()
         || !test_deferred_font_families_and_aliases()
         || !test_exact_cached_web_font_advances()
-        || !test_external_font_publication(false, false)
-        || !test_external_font_publication(true, false)
-        || !test_external_font_publication(false, true)
+        || !test_external_font_publication(false, false, EXTERNAL_FONT_STANDARD)
+        || !test_external_font_publication(true, false, EXTERNAL_FONT_STANDARD)
+        || !test_external_font_publication(false, true, EXTERNAL_FONT_STANDARD)
+        || !test_external_font_publication(false, false, EXTERNAL_FONT_PRESENTATION)
+        || !test_external_font_publication(false, true, EXTERNAL_FONT_ICON_PRESSURE)
+        || !test_presentation_font_source_identity()
         || !test_web_font_modes()
         || !test_blocked_font_settles_without_backpressure_retry()
         || !test_inline_discovery_and_canonicalization()

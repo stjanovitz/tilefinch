@@ -741,8 +741,8 @@
           && explicit_background_style.background_position_x == 50
           && explicit_background_style.background_position_y == 50
           && explicit_background_style.text_indent == -9999);
-    CHECK(tracking_parent_style.letter_spacing == 3
-          && tracking_child_style.letter_spacing == 3);
+    CHECK(tracking_parent_style.letter_spacing_fixed == 3 * 64
+          && tracking_child_style.letter_spacing_fixed == 3 * 64);
     CHECK(sibling_b_style.color == 0x314159
           && sibling_c_style.has_background
           && sibling_c_style.background == 0x271828);

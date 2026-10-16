@@ -1323,6 +1323,9 @@ bool fetch_trace_replay_seed_session(
     struct BrowserSession *session, char *error, size_t error_size);
 void fetch_trace_end(void);
 bool fetch_trace_clock_origin_ms(uint64_t *origin_ms);
+/* Explicit trace-only civil-time snapshot. Monotonic replay time still
+   advances, and traces without this declaration retain per-call wall time. */
+bool fetch_trace_fixed_wall_clock(void);
 FetchResult *fetch_result_create(Budget *budget);
 /* Converts an owned response payload to the main-thread immutable shared-body
    representation in place.  Existing shared results are accepted only when

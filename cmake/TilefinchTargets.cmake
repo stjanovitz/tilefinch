@@ -764,7 +764,25 @@ if(PSP)
             # Session-safe sign-in recovery and independent native header
             # publication measured 4,887,568 bytes. The approved 2 KiB
             # increase changes no memory, cookie or download quotas.
-            set(TILEFINCH_PSP_TEXT_LIMIT 4888832)
+            # Bounded focus-shadow slots and exact pseudo paint updates:
+            # measured 4,895,100 bytes; approved 7 KiB, with the 64-slot
+            # paint ceiling and all page-memory quotas unchanged.
+            # Generated-content wrapping, final containing-block geometry and
+            # bounded image-load tasks measure 4,899,748 bytes. The approved
+            # 3 KiB increase changes no page or download ceiling; positioned
+            # jobs add 384 bytes of context and image tasks allocate lazily.
+            # Fractional tracking and nested inline-block baselines measure
+            # 4,901,732 bytes. The approved 2 KiB increase preserves retained
+            # command/style sizes and all page and download ceilings.
+            # CSS replacement images, independent unknown-media dimensions
+            # and flow-button centering measure 4,903,080 bytes, 936 bytes
+            # over the preceding limit after the final sizing checks.
+            # The approved 1 KiB changes no retained record or resource quota.
+            # Generated float exclusions, indefinite flex minimums and
+            # allocation-free font sharing measure 4,908,384 bytes after
+            # preserving Smart icon fonts through full sheet rebuilds.
+            # The approved 2 + 1 KiB changes no retained record or quota.
+            set(TILEFINCH_PSP_TEXT_LIMIT 5114112)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the

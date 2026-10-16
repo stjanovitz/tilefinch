@@ -4667,7 +4667,12 @@ static bool image_process_node(
         context->images->stats.node_style_resolve_us += elapsed;
     }
     *traverse = style->display != DISPLAY_NONE && !style->hidden;
-    bool atomic_inline_svg = *traverse && image_name_is(node, "svg");
+    bool replacement = *traverse && style->generated_image;
+    if (replacement && !load_stylesheet_image_node(context, node,
+            style->generated_text, strlen(style->generated_text),
+            false, true, PSEUDO_NONE)) return false;
+    bool atomic_inline_svg = *traverse && !replacement
+        && image_name_is(node, "svg");
     if (atomic_inline_svg && image_inline_svg_is_sprite_sheet(node)) {
         /* Its symbols render through <use> in other SVGs, which serialize
            the referenced symbol themselves; nothing below it is an HTML
@@ -4680,7 +4685,7 @@ static bool image_process_node(
         for (size_t i = 0; !deferred && i < context->deferred_node_count; i++)
             deferred = context->deferred_nodes[i] == node;
     }
-    if (*traverse && !deferred && image_name_is(node, "img")
+    if (*traverse && !replacement && !deferred && image_name_is(node, "img")
         && (!context->preserve_staged_document_images
             || images_find_node(context->images, node) == NULL)) {
         size_t source_length = 0;
@@ -4689,7 +4694,7 @@ static bool image_process_node(
         if (!load_document_image_node(context, node, source, source_length,
                                       false, false, PSEUDO_NONE)) return false;
     }
-    if (*traverse && image_name_is(node, "video")) {
+    if (*traverse && !replacement && image_name_is(node, "video")) {
         size_t poster_length = 0;
         const char *poster = document_attribute(
             node, "poster", &poster_length);
@@ -4763,13 +4768,16 @@ static bool image_process_node(
                       context, node, style->mask_image,
                       strlen(style->mask_image), true, false,
                       PSEUDO_NONE)) return false;
+    /* A replacement suppresses markup descendants and generated pseudos,
+       but its own background and mask still belong to the element's box. */
+    if (replacement) *traverse = false;
     if (!*traverse) return true;
     /* Inline SVG is decoded as one atomic replaced image. Its serializer
        already resolved the descendant presentation cascade. Set this before
        the pseudo-image prefilter can return, or that common fast path walks
        the descendants again despite having no independent HTML resources. */
     if (atomic_inline_svg) *traverse = false;
-    /* Generated-content images can only come from ::before/::after rules.
+    /* Remaining generated-content images come from ::before/::after rules.
        When no such rule that can supply one matches this element, both
        pseudo resolutions are skipped; the exact test on the few flagged
        candidates is far cheaper than two resolutions. */
@@ -6251,6 +6259,16 @@ const void *image_resource_backing_identity(const ImageResource *image)
     if (image->pixels != NULL) return image->pixels;
     if (image->encoded_body != NULL) return image->encoded_body;
     return image->encoded;
+}
+
+bool image_resource_source_current(const Stylesheet *sheet,
+                                    const ImageResource *image)
+{
+    if (image == NULL || image->node == NULL) return false;
+    size_t length = 0;
+    const char *source = image_select_source(sheet, image->node, &length);
+    return source != NULL && length != 0
+        && image->source_hash == image_hash_bytes(source, length);
 }
 
 const ImageResource *images_find_node(const ImageResources *images,

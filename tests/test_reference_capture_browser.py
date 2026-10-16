@@ -142,6 +142,11 @@ def record(trace, number, url, body, content_type, status=200, headers=()):
 
 @unittest.skipUnless(PLAYWRIGHT, "Node/Playwright is unavailable")
 class BrowserCaptureTests(unittest.TestCase):
+    def test_environment_preflight_and_failed_image_contracts(self):
+        result = subprocess.run([NODE, str(ROOT / "tests/playwright_reference_contract.js")],
+                                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def capture(self, directory, *, missing=False, full=True, iframe=False, viewport_units=False, corrupt_frame_image=False, hidden_frame=False, pointer_media=False):
         trace = directory / "trace"
         trace.mkdir()

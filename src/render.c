@@ -4550,6 +4550,14 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
             cache->visual_layout.commands[i].opacity_scale =
                 cache->source_layout->commands[i].opacity_scale;
             const DrawCommand *source = &cache->source_layout->commands[i];
+            if (source->type == DRAW_FILL_RECT && source->text != NULL
+                && (source->text_length == PSEUDO_BEFORE || source->text_length == PSEUDO_AFTER)) {
+                DrawCommand *target = &cache->visual_layout.commands[i];
+                target->x = source->x; target->width = source->width;
+                target->y = source->y; target->height = source->height;
+                viewport_css_box_to_device(&cache->source_layout->viewport, &target->x, &target->width);
+                viewport_css_box_to_device(&cache->source_layout->viewport, &target->y, &target->height);
+            }
             if (source->type == DRAW_STROKE_RECT
                 && source->image_fit == LAYOUT_STROKE_FOCUS_INSET) {
                 cache->visual_layout.commands[i].scale = viewport_scale_ceil(
@@ -4566,8 +4574,9 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
         &cache->source_layout->viewport, right) + 1;
     int visual_bottom = viewport_css_to_device(
         &cache->source_layout->viewport, bottom) + 1;
-    /* Paint only: colors, opacity and a focus stroke's width change, never
-       boxes, command flags or indices, so the overflow geometry stands. The
+    /* Paint only: colors, opacity, a focus stroke's width and proven
+       within-band pseudo translations change, never boxes or indices, so
+       the overflow geometry stands. The
        fixed layer is rebuilt only when a repainted command is one of its
        own; the damage is the union of the repainted boxes, so any such
        command intersects it (a drawer's box-shadows take ~0.6 s to redraw). */

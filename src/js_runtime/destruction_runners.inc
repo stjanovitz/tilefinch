@@ -221,6 +221,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     budget_free(budget, runtime->validation_phases);
 #endif
     budget_free(budget, runtime->xhr_diagnostics);
+    budget_free(budget, runtime->image_load_states);
     budget_free(budget, runtime);
 }
 

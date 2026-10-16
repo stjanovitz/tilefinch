@@ -1,4 +1,5 @@
 #include "tilefinch/reader_mode.h"
+#include "tilefinch/layout.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/style.h"
@@ -1175,6 +1176,49 @@ static bool test_text_nodes_do_not_bound_the_classifier(void)
     return true;
 }
 
+static bool test_basic_images_keep_settled_inline_size(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.small{width:32px;height:24px}"
+        "</style><body><img id=icon class=small src='/icon.png' width=240 height=180>"
+        "<h1>Useful content</h1><p>A small navigation graphic must not take "
+        "over the simplified page.</p></body>";
+    Budget budget;
+    budget_init(&budget, 16u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument source = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 113u)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&source, &budget, &document, &sheet, NULL, NULL, 480)
+          && reader_document_prepare_basic_complete_with_layout(
+                 &document, &sheet, &source, &analysis));
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    lxb_dom_node_t *image = root == NULL ? NULL : find_named_within(root, "img");
+    size_t length = 0;
+    const char *sizing = image == NULL ? NULL
+        : document_attribute(image, "style", &length);
+    CHECK(analysis.kind == READER_PAGE_BASIC && !analysis.bounded_out
+          && !analysis.extraction_truncated && sizing != NULL
+          && length == strlen("width:32px!important")
+          && memcmp(sizing, "width:32px!important", length) == 0
+          && subtree_contains_text(root, "Useful content"));
+    /* A later source revision must not borrow stale node-box dimensions. */
+    CHECK(reader_document_discard_prepared_view(&document, READER_PAGE_BASIC)
+          && reader_document_prepare_basic_complete_with_layout(
+                 &document, &sheet, &source, &analysis));
+    root = find_direct_reader_root(&document);
+    image = root == NULL ? NULL : find_named_within(root, "img");
+    CHECK(image != NULL && document_attribute(image, "style", NULL) == NULL);
+    layout_destroy(&source);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u);
+    return true;
+}
+
 static bool test_reader_heading_sizes_are_bounded(void)
 {
     char css[SITE_ADAPTER_READER_CSS_LIMIT];
@@ -1187,6 +1231,95 @@ static bool test_reader_heading_sizes_are_bounded(void)
           && strstr(css, "h2{font-size:1.3rem!important}") != NULL
           && strstr(css, "h3{font-size:1.15rem!important}") != NULL
           && strstr(css, "h6{font-size:1.05rem!important}") != NULL);
+    return true;
+}
+
+static bool test_hidden_prose_is_manual_only_evidence(void)
+{
+    for (unsigned hidden = 0; hidden < 4; hidden++) {
+        char html[8192];
+        size_t used = 0;
+        static const char *const declarations[] = {
+            "", "display:none", "visibility:hidden", "opacity:0"
+        };
+        char head[256];
+        snprintf(head, sizeof(head),
+            "<!doctype html><style>.notice{%s}</style><body><main>"
+            "<h1>Choose a destination</h1><a href=/one>First destination</a>"
+            "<div class=notice>", declarations[hidden]);
+        CHECK(append_text(html, sizeof(html), &used, head)
+              && append_paragraphs(html, sizeof(html), &used, clear_prose_paragraph, 6u)
+              && append_text(html, sizeof(html), &used, "</div></main></body>"));
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        ReaderDocumentAnalysis analysis = {0};
+        CHECK(document_parse(&document, &budget, html, used, 113u)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && reader_document_analyze_with_stylesheet(&document, &sheet, &analysis));
+        CHECK(analysis.kind == READER_PAGE_ARTICLE
+              && analysis.high_confidence == (hidden == 0));
+        CHECK(reader_document_prepare_with_stylesheet(&document, &sheet, &analysis)
+              && find_reader_root(&document) != NULL);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u);
+    }
+    return true;
+}
+
+static bool test_reader_references_remain_inline(void)
+{
+    static const char html[] = "<!doctype html><style>sup,sub,abbr,kbd{display:block;width:1px;vertical-align:baseline}</style>"
+        "<body data-tilefinch-reader-kind=article><div data-tilefinch-reader-root=article>"
+        "<p>Prose<span data-tilefinch-reader-anchor id=fragment></span>"
+        "<sup><a href=#note>[12]</a></sup> continues <sub>2</sub> "
+        "with <abbr>units</abbr> and <kbd>keys</kbd>.</p></div>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    char css[SITE_ADAPTER_READER_CSS_LIMIT], adapter[32];
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 113u)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && site_adapter_reader_css("https://reader.test/article", SITE_ADAPTER_READER_FONT_SERIF, 100u,
+              css, sizeof(css), adapter, sizeof(adapter))
+          && stylesheet_add_user_css(&sheet, css, strlen(css)));
+    lxb_dom_node_t *body = document_body_node(&document);
+    ComputedStyle parent = style_for_node(&sheet, body, NULL);
+    lxb_dom_node_t *root = find_reader_root(&document);
+    CHECK(root != NULL);
+    parent = style_for_node(&sheet, root, &parent);
+    lxb_dom_node_t *paragraph = find_named_within(root, "p");
+    parent = style_for_node(&sheet, paragraph, &parent);
+    ComputedStyle marker = style_for_node(&sheet,
+        find_named_within(paragraph, "span"), &parent);
+    CHECK(marker.display == DISPLAY_INLINE);
+    static const char *const names[] = {"sup", "sub", "abbr", "kbd"};
+    for (unsigned i = 0; i < 4; i++) {
+        ComputedStyle style = style_for_node(&sheet, find_named_within(paragraph, names[i]), &parent);
+        CHECK(style.display == DISPLAY_INLINE);
+        if (i < 2) CHECK(style.vertical_align == (i == 0 ? VERTICAL_SUPER : VERTICAL_SUB)
+                         && computed_style_font_size_fixed(&style) < computed_style_font_size_fixed(&parent));
+    }
+    LayoutDocument layout = {0};
+    CHECK(layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    const DrawCommand *prose = NULL, *reference = NULL;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_TEXT) continue;
+        if (command->text_length == 5u && memcmp(command->text, "Prose", 5u) == 0) prose = command;
+        if (command->text_length == 4u && memcmp(command->text, "[12]", 4u) == 0) reference = command;
+    }
+    CHECK(prose && reference && reference->y + reference->height < prose->y + prose->height
+          && reference->x >= prose->x + prose->width - 1);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u);
     return true;
 }
 
@@ -1502,9 +1635,60 @@ static bool test_unknown_wrappers_do_not_consume_semantic_quota(void)
     return true;
 }
 
-static bool test_extraction_truncation_is_explicit(void)
+static bool test_long_article_completes_with_budget_headroom(void)
 {
     const size_t capacity = 1024u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = 0;
+    CHECK(append_text(html, capacity, &used,
+        "<!doctype html><body><article><h1>A long readable article</h1>"));
+    for (size_t i = 0; i < 5500u; i++)
+        CHECK(append_text(html, capacity, &used,
+            "<p>Substantial article prose preserves every paragraph in source "
+            "order. Available memory admits the complete content without "
+            "discarding its final section.</p>"));
+    CHECK(append_text(html, capacity, &used,
+        "<h2 id=conclusion>Final section</h2><p>COMPLETE ARTICLE SENTINEL</p>"
+        "<a href='#conclusion'>Return to conclusion</a></article></body>"));
+    for (unsigned basic = 0; basic < 2u; basic++) {
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        ReaderDocumentAnalysis analysis = {0};
+        CHECK(document_parse(&document, &budget, html, used, 4096u));
+        ReaderCooperateProbe probe = {0};
+        TilefinchPlatformServices services = {
+            .context = &probe, .cooperate = reader_cooperate_probe
+        };
+        tilefinch_platform_set_services(&services);
+        bool prepared = basic
+            ? reader_document_prepare_basic_complete_with_stylesheet(
+                  &document, NULL, &analysis)
+            : reader_document_prepare_complete_with_stylesheet(
+                  &document, NULL, &analysis);
+        tilefinch_platform_set_services(NULL);
+        lxb_dom_node_t *root = find_reader_root(&document);
+        CHECK(prepared && root != NULL && !analysis.bounded_out
+              && !analysis.extraction_truncated && analysis.extracted_nodes > 5500u
+              && subtree_contains_text(root, "COMPLETE ARTICLE SENTINEL")
+              && count_named_within(root, "p") == 5501u
+              && analysis.mapped_anchors == 1u
+              && probe.extract_node_calls > 64u
+              && probe.extract_node_max_gap <= 128u
+              && probe.extract_max_gap <= 4096u);
+        document_destroy(&document);
+        CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+              && budget_categories_reconcile(&budget));
+    }
+    free(html);
+    return true;
+}
+
+static bool test_extraction_truncation_is_explicit(void)
+{
+    const size_t capacity = 2u * 1024u * 1024u;
     char *html = malloc(capacity);
     CHECK(html != NULL);
     size_t used = 0;
@@ -1514,8 +1698,8 @@ static bool test_extraction_truncation_is_explicit(void)
     static const char paragraph[] =
         "<p>Bounded readable prose fills the article while the extracted tree "
         "retains a balanced prefix and explicitly reports its omitted suffix.</p>";
-    /* More paragraphs than the 4,096-node ceiling an ample budget grants. */
-    for (size_t i = 0; i < 4200u; i++)
+    /* Enough paragraphs to exceed even the admitted markup-byte ceiling. */
+    for (size_t i = 0; i < 7900u; i++)
         CHECK(append_text(html, capacity, &used, paragraph));
     CHECK(append_text(html, capacity, &used,
                       "<p>BOTTOM MUST BE OMITTED</p></article></main></body>"));
@@ -1531,7 +1715,8 @@ static bool test_extraction_truncation_is_explicit(void)
     CHECK(analysis.kind == READER_PAGE_ARTICLE
           && analysis.extraction_truncated && analysis.bounded_out
           && !analysis.high_confidence
-          && analysis.extracted_nodes == 4096u
+          && analysis.extracted_nodes > 4096u
+          && analysis.extracted_nodes < 8192u
           && root != NULL
           && document_attribute(
                  root, "data-tilefinch-reader-truncated",
@@ -1928,14 +2113,14 @@ static bool test_basic_anchor_bounds_are_transactional(void)
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
           && budget_categories_reconcile(&budget));
 
-    const size_t many_capacity = 160u * 1024u;
+    const size_t many_capacity = 256u * 1024u;
     char *many = malloc(many_capacity);
     CHECK(many != NULL);
     size_t used = 0u;
     CHECK(append_text(
         many, many_capacity, &used,
         "<!doctype html><body><h1>Many anchors</h1>"));
-    for (size_t i = 0; i <= 4096u; i++) {
+    for (size_t i = 0; i <= 8192u; i++) {
         char marker[48];
         written = snprintf(marker, sizeof(marker), "<x id='a%zu'></x>", i);
         CHECK(written > 0 && (size_t) written < sizeof(marker)
@@ -1956,7 +2141,7 @@ static bool test_basic_anchor_bounds_are_transactional(void)
               &document, &stylesheet, &analysis)
           && analysis.prepared && analysis.kind == READER_PAGE_BASIC
           && !analysis.bounded_out && analysis.extraction_truncated
-          && analysis.extracted_nodes == 4096u
+          && analysis.extracted_nodes == 8192u
           && find_direct_reader_root(&document) != NULL
           && has_attribute(body, "data-tilefinch-reader-kind")
           && subtree_contains_text(
@@ -1989,8 +2174,8 @@ static bool test_basic_view_bounds_emitted_not_inspected_nodes(void)
         "</nav><h1>Front page</h1><p>The first story survives the "
         "wrappers.</p><form role='search' action='/find'>"
         "<label>Query<input name='q'></label>"));
-    /* More filler than the 4,096-node ceiling an ample budget grants. */
-    for (size_t i = 0; i < 4200u; i++)
+    /* More filler than the 8,192-node ceiling an ample budget grants. */
+    for (size_t i = 0; i < 8300u; i++)
         CHECK(append_text(html, capacity, &used, "<p>filler</p>"));
     CHECK(append_text(html, capacity, &used,
                       "<input name='late'></form></body>"));
@@ -2429,7 +2614,10 @@ int main(void)
         || !test_hidden_or_peripheral_media_is_not_primary()
         || !test_primary_media_requires_visible_authored_source()
         || !test_auto_article_requires_semantic_root()
+        || !test_basic_images_keep_settled_inline_size()
         || !test_reader_heading_sizes_are_bounded()
+        || !test_hidden_prose_is_manual_only_evidence()
+        || !test_reader_references_remain_inline()
         || !test_excluded_text_does_not_dilute_article()
         || !test_aria_and_header_chrome_are_excluded()
         || !test_flattened_blocks_and_empty_semantics()
@@ -2437,6 +2625,7 @@ int main(void)
         || !test_large_text_node_is_cooperative()
         || !test_semantic_attributes_survive_extraction()
         || !test_unknown_wrappers_do_not_consume_semantic_quota()
+        || !test_long_article_completes_with_budget_headroom()
         || !test_extraction_truncation_is_explicit()
         || !test_large_page_bound()
         || !test_bounded_page_keeps_manual_article()

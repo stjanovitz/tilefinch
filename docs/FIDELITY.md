@@ -5,12 +5,91 @@ comparison is intentionally offline and deterministic: both browsers consume
 the same retained response-keyed trace, use the same viewport and replay
 clock, and must close their request ledgers before a frame is eligible.
 
+A trace may explicitly declare `wall-clock=fixed-origin-v1` in `trace.meta`.
+This snapshot mode holds civil time (`Date`) at the retained origin while
+monotonic time, timers and animation frames continue advancing normally. Both
+renderers must report the matching clock contract and complete source-count
+accounting. Undeclared traces retain the ordinary advancing-clock contract;
+unknown modes are refused. Snapshot mode does not relax exact request URLs,
+POST bodies, response headers, resource completion or teardown checks.
+
+The browser request audit also accounts for a parent fetch that Chromium
+rejects before interception because its declared-policy preflight was denied.
+This requires the same CDP session, exact initiator request ID, URL, method,
+matching frame when supplied, and confirmed blocked-by-client completion.
+Unlinked transport errors remain failures. Host network media cannot bypass
+an active HTTP replay through the decoder's separate transport; local media
+fixtures remain available for playback tests.
+
+The optional `--retained-preflights` capture mode replays CORS permission
+checks for GET/HEAD requests through the same protocol interception as other
+HTTP work. It requires an actual retained OPTIONS response and an exact
+request Origin, target method and normalized header-name set, stored as
+`request-origin`, `request-preflight-method` and `request-preflight-headers`.
+Missing or mismatched permission checks fail closed; no successful preflight
+is synthesized. Author writes remain blocked, and the browser still enforces
+the retained server's CORS response headers. The ordinary mode retains its
+early preflight denial. Capture receipts bind the selected mode.
+
+Opt-in preflight diagnostics retain at most 256 request shapes and 128 KiB of
+associated custom-header evidence, with an 8 KiB per-read ceiling. Sensitive
+header names are omitted and mark a read unsuitable for anonymous acquisition.
+These diagnostics, like the underlying page responses, belong in private
+capture storage, never public fixtures. They do not authorize live requests.
+
+The host-only trace recorder can acquire an explicitly approved permission
+check with `--method OPTIONS --origin HTTPS_ORIGIN --preflight-method GET`
+and `--preflight-headers NAMES` (HEAD is also supported). Approved read-only
+application headers can instead be supplied through a bounded `--headers-file`.
+Known credential-bearing header names and forbidden transport headers are
+refused. This is not a general secret detector: review the exact request before
+acquisition and keep its input file private. The recorder supplies no cookie
+jar or account credentials and never follows redirects.
+
+A painted image which has finished with a retained HTTP error is recorded as
+an explicit failed image, not as a successful load or perpetually pending work.
+This requires a served GET route whose selected responses all have error
+statuses. Unknown requests, unfinished images and corrupt successful image
+responses still fail visual qualification. The broken image remains in the
+reference pixels and its failure remains in the audit.
+
 The corpus is git-ignored because it contains third-party page material.
 Scenario definitions, trace digests, commands, metrics, and floor values are
 committed, so an authorized maintainer can rebuild the evidence without
 redistributing site captures.
 
 ## What is measured
+
+Modern system-font stacks keep a distinct fallback identity from Arial.
+Bounded ASCII advance profiles at small-text and heading sizes reuse the
+existing metric-sans outlines, with the same interpolation for measurement
+and painting; no additional font face is introduced. Platform-specific
+outlines and non-ASCII glyphs remain fallbacks, not exact font emulation.
+Prefixed line clamping affects vertical legacy boxes, not ordinary blocks.
+Float exclusions survive ordinary block boundaries so negative margins can
+still reach them; expired entries are recycled when new floats need slots.
+Reduced regressions cover these cases, including a full inherited float set.
+Layout scratch and retained style/command sizes do not grow. No fidelity floor
+is changed.
+
+Text tracking is retained in signed 26.6 pixels through measurement, inline
+boundaries, bidi placement, scaling and painting. Fractional tracking shares
+the existing display-command scale word and style alignment padding; retained
+records do not grow. Independent split-run pixel and wrapping checks cover it.
+Treadline's exact screenshots were refreshed for its authored `.3px` and `.7px`
+labels, previously rounded to `0px` and `1px`. Their corrected tracking changes
+text pixels, not menu geometry or game output. No fidelity floor was lowered.
+
+Ordinary-element `content:url()` uses the existing bounded, source-keyed image
+loader and replacement layout, including subtree suppression. Unknown video
+and frame dimensions use independent defaults rather than treating the fallback
+box as an intrinsic ratio. Definite-height flow buttons center anonymous content
+without moving positioned decorations or overriding flex/grid alignment. Reduced
+tests cover these paths and zero-owned-byte teardown; no fidelity floor changes.
+The two search-form engine goldens include the corrected centered button label
+(one raster row lower). An offline Chrome render with the same pinned fonts
+confirmed the centered alignment; field geometry and all non-button pixels stay
+unchanged. These are reviewed engine goldens, not lowered fidelity floors.
 
 Named font declarations retain bounded resolution programs when their face is
 declared by a later stylesheet. Font shorthand replay preserves subsequent
@@ -635,3 +714,25 @@ the frame is more faithful.
   parent's 26px and 22px, so the article lead, the infobox and the main
   page's welcome box land within a pixel or two of the reference. The
   hackernews rows and both `bottom` rows did not move.
+
+- **2026-10, image and intrinsic-layout parity.** Enlarged ordinary images
+  use pixel-center, premultiplied-alpha interpolation within the existing
+  scaled-image cache; masks, backgrounds and canvas sampling retain their
+  existing behavior. Offset zero-spread uniform-corner shadows now exclude
+  the original border box, including transparent interiors. Intrinsic sizing
+  accounts for generated flex separators and definite-height grid images,
+  avoids feeding a box's own constraints back into its intrinsic width, and
+  deducts grid-item margins before alignment. Synthetic pixel and geometry
+  regressions cover these paths, alongside resource-complete, matching-content
+  private comparisons. Existing fidelity floors remain unchanged.
+
+- **2026-10, compact header and focus-decoration parity.** Definite generated
+  decorations now contribute to non-flex min-content sizing, so a grid's
+  compact icon control retains its padding and icon width. Absolutely
+  positioned generated text no longer participates in surrounding line
+  baselines or increases line height. Up to 64 simple punctuation decorations
+  can retain invisible paint commands for focus-only visibility changes;
+  repeated focus/blur is pixel-compared against authoritative rebuilds.
+  Missing slots, changed geometry and complex compositing still require
+  layout. Detached streaming previews clear the native decoration identity.
+  Existing fidelity floors remain unchanged.

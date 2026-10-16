@@ -86,7 +86,7 @@ static bool equivalent(const Stylesheet *left_sheet,
         : memcmp(left_gradient, right_gradient, sizeof(*left_gradient)) == 0;
     return left->display == right->display
         && left->color == right->color
-        && left->letter_spacing == right->letter_spacing
+        && left->letter_spacing_fixed == right->letter_spacing_fixed
         && left->word_spacing == right->word_spacing
         && left->padding.top == right->padding.top
         && left->padding.right == right->padding.right
@@ -833,7 +833,7 @@ static int test_long_custom_property_values(void)
                                          value, sizeof(value));
     CHECK(shrunk > 0 && shrunk < 200u && strncmp(value, "1px 1px", 7) == 0);
     ComputedStyle stacked = style_for_node(&sheet, long_name, NULL);
-    CHECK(stacked.font_family == FONT_METRIC_SANS);
+    CHECK(stacked.font_family == FONT_SYSTEM_SANS);
     StyleTransitionComputed motion;
     CHECK(style_transition_computed(&sheet, long_transition, PSEUDO_NONE,
                                     &motion));
@@ -2376,7 +2376,7 @@ static bool utility_styles_equal(const ComputedStyle *left,
         && left->color == right->color
         && left->has_background == right->has_background
         && left->background == right->background
-        && left->letter_spacing == right->letter_spacing
+        && left->letter_spacing_fixed == right->letter_spacing_fixed
         && left->word_spacing == right->word_spacing
         && left->padding.top == right->padding.top
         && left->padding.right == right->padding.right
@@ -3310,6 +3310,72 @@ static int test_large_sheet_compiles_every_rule(void)
 }
 
 
+/* Repeated selector bytes share instructions, not cascade state. The old
+   per-rule programs exhaust the instruction ceiling on this exact input. */
+static int test_shared_selector_programs(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    const size_t capacity = 1024u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = (size_t) snprintf(html, capacity, "<!doctype html><style>");
+    for (unsigned pass = 0; pass < 3; pass++) {
+        for (unsigned i = 0; i < 3000; i++) {
+            CHECK(used < capacity - 128u);
+            used += (size_t) snprintf(html + used, capacity - used,
+                ".zone-%u .stack-%u>span.item-%u{color:#345678;margin-top:%upx}",
+                i, i, i, pass);
+        }
+    }
+    used += (size_t) snprintf(html + used, capacity - used,
+        ".zone-7 .stack-7>span.item-7{padding-left:9px!important}"
+        "</style><body class=zone-7><div class=stack-7>"
+        "<span id=target class=item-7>target</span>"
+        "<span id=other class=item-8>other</span></div>");
+    CHECK(used < capacity);
+    for (size_t fault = 0; fault < 5; fault++) {
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        CHECK(document_parse(&document, &budget, html, used, 31)
+            && stylesheet_build(&sheet, &budget, &document, 480));
+        /* Offsets, optional interning, and final program all refuse cleanly. */
+        if (fault != 0) budget_inject_failure_after(&budget, fault - 1u);
+        stylesheet_prepare_selector_program(&sheet);
+        budget_clear_failure_injection(&budget);
+        if (fault == 0) {
+            CHECK(sheet.count == 9001u && sheet.selector_program_ready
+                && sheet.selector_program_rule_count == sheet.count
+                && sheet.selector_program_instruction_count < 40000u);
+            lxb_dom_node_t *target = find_id(
+                lxb_dom_interface_node(document.html), "target");
+            lxb_dom_node_t *other = find_id(
+                lxb_dom_interface_node(document.html), "other");
+            CHECK(target != NULL && other != NULL);
+            for (size_t i = 0; i < sheet.count; i++) {
+                CHECK(style_rule_selector_matches(&sheet, i, target)
+                    == style_selector_matches_profiled(&sheet, target,
+                        sheet.rules[i].selector, sheet.rules[i].selector_length));
+                CHECK(style_rule_selector_matches(&sheet, i, other)
+                    == style_selector_matches_profiled(&sheet, other,
+                        sheet.rules[i].selector, sheet.rules[i].selector_length));
+            }
+        }
+        lxb_dom_node_t *target = find_id(
+            lxb_dom_interface_node(document.html), "target");
+        ComputedStyle style = style_for_node(&sheet, target, NULL);
+        CHECK(style.color == 0x345678 && style.margin.top == 2
+            && style.padding.left == 9);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+    free(html);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* A sparse key space and one cold dependency per rule must not reserve
    empty bucket payloads or eight dependency hashes for every rule. */
 static int test_sparse_selector_metadata(void)
@@ -3655,6 +3721,7 @@ int main(int argc, char **argv)
     CHECK(test_registered_custom_properties() == 0);
     CHECK(test_svg_raster_token_gate() == 0);
     CHECK(test_large_sheet_compiles_every_rule() == 0);
+    CHECK(test_shared_selector_programs() == 0);
     CHECK(test_class_token_quick_filter() == 0);
     CHECK(test_walk_subject_cache_matches_fresh() == 0);
     Budget budget;
@@ -3988,7 +4055,7 @@ int main(int argc, char **argv)
 
     CHECK(indexed_target.display == DISPLAY_FLEX
           && indexed_target.color == 0x112233
-          && indexed_target.letter_spacing == 6
+          && indexed_target.letter_spacing_fixed == 6 * 64
           && indexed_target.word_spacing == 2
           && indexed_target.padding.top == 3
           && indexed_target.background_image != NULL

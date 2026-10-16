@@ -272,7 +272,9 @@ static bool print_visual_evidence_record(
            (unsigned long long) replay->seed,
            SCRIPT_DETERMINISTIC_REPLAY_SEED_SOURCE,
            SCRIPT_DETERMINISTIC_ENTROPY_CONTRACT,
-           SCRIPT_DETERMINISTIC_CLOCK_CONTRACT,
+           replay->fixed_wall_clock
+               ? SCRIPT_DETERMINISTIC_FIXED_WALL_CLOCK_CONTRACT
+               : SCRIPT_DETERMINISTIC_CLOCK_CONTRACT,
            SCRIPT_DETERMINISTIC_CLOCK_EVIDENCE_SCOPE,
            (unsigned long long) replay->host_elapsed_ms,
            (unsigned long long) replay->wall_elapsed_ms,

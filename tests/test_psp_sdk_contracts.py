@@ -8576,7 +8576,7 @@ int main(void) {
             resolver.index("static bool computed_style_equal_without_outline(")]
         self.assertIn("set_focus_marker(node, false)", helper)
         classify = resolver[
-            resolver.index("StyleFocusChange style_focus_change_classify("):
+            resolver.index("static StyleFocusChange focus_change_classify("):
             resolver.index("bool style_focus_change_is_outline_only(")]
         first = classify.index("restored = restore_focus_marker(")
         retry = classify.index("restored = restore_focus_marker(", first + 1)

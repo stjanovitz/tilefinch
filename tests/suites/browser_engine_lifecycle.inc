@@ -1334,6 +1334,8 @@ static int test_computed_style_resolved_values(void)
         "<div id=pct>p</div><pre id=tab>t</pre><div id=plain>q</div>"
         "<div id=inl style='line-height:inherit;"
         "letter-spacing:var(--nope, 1px);word-spacing:2em'>i</div>"
+        "<div id=frac style='letter-spacing:.5px'><span id=fracchild>f</span></div>"
+        "<div id=negfrac style='letter-spacing:calc(-.25px - .25px)'>f</div>"
         "<ol><li id=ordered>o</li></ol>"
         "<div id=half>h</div><div id=border>b</div>"
         "<div id=pctpad>p</div><div id=pseudo>s</div>"
@@ -1382,6 +1384,9 @@ static int test_computed_style_resolved_values(void)
         "want('imp','line-height','30px');want('imp','text-align','center');"
         "want('inl','line-height','normal');"
         "want('inl','letter-spacing','1px');"
+        "want('frac','letter-spacing','0.5px');"
+        "want('fracchild','letter-spacing','0.5px');"
+        "want('negfrac','letter-spacing','-0.5px');"
         "want('inl','word-spacing','32px');"
         /* Scaled integer fields decode to CSS numbers. */
         "want('item','flex-grow','2');want('item','flex-shrink','3');"

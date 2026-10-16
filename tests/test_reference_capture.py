@@ -93,6 +93,24 @@ def reference_environment_state() -> dict[str, object]:
 
 @unittest.skipIf(NODE is None, "Node.js is unavailable")
 class ReferenceCaptureIndexTests(unittest.TestCase):
+    def test_retained_preflight_shapes_are_exact_read_only_requests(self) -> None:
+        script = r'''
+const shape=require(process.argv[1]).preflightShape;
+const input={origin:'https://page.test','access-control-request-method':'GET',
+ 'access-control-request-headers':'X-Two, x-one, X-Two'};
+console.log(JSON.stringify([shape(input),shape({...input,origin:'null'}),
+ shape({...input,origin:'https://page.test/path'}),
+ shape({...input,'access-control-request-method':'POST'}),
+ shape({...input,'access-control-request-headers':'bad:name'}),
+ shape({...input,'access-control-request-headers':'x'.repeat(1025)})]));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual(values[0], {"origin": "https://page.test", "method": "GET", "headers": "x-one,x-two"})
+        self.assertEqual(values[1:], [None] * 5)
+
     def test_origin_aware_acquisition_is_exact_and_conflicts_fail_closed(self) -> None:
         script = r'''
 const capture=require(process.argv[1]);
@@ -169,6 +187,42 @@ console.log(JSON.stringify([audit.summary(4),unknown.summary(1),transport.summar
         self.assertEqual(audit["failures"][0]["reason"], "canceled-replayed-response")
         self.assertFalse(unknown["ready"])
         self.assertFalse(transport["ready"])
+
+    def test_blocked_preflight_covers_only_its_linked_parent(self) -> None:
+        script = r'''
+const make=require(process.argv[1]).createRequestAudit;
+function sample({linked=true,method="POST",frame="frame",error="net::ERR_BLOCKED_BY_CLIENT",interceptParent=false,declared=true,latePermission=false,parentEndsFirst=false}={}) {
+ const audit=make(),session={},url="https://excluded.test/report";
+ audit.networkBegin(session,{requestId:"parent",request:{url,method:"POST"},type:"XHR",frameId:"frame"});
+ const permission={requestId:"permission",request:{url,method:"OPTIONS"},type:"Other",...(frame?{frameId:frame}:{}),
+   initiator:linked?{type:"preflight",requestId:"parent"}:{type:"script"}};
+ if(!latePermission)audit.networkBegin(session,permission);
+ if(interceptParent)audit.networkIntercepted?.(session,{networkId:"parent"});
+ audit.networkIntercepted?.(session,{networkId:"permission"});
+ audit.expectFailure("OPTIONS",url);
+ audit.networkAborted?.(session,{networkId:"permission",request:{url,method:"OPTIONS",
+   headers:{"Access-Control-Request-Method":method}}},{declaredPolicy:declared});
+ if(latePermission)audit.networkBegin(session,permission);
+ if(parentEndsFirst)audit.networkEnd(session,{requestId:"parent",errorText:error},true);
+ audit.networkEnd(session,{requestId:"permission",errorText:"net::ERR_BLOCKED_BY_CLIENT"},true);
+ if(!parentEndsFirst)audit.networkEnd(session,{requestId:"parent",errorText:error},true);
+ return audit.summary(interceptParent?2:1);
+}
+console.log(JSON.stringify([sample(),sample({latePermission:true,frame:null,parentEndsFirst:true}),sample({linked:false}),sample({method:"GET"}),sample({frame:"other"}),
+ sample({error:"net::ERR_NAME_NOT_RESOLVED"}),sample({interceptParent:true}),sample({declared:false})]));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good, reordered, *refused = json.loads(result.stdout)
+        self.assertTrue(good["ready"])
+        self.assertEqual(good["observed"], 2)
+        self.assertEqual(good["preflight_denied_parents"], 1)
+        self.assertEqual(good["failures"][1]["reason"], "denied-preflight-parent")
+        self.assertTrue(reordered["ready"])
+        self.assertEqual(reordered["preflight_denied_parents"], 1)
+        for row in refused:
+            self.assertFalse(row["ready"])
 
     def test_oopif_completion_transfers_only_its_exact_document_ticket(self) -> None:
         script = r'''
@@ -1226,6 +1280,47 @@ process.stdout.write(JSON.stringify({
                 },
             },
         )
+
+    def test_explicit_fixed_wall_clock_keeps_monotonic_and_accounting_live(self) -> None:
+        script = r'''
+const capture=require(process.argv[1]);
+globalThis.location={href:"https://clock-snapshot.test/"};globalThis.top=globalThis;
+const contract="fixed-origin-wall-observed-monotonic-v1";
+capture.installReplayEnvironment({version:"deterministic-hermetic-v3",clockVersion:"playwright-clock-paused-v2",
+ clockContract:contract,clockScope:"top-level-realm-v1",rngVersion:"splitmix64-url-scope-v1",
+ seedSource:"trace-origin-ms-v1",intlContract:"bounded-en-us-utc-v1",seedSha256:"0".repeat(64),seedU64:"1000",originMs:1000});
+const before=[Date.now(),new Date().getTime(),performance.now()];
+globalThis.__tilefinchAdvanceReplayClock(33);
+const after=[Date.now(),new Date().getTime(),performance.now()];
+const evidence={...globalThis.__tilefinchReplayClockEvidence(),playwrightElapsedMs:33};
+console.log(JSON.stringify({before,after,evidence,
+ valid:capture.replayClockEvidenceReady(evidence,1000,33,contract),
+ wrongContract:capture.replayClockEvidenceReady(evidence,1000,33),
+ wrongWall:capture.replayClockEvidenceReady({...evidence,wallElapsedMs:1},1000,33,contract),
+ wrongCounts:capture.replayClockEvidenceReady({...evidence,wallObservations:0},1000,33,contract)}));
+'''
+        completed = subprocess.run((NODE, "-e", script, str(CAPTURE)), capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertEqual(value["before"], [1000, 1000, 0])
+        self.assertEqual(value["after"], [1000, 1000, 34])
+        self.assertEqual(value["evidence"]["wallElapsedMs"], 0)
+        self.assertEqual(value["evidence"]["wallObservations"], 4)
+        self.assertTrue(value["valid"])
+        for key in ("wrongContract", "wrongWall", "wrongCounts"):
+            self.assertFalse(value[key])
+
+    def test_fixed_wall_clock_requires_a_recognized_trace_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace"
+            shutil.copytree(ROOT / "fixtures/http-fixed-wall-clock", trace)
+            result = inspect(trace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["clock_contract"],
+                             "fixed-origin-wall-observed-monotonic-v1")
+            info = trace / "trace.meta"
+            info.write_text(info.read_text().replace("fixed-origin-v1", "unrecognized"))
+            self.assertNotEqual(inspect(trace).returncode, 0)
 
     def test_replay_wall_clock_saturates_at_the_date_limit(self) -> None:
         script = r"""

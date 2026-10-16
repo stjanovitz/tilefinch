@@ -238,6 +238,25 @@ void layout_block_size_paint_image_command(
 }
 
 
+bool layout_bind_fixed_mask_image(const Stylesheet *sheet,
+                                  DrawCommand *command,
+                                  const ImageResource *image)
+{
+    if (command == NULL || command->type != DRAW_IMAGE
+        || (command->font_family & LAYOUT_IMAGE_SLOT_MASK) == 0
+        || command->image != NULL || !image_resource_available(image)
+        || !image->is_mask || command->text_length > UINT8_MAX) return false;
+    const StylePaintStack *stack = stylesheet_paint_stack(
+        sheet, (uint8_t) command->text_length);
+    if (stack == NULL || stack->mask_count != 1
+        || stack->masks[0].kind != STYLE_PAINT_IMAGE_URL) return false;
+    command->text_length = 0;
+    layout_block_size_paint_image_command(command, &stack->masks[0], image,
+        command->width, command->height);
+    command->image = image;
+    return true;
+}
+
 int style_pixel_height(const Stylesheet *sheet,
                               const ComputedStyle *style, int reference)
 {
@@ -357,7 +376,7 @@ void constrain_replaced_content_size(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, const ComputedStyle *style,
     int containing_width, int containing_height,
-    bool width_definite, bool height_definite,
+    bool width_definite, bool height_definite, bool preserve_ratio,
     int *width, int *height)
 {
     if (context == NULL || style == NULL || width == NULL || height == NULL
@@ -375,7 +394,7 @@ void constrain_replaced_content_size(
     int content_width = border_width - horizontal_edges;
     if (content_width < 0) content_width = 0;
     int content_height = original_height;
-    if (content_width != original_width && !height_definite
+    if (preserve_ratio && content_width != original_width && !height_definite
         && original_width > 0) {
         content_height = layout_scale_dimension(
             original_height, content_width, original_width);
@@ -406,7 +425,7 @@ void constrain_replaced_content_size(
         /* CSS sizing applies the minimum after the maximum. */
         if (content_height < minimum) content_height = minimum;
     }
-    if (content_height != original_height && !width_definite
+    if (preserve_ratio && content_height != original_height && !width_definite
         && original_height > 0) {
         int ratio_width = layout_scale_dimension(
             original_width, content_height, original_height);
@@ -426,10 +445,14 @@ int constrain_border_box_width(
     const ComputedStyle *parent, const ComputedStyle *style,
     int containing_width, int candidate, bool *has_maximum)
 {
+    /* Content sizing must not feed this box's own max/min back into the
+       intrinsic value being computed. Descendant constraints still apply. */
+    if (node != NULL && node == context->intrinsic_constraint_node)
+        return candidate;
     int edges = style->padding.left + style->padding.right
                 + style->border.left + style->border.right;
     int maximum_width = 0;
-    bool intrinsic_maximum = context->intrinsic_constraint_depth == 0
+    bool intrinsic_maximum = context->intrinsic_constraint_node == NULL
         && (style->max_width == STYLE_LENGTH_MIN_CONTENT
         || style->max_width == STYLE_LENGTH_MAX_CONTENT
         || style->max_width == STYLE_LENGTH_FIT_CONTENT);
@@ -441,13 +464,13 @@ int constrain_border_box_width(
         if (intrinsic_maximum) {
             int measure_limit = style->max_width == STYLE_LENGTH_MAX_CONTENT
                 ? LAYOUT_COORDINATE_LIMIT : containing_width;
-            context->intrinsic_constraint_depth++;
+            context->intrinsic_constraint_node = node;
             maximum = style->max_width == STYLE_LENGTH_MIN_CONTENT
                 ? intrinsic_min_text_width_ignoring_own_width(
                       context, node, parent, measure_limit)
                 : intrinsic_text_width(
                       context, node, parent, measure_limit);
-            context->intrinsic_constraint_depth--;
+            context->intrinsic_constraint_node = NULL;
             maximum -= style->margin.left + style->margin.right;
             if (maximum < 0) maximum = 0;
         } else {
@@ -464,16 +487,16 @@ int constrain_border_box_width(
             style->min_width == STYLE_LENGTH_MIN_CONTENT
             || style->min_width == STYLE_LENGTH_MAX_CONTENT
             || style->min_width == STYLE_LENGTH_FIT_CONTENT;
-        if (intrinsic_minimum && context->intrinsic_constraint_depth == 0) {
+        if (intrinsic_minimum && context->intrinsic_constraint_node == NULL) {
             int measure_limit = style->min_width == STYLE_LENGTH_MAX_CONTENT
                 ? LAYOUT_COORDINATE_LIMIT : containing_width;
-            context->intrinsic_constraint_depth++;
+            context->intrinsic_constraint_node = node;
             minimum = style->min_width == STYLE_LENGTH_MIN_CONTENT
                 ? intrinsic_min_text_width_ignoring_own_width(
                       context, node, parent, measure_limit)
                 : intrinsic_text_width(
                       context, node, parent, measure_limit);
-            context->intrinsic_constraint_depth--;
+            context->intrinsic_constraint_node = NULL;
             minimum -= style->margin.left + style->margin.right;
             if (minimum < 0) minimum = 0;
         } else if (!intrinsic_minimum) {

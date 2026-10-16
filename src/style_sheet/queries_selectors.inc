@@ -781,6 +781,9 @@ static bool style_selector_admission_contains(
     size_t needle_length = strlen(needle);
     if (needle_length == 0 || needle_length > length) return false;
     for (size_t at = 0; at <= length - needle_length; at++) {
+        /* All callers search for a pseudo-function beginning with ':'.
+           Avoid locale case folding at every byte of every absent name. */
+        if (selector[at] != ':') continue;
         size_t matched = 0;
         while (matched < needle_length
                && tolower((unsigned char) selector[at + matched])
@@ -1045,27 +1048,29 @@ static bool selector_to_rule(
         size_t head_limit = sheet->source_rule_head_limit_end != 0
                             ? sheet->source_rule_head_limit_end
                             : sheet->source_rule_limit_end;
-        bool priority =
-            sheet->count < sheet->source_rule_relevant_limit_end
-            && style_selector_admission_matches_document_tokens(
-                sheet->source_rule_priority_token_bloom,
-                sheet->source_rule_priority_token_bloom_words,
-                selector, length);
         size_t secondary_limit =
             sheet->source_rule_secondary_limit_end != 0
             ? sheet->source_rule_secondary_limit_end
             : sheet->source_rule_relevant_limit_end;
-        bool secondary = sheet->count < secondary_limit
-            && style_selector_admission_matches_document_tokens(
-                sheet->source_rule_token_bloom,
-                sheet->source_rule_token_bloom_words, selector, length);
-        bool relevant = priority || secondary;
         bool in_tail = sheet->source_rule_tail_begin != NULL
             && selector >= sheet->source_rule_tail_begin
             && sheet->count < sheet->source_rule_limit_end;
-        if (sheet->count >= head_limit && !relevant && !in_tail) {
-            diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
-            return true;
+        /* Head/tail rules are admitted regardless of token relevance. For
+           the middle, a priority hit also makes the secondary scan redundant.
+           Admission order and all three rule ceilings remain unchanged. */
+        if (sheet->count >= head_limit && !in_tail) {
+            bool priority = sheet->count < sheet->source_rule_relevant_limit_end
+                && style_selector_admission_matches_document_tokens(
+                    sheet->source_rule_priority_token_bloom,
+                    sheet->source_rule_priority_token_bloom_words, selector, length);
+            bool secondary = !priority && sheet->count < secondary_limit
+                && style_selector_admission_matches_document_tokens(
+                    sheet->source_rule_token_bloom,
+                    sheet->source_rule_token_bloom_words, selector, length);
+            if (!priority && !secondary) {
+                diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
+                return true;
+            }
         }
     }
     PseudoElement pseudo = PSEUDO_NONE;

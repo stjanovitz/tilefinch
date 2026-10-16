@@ -246,6 +246,98 @@ static bool test_canvas_surface_count_is_bounded(void)
     return ok && clean;
 }
 
+static bool test_image_load_tasks_case(bool deferred)
+{
+    static const char format[] =
+        "<!doctype html><body><img id=source class=loading width=1 height=1 "
+        "src='%s' "
+        "onload=\"document.getElementById('retired')?.remove();"
+        "this.classList.remove('loading');globalThis.loads++;"
+        "globalThis.valid=event.isTrusted&&!event.bubbles&&!event.cancelable"
+        "&&this.complete&&this.naturalWidth>0\">"
+        "<img id=retired width=1 height=1 src='%s' "
+        "onload='globalThis.retiredLoads++'>"
+        "<script>globalThis.loads=0;globalThis.retiredLoads=0;globalThis.valid=false;"
+        "setInterval(()=>{},1000)</script></body>";
+    char html[2048];
+    const char *source = deferred
+        ? ""
+        : "data:image/webp;base64,"
+          "UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAAAfQssI0uf+BiOh/AAA=";
+    snprintf(html, sizeof(html), format, source, source);
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    char error[256] = {0};
+    bool trace = deferred && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
+        error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && (!deferred || trace)
+        && navigation_commit_html(&navigation, generation,
+        "https://interactive-images.test/page", html, strlen(html),
+        480, NULL, NULL, true);
+    if (ok && deferred) {
+        ScriptResult mutation = {0};
+        ok = script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "document.getElementById('source').src="
+            "'https://interactive-images.test/hero.svg'", "<late-image>", &mutation)
+            && navigation_relayout(&navigation);
+        for (size_t i = 0; ok && i < 256
+             && navigation.page.image_continuation_pending; i++)
+            ok = navigation_run_deferred_image_work(&navigation);
+        ok = ok && !navigation.page.image_continuation_pending;
+    }
+    ScriptResult result = {0};
+    if (ok) ok = script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "globalThis.pocSummary=String(loads)", "<image-before-task>", &result)
+        && strcmp(result.summary, "0") == 0;
+    if (ok) ok = navigation_advance_runtime(&navigation, 0, 0)
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "globalThis.pocSummary=String(loads)", "<image-zero-budget>", &result)
+        && strcmp(result.summary, "0") == 0;
+    if (ok) ok = navigation_advance_runtime(&navigation, 0, 4)
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "globalThis.pocSummary=loads===1&&valid&&"
+            "!document.getElementById('source').classList.contains('loading')"
+            "?'loaded':'failed:'+loads+':'+valid", "<image-after-task>", &result)
+        && strcmp(result.summary, "loaded") == 0;
+    /* Reattaching the same pixels during a relayout must not re-fire load. */
+    if (ok) ok = navigation_relayout(&navigation)
+        && navigation_advance_runtime(&navigation, 0, 4)
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "globalThis.pocSummary=retiredLoads===0?String(loads):'retired-fired'",
+            "<image-repeat>", &result)
+        && strcmp(result.summary, "1") == 0;
+    if (!ok) fprintf(stderr, "image load task: deferred=%d trace=%d loaded=%d "
+        "pending=%d count=%zu images=%zu attempted=%zu failures=%zu "
+        "summary=%s error=%s navigation=%s\n", deferred, trace,
+        navigation.page.loaded, navigation.page.image_continuation_pending,
+        navigation.page.deferred_image_count, navigation.page.images.count,
+        navigation.page.images.stats.attempted, navigation.page.images.stats.failed,
+        result.summary, result.error, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    if (trace) fetch_trace_end();
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_image_load_tasks_follow_publication(void)
+{
+    return test_image_load_tasks_case(false) && test_image_load_tasks_case(true);
+}
+
 static bool test_canvas_draw_image_accepts_loaded_html_image(void)
 {
     static const char html[] =

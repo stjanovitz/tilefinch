@@ -15,6 +15,7 @@
 
 bool layout_node_name_is(lxb_dom_node_t *node, const char *wanted);
 
+
 /* DRAW_IMAGE does not use its text member. A fixed raster <img> may borrow
    its node identity there (text_length stays zero), allowing allocation-free
    resource rebinding after the image table moves. This is native metadata,
@@ -353,6 +354,7 @@ _Static_assert(sizeof(LayoutCounterEntry) * LAYOUT_COUNTER_NODE_LIMIT <= 65536u,
     "counter prefix must remain at most 64 KiB (32 KiB on the PSP)");
 
 struct LayoutReuseCache {
+    int focus_scroll;
     Budget *budget;
     const Stylesheet *sheet;
     uint64_t sheet_generation;
@@ -371,6 +373,7 @@ struct LayoutReuseCache {
     uint16_t style_payload_count;
     uint16_t style_payload_free; /* index + 1, zero means no free payload */
     bool style_payload_refused;
+    bool style_pressure_trimmed;
     size_t style_mask;
     size_t style_shortfall;
     bool font_publication_active;
@@ -595,7 +598,7 @@ typedef struct {
     bool intrinsic_pair_mode;
     /* Prevent an intrinsic min/max constraint from recursively applying
        itself while its content contribution is being measured. */
-    uint8_t intrinsic_constraint_depth;
+    lxb_dom_node_t *intrinsic_constraint_node;
     LayoutStyleCacheEntry style_cache[LAYOUT_STYLE_CACHE_CAPACITY];
     LayoutIntrinsicCacheEntry
         intrinsic_cache[LAYOUT_INTRINSIC_CACHE_CAPACITY];
@@ -664,6 +667,13 @@ typedef struct {
         int assumed_bottom;
     } bottom_fixups[LAYOUT_BOTTOM_FIXUP_LIMIT];
     size_t bottom_fixup_count;
+    /* Percentage-sized absolute descendants of an auto-height containing
+       block wait for its used padding box. No second layout or raster. */
+    struct {
+        lxb_dom_node_t *node, *containing_node, *link_container;
+        int x, y, width;
+    } positioned_height_jobs[LAYOUT_BOTTOM_FIXUP_LIMIT];
+    size_t positioned_height_job_count;
     LineAtomicStack line_atomics;
     /* The block whose descendants layout_block is currently placing. A box
        reached through an inline or display:contents <a href> between it and
@@ -675,6 +685,8 @@ typedef struct {
        the retained cache instead of repeatedly traversing and blurring it. */
     uint8_t backdrop_filter_count;
     uint8_t focus_inset_slot_count;
+    uint8_t focus_inset_offscreen_slots;
+    uint8_t focus_pseudo_visibility_slots;
     bool backdrop_filter_disabled;
     /* A declared-video label is discovered only if an authored <video>
        actually reaches paint. The retained copies live in LayoutDocument's
@@ -700,6 +712,17 @@ typedef struct {
     size_t pseudo_resolutions, pseudo_generated, pseudo_absence_hits;
 #endif
 } LayoutContext;
+
+/* A CSS replacement uses the existing source-keyed stylesheet-image role.
+   It remains distinct from the element's markup image and background URL. */
+static inline const ImageResource *layout_replaced_image(
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style)
+{
+    return style->generated_image
+        ? images_find_background_source(context->images, node,
+            style->generated_text, PSEUDO_NONE)
+        : images_find_node(context->images, node);
+}
 
 /* A pseudo-element of `node` known, from the reuse cache, to generate
    nothing when resolved from `parent` (its element's style): layout skips
@@ -880,8 +903,9 @@ typedef struct {
     bool find_block_start;
     bool has_text_character;
     bool previous_atomic;
-    int8_t letter_boundary_spacing;
-    int8_t pending_space_letter_spacing;
+    /* Tracking stays in signed 26.6 pixels across inline boundaries. */
+    int16_t letter_boundary_spacing;
+    int16_t pending_space_letter_spacing;
     bool x_fixed_valid;
     bool y_fixed_valid;
     uint32_t text_generation;
@@ -1060,7 +1084,12 @@ struct LayoutBlockScratch {
     ComputedStyle style;
     LineState line;
     PositionedBox descendant_positioned_box;
-    FlexOrderPlan row_order;
+    /* Row-flex ordering and ordinary-block float propagation are disjoint
+       passes. Keep child output separate from its inherited float input. */
+    union {
+        FlexOrderPlan row_order;
+        FloatExclusion child_float_output[ACTIVE_FLOAT_LIMIT];
+    };
     FlexOrderPlan column_order;
     LayoutBidiFlow *bidi_flow;
     union {
@@ -1092,6 +1121,10 @@ struct LayoutBlockScratch {
         } collapse;
     } traversal;
 };
+
+_Static_assert(sizeof(FloatExclusion) * ACTIVE_FLOAT_LIMIT
+                   <= sizeof(FlexOrderPlan),
+               "float propagation must not enlarge block scratch");
 
 typedef struct {
     size_t count;
@@ -1240,7 +1273,7 @@ bool flex_order_plan_build(FlexOrderPlan *plan, LayoutContext *context, lxb_dom_
 bool flow_inline(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, LineState *line, const char *link_url, size_t link_url_length, lxb_dom_node_t *link_node);
 bool flow_subtree_fallback(LayoutContext *context, lxb_dom_node_t *root, const ComputedStyle *style, LineState *line, const char *inherited_link_url, size_t inherited_link_length, lxb_dom_node_t *inherited_link_node);
 bool flow_text(LayoutContext *context, LineState *line, const char *text, size_t length, const ComputedStyle *style, const char *link_url, size_t link_url_length, lxb_dom_node_t *link_node);
-int generated_inline_pseudo_width(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo);
+int generated_inline_pseudo_width(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, bool *block);
 bool flow_generated_inline_pseudo(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, LineState *line, const char *link_url, size_t link_url_length, lxb_dom_node_t *link_node, bool *flowed);
 bool generated_pseudo_is_flow_block(const ComputedStyle *style);
 int layout_inline_strut_baseline(LayoutContext *context,
@@ -1326,7 +1359,7 @@ void constrain_replaced_content_size(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, const ComputedStyle *style,
     int containing_width, int containing_height,
-    bool width_definite, bool height_definite,
+    bool width_definite, bool height_definite, bool preserve_ratio,
     int *width, int *height);
 bool style_uses_bold_face(const ComputedStyle *style);
 bool style_uses_synthetic_weight(const FontSet *fonts, const WebFontSet *web_fonts, const ComputedStyle *style, const FontFace *face);
@@ -1363,6 +1396,9 @@ int intrinsic_text_width(LayoutContext *context, lxb_dom_node_t *node, const Com
 int intrinsic_positioned_width(LayoutContext *context, lxb_dom_node_t *node,
                                const ComputedStyle *parent, int limit);
 int layout_fixed_scale_floor(int value, int numerator, int denominator);
+int layout_box_first_text_baseline(const LayoutDocument *layout,
+                                   const LayoutNodeBox *box);
+/* All text-measurement tracking arguments below are signed 26.6 pixels. */
 int measured_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, bool kerning);
 int measured_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
@@ -1411,6 +1447,8 @@ uint32_t blend_color_over(uint32_t foreground, uint8_t alpha, uint32_t backgroun
 uint8_t draw_font_weight(const ComputedStyle *style);
 uint8_t text_decoration_bits(const ComputedStyle *style);
 void align_flex_row_items(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int stretch_free, size_t stretch_lines);
+void layout_border_triangle(DrawCommand *command, const StyleEdges *borders,
+                            unsigned side, int x, int y, int width, int height);
 void layout_mask_background_gradient(LayoutContext *context,
                                       const ComputedStyle *style,
                                       DrawCommand *command);

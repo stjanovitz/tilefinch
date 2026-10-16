@@ -4397,6 +4397,44 @@
           && source_diagnostics.sources.intersection_observer == 1
           && source_diagnostics.sources.idle_callback_start == 1);
     script_runtime_destroy(deterministic_clock_sources_runtime);
+    puts("test: explicit replay snapshot freezes civil time but not timers");
+    char fixed_wall_error[256] = {0};
+    bool fixed_wall_started = fetch_trace_replay_begin(
+              TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-fixed-wall-clock",
+              fixed_wall_error, sizeof(fixed_wall_error));
+    if (!fixed_wall_started) fprintf(stderr, "fixed wall trace: %s\n", fixed_wall_error);
+    CHECK(fixed_wall_started && fetch_trace_fixed_wall_clock());
+    ScriptResult fixed_wall_result;
+    ScriptRuntime *fixed_wall_runtime = script_runtime_create_configured(
+        &deterministic_tick_document, &budget, 4u * MIB, 1000,
+        "https://clock-snapshot.test/", &deterministic_tick_options,
+        &fixed_wall_result);
+    CHECK(fixed_wall_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              fixed_wall_runtime,
+              "globalThis.fixedWallStart=Date.now();"
+              "globalThis.fixedWallSame=new Date().getTime()===fixedWallStart;"
+              "setTimeout(()=>{globalThis.pocSummary=fixedWallSame"
+              "&&Date.now()===fixedWallStart&&performance.now()>=16"
+              "?'FIXED-WALL-OK':'FIXED-WALL-BAD';},8)",
+              "<fixed-wall-start>", &fixed_wall_result)
+          && script_runtime_advance(fixed_wall_runtime, 16, 8, &fixed_wall_result));
+    ScriptDeterministicReplayDiagnostics fixed_wall_diagnostics;
+    CHECK(fixed_wall_result.success
+          && strcmp(fixed_wall_result.summary, "FIXED-WALL-OK") == 0
+          && script_runtime_deterministic_replay_diagnostics(
+              fixed_wall_runtime, &fixed_wall_diagnostics)
+          && fixed_wall_diagnostics.fixed_wall_clock
+          && fixed_wall_diagnostics.clock_origin_ms == UINT64_C(1700000000042)
+          && fixed_wall_diagnostics.host_elapsed_ms == 16
+          && fixed_wall_diagnostics.wall_elapsed_ms == 0
+          && fixed_wall_diagnostics.wall_observations >= 3
+          && fixed_wall_diagnostics.monotonic_elapsed_ms
+                 == fixed_wall_diagnostics.host_elapsed_ms
+                    + fixed_wall_diagnostics.monotonic_observations);
+    script_runtime_destroy(fixed_wall_runtime);
+    fetch_trace_end();
+    CHECK(!fetch_trace_fixed_wall_clock());
     script_runtime_configure_deterministic_replay(false, 0);
 
     puts("test: network tasks checkpoint microtasks between completions");

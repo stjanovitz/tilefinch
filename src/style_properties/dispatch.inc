@@ -222,6 +222,33 @@ static const StylePropertyEntry style_property_table[] = {
     { "border-bottom-right-radius", 26, style_property_border_corner_radius },
 };
 
+bool style_deferred_focus_shadow(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, bool outset)
+{
+    size_t offset = declaration->deferred_program_offset;
+    size_t count = declaration->deferred_program_count;
+    if (offset > sheet->deferred_instruction_count
+        || count > sheet->deferred_instruction_count - offset) return false;
+    for (size_t i = 0; i < count; i++) {
+        const StyleDeferredInstruction *op = &sheet->deferred_instructions[offset + i];
+        if (op->property_index >= sizeof(style_property_table) / sizeof(style_property_table[0])
+            || style_property_table[op->property_index].handler != style_property_box_shadow
+            || op->value_offset > declaration->deferred_length
+            || op->value_length > declaration->deferred_length - op->value_offset) continue;
+        bool inset = false;
+        const char *value = declaration->deferred_declarations + op->value_offset;
+        size_t length = declaration_value_length(value, op->value_length);
+        trim(&value, &length);
+        if (span_case_equal(value, length, "none")) continue;
+        if (outset) for (size_t at = 0; at + 5u <= length; at++) {
+            if (strncasecmp(value + at, "inset", 5) == 0) { inset = true; break; }
+        }
+        if (!inset) return true;
+    }
+    /* Uncompiled programs simply keep full-layout focus fallback. */
+    return false;
+}
+
 static const StylePropertyEntry *style_property_lookup(const char *name,
                                                        size_t name_length)
 {

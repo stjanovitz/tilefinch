@@ -67,6 +67,17 @@ static bool style_property_content(const StylePropertyParse *parse)
             style->generated_attr = NULL;
             style->generated_attr_length = 0;
             style->generated_expression = false;
+            style->generated_image = false;
+            const char *image = NULL;
+            if (style->generated_content
+                && style_parse_image_url(sheet, resolved, strlen(resolved), &image)
+                && image != NULL) {
+                style->generated_image = true;
+                style->generated_text = image;
+                style->generated_text_length = 0;
+                *mask |= S_CONTENT;
+                return true;
+            }
             char decoded[STYLE_GENERATED_TEXT_CAPACITY];
             const char *attribute = resolved;
             size_t attribute_length = strlen(resolved);

@@ -748,7 +748,8 @@ typedef struct {
     uint8_t white_space_mode;
     OverflowWrap overflow_wrap;
     WordBreakMode word_break_mode;
-    int8_t letter_spacing;
+    /* Signed 26.6 pixels; replaces one byte and its alignment padding. */
+    int16_t letter_spacing_fixed;
     StyleEdges margin;
     uint8_t margin_top_auto : 1;
     uint8_t margin_left_auto : 1;
@@ -844,6 +845,9 @@ typedef struct {
     /* One-based ID for uncommon per-side border colours. This consumes
        pointer-alignment padding before generated_attr. */
     uint8_t border_color_set;
+    /* CSS content:url() replaces an element; shares generated_text storage
+       and the alignment byte before generated_attr, not a new URL pointer. */
+    bool generated_image;
     const char *generated_attr;
     bool has_top;
     bool has_right;
@@ -934,6 +938,11 @@ typedef struct {
     uint16_t object_position_x;
     uint16_t object_position_y;
 } ComputedStyle;
+
+_Static_assert(offsetof(ComputedStyle, margin)
+                   - offsetof(ComputedStyle, letter_spacing_fixed)
+                   == 2,
+               "fractional tracking must reuse existing style alignment");
 
 typedef uint8_t StyleUnicodeBidi;
 enum {
@@ -1834,7 +1843,7 @@ typedef struct {
    list and data: URL icons up to 2.2 KiB (which no property parser could
    take in anyway). */
 #define STYLE_CUSTOM_SELECTOR_CAPACITY STYLE_SELECTOR_TEXT_CAPACITY
-#define STYLE_CUSTOM_NAME_CAPACITY 48u
+#define STYLE_CUSTOM_NAME_CAPACITY 128u
 #define STYLE_CUSTOM_VALUE_CAPACITY 1024u
 /* Custom-property values at least this long are "long": together they may
    take at most STYLE_CUSTOM_LONG_VALUE_BYTES of one sheet's arena (the
@@ -2632,6 +2641,13 @@ FontFace *stylesheet_web_font_face(Stylesheet *sheet, unsigned family_slot,
 FontFace *stylesheet_web_font_face_at(Stylesheet *sheet, unsigned family_slot,
                                      unsigned face_slot);
 const WebFontSet *stylesheet_web_font_set(const Stylesheet *sheet);
+/* Stylesheet rebuilds may retain decoded faces whose declaration and
+   response provenance are unchanged. Shared ownership survives rollback. */
+void stylesheet_share_unchanged_web_fonts(Stylesheet *target,
+    const StyleWebFonts *source, size_t maximum_backend_bytes);
+/* Release an owned, detached web_fonts registry. All its metadata and faces
+   remain independently owned when the surrounding stylesheet is destroyed. */
+void stylesheet_release_web_fonts(Budget *budget, StyleWebFonts *fonts);
 bool stylesheet_web_font_stats(const Stylesheet *sheet,
                                StylesheetWebFontStats *stats);
 /* Returns the request provenance attached to an interned CSS image
@@ -2773,16 +2789,37 @@ typedef enum {
     /*
      * Geometry and every inherited/descendant-visible computed field are
      * unchanged. Only outline, a uniformly painted rounded border and at most
-     * one zero-offset unblurred inset ring differ. Layout must also prove a
+     * one zero-offset unblurred shadow differ. Layout must also prove a
      * retained slot exists before changing the ring.
      */
     STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY,
-    STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY
+    STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY,
+    STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY,
+    STYLE_FOCUS_CHANGE_PSEUDO_TRANSLATION_ONLY
 } StyleFocusChange;
+typedef struct {
+    int dx[2];
+    int dy[2];
+    uint8_t visibility_changed;
+    uint8_t normal_hidden;
+    uint8_t focused_hidden;
+    uint8_t visibility_alpha[2];
+} StyleFocusPseudoTranslation;
+/* A small, absolutely positioned punctuation decoration can retain one
+   invisible text command for exact focus-only visibility changes. */
+bool style_focus_pseudo_visibility_slot(const Stylesheet *sheet,
+                                        const ComputedStyle *style);
 StyleFocusChange style_focus_change_classify(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *normal,
     ComputedStyle *focused);
+StyleFocusChange style_focus_pseudo_change_classify(
+    const Stylesheet *sheet, lxb_dom_node_t *node,
+    const ComputedStyle *parent, ComputedStyle *normal,
+    ComputedStyle *focused, StyleFocusPseudoTranslation *translation);
+/* Both marker states leave other elements' selector answers unchanged.
+   Concrete changes (including unsupported paint) still require full flow. */
+bool style_focus_change_is_local(const Stylesheet *sheet, lxb_dom_node_t *node);
 /* Layout-only second pass for font-metric-dependent `ch` units. */
 ComputedStyle style_for_node_with_ch_basis(
     const Stylesheet *sheet, lxb_dom_node_t *node,
@@ -2832,10 +2869,12 @@ typedef struct {
 /* Resolves a retained physical box shorthand and its four longhands as one
    cascade. This preserves source order between shorthand and longhand rules
    without adding those uncommon values to every ComputedStyle. Values are
-   ordered top, right, bottom, left. */
+   ordered top, right, bottom, left. Optional aliases name an additional
+   longhand per physical edge (for writing-mode-aware logical scroll values). */
 bool style_retained_box_values(
     const Stylesheet *sheet, lxb_dom_node_t *node,
-    const char *shorthand, StyleRetainedBoxValues *output);
+    const char *shorthand, const char *const aliases[4],
+    StyleRetainedBoxValues *output);
 typedef struct {
     uint8_t present_mask;
     char values[2][STYLE_RETAINED_BOX_VALUE_CAPACITY];

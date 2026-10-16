@@ -513,7 +513,8 @@ int main(int argc, char **argv)
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
-    CHECK(test_provisional_preview_retries_and_refreshes() == 0);
+    CHECK(test_provisional_preview_retries_and_refreshes(false) == 0);
+    CHECK(test_provisional_preview_retries_and_refreshes(true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
     CHECK(test_preview_scrolls_ahead_during_load() == 0);

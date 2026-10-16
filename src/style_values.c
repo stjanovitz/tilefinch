@@ -2357,6 +2357,39 @@ bool style_apply_paint_stack(
     bool *retained)
 {
     static const StylePaintStack empty;
+    /* One ordinary geometry layer already fits in ComputedStyle. Retaining
+       another catalog entry for each sprite offset can exhaust the rare-paint
+       IDs before a later visible gradient is encountered. Rich lists, edge
+       offsets, independent axis units and all other components stay retained. */
+    if (stack != NULL && stack->background_count == 1
+        && stack->components == 0) {
+        const StylePaintLayer *layer = &stack->backgrounds[0];
+        uint8_t pixels = layer->position_edges;
+        StylePaintStack simple = {.background_count = 1};
+        simple.backgrounds[0] = (StylePaintLayer) {
+            .width = layer->width, .height = layer->height,
+            .position_x = layer->position_x, .position_y = layer->position_y,
+            .fit = layer->fit, .flags = layer->flags,
+            .origin = layer->origin, .position_edges = pixels
+        };
+        if ((pixels == 0 || pixels == (STYLE_PAINT_POSITION_X_PIXELS
+                                       | STYLE_PAINT_POSITION_Y_PIXELS))
+            && layer->origin <= STYLE_PAINT_BOX_PADDING
+            && memcmp(stack, &simple, sizeof(simple)) == 0) {
+            style->background_position_x = layer->position_x;
+            style->background_position_y = layer->position_y;
+            style->background_width = layer->width;
+            style->background_height = layer->height;
+            style->background_fit = layer->fit;
+            style->background_size_flags = layer->flags
+                & (uint8_t) ~STYLE_BACKGROUND_POSITION_PIXELS;
+            if (pixels != 0)
+                style->background_size_flags |= STYLE_BACKGROUND_POSITION_PIXELS;
+            computed_style_set_paint_stack_id(style, 0);
+            if (retained != NULL) *retained = true;
+            return true;
+        }
+    }
     if (stack != NULL && memcmp(stack, &empty, sizeof(*stack)) == 0) {
         computed_style_set_paint_stack_id(style, 0);
         if (retained != NULL) *retained = true;
@@ -2381,7 +2414,23 @@ StylePaintStack style_paint_stack_copy(
     uint8_t id = computed_style_paint_stack_id(style);
     if (sheet == NULL || sheet->paint_storage == NULL
         || id == 0 || id > sheet->paint_storage->count) {
-        return (StylePaintStack) {0};
+        StylePaintStack result = {0};
+        if (style->background_position_x != 0 || style->background_position_y != 0
+            || style->background_width != 0 || style->background_height != 0
+            || style->background_fit != 0 || style->background_size_flags != 0) {
+            result.background_count = 1;
+            result.backgrounds[0] = (StylePaintLayer) {
+                .width = style->background_width, .height = style->background_height,
+                .position_x = style->background_position_x,
+                .position_y = style->background_position_y,
+                .fit = style->background_fit, .flags = style->background_size_flags,
+                .origin = STYLE_PAINT_BOX_PADDING,
+                .position_edges = (style->background_size_flags
+                    & STYLE_BACKGROUND_POSITION_PIXELS) != 0
+                    ? STYLE_PAINT_POSITION_X_PIXELS | STYLE_PAINT_POSITION_Y_PIXELS : 0
+            };
+        }
+        return result;
     }
     const StylePaintStack *stack =
         style_paint_storage_const_slot(sheet->paint_storage, id - 1u);
@@ -3004,6 +3053,7 @@ bool style_parse_background_layer_position(
         index++;
     }
     if (index == 0) return false;
+    if (stack.background_count < index) stack.background_count = (uint8_t) index;
     return style_apply_paint_stack(sheet, style, &stack, NULL);
 }
 
@@ -3068,6 +3118,7 @@ bool style_parse_background_layer_position_axis(
         index++;
     }
     if (index == 0) return false;
+    if (stack.background_count < index) stack.background_count = (uint8_t) index;
     return style_apply_paint_stack(sheet, style, &stack, NULL);
 }
 
@@ -3112,6 +3163,7 @@ bool style_parse_background_layer_size(
         index++;
     }
     if (index == 0) return false;
+    if (stack.background_count < index) stack.background_count = (uint8_t) index;
     return style_apply_paint_stack(sheet, style, &stack, NULL);
 }
 
@@ -4395,8 +4447,6 @@ static bool select_platform_font_family(const char *text, size_t length,
     if (style_font_span_equal(text, length, "arial")
         || style_font_span_equal(text, length, "helvetica")
         || style_font_span_equal(text, length, "helvetica neue")
-        || style_font_span_equal(text, length, "-apple-system")
-        || style_font_span_equal(text, length, "blinkmacsystemfont")
         || style_font_span_equal(text, length, "liberation sans")
         || style_font_span_equal(text, length, "nimbus sans")
         || style_font_span_equal(text, length, "nimbus sans l")) {
@@ -4407,9 +4457,14 @@ static bool select_platform_font_family(const char *text, size_t length,
         *family = FONT_HUMANIST_SANS;
         return true;
     }
-    if (style_font_span_equal(text, length, "sans-serif")
-        || style_font_span_equal(text, length, "ui-sans-serif")
+    if (style_font_span_equal(text, length, "-apple-system")
+        || style_font_span_equal(text, length, "blinkmacsystemfont")
         || style_font_span_equal(text, length, "system-ui")) {
+        *family = FONT_SYSTEM_SANS;
+        return true;
+    }
+    if (style_font_span_equal(text, length, "sans-serif")
+        || style_font_span_equal(text, length, "ui-sans-serif")) {
         *family = FONT_SANS;
         return true;
     }

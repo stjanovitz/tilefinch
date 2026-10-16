@@ -1230,7 +1230,7 @@ int main(int argc, char **argv)
                     command->color, command->font_size,
                     (int) draw_command_font_family(command),
                     draw_command_font_weight_code(command) >= 60 ? 1 : 0);
-            if (command->text != NULL) {
+            if (command->type == DRAW_TEXT && command->text != NULL) {
                 fprintf(layout_file, "%.*s", (int) command->text_length,
                         command->text);
             }
