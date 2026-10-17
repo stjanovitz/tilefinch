@@ -141,40 +141,72 @@ static bool web_font_format_supported(const char *text, size_t length)
         || strcmp(format, "opentype") == 0;
 }
 
-static bool web_font_source_item(const char *text, size_t length,
-                                 char reference[2048])
+enum {
+    WEB_FONT_INLINE_REFERENCE_LIMIT = 128u * 1024u,
+    /* The previous worst case was 64 pairs of 2 KiB URL/base strings. */
+    WEB_FONT_RETAINED_SOURCE_LIMIT = STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT * 4096u
+};
+
+static bool web_font_inline_reference(const char *reference)
 {
-    size_t url_open = 0;
-    if (!css_function_at(text, length, "url", &url_open)) return false;
-    size_t url_close = css_function_close(text, length, url_open);
-    if (url_close == length
-        || !css_unescape_value(text + url_open + 1,
-                               url_close - url_open - 1,
-                               reference, 2048)) return false;
-    /* URL schemes are ASCII case-insensitive.  Retaining a DATA: URL would
-       both violate the no-inline-font boundary and, more subtly, consume one
-       of the two bounded fallback slots ahead of a usable network source. */
-    if (strlen(reference) >= 5
-        && style_font_span_equal(reference, 5, "data:")) return false;
-    size_t tail = skip_css_space_and_comments(text, length, url_close + 1);
-    if (tail == length) return true;
-    size_t format_open = 0;
-    if (!css_function_at(text + tail, length - tail, "format",
-                         &format_open)) return false;
-    format_open += tail;
-    size_t format_close = css_function_close(text, length, format_open);
-    if (format_close == length
-        || !web_font_format_supported(text + format_open + 1,
-                                      format_close - format_open - 1)) {
-        return false;
-    }
-    return skip_css_space_and_comments(text, length, format_close + 1)
-           == length;
+    return reference != NULL && strncasecmp(reference, "data:", 5) == 0;
 }
 
-static size_t web_font_sources(const char *text, size_t length,
-                               char references[STYLE_WEB_FONT_SOURCE_LIMIT]
-                                              [2048])
+static char *web_font_copy(Stylesheet *sheet, const char *text,
+                           size_t *retained_bytes);
+
+static char *web_font_source_item(Stylesheet *sheet, const char *text,
+                                  size_t length)
+{
+    size_t url_open = 0;
+    if (!css_function_at(text, length, "url", &url_open)) return NULL;
+    size_t url_close = css_function_close(text, length, url_open);
+    if (url_close == length) return NULL;
+    size_t tail = skip_css_space_and_comments(text, length, url_close + 1);
+    if (tail != length) {
+        size_t format_open = 0;
+        if (!css_function_at(text + tail, length - tail, "format",
+                             &format_open)) return NULL;
+        format_open += tail;
+        size_t format_close = css_function_close(text, length, format_open);
+        if (format_close == length
+            || !web_font_format_supported(text + format_open + 1,
+                                          format_close - format_open - 1)
+            || skip_css_space_and_comments(text, length, format_close + 1)
+                != length) return NULL;
+    }
+    const char *url = text + url_open + 1;
+    size_t url_length = url_close - url_open - 1;
+    char small[2048];
+    char *reference = NULL;
+    if (css_unescape_value(url, url_length, small, sizeof(small))) {
+        reference = web_font_copy(sheet, small, NULL);
+    } else if (url_length >= sizeof(small)
+               && url_length < WEB_FONT_INLINE_REFERENCE_LIMIT) {
+        /* Keep ordinary URLs on the existing stack/one-allocation path.
+           Only embedded sources need a larger Budget-owned decoding buffer. */
+        reference = budget_malloc(sheet->budget, url_length + 1u);
+        if (reference != NULL
+            && (!css_unescape_value(url, url_length, reference, url_length + 1u)
+                || !web_font_inline_reference(reference))) {
+            budget_free(sheet->budget, reference);
+            reference = NULL;
+        }
+    }
+    if (web_font_inline_reference(reference)) {
+        const char *comma = strchr(reference, ',');
+        /* Even an sfnt header needs twelve decoded bytes. Do not let an
+           obviously malformed inline source displace a usable fallback. */
+        if (comma == NULL || strlen(comma + 1) < 12u) {
+            budget_free(sheet->budget, reference);
+            reference = NULL;
+        }
+    }
+    return reference;
+}
+
+static size_t web_font_sources(Stylesheet *sheet, const char *text, size_t length,
+                               char *references[STYLE_WEB_FONT_SOURCE_LIMIT])
 {
     size_t count = 0;
     for (size_t at = 0; at < length;) {
@@ -205,16 +237,18 @@ static size_t web_font_sources(const char *text, size_t length,
         }
         /* An unterminated comment ending the value steps past length. */
         if (end > length) end = length;
-        char candidate[2048];
-        if (web_font_source_item(text + at, end - at, candidate)) {
+        char *candidate = web_font_source_item(sheet, text + at, end - at);
+        if (candidate != NULL) {
             bool duplicate = false;
             for (size_t i = 0; i < count; i++) {
                 if (strcmp(references[i], candidate) == 0) duplicate = true;
             }
             if (!duplicate && count < STYLE_WEB_FONT_SOURCE_LIMIT) {
-                memcpy(references[count], candidate,
-                       strlen(candidate) + 1u);
+                references[count] = candidate;
                 count++;
+                if (count == STYLE_WEB_FONT_SOURCE_LIMIT) break;
+            } else {
+                budget_free(sheet->budget, candidate);
             }
         }
         at = end + (end < length);
@@ -229,7 +263,9 @@ static char *web_font_copy(Stylesheet *sheet, const char *text,
     size_t length = strlen(text);
     if (length >= 2048
         || (retained_bytes != NULL
-            && *retained_bytes > SIZE_MAX - length - 1u)) return NULL;
+            && (*retained_bytes > WEB_FONT_RETAINED_SOURCE_LIMIT
+                || length + 1u > WEB_FONT_RETAINED_SOURCE_LIMIT
+                    - *retained_bytes))) return NULL;
     char *copy = budget_malloc(sheet->budget, length + 1u);
     if (copy == NULL) return NULL;
     memcpy(copy, text, length + 1u);
@@ -265,7 +301,7 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
     size_t family_length = 0;
     const char *source_value = NULL;
     size_t source_length = 0;
-    uint16_t weight = 400;
+    uint16_t weight = 400, weight_max = 0;
     bool normal_style = true;
     for (size_t at = 0; at < length;) {
         at = skip_css_space_and_comments(declarations, length, at);
@@ -287,10 +323,18 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
                 source_value = value;
                 source_length = value_length;
             } else if (style_font_span_equal(name, name_length, "font-weight")) {
-                if (!style_parse_font_weight_component(value, value_length,
-                                                 &weight)) {
-                    normal_style = false;
-                }
+                size_t start = skip_css_space_and_comments(value, value_length, 0), split = start;
+                while (split < value_length && !isspace((unsigned char)value[split])
+                    && !(value[split] == '/' && split+1 < value_length && value[split+1] == '*')) split++;
+                if (!style_parse_font_weight_component(value+start, split-start, &weight)) normal_style = false;
+                start = skip_css_space_and_comments(value, value_length, split);
+                split = start;
+                while (split < value_length && !isspace((unsigned char)value[split])
+                    && !(value[split] == '/' && split+1 < value_length && value[split+1] == '*')) split++;
+                if (start != value_length
+                    && (!style_parse_font_weight_component(value+start, split-start, &weight_max)
+                        || weight_max < weight
+                        || skip_css_space_and_comments(value,value_length,split) != value_length)) normal_style = false;
             } else if (style_font_span_equal(name, name_length, "font-style")
                        && !style_font_span_equal(value, value_length, "normal")) {
                 normal_style = false;
@@ -299,12 +343,16 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
         at = end + (end < length);
     }
     char family[STYLE_WEB_FONT_NAME_CAPACITY];
-    char references[STYLE_WEB_FONT_SOURCE_LIMIT][2048];
-    size_t source_count = source_value == NULL ? 0
-        : web_font_sources(source_value, source_length, references);
-    if (!normal_style || family_value == NULL || source_count == 0
+    if (!normal_style || family_value == NULL || source_value == NULL
         || !style_canonical_font_family_name(family_value, family_length,
                                        family)) {
+        fonts->stats.unsupported_sources++;
+        return;
+    }
+    char *references[STYLE_WEB_FONT_SOURCE_LIMIT] = {0};
+    size_t source_count = web_font_sources(sheet, source_value, source_length,
+                                           references);
+    if (source_count == 0) {
         fonts->stats.unsupported_sources++;
         return;
     }
@@ -318,26 +366,29 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
     if (family_slot == fonts->family_count) {
         if (fonts->family_count == TILEFINCH_WEB_FONT_FAMILY_LIMIT) {
             fonts->stats.skipped_family_limit++;
-            return;
+            goto font_sources_done;
         }
         memcpy(fonts->families[family_slot].name, family,
                strlen(family) + 1u);
         fonts->family_count++;
     }
     uint16_t *weights = fonts->loaded.families[family_slot].weights;
+    uint16_t *maxima = fonts->loaded.families[family_slot].weight_max;
     size_t face_slot = weight >= 600 ? 1u : 0u;
     for (size_t i = 0; i < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; i++) {
-        if (weights[i] == weight) { face_slot = i; break; }
+        if (weights[i] == weight && maxima[i] == weight_max) { face_slot = i; break; }
     }
-    if (weights[face_slot] != 0 && weights[face_slot] != weight) {
+    if (weights[face_slot] != 0
+        && (weights[face_slot] != weight || maxima[face_slot] != weight_max)) {
         for (face_slot = 2; face_slot < TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
              face_slot++) if (weights[face_slot] == 0) break;
         if (face_slot == TILEFINCH_WEB_FONT_WEIGHT_LIMIT) {
             fonts->stats.skipped_source_limit++;
-            return;
+            goto font_sources_done;
         }
     }
     weights[face_slot] = weight;
+    maxima[face_slot] = weight_max;
     StyleWebFontFaceSource *destination =
         &fonts->families[family_slot].faces[face_slot];
     for (size_t source = 0; source < source_count; source++) {
@@ -365,12 +416,21 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
             fonts->stats.duplicate_sources++;
             continue;
         }
-        if (destination->source_count == STYLE_WEB_FONT_SOURCE_LIMIT) {
+        if (destination->source_count == STYLE_WEB_FONT_SOURCE_LIMIT
+            || stylesheet_web_font_source_count(sheet)
+                >= STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT) {
             fonts->stats.skipped_source_limit++;
             continue;
         }
-        char *reference = web_font_copy(
-            sheet, references[source], &fonts->retained_source_bytes);
+        char *reference = references[source];
+        size_t reference_bytes = budget_usable_size(reference);
+        if (fonts->retained_source_bytes > WEB_FONT_RETAINED_SOURCE_LIMIT
+            || reference_bytes > WEB_FONT_RETAINED_SOURCE_LIMIT
+                - fonts->retained_source_bytes) {
+            fonts->stats.skipped_source_limit++;
+            continue;
+        }
+        fonts->retained_source_bytes += reference_bytes;
         char *base = NULL;
         if (reference != NULL && source_base_url != NULL) {
             base = web_font_copy(sheet, source_base_url,
@@ -379,17 +439,17 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
         if (reference == NULL
             || (source_base_url != NULL && base == NULL)) {
             if (reference != NULL) {
-                size_t bytes = strlen(reference) + 1u;
+                size_t bytes = reference_bytes;
                 if (bytes <= fonts->retained_source_bytes) {
                     fonts->retained_source_bytes -= bytes;
                 }
-                budget_free(sheet->budget, reference);
             }
             fonts->stats.skipped_source_limit++;
             continue;
         }
         size_t index = destination->source_count++;
         destination->references[index] = reference;
+        references[source] = NULL;
         destination->source_bases[index] = base;
         if (source_base_url != NULL) {
             memcpy(destination->source_referrer_policies[index],
@@ -398,6 +458,9 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
         }
         fonts->stats.sources_selected++;
     }
+font_sources_done:
+    for (size_t source = 0; source < source_count; source++)
+        budget_free(sheet->budget, references[source]);
 }
 
 static size_t css_selector_item_end(const char *text, size_t length,

@@ -765,8 +765,7 @@ bool site_adapter_reader_css(
         "[data-tilefinch-reader-root] h1{font-size:1.55rem!important}"
         "[data-tilefinch-reader-root] h2{font-size:1.3rem!important}"
         "[data-tilefinch-reader-root] h3{font-size:1.15rem!important}"
-        "[data-tilefinch-reader-root] h4,[data-tilefinch-reader-root] h5,"
-        "[data-tilefinch-reader-root] h6{font-size:1.05rem!important}"
+        "[data-tilefinch-reader-root] :is(h4,h5,h6){font-size:1.05rem!important}"
         "[data-tilefinch-reader-root] :is(p,li,blockquote){height:auto!important;"
         "margin-top:0!important;margin-bottom:.8em!important;"
         "color:#292724!important;background:transparent!important}"
@@ -793,6 +792,8 @@ bool site_adapter_reader_css(
         /* Common sizing, wrapping and transparent paint already come from
            the universal extracted-descendant reset above. */
         "[data-tilefinch-reader-root] img{display:block!important}"
+        "[data-tilefinch-reader-root] img[data-tilefinch-reader-compact-image]{"
+        "white-space:nowrap!important;word-break:normal!important;overflow:hidden!important}"
         "[data-tilefinch-reader-root] table{display:block!important;"
         "width:100%!important;"
         "overflow:hidden!important;table-layout:fixed!important;"

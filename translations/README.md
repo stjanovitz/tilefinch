@@ -44,7 +44,7 @@ Sources and generation tools remain in the browser repository. Host builds
 generate test resources in their build directory; public-clone tests need no
 network or optional-download checkout. The generated-file test checks their
 exact identity. The browser accepts only
-the SHA-256-pinned bytes, with a 32 KiB / 336-row limit. Values are display text,
+the SHA-256-pinned bytes, with a 32 KiB / 400-row limit. Values are display text,
 not executable code or formatting programs.
 
 Downloads use tilefinch-models' `main` branch and versioned
@@ -100,3 +100,13 @@ For a new catalog, rebuild the Hindi pack from the active version's
 new navigation instructions' syllable clusters.
 The v7 Hindi catalog requires signed Devanagari revision 4; selecting Hindi
 updates an older pack before reporting installation complete.
+
+V11 adds file-download and homebrew-management controls and warnings in every
+interface language. V1–v10 downloads and saved language IDs remain unchanged.
+V11 requires Devanagari revision 6 and Bengali-Assamese revision 2 for its new
+shaped labels. These resources must be built and published before shipping an
+app that pins v11; generating the catalog does not publish the downloads.
+The native layout gate covers Save, Install, Remove, Downloads, and the ZIP
+deletion confirmation. Filenames, application names, paths and links remain
+unchanged. Generated HTML uses logical translations and escapes them; native
+chrome uses the pre-shaped display labels.

@@ -25,6 +25,10 @@ const SAFE_HEADER = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const TRACE_DIGEST = /^[0-9a-f]{64}$/;
 const MAX_TRACE_RECORDS = 4096;
+// Long articles with discussions still use viewport-sized images, not one
+// enormous raster. Bound traversal independently from screenshot dimensions.
+const MAX_DOCUMENT_HEIGHT = 262144;
+const MAX_DOCUMENT_SWEEP_STEPS = 2048;
 const MAX_RESPONSE_HEADERS = 512;
 const MAX_RESPONSE_COOKIES = 16;
 const MAX_SET_COOKIE_BYTES = 4095;
@@ -3182,9 +3186,6 @@ function parseSetCookie(value, sourceUrl, label = "Set-Cookie") {
   if (secure && parsedSource.protocol !== "https:") {
     throw new CaptureError(`${label}: Secure cookie came from a non-HTTPS URL`);
   }
-  if (sameSite === "None" && !secure) {
-    throw new CaptureError(`${label}: SameSite=None requires Secure`);
-  }
   if (name.startsWith("__Secure-") && (!secure || parsedSource.protocol !== "https:")) {
     throw new CaptureError(`${label}: invalid __Secure- cookie scope`);
   }
@@ -3197,6 +3198,8 @@ function parseSetCookie(value, sourceUrl, label = "Set-Cookie") {
     domain: domainAttribute === null ? parsedSource.hostname : `.${domainAttribute}`,
     path: cookiePath, hostOnly: domainAttribute === null,
     secure, httpOnly, sameSite, maxAge, expires,
+    ...(sameSite === "None" && !secure
+      ? { ignoredReason: "samesite-none-without-secure" } : {}),
   };
 }
 
@@ -3294,6 +3297,10 @@ function cookieReplayOperation(cookie, nowSeconds, originMs, responseDateSeconds
   if (!Number.isFinite(nowSeconds) || nowSeconds <= 0) {
     throw new CaptureError("cookie replay clock is invalid");
   }
+  /* RFC 6265bis rejects this cookie, not the response containing it. In
+     particular, an ignored deletion must not clear an existing safe cookie. */
+  if (cookie.ignoredReason === "samesite-none-without-secure")
+    return { action: "ignore", reason: cookie.ignoredReason };
   let replayExpires = null;
   let remove = false;
   if (cookie.maxAge !== null) {
@@ -3337,7 +3344,7 @@ async function applyResponseCookies(
         throw new CaptureError("offline capture requires BrowserContext.addCookies");
       }
       await context.addCookies([operation.cookie]);
-    } else {
+    } else if (operation.action === "delete") {
       if (typeof context.clearCookies !== "function") {
         throw new CaptureError("offline capture requires filtered BrowserContext.clearCookies");
       }
@@ -3941,6 +3948,8 @@ function inspectTrace(traceDirectory) {
       .filter((route) => route.mode === "occurrence-sequence").length,
     route_selection_version: ROUTE_SELECTION_VERSION,
     response_cookies: trace.records.reduce((count, record) => count + record.cookies.length, 0),
+    ignored_response_cookies: trace.records.reduce((count, record) =>
+      count + record.cookies.filter(cookie => cookie.ignoredReason !== undefined).length, 0),
     clock_origin_ms: trace.originMs,
     ...(trace.fixedWallClock ? { clock_contract: REPLAY_FIXED_WALL_CLOCK_CONTRACT } : {}),
     urls: [...new Set([...trace.routes.keys()]
@@ -4455,6 +4464,9 @@ async function captureReference(options) {
       "--host-resolver-rules=MAP * ~NOTFOUND", "--metrics-recording-only",
       "--no-default-browser-check", "--no-first-run",
       "--site-per-process",
+      /* FedCM fetches can originate in the browser process, beyond Fetch
+         interception. Anonymous content captures do not permit sign-in. */
+      "--disable-blink-features=FedCm",
     ];
   }
   {
@@ -5007,7 +5019,7 @@ async function captureReference(options) {
   if (!failure && options.fullDocument) {
     try {
       let requested = 0;
-      for (let step = 0; step < 256; step += 1) {
+      for (let step = 0; step < MAX_DOCUMENT_SWEEP_STEPS; step += 1) {
         await runHost("document-sweep-position", () => page.evaluate((y) => {
           scrollTo({ top: y, behavior: "instant" });
         }, requested));
@@ -5022,10 +5034,13 @@ async function captureReference(options) {
           return { y: scrollY, maximum: Math.max(0, root.scrollHeight - innerHeight), height: innerHeight };
         }));
         fullDocument.steps += 1;
+        if (position.maximum + position.height > MAX_DOCUMENT_HEIGHT) {
+          throw new CaptureError("full-document extent exceeds bounded height");
+        }
         if (position.y >= position.maximum - 2) { fullDocument.complete = true; break; }
         requested = Math.min(position.maximum, position.y + Math.max(1, position.height - 32));
       }
-      if (!fullDocument.complete) throw new CaptureError("full-document scroll exceeded 256 steps");
+      if (!fullDocument.complete) throw new CaptureError("full-document scroll exceeded bounded steps");
       fullDocument.geometry_attempts = [];
       for (let geometryAttempt = 0; geometryAttempt < 2; geometryAttempt += 1) {
       fullDocument.viewports = [];
@@ -5069,7 +5084,7 @@ async function captureReference(options) {
       }
       const extent = fullDocument.viewports.at(-1);
       const pixelScale = scenario.scaleNumerator / scenario.scaleDenominator;
-      if (extent.document_width * pixelScale > 2048 || extent.document_height * pixelScale > 61440) {
+      if (extent.document_width * pixelScale > 2048 || extent.document_height * pixelScale > MAX_DOCUMENT_HEIGHT) {
         throw new CaptureError("full-document screenshot exceeds bounded dimensions");
       }
       /* Full-page Chromium capture changes touch emulation while painting.

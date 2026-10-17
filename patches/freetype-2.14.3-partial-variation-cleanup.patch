@@ -1,0 +1,11 @@
+--- a/src/truetype/ttgxvar.c
++++ b/src/truetype/ttgxvar.c
+@@ -4830,7 +4830,8 @@
+ 
+       /* blend->num_axis might not be set up yet */
+-      num_axes = blend->mmvar->num_axis;
++      /* The mmvar allocation itself can also have been refused. */
++      num_axes = blend->mmvar ? blend->mmvar->num_axis : 0;
+ 
+       FT_FREE( blend->coords );
+       FT_FREE( blend->normalizedcoords );

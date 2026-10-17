@@ -1,10 +1,44 @@
 #include "tilefinch/ui_language.h"
+#include "tilefinch/offline_library.h"
+#include "tilefinch/file_download.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); return 1; } } while (0)
+
+static int translated_download_pages(Budget *budget)
+{
+    char root[] = "/tmp/tilefinch-translated-download-XXXXXX";
+    CHECK(mkdtemp(root));
+    OfflineLibrary library;
+    offline_library_init(&library, budget, root);
+    library.loaded = true;
+    library.count = 1;
+    library.items[0] = (OfflineLibraryItem){.id=1, .type=OFFLINE_ITEM_FILE,
+        .state=OFFLINE_ITEM_READY, .content_bytes=4};
+    strcpy(library.items[0].title, "Settings.zip");
+    char path[512];
+    CHECK(file_download_path(&library, 1, path, sizeof(path)));
+    FILE *file = fopen(path, "wb");
+    CHECK(file && fwrite("PK\003\004", 1, 4, file)==4 && !fclose(file));
+    size_t retained = budget->current, length = 0;
+    char *html = NULL;
+    CHECK(offline_library_build_file_page(&library, budget, 1, &html, &length));
+    char heading[512];
+    snprintf(heading, sizeof(heading), "<h1>%s</h1>", tilefinch_ui_logical_text("File saved"));
+    CHECK(strstr(html, heading) && strstr(html, "Settings.zip")
+        && strstr(html, tilefinch_ui_logical_text("Install homebrew?"))
+        && strstr(html, "https://tilefinch.local/offline/extract?id=1"));
+    budget_free(budget, html);
+    CHECK(offline_library_build_homebrew_page(budget, root, &html, &length));
+    snprintf(heading, sizeof(heading), "<h1>%s</h1>", tilefinch_ui_logical_text("Installed homebrew"));
+    CHECK(strstr(html, heading) && strstr(html, tilefinch_ui_logical_text("No installed homebrew found.")));
+    budget_free(budget, html);
+    CHECK(budget->current == retained && !unlink(path) && !rmdir(root));
+    return 0;
+}
 
 int main(void)
 {
@@ -24,7 +58,9 @@ int main(void)
         == BROWSER_GLYPH_LANGUAGE_KOREAN);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->glyphs
         == BROWSER_GLYPH_LANGUAGE_DEVANAGARI);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 5);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HINDI)->minimum_glyph_sequence == 6);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_BENGALI)->minimum_glyph_sequence == 2);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ASSAMESE)->minimum_glyph_sequence == 2);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->minimum_glyph_sequence == 1);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ARABIC)->glyphs
         == BROWSER_GLYPH_LANGUAGE_ARABIC);
@@ -38,8 +74,8 @@ int main(void)
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 10);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 10);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 11);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 11);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -75,7 +111,7 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
-            CHECK(tilefinch_ui_language_spec(language)->version == 10);
+            CHECK(tilefinch_ui_language_spec(language)->version == 11);
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
         }
@@ -93,6 +129,7 @@ int main(void)
         CHECK(!strcmp(tilefinch_ui_translation_text(t, "settings"), tilefinch_ui_translation_text(t, "Settings")));
         CHECK(!strcmp(tilefinch_ui_translation_text(t, "Unknown advanced message"), "Unknown advanced message"));
         tilefinch_ui_translation_bind(t);
+        CHECK(translated_download_pages(&budget) == 0);
         if (language == TILEFINCH_UI_LANGUAGE_ARABIC)
             CHECK(!strcmp(tilefinch_ui_logical_text("Back"), "رجوع"));
         CHECK(!strcmp(tilefinch_ui_text("Settings"), tilefinch_ui_translation_text(t, "Settings")));

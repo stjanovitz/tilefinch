@@ -5,7 +5,10 @@
 #include <string.h>
 
 #include "tilefinch/web_app_manifest.h"
+#include "tilefinch/file_download.h"
+#include "tilefinch/url.h"
 #include "tilefinch/resources.h"
+#include "tilefinch/platform.h"
 #include "image_decode_internal.h"
 
 #define OFFLINE_ICON_DOWNLOAD_LIMIT (256u * 1024u)
@@ -19,6 +22,11 @@ struct PspOfflineAppPreparation {
     char source_url[OFFLINE_LIBRARY_URL_LIMIT];
     unsigned char icon[OFFLINE_LIBRARY_APP_ICON_LIMIT];
     size_t icon_length;
+};
+
+struct PspFileDownloadOffer {
+    PspUiFileDownloadPreview view;
+    char url[OFFLINE_LIBRARY_URL_LIMIT];
 };
 
 static bool offline_internal_url(const char *url)
@@ -111,6 +119,10 @@ void psp_offline_store_init(
     store->library.progress = offline_store_progress;
     store->library.progress_context = store;
     store->session = session;
+#ifdef __PSP__
+    store->game_directory = !strncmp(store->library.directory, "ef0:", 4)
+        ? "ef0:/PSP/GAME" : "ms0:/PSP/GAME";
+#endif
     offline_download_manager_init(
         &store->download, budget, session, &store->library);
 }
@@ -515,6 +527,94 @@ bool psp_offline_store_save_current(
     return saved;
 }
 
+bool psp_offline_store_offer_file(PspOfflineStore *store,
+                                 BrowserEngine *engine, const char *url)
+{
+    if (store == NULL || engine == NULL || !file_download_url_supported(url)
+        || strlen(url) >= OFFLINE_LIBRARY_URL_LIMIT) return false;
+    Budget *budget = store->library.budget;
+    PspFileDownloadOffer *offer = budget_calloc_category(budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*offer));
+    if (offer == NULL) return false;
+    strcpy(offer->url, url);
+    if (!file_download_filename(url, NULL, offer->view.name)
+        || !tilefinch_url_origin(url, offer->view.origin, sizeof(offer->view.origin))) {
+        budget_free(budget, offer); return false;
+    }
+    psp_offline_store_discard_file(store);
+    store->file_offer = offer;
+    return true;
+}
+
+const PspUiFileDownloadPreview *psp_offline_store_file_preview(const PspOfflineStore *store)
+{
+    return store == NULL || store->file_offer == NULL ? NULL : &store->file_offer->view;
+}
+
+bool psp_offline_store_take_download_offer(PspOfflineStore *store, BrowserEngine *engine)
+{
+    char url[NAVIGATION_URL_LIMIT], name[FILE_DOWNLOAD_FILENAME_LIMIT];
+    if (!browser_engine_take_download_offer(engine, url, sizeof(url), name, sizeof(name))
+        || !psp_offline_store_offer_file(store, engine, url)) return false;
+    snprintf(store->file_offer->view.name, sizeof(store->file_offer->view.name), "%s", name);
+    return true;
+}
+
+void psp_offline_store_discard_file(PspOfflineStore *store)
+{
+    if (store == NULL) return;
+    budget_free(store->library.budget, store->file_offer);
+    store->file_offer = NULL;
+}
+
+bool psp_offline_store_accept_file(PspOfflineStore *store)
+{
+    if (store == NULL || store->file_offer == NULL) return false;
+    uint32_t id = 0;
+    char error[128] = {0};
+    bool queued = file_download_enqueue(&store->library, store->file_offer->url,
+        store->file_offer->view.name, &id, error, sizeof(error));
+    psp_offline_store_discard_file(store);
+    if (!queued) { offline_status(store, error); return false; }
+    bool busy = offline_download_manager_active(&store->download, NULL);
+    bool started = !busy && offline_download_manager_start(&store->download, id);
+    offline_status(store, started ? "FILE DOWNLOAD STARTED" : busy
+        ? "FILE ADDED TO DOWNLOAD QUEUE" : "FILE QUEUED - OPEN DOWNLOADS TO RETRY");
+    return true;
+}
+
+void psp_offline_store_discard_zip(PspOfflineStore *store)
+{
+    if (store == NULL) return;
+    zip_install_destroy(store->zip_install);
+    store->zip_install = NULL;
+}
+
+bool psp_offline_store_install_prepared_zip(PspOfflineStore *store)
+{
+    if (store == NULL || store->zip_install == NULL) return false;
+    bool removing = zip_install_preview(store->zip_install)->removing;
+    bool okay = zip_install_begin(store->zip_install);
+    ZipInstallStatus status = okay ? ZIP_INSTALL_PENDING : ZIP_INSTALL_FAILED;
+    for (size_t turns = 0; okay && status == ZIP_INSTALL_PENDING && turns < 131072u; turns++) {
+        status = zip_install_pump(store->zip_install);
+        if (status == ZIP_INSTALL_PENDING
+            && !tilefinch_platform_cooperate("zip-install", turns+1)) {
+            zip_install_cancel(store->zip_install);
+            status = ZIP_INSTALL_CANCELLED;
+        }
+    }
+    if (status == ZIP_INSTALL_PENDING) {
+        zip_install_cancel(store->zip_install);
+        status = ZIP_INSTALL_CANCELLED;
+    }
+    okay = status == ZIP_INSTALL_DONE;
+    offline_status(store, okay ? (removing ? "HOMEBREW REMOVED - DOWNLOADS UNCHANGED" : "INSTALLED TO PSP/GAME - ARCHIVE KEPT")
+        : status == ZIP_INSTALL_CANCELLED ? (removing ? "REMOVAL STOPPED - RETRY TO FINISH" : "INSTALLATION CANCELLED - ARCHIVE KEPT")
+        : zip_install_error(store->zip_install));
+    psp_offline_store_discard_zip(store);
+    return okay;
+}
+
 bool psp_offline_store_open_library(
     PspOfflineStore *store, BrowserEngine *engine, bool record_history)
 {
@@ -716,6 +816,55 @@ PspOfflineRouteResult psp_offline_store_handle_url(
             store, engine, video_id, source_title, record_history);
     }
     uint32_t id = 0;
+    if (!strcmp(url, OFFLINE_ROOT "/homebrew")) {
+        char *html = NULL; size_t length = 0;
+        bool okay = offline_library_build_homebrew_page(browser_engine_budget(engine), store->game_directory, &html, &length)
+            && offline_commit(engine, url, html, length, record_history);
+        offline_status(store, okay ? "INSTALLED HOMEBREW" : "HOMEBREW LIST UNAVAILABLE OR TOO LARGE");
+        return okay ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
+    }
+    static const char remove_prefix[] = OFFLINE_ROOT "/remove-homebrew?name=";
+    if (!strncmp(url, remove_prefix, sizeof(remove_prefix)-1)) {
+        const char *hex = url + sizeof(remove_prefix)-1; size_t bytes = strlen(hex);
+        char name[64] = {0};
+        if (!bytes || bytes > 126 || bytes % 2) return PSP_OFFLINE_ROUTE_ERROR;
+        for (size_t i = 0; i < bytes; i++) {
+            unsigned char c = (unsigned char) hex[i];
+            int value = c >= '0' && c <= '9' ? c-'0' : c >= 'a' && c <= 'f' ? c-'a'+10 : -1;
+            if (value < 0) return PSP_OFFLINE_ROUTE_ERROR;
+            name[i/2] |= (char)(value << (i%2 ? 0 : 4));
+        }
+        if (strlen(name) != bytes/2) return PSP_OFFLINE_ROUTE_ERROR;
+        psp_offline_store_discard_zip(store);
+        char error[128] = {0};
+        store->zip_install = zip_install_prepare_removal(store->library.budget,
+            store->game_directory, name, error, sizeof(error));
+        if (!store->zip_install) { offline_status(store, error); return PSP_OFFLINE_ROUTE_ERROR; }
+        return PSP_OFFLINE_ROUTE_ZIP_PREVIEW;
+    }
+    if (offline_route_id(url, "extract", &id)) {
+        const OfflineLibraryItem *item = offline_library_find(&store->library, id);
+        char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u];
+        psp_offline_store_discard_zip(store);
+        if (item == NULL || item->state != OFFLINE_ITEM_READY || store->game_directory == NULL
+            || !file_download_path(&store->library, id, path, sizeof(path))) {
+            offline_status(store, "COMPLETED ZIP OR INSTALL DIRECTORY UNAVAILABLE");
+            return PSP_OFFLINE_ROUTE_ERROR;
+        }
+        char error[128] = {0};
+        store->zip_install = zip_install_prepare(store->library.budget, path,
+            store->game_directory, item->title, id, error, sizeof(error));
+        if (!store->zip_install) { offline_status(store, error); return PSP_OFFLINE_ROUTE_ERROR; }
+        return PSP_OFFLINE_ROUTE_ZIP_PREVIEW;
+    }
+    if (offline_route_id(url, "file", &id)) {
+        char *html = NULL;
+        size_t length = 0;
+        return offline_library_build_file_page(&store->library,
+                browser_engine_budget(engine), id, &html, &length)
+            && offline_commit(engine, url, html, length, record_history)
+            ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
+    }
     if (offline_route_id(url, "article", &id))
         return offline_open_article(store, engine, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
@@ -825,7 +974,7 @@ bool psp_offline_store_pump(PspOfflineStore *store)
             &store->library, before);
         offline_status(store,
             item != NULL && item->state == OFFLINE_ITEM_READY
-                ? "VIDEO SAVED OFFLINE"
+                ? (item->type == OFFLINE_ITEM_FILE ? "FILE SAVED" : "VIDEO SAVED OFFLINE")
                 : (store->download.error[0] != 0
                     ? store->download.error : "DOWNLOAD PAUSED"));
         uint32_t next_id = 0;
@@ -835,7 +984,7 @@ bool psp_offline_store_pump(PspOfflineStore *store)
                    &store->download, &next_id);
         store->last_active_id = started_next ? next_id : 0;
         if (started_next)
-            offline_status(store, "VIDEO SAVED - NEXT DOWNLOAD STARTED");
+            offline_status(store, "SAVED - NEXT DOWNLOAD STARTED");
         return true;
     }
     return false;
@@ -845,6 +994,8 @@ void psp_offline_store_destroy(PspOfflineStore *store)
 {
     if (store == NULL) return;
     psp_offline_store_discard_app_preparation(store);
+    psp_offline_store_discard_file(store);
+    psp_offline_store_discard_zip(store);
     offline_download_manager_destroy(&store->download);
     budget_free(store->library.budget, store->app_icon_cache);
     store->app_icon_cache = NULL;

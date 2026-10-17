@@ -152,8 +152,7 @@
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
-  const trustedPromiseResolve = Function.call.bind(Promise.resolve, Promise);
-  const trustedPromiseThen = Function.call.bind(Promise.prototype.then);
+  const trustedEnqueueMicrotask = globalThis.__tilefinchEnqueueMicrotask;
   const trustedQueueCheckpointContinuation =
     globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.queueMicrotask === undefined)
@@ -162,7 +161,7 @@
       queueMicrotask: (callback) => {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
-        trustedPromiseThen(trustedPromiseResolve(), () => {
+        trustedEnqueueMicrotask(() => {
           try {
             globalThis.__tilefinchRunTask(
               "microtask",
@@ -176,6 +175,7 @@
         });
       },
     }.queueMicrotask;
+  delete globalThis.__tilefinchEnqueueMicrotask;
   delete globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.CSS === undefined)
     globalThis.CSS = {
@@ -6725,15 +6725,25 @@
     /* The document's listeners live in the list the native dispatcher
        reads, so EventTarget.prototype's methods serve document (and window)
        directly, as in browsers. */
-    const maps = new WeakMap([[document, documentListeners]]),
-      mapFor = (target) => {
-        let map = maps.get(target);
-        if (!map) {
-          map = new Map();
-          maps.set(target, map);
-        }
-        return map;
-      };
+    /* Listener callbacks often capture their target. A global WeakMap would
+       root that cycle in our collector, which marks weak-map values. Keep
+       the list on its owner, including frozen targets, without exposing an
+       author-mutable property. Small realms pay for the stamper lazily. */
+    let ListenerOwner;
+    const mapFor = (target) => {
+      if (target === document) return documentListeners;
+      if (!ListenerOwner) {
+        class OwnerBase { constructor(owner) { return owner; } }
+        ListenerOwner = class extends OwnerBase {
+          #listeners = new Map();
+          static get(owner) {
+            if (!(#listeners in owner)) new ListenerOwner(owner);
+            return owner.#listeners;
+          }
+        };
+      }
+      return ListenerOwner.get(target);
+    };
     globalThis.__tilefinchInvokeEventTarget = (
       target,
       event,

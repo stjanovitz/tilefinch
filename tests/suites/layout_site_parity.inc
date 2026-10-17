@@ -1049,6 +1049,63 @@ static int test_positioned_percentage_height_after_flow(void)
     const LayoutNodeBox *next = parity_box(&page, "next");
     CHECK(next && next->x == 392 && next->y == 0 && next->height == 23);
     CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.host{position:relative;"
+        "width:200px;padding:10px 0;border:2px solid;min-height:20px}"
+        ".content{height:339px}.arrow{position:absolute;top:50%;right:0;"
+        "width:16px;height:20px}.low{top:auto;bottom:25%}"
+        "</style><div id=host class=host><div class=content></div>"
+        "<div><a href=x id=arrow class=arrow>Go</a>"
+        "<a href=y id=low class='arrow low'>Low</a></div></div>"));
+    const LayoutNodeBox *host = parity_box(&page, "host");
+    const LayoutNodeBox *arrow = parity_box(&page, "arrow");
+    const LayoutNodeBox *low = parity_box(&page, "low");
+    CHECK(host && arrow && low && host->height == 363);
+    CHECK(arrow->y == host->y + 2 + 359 / 2
+          && low->y == host->y + 2 + 359 - 359 / 4 - 20);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_page_font_normal_leading(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2u * MIB, FONT_SET_FACE_SANS));
+    FontFace web = {0};
+    CHECK(font_face_load_encoded(&web, &budget, fonts.sans.data,
+        fonts.sans.data_length, 2u * MIB));
+    int metric = font_metric_height_fixed_at_size(&web, 922);
+    CHECK(metric > 0 && metric < (922 * 6 + 2) / 5
+          && font_line_height_fixed_at_size(&web, 922) == metric
+          && font_line_height_fixed_at_size(&fonts.sans, 922) > metric);
+    font_face_destroy(&web);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_generated_inline_padding(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:16px/20px monospace}"
+        "p{margin:0}.label{padding:0 7px;border-left:1px solid;"
+        "margin-left:3px;white-space:nowrap;background:#ddd}"
+        "#generated::before{content:'I'}"
+        "</style><p><a href=x id=generated class=label> Label</a></p>"
+        "<p><a href=y class=label>I Label</a></p>"));
+    const DrawCommand *runs[2] = {0};
+    size_t count = 0;
+    for (size_t i = 0; i < page.layout.count && count < 2; i++) {
+        const DrawCommand *command = &page.layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == 1
+            && command->text[0] == 'I') runs[count++] = command;
+    }
+    CHECK(count == 2 && runs[0]->x == 11 && runs[1]->x == 11);
+    CHECK(parity_page_destroy(&page));
     return 0;
 }
 
@@ -1072,6 +1129,90 @@ static int test_button_content_centering(void)
         && start->y - parity_box(&page, "flex")->y == 1);
     CHECK(parity_box(&page, "fixed")->y - parity_box(&page, "positioned")->y == 3);
     CHECK(text_command(&page.layout, "Auto")->y - parity_box(&page, "auto")->y == 1);
+    CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}button{display:block;"
+        "height:50px;width:100px;border:0;padding:0}"
+        "#inner{display:block;position:relative;height:30px}"
+        "#icon{position:absolute;top:5px;width:5px;height:5px}"
+        "</style><button><b id=inner>Label<i id=icon></i></b></button>"));
+    CHECK(parity_box(&page, "inner")->y == 10
+          && parity_box(&page, "icon")->y == 15);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_nested_toolbar_intrinsics(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.row{display:flex}"
+        "table{border-spacing:2px}td{padding:0}button{display:flex;"
+        "padding:3px;border:1px solid;height:36px;box-sizing:border-box}"
+        "button span{display:block;width:60px;height:12px}"
+        "</style><div class=row><div id=picker><table><tr><td>"
+        "<button><span></span></button></td><td><button><span></span>"
+        "</button></td></tr></table></div></div>"));
+    CHECK(parity_box(&page, "picker")->width == 142);
+    CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.row{display:flex;justify-content:end}"
+        "</style><div class=row><div id=count><span>1 - 45 </span>"
+        "<span> of 45</span></div></div>"));
+    const DrawCommand *last = text_command(&page.layout, "45");
+    CHECK(last && parity_box(&page, "count")->height < 30);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_legacy_grid_gaps(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}#grid{display:grid;"
+        "width:100px;grid-template-columns:20px 20px;"
+        "grid-template-rows:10px 10px;grid-column-gap:11px;grid-row-gap:2px}"
+        "</style><div id=grid><i></i><i id=second></i><i id=third></i></div>"));
+    CHECK(parity_box(&page, "second")->x == 31
+          && parity_box(&page, "third")->y == 12);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_nested_button_duration(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}button{height:30px;"
+        "padding:0 10px;border:0;font-size:14px}"
+        ".inner{display:flex;align-items:center;height:100%}"
+        ".icon{display:block;width:10px;height:10px;background:red}"
+        ".label{display:inline-block;margin-left:6px;line-height:1}"
+        "button{text-indent:-999em}.wrapper{display:block;text-indent:0}"
+        ".wrapper button{text-indent:inherit}"
+        ".hide{display:none}</style><div class=wrapper><button><b class=inner><b class=icon></b>"
+        "<b class=label><b class=hide>Listen</b><b id=duration>"
+        "<span class=hide>separator</span> 4:22</b></b></b></button></div>"));
+    CHECK(text_command(&page.layout, "4:22") != NULL
+          && text_command(&page.layout, "4:22")->x >= 0
+          && parity_box(&page, "duration")->width > 0);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_auto_fractional_grid_rows(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}#grid{display:grid;width:200px;"
+        "grid-template-columns:auto 1fr;grid-template-rows:1fr 1fr;gap:2px 11px}"
+        "#icon{grid-column:1/2;grid-row:1/3;width:35px;height:35px}"
+        "#label{grid-column:2/2;grid-row:1/2;align-self:end;font-size:12px;line-height:12px}"
+        "</style><div id=grid><b id=icon></b><b id=label>Radio</b></div>"));
+    CHECK(parity_box(&page, "grid")->height == 35
+          && parity_box(&page, "label")->x == 46
+          && parity_box(&page, "label")->y >= 4
+          && parity_box(&page, "label")->y <= 5);
     CHECK(parity_page_destroy(&page));
     return 0;
 }
@@ -1360,6 +1501,101 @@ static int test_clamp_requires_vertical_box(void)
     CHECK(plain && clamped && plain->height == 36
           && clamped->height == 12);
     CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_generated_icon_intrinsic_space(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:16px/20px monospace}"
+        ".row{height:40px}.float{float:right}a{display:inline-block;"
+        "padding:3px 12px;border:3px solid;margin-left:8px}"
+        "i{font-style:normal}i::before{content:'X'}"
+        "#own::before{content:'X'}"
+        "</style><div class=row><div class=float><a id=icon><i></i> Alpha</a></div></div>"
+        "<div class=row><div class=float><a id=literal>X Alpha</a></div></div>"
+        "<div class=row><div class=float><a id=own> Alpha</a></div></div>"));
+    const LayoutNodeBox *icon = parity_box(&page, "icon");
+    const LayoutNodeBox *literal = parity_box(&page, "literal");
+    const LayoutNodeBox *own = parity_box(&page, "own");
+    CHECK(icon && literal && own);
+    if (icon->width != literal->width || icon->height != literal->height
+        || own->width != literal->width || own->height != literal->height)
+        fprintf(stderr, "generated spacing icon=%dx%d own=%dx%d literal=%dx%d\n",
+            icon->width, icon->height, own->width, own->height,
+            literal->width, literal->height);
+    CHECK(icon->width == literal->width && icon->height == literal->height
+          && own->width == literal->width && own->height == literal->height);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+static int test_adjacent_nowrap_inline_boundaries(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0;font:16px/20px monospace}"
+        ".row{width:130px}.tag{white-space:nowrap;padding:0 7px}"
+        "#joined{overflow:hidden;text-overflow:ellipsis}"
+        "#multi{overflow:hidden;text-overflow:ellipsis}"
+        "#atomic .tag{display:inline-block}"
+        "</style><div id=joined class=row><span class=tag>First tag</span>"
+        "<span class=tag>Second tag</span><span class=tag>Third tag</span></div>"
+        "<div id=visible class=row><span class=tag>First tag</span>"
+        "<span class=tag>Second tag</span></div>"
+        "<div id=spaced class=row><span class=tag>First tag</span> "
+        "<span class=tag>Second tag</span></div>"
+        "<div id=atomic class=row><span class=tag>First tag</span>"
+        "<span class=tag>Second tag</span></div>"
+        "<div id=hyphen class=row>abcdefghij-<span class=tag>Second tag</span></div>"
+        "<div id=cjk class=row>日本語日本語<span class=tag>Second tag</span></div>"
+        "<div id=multi class=row><span class=tag>Veryverylonglabel</span> "
+        "<span class=tag>Tail</span></div>"));
+    const LayoutNodeBox *joined = parity_box(&page, "joined");
+    const LayoutNodeBox *visible = parity_box(&page, "visible");
+    const LayoutNodeBox *spaced = parity_box(&page, "spaced");
+    const LayoutNodeBox *atomic = parity_box(&page, "atomic");
+    CHECK(joined && visible && spaced && atomic);
+    if (joined->height != 20 || visible->height != 20)
+        fprintf(stderr, "nowrap boundaries joined=%d visible=%d spaced=%d atomic=%d\n",
+            joined->height, visible->height, spaced->height, atomic->height);
+    CHECK(joined->height == 20 && visible->height == 20
+          && spaced->height > joined->height && atomic->height > joined->height);
+    const LayoutNodeBox *hyphen = parity_box(&page, "hyphen");
+    const LayoutNodeBox *cjk = parity_box(&page, "cjk");
+    const LayoutNodeBox *multi = parity_box(&page, "multi");
+    CHECK(hyphen && cjk && multi && hyphen->height == 40
+          && cjk->height == 40 && multi->height == 40);
+    size_t markers = 0;
+    for (size_t i = joined->command_start; i < joined->command_end; i++) {
+        const DrawCommand *command = &page.layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == 3
+            && memcmp(command->text, "\xe2\x80\xa6", 3) == 0) markers++;
+    }
+    CHECK(markers == 1 && text_command(&page.layout, "Tail") != NULL);
+    CHECK(parity_page_destroy(&page));
+    /* Refusing the optional marker must leave the original text and hit
+       regions available to ordinary overflow clipping. */
+    Budget budget;
+    budget_init(&budget, MIB);
+    DrawCommand *command = budget_calloc(&budget, 1, sizeof(*command));
+    CHECK(command != NULL);
+    *command = (DrawCommand) {.type = DRAW_TEXT, .text = "Verylonglabel",
+        .text_length = 13, .width = 100, .height = 20,
+        .font_size = 16, .scale = 1, .opacity_scale = 255};
+    LinkRegion link = {.width = 100, .height = 20};
+    LayoutDocument layout = {.budget = &budget, .commands = command,
+        .count = 1, .capacity = 1, .links = &link, .link_count = 1};
+    LineState line = {.layout = &layout, .x = 100, .right = 30,
+        .base_right = 30, .line_height = 20, .has_text_character = true,
+        .inline_overflow_ellipsis = true};
+    budget.limit = budget.current;
+    layout_flush_line(&line);
+    CHECK(layout.count == 1 && command->text_length == 13
+          && command->width == 100 && link.width == 100);
+    budget_free(&budget, command);
+    CHECK(budget.current == 0);
     return 0;
 }
 
@@ -1887,6 +2123,8 @@ static int test_site_parity(void)
     CHECK(test_inline_replaced_percentage_height() == 0);
     CHECK(test_parity_generated_inline_spacing() == 0);
     CHECK(test_generated_atomic_nowrap() == 0);
+    CHECK(test_generated_icon_intrinsic_space() == 0);
+    CHECK(test_adjacent_nowrap_inline_boundaries() == 0);
     CHECK(test_clamp_requires_vertical_box() == 0);
     CHECK(test_negative_margin_reaches_enclosing_floats() == 0);
     CHECK(test_system_font_family_identity() == 0);
@@ -1897,10 +2135,16 @@ static int test_site_parity(void)
     CHECK(test_intrinsic_float_rows() == 0);
     CHECK(test_border_color_triangles() == 0);
     CHECK(test_positioned_percentage_height_after_flow() == 0);
+    CHECK(test_page_font_normal_leading() == 0);
+    CHECK(test_generated_inline_padding() == 0);
     CHECK(test_fractional_tracking() == 0);
     CHECK(test_nested_flex_baseline() == 0);
     CHECK(test_css_replacement_image() == 0);
     CHECK(test_button_content_centering() == 0);
+    CHECK(test_nested_toolbar_intrinsics() == 0);
+    CHECK(test_legacy_grid_gaps() == 0);
+    CHECK(test_nested_button_duration() == 0);
+    CHECK(test_auto_fractional_grid_rows() == 0);
     CHECK(test_unknown_media_dimensions() == 0);
     CHECK(test_flex_thumbnail_text_column() == 0);
     CHECK(test_column_generated_ratio_spacer() == 0);

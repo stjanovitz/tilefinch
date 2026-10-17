@@ -804,6 +804,8 @@ struct NavigationSession {
     bool resource_fingerprint_parts_valid;
     bool style_rebuild_required;
     bool relayout_damage_valid;
+    /* Exact fixed-layer equivalence proved for this focus-only generation. */
+    size_t fixed_paint_relayout_generation;
     int relayout_damage_left;
     int relayout_damage_top;
     int relayout_damage_right;
@@ -1295,6 +1297,8 @@ NavigationLoadStatus navigation_load_pump(
 NavigationLoadStatus navigation_load_status(const NavigationLoad *load);
 /* Headers were accepted but no service HTML was parsed or executed. */
 const char *navigation_load_adapter_redirect(const NavigationLoad *load);
+/* A top-level GET's attachment stops before parsing or publishing its body. */
+const char *navigation_load_download_filename(const NavigationLoad *load);
 bool navigation_load_metrics(const NavigationLoad *load,
                              NavigationLoadMetrics *metrics);
 /* With a non-NULL quota, advances exactly one transactional finalization

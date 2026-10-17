@@ -1,5 +1,20 @@
 #define NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT 128u
 
+static void navigation_record_compiled_stylesheet(
+    NavigationSession *session, uint64_t fingerprint)
+{
+    session->page.compiled_stylesheet_fingerprint = fingerprint;
+    session->page.compiled_stylesheet_resource_signature =
+        browser_session_stylesheet_cache_signature(
+            session->browser_session, tilefinch_platform_monotonic_time_ns());
+    session->page.compiled_stylesheet_build_generation =
+        session->page.stylesheet.build_generation;
+    session->page.compiled_stylesheet_cacheable =
+        session->page.compiled_stylesheet_resource_signature != 0
+        && session->page.external_stylesheets.skipped_pressure == 0
+        && session->performance.stylesheet_pressure_fallbacks == 0;
+}
+
 static bool navigation_replace_server_body_with_runtime(
     void *opaque, PocDocument *document,
     const char *markup, size_t length)
@@ -982,6 +997,10 @@ static bool navigation_finish_authoritative_layout(
         attach_relayout_requested =
             script_runtime_has_pending_resource_mutations(session->page.runtime)
             || script_runtime_consume_relayout(session->page.runtime);
+    } else {
+        /* Font admission follows the committed layout, not the existence
+           of an author runtime. Static pages need the same demand filter. */
+        navigation_update_font_usage(session);
     }
     session->page.loaded = true;
     script_runtime_heavy_commit(session->page.runtime);
@@ -1400,18 +1419,7 @@ static bool navigation_commit_document(
             stylesheet_external_current = true;
             user_stylesheet_current = true;
             adopted_stylesheet_fingerprint = final_fingerprint;
-            session->page.compiled_stylesheet_fingerprint =
-                final_fingerprint;
-            session->page.compiled_stylesheet_resource_signature =
-                browser_session_stylesheet_cache_signature(
-                    session->browser_session,
-                    tilefinch_platform_monotonic_time_ns());
-            session->page.compiled_stylesheet_build_generation =
-                session->page.stylesheet.build_generation;
-            session->page.compiled_stylesheet_cacheable =
-                session->page.compiled_stylesheet_resource_signature != 0
-                && session->page.external_stylesheets.skipped_pressure == 0
-                && session->performance.stylesheet_pressure_fallbacks == 0;
+            navigation_record_compiled_stylesheet(session, final_fingerprint);
             session->performance.blocking_stylesheet_adoptions++;
             if (session->page.runtime != NULL) {
                 script_runtime_set_stylesheet(
@@ -1434,18 +1442,7 @@ static bool navigation_commit_document(
             stylesheet_external_current = true;
             user_stylesheet_current = true;
             adopted_stylesheet_fingerprint = final_fingerprint;
-            session->page.compiled_stylesheet_fingerprint =
-                final_fingerprint;
-            session->page.compiled_stylesheet_resource_signature =
-                browser_session_stylesheet_cache_signature(
-                    session->browser_session,
-                    tilefinch_platform_monotonic_time_ns());
-            session->page.compiled_stylesheet_build_generation =
-                session->page.stylesheet.build_generation;
-            session->page.compiled_stylesheet_cacheable =
-                session->page.compiled_stylesheet_resource_signature != 0
-                && session->page.external_stylesheets.skipped_pressure == 0
-                && session->performance.stylesheet_pressure_fallbacks == 0;
+            navigation_record_compiled_stylesheet(session, final_fingerprint);
         }
     }
     if (!adopted_streaming_stylesheet && !adopted_compiled_stylesheet
@@ -1590,6 +1587,13 @@ static bool navigation_commit_document(
         if (session->page.runtime != NULL) {
             script_runtime_set_stylesheet(session->page.runtime,
                                           &session->page.stylesheet);
+            /* Streaming storage has moved, but deferred image sizing still
+               runs before publication. Supply real image boxes instead of
+               guessed CSS percentages. Do not turn unrelated library feature
+               probes into full-page layouts during this admission phase. */
+            script_runtime_set_image_sizing_layout_callback(
+                session->page.runtime, navigation_flush_candidate_geometry,
+                session);
             script_document_may_have_changed = true;
             if (!page_capability_trace_setup(session)) {
                 snprintf(session->last_error, sizeof(session->last_error),
@@ -1675,6 +1679,12 @@ static bool navigation_commit_document(
                     session, rollback_snapshot);
             }
             document_body_snapshot_destroy(&server_snapshot);
+            /* Ready-event geometry is an author-read snapshot, not the
+               final image/font publication. Release it before those
+               resource transients and the authoritative build overlap. */
+            if (session->page.runtime != NULL)
+                script_runtime_set_layout(session->page.runtime, NULL,
+                                          session->viewport.css_height);
             session->script_discovered = metrics.discovered;
             session->script_attempted = metrics.attempted;
             session->script_loaded = metrics.loaded;
@@ -1782,7 +1792,7 @@ static bool navigation_commit_document(
             if (script_runtime_consume_mutations(
                     session->page.runtime, &committed)
                 && session->page.layout_reuse != NULL)
-                navigation_prepare_layout_reuse(session, &committed, false);
+                navigation_prepare_layout_reuse(session, &committed, false, NULL);
         }
         session->performance.style_us += navigation_record_slice(
             session, NAVIGATION_SLICE_STYLE, phase_started,
@@ -1942,18 +1952,7 @@ static bool navigation_commit_document(
         if (navigation_stream_stylesheet_fingerprint(
                 streaming, &session->page.document,
                 &final_fingerprint)) {
-            session->page.compiled_stylesheet_fingerprint =
-                final_fingerprint;
-            session->page.compiled_stylesheet_resource_signature =
-                browser_session_stylesheet_cache_signature(
-                    session->browser_session,
-                    tilefinch_platform_monotonic_time_ns());
-            session->page.compiled_stylesheet_build_generation =
-                session->page.stylesheet.build_generation;
-            session->page.compiled_stylesheet_cacheable =
-                session->page.compiled_stylesheet_resource_signature != 0
-                && session->page.external_stylesheets.skipped_pressure == 0
-                && session->performance.stylesheet_pressure_fallbacks == 0;
+            navigation_record_compiled_stylesheet(session, final_fingerprint);
         }
     }
     if (session->web_fonts_enabled) {

@@ -22,7 +22,9 @@ typedef enum {
 #define TILEFINCH_FONT_RASTER_PIXEL_LIMIT 256
 #define TILEFINCH_BITMAP_FONT_SCALE_LIMIT 32
 #define TILEFINCH_WEB_FONT_FAMILY_LIMIT 8
-#define TILEFINCH_WEB_FONT_WEIGHT_LIMIT 4
+#define TILEFINCH_WEB_FONT_WEIGHT_LIMIT 6
+#define TILEFINCH_FONT_SYNTHETIC_WEIGHT 550u
+#define TILEFINCH_FONT_BOLD_FACE_WEIGHT 650u
 #define TILEFINCH_WEB_FONT_FAMILY_STRIDE 6
 #define TILEFINCH_WEB_FONT_BASE 16
 #define TILEFINCH_WEB_FONT_GLYPH_PIXEL_LIMIT (64u * 1024u)
@@ -60,6 +62,8 @@ _Static_assert(TILEFINCH_WEB_FONT_BASE
                      * TILEFINCH_WEB_FONT_FAMILY_STRIDE
                    <= UINT8_MAX,
                "web-font family encoding must remain byte-sized");
+_Static_assert(TILEFINCH_WEB_FONT_WEIGHT_LIMIT <= 8,
+               "per-family face usage fits one byte");
 
 typedef struct {
     Budget *budget;
@@ -82,6 +86,9 @@ uint64_t font_generation(void);
    Budget bookkeeping. Useful for comparing page-font ownership. */
 size_t font_face_backend_bytes(const FontFace *face);
 size_t font_face_cached_ascii_advances(const FontFace *face);
+/* Temporary reconstruction is separately bounded; retained backend and page
+   ceilings remain authoritative after opening. */
+size_t font_face_load_workspace_limit(size_t retained_limit);
 /* Share an already admitted page face only after the new response has passed
    request policy and its exact bytes and allocator ceiling match. */
 bool font_face_share_encoded(FontFace *destination, const FontFace *source,
@@ -128,11 +135,21 @@ typedef struct {
         FontFace faces[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
     };
     uint16_t weights[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
+    /* Zero means a static descriptor; otherwise the inclusive range end. */
+    uint16_t weight_max[TILEFINCH_WEB_FONT_WEIGHT_LIMIT];
 } WebFontFamilyFaces;
+
+/* The same CSS weight ranking is used before admission and after loading. */
+size_t font_family_face_slot_at_weight(const WebFontFamilyFaces *faces,
+    unsigned weight, bool loaded_only);
+uint8_t font_family_face_usage_mask(const WebFontFamilyFaces *faces, unsigned weight);
 
 typedef struct {
     WebFontFamilyFaces families[TILEFINCH_WEB_FONT_FAMILY_LIMIT];
 } WebFontSet;
+
+bool font_face_needs_synthetic_bold(const FontSet *fonts,
+    const WebFontSet *web_fonts, const FontFace *face, unsigned weight);
 
 typedef struct {
     unsigned char *pixels;
@@ -275,6 +292,9 @@ int font_kerning_fixed(const FontFace *face, unsigned left, unsigned right,
                        int pixel_height);
 int font_kerning_at_size_fixed(const FontFace *face, unsigned left,
                                unsigned right, int pixel_height_fixed);
+/* Keep compatible profile pair spacing identical in measurement and paint. */
+int font_kerning_for_family_at_size_fixed(const FontFace *face,
+    FontFamily family, unsigned left, unsigned right, int size_fixed, bool bold);
 /* Exact cmap coverage. font_glyph_load() succeeds for a codepoint the face
    lacks -- it renders .notdef, which is blank in one shipped subset and a box
    in another -- so a caller that must know whether the face really has the

@@ -232,6 +232,123 @@ not run concurrently with native video playback. Local playback reuses the
 ordinary bounded MP4 demuxer and PSP decoder through a size-checked file-range
 reader; downloaded files are not copied into the page heap.
 
+## File downloads
+
+Opening a common archive or binary link (such as a ZIP or PBP) offers
+**Save file?**. Ordinary GET navigation also recognizes attachment headers and
+supported binary content types, including extensionless download endpoints,
+before parsing the response body. For another file type, focus its
+link and choose **Page tools → Download focused link**. Same-origin HTML
+`download` links also offer saving. The native confirmation stays over the
+current page, so cancelling does not reload it or lose its scroll and focus.
+It shows the source origin, not a potentially sensitive query string.
+
+After confirmation, the existing **Downloads** section provides Pause,
+Resume/Retry, Details, and Delete. Each file receives an ID-prefixed safe
+filename under `data/offline/` on the Memory Stick. The server's
+Content-Disposition filename takes precedence over the URL basename; path
+components and unsafe FAT characters are removed. Non-ASCII filename bytes
+currently become underscores. Downloaded bytes are not changed or executed.
+Use USB storage to move a file, or open a completed ZIP's Details to request
+the separately confirmed installation described below.
+
+Transfers accept HTTPS only, including every redirect. They stream directly
+to a partial file, using at most 32 KiB of body callbacks or 2 ms of owner work
+per pump. A file is limited to 512 MiB and shares the existing 12-item library
+and one-active-download limit. At least 8 MiB of free space is reserved.
+The transport ring is bounded independently of file size. A completed stream
+is flushed and its completed length recorded before publication.
+
+Resume requires a matching strong ETag or Last-Modified validator and an
+exact Content-Range. A server that returns a fresh complete response starts
+over safely rather than appending it. Without a validator, Retry restarts the
+file. HTML responses without an explicit attachment disposition, HTTP errors,
+unverifiable partial responses, over-limit
+bodies, and failed writes leave a retryable item rather than a completed file.
+Existing destination files are not intentionally overwritten.
+
+No save occurs before confirmation. Retrying persists the original download
+URL and validator, which can themselves contain private access tokens; these
+are local, unencrypted files, not diagnostic logs. Cookies and passwords are
+not saved in download metadata, and persisted failure messages omit transport
+text that could contain a signed URL. Delete removes the record, partial,
+metadata, and completed file. The index format is upgraded when this feature
+is used; older app versions cannot read the new format.
+
+They do not bypass a site's authentication, API, or JavaScript requirements.
+
+### Install homebrew from ZIP
+
+A completed ZIP offers **Install homebrew…** in Details, including when its
+filename has no ZIP extension. This signature check is only a UI hint. A
+read-only validation pass must find exactly one `EBOOT.PBP` and an unambiguous
+app folder before showing the native confirmation with the destination,
+expanded size and file count. Nothing is installed until **X Install**.
+
+Installation targets `ms0:/PSP/GAME/<app>` (or `ef0:` for an internal-storage
+library). Bare EBOOT archives receive a folder derived from the archive name.
+Existing destinations are refused, including links; this is not an updater.
+Only install software you trust: ZIP checksums detect corruption, not malicious
+programs or publisher identity. No game is launched automatically.
+
+The first implementation supports single-disk stored/DEFLATE ZIPs, at most
+512 entries, eight path components, 128 MiB per file and 256 MiB of installed
+data, with an 8 MiB free-space reserve. Names must be portable ASCII/FAT names.
+It refuses traversal and absolute paths, case aliases, duplicate/conflicting
+names, symbolic/special files, encryption, ZIP64 and ambiguous multi-app
+packages. Explicit directory entries must be empty and stored. Root-level
+documentation and desktop resource-fork metadata stay in the original ZIP.
+Other payloads outside the selected app folder make the archive ambiguous.
+
+Extraction uses bounded Budget memory and cancellable 32 KiB/2 ms owner slices.
+Every installed file must match its declared length and CRC; the EBOOT header
+is checked too. Files are written beneath a newly created private staging
+folder and published by one final directory rename. Cancellation or a normal
+failure attempts to remove only this attempt's staging files and retains the ZIP. A power
+cut may leave `.tilefinch-unpack-<id>` under `PSP/GAME`; it is deliberately not
+deleted automatically. Remove that unfinished staging folder through USB
+before retrying the same item. Deleting the download does not uninstall a game.
+
+**Downloads → Installed homebrew** lists the folders installed by Tilefinch,
+even after their source ZIPs have been deleted. Choose an app, review its native
+**Remove homebrew?** confirmation and press X to remove the folder. This also
+removes saved data inside that folder; downloads and other app folders are not
+touched. Cancel before confirmation writes nothing. Stopping a removal after
+it begins cannot restore files already deleted; its receipt remains so the
+remaining contents can be inventoried and removed on a retry.
+
+Each new installation includes an 80-byte, corruption-checked
+`.tilefinch-homebrew` ownership receipt containing only its folder name and
+local installation ID—not its source URL or credentials. ZIPs cannot supply
+that reserved root file. Manual/older installations without a valid receipt
+are never offered for removal. The manager supports at most 64 installations
+and examines at most 512 GAME directory entries. Removal inventories at most
+1,024 files/directories, eight levels and 256 MiB before confirmation; links,
+special files, changed types and larger/unsupported trees require USB cleanup.
+Deletion is pumped in small, cooperative batches rather than one recursive
+blocking call. A filesystem failure retains the receipt when possible and
+reports an incomplete removal instead of claiming success.
+
+The host `tilefinch-file-download-tests` runs synthetic streaming, recovery,
+filename, confirmation, and allocation-refusal checks without network access.
+Its optional `--fetch-url HTTPS_URL EXPECTED_SHA256` mode performs one public
+download into a temporary host directory, checks its complete SHA-256, reports
+bytes and Budget peak, then deletes it. `--source-journey PAGE_URL FILE_URL
+EXPECTED_SHA256` additionally checks actual rendered-link activation, native
+confirmation and cancellation continuity. `tilefinch-zip-install-tests` covers
+staging, publication, corrupt/unsafe archives, cancellation and allocation
+refusals; `--qualify-archive LOCAL_ZIP` extracts a public package only into a
+temporary host folder and removes that test installation. Do not pass account-bearing URLs to
+this command or include them in shared logs.
+
+The optional `tilefinch-file-download-tests --profile` reports host owner-pump
+times and simulated focus/scroll-to-frame readiness on a warm synthetic page
+while an 8 MiB response is streamed. The simulated press is due immediately
+before a pump, so its timing includes that pump's blocking work. This is not
+physical display latency or a prediction of Memory Stick speed.
+`tilefinch-zip-install-tests --profile-archive LOCAL_ZIP` reports preview and
+extraction-pump timing using the same bounded installer.
+
 ## Storage and privacy
 
 The index is bounded to 32 KiB and written through a temporary file. A prior

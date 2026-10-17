@@ -234,6 +234,7 @@ struct NavigationLoad {
     bool response_taken;
     bool response_cookies_accepted;
     bool adapter_redirect;
+    char download_filename[FILE_DOWNLOAD_FILENAME_LIMIT];
     bool client_hint_retried;
     bool client_hint_retry_pending;
     bool zero_body_retry_attempted;
@@ -340,6 +341,15 @@ static bool navigation_load_headers(void *opaque,
         load->session->browser_session, &load->request_context, metadata,
         effective);
     load->response_cookies_accepted = true;
+    if (!strcasecmp(load->method, "GET")
+        && file_download_url_supported(load->requested_url)
+        && file_download_url_supported(effective)
+        && file_download_response_candidate(metadata)) {
+        char disposition[4097];
+        bool have = fetch_response_header_value(metadata, "content-disposition", disposition, sizeof(disposition));
+        if (file_download_filename(effective, have ? disposition : NULL, load->download_filename))
+            return false; /* Refuse body delivery; native confirmation owns any save. */
+    }
     /* A redirect from an ordinary sign-in page must not start parsing the
        full service application before the facade can select its provider. */
     if (site_adapter_handles_navigation("GET", effective)) {
@@ -1857,10 +1867,15 @@ static void navigation_page_relocate_runtime_storage(
     if (session->page.runtime != NULL) {
         script_runtime_relocate_document_storage(
             session->page.runtime, &session->page.document);
+        /* set_layout snapshots the stylesheet generations. Rebind every
+           input it reads before touching the moved layout: the candidate
+           session which held the old inline stylesheet is already freed. */
+        script_runtime_set_stylesheet(session->page.runtime,
+                                      &session->page.stylesheet);
         script_runtime_set_layout(session->page.runtime,
                                   &session->page.layout,
                                   session->viewport.css_height);
-        script_runtime_set_synchronous_layout_callback(session->page.runtime,
+        script_runtime_set_geometry_layout_callback(session->page.runtime,
             navigation_flush_committed_geometry, session);
         /* Transactional promotion memcpy-moves the inline NavigationPage.
            The realm's publication target must follow that move just like
@@ -1869,8 +1884,6 @@ static void navigation_page_relocate_runtime_storage(
            session address and its native surface becomes orphaned. */
         script_runtime_set_images(session->page.runtime,
                                   &session->page.images);
-        script_runtime_set_stylesheet(session->page.runtime,
-                                      &session->page.stylesheet);
         script_runtime_relocate_messaging_opaque(session->page.runtime,
                                                  session);
         /* The retirement observer also retains the session address. */
@@ -2285,6 +2298,12 @@ const char *navigation_load_adapter_redirect(const NavigationLoad *load)
 {
     return load != NULL && load->adapter_redirect
         ? load->effective_history_url : NULL;
+}
+
+const char *navigation_load_download_filename(const NavigationLoad *load)
+{
+    return load != NULL && load->download_filename[0] != '\0'
+        ? load->download_filename : NULL;
 }
 
 bool navigation_load_url(NavigationSession *session, uint64_t generation,

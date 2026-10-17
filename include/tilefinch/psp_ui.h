@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "tilefinch/zip_install.h"
 
 #include "tilefinch/diagnostic_qr.h"
 #include "tilefinch/diagnostics.h"
@@ -107,6 +108,7 @@ typedef struct {
     char trailing[PSP_UI_COLLECTIONS_TRAILING_CAPACITY];
     bool deletable;
     bool is_web_app;
+    bool is_file;
     bool app_theme_valid;
     uint16_t app_theme_rgb565;
     uint16_t progress_per_mille;
@@ -151,6 +153,11 @@ typedef struct {
     uint8_t operation;
     bool theme_color_valid;
 } PspUiOfflineAppPreview;
+
+typedef struct {
+    char name[128];
+    char origin[320];
+} PspUiFileDownloadPreview;
 
 typedef enum {
     PSP_UI_BUTTON_UP       = 1u << 0,
@@ -273,7 +280,12 @@ typedef enum {
     PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
     PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW,
     PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER,
-    PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE
+    PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE,
+    PSP_UI_ACTION_DOWNLOAD_LINK,
+    PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD,
+    PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD,
+    PSP_UI_ACTION_CONFIRM_ZIP_INSTALL,
+    PSP_UI_ACTION_CANCEL_ZIP_INSTALL
 } PspUiAction;
 
 /* Stable diagnostic spelling shared by the operation journal and validation
@@ -578,7 +590,9 @@ typedef enum {
        X Install / O Cancel. An overlay over the page; appended so the
        surfaces above keep their numbers. */
     PSP_UI_SCREEN_GLYPH_OFFER,
-    PSP_UI_SCREEN_YOUTUBE_LOGIN
+    PSP_UI_SCREEN_YOUTUBE_LOGIN,
+    PSP_UI_SCREEN_FILE_DOWNLOAD,
+    PSP_UI_SCREEN_ZIP_INSTALL
 } PspUiScreen;
 
 /* True for the native surfaces above, which draw instead of the page. */
@@ -825,6 +839,8 @@ typedef struct {
         const PspUiHomeView *home;
         const PspUiCollectionsView *collections;
         const PspUiOfflineAppPreview *offline_app_preview;
+        const PspUiFileDownloadPreview *file_download_preview;
+        const ZipInstallPreview *zip_install_preview;
     };
     unsigned browser_ui_scale;
     unsigned page_font_percent;
@@ -1291,6 +1307,9 @@ void psp_ui_set_collections(
     PspUiState *ui, const PspUiCollectionsView *collections);
 void psp_ui_show_offline_app_preview(
     PspUiState *ui, const PspUiOfflineAppPreview *preview);
+void psp_ui_show_file_download(PspUiState *ui,
+                               const PspUiFileDownloadPreview *preview);
+void psp_ui_show_zip_install(PspUiState *ui, const ZipInstallPreview *preview);
 /* The same panel offered from Library > Saved (a recompile): Circle
    returns to the Library instead of Page tools. */
 void psp_ui_show_offline_app_offer(

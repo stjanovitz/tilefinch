@@ -7712,7 +7712,7 @@ enum {
     X(TEXT_WRAP_STYLE, "text-wrap-style", true, CSP_SPARSE_MODERN) \
     X(TOP, "top", true, 0) \
     X(TOUCH_ACTION, "touch-action", true, CSP_SPARSE_MODERN) \
-    X(TRANSFORM, "transform", true, 0) \
+    X(TRANSFORM, "transform", true, CSP_STYLE_ONLY) \
     X(TRANSFORM_ORIGIN, "transform-origin", true, CSP_USED_GEOMETRY) \
     X(TRANSFORM_STYLE, "transform-style", true, CSP_SPARSE_MODERN) \
     X(TRANSITION, "transition", false, 0) \
@@ -8376,18 +8376,22 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
     bool used_geometry_property = (property_flags & CSP_USED_GEOMETRY) != 0;
     /* Hydration often toggles a class and immediately asks whether a node
        is visible. These values resolve from the current DOM/cascade without
-       rebuilding geometry. Keep the conservative path for stylesheet changes
-       and container-dependent rules, whose cascade needs fresh layout.
+       rebuilding geometry. A geometry-only callback cannot install pending
+       stylesheets, so such reads need no scratch flow even during resource
+       changes. Other host callbacks can refresh the cascade and retain the
+       conservative path, as do container-dependent rules.
        Container-relative units may exist only in style attributes; the
        last layout's collected container state reveals those too. */
     bool independent_style_property = (property_flags & CSP_STYLE_ONLY) != 0;
-    bool style_only = independent_style_property
-        && bridge->mutations.count != 0
-        && !bridge->mutations.overflowed
-        && !bridge->mutations.resource_rebuild_required
-        && !bridge->mutations.conservative_resource_scan
-        && !stylesheet_has_container_queries(bridge->stylesheet)
+    bool geometry_independent = !stylesheet_has_container_queries(bridge->stylesheet)
         && !style_container_layout_state_present(bridge->stylesheet);
+    bool style_only = independent_style_property
+        && (bridge->synchronous_layout_geometry_only
+            || (bridge->mutations.count != 0
+                && !bridge->mutations.overflowed
+                && !bridge->mutations.resource_rebuild_required
+                && !bridge->mutations.conservative_resource_scan))
+        && geometry_independent;
     /* Transitions and the watcher's snapshots need the cascade, not
        geometry: only a stylesheet change waiting to be applied forces the
        flush. */
@@ -8398,11 +8402,24 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
         && (bridge->mutations.overflowed
             || bridge->mutations.resource_rebuild_required
             || bridge->mutations.conservative_resource_scan);
-    if (cascade_only ? sheet_stale
+    /* Overflow can request a later whole-page resource audit, but a
+       geometry-only callback cannot install those sources. Rebuilding the
+       same scratch flow for every transition property cannot freshen the
+       cascade. Container-dependent rules still need their geometry. */
+    bool cascade_refresh = sheet_stale
+        && (!bridge->synchronous_layout_geometry_only || !geometry_independent);
+    if (cascade_only ? cascade_refresh
         : ((bridge->relayout_dirty != NULL && *bridge->relayout_dirty
             && !style_only)
            || (bridge->layout == NULL && used_geometry_property))) {
-        if (js_rt_bridge_flush_synchronous_layout(bridge)) {
+#ifndef TILEFINCH_NO_TRACE
+        if (tilefinch_trace_runtime_steps())
+            fprintf(stderr, "computed-style-layout property=%s independent=%d queries=%d containers=%d\n",
+                    name, (int) independent_style_property,
+                    (int) stylesheet_has_container_queries(bridge->stylesheet),
+                    (int) style_container_layout_state_present(bridge->stylesheet));
+#endif
+        if (js_rt_bridge_flush_synchronous_layout(bridge, node)) {
             if (!js_rt_notify_style_flushed(context)) return JS_EXCEPTION;
             node = js_rt_bridge_node_arg(context, bridge, argv[0]);
             if (node == NULL || bridge->stylesheet == NULL)
@@ -9128,7 +9145,8 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
             : computed_style_overflow_x_hidden(&style) ? "hidden"
             : (style.overflow_x_scroll ? "auto" : "visible");
         const char *y = style.overflow_y_clip_only
-            ? "clip" : (style.overflow_y_scroll ? "auto" : "visible");
+            ? "clip" : style.overflow_y_hidden ? "hidden"
+            : (style.overflow_y_scroll ? "auto" : "visible");
         if (strcmp(x, y) == 0) snprintf(value, sizeof(value), "%s", x);
         else snprintf(value, sizeof(value), "%s %s", x, y);
     } else if (id == CSP_OVERFLOW_X) {
@@ -9138,7 +9156,8 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
                  : (style.overflow_x_scroll ? "auto" : "visible"));
     } else if (id == CSP_OVERFLOW_Y) {
         snprintf(value, sizeof(value), "%s", style.overflow_y_clip_only
-                 ? "clip" : (style.overflow_y_scroll ? "auto" : "visible"));
+                 ? "clip" : style.overflow_y_hidden ? "hidden"
+                 : (style.overflow_y_scroll ? "auto" : "visible"));
     } else if (id == CSP_SCROLLBAR_GUTTER) {
         snprintf(value, sizeof(value), "%s",
                  style.scrollbar_gutter_stable ? "stable" : "auto");
@@ -9487,8 +9506,19 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
                      (double) alpha / 255.0);
         }
     } else if (id == CSP_TRANSFORM) {
+        /* This serializer retains percentage translations rather than a
+           box-dependent matrix. It needs the cascade, not scratch layout. */
         if (!style.has_transform) {
             snprintf(value, sizeof(value), "none");
+        } else if (style.transform_x > STYLE_LENGTH_DIRECT_LIMIT
+                   || style.transform_y > STYLE_LENGTH_DIRECT_LIMIT) {
+            const LayoutNodeBox *box = bridge->layout == NULL ? NULL
+                : layout_box_for_node(bridge->layout, node);
+            int x, y;
+            style_transform_resolve_translation(bridge->stylesheet, &style,
+                box == NULL ? 0 : box->width, box == NULL ? 0 : box->height,
+                &x, &y);
+            snprintf(value, sizeof(value), "translate(%dpx, %dpx)", x, y);
         } else {
             snprintf(value, sizeof(value), "translate(%d%s, %d%s)",
                      style.transform_x,

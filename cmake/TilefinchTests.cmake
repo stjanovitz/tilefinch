@@ -781,6 +781,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;architecture;lifecycle"
         ENVIRONMENT "TILEFINCH_TRACE_TASKS=1"
         TIMEOUT 30)
+    # Incremental commit frees the candidate session before rebinding the
+    # live runtime. Keep this small ownership journey in the sanitizer lane:
+    # set_layout must not snapshot the candidate's freed inline stylesheet.
+    add_test(NAME tilefinch-candidate-runtime-relocation-tests
+        COMMAND tilefinch-browser-engine-tests --pointer-search-only)
+    set_tests_properties(tilefinch-candidate-runtime-relocation-tests PROPERTIES
+        LABELS "tilefinch;unit;navigation;lifecycle;sanitizer"
+        TIMEOUT 30)
     add_test(NAME tilefinch-search-video-journey-tests
         COMMAND tilefinch-browser-engine-tests --search-video-journey-only)
     set_tests_properties(tilefinch-search-video-journey-tests PROPERTIES
@@ -854,6 +862,20 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-offline-library-tests PROPERTIES
         LABELS "tilefinch;unit;storage;psp"
         TIMEOUT 10)
+
+    tilefinch_add_test_binary(tilefinch-file-download-tests
+        tests/test_file_download.c src/psp_offline_store.c)
+    target_link_libraries(tilefinch-file-download-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-file-download-tests COMMAND tilefinch-file-download-tests)
+    set_tests_properties(tilefinch-file-download-tests PROPERTIES
+        LABELS "tilefinch;unit;storage;psp" TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-zip-install-tests
+        tests/test_zip_install.c src/psp_offline_store.c)
+    target_link_libraries(tilefinch-zip-install-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-zip-install-tests COMMAND tilefinch-zip-install-tests)
+    set_tests_properties(tilefinch-zip-install-tests PROPERTIES
+        LABELS "tilefinch;unit;storage;security;psp" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-offline-app-limits-tests
         tests/test_offline_app_limits.c)
@@ -1869,6 +1891,11 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     # Python is required above for host test registration.
     if(NOT PSP)
+        add_test(NAME tilefinch-allocator-pgo-tool-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_allocator_pgo_tool.py)
+        set_tests_properties(tilefinch-allocator-pgo-tool-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 15)
         add_test(NAME tilefinch-quickjs-pgo-training-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quickjs_pgo_training.py)

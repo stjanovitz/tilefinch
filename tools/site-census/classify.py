@@ -50,7 +50,7 @@ RULES = [
              "nativo.com", "kargo.com", "33across.com", "permutive.com",
              "permutive.app", "id5-sync.com", "liadm.com", "tapad.com",
              "btloader.com", "ad-delivery.net", "adthrive", "mediavine",
-             "freestar", "pub.network", "carbonads.net", "buysellads",
+             "freestar", "pub.network", "ay.delivery", "carbonads.net", "buysellads",
              "ezoic", "aniview.com", "vidazoo.com", "seedtag.com",
              "confiant-integrations.net", "clean.gg", "blockthrough",
              "admiral", "getadmiral.com", "/ads/", "/ad-", "adsbygoogle",
@@ -202,6 +202,10 @@ def classify(script_url, page_url, kind="external"):
             continue
         for needle in needles:
             if needle in url:
+                # A short legacy script basename must not match the random
+                # suffix of a content bundle (for example audio-abcgga.js).
+                if needle == "ga.js" and urlsplit(url).path.rsplit("/", 1)[-1] != needle:
+                    continue
                 # Generic words (pixel, metrics, beacon, consent, /ads/) only
                 # count on third-party hosts: sites name their own bundles
                 # after features.

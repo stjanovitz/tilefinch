@@ -24,8 +24,6 @@
  * FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT | FT_LOAD_NO_BITMAP |
  * FT_LOAD_NO_SVG. Everything below is reachable only through APIs it never
  * calls, so the outlines, advances and kerning it reads do not change:
- * - variation fonts: no design coordinates are ever set, so FreeType already
- *   loads the default instance (the plain `glyf' outlines);
  * - COLR/CPAL layers and OT-SVG documents: colour glyphs are never requested
  *   (no FT_LOAD_COLOR, and FT_LOAD_NO_SVG);
  * - glyph names from `post', `name'-table access (FT_Get_Sfnt_Name), BDF
@@ -35,7 +33,8 @@
  * - Mac resource-fork and dfont containers: browsers do not accept them as
  *   web fonts; without the fallback such data fails to load like any other
  *   unknown format. */
-#undef TT_CONFIG_OPTION_GX_VAR_SUPPORT
+/* Bounded page-font weight instances use the GX outlines and HVAR metrics. */
+#undef TT_CONFIG_OPTION_GPOS_KERNING
 #undef TT_CONFIG_OPTION_COLOR_LAYERS
 #undef TT_SUPPORT_COLRV1
 #undef FT_CONFIG_OPTION_SVG

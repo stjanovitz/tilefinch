@@ -979,6 +979,131 @@ static bool computed_style_test_flush(void *opaque)
     return navigation_relayout(opaque);
 }
 
+static int test_geometry_only_callback_skips_style_only_flow(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><style>#target{width:100px;color:#010203}"
+        ".hidden{visibility:hidden}</style><div id=target>Current styles</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://style-flow.test/", page, sizeof(page) - 1, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    ScriptResult result = {0};
+    size_t snapshots = navigation->page.script_result.geometry_snapshot_builds;
+    /* Exercise the actual callback installed by transactional page promotion.
+       An unrelated pending stylesheet must not force flow merely to read
+       current inline/class visibility. The callback cannot install it. */
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.target=document.getElementById('target');"
+        "const pending=document.createElement('style');"
+        "pending.textContent='#unrelated{color:red}';document.head.appendChild(pending);"
+        "target.className='hidden';"
+        "if(getComputedStyle(target).visibility!=='hidden')throw Error('hidden');"
+        "target.style.color='rgb(3, 4, 5)';"
+        "if(getComputedStyle(target).color!=='rgb(3, 4, 5)')throw Error('color');",
+        "<geometry-only-style-read>", &result) && result.success
+        && result.geometry_snapshot_builds == snapshots
+        && script_runtime_has_pending_mutations(navigation->page.runtime));
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "target.style.width='123px';"
+        "if(getComputedStyle(target).width!=='123px')throw Error('width');",
+        "<geometry-only-width-read>", &result) && result.success
+        && result.geometry_snapshot_builds > snapshots);
+    CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
+    /* Replacing the callback must also replace its capability. A callback
+       that really installs new rules must still run before a color read. */
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    size_t relayouts = navigation->incremental_relayouts;
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "const fresh=document.createElement('style');"
+        "fresh.textContent='#target{color:rgb(22, 33, 44)!important}';"
+        "document.head.appendChild(fresh);"
+        "if(getComputedStyle(target).color!=='rgb(22, 33, 44)')throw Error('fresh sheet');",
+        "<stylesheet-capable-callback>", &result) && result.success
+        && navigation->incremental_relayouts > relayouts);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_focus_paint_geometry_reuse(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] = "<!doctype html><style>"
+        "button{width:80px;height:24px;border:1px solid gray;border-radius:4px}"
+        "#paint:focus{border-color:red}#size:focus{width:100px}"
+        "#rel:focus+#sibling{width:123px}"
+        "</style><button id=paint>Paint</button><button id=size>Size</button>"
+        "<button id=rel>Related</button><div id=sibling>Sibling</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://focus-geometry.test/", page, sizeof(page)-1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    size_t snapshots = navigation->page.script_result.geometry_snapshot_builds;
+    size_t relayouts = navigation->incremental_relayouts;
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.paint=document.getElementById('paint');"
+        "const width=paint.getBoundingClientRect().width;paint.focus();"
+        "for(let i=0;i<40;i++)if(paint.getBoundingClientRect().width!==width)"
+        "throw Error('paint moved');pocSummary='PAINT-GEOMETRY';",
+        "<focus-paint-geometry>", &result) && result.success
+        && result.geometry_snapshot_builds == snapshots
+        && result.geometry_snapshot_hits >= 40u
+        && navigation->incremental_relayouts == relayouts
+        && script_runtime_has_pending_mutations(navigation->page.runtime));
+    CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
+    bool red_border = false;
+    for (size_t i = 0; i < navigation->page.layout.count; i++) {
+        const DrawCommand *command = &navigation->page.layout.commands[i];
+        red_border |= command->type == DRAW_STROKE_RECT && command->color == 0xff0000;
+    }
+    CHECK(red_border);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "const size=document.getElementById('size');"
+        "const old=size.getBoundingClientRect().width;size.focus();"
+        "if(size.getBoundingClientRect().width!==old+20)throw Error('stale size');",
+        "<focus-size-geometry>", &result) && result.success
+        && result.geometry_snapshot_builds > snapshots);
+    snapshots = result.geometry_snapshot_builds;
+    CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "document.getElementById('rel').focus();"
+        "if(document.getElementById('sibling').getBoundingClientRect().width!==123)"
+        "throw Error('stale sibling');", "<focus-relative-geometry>", &result)
+        && result.success && result.geometry_snapshot_builds > snapshots);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    engine = browser_engine_create(&config, error, sizeof(error));
+    static const char literal[] = "<!doctype html><style>"
+        "#literal[data-tilefinch-focus]+#sibling{width:123px}"
+        "</style><button id=literal>Literal</button><div id=sibling>Sibling</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://focus-geometry.test/literal", literal, sizeof(literal)-1u, true));
+    navigation = browser_engine_navigation(engine);
+    snapshots = navigation->page.script_result.geometry_snapshot_builds;
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "document.getElementById('literal').focus();"
+        "if(document.getElementById('sibling').getBoundingClientRect().width!==123)"
+        "throw Error('literal marker sibling');", "<focus-literal-geometry>", &result)
+        && result.success && result.geometry_snapshot_builds > snapshots);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_computed_paint_style_does_not_force_layout(void)
 {
     BrowserDeviceProfile profile;
@@ -1070,6 +1195,18 @@ static int computed_style_container_geometry_case(bool inline_units)
     NavigationSession *navigation = browser_engine_navigation(engine);
     CHECK(navigation->page.stylesheet.has_container_relative_units
           == !inline_units);
+    ScriptResult native_result = {0};
+    /* The production geometry-only callback must still flush styles whose
+       values depend on container geometry, including units written inline
+       when the sheet itself contains no container query or relative unit. */
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "(()=>{const side=document.getElementById('side');"
+        "side.style.width='200px';"
+        "const spacing=parseFloat(getComputedStyle(document.getElementById('u')).letterSpacing);"
+        "const width=document.getElementById('box').clientWidth;"
+        "if(Math.abs(spacing-width/50)>.51)throw Error('native container');"
+        "side.style.width=''})()", "<native-container-style>", &native_result)
+        && native_result.success && native_result.geometry_snapshot_builds > 0);
     script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
         computed_style_test_flush, navigation);
     ScriptResult result = {0};
@@ -1361,7 +1498,8 @@ static int test_computed_style_resolved_values(void)
         "<div id=calc0px>b</div><div id=calcdiff>c</div>"
         "<div id=calcsix>d</div><div id=invalidzero>i</div>"
         "<div id=invalidangle>a</div><div id=invalidpercent>p</div>"
-        "<div id=zerolines>Visible<br>overflow<br>text</div>";
+        "<div id=zerolines>Visible<br>overflow<br>text</div>"
+        "<div id=empty-auto><span style='display:none'>Hidden</span></div>";
     CHECK(engine != NULL && browser_engine_commit_html(engine,
         "https://style-values.test/", page, sizeof(page) - 1, true));
     NavigationSession *navigation = browser_engine_navigation(engine);
@@ -1370,6 +1508,13 @@ static int test_computed_style_resolved_values(void)
     ScriptResult result = {0};
     static const char source[] =
         "(()=>{const bad=[];"
+        /* A real zero-height box is not a missing layout. No fallback style
+           walk should run merely because a hidden descendant exists. */
+        "{const original=getComputedStyle;let reads=0;"
+        "globalThis.getComputedStyle=(...args)=>{reads++;return original(...args)};"
+        "let rect;try{rect=document.getElementById('empty-auto').getBoundingClientRect()}"
+        "finally{globalThis.getComputedStyle=original}"
+        "if(rect.height!==0||reads!==0)bad.push('empty authoritative='+rect.height+':'+reads);}"
         "const want=(id,name,expected)=>{const got=getComputedStyle("
         "document.getElementById(id)).getPropertyValue(name);"
         "if(got!==expected)bad.push(id+'.'+name+'='+JSON.stringify(got));};"
@@ -2397,6 +2542,7 @@ static int test_transition_watch_scopes(void)
         "<!doctype html><style>"
         ".t{transition:opacity 30ms,visibility 30ms}"
         "body.dim .a{opacity:.5}"
+        "html[data-tone=dim] #d{opacity:.2}"
         "#flag.on+#list .b{opacity:.4}"
         "body:has(#u.hot) .c{opacity:.3}"
         "</style><body><div id=flag></div><div id=list>"
@@ -2407,7 +2553,8 @@ static int test_transition_watch_scopes(void)
     CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
     bool ok = true;
     ok &= transition_expect(&page, "<watch-scopes-setup>",
-        "(()=>{const log=[];globalThis.__census=()=>"
+        "(()=>{const log=[];globalThis.__clearTransitionLog=()=>log.length=0;"
+        "globalThis.__census=()=>"
         "__tilefinchRootCensus.transitionSnapshots;"
         "for(const id of ['a','b','c','d'])document.getElementById(id)"
         ".addEventListener('transitionend',event=>{log.push(id+':'+"
@@ -2421,6 +2568,17 @@ static int test_transition_watch_scopes(void)
         "Promise.resolve().then(()=>{globalThis.pocSummary="
         "'unrelated snapshots='+(__census()-before)})})()",
         16, 0, "unrelated snapshots=0");
+    ok &= transition_expect(&page, "<watch-scopes-root-bookkeeping>",
+        "(()=>{const before=__census();"
+        "document.documentElement.dataset.inputElement='button';"
+        "document.documentElement.dataset.inputClasses='action';"
+        "Promise.resolve().then(()=>{globalThis.pocSummary="
+        "'root snapshots='+(__census()-before)})})()",
+        16, 0, "root snapshots=0");
+    ok &= transition_expect(&page, "<watch-scopes-root-selector>",
+        "document.documentElement.dataset.tone='dim'", 16, 8, "d:opacity");
+    ok &= transition_expect(&page, "<watch-scopes-clear-log>",
+        "__clearTransitionLog();globalThis.pocSummary='ready'", 16, 0, "ready");
     ok &= transition_expect(&page, "<watch-scopes-ancestor-class>",
         "document.body.classList.add('dim')", 16, 8, "a:opacity");
     ok &= transition_expect(&page, "<watch-scopes-sibling-class>",
@@ -2433,6 +2591,72 @@ static int test_transition_watch_scopes(void)
         "document.getElementById('list').style.visibility='hidden'", 16, 8,
         "a:opacity,a:visibility,b:opacity,b:visibility,c:opacity,"
         "c:visibility,d:visibility");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+/* Delegated frameworks register several transition types and both phases on
+   the same root. Only the first registration needs descendant discovery;
+   later DOM/style mutations still discover newly transitioning children. */
+static int test_transition_listener_discovery_reuse(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.t{transition:opacity 30ms}</style>"
+        "<body><div id=root></div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = transition_expect(&page, "<listener-discovery-reuse>",
+        "(()=>{const root=document.getElementById('root');"
+        "for(let i=0;i<24;i++){const child=document.createElement('div');"
+        "child.className='t';root.appendChild(child)}"
+        "const count=()=>__tilefinchRootCensus.transitionDiscoveryVisits||0;"
+        "const before=count();root.addEventListener('transitionend',()=>{});"
+        "const initial=count()-before,registered=count();"
+        "for(const type of ['transitionrun','transitionstart','transitionend',"
+        "'transitioncancel'])for(const capture of [false,true])"
+        "root.addEventListener(type,()=>{},capture);"
+        "globalThis.pocSummary='initial='+initial+' repeat='+"
+        "(count()-registered)})()",
+        16, 2, "initial=24 repeat=0");
+    ok &= transition_expect(&page, "<listener-discovery-new-child>",
+        "(()=>{const root=document.getElementById('root');"
+        "const child=document.createElement('div');child.id='late';"
+        "child.className='t';root.appendChild(child);"
+        "root.addEventListener('transitionend',event=>{"
+        "if(event.target===child)globalThis.pocSummary='late:'+"
+        "event.propertyName});globalThis.pocSummary='added'})()",
+        16, 2, "added");
+    ok &= transition_expect(&page, "<listener-discovery-new-transition>",
+        "document.getElementById('late').style.opacity='0'",
+        16, 6, "late:opacity");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+static int test_transition_discovery_uses_changed_subtree(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.t{transition:opacity 30ms}</style>"
+        "<body><div id=unrelated></div><section id=changed><div id=late>"
+        "child</div></section></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = transition_expect(&page, "<discovery-subtree-setup>",
+        "(()=>{const other=document.getElementById('unrelated');"
+        "for(let i=0;i<160;i++)other.appendChild(document.createElement('div'));"
+        "document.body.addEventListener('transitionend',event=>{"
+        "if(event.target.id==='late')pocSummary='late:'+event.propertyName});"
+        "pocSummary='ready'})()", 16, 2, "ready");
+    ok &= transition_expect(&page, "<discovery-subtree-mutation>",
+        "globalThis.discoveryBefore=__tilefinchRootCensus.transitionDiscoveryVisits;"
+        "document.getElementById('late').className='t';pocSummary='changed'",
+        16, 2, "changed");
+    ok &= transition_expect(&page, "<discovery-subtree-count>",
+        "pocSummary=(__tilefinchRootCensus.transitionDiscoveryVisits-"
+        "discoveryBefore<8)?'bounded':'whole-root'", 16, 1, "bounded");
+    ok &= transition_expect(&page, "<discovery-subtree-transition>",
+        "document.getElementById('late').style.opacity='0'",
+        16, 6, "late:opacity");
     CHECK(transition_page_close(&page) && ok);
     return 0;
 }

@@ -988,11 +988,8 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
     FontFamily family = font_context_metric_family(
         layout->web_fonts, draw_command_font_family(command), face);
     unsigned weight = (unsigned) draw_command_font_weight_code(command) * 10u;
-    bool synthetic_bold = weight >= LAYOUT_SYNTHETIC_WEIGHT
-        && (face == NULL || face->authored_weight != weight)
-        && (weight < LAYOUT_BOLD_FACE_WEIGHT
-            || !font_context_face_is_bold(
-                   layout->fonts, layout->web_fonts, face));
+    bool synthetic_bold = font_face_needs_synthetic_bold(
+        layout->fonts, layout->web_fonts, face, weight);
     char encoded[4];
     size_t length = sequence == NULL
         ? bidi_encode(codepoint, encoded) : sequence_length;
@@ -1007,9 +1004,9 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
     if (previous != 0) {
         if (!draw_command_text_kerning_none(command)) {
             advance = layout_fixed_add(
-                advance, font_kerning_at_size_fixed(
-                    face, previous, codepoint,
-                    draw_command_text_font_size_fixed(command)));
+                advance, font_kerning_for_family_at_size_fixed(
+                    face, family, previous, codepoint,
+                    draw_command_text_font_size_fixed(command), bold_face));
         }
         advance = layout_fixed_add(
             advance, draw_command_text_letter_spacing_fixed(command));

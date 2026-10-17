@@ -455,6 +455,37 @@ static void collect_node_text(lxb_dom_node_t *node, char *output,
     output[*used] = '\0';
 }
 
+/* Allocation-free continuity receipt, including when author JS has exhausted
+   its heap. Traverse only this subtree and refuse oversized diagnostics rather
+   than silently reporting a hash of a truncated prefix. */
+static bool diagnostic_text_checksum(lxb_dom_node_t *root, size_t *bytes,
+                                     uint32_t *hash)
+{
+    *bytes = 0;
+    *hash = UINT32_C(2166136261);
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = root; node != NULL;) {
+        if (++visited > 262144u) return false;
+        size_t length = 0;
+        const unsigned char *text = (const unsigned char *)
+            document_text_data(node, &length);
+        if (text != NULL) {
+            if (length > 1048576u - *bytes) return false;
+            for (size_t i = 0; i < length; i++)
+                *hash = (*hash ^ text[i]) * UINT32_C(16777619);
+            *bytes += length;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    return true;
+}
+
 static lxb_dom_node_t *find_external_script(lxb_dom_node_t *node)
 {
     for (; node != NULL; node = node->next) {

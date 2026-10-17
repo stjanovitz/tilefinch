@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 
 #include <lexbor/tag/tag.h>
 
@@ -3642,11 +3643,22 @@ static uint64_t stylesheet_scope_mask_of(const StyleAdoptedScopeRoot *roots,
     return 0;
 }
 
-bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
-                                   const PocDocument *document,
-                                   const lxb_dom_node_t **changed,
-                                   size_t capacity, size_t *changed_count,
-                                   bool *global)
+static uint64_t stylesheet_remap_scope_mask(uint64_t mask,
+                                            const uint8_t remap[64])
+{
+    uint64_t result = 0;
+    for (size_t i = 0; i < 64; i++) {
+        if ((mask & (UINT64_C(1) << i)) != 0 && remap[i] < 64)
+            result |= UINT64_C(1) << remap[i];
+    }
+    return result;
+}
+
+bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global)
 {
     if (changed_count != NULL) *changed_count = 0;
     if (global != NULL) *global = false;
@@ -3655,6 +3667,23 @@ bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
     if (sources > sheet->style_source_count || sheet->style_sources_bounded_out)
         sources = 0;
     size_t base = sheet->style_source_count - sources;
+    uint8_t remap[64];
+    bool tracked = previous_sources != NULL && previous_count <= 64
+        && sources <= 64 && !sheet->adopted_scopes_failed;
+    uint64_t existing = 0;
+    memset(remap, 0xff, sizeof(remap));
+    for (size_t i = 0; tracked && i < previous_count; i++) {
+        for (size_t k = 0; k < sources; k++) {
+            if (previous_sources[i] == sheet->style_source_nodes[base + k]) {
+                remap[i] = (uint8_t) k;
+                existing |= UINT64_C(1) << k;
+                break;
+            }
+        }
+        /* Removal is not an append. Fall back if the caller cannot prove
+           that all previously scoped sources still exist. */
+        if (remap[i] == UINT8_MAX) tracked = false;
+    }
     StyleAdoptedScopeRoot roots[DOCUMENT_ADOPTION_ROOT_LIMIT];
     size_t root_count = 0;
     uint64_t document_mask = 0, shadow_mask = 0;
@@ -3705,17 +3734,36 @@ bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
         const StyleAdoptedScopeRoot *against = pass == 0 ? old : roots;
         size_t against_count = pass == 0 ? old_count : root_count;
         for (size_t i = 0; i < from_count; i++) {
+            StyleAdoptedScopeRoot translated;
+            const StyleAdoptedScopeRoot *entry = &from[i];
+            if (tracked && pass == 1) {
+                translated = *entry;
+                translated.mask = stylesheet_remap_scope_mask(entry->mask, remap);
+                memset(translated.order, 0, sizeof(translated.order));
+                for (size_t k = 0; k < previous_count; k++)
+                    translated.order[remap[k]] = entry->order[k];
+                entry = &translated;
+            }
             uint64_t other = stylesheet_scope_mask_of(
-                against, against_count, from[i].root);
+                against, against_count, entry->root);
+            if (tracked && pass == 0)
+                other = stylesheet_remap_scope_mask(other, remap);
             bool same_order = false;
             for (size_t k = 0; k < against_count; k++) {
-                if (against[k].root == from[i].root) {
-                    same_order = memcmp(against[k].order, from[i].order,
-                                        sizeof(from[i].order)) == 0;
+                if (against[k].root == entry->root) {
+                    uint8_t order[64] = {0};
+                    const uint8_t *other_order = against[k].order;
+                    if (tracked && pass == 0) {
+                        for (size_t bit = 0; bit < previous_count; bit++)
+                            order[remap[bit]] = other_order[bit];
+                        other_order = order;
+                    }
+                    same_order = memcmp(other_order, entry->order,
+                                        sizeof(entry->order)) == 0;
                     break;
                 }
             }
-            if (other == from[i].mask && same_order) continue;
+            if (other == entry->mask && same_order) continue;
             /* A root listed with a different mask is reported once. A root
                only the old table lists is reported while it lives: the
                registry forgets a carrier before it is destroyed. */
@@ -3732,9 +3780,16 @@ bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
     }
     if (changed_count != NULL)
         *changed_count = reported < capacity ? reported : capacity;
+    uint64_t old_shadow = sheet->adopted_shadow_only_mask;
+    uint64_t old_document = sheet->adopted_document_mask;
+    if (tracked) {
+        old_shadow = stylesheet_remap_scope_mask(old_shadow, remap);
+        old_document = stylesheet_remap_scope_mask(old_document, remap);
+    }
     if (global != NULL)
-        *global = overflow || shadow_only != sheet->adopted_shadow_only_mask
-            || document_mask != sheet->adopted_document_mask;
+        *global = overflow
+            || ((shadow_only ^ old_shadow) & (tracked ? existing : UINT64_MAX)) != 0
+            || document_mask != old_document;
     sheet->adopted_document_mask = document_mask;
     memcpy(sheet->adopted_document_order, document_order,
            sizeof(document_order));
@@ -3786,6 +3841,16 @@ bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
         }
     }
     return true;
+}
+
+bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
+                                   const PocDocument *document,
+                                   const lxb_dom_node_t **changed,
+                                   size_t capacity, size_t *changed_count,
+                                   bool *global)
+{
+    return stylesheet_set_appended_adopted_scopes(sheet, document, NULL, 0,
+        changed, capacity, changed_count, global);
 }
 
 bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
@@ -4189,7 +4254,9 @@ void stylesheet_share_unchanged_web_fonts(Stylesheet *target,
                     const FontFace *face = &source->loaded.families[from].faces[sw];
                     if (!face->loaded || a->source_count != b->source_count
                         || target->web_fonts->loaded.families[to].weights[tw]
-                            != source->loaded.families[from].weights[sw]) continue;
+                            != source->loaded.families[from].weights[sw]
+                        || target->web_fonts->loaded.families[to].weight_max[tw]
+                            != source->loaded.families[from].weight_max[sw]) continue;
                     bool same = true;
                     for (size_t i = 0; i < a->source_count; i++) {
                         const char *ab = a->source_bases[i], *bb = b->source_bases[i];

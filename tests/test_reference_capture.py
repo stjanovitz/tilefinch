@@ -728,12 +728,6 @@ process.stdout.write(JSON.stringify(trace.records[0].cookies.map(
                 "unsupported cookie attribute Partitioned",
             ),
             (
-                "insecure-samesite-none",
-                "set-cookie-count=1\nset-cookie-0=a=x; SameSite=None; Path=/\n"
-                "set-cookie-url-0=https://capture.test/\n",
-                "SameSite=None requires Secure",
-            ),
-            (
                 "invalid-date",
                 "set-cookie-count=1\nset-cookie-0=a=x; Path=/; "
                 "Expires=Tue, 31 Feb 2026 00:00:00 GMT\n"
@@ -762,6 +756,19 @@ process.stdout.write(JSON.stringify(trace.records[0].cookies.map(
                 completed = inspect(trace)
                 self.assertEqual(completed.returncode, 2)
                 self.assertIn(expected, completed.stderr)
+
+    def test_insecure_samesite_none_is_ignored_without_rejecting_response(self) -> None:
+        script = r"""
+const capture = require(process.argv[1]);
+const parsed = capture.parseSetCookie('safe=x; SameSite=None; Path=/; Max-Age=0',
+  'https://capture.test/');
+process.stdout.write(JSON.stringify(capture.cookieReplayOperation(parsed, 2000000000, 1000)));
+"""
+        completed = subprocess.run((NODE, '-e', script, str(CAPTURE)),
+            capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout),
+            dict(action='ignore', reason='samesite-none-without-secure'))
 
     def test_expires_only_cookie_requires_trace_clock_during_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

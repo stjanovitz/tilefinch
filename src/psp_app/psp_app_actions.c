@@ -1103,6 +1103,11 @@ static void psp_app_dispatch_heavy_action(
                         || (youtube_save && source_entry != NULL
                             && youtube_watch_url_supported(
                                    source_entry->url));
+                    bool zip_preview = trusted_source && (strstr(action.url, "/offline/extract?id=")
+                        || strstr(action.url, "/offline/remove-homebrew?name=") || strstr(action.url, "/offline/homebrew"));
+                    if (zip_preview)
+                        psp_work_cooperate_begin(&app->process->presentation.ui, engine_frame,
+                            true, true, false, "STOPPING ZIP CHECK...", "zip-preview", NULL, NULL);
                     PspOfflineRouteResult offline_result =
                         trusted_source
                         ? psp_offline_store_handle_url(
@@ -1112,6 +1117,9 @@ static void psp_app_dispatch_heavy_action(
                                   ? NULL : source_entry->title,
                               true)
                         : PSP_OFFLINE_ROUTE_ERROR;
+                    if (zip_preview)
+                        psp_navigation_cooperate_end_adopting_buttons(
+                            "zip-preview", &app->interactive->previous_buttons);
                     if (!trusted_source)
                         psp_ui_show_status(
                             &app->process->presentation.ui, "OFFLINE SAVE LINK REFUSED", 180);
@@ -1125,6 +1133,9 @@ static void psp_app_dispatch_heavy_action(
                         app->process->presentation.ui.basic_mode = false;
                         (void) psp_engine_views_refresh(app->views, engine);
                         psp_sync_ui(&app->process->presentation.ui, engine, profile);
+                        if (offline_result == PSP_OFFLINE_ROUTE_ZIP_PREVIEW)
+                            psp_ui_show_zip_install(&app->process->presentation.ui,
+                                zip_install_preview(app->browser->offline_store.zip_install));
                         if (tabs != NULL)
                             (void) browser_tabs_capture_active(
                                 tabs, app->views->navigation);
@@ -1133,6 +1144,18 @@ static void psp_app_dispatch_heavy_action(
                             != PSP_OFFLINE_ROUTE_ERROR || frame->page_dirty;
                         break;
                     }
+                }
+                if (navigates && action.prefer_download) {
+                    bool shown = psp_offline_store_offer_file(
+                        &app->browser->offline_store, engine, action.url);
+                    (void) psp_engine_views_refresh(app->views, engine);
+                    psp_sync_ui(&app->process->presentation.ui, engine, profile);
+                    if (shown) psp_ui_show_file_download(&app->process->presentation.ui,
+                        psp_offline_store_file_preview(&app->browser->offline_store));
+                    frame->page_dirty |= shown;
+                    if (!shown) psp_ui_show_status(&app->process->presentation.ui,
+                                                  "DOWNLOAD PREVIEW UNAVAILABLE", 180);
+                    break;
                 }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
                 if (navigates && !psp_action_network_ready(
@@ -1381,6 +1404,60 @@ static void psp_app_dispatch_heavy_action(
                 (void) psp_engine_views_refresh(app->views, engine);
             }
             app->interactive->previous_buttons = 0;
+            break;
+        case PSP_UI_ACTION_DOWNLOAD_LINK: {
+            char url[NAVIGATION_URL_LIMIT];
+            bool shown = controller_focused_download_url(browser_engine_controller(engine), url, sizeof(url))
+                && psp_offline_store_offer_file(&app->browser->offline_store, engine, url);
+            (void) psp_engine_views_refresh(app->views, engine);
+            psp_sync_ui(&app->process->presentation.ui, engine, profile);
+            if (shown) psp_ui_show_file_download(&app->process->presentation.ui,
+                psp_offline_store_file_preview(&app->browser->offline_store));
+            frame->page_dirty |= shown;
+            if (!shown) psp_ui_show_status(&app->process->presentation.ui,
+                "FOCUS AN HTTPS DOWNLOAD LINK FIRST", 180);
+            break;
+        }
+        case PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD:
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            {
+                const PspUiFileDownloadPreview *offer =
+                    psp_offline_store_file_preview(&app->browser->offline_store);
+                if (offer == NULL || !psp_action_network_ready(app, "GET", offer->origin, engine_frame)) {
+                    psp_offline_store_discard_file(&app->browser->offline_store);
+                    break;
+                }
+            }
+#endif
+            (void) psp_offline_store_accept_file(&app->browser->offline_store);
+            psp_ui_show_status(&app->process->presentation.ui,
+                psp_offline_store_status(&app->browser->offline_store), 240);
+            break;
+        case PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD:
+            psp_offline_store_discard_file(&app->browser->offline_store);
+            break;
+        case PSP_UI_ACTION_CONFIRM_ZIP_INSTALL: {
+            bool removing = zip_install_preview(app->browser->offline_store.zip_install) != NULL
+                && zip_install_preview(app->browser->offline_store.zip_install)->removing;
+            psp_ui_show_status(&app->process->presentation.ui,
+                removing ? "REMOVING HOMEBREW - O STOP" : "INSTALLING HOMEBREW - O CANCEL", 600);
+            psp_work_cooperate_begin(&app->process->presentation.ui, engine_frame,
+                true, true, false, removing ? "STOPPING REMOVAL..." : "STOPPING INSTALLATION...", "zip-install", NULL, NULL);
+            (void) psp_offline_store_install_prepared_zip(&app->browser->offline_store);
+            psp_navigation_cooperate_end_adopting_buttons("zip-install", &app->interactive->previous_buttons);
+            psp_ui_show_status(&app->process->presentation.ui,
+                psp_offline_store_status(&app->browser->offline_store), 300);
+            if (removing) {
+                (void) psp_offline_store_handle_url(&app->browser->offline_store, engine, profile,
+                    "https://tilefinch.local/offline/homebrew", NULL, false);
+                (void) psp_engine_views_refresh(app->views, engine);
+                psp_sync_ui(&app->process->presentation.ui, engine, profile);
+                frame->page_dirty = true;
+            }
+            break;
+        }
+        case PSP_UI_ACTION_CANCEL_ZIP_INSTALL:
+            psp_offline_store_discard_zip(&app->browser->offline_store);
             break;
         case PSP_UI_ACTION_SAVE_FOR_LATER: {
             psp_ui_show_status(
@@ -2433,8 +2510,11 @@ recovery_reload: {
                         ? "video"
                         : selected_item != NULL
                               && selected_item->type == OFFLINE_ITEM_WEB_APP
-                            ? "app" : "article",
+                            ? "app" : selected_item != NULL
+                                && selected_item->type == OFFLINE_ITEM_FILE ? "file" : "article",
                     (unsigned) selected_id);
+                if (selected_id == 0)
+                    snprintf(offline_url, sizeof(offline_url), "https://tilefinch.local/offline/homebrew");
                 psp_text_input_before_navigation(&app->process->text_input);
                 psp_ui_leave_native_surface(&app->process->presentation.ui);
                 psp_leave_reader_for_navigation(

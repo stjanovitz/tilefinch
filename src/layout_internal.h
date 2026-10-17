@@ -667,8 +667,9 @@ typedef struct {
         int assumed_bottom;
     } bottom_fixups[LAYOUT_BOTTOM_FIXUP_LIMIT];
     size_t bottom_fixup_count;
-    /* Percentage-sized absolute descendants of an auto-height containing
-       block wait for its used padding box. No second layout or raster. */
+    /* Absolute descendants with percentage heights or vertical insets wait
+       for an auto-height containing block's used padding box. No second
+       layout or raster. */
     struct {
         lxb_dom_node_t *node, *containing_node, *link_container;
         int x, y, width;
@@ -923,6 +924,7 @@ typedef struct {
     bool floats_enabled;
     bool first_inline_block_collapses_top;
     bool text_overflow_ended;
+    bool inline_overflow_ellipsis;
     uint8_t clamp_limit;
     uint8_t clamp_lines;
     bool clamp_pending;
@@ -1164,8 +1166,8 @@ static inline size_t layout_pointer_hash(const void *pointer)
    synthetic emboldening pass runs when no bold face exists.  DrawCommand
    stores weights in ten-unit increments, so the encoded twin of the bold
    boundary is LAYOUT_BOLD_FACE_WEIGHT / 10. */
-#define LAYOUT_BOLD_FACE_WEIGHT 650
-#define LAYOUT_SYNTHETIC_WEIGHT 550
+#define LAYOUT_BOLD_FACE_WEIGHT TILEFINCH_FONT_BOLD_FACE_WEIGHT
+#define LAYOUT_SYNTHETIC_WEIGHT TILEFINCH_FONT_SYNTHETIC_WEIGHT
 
 /* Tracing.  TILEFINCH_TRACE_* environment variables are read once per build
    into LayoutDocument.trace_flags; defining TILEFINCH_NO_TRACE compiles every

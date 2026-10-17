@@ -801,11 +801,65 @@ static bool navigation_focus_paint_candidate(
     return valid;
 }
 
+enum { NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT = 4 };
+static bool navigation_layout_provisional(const NavigationSession *session);
+
+/* Geometry reads need not rebuild paint. Even where a retained ring cannot
+   be patched safely in z order, a local border/shadow/outline colour change
+   leaves boxes and scrollable overflow intact. The publication path still
+   sees the entire journal and performs its authoritative paint update. */
+static bool navigation_focus_geometry_unchanged(
+    NavigationSession *session, const ScriptMutationJournal *mutations)
+{
+    if (session == NULL || !session->page.loaded || session->style_rebuild_required
+        || session->page.image_continuation_pending
+        || session->page.visual_image_publication_pending
+        || navigation_layout_provisional(session)
+        || mutations == NULL || mutations->count == 0
+        || mutations->count > NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT
+        || mutations->overflowed || mutations->retirement_unobserved
+        || mutations->resource_rebuild_required
+        || mutations->image_resource_scan_required
+        || mutations->image_resource_refresh_required
+        || mutations->conservative_resource_scan) return false;
+    if (stylesheet_selectors_reference_attribute_prefix(
+            &session->page.stylesheet, "data-tilefinch-focus",
+            sizeof("data-tilefinch-focus") - 1u)) return false;
+    /* Reject mixed author work before running any two-state style proof. */
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind != SCRIPT_MUTATION_ATTRIBUTE || record->node == NULL
+            || strcmp(record->attribute, "data-tilefinch-focus") != 0)
+            return false;
+    }
+    ComputedStyle parent = {0};
+    lxb_dom_node_t *parent_of = NULL;
+    bool has_parent = false;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (parent_of == NULL || parent_of != record->node->parent) {
+            parent_of = record->node->parent;
+            if (!navigation_focus_parent_style(&session->page.stylesheet,
+                    record->node, &parent, &has_parent)) return false;
+        }
+        ComputedStyle normal, focused;
+        StyleFocusPseudoTranslation translation;
+        StyleFocusChange change = style_focus_pseudo_change_classify(
+            &session->page.stylesheet, record->node,
+            has_parent ? &parent : NULL, &normal, &focused, &translation, NULL);
+        if (change == STYLE_FOCUS_CHANGE_UNSAFE
+            || change == STYLE_FOCUS_CHANGE_PSEUDO_TRANSLATION_ONLY
+            || translation.visibility_changed
+            || translation.dx[0] || translation.dx[1]
+            || translation.dy[0] || translation.dy[1]) return false;
+    }
+    return true;
+}
+
 static bool navigation_mutations_are_paint_only_focus(
     NavigationSession *session, const ScriptMutationJournal *mutations,
-    bool *border_paint)
+    bool *border_paint, bool *local)
 {
-    enum { NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT = 4 };
     if (border_paint != NULL) *border_paint = false;
     if (session == NULL || mutations == NULL || mutations->count == 0
         || mutations->count > NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT
@@ -837,16 +891,13 @@ static bool navigation_mutations_are_paint_only_focus(
              && !navigation_focus_parent_style(
                     &session->page.stylesheet, record->node,
                     &parent, &has_parent)) return false;
-        candidates[i].change = style_focus_change_classify(
-                    &session->page.stylesheet, record->node,
-                    has_parent ? &parent : NULL,
-                    &candidates[i].normal,
-                    &candidates[i].focused);
-        if (candidates[i].change == STYLE_FOCUS_CHANGE_UNSAFE)
-            candidates[i].change = style_focus_pseudo_change_classify(
+        /* The pseudo-aware proof includes the ordinary paint proof. Do not
+           repeat its two marker toggles, style queries and dependency scans
+           after a non-pseudo refusal (geometry, inherited state, z-order). */
+        candidates[i].change = style_focus_pseudo_change_classify(
                 &session->page.stylesheet, record->node,
                 has_parent ? &parent : NULL, &candidates[i].normal,
-                &candidates[i].focused, &candidates[i].translation);
+                &candidates[i].focused, &candidates[i].translation, &local[i]);
         if (candidates[i].change == STYLE_FOCUS_CHANGE_UNSAFE) return false;
         candidates[i].node = record->node;
         size_t focus_length = 0;
@@ -900,8 +951,7 @@ static bool navigation_mutations_are_paint_only_focus(
     }
     unsigned width = computed_style_outline_width(&focused_style);
     unsigned line_style = computed_style_outline_style(&focused_style);
-    if (focused_node != NULL && width != 0 && width <= UINT8_MAX
-        && line_style != STYLE_OUTLINE_NONE && line_style <= UINT8_MAX) {
+    if (focused_node != NULL && width <= UINT8_MAX && line_style <= UINT8_MAX) {
         bool current_color =
             (focused_style.outline_state & STYLE_OUTLINE_CURRENT_COLOR) != 0;
         session->focus_outline_cache_node = focused_node;
@@ -918,8 +968,10 @@ static bool navigation_mutations_are_paint_only_focus(
               ? focused_style.color_alpha : focused_style.outline_alpha;
         session->focus_outline_cache_width = (uint8_t) width;
         session->focus_outline_cache_style = (uint8_t) line_style;
-        session->focus_outline_cache_valid =
-            session->focus_outline_cache_alpha != 0;
+        /* Absence is a proved result too. Otherwise the controller repeats
+           both marker states and their dependency scans merely to learn
+           again that this control has no authored outline. */
+        session->focus_outline_cache_valid = true;
     }
     return true;
 }
@@ -1125,6 +1177,14 @@ static bool navigation_try_append_style_sources(
     Stylesheet *sheet = &session->page.stylesheet;
     if (sheet->style_sources_bounded_out || sheet->count == 0)
         return navigation_style_append_refused("sources unknown");
+    const lxb_dom_node_t *previous_adopted[64];
+    size_t previous_count = sheet->adopted_source_count;
+    bool previous_known = previous_count <= 64
+        && previous_count <= sheet->style_source_count;
+    if (previous_known)
+        memcpy(previous_adopted,
+            sheet->style_source_nodes + sheet->style_source_count - previous_count,
+            previous_count * sizeof(previous_adopted[0]));
     lxb_dom_node_t *candidates[CANDIDATE_LIMIT];
     size_t count = 0;
     /* Whether every record describes its change exactly. A removal, a move,
@@ -1241,9 +1301,10 @@ static bool navigation_try_append_style_sources(
         return navigation_style_append_refused("candidate order");
     /* Adopted constructed sheets follow every document source, in the
        registry's order. The ones the sheet holds must be unchanged (same
-       sheets, order and text revisions); newly adopted ones may follow
-       them. Adoption by one more root of a sheet already held is no change
-       at all. */
+       sheets, relative order and text revisions). Newly adopted sources may
+       be inserted between them, using the same tracked order remap as an
+       ordinary style insertion. Adoption by one more root of a sheet already
+       held is no change at all. */
     lxb_dom_node_t *tier[DOCUMENT_ADOPTED_TIER_LIMIT];
     uint32_t tier_revisions[DOCUMENT_ADOPTED_TIER_LIMIT];
     uint32_t candidate_revisions[CANDIDATE_LIMIT];
@@ -1257,8 +1318,6 @@ static bool navigation_try_append_style_sources(
     for (size_t i = 0; i < tier_count; i++) {
         if (seen < sheet->style_source_count
             && sheet->style_source_nodes[seen] == tier[i]) {
-            if (found != first_adopted)
-                return navigation_style_append_refused("adopted order");
             known_adopted_hash = document_adopted_tier_hash(
                 known_adopted_hash, tier[i], tier_revisions[i]);
             known_adopted++;
@@ -1388,24 +1447,38 @@ static bool navigation_try_append_style_sources(
                 preload_count, appended_total, sheet->count, (int) lists_valid,
                 (int) context_changed, (int) precise);
 #endif
+    /* Appending parses at the tail before the tracked insertion remaps it.
+       Recompute the signature in final source order rather than keeping the
+       parser's append-order hash when new adopted sources were interleaved.
+       Optional sources refused by the source ceiling contribute no rules. */
+    sheet->adopted_sources_signature = 0;
+    for (size_t i = 0; i < tier_count; i++) {
+        if (stylesheet_style_source_known(sheet, tier[i]))
+            sheet->adopted_sources_signature = document_adopted_tier_hash(
+                sheet->adopted_sources_signature, tier[i], tier_revisions[i]);
+    }
     /* Which elements adopted rules reach follows the adoption lists: a
        root that began or stopped adopting a held sheet restyles its own
        subtree; a sheet gaining or losing document scope, everything. */
     const lxb_dom_node_t *rescoped[DOCUMENT_ADOPTION_ROOT_LIMIT];
     size_t rescoped_count = 0;
     bool rescoped_everything = false;
-    if (!stylesheet_set_adopted_scopes(
-            sheet, &session->page.document, rescoped,
+    if (!stylesheet_set_appended_adopted_scopes(
+            sheet, &session->page.document,
+            previous_known ? previous_adopted : NULL, previous_count, rescoped,
             DOCUMENT_ADOPTION_ROOT_LIMIT, &rescoped_count,
             &rescoped_everything)) rescoped_everything = true;
     if (session->page.layout_reuse != NULL) {
         if (rescoped_everything) {
             layout_reuse_cache_reset(session->page.layout_reuse);
         } else {
+            /* :host and ::slotted can reach outside the carrier itself.
+               Include its host and light children, not just the shadow tree. */
             for (size_t i = 0; i < rescoped_count; i++)
                 layout_reuse_cache_invalidate_tree(
                     session->page.layout_reuse,
-                    (lxb_dom_node_t *) rescoped[i], false);
+                    (lxb_dom_node_t *) (rescoped[i]->parent != NULL
+                        ? rescoped[i]->parent : rescoped[i]), false);
         }
     }
     session->page.compiled_stylesheet_cacheable = false;
@@ -1431,7 +1504,7 @@ static bool navigation_journal_inserted(void *context,
 
 static void navigation_prepare_layout_reuse(
     NavigationSession *session, const ScriptMutationJournal *mutations,
-    bool full_rebuild)
+    bool full_rebuild, const bool *local_focus)
 {
     if (session == NULL || session->page.layout_reuse == NULL) return;
     navigation_bind_node_retirement(session);
@@ -1648,8 +1721,17 @@ static void navigation_prepare_layout_reuse(
             if (record->kind == SCRIPT_MUTATION_ATTRIBUTE
                 && strcmp(
                     record->attribute, "data-tilefinch-focus") == 0) {
-                layout_reuse_cache_invalidate_focus(
-                    session->page.layout_reuse, record->node);
+                /* Receipts are stack-local to this relayout and indexed by
+                   the unchanged journal. Never reuse them across turns. */
+                if (local_focus != NULL
+                    && i < NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT
+                    && local_focus[i]) {
+                    layout_reuse_cache_invalidate_local_focus(
+                        session->page.layout_reuse, record->node);
+                } else {
+                    layout_reuse_cache_invalidate_focus(
+                        session->page.layout_reuse, record->node);
+                }
             } else if (record->kind == SCRIPT_MUTATION_ATTRIBUTE
                        && record->changed_tokens_exact) {
                 layout_reuse_cache_invalidate_attribute(
@@ -1988,6 +2070,10 @@ static bool navigation_sweep_stylesheet_events(NavigationSession *session)
 {
     if (session->page.stylesheet_events_swept
         || session->page.runtime == NULL
+        /* Completion notifications are tasks, not an extra checkpoint inside
+           the input task that happened to publish their layout. Finish the
+           already-bounded microtask checkpoint before dispatching them. */
+        || !script_runtime_message_dispatch_ready(session->page.runtime)
         || !session->external_resources_enabled
         || session->page.resource_base_url[0] == '\0'
         || session->page.document.html == NULL) return true;
@@ -2693,7 +2779,7 @@ static const char *navigation_hidden_record_refusal(
    invalidations were applied; the caller must not apply them again. */
 static bool navigation_mutations_are_hidden_only(
     NavigationSession *session, const ScriptMutationJournal *mutations,
-    bool *reuse_prepared)
+    bool *reuse_prepared, const bool *local_focus)
 {
     if (session == NULL || mutations == NULL || mutations->count == 0
         || mutations->overflowed || mutations->resource_rebuild_required
@@ -2717,7 +2803,7 @@ static bool navigation_mutations_are_hidden_only(
             && kind != SCRIPT_MUTATION_INLINE_STYLE) return false;
     }
     /* Resolve against styles the journal's changes already invalidated. */
-    navigation_prepare_layout_reuse(session, mutations, false);
+    navigation_prepare_layout_reuse(session, mutations, false, local_focus);
     *reuse_prepared = true;
     bool head_checked = false;
     for (size_t i = 0; i < mutations->count; i++) {
@@ -2906,9 +2992,10 @@ static bool navigation_relayout_body(NavigationSession *session,
        journal that dropped records cannot name them all. */
     if (mutations.overflowed && image_resource_refresh) image_rebuild = true;
     bool focus_border_paint = false;
+    bool local_focus[NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT] = {0};
     if (mutation_driven
         && navigation_mutations_are_paint_only_focus(
-            session, &mutations, &focus_border_paint)) {
+            session, &mutations, &focus_border_paint, local_focus)) {
         if (focus_border_paint) {
             session->performance.focus_paint_relayout_skips++;
         } else {
@@ -2924,7 +3011,7 @@ static bool navigation_relayout_body(NavigationSession *session,
     bool journal_reuse_prepared = false;
     if (mutation_driven
         && navigation_mutations_are_hidden_only(session, &mutations,
-                                                &journal_reuse_prepared)) {
+                                                &journal_reuse_prepared, local_focus)) {
         session->performance.hidden_relayout_skips++;
         return true;
     }
@@ -2982,7 +3069,7 @@ static bool navigation_relayout_body(NavigationSession *session,
     /* Image discovery below reuses computed styles too. Invalidate the old
        hidden ancestry before that traversal, not only before final layout. */
     if (!full_rebuild && !journal_reuse_prepared)
-        navigation_prepare_layout_reuse(session, &mutations, false);
+        navigation_prepare_layout_reuse(session, &mutations, false, local_focus);
 #if NAVIGATION_RELAYOUT_PHASE_LOG
     uint64_t reuse_prepared = navigation_now_us();
     LayoutReuseStats images_before = {0}, images_after = {0};
@@ -3196,6 +3283,28 @@ static bool navigation_relayout_body(NavigationSession *session,
                 ? incumbent_height : next.height;
         } else {
             navigation_measure_damage(session, &session->page.layout, &next);
+            bool focus_only = mutation_driven && !full_rebuild
+                && !image_rebuild && !image_resource_scan && !image_resource_refresh
+                && !style_append_tried && !mutations.overflowed
+                && !mutations.retirement_unobserved && mutations.count != 0;
+            bool attributes_only = mutation_driven && !full_rebuild
+                && !style_append_tried && !mutations.overflowed
+                && !mutations.retirement_unobserved && mutations.count != 0;
+            for (size_t i = 0; attributes_only && i < mutations.count; i++) {
+                ScriptMutationKind kind = mutations.records[i].kind;
+                attributes_only = kind == SCRIPT_MUTATION_ATTRIBUTE
+                    || kind == SCRIPT_MUTATION_INLINE_STYLE;
+            }
+            for (size_t i = 0; focus_only && i < mutations.count; i++) {
+                const ScriptMutationRecord *record = &mutations.records[i];
+                focus_only = record->kind == SCRIPT_MUTATION_ATTRIBUTE
+                    && strcmp(record->attribute, "data-tilefinch-focus") == 0;
+            }
+            if ((focus_only || attributes_only)
+                && navigation_fixed_focus_context_equal(
+                    &session->page.layout, &next, focus_only))
+                session->fixed_paint_relayout_generation =
+                    session->incremental_relayouts + 1u;
         }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t relayout_damaged = navigation_now_us();
@@ -3282,7 +3391,7 @@ static bool navigation_relayout_body(NavigationSession *session,
 #else
 #define FULL_RELAYOUT_STEP() ((void) 0)
 #endif
-    navigation_prepare_layout_reuse(session, &mutations, true);
+    navigation_prepare_layout_reuse(session, &mutations, true, NULL);
     navigation_evict_layout_reuse_under_pressure(session);
     fonts_external_loader_cancel(
         &session->page.external_font_loader,
@@ -3523,7 +3632,7 @@ static bool navigation_relayout_static_fallback(
     uint64_t fingerprint = 0;
     bool fingerprint_valid = page_resource_fingerprint(
         &session->page.document, &fingerprint);
-    navigation_prepare_layout_reuse(session, NULL, true);
+    navigation_prepare_layout_reuse(session, NULL, true, NULL);
     navigation_evict_layout_reuse_under_pressure(session);
     LayoutDocument next = {0};
     uint64_t started = navigation_now_us();
@@ -4065,8 +4174,9 @@ NavigationBackgroundWorkOutcome navigation_run_web_font_memory_work(
         && fonts_external_loader_pending(&session->page.external_font_loader)) {
         size_t free = budget_remaining(session->budget);
         size_t reserve = navigation_web_font_reserve(session);
-        if (free < reserve || session->maximum_font_face_backend_bytes > free - reserve
-            || session->maximum_font_file_bytes > free - reserve - session->maximum_font_face_backend_bytes)
+        size_t workspace = font_face_load_workspace_limit(session->maximum_font_face_backend_bytes);
+        if (free < reserve || workspace > free - reserve
+            || session->maximum_font_file_bytes > free - reserve - workspace)
             session->page.web_font_pressure_fallback = true;
     }
     if (!navigation_web_font_fallback_pending(session))
@@ -4468,7 +4578,12 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
 {
     NavigationPage *page = &session->page;
     LayoutDocument *layout = &page->layout;
-    if (page->runtime != NULL || page->layout_provisional
+    /* A live realm is safe too when its journal is clean and the exact
+       committed generations still match. Queued author tasks run later;
+       any mutation they make must go through ordinary replacement flow. */
+    if ((page->runtime != NULL
+         && script_runtime_has_pending_mutations(page->runtime))
+        || page->layout_provisional
         || session->style_rebuild_required || layout->count == 0
         || layout->image_content_generation != page->document.content_generation
         || layout->image_style_generation != document_style_generation()
@@ -4585,6 +4700,15 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
     session->canvas_paint_damage_pending = true;
     layout->image_resource_count = page->images.count;
     session->incremental_relayouts++;
+    /* Publish availability to DOM image consumers too. This queues load
+       tasks for a later runtime turn; it must not invoke onload in the
+       middle of the retained-paint transaction. */
+    if (page->runtime != NULL) {
+        /* A CSSOM snapshot may borrow the former image table or contain
+           empty slots. Keep it from being adopted over these new pixels. */
+        script_runtime_set_layout(page->runtime, layout, session->viewport.css_height);
+        script_runtime_set_images(page->runtime, &page->images);
+    }
     return true;
 }
 
@@ -5293,24 +5417,90 @@ static void navigation_frontier_script_execute(
     }
 }
 
+static bool navigation_script_execution_limits(
+    NavigationSession *session, const char **document_url,
+    size_t *remaining_scripts, size_t *remaining_bytes)
+{
+    *document_url = navigation_active_document_url(session);
+    if (!session->page.loaded || session->page.runtime == NULL
+        || session->page.resource_scheduler == NULL
+        || *document_url == NULL) {
+        return false;
+    }
+    *remaining_scripts = session->script_discovered < session->maximum_scripts
+        ? session->maximum_scripts - session->script_discovered : 0;
+    *remaining_bytes = session->script_bytes < session->maximum_script_bytes
+        ? session->maximum_script_bytes - session->script_bytes : 0;
+    return true;
+}
+
+static bool navigation_prepare_script_execution(
+    NavigationSession *session, PocDocument *document, const char *document_url)
+{
+    if (!navigation_document_resource_base(
+            document, document_url, session->page.resource_base_url)) {
+        return false;
+    }
+    script_runtime_invalidate_document_base(session->page.runtime);
+    return true;
+}
+
+static bool navigation_record_script_execution(
+    NavigationSession *session, const ExternalScriptMetrics *metrics,
+    uint64_t started, bool ok, const char *failure_label)
+{
+    session->performance.script_us += navigation_record_script_slices(
+        session, started, &session->page.script_result,
+        metrics->attempted + session->page.script_result.scripts_evaluated);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
+    if (!ok) {
+        /* A failed frontier snapshot already supplied its specific error. */
+        if (failure_label != NULL) {
+            snprintf(session->last_error, sizeof(session->last_error), "%s",
+                     session->page.script_result.error[0] == '\0'
+                       ? failure_label : session->page.script_result.error);
+        }
+        return false;
+    }
+    navigation_accumulate_script_metrics(session, metrics);
+    return true;
+}
+
+/* Whole-document execution also repairs degraded static shells and loads
+   frames. Section/body execution intentionally retains its smaller tail. */
+static bool navigation_finish_document_scripts(
+    NavigationSession *session, const ExternalScriptMetrics *metrics,
+    const char *document_url)
+{
+    bool static_shell_changed = false;
+    if (metrics->failed != 0 || metrics->skipped_quota != 0
+        || metrics->skipped_pressure != 0
+        || metrics->cost_class_rejections != 0) {
+        stylesheet_enable_static_custom_element_fallback(
+            &session->page.stylesheet);
+        static_shell_changed = document_install_static_shell_fallback(
+            &session->page.document);
+    }
+    bool runtime_relayout = script_runtime_consume_relayout(
+        session->page.runtime);
+    bool relayout = static_shell_changed || runtime_relayout;
+    return (!relayout || navigation_relayout(session))
+        && navigation_load_frames(session, document_url);
+}
+
 bool navigation_execute_document_scripts_streaming_from(
     NavigationSession *session, PocDocument *document,
     NavigationScriptFrontierCallback frontier, void *frontier_opaque)
 {
     if (session == NULL || document == NULL
         || !session->document_scripts_enabled) return true;
-    const char *document_url = navigation_active_document_url(session);
-    if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL
-        || document_url == NULL) {
+    const char *document_url;
+    size_t remaining_scripts, remaining_bytes;
+    if (!navigation_script_execution_limits(
+            session, &document_url, &remaining_scripts, &remaining_bytes)) {
         return false;
     }
-    size_t remaining_scripts = session->script_discovered
-        < session->maximum_scripts
-        ? session->maximum_scripts - session->script_discovered : 0;
-    size_t remaining_bytes = session->script_bytes
-        < session->maximum_script_bytes
-        ? session->maximum_script_bytes - session->script_bytes : 0;
     StreamingScriptState state = {0};
     NavigationFrontierScriptWalk walk = {
         .session = session,
@@ -5330,11 +5520,8 @@ bool navigation_execute_document_scripts_streaming_from(
     budget_free(session->budget, walk.script_handles);
     walk.script_handles = NULL;
     ExternalScriptMetrics metrics = {0};
-    if (!navigation_document_resource_base(
-            document, document_url, session->page.resource_base_url)) {
-        return false;
-    }
-    script_runtime_invalidate_document_base(session->page.runtime);
+    if (!navigation_prepare_script_execution(
+            session, document, document_url)) return false;
     bool ok = snapshot_ok && !walk.failed && document_scripts_finish_streaming(
         document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
@@ -5343,35 +5530,12 @@ bool navigation_execute_document_scripts_streaming_from(
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &state, &metrics,
         &session->page.script_result);
-    session->performance.script_us += navigation_record_script_slices(
-        session, started, &session->page.script_result,
-        metrics.attempted + session->page.script_result.scripts_evaluated);
-    if (navigation_retire_failed_document_refresh(
-            session, session->page.runtime)) return false;
-    if (!ok) {
-        if (snapshot_ok) {
-            snprintf(session->last_error, sizeof(session->last_error), "%s",
-                     session->page.script_result.error[0] == '\0'
-                       ? "frontier document script pipeline failed"
-                       : session->page.script_result.error);
-        }
+    if (!navigation_record_script_execution(
+            session, &metrics, started, ok,
+            snapshot_ok ? "frontier document script pipeline failed" : NULL)) {
         return false;
     }
-    navigation_accumulate_script_metrics(session, &metrics);
-    bool static_shell_changed = false;
-    if (metrics.failed != 0 || metrics.skipped_quota != 0
-        || metrics.skipped_pressure != 0
-        || metrics.cost_class_rejections != 0) {
-        stylesheet_enable_static_custom_element_fallback(
-            &session->page.stylesheet);
-        static_shell_changed = document_install_static_shell_fallback(
-            &session->page.document);
-    }
-    bool runtime_relayout = script_runtime_consume_relayout(
-        session->page.runtime);
-    bool relayout = static_shell_changed || runtime_relayout;
-    return (!relayout || navigation_relayout(session))
-        && navigation_load_frames(session, document_url);
+    return navigation_finish_document_scripts(session, &metrics, document_url);
 }
 
 bool navigation_execute_document_scripts_from(
@@ -5379,25 +5543,16 @@ bool navigation_execute_document_scripts_from(
 {
     if (session == NULL || document == NULL
         || !session->document_scripts_enabled) return true;
-    const char *document_url = navigation_active_document_url(session);
-    if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL
-        || document_url == NULL) {
+    const char *document_url;
+    size_t remaining_scripts, remaining_bytes;
+    if (!navigation_script_execution_limits(
+            session, &document_url, &remaining_scripts, &remaining_bytes)) {
         return false;
     }
-    size_t remaining_scripts = session->script_discovered
-        < session->maximum_scripts
-        ? session->maximum_scripts - session->script_discovered : 0;
-    size_t remaining_bytes = session->script_bytes
-        < session->maximum_script_bytes
-        ? session->maximum_script_bytes - session->script_bytes : 0;
     ExternalScriptMetrics metrics = {0};
     uint64_t started = navigation_now_us();
-    if (!navigation_document_resource_base(
-            document, document_url, session->page.resource_base_url)) {
-        return false;
-    }
-    script_runtime_invalidate_document_base(session->page.runtime);
+    if (!navigation_prepare_script_execution(
+            session, document, document_url)) return false;
     bool ok = document_scripts_execute(
         document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
@@ -5406,57 +5561,25 @@ bool navigation_execute_document_scripts_from(
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &metrics,
         &session->page.script_result);
-    session->performance.script_us += navigation_record_script_slices(
-        session, started, &session->page.script_result,
-        metrics.attempted + session->page.script_result.scripts_evaluated);
-    if (navigation_retire_failed_document_refresh(
-            session, session->page.runtime)) return false;
-    if (!ok) {
-        snprintf(session->last_error, sizeof(session->last_error), "%s",
-                 session->page.script_result.error[0] == '\0'
-                   ? "deferred document script pipeline failed"
-                   : session->page.script_result.error);
-        return false;
-    }
-    navigation_accumulate_script_metrics(session, &metrics);
-    bool static_shell_changed = false;
-    if (metrics.failed != 0 || metrics.skipped_quota != 0
-        || metrics.skipped_pressure != 0
-        || metrics.cost_class_rejections != 0) {
-        stylesheet_enable_static_custom_element_fallback(
-            &session->page.stylesheet);
-        static_shell_changed = document_install_static_shell_fallback(
-            &session->page.document);
-    }
-    bool runtime_relayout = script_runtime_consume_relayout(
-        session->page.runtime);
-    bool relayout = static_shell_changed || runtime_relayout;
-    if ((relayout && !navigation_relayout(session))
-        || !navigation_load_frames(session, document_url)) return false;
-    return true;
+    if (!navigation_record_script_execution(
+            session, &metrics, started, ok,
+            "deferred document script pipeline failed")) return false;
+    return navigation_finish_document_scripts(session, &metrics, document_url);
 }
 
 bool navigation_execute_current_body_scripts(NavigationSession *session)
 {
     if (session == NULL || !session->document_scripts_enabled) return true;
-    const char *document_url = navigation_active_document_url(session);
-    if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL
-        || document_url == NULL) {
+    const char *document_url;
+    size_t remaining_scripts, remaining_bytes;
+    if (!navigation_script_execution_limits(
+            session, &document_url, &remaining_scripts, &remaining_bytes)) {
         return false;
     }
-    size_t remaining_scripts = session->script_discovered
-        < session->maximum_scripts
-        ? session->maximum_scripts - session->script_discovered : 0;
-    size_t remaining_bytes = session->script_bytes
-        < session->maximum_script_bytes
-        ? session->maximum_script_bytes - session->script_bytes : 0;
     ExternalScriptMetrics metrics = {0};
     uint64_t started = navigation_now_us();
-    if (!navigation_document_resource_base(
-            &session->page.document, document_url,
-            session->page.resource_base_url)) return false;
-    script_runtime_invalidate_document_base(session->page.runtime);
+    if (!navigation_prepare_script_execution(
+            session, &session->page.document, document_url)) return false;
     bool ok = document_body_scripts_execute(
         &session->page.document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
@@ -5465,19 +5588,9 @@ bool navigation_execute_current_body_scripts(NavigationSession *session)
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &metrics,
         &session->page.script_result);
-    session->performance.script_us += navigation_record_script_slices(
-        session, started, &session->page.script_result,
-        metrics.attempted + session->page.script_result.scripts_evaluated);
-    if (navigation_retire_failed_document_refresh(
-            session, session->page.runtime)) return false;
-    if (!ok) {
-        snprintf(session->last_error, sizeof(session->last_error), "%s",
-                 session->page.script_result.error[0] == '\0'
-                   ? "deferred section script pipeline failed"
-                   : session->page.script_result.error);
-        return false;
-    }
-    navigation_accumulate_script_metrics(session, &metrics);
+    if (!navigation_record_script_execution(
+            session, &metrics, started, ok,
+            "deferred section script pipeline failed")) return false;
     bool relayout = script_runtime_consume_relayout(session->page.runtime);
     return !relayout || navigation_relayout(session);
 }
@@ -5982,6 +6095,12 @@ bool navigation_advance_runtime(NavigationSession *session,
                  session->page.script_result.error);
         return false;
     }
+    /* Retry completion tasks deferred by an incomplete checkpoint even if
+       that checkpoint made no DOM changes. Keep this before navigation,
+       scroll and relayout consumption: a load handler may destroy the DOM
+       or navigate, so its effects must settle before returning to paint. */
+    if (!script_runtime_has_pending_mutations(session->page.runtime)
+        && !navigation_sweep_stylesheet_events(session)) return false;
 consume_script_navigation:
     ;
     if (session->defer_script_navigation

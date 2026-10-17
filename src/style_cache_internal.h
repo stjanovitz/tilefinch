@@ -7,8 +7,13 @@ bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet);
 bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *node,
                                      bool outset);
 bool style_node_focus_outset_shadow(const Stylesheet *sheet, lxb_dom_node_t *node,
-    const ComputedStyle *parent, const ComputedStyle *style, StyleBoxShadow *output);
+    const ComputedStyle *parent, const ComputedStyle *style, StyleBoxShadow *output,
+    size_t *layer_index);
 bool style_selector_reads_focus(const char *selector);
+/* Rules whose focus carrier can change a subject outside this subtree.
+   SIZE_MAX means the bounded proof could not be completed. */
+size_t style_focus_nonlocal_rules(const Stylesheet *sheet,
+    lxb_dom_node_t *node, uint32_t *rules, size_t capacity);
 bool style_custom_rules_may_select_node(const Stylesheet *sheet,
     const uint32_t *rules, size_t count, lxb_dom_node_t *node);
 

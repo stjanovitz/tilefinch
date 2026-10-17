@@ -89,8 +89,19 @@ tried first, and switching to the other view needs a reload.
 [Basic view](BASIC_VIEW.md) describes its bounds and fallback in detail.
 
 **Page tools → Save article** creates a self-contained text snapshot. The
+**Download focused link** tool saves an HTTPS file to the Memory Stick after
+confirmation; common archive links, attachment responses and homebrew binary
+links offer this directly. Downloads never install or run automatically.
+A completed homebrew ZIP offers **Details → Install homebrew…**, with a
+separate native destination confirmation. It installs one verified app folder
+under `PSP/GAME`, refuses existing folders and keeps the ZIP. Circle cancels
+and removes the current attempt's temporary output. The
+ZIP can be deleted separately in Downloads (Square, then Square again).
+**Downloads → Installed homebrew** removes a Tilefinch-installed app even
+after its ZIP is gone, with a separate confirmation warning that saved data
+inside the app folder is removed too. Other apps are not touched. The
 Library's **Saved** and **Downloads** sections open and delete saved
-articles and pause, resume, play, or delete YouTube downloads. An active
+articles and manage file and YouTube downloads. An active
 download shows its progress, speed, the remaining Memory Stick space, and a
 lasting failure reason; an interrupted download resumes from its last
 verified byte instead of starting over. The library holds at most 12 items

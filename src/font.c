@@ -24,6 +24,8 @@
 #include FT_FREETYPE_H
 #include FT_MODULE_H
 #include FT_SYSTEM_H
+#include FT_MULTIPLE_MASTERS_H
+#include FT_TRUETYPE_TABLES_H
 #ifdef TILEFINCH_HAVE_BOUNDED_WOFF2
 #include <brotli/decode.h>
 #endif
@@ -33,6 +35,73 @@
 #define SFNT_TRUETYPE_SIGNATURE UINT32_C(0x00010000)
 #define WOFF_SIGNATURE UINT32_C(0x774f4646)
 #define WOFF2_SIGNATURE UINT32_C(0x774f4632)
+static uint32_t read_be32(const unsigned char *data);
+#ifdef TILEFINCH_HAVE_FREETYPE
+static bool font_sfnt_has_usable_gpos(unsigned char *bytes, size_t length);
+#endif
+
+/* Internal reconstructed streams need only tables consumed by this unhinted
+   outline backend. Preserve unknown tables; discard only APIs disabled in
+   ftoption-tilefinch.h, and GSUB (the renderer does not use an OT shaper).
+   Sort physical spans before compacting so tag order cannot overwrite input. */
+int tilefinch_font_compact_sfnt(unsigned char *bytes, unsigned long *length)
+{
+    if (bytes == NULL || length == NULL || *length < 12) return -1;
+    unsigned count = (unsigned)bytes[4] * 256u + bytes[5];
+    if (count == 0 || count > 256 || count > (*length - 12u) / 16u) return -1;
+    struct { unsigned char entry[16]; bool keep; } tables[256];
+    unsigned order[256], kept = 0;
+    bool retain_gpos = true;
+#ifdef TILEFINCH_HAVE_FREETYPE
+    retain_gpos = font_sfnt_has_usable_gpos(bytes, (size_t)*length);
+#endif
+    size_t destination = 12u + 16u * count;
+    for (unsigned i = 0; i < count; i++) {
+        memcpy(tables[i].entry, bytes + 12u + i * 16u, 16);
+        uint32_t tag = read_be32(tables[i].entry);
+        tables[i].keep = tag != UINT32_C(0x47535542) /* GSUB */
+            && (tag != UINT32_C(0x47504f53) || retain_gpos)
+            && tag != UINT32_C(0x6e616d65) /* name */
+            && tag != UINT32_C(0x6670676d) /* fpgm */
+            && tag != UINT32_C(0x70726570) /* prep */
+            && tag != UINT32_C(0x63767420) /* cvt */
+            && tag != UINT32_C(0x44534947); /* DSIG */
+        kept += tables[i].keep;
+        order[i] = i;
+        for (unsigned j = i; j > 0 && read_be32(tables[order[j]].entry + 8)
+                 < read_be32(tables[order[j-1]].entry + 8); j--) {
+            unsigned swap = order[j]; order[j] = order[j-1]; order[j-1] = swap;
+        }
+    }
+    if (kept == 0) return -1;
+    size_t previous_end = destination;
+    for (unsigned i = 0; i < count; i++) {
+        unsigned at = order[i]; unsigned char *entry = tables[at].entry;
+        size_t offset = read_be32(entry + 8), size = read_be32(entry + 12);
+        if (size == 0) continue;
+        if (offset < previous_end || offset > *length || size > *length - offset) return -1;
+        previous_end = offset + size;
+        if (!tables[at].keep) continue;
+        if (destination > offset || destination > *length
+            || size > *length - destination) return -1;
+        if (!tilefinch_platform_cooperate("font-sfnt", size)) return -1;
+        memmove(bytes + destination, bytes + offset, size);
+        entry[8]=(unsigned char)(destination>>24);entry[9]=(unsigned char)(destination>>16);
+        entry[10]=(unsigned char)(destination>>8);entry[11]=(unsigned char)destination;
+        destination += size;
+        while ((destination & 3u) && destination < *length) bytes[destination++] = 0;
+    }
+    unsigned out = 0;
+    for (unsigned i = 0; i < count; i++) if (tables[i].keep)
+        memcpy(bytes + 12u + 16u * out++, tables[i].entry, 16);
+    bytes[4]=(unsigned char)(kept>>8);bytes[5]=(unsigned char)kept;
+    unsigned power = 1, selector = 0;
+    while (power <= kept / 2u) { power *= 2u; selector++; }
+    unsigned values[] = {power * 16u, selector, kept * 16u - power * 16u};
+    for (unsigned i=0;i<3;i++) {bytes[6+i*2]=(unsigned char)(values[i]>>8);bytes[7+i*2]=(unsigned char)values[i];}
+    *length = (unsigned long)destination;
+    return 0;
+}
 
 #include "generated/font_fallback_bitmaps.inc"
 
@@ -230,6 +299,28 @@ int tilefinch_font_woff2_decompress(FT_Memory memory, FT_Byte *output,
     return status;
 }
 #endif
+#include "font_gpos.inc"
+static bool font_sfnt_has_usable_gpos(unsigned char *bytes, size_t length)
+{
+    /* FreeType's basic GPOS mode is disabled. Retain the complete table
+       whenever our existing bounded kern reader can consume any plan;
+       otherwise it is dead data, not an opportunity to apply partial kern. */
+    FT_StreamRec stream = {0}; stream.base = bytes; stream.size = (FT_ULong)length;
+    FT_FaceRec face = {0}; face.stream = &stream;
+    FontGpos plans = {0}; gpos_initialize(&plans, &face);
+    return plans.plans[0].count || plans.plans[1].count
+        || plans.plans[2].count || plans.plans[3].count;
+}
+#define FONT_VARIATION_AXES 4u
+#define FONT_VARIATION_INSTANCES 16u
+typedef struct {
+    FontFace instances[FONT_VARIATION_INSTANCES];
+    FT_Fixed coordinates[FONT_VARIATION_AXES];
+    FT_Fixed minimum, maximum;
+    FT_Fixed optical_minimum, optical_maximum, optical_active;
+    unsigned axes, weight_axis, count, active_weight;
+    unsigned optical_axis;
+} FontVariations;
 typedef struct {
     Budget *budget;
     size_t current_bytes;
@@ -245,15 +336,52 @@ typedef struct {
        Avoid loading outlines repeatedly just to measure ASCII prose. */
     int ascii_advances[128];
     uint32_t ascii_advance_valid[4];
+    /* Unicode cmap selection is immutable for this face. UINT16_MAX cannot
+       be a glyph index: accepted faces have at most 65535 glyphs. */
+    uint16_t ascii_glyphs[128];
     unsigned references;
     bool cache_ascii_advances;
+    bool has_pair_kerning;
+    bool opening;
+    FontVariations *variations;
+    FontGpos gpos;
 } FreeTypeWebFace;
+
+static FT_UInt freetype_char_index(FreeTypeWebFace *state, unsigned codepoint)
+{
+    if (state->cache_ascii_advances && codepoint < 128
+        && state->ascii_glyphs[codepoint] != UINT16_MAX)
+        return state->ascii_glyphs[codepoint];
+#ifndef __PSP__
+    tilefinch_test_faults()->web_font_charmap_lookups++;
+#endif
+    FT_UInt glyph = FT_Get_Char_Index(state->face, codepoint);
+    if (state->cache_ascii_advances && codepoint < 128)
+        state->ascii_glyphs[codepoint] = (uint16_t) glyph;
+    return glyph;
+}
+
+static int freetype_pair_kerning(FreeTypeWebFace *state,
+    unsigned left, unsigned right, unsigned left_codepoint, unsigned right_codepoint)
+{
+    if (left == 0 || right == 0) return 0;
+    int adjustment = 0;
+    if (gpos_kerning(&state->gpos, left, right, left_codepoint, right_codepoint,
+                     state->face->size->metrics.x_scale, &adjustment)) return adjustment;
+    FT_Vector delta = {0};
+    return FT_HAS_KERNING(state->face)
+        && FT_Get_Kerning(state->face, left, right, FT_KERNING_UNFITTED, &delta) == 0
+        ? (int) delta.x : 0;
+}
 
 static void *freetype_allocate(FT_Memory memory, long size)
 {
     FreeTypeWebFace *state = memory == NULL ? NULL : memory->user;
-    if (state == NULL || size <= 0 || (size_t) size > state->maximum_bytes
-        || state->current_bytes > state->maximum_bytes - (size_t) size) {
+    size_t limit = state == NULL ? 0 : state->opening
+        ? font_face_load_workspace_limit(state->maximum_bytes) : state->maximum_bytes;
+    limit = limit > sizeof(*state) ? limit - sizeof(*state) : 0;
+    if (state == NULL || size <= 0 || (size_t) size > limit
+        || state->current_bytes > limit - (size_t) size) {
         return NULL;
     }
     void *allocation = budget_malloc(state->budget, (size_t) size);
@@ -284,8 +412,10 @@ static void *freetype_reallocate(FT_Memory memory, long current_size,
     size_t requested = (size_t) requested_size;
     size_t retained = previous <= state->current_bytes
                       ? state->current_bytes - previous : 0;
-    if (requested > state->maximum_bytes
-        || retained > state->maximum_bytes - requested) return NULL;
+    size_t limit = state->opening
+        ? font_face_load_workspace_limit(state->maximum_bytes) : state->maximum_bytes;
+    limit = limit > sizeof(*state) ? limit - sizeof(*state) : 0;
+    if (requested > limit || retained > limit - requested) return NULL;
     void *replacement = budget_realloc(state->budget, block, requested);
     if (replacement != NULL) state->current_bytes = retained + requested;
     return replacement;
@@ -296,8 +426,48 @@ static void freetype_web_destroy(FreeTypeWebFace *state)
     if (state == NULL) return;
     Budget *budget = state->budget;
     if (state->face != NULL) FT_Done_Face(state->face);
+    if (state->variations != NULL) freetype_release(&state->memory, state->variations);
     if (state->library != NULL) FT_Done_Library(state->library);
     budget_free(budget, state);
+}
+
+static bool freetype_prepare_variations(FreeTypeWebFace *state)
+{
+    if (!FT_HAS_MULTIPLE_MASTERS(state->face)) return true;
+    /* Inspect fixed-size fvar counts before asking FreeType to allocate its
+       axis/named-instance description. No named-instance UI is exposed. */
+    FT_Byte header[16]; FT_ULong length = sizeof(header);
+    if (FT_Load_Sfnt_Table(state->face, FT_MAKE_TAG('f','v','a','r'), 0, header, &length)
+        || length != sizeof(header)) return false;
+    unsigned axes = (unsigned)header[8] * 256u + header[9];
+    unsigned named = (unsigned)header[12] * 256u + header[13];
+    if (axes == 0 || axes > FONT_VARIATION_AXES || named > 32u) return false;
+    FT_MM_Var *description = NULL;
+    if (FT_Get_MM_Var(state->face, &description) || description == NULL) return false;
+    bool valid = description->num_axis == axes;
+    FontVariations *v = valid ? freetype_allocate(&state->memory, sizeof(*v)) : NULL;
+    if (v != NULL) {
+        memset(v, 0, sizeof(*v)); v->axes = axes; v->weight_axis = axes; v->optical_axis = axes;
+        for (unsigned i = 0; i < axes; i++) {
+            v->coordinates[i] = description->axis[i].def;
+            if (description->axis[i].tag == FT_MAKE_TAG('w','g','h','t')) {
+                v->weight_axis = i;
+                v->minimum = description->axis[i].minimum;
+                v->maximum = description->axis[i].maximum;
+            }
+            if (description->axis[i].tag == FT_MAKE_TAG('o','p','s','z')) {
+                v->optical_axis = i;
+                v->optical_minimum = description->axis[i].minimum;
+                v->optical_maximum = description->axis[i].maximum;
+                v->optical_active = description->axis[i].def;
+            }
+        }
+    }
+    FT_Done_MM_Var(state->library, description);
+    if (v == NULL) return false;
+    if (v->weight_axis == axes) { freetype_release(&state->memory, v); return true; }
+    state->variations = v;
+    return true;
 }
 
 static bool face_adopt_web(FontFace *output, Budget *budget,
@@ -308,11 +478,13 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
     if (state == NULL) return false;
     state->budget = budget;
     state->references = 1;
+    memset(state->ascii_glyphs, 0xff, sizeof(state->ascii_glyphs));
     state->cache_ascii_advances = true;
 #ifndef __PSP__
     state->cache_ascii_advances = !tilefinch_test_faults()->legacy_web_font_work;
 #endif
     state->maximum_bytes = maximum_backend_bytes;
+    state->opening = true;
     state->memory.user = state;
     state->memory.alloc = freetype_allocate;
     state->memory.free = freetype_release;
@@ -333,6 +505,20 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
         freetype_web_destroy(state);
         return false;
     }
+    if (!freetype_prepare_variations(state)) {
+        freetype_web_destroy(state);
+        return false;
+    }
+    state->opening = false;
+    if (maximum_backend_bytes < sizeof(*state)
+        || state->current_bytes > maximum_backend_bytes - sizeof(*state)) {
+        freetype_web_destroy(state);
+        return false;
+    }
+    gpos_initialize(&state->gpos, state->face);
+    state->has_pair_kerning = FT_HAS_KERNING(state->face)
+        || state->gpos.plans[0].count != 0 || state->gpos.plans[1].count != 0
+        || state->gpos.plans[2].count != 0 || state->gpos.plans[3].count != 0;
     *output = (FontFace) {
         .budget = budget,
         .data = data,
@@ -345,6 +531,13 @@ static bool face_adopt_web(FontFace *output, Budget *budget,
     return true;
 }
 #endif
+
+size_t font_face_load_workspace_limit(size_t retained_limit)
+{
+    const size_t ceiling = 1024u * 1024u;
+    if (retained_limit >= ceiling) return retained_limit;
+    return retained_limit > ceiling / 4u ? ceiling : retained_limit * 4u;
+}
 
 bool font_face_load_encoded(FontFace *face, Budget *budget,
                             const unsigned char *data, size_t length,
@@ -653,6 +846,70 @@ static unsigned font_weight_rank(unsigned requested, unsigned candidate)
         : 1000u + requested - candidate;
 }
 
+static unsigned font_family_matched_weight(const WebFontFamilyFaces *faces,
+    size_t slot, unsigned requested)
+{
+    unsigned low = faces->weights[slot];
+    if (low == 0) low = slot == 1 ? 700u : 400u;
+    unsigned high = faces->weight_max[slot];
+    if (high < low) high = low;
+    return requested < low ? low : requested > high ? high : requested;
+}
+
+static const FontFace *font_weight_instance(const FontFace *face, unsigned weight)
+{
+#ifdef TILEFINCH_HAVE_FREETYPE
+    FreeTypeWebFace *state = face->backend == FONT_FACE_BACKEND_FREETYPE_WEB
+        ? face->implementation : NULL;
+    FontVariations *v = state == NULL ? NULL : state->variations;
+    if (v != NULL) {
+        unsigned nearest = 0, distance = UINT_MAX;
+        for (unsigned i = 0; i < v->count; i++) {
+            unsigned candidate = v->instances[i].authored_weight;
+            if (candidate == weight) return &v->instances[i];
+            unsigned d = candidate < weight ? weight-candidate : candidate-weight;
+            if (d < distance) { distance = d; nearest = i; }
+        }
+        if (v->count == FONT_VARIATION_INSTANCES) return &v->instances[nearest];
+        FontFace *instance = &v->instances[v->count++];
+        *instance = *face;
+        instance->authored_weight = (uint16_t)weight;
+        instance->serial = font_next_generation();
+        return instance;
+    }
+#else
+    (void)weight;
+#endif
+    return face;
+}
+
+size_t font_family_face_slot_at_weight(const WebFontFamilyFaces *faces,
+    unsigned weight, bool loaded_only)
+{
+    if (faces == NULL) return SIZE_MAX;
+    size_t selected = SIZE_MAX;
+    unsigned rank = UINT_MAX;
+    for (size_t at = 0; at < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; at++) {
+        if (loaded_only ? !faces->faces[at].loaded
+            : faces->weights[at] == 0 && !faces->faces[at].loaded) continue;
+        unsigned declared = font_family_matched_weight(faces, at, weight);
+        unsigned score = font_weight_rank(weight, declared);
+        if (score < rank) { rank = score; selected = at; }
+        if (rank == 0) break;
+    }
+    return selected;
+}
+
+uint8_t font_family_face_usage_mask(const WebFontFamilyFaces *faces, unsigned weight)
+{
+    size_t selected = font_family_face_slot_at_weight(faces, weight, false);
+    size_t fallback = weight == 400 ? selected
+        : font_family_face_slot_at_weight(faces, 400, false);
+    uint8_t mask = selected == SIZE_MAX ? 0 : (uint8_t)(1u << selected);
+    if (fallback != SIZE_MAX) mask |= (uint8_t)(1u << fallback);
+    return mask;
+}
+
 const FontFace *font_context_face_at_weight(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
     bool italic, bool bold, unsigned weight)
@@ -661,17 +918,9 @@ const FontFace *font_context_face_at_weight(
         unsigned slot = font_family_web_slot(family);
         if (web_fonts != NULL && slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) {
             const WebFontFamilyFaces *faces = &web_fonts->families[slot];
-            const FontFace *selected = NULL;
-            unsigned rank = UINT_MAX;
-            for (size_t at = 0; at < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; at++) {
-                if (!faces->faces[at].loaded) continue;
-                unsigned declared = faces->weights[at];
-                if (declared == 0) declared = at == 1 ? 700u : 400u;
-                unsigned score = font_weight_rank(weight, declared);
-                if (score < rank) { rank = score; selected = &faces->faces[at]; }
-                if (rank == 0) break;
-            }
-            if (selected != NULL) return selected;
+            size_t selected = font_family_face_slot_at_weight(faces, weight, true);
+            if (selected != SIZE_MAX) return font_weight_instance(&faces->faces[selected],
+                font_family_matched_weight(faces, selected, weight));
         }
         family = font_family_web_fallback(family);
     }
@@ -698,6 +947,16 @@ bool font_context_face_is_bold(
     return font_set_face_is_bold(fonts, face);
 }
 
+bool font_face_needs_synthetic_bold(const FontSet *fonts,
+    const WebFontSet *web_fonts, const FontFace *face, unsigned weight)
+{
+    return weight >= TILEFINCH_FONT_SYNTHETIC_WEIGHT
+        && (face == NULL || face->authored_weight == 0
+            || face->authored_weight < weight)
+        && (weight < TILEFINCH_FONT_BOLD_FACE_WEIGHT
+            || !font_context_face_is_bold(fonts, web_fonts, face));
+}
+
 const FontFace *font_set_face(const FontSet *fonts, FontFamily family)
 {
     if (fonts == NULL) return NULL;
@@ -719,7 +978,7 @@ const FontFace *font_set_face_style(const FontSet *fonts, FontFamily family,
 const FontFace *font_set_face_variant(const FontSet *fonts, FontFamily family,
                                       bool italic, bool bold)
 {
-    if (fonts != NULL && bold && !italic) {
+    if (fonts != NULL && bold) {
         if ((family == FONT_METRIC_SANS || family == FONT_SYSTEM_SANS)
             && fonts->metric_sans_bold.loaded) {
             return &fonts->metric_sans_bold;
@@ -727,7 +986,7 @@ const FontFace *font_set_face_variant(const FontSet *fonts, FontFamily family,
         if (family == FONT_SERIF && fonts->serif_bold.loaded) {
             return &fonts->serif_bold;
         }
-        if (family != FONT_SERIF && fonts->sans_bold.loaded) {
+        if (!italic && family != FONT_SERIF && fonts->sans_bold.loaded) {
             return &fonts->sans_bold;
         }
     }
@@ -782,9 +1041,27 @@ static const stbtt_fontinfo *font_info(const FontFace *face)
 #ifdef TILEFINCH_HAVE_FREETYPE
 static FreeTypeWebFace *freetype_info(const FontFace *face)
 {
-    return face != NULL && face->loaded
+    FreeTypeWebFace *state = face != NULL && face->loaded
            && face->backend == FONT_FACE_BACKEND_FREETYPE_WEB
            ? (FreeTypeWebFace *) face->implementation : NULL;
+    FontVariations *v = state == NULL ? NULL : state->variations;
+    if (v != NULL && face->authored_weight != 0
+        && v->active_weight != face->authored_weight) {
+        int64_t coordinate = (int64_t)face->authored_weight * 65536;
+        if (coordinate < v->minimum) coordinate = v->minimum;
+        if (coordinate > v->maximum) coordinate = v->maximum;
+        v->coordinates[v->weight_axis] = (FT_Fixed)coordinate;
+        if (!tilefinch_platform_cooperate("font-variation", face->authored_weight)
+            || FT_Set_Var_Design_Coordinates(state->face, v->axes, v->coordinates)) {
+            v->active_weight = 0;
+            return NULL;
+        }
+        v->active_weight = face->authored_weight;
+        if (v->optical_axis < v->axes) v->optical_active = v->coordinates[v->optical_axis];
+        state->selected_pixel_height_fixed = 0;
+        memset(state->ascii_advance_valid, 0, sizeof(state->ascii_advance_valid));
+    }
+    return state;
 }
 
 static bool freetype_set_pixel_height_fixed(FreeTypeWebFace *state,
@@ -792,6 +1069,25 @@ static bool freetype_set_pixel_height_fixed(FreeTypeWebFace *state,
 {
     if (state == NULL || state->face == NULL || pixel_height_fixed <= 0) {
         return false;
+    }
+    FontVariations *v = state->variations;
+    if (v != NULL && v->optical_axis < v->axes) {
+        /* CSS's default optical sizing follows the used text size. Other
+           unexposed axes remain at the font's declared defaults. */
+        FT_Fixed optical = (FT_Fixed)pixel_height_fixed * 1024L;
+        if (optical < v->optical_minimum) optical = v->optical_minimum;
+        if (optical > v->optical_maximum) optical = v->optical_maximum;
+        if (optical != v->optical_active) {
+            v->coordinates[v->optical_axis] = optical;
+            if (!tilefinch_platform_cooperate("font-variation", (size_t)pixel_height_fixed)
+                || FT_Set_Var_Design_Coordinates(state->face, v->axes, v->coordinates)) {
+                v->active_weight = 0;
+                v->optical_active = LONG_MIN;
+                return false;
+            }
+            v->optical_active = optical;
+            state->selected_pixel_height_fixed = 0;
+        }
     }
     if (state->selected_pixel_height_fixed == pixel_height_fixed) return true;
     if (FT_Set_Char_Size(state->face, 0, (FT_F26Dot6) pixel_height_fixed,
@@ -1399,13 +1695,15 @@ static bool builtin_fallback_supported(unsigned codepoint)
            legible while their optional WOFF is still loading. */
         || codepoint == 0xe0d5u || codepoint == 0xe700u
         || codepoint == 0xe70du || codepoint == 0xe721u
+        || codepoint == 0x25b2u || codepoint == 0x25b3u
         || builtin_bitmap_lookup(codepoint, NULL);
 }
 
 static bool builtin_navigation_icon(unsigned codepoint)
 {
     return codepoint == 0xe0d5u || codepoint == 0xe700u
-        || codepoint == 0xe70du || codepoint == 0xe721u;
+        || codepoint == 0xe70du || codepoint == 0xe721u
+        || codepoint == 0x25b2u || codepoint == 0x25b3u;
 }
 
 static bool optional_fallback_advance_fixed(unsigned codepoint,
@@ -1459,7 +1757,7 @@ bool font_face_has_codepoint(const FontFace *face, unsigned codepoint)
     FreeTypeWebFace *freetype = freetype_info(face);
     if (freetype != NULL) {
         return freetype->face != NULL
-            && FT_Get_Char_Index(freetype->face, codepoint) != 0;
+            && freetype_char_index(freetype, codepoint) != 0;
     }
 #endif
     const stbtt_fontinfo *info = font_info(face);
@@ -1664,7 +1962,20 @@ static bool builtin_navigation_icon_glyph(
         for (int x = 0; x < side; x++) {
             int sx = x * 16 / side;
             bool mark = false;
-            if (codepoint == 0xe700u) {
+            if (codepoint == 0x25b2u || codepoint == 0x25b3u) {
+                unsigned coverage = 0;
+                for (int yy = 0; yy < 4; yy++) for (int xx = 0; xx < 4; xx++) {
+                    int px = ((x * 4 + xx) * 64 + 32) / (side * 4);
+                    int py = ((y * 4 + yy) * 64 + 32) / (side * 4);
+                    int edge = (py - 12) * 20;
+                    int distance = abs(px - 32) * 36;
+                    coverage += py >= 12 && py <= 48 && distance <= edge
+                        && (codepoint == 0x25b2u || py >= 44
+                            || distance >= edge - (bold ? 160 : 100));
+                }
+                pixels[(size_t) y * side + x] = (unsigned char) ((coverage * 255u + 8u) / 16u);
+                continue;
+            } else if (codepoint == 0xe700u) {
                 mark = sx >= 2 && sx <= 13
                     && (abs(sy - 4) <= thickness - 1
                         || abs(sy - 8) <= thickness - 1
@@ -1791,6 +2102,7 @@ int font_text_width_at_size_fixed_mode(
         }
         int64_t width = 0;
         FT_UInt previous = 0;
+        unsigned previous_codepoint = 0;
         for (size_t at = 0; at < length;) {
             size_t sequence_used = 0;
             int sequence_advance = 0;
@@ -1811,7 +2123,7 @@ int font_text_width_at_size_fixed_mode(
                 at += used;
                 continue;
             }
-            FT_UInt glyph = FT_Get_Char_Index(freetype->face, codepoint);
+            FT_UInt glyph = freetype_char_index(freetype, codepoint);
             int fallback_advance = 0;
             if (glyph == 0
                 && (optional_fallback_advance_fixed(
@@ -1825,14 +2137,9 @@ int font_text_width_at_size_fixed_mode(
                 at += used;
                 continue;
             }
-            if (kerning && previous != 0 && glyph != 0
-                && FT_HAS_KERNING(freetype->face)) {
-                FT_Vector delta = {0};
-                if (FT_Get_Kerning(freetype->face, previous, glyph,
-                                   FT_KERNING_UNFITTED, &delta) == 0) {
-                    width += delta.x;
-                }
-            }
+            if (kerning && previous != 0 && glyph != 0 && freetype->has_pair_kerning)
+                width += freetype_pair_kerning(freetype, previous, glyph,
+                                               previous_codepoint, codepoint);
             uint32_t bit = UINT32_C(1) << (codepoint & 31u);
             int advance;
             if (freetype->cache_ascii_advances && codepoint < 128u
@@ -1851,6 +2158,7 @@ int font_text_width_at_size_fixed_mode(
             if (width > INT_MAX) return INT_MAX;
             if (width < INT_MIN) return INT_MIN;
             previous = glyph;
+            previous_codepoint = codepoint;
             at += used;
         }
         return (int) width;
@@ -2028,6 +2336,48 @@ static const uint16_t system_sans_small_advances[2][95] = {
     }
 };
 
+#include "font_system_pairs.inc"
+
+static bool family_compatible_kerning(FontFamily family, unsigned left,
+                                      unsigned right, int size_fixed,
+                                      bool bold, int *units)
+{
+    if (family != FONT_SYSTEM_SANS || left < 32 || left > 126
+        || right < 32 || right > 126) return false;
+    size_t lo = system_pair_starts[left - 32];
+    size_t end = system_pair_starts[left - 31], hi = end;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (system_pairs[mid].right < right) lo = mid + 1;
+        else hi = mid;
+    }
+    *units = 0;
+    if (lo == end || system_pairs[lo].right != right) return true;
+    int small = system_pairs[lo].small[bold ? 1 : 0];
+    int large = system_pairs[lo].large[bold ? 1 : 0];
+    if (size_fixed <= 13 * 64 || small == large) { *units = small; return true; }
+    if (size_fixed >= 22 * 64) { *units = large; return true; }
+    unsigned fraction = size_fixed <= 13 * 64 ? 0u
+        : size_fixed >= 22 * 64 ? 9 * 64u
+        : (unsigned) (size_fixed - 13 * 64);
+    *units = font_width_round_ratio(
+        (int64_t) small * (9 * 64u - fraction)
+            + (int64_t) large * fraction, 9 * 64u);
+    return true;
+}
+
+int font_kerning_for_family_at_size_fixed(const FontFace *face,
+    FontFamily family, unsigned left, unsigned right, int size_fixed, bool bold)
+{
+    if (size_fixed <= 0) return 0;
+    size_fixed = bounded_pixel_height_fixed(size_fixed);
+    int units = 0;
+    if (family_compatible_kerning(family, left, right, size_fixed, bold, &units))
+        return units == 0 ? 0
+            : font_width_round_ratio((int64_t) units * size_fixed, 2048);
+    return font_kerning_at_size_fixed(face, left, right, size_fixed);
+}
+
 static bool family_compatible_advance(FontFamily family, unsigned codepoint,
                                       int size_fixed, bool bold,
                                       unsigned *units)
@@ -2111,11 +2461,15 @@ int font_text_width_for_family_at_size_fixed_mode(
         int glyph = kerning || !compatible
             ? stbtt_FindGlyphIndex(info, (int) codepoint) : 0;
         if (kerning && previous != 0) {
-            int kerning = stbtt_GetGlyphKernAdvance(
+            int kerning = 0;
+            bool profile = family_compatible_kerning(metric_family, previous,
+                codepoint, pixel_height_fixed, metric_bold, &kerning);
+            if (!profile) kerning = stbtt_GetGlyphKernAdvance(
                 info, previous_glyph, glyph);
             if (!font_width_accumulate(
                     &numerator,
-                    (int64_t) kerning * pixel_height_fixed * 2048 * 5)) {
+                    (int64_t) kerning * pixel_height_fixed
+                        * (profile ? units_per_em : 2048) * 5)) {
                 return numerator < 0 ? INT_MIN : INT_MAX;
             }
         }
@@ -2199,6 +2553,8 @@ int font_metric_height_fixed_at_size(const FontFace *face,
 #ifdef TILEFINCH_HAVE_FREETYPE
     FreeTypeWebFace *freetype = freetype_info(face);
     if (freetype != NULL) {
+        if (freetype->variations != NULL
+            && !freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)) return -1;
         FT_Face scalable = freetype->face;
         /* size->metrics.height is grid-fitted to the nearest pixel.  That is
            useful for a terminal cell but makes CSS half-leading jump when a
@@ -2251,6 +2607,10 @@ int font_line_height_fixed_at_size(const FontFace *face,
     int metric_height = font_metric_height_fixed_at_size(
         face, pixel_height_fixed);
     if (metric_height <= 0) return -1;
+    /* Downloaded faces supply their own design-space line box. The compact
+       application fallback's minimum leading must not enlarge those metrics
+       (or a 14.4px label gains an extra pixel on every line). */
+    if (face->backend == FONT_FACE_BACKEND_FREETYPE_WEB) return metric_height;
     /* CSS leaves `normal` line-height to the user agent, with roughly 1.2em
        as the interoperable expectation.  Several compact TrueType fallbacks
        expose zero lineGap and a shorter hhea box (for example 14px at a
@@ -2345,15 +2705,11 @@ int font_kerning(const FontFace *face, unsigned left, unsigned right,
 #ifdef TILEFINCH_HAVE_FREETYPE
     FreeTypeWebFace *freetype = freetype_info(face);
     if (freetype != NULL) {
-        if (!freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)
-            || !FT_HAS_KERNING(freetype->face)) return 0;
-        FT_Vector delta = {0};
-        FT_UInt left_glyph = FT_Get_Char_Index(freetype->face, left);
-        FT_UInt right_glyph = FT_Get_Char_Index(freetype->face, right);
-        if (left_glyph == 0 || right_glyph == 0
-            || FT_Get_Kerning(freetype->face, left_glyph, right_glyph,
-                              FT_KERNING_UNFITTED, &delta) != 0) return 0;
-        return fixed_26_6_to_int(delta.x) / 64;
+        if (!freetype->has_pair_kerning
+            || !freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)) return 0;
+        FT_UInt left_glyph = freetype_char_index(freetype, left);
+        FT_UInt right_glyph = freetype_char_index(freetype, right);
+        return freetype_pair_kerning(freetype, left_glyph, right_glyph, left, right) / 64;
     }
 #endif
     if (info == NULL) return 0;
@@ -2374,15 +2730,11 @@ int font_kerning_at_size_fixed(const FontFace *face, unsigned left,
 #ifdef TILEFINCH_HAVE_FREETYPE
     FreeTypeWebFace *freetype = freetype_info(face);
     if (freetype != NULL) {
-        if (!freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)
-            || !FT_HAS_KERNING(freetype->face)) return 0;
-        FT_Vector delta = {0};
-        FT_UInt left_glyph = FT_Get_Char_Index(freetype->face, left);
-        FT_UInt right_glyph = FT_Get_Char_Index(freetype->face, right);
-        if (left_glyph == 0 || right_glyph == 0
-            || FT_Get_Kerning(freetype->face, left_glyph, right_glyph,
-                              FT_KERNING_UNFITTED, &delta) != 0) return 0;
-        return fixed_26_6_to_int(delta.x);
+        if (!freetype->has_pair_kerning
+            || !freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)) return 0;
+        FT_UInt left_glyph = freetype_char_index(freetype, left);
+        FT_UInt right_glyph = freetype_char_index(freetype, right);
+        return freetype_pair_kerning(freetype, left_glyph, right_glyph, left, right);
     }
 #endif
     if (info == NULL) return 0;
@@ -2424,7 +2776,7 @@ bool font_glyph_load_at_size_profile(const FontFace *face, unsigned codepoint,
         if (!freetype_set_pixel_height_fixed(freetype, pixel_height_fixed)) {
             return false;
         }
-        FT_UInt index = FT_Get_Char_Index(freetype->face, codepoint);
+        FT_UInt index = freetype_char_index(freetype, codepoint);
         bool provider_pending = false;
         if (index == 0) {
             if (optional_fallback_glyph(

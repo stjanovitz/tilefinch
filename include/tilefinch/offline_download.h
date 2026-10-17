@@ -18,7 +18,8 @@ typedef enum {
     OFFLINE_DOWNLOAD_IDLE = 0,
     OFFLINE_DOWNLOAD_RESOLVE,
     OFFLINE_DOWNLOAD_VIDEO,
-    OFFLINE_DOWNLOAD_AUDIO
+    OFFLINE_DOWNLOAD_AUDIO,
+    OFFLINE_DOWNLOAD_FILE
 } OfflineDownloadPhase;
 
 typedef struct {
@@ -34,6 +35,7 @@ typedef struct {
 
 typedef struct {
     Budget *budget;
+    struct FileDownloadManager *file;
     BrowserSession *session;
     OfflineLibrary *library;
     FetchScheduler *scheduler;

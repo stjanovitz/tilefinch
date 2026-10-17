@@ -1,6 +1,49 @@
 #include "tilefinch_test_common.h"
 #include "../src/image_svg_decode_internal.h"
 
+static int test_overflow_clip_geometry(void)
+{
+    static const struct {
+        StyleOverflowClipBox clip_box;
+        int width, height;
+        int expected_width, expected_height;
+    } cases[] = {
+        {STYLE_OVERFLOW_CLIP_PADDING_BOX, 40, 30, 29, 17},
+        {STYLE_OVERFLOW_CLIP_BORDER_BOX, 40, 30, 40, 30},
+        {STYLE_OVERFLOW_CLIP_CONTENT_BOX, 40, 30, 34, 22},
+        {STYLE_OVERFLOW_CLIP_CONTENT_BOX, 5, 7, 0, 0}
+    };
+    static const unsigned margins[] = {0u, 2u, 63u};
+    static const int origins[][2] = {{31, 19}, {-7, 11}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        LayoutNodeBox box = {
+            .x = 900, .y = 800,
+            .width = cases[i].width, .height = cases[i].height,
+            .client_width = 29, .client_height = 17,
+            .clip_inset_left = 3, .clip_inset_top = 4
+        };
+        for (size_t m = 0; m < sizeof(margins) / sizeof(margins[0]); m++) {
+            layout_node_box_set_clip_geometry(
+                &box, 8u, margins[m], cases[i].clip_box);
+            LayoutNodeBox before;
+            memcpy(&before, &box, sizeof(box));
+            for (size_t o = 0; o < sizeof(origins) / sizeof(origins[0]); o++) {
+                int left, top, right, bottom;
+                layout_node_box_clip_rect(&box, origins[o][0], origins[o][1],
+                                          &left, &top, &right, &bottom);
+                CHECK(left == origins[o][0] + 3 - (int) margins[m]
+                      && top == origins[o][1] + 4 - (int) margins[m]
+                      && right - left
+                         == cases[i].expected_width + 2 * (int) margins[m]
+                      && bottom - top
+                         == cases[i].expected_height + 2 * (int) margins[m]
+                      && memcmp(&box, &before, sizeof(box)) == 0);
+            }
+        }
+    }
+    return 0;
+}
+
 static int test_svg_default_aspect_ratio(Budget *budget)
 {
     static const char *const alignment[] = {
@@ -301,6 +344,7 @@ static int test_shadow_offset_visual_clone(Budget *budget)
 
 int main(int argc, char **argv)
 {
+    CHECK(test_overflow_clip_geometry() == 0);
     Budget budget;
     budget_init(&budget, 16u * MIB);
     budget_install_lexbor(&budget);

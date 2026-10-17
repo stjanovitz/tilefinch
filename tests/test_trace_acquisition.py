@@ -868,6 +868,23 @@ class TraceAcquisitionTests(unittest.TestCase):
         self.assertIn("diagnostic SHA-256 mismatch", completed.stderr)
         self.assertFalse(self.marker.exists())
 
+    def test_large_viewport_evidence_keeps_authority_and_size_guards(self) -> None:
+        data = json.loads(self.diagnostic.read_text())
+        data['full_document'] = {'bounded_test_evidence': 'x' * (1100 * 1024)}
+        self.diagnostic.write_text(json.dumps(data))
+        contract = ACQUIRE._validate_contract(self.contract)
+        contract['diagnostic_sha256'] = ACQUIRE._file_sha256(self.diagnostic)
+        self.assertEqual(ACQUIRE._validate_plan(self.diagnostic, contract), self.requests)
+        # Contracts retain their smaller ceiling; only reference evidence
+        # receives the larger bound, still pinned to the approved digest.
+        with self.assertRaisesRegex(ACQUIRE.AcquisitionError, 'exceeds'):
+            ACQUIRE._load_json(self.diagnostic, 'contract')
+        data['full_document']['bounded_test_evidence'] = 'x' * (8 * 1024 * 1024)
+        self.diagnostic.write_text(json.dumps(data))
+        contract['diagnostic_sha256'] = ACQUIRE._file_sha256(self.diagnostic)
+        with self.assertRaisesRegex(ACQUIRE.AcquisitionError, 'exceeds'):
+            ACQUIRE._validate_plan(self.diagnostic, contract)
+
     def test_v2_plan_is_bound_to_exact_complete_unmatched_evidence(self) -> None:
         contract = ACQUIRE._validate_contract(self.contract)
         self.assertEqual(
@@ -1061,7 +1078,7 @@ class TraceAcquisitionTests(unittest.TestCase):
             "trace_dir": str(self.source),
             "trace_sha256": ACQUIRE.trace_digest(self.source, 1024 * 1024)[0],
             "records": 260, "routes": 260, "ambiguous_routes": 0,
-            "occurrence_routes": 0, "response_cookies": 0,
+            "occurrence_routes": 0, "response_cookies": 0, "ignored_response_cookies": 0,
             "clock_origin_ms": 123456789,
             "route_selection_version": ACQUIRE.REFERENCE_ROUTE_SELECTION,
             "urls": urls,

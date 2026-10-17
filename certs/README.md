@@ -1,7 +1,7 @@
 # PSP TLS trust bundle
 
 `roots.pem` is the deliberately compact trust bundle staged beside the live
-PSP EBOOT. It contains twenty-six public root certificates:
+PSP EBOOT. It contains twenty-seven public root certificates:
 
 - Amazon Root CA 1 (expires 2038-01-17)
 - DigiCert Global Root G2 (expires 2038-01-15)
@@ -27,6 +27,7 @@ PSP EBOOT. It contains twenty-six public root certificates:
 - SSL.com TLS ECC Root CA 2022 (expires 2046-08-19)
 - SSL.com TLS RSA Root CA 2022 (expires 2046-08-19)
 - Starfield Root Certificate Authority - G2 (expires 2037-12-31)
+- Starfield Services Root Certificate Authority - G2 (expires 2037-12-31)
 - USERTrust RSA Certification Authority (expires 2038-01-18)
 - USERTrust ECC Certification Authority (expires 2038-01-18)
 
@@ -35,7 +36,7 @@ PSP EBOOT. It contains twenty-six public root certificates:
 Certificate data is not automatically covered by the project's MIT license.
 Keep the [CA-bundle provenance and redistribution notice](../third_party/notices/ca-bundle/NOTICE.md)
 with distributions of `roots.pem`. It records the fingerprints and
-redistribution basis for all 26 roots: Mozilla CA-store data and Microsoft's
+redistribution basis for all 27 roots: Mozilla CA-store data and Microsoft's
 Azure Linux CA package (MPL-2.0), plus direct CA redistribution grants. The
 Microsoft anchor is byte-identical to its issuer's pinned, MPL-2.0-licensed
 Azure Linux source linked from that notice. The complete MPL text
@@ -118,6 +119,15 @@ the live census found a chain that needs it. Its DER SHA-256 is
 matching both [SSL.com's official repository](https://www.ssl.com/repository/)
 and the current Mozilla bundle. The fingerprint is pinned by the bundle test;
 no leaf/intermediate trust or certificate-verification policy is relaxed.
+
+The 0.1.40 refresh adds the self-signed Starfield Services Root Certificate
+Authority G2 after native-Mbed-TLS chain checks found missing trust. Its DER
+SHA-256 is
+`568d6905a2c88708a4b3025190edcfedb1974a606a13c6e5290fcb2ae63edab5`,
+matching [Amazon's official repository](https://www.amazontrust.com/repository/)
+and the current Mozilla bundle. It is distinct from Starfield Root G2.
+The complete signed certificate is preserved and its fingerprint is pinned;
+peer, hostname, expiry, and signature verification remain unchanged.
 
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the

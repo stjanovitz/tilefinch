@@ -387,7 +387,11 @@ int main(int argc, char **argv)
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
-        return test_computed_paint_style_does_not_force_layout();
+        return test_geometry_only_callback_skips_style_only_flow()
+            || test_focus_paint_geometry_reuse()
+            || test_computed_paint_style_does_not_force_layout();
+    if (argc == 2 && strcmp(argv[1], "--focus-geometry-only") == 0)
+        return test_focus_paint_geometry_reuse();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
         return test_computed_style_resolved_values();
     if (argc == 2 && strcmp(argv[1], "--container-style-only") == 0)
@@ -402,6 +406,8 @@ int main(int argc, char **argv)
         failed |= test_transition_handler_replacement();
         failed |= test_transition_negative_delay();
         failed |= test_transition_watch_scopes();
+        failed |= test_transition_listener_discovery_reuse();
+        failed |= test_transition_discovery_uses_changed_subtree();
         return failed != 0;
     }
     if (argc == 2 && strcmp(argv[1], "--transition-watch-profile") == 0)
@@ -492,6 +498,8 @@ int main(int argc, char **argv)
     CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
     CHECK(test_optional_bold_faces_follow_page_families() == 0);
     CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
+    CHECK(test_geometry_only_callback_skips_style_only_flow() == 0);
+    CHECK(test_focus_paint_geometry_reuse() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
@@ -505,6 +513,8 @@ int main(int argc, char **argv)
     CHECK(test_transition_handler_replacement() == 0);
     CHECK(test_transition_negative_delay() == 0);
     CHECK(test_transition_watch_scopes() == 0);
+    CHECK(test_transition_listener_discovery_reuse() == 0);
+    CHECK(test_transition_discovery_uses_changed_subtree() == 0);
     CHECK(test_author_error_text_is_not_fatal() == 0);
     CHECK(test_emergency_break_uses_pair_kerning() == 0);
     CHECK(test_managed_challenge_script_heap() == 0);

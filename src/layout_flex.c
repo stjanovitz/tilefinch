@@ -636,6 +636,24 @@ static bool intrinsic_text_has_visible_character(
     return false;
 }
 
+static bool intrinsic_has_generated_inline_text(
+    LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, PseudoElement first, PseudoElement last)
+{
+    if (!style_node_pseudo_rules_may_affect_discovery(context->sheet, node))
+        return false;
+    for (PseudoElement p = first; p <= last; p++) {
+        ComputedStyle generated = layout_style_for_pseudo(context, node, p, style);
+        if (generated.generated_content && !generated.hidden
+            && !generated.out_of_flow && !generated.fixed_position
+            && generated.display == DISPLAY_INLINE
+            && intrinsic_text_has_visible_character(
+                generated.generated_text, generated.generated_text_length))
+            return true;
+    }
+    return false;
+}
+
 static bool intrinsic_wraps_single_atomic(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent)
@@ -879,6 +897,15 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         return constrain_intrinsic_outer_width(
             context, node, parent, &style, limit, width);
     }
+    if (style.display == DISPLAY_TABLE) {
+        /* A table contributes the combined column widths, not just the
+           widest cell encountered by the ordinary block-child walker. */
+        int width = table_intrinsic_width(context, node, &style, limit);
+        width = layout_add_coordinate(
+            width, style.margin.left + style.margin.right);
+        return constrain_intrinsic_outer_width(
+            context, node, parent, &style, limit, width);
+    }
     const ImageResource *mask = style.mask_image != NULL
         ? images_find_mask_source(
             context->images, node, style.mask_image, PSEUDO_NONE)
@@ -973,7 +1000,9 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     }
     int boundary_space_width = -1;
     bool pending_boundary_space = false;
-    bool has_inline_text = false;
+    bool has_inline_text = inline_width > 0
+        && intrinsic_has_generated_inline_text(
+            context, node, &style, PSEUDO_BEFORE, PSEUDO_BEFORE);
     bool previous_atomic = false;
     int float_left_width = 0, float_right_width = 0;
     for (lxb_dom_node_t *child = document_flat_first_child(node);
@@ -1022,6 +1051,21 @@ static int intrinsic_text_width_impl(LayoutContext *context,
             const char *text = first_text_data(child, &text_length);
             child_has_text = intrinsic_text_has_visible_character(
                 text, text_length);
+            if (!block && !child_atomic && text != NULL && text_length != 0) {
+                leading_space = isspace((unsigned char) text[0]);
+                /* A single text child is the common inline label case.
+                   Its trailing source-space belongs to the next sibling's
+                   collapsed boundary just as a direct text node does. */
+                lxb_dom_node_t *only = document_flat_first_child(child);
+                if (only != NULL && only->type == LXB_DOM_NODE_TYPE_TEXT
+                    && document_flat_next_sibling(only) == NULL)
+                    trailing_space = isspace((unsigned char) text[text_length - 1]);
+            }
+            /* Generated glyphs are text too. A following source-space must
+               survive intrinsic sizing just as it survives actual flow. */
+            if (!child_has_text && child_width > 0 && !block)
+                child_has_text = intrinsic_has_generated_inline_text(
+                    context, child, &child_style, PSEUDO_BEFORE, PSEUDO_AFTER);
             /*
              * A transparent wrapper around one atomic child remains part of
              * that atomic run. Do not infer atomicity merely from a non-zero
@@ -2854,17 +2898,12 @@ void reverse_flex_row_items(LayoutContext *context,
     }
 }
 
-/* Reflect wrapped rows across the used cross axis. Performing this after
-   line packing and per-item alignment makes cross-start/end, baseline,
-   automatic margins, links, and controls follow the reversed axis without a
-   retained line table. Physical margins keep their authored sides. */
-void reverse_flex_cross_items(LayoutContext *context,
-                                     lxb_dom_node_t *container,
-                                     const ComputedStyle *style,
-                                     const FlexOrderPlan *order_plan,
-                                     int content_top, int content_height)
+static void reflect_flex_items_y(LayoutContext *context,
+                                 lxb_dom_node_t *container,
+                                 const ComputedStyle *style,
+                                 const FlexOrderPlan *order_plan,
+                                 int content_top, int content_height)
 {
-    if (!style->flex_wrap_reverse || content_height <= 0) return;
     FlexItemIterator iterator;
     FlatItem item;
     flex_iterator_init(&iterator, context, container, style, order_plan);
@@ -2882,29 +2921,32 @@ void reverse_flex_cross_items(LayoutContext *context,
     }
 }
 
+/* Reflect wrapped rows across the used cross axis. Performing this after
+   line packing and per-item alignment makes cross-start/end, baseline,
+   automatic margins, links, and controls follow the reversed axis without a
+   retained line table. Physical margins keep their authored sides. The
+   entry-point gates remain separate from the shared reflection operation. */
+void reverse_flex_cross_items(LayoutContext *context,
+                              lxb_dom_node_t *container,
+                              const ComputedStyle *style,
+                              const FlexOrderPlan *order_plan,
+                              int content_top, int content_height)
+{
+    if (!style->flex_wrap_reverse || content_height <= 0) return;
+    reflect_flex_items_y(context, container, style, order_plan,
+                         content_top, content_height);
+}
+
 void reverse_flex_column_items(LayoutContext *context,
-                                      lxb_dom_node_t *container,
-                                      const ComputedStyle *style,
-                                      const FlexOrderPlan *order_plan,
-                                      int content_top, int content_height)
+                               lxb_dom_node_t *container,
+                               const ComputedStyle *style,
+                               const FlexOrderPlan *order_plan,
+                               int content_top, int content_height)
 {
     if (style->flex_direction != FLEX_COLUMN_REVERSE
         || content_height <= 0) return;
-    FlexItemIterator iterator;
-    FlatItem item;
-    flex_iterator_init(&iterator, context, container, style, order_plan);
-    while (flex_iterator_next(&iterator, &item)) {
-        if (item.style.out_of_flow || item.style.fixed_position) continue;
-        const LayoutNodeBox *box = flex_item_box(context->layout, &item);
-        if (box == NULL) continue;
-        int target_y = content_top + content_height
-                       - (box->y - content_top) - box->height
-                       + item.style.margin.top - item.style.margin.bottom;
-        int dy = target_y - box->y;
-        if (dy != 0) {
-            translate_flex_item(context->layout, &item, 0, dy);
-        }
-    }
+    reflect_flex_items_y(context, container, style, order_plan,
+                         content_top, content_height);
 }
 
 /* Pack a column-axis flex container after its children have been measured.

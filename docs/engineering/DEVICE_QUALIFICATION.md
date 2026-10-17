@@ -140,6 +140,35 @@ rebuild/run/collect cycles. See [PSPLink development loop](PSPLINK_DEV_LOOP.md).
 Release-style storage paths still require a separate packaged-EBOOT check when
 the feature under test depends on Memory Stick semantics.
 
+### File downloads and ZIP installation
+
+Before releasing changes to file downloads or ZIP installation, qualify the
+production paths on a physical Memory Stick; host directories and `host0:`
+alone do not cover this boundary. Keep test files in an isolated, owned
+directory and never execute a downloaded application as part of this check.
+
+- Confirm and complete an HTTPS download; compare its exact length and
+  SHA-256 with the expected artifact. Cancelling the save confirmation must
+  preserve the incumbent page, scroll and focus without a reload.
+- Pause an active transfer, exit normally, restart, and resume with a matching
+  validator. Verify exact final bytes and safe restart when a server ignores
+  Range or changes its validator.
+- Cancel/delete an active download and confirm that its transfer retires and
+  only its owned partial file and metadata are removed. Check browsing and
+  button responsiveness during transfer and cancellation.
+- Exercise insufficient-space admission and a write failure on controlled
+  test storage, without filling or damaging unrelated user storage. The item
+  must remain retryable, no partial file may be marked complete, and existing
+  files must remain unchanged.
+- Preview and explicitly install a known test ZIP. Verify the extracted
+  lengths/checksums, retained source archive, and complete app folder under
+  `PSP/GAME`. Cancel during extraction and verify owned staging cleanup.
+- Repeat with an existing destination folder containing a sentinel file.
+  Installation must be refused and the folder and sentinel left unchanged.
+
+Record hardware qualification as `UNTESTED` while these checks are deferred;
+passing host tests and cross-builds do not make the feature release-qualified.
+
 ## Required lifecycle scenarios
 
 Device-sensitive changes select from this matrix:

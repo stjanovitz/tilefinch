@@ -400,11 +400,8 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
             cache->layout->fonts, cache->layout->web_fonts,
             draw_command_font_family(command), false, bold_face, draw_command_font_weight(command));
     unsigned weight = draw_font_weight(command);
-    bool synthetic_bold = weight >= 550u
-        && face->authored_weight != weight
-        && (weight < 650u
-            || !font_context_face_is_bold(cache->layout->fonts,
-                                          cache->layout->web_fonts, face));
+    bool synthetic_bold = font_face_needs_synthetic_bold(
+        cache->layout->fonts, cache->layout->web_fonts, face, weight);
     bool metric_bold = bold_face;
     FontFamily metric_family = font_context_metric_family(
         cache->layout->web_fonts, draw_command_font_family(command), face);
@@ -533,8 +530,9 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
         }
         if (bidi_command == NULL && !provider_sequence
             && !draw_command_text_kerning_none(command))
-            pen_x_fixed += font_kerning_at_size_fixed(
-                face, previous, codepoint, pixel_height_fixed);
+            pen_x_fixed += font_kerning_for_family_at_size_fixed(
+                face, metric_family, previous, codepoint, pixel_height_fixed,
+                metric_bold);
         FontGlyph temporary;
         memset(&temporary, 0, sizeof(temporary));
         bool smoothed = false;

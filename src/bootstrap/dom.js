@@ -778,11 +778,30 @@
           ? document.body || node
           : node;
   };
-  const attributeListMemo = new WeakMap(),
+  /* Attr and NamedNodeMap retain their owner. A realm-global WeakMap whose
+     value points back to that key keeps the cycle alive in this collector.
+     Stamp one unreflectable private slot on the owner instead, so ordinary
+     cycle collection sees the complete ownership graph. Stamping preserves
+     its prototype and also works after the author freezes the wrapper. */
+  const createAttributeState = Object.create;
+  class AttributeStateBase {
+    constructor(owner) { return owner; }
+  }
+  class AttributeStateOwner extends AttributeStateBase {
+    #state = createAttributeState(null);
+    static get(owner, create = false) {
+      if (#state in owner) return owner.#state;
+      if (!create) return undefined;
+      new AttributeStateOwner(owner);
+      return owner.#state;
+    }
+  }
+  const attributeState = AttributeStateOwner.get,
+    /* Nonempty namespace mirrors contain semantic data the native DOM cannot
+       reconstruct yet. Keep their existing lifetime across wrapper collection;
+       ordinary Attr/NamedNodeMap caches no longer retain discarded owners. */
     namespacedAttributes = new WeakMap(),
-    attributeObjects = new WeakMap(),
-    attributeOrder = new WeakMap(),
-    namedNodeMaps = new WeakMap(),
+    emptyNamespaceAttributes = Object.freeze([]),
     normalizeNamespace = (namespace) =>
       namespace === null || namespace === undefined || namespace === ""
         ? null
@@ -802,10 +821,10 @@
         prefix && name.startsWith(prefix + ":")
           ? name.slice(prefix.length + 1)
           : name;
-      let cache = owner ? attributeObjects.get(owner) : null;
+      let cache = owner ? attributeState(owner)?.objects : null;
       if (owner && !cache) {
         cache = new Map();
-        attributeObjects.set(owner, cache);
+        attributeState(owner, true).objects = cache;
       }
       const key = attributeKey(namespaceURI, localName);
       let record = cache?.get(key);
@@ -851,10 +870,10 @@
         });
         if (cache) {
           cache.set(key, record);
-          let order = attributeOrder.get(owner);
+          let order = attributeState(owner).order;
           if (!order) {
             order = [];
-            attributeOrder.set(owner, order);
+            attributeState(owner).order = order;
           }
           order.push(record);
         }
@@ -867,13 +886,15 @@
       record.__tilefinchAttributeValue = String(value);
       return record;
     },
-    namespaceAttributes = (node) => {
+    namespaceAttributes = (node, create = false) => {
       let values = namespacedAttributes.get(node);
-      if (!values) {
+      if (!values && create) {
         values = [];
         namespacedAttributes.set(node, values);
       }
-      return values;
+      /* Ordinary HTML reads need no namespace mirror. Keep the empty case
+         shared until a write actually introduces mirrored attributes. */
+      return values || emptyNamespaceAttributes;
     };
   const namedWindowProperties = new Map(),
     namedWindowLimit = 128;
@@ -3536,26 +3557,19 @@
       if (style) style.cssText = String(value);
     },
   }, "style"));
-  const namedNodeMapFor = (owner, read) => {
-    let map = namedNodeMaps.get(owner);
-    if (map) return map;
-    const target = new NamedNodeMap();
-    Object.defineProperties(target, {
-      __tilefinchAttributeOwner: { configurable: true, value: owner },
-      __tilefinchAttributeRead: { configurable: true, value: read },
-    });
-    map = new Proxy(target, {
+  /* Most startup paths never request attributes. Share the traps once they
+     are needed without making a tiny realm instantiate them eagerly. */
+  const makeNamedNodeMapHandler = () => ({
       get(object, key, receiver) {
-        const values = object.__tilefinchAttributeRead();
-        if (key === "length") return values.length;
+        if (key === "length") return object.__tilefinchAttributeRead().length;
         if (key === Symbol.iterator)
           return () => object.__tilefinchAttributeRead()[Symbol.iterator]();
         if (typeof key === "string" && /^\d+$/.test(key))
-          return values[Number(key)];
+          return object.__tilefinchAttributeRead()[Number(key)];
         if (
           ["filter", "find", "forEach", "map", "slice", "some"].includes(key)
         )
-          return Array.prototype[key].bind(values);
+          return Array.prototype[key].bind(object.__tilefinchAttributeRead());
         if (
           typeof key === "string" &&
           !Reflect.has(object, key) &&
@@ -3618,8 +3632,19 @@
         }
         return undefined;
       },
+  });
+  let namedNodeMapHandler;
+  const namedNodeMapFor = (owner, read) => {
+    let map = attributeState(owner)?.map;
+    if (map) return map;
+    const target = new NamedNodeMap();
+    Object.defineProperties(target, {
+      __tilefinchAttributeOwner: { configurable: true, value: owner },
+      __tilefinchAttributeRead: { configurable: true, value: read },
     });
-    namedNodeMaps.set(owner, map);
+    namedNodeMapHandler ||= makeNamedNodeMapHandler();
+    map = new Proxy(target, namedNodeMapHandler);
+    attributeState(owner, true).map = map;
     return map;
   };
   globalThis.__tilefinchNamedNodeMapFor = namedNodeMapFor;
@@ -3666,15 +3691,15 @@
           this.__tilefinchAttributeRead().find(
             (candidate) => candidate.name === attribute.name,
           ) || null,
-        cache = attributeObjects.get(owner) || new Map(),
+        cache = attributeState(owner)?.objects || new Map(),
         key = attributeKey(attribute.namespaceURI, attribute.localName),
-        order = attributeOrder.get(owner) || [];
-      if (!attributeOrder.has(owner)) attributeOrder.set(owner, order);
+        order = attributeState(owner)?.order || [];
+      attributeState(owner, true).order = order;
       if (replaced === attribute) {
         attribute.value = attribute.value;
         return attribute;
       }
-      attributeObjects.set(owner, cache);
+      attributeState(owner).objects = cache;
       attribute.__tilefinchAttributeOwner = owner;
       attribute.__tilefinchAttributeOwnerDocument = owner.ownerDocument;
       cache.set(key, attribute);
@@ -3710,15 +3735,15 @@
           attribute.namespaceURI,
           attribute.localName,
         ),
-        cache = attributeObjects.get(owner) || new Map(),
+        cache = attributeState(owner)?.objects || new Map(),
         key = attributeKey(attribute.namespaceURI, attribute.localName),
-        order = attributeOrder.get(owner) || [];
-      if (!attributeOrder.has(owner)) attributeOrder.set(owner, order);
+        order = attributeState(owner)?.order || [];
+      attributeState(owner, true).order = order;
       if (replaced === attribute) {
         attribute.value = attribute.value;
         return attribute;
       }
-      attributeObjects.set(owner, cache);
+      attributeState(owner).objects = cache;
       attribute.__tilefinchAttributeOwner = owner;
       attribute.__tilefinchAttributeOwnerDocument = owner.ownerDocument;
       owner.setAttributeNS(
@@ -3762,7 +3787,7 @@
     configurable: false,
     writable: false,
     value: (node, owner) => {
-      const cache = attributeObjects.get(node);
+      const cache = attributeState(node)?.objects;
       if (cache)
         for (const attribute of cache.values())
           if (attribute.__tilefinchAttributeOwner === node)
@@ -4770,7 +4795,7 @@
       const authoritativeAutoHeight =
         g.authoritative &&
         (Number(g.height) || 0) <= 0 &&
-        (this.firstChild || shadowRootForHost(this));
+        shadowRootForHost(this);
       if (g.authoritative && !authoritativeAutoHeight)
         return new DOMRect(
           Number(g.x) || 0,
@@ -5927,7 +5952,7 @@
         const remote = globalThis.__tilefinchIsVirtualRemote(this),
           version = remote ? -1 : __tilefinchDomVersion(),
           task = activeTaskSequence,
-          memo = remote ? null : attributeListMemo.get(this);
+          memo = remote ? null : attributeState(this)?.memo;
         if (memo && memo.version === version && memo.task === task)
           return memo.values;
         const raw = remote
@@ -5960,12 +5985,12 @@
               ),
             ),
           current = [...ordinary, ...shadow],
-          order = attributeOrder.get(this) || [];
+          order = attributeState(this)?.order || [];
         const values = Object.freeze([
           ...order.filter((attribute) => current.includes(attribute)),
           ...current.filter((attribute) => !order.includes(attribute)),
         ]);
-        if (!remote) attributeListMemo.set(this, { version, task, values });
+        if (!remote) attributeState(this, true).memo = { version, task, values };
         return values;
       });
     },
@@ -5994,7 +6019,7 @@
       if (html)
         name = name.toLowerCase();
       value = String(value);
-      const cachedAttributes = attributeObjects.get(this),
+      const cachedAttributes = attributeState(this)?.objects,
         matching = html
           ? cachedAttributes?.get(attributeKey(null, name))
           : [...this.attributes].find(
@@ -6044,7 +6069,7 @@
         this.namespaceURI !== "http://www.w3.org/1999/xhtml"
       ) {
         const record = attributeRecord(this, name, value);
-        namespaceAttributes(this).push(record);
+        namespaceAttributes(this, true).push(record);
         result = __tilefinchSetAttribute(nativeReceiver.__handle, name, value) || true;
       } else {
         result = __tilefinchSetAttribute(nativeReceiver.__handle, name, value);
@@ -6122,7 +6147,7 @@
       )
         throw new DOMException("Invalid namespace", "NamespaceError");
       const
-        values = namespaceAttributes(this),
+        values = namespaceAttributes(this, true),
         existing = [...this.attributes].find(
           (attribute) =>
             attribute.namespaceURI === namespace &&
@@ -6203,7 +6228,7 @@
         this.namespaceURI === "http://www.w3.org/1999/xhtml";
       if (html)
         name = name.toLowerCase();
-      const cachedAttributes = attributeObjects.get(this),
+      const cachedAttributes = attributeState(this)?.objects,
         matching = html
           ? cachedAttributes?.get(attributeKey(null, name))
           : [...this.attributes].find(
@@ -6311,9 +6336,9 @@
         if (at >= 0) values.splice(at, 1);
         __tilefinchRemoveAttribute(nativeReceiver.__handle, removed.name);
         removed.__tilefinchAttributeOwner = null;
-        attributeObjects
-          .get(this)
-          ?.delete(attributeKey(namespace, removed.localName));
+        attributeState(this)?.objects?.delete(
+          attributeKey(namespace, removed.localName),
+        );
         if (namespace === null)
           globalThis.__tilefinchCanvasAttributeChanged?.(
             this, removed.localName);

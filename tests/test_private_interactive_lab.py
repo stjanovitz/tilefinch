@@ -27,6 +27,30 @@ LAB = Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 else None
 
 class PrivateConsoleTests(unittest.TestCase):
     @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_text_checksum_does_not_need_javascript_or_include_siblings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "continuity.html"
+            fixture.write_text(
+                "<!doctype html><meta charset=utf-8><article>a<em>b</em>é</article>"
+                "<aside>excluded</aside><article>another article</article>",
+                encoding="utf-8")
+            commands = root / "commands.txt"
+            commands.write_text("text-checksum article\ntext-checksum article\nquit\n")
+            result = subprocess.run(
+                [str(LAB), "--fixture", str(fixture), "--no-javascript",
+                 "--commands", str(commands), "--no-loop-capture"],
+                capture_output=True, text=True, timeout=30, check=True)
+            content = "abé".encode("utf-8")
+            checksum = 2166136261
+            for byte in content:
+                checksum = ((checksum ^ byte) * 16777619) & 0xffffffff
+            receipt = (f"loop-text-checksum ok=yes bytes={len(content)} "
+                       f"hash={checksum}")
+            self.assertEqual(result.stdout.count(receipt), 2)
+            self.assertIn("interactive teardown=0 active=0", result.stdout)
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_memory_and_callback_diagnostics_export_only_fixed_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

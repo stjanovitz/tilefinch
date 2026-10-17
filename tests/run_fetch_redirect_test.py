@@ -239,6 +239,11 @@ class RedirectHandler(BaseHTTPRequestHandler):
             self.portal_probe_count()
         elif path == "/beacon-log":
             self.beacon_log_reply()
+        elif path == "/trace-cookie-values":
+            self.reply(200, b"cookie-shape", (
+                ("Set-Cookie", 'structured={"code":"ZZ"}; Path=/'),
+                ("Set-Cookie", 'quoted="value"; Path=/'),
+            ))
         elif path == "/same":
             self.redirect(302, "/final", "hop=seen; Path=/")
         elif path == "/fragment-inherit":

@@ -1821,6 +1821,7 @@ static int test_foundation(void)
     CHECK(test_zero_font_background_anchor_paints(&budget, 1));
     CHECK(test_zero_font_background_anchor_paints(&budget, 3));
     CHECK(test_zero_font_background_anchor_paints(&budget, 2));
+    CHECK(test_zero_font_background_anchor_paints(&budget, 4));
     CHECK(test_generated_pseudo_opacity(&budget));
     CHECK(test_generated_literal_storage_bounds(&budget));
     CHECK(test_image_style_scope(&budget) == 0);

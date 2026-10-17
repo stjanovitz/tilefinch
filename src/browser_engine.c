@@ -50,6 +50,7 @@ typedef struct {
     bool history_forward;
     bool record_history;
     char url[NAVIGATION_URL_LIMIT];
+    char download_filename[128];
 } BrowserEngineNavigationWork;
 
 /* The load preview on screen. NONE: nothing. FRAME: a frame is presented
@@ -664,7 +665,9 @@ void browser_config_init(BrowserConfig *config,
             .maximum_stylesheet_file_bytes = 512u * KIB,
             .maximum_font_attempts = 8,
             .maximum_font_bytes = 256u * KIB,
-            .maximum_font_file_bytes = 96u * KIB,
+            /* A useful variable subset may exceed 96 KiB. Repartition the
+               unchanged 256 KiB total; this does not enlarge page storage. */
+            .maximum_font_file_bytes = 128u * KIB,
             .maximum_font_face_backend_bytes = 256u * KIB,
             .maximum_images = 24,
             .maximum_image_bytes = 4u * MIB,
@@ -2616,7 +2619,15 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
            current paint list through the ordinary transactional fallback. */
         engine->navigation.canvas_paint_damage_pending = false;
     }
-    if (!tile_cache_replace_layout_damage(
+    bool preserve_fixed = engine->navigation.incremental_relayouts != 0u
+        && engine->render_relayout_generation
+            == engine->navigation.incremental_relayouts - 1u
+        && engine->navigation.fixed_paint_relayout_generation
+            == engine->navigation.incremental_relayouts;
+    bool (*replace_damage)(TileCache *, const LayoutDocument *, int, int, int, int) =
+        preserve_fixed ? tile_cache_replace_layout_damage_preserving_fixed
+                       : tile_cache_replace_layout_damage;
+    if (!replace_damage(
             &engine->render, &engine->navigation.page.layout,
             engine->navigation.relayout_damage_left,
             engine->navigation.relayout_damage_top,
@@ -3556,6 +3567,12 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
             ? finished_us - work->started_us : 0;
     bool succeeded = terminal == NAVIGATION_LOAD_SUCCEEDED
         && engine->navigation.page.loaded;
+    const char *download = navigation_load_download_filename(work->load);
+    if (download != NULL) {
+        snprintf(work->download_filename, sizeof(work->download_filename), "%s", download);
+        terminal = NAVIGATION_LOAD_CANCELLED;
+        snprintf(engine->navigation.last_error, sizeof(engine->navigation.last_error), "File download awaiting confirmation");
+    }
     if (work->hooks_installed) {
         (void) navigation_set_candidate_commit_hooks(
             &engine->navigation, NULL, NULL, NULL, NULL);
@@ -5034,6 +5051,11 @@ static bool browser_engine_do_load_url(BrowserEngine *engine,
     if (navigation == NULL) return false;
     while (navigation_load_status(navigation) == NAVIGATION_LOAD_PENDING)
         (void) navigation_load_pump(navigation, NULL);
+    const char *download = navigation_load_download_filename(navigation);
+    if (download != NULL) {
+        snprintf(engine->navigation_work.download_filename, sizeof(engine->navigation_work.download_filename), "%s", download);
+        snprintf(engine->navigation_work.url, sizeof(engine->navigation_work.url), "%s", load->url);
+    }
     const char *redirect = navigation_load_adapter_redirect(navigation);
     char destination[NAVIGATION_URL_LIMIT] = {0};
     if (redirect != NULL) snprintf(destination, sizeof(destination), "%s", redirect);
@@ -5068,6 +5090,7 @@ bool browser_engine_load_url_with_limits(
     if (url == NULL) return set_error_code(
         engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
         "url-load", "URL load is invalid");
+    if (engine != NULL) engine->navigation_work.download_filename[0] = '\0';
     if (maximum_bytes == 0 || timeout_ms <= 0) return set_error_code(
         engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
         "url-load", "URL load limits are invalid");
@@ -7988,9 +8011,10 @@ bool browser_engine_prepare_reader(
         return false;
     }
     if (prepared_now
-        && !reader_document_prepare_with_stylesheet(
+        && !reader_document_prepare_with_layout(
                &engine->navigation.page.document,
-               &engine->navigation.page.stylesheet, stored)) return false;
+               &engine->navigation.page.stylesheet,
+               &engine->navigation.page.layout, stored)) return false;
     lxb_dom_node_t *reader_root = stored->kind != READER_PAGE_RAW
         ? browser_engine_establish_reader_root(
               &engine->navigation.page, stored->kind)
@@ -8569,9 +8593,10 @@ BrowserBlankReaderRecovery browser_engine_prepare_blank_reader_recovery(
         return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
     }
     if (!stored->prepared
-        && !reader_document_prepare_complete_with_stylesheet(
+        && !reader_document_prepare_complete_with_layout(
                &engine->navigation.page.document,
-               &engine->navigation.page.stylesheet, stored)) {
+               &engine->navigation.page.stylesheet,
+               &engine->navigation.page.layout, stored)) {
         return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
     }
     ReaderDocumentAnalysis prepared = *stored;
@@ -8779,6 +8804,19 @@ NavigationSession *browser_engine_navigation(BrowserEngine *engine)
 {
     return engine == NULL || !engine->navigation_ready
         ? NULL : &engine->navigation;
+}
+
+bool browser_engine_take_download_offer(BrowserEngine *engine,
+    char *url, size_t url_capacity, char *filename, size_t filename_capacity)
+{
+    if (engine == NULL || url == NULL || filename == NULL) return false;
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (!work->download_filename[0] || strlen(work->url) >= url_capacity
+        || strlen(work->download_filename) >= filename_capacity) return false;
+    strcpy(url, work->url);
+    strcpy(filename, work->download_filename);
+    work->download_filename[0] = '\0';
+    return true;
 }
 
 BrowserController *browser_engine_controller(BrowserEngine *engine)

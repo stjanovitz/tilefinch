@@ -158,10 +158,36 @@ late generated glyphs, the family ceiling, all family/fallback/filter combinatio
 and clean teardown. Shipping `.text` measures 4,786,400 bytes, within the existing
 4,786,432-byte cap; no limit increase was required.
 
-Named web-font families retain up to four distinct authored weights rather
+Named web-font families retain up to six distinct authored weights rather
 than merging all light/medium faces into one regular slot. Selection follows
-the CSS weight-search order, while existing download and backend budgets
-remain authoritative. Inline-block baselines use their line-box baseline,
+the CSS weight-search order. Deferred loading admits used weights and one
+normal-weight fallback, reconsidering other weights when later layouts use
+them. Font-relative geometry contributes demand even in empty text boxes.
+The global source ceiling remains 64, with existing download and backend
+budgets authoritative. Measurement, ellipsis and painting share the same
+synthetic-bold rule so an already-heavier authored face is not emboldened
+again. Where italic must be synthesized, metric-sans and serif bold-italic
+text use the available real bold face.
+
+Variable weight ranges use one decoded backend with at most 16 stable weight
+instances, four axes and 32 named instances. The requested weight and default
+size-dependent optical axis are applied to outlines and metrics; other axes
+remain at their font defaults. Excess weight instances use the nearest already
+admitted instance rather than growing storage. Arbitrary variation settings,
+explicit optical-sizing controls and variation-dependent GPOS positioning are
+not implemented. Static bounded kern plans retain their complete source tables;
+tables with no consumable plan are discarded, along with unused substitution,
+name and hint-program tables in reconstructed WOFF2 streams.
+
+Font loading prioritizes requested faces before fallbacks, and does not fetch
+an unused fallback after the requested family faces have loaded. The default
+per-response ceiling is 128 KiB within the unchanged 256 KiB total encoded
+allowance. Retained backends remain capped at 256 KiB per face. Temporary
+opening/reconstruction has a separate 1 MiB ceiling under these defaults,
+charged to the same page Budget and included in Smart's headroom check. Refusal
+and cancellation discard staged ownership without changing a published face.
+
+Inline-block baselines use their line-box baseline,
 not the lowest vertically shifted glyph; single-line inline fragments align
 their generated content as a group. No retained node or draw-command storage
 was added for baselines.
@@ -360,6 +386,12 @@ Resource acquisition and reference qualification remain separate steps.
 The receipt binds the lab executable, trace and invocation by hash and refuses
 input changes during either attempt. Verified frames, offsets and teardown
 do not prove resource completion or completed page hydration.
+
+After the five views, the native runner returns to the top and settles the
+scroll-linked motion on the recorded clock, matching the reference runner's
+reset. The receipt requires that final zero-scroll state. Supplemental content
+anchors must start from this same state and approach in the same direction;
+otherwise a correctly restored toolbar can be mistaken for a rendering defect.
 
 For typography investigations, the lab can emit bounded text-run geometry and
 computed font data. `benchmarks/compare-text-metrics.py` then separates glyph

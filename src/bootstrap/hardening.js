@@ -5,113 +5,7 @@
     deleteProperty = Reflect.deleteProperty,
     getDescriptor = Object.getOwnPropertyDescriptor,
     defineProperty = Object.defineProperty,
-    freeze = Object.freeze,
-    protectedFunctions = new Set([
-      "__tilefinchBoundedAncestorPath",
-      "__tilefinchBlobBytes",
-      "__tilefinchBlobForURL",
-      "__tilefinchCloneWorkerValue",
-      "__tilefinchAbortFileReaderForWorker",
-      "__tilefinchAbortIndexedDBForWorker",
-      "__tilefinchAbortSignalBrand",
-      "__tilefinchBlobTextForWorker",
-      "__tilefinchAbortXHRForWorker",
-      "__tilefinchCloseWebSocketForWorker",
-      "__tilefinchDetachArrayBuffer",
-      "__tilefinchPrepareMessagePortTransfer",
-      "__tilefinchCreatePrivateWeakMap",
-      "__tilefinchCreateMessageEvent",
-      "__tilefinchCreateWorkerCrypto",
-      "__tilefinchSetCryptoBufferNormalizer",
-      "__tilefinchCreateWorkerPerformance",
-      "__tilefinchWorkerCloneIntrinsics",
-      "__tilefinchCurrentScriptForStable",
-      "__tilefinchCurrentDocumentURL",
-      "__tilefinchSecureContext",
-      "__tilefinchDocumentDomainValid",
-      "__tilefinchDiagnosticLookup",
-      "__tilefinchDispatchActivationHandle",
-      "__tilefinchDispatchAt",
-      "__tilefinchDispatchDOMContentLoaded",
-      "__tilefinchDispatchHandle",
-      "__tilefinchDispatchInputHandle",
-      "__tilefinchDispatchSubmitHandle",
-      "__tilefinchDispatchWindowEventCheckpointed",
-      "__tilefinchDispatchEventTargetCheckpointed",
-      "__tilefinchEventObserverDelta",
-      "__tilefinchFetchForWorker",
-      "__tilefinchFetchWorkerScript",
-      "__tilefinchFetchWorkerScriptSync",
-      "__tilefinchFocusEventsObserved",
-      "__tilefinchInvokeEventTargetCheckpointed",
-      "__tilefinchIsProxy",
-      "__tilefinchGetTextPrefix",
-      "__tilefinchGetStyleAttributePrefix",
-      "__tilefinchMarkNativeFunction",
-      "__tilefinchNormalizeTimerDelay",
-      "__tilefinchScheduleTimeout",
-      "__tilefinchScheduleInterval",
-      "__tilefinchScheduleTask",
-      "__tilefinchCancelTimer",
-      "__tilefinchSchedulerTime",
-      "__tilefinchScheduleReservedTask",
-      "__tilefinchScheduleReservedFrame",
-      "__tilefinchPointerHoverEventsObserved",
-      "__tilefinchPointerMarkupChanged",
-      "__tilefinchPointerMoveEventsObserved",
-      "__tilefinchRecordEventHandler",
-      "__tilefinchCompressionRun",
-      "__tilefinchWasmCompile",
-      "__tilefinchWasmGlobalGet",
-      "__tilefinchWasmGlobalSet",
-      "__tilefinchWasmValidate",
-      "__tilefinchRegisterNativeNodeStateCleanup",
-      "__tilefinchReportUncaught",
-      "__tilefinchRetireNativeNodeState",
-      "__tilefinchRunTask",
-      "__tilefinchSchedulerNow",
-      "__tilefinchSetFocusHandle",
-      "__tilefinchWrap",
-      "__tilefinchWrapRemote",
-      "__tilefinchWrapRemoteRelation",
-      "__tilefinchWrapRemoteSelector",
-      "__tilefinchWrapRemoteStable",
-      /* Entry points invoked through the global object by name: by native
-         code (runtime_call in src/js_runtime/event_loop.inc and friends) or
-         by later bootstrap modules (the motion, resize and trusted-event
-         hooks). Left writable, page script could replace one and take over
-         that call.  __tilefinchReceiveMessage is deliberately absent:
-         tests/suites/web_runtime_forms.inc overrides it to exercise a
-         failing realm. */
-      "__tilefinchCommitSameDocument",
-      "__tilefinchDeliverEventSource",
-      "__tilefinchDeliverWebSocket",
-      "__tilefinchDeliverMultiplayer",
-      "__tilefinchDeliverNetwork",
-      "__tilefinchDocumentURLRevision",
-      "__tilefinchDetachNetwork",
-      "__tilefinchIntersectionRecheck",
-      "__tilefinchMediaRecheck",
-      "__tilefinchMaybeStartMotion",
-      "__tilefinchMotionRecheck",
-      "__tilefinchBeginMotionObservation",
-      "__tilefinchParserMutationCheckpoint",
-      "__tilefinchPumpTimers",
-      "__tilefinchSchedulerSnapshot",
-      "__tilefinchRebindDocument",
-      "__tilefinchRecordNavigationTiming",
-      "__tilefinchRecordResourceTiming",
-      "__tilefinchRefreshNamedProperties",
-      "__tilefinchResizeRecheck",
-      "__tilefinchRestoreSameDocument",
-      "__tilefinchRestoreSectionState",
-      "__tilefinchSaveSectionState",
-      "__tilefinchSetFrameWindowState",
-      "__tilefinchStylesheetHasMotionKeyframes",
-      "__tilefinchTrustedEvent",
-      "__tilefinchTrustedString",
-      "__tilefinchUpdateGamepad",
-    ]);
+    freeze = Object.freeze;
   /* Set by the host for host and validation realms only; the probes it
      enabled are published by now. */
   deleteProperty(globalThis, "__tilefinchTestProbes");
@@ -176,28 +70,9 @@
     ]],
   ])
     for (const name of names) markNative(owner?.[name]);
-  for (const key of nativeOwnKeys(globalThis)) {
-    if (typeof key !== "string" || !key.startsWith("__tilefinch")) continue;
-    const descriptor = getDescriptor(globalThis, key);
-    if (!descriptor) continue;
-    const protectedFunction =
-      protectedFunctions.has(key) && typeof descriptor.value === "function";
-    if (!descriptor.enumerable && !protectedFunction) continue;
-    try {
-      defineProperty(globalThis, key, {
-        ...descriptor,
-        enumerable: false,
-        configurable: protectedFunction ? false : descriptor.configurable,
-        writable:
-          protectedFunction && "writable" in descriptor
-            ? false
-            : descriptor.writable,
-      });
-    } catch {
-      /* A host-defined non-configurable property is already as hard as this
-         page-realm pass can make it. */
-    }
-  }
+  /* The temporary trusted channel applies the same descriptor flags without
+     allocating a page-visible array and descriptor objects for every hook. */
+  globalThis.__tilefinchHostChannel.hardenGlobalHooks();
   /* WebIDL puts Document members on Document.prototype: in browsers the
      document's only own property is the [LegacyUnforgeable] location, and
      document.createElement === Document.prototype.createElement. The

@@ -724,11 +724,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 node_control_start, node_box_start,
                 origin_x_twice, origin_y_twice,
                 style->individual_rotate_quadrants, node);
-            int dx = style->transform_x_percent
-                     ? outer_width * style->transform_x / 100
-                     : style->transform_x;
-            int dy = style->transform_y_percent
-                     ? 8 * style->transform_y / 100 : style->transform_y;
+            int dx, dy;
+            style_transform_resolve_translation(context->sheet, style,
+                outer_width, 8, &dx, &dy);
             layout_translate_range(context->layout, node_command_start,
                             node_link_start, node_control_start,
                             node_box_start, dx, dy,
@@ -829,12 +827,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         style->row_gap, definite_height ? declared_content_height : 0);
     int child_containing_height = definite_height
                                   ? declared_content_height : 0;
-    /* The body establishes the handheld initial containing block even when
-       its own computed height is auto. This also matches the root-height
-       propagation browsers provide to common full-height application shells. */
-    if (layout_node_name_is(node, "body") && child_containing_height <= 0) {
-        child_containing_height = viewport_height;
-    }
+    /* Only an authored definite height propagates a percentage-height basis.
+       Positioned descendants still use their separate initial containing
+       block; an auto-height body is not itself the viewport. */
     PositionedBox *descendant_positioned_box =
         &scratch->descendant_positioned_box;
     *descendant_positioned_box = *positioned_box;
@@ -908,6 +903,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         .node_box_start = context->layout->node_box_count,
         .text_align = computed_style_used_text_align(style),
         .direction_rtl = computed_style_direction_rtl(style),
+        .inline_overflow_ellipsis = computed_style_text_overflow_ellipsis(style)
+            && (computed_style_overflow_x_hidden(style)
+                || style->overflow_x_clip_only),
         .clamp_limit = clamped_vertical_box
             ? computed_style_line_clamp(style) : 0,
         .positioned_box = *descendant_positioned_box,
@@ -1663,7 +1661,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             }
             int positioned_bottom = line->y;
             if (flow_item->style.out_of_flow
-                && flow_item->style.has_height && flow_item->style.height_percent
+                && ((flow_item->style.has_height && flow_item->style.height_percent)
+                    || (flow_item->style.has_top
+                        && (flow_item->style.inset_percent_mask & STYLE_INSET_TOP_PERCENT))
+                    || (flow_item->style.has_bottom
+                        && (flow_item->style.inset_percent_mask & STYLE_INSET_BOTTOM_PERCENT)))
                 && (flow_item->style.has_top || flow_item->style.has_bottom)
                 && (flow_item->style.has_left || flow_item->style.has_right)
                 && descendant_positioned_box->height_provisional
@@ -1950,6 +1952,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                     bool growing_single_item =
                         column_in_flow_count == 1
                         && flow_item->style.flex_grow > 0
+                        && definite_height
                         && declared_content_height > 0;
                     bool definite_minimum =
                         !flow_item->style.has_height
@@ -2289,15 +2292,24 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     /* A definite-height flow button centers its anonymous content box.
        Flex/grid buttons already apply their authored alignment. Root-level
        positioned children are still deferred until the containing box is
-       final; preserve the historical path for nested positioned subtrees. */
+       final. A positioned icon contained by an in-flow descendant moves
+       with that descendant; only a box anchored outside that content
+       subtree prevents translating the whole range. */
     if (definite_height && !flex_container && !grid && !maximum_height_clamped
         && layout_node_name_is(node, "button")
         && natural_content_height > 0
         && declared_height > natural_content_height) {
         bool positioned = false;
-        for (size_t i = node_box_start; i < context->layout->node_box_count; i++)
-            if (context->layout->node_boxes[i].positioned_ancestor_distance != 0)
-                positioned = true;
+        for (size_t i = node_box_start; i < context->layout->node_box_count; i++) {
+            const LayoutNodeBox *box = &context->layout->node_boxes[i];
+            unsigned distance = box->positioned_ancestor_distance;
+            if (distance == 0) continue;
+            lxb_dom_node_t *owner = box->node;
+            for (unsigned step = 0; owner != NULL && step < distance; step++)
+                owner = owner->parent;
+            if (distance == UINT8_MAX || owner == NULL || owner == node
+                || !layout_node_within(owner, node)) positioned = true;
+        }
         if (!positioned) {
             int offset = (declared_height - natural_content_height) / 2;
             layout_translate_range(context->layout, scroll_command_start,
@@ -2975,12 +2987,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             node_control_start, node_box_start,
             origin_x_twice, origin_y_twice,
             style->individual_rotate_quadrants, node);
-        int dx = style->transform_x_percent
-                 ? outer_width * style->transform_x / 100
-                 : style->transform_x;
-        int dy = style->transform_y_percent
-                 ? border_height * style->transform_y / 100
-                 : style->transform_y;
+        int dx, dy;
+        style_transform_resolve_translation(context->sheet, style,
+            outer_width, border_height, &dx, &dy);
         layout_translate_range(context->layout, node_command_start, node_link_start,
                         node_control_start, node_box_start, dx, dy,
                         "transform", node);

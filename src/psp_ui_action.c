@@ -43,6 +43,11 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_HOME: return "home";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "save-for-later";
         case PSP_UI_ACTION_INSTALL_OFFLINE_APP: return "install-offline-app";
+        case PSP_UI_ACTION_DOWNLOAD_LINK: return "download-link";
+        case PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD: return "confirm-file-download";
+        case PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD: return "cancel-file-download";
+        case PSP_UI_ACTION_CONFIRM_ZIP_INSTALL: return "confirm-zip-install";
+        case PSP_UI_ACTION_CANCEL_ZIP_INSTALL: return "cancel-zip-install";
         case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
             return "confirm-offline-app";
         case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return "cancel-offline-app";

@@ -419,6 +419,11 @@ and never persisted.
 | `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1.5 MiB/32 same-origin responses + 1 MiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed; while an app runs, a precompiled script's source is read back from `.app.pack` on demand and verified against a 64-bit FNV hash taken at launch; Library → Saved → Recompile (after an update changed the compiler) writes a complete new generation the same way and removes the old one only after the index names the new one |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
+| `<id>-<safe filename>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream |
+| `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range required for append; no cookies/passwords |
+| `PSP/GAME/.tilefinch-unpack-<id>/` | `zip_install.c` | ≤ 256 MiB, 512 entries | cancelled/failed attempt cleanup; manual USB cleanup after power loss | created exclusively after native Install confirmation; complete CRC-checked tree renamed once |
+| `PSP/GAME/<app>/` | `zip_install.c` | ≤ 256 MiB installed data, 64 managed installations | confirmed Installed homebrew removal or manual USB cleanup | no overwrite, automatic execution, firmware changes or plugin activation; source ZIP retained |
+| `PSP/GAME/<app>/.tilefinch-homebrew` | `zip_install.c` | 80 bytes | successful app removal | checked folder name/local ID, no URL or credentials; independent of the ZIP's library record; kept through interrupted removal |
 
 The library holds at most 12 items. Saves are refused up-front with honest
 messages when space is short: articles need `1 MB + 256 KB` free

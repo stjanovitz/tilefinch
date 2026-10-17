@@ -3633,8 +3633,47 @@ static int test_shadow_scope_allocation_refusal(void)
     return 0;
 }
 
+static int test_padding_initial_shorthand(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><style>"
+        "button{padding:8px;box-sizing:content-box;width:24px;height:24px;"
+        "border:0}#reset{padding:unset}#initial{padding:initial}"
+        "#invalid{padding:unset 4px}</style>"
+        "<button id=reset></button><button id=initial></button>"
+        "<button id=invalid></button>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 23)
+        && stylesheet_build(&sheet, &budget, &document, 480)
+        && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const char *ids[] = {"reset", "initial", "invalid"};
+    for (size_t i = 0; i < 3; i++) {
+        lxb_dom_node_t *node = find_id(root, ids[i]);
+        ComputedStyle style = style_for_node(&sheet, node, NULL);
+        const LayoutNodeBox *box = layout_box_for_node(&layout, node);
+        CHECK(style.padding.top == (i == 2 ? 8 : 0)
+            && style.padding.right == style.padding.top
+            && style.padding.bottom == style.padding.top
+            && style.padding.left == style.padding.top);
+        CHECK(box != NULL && box->width == (i == 2 ? 40 : 24)
+            && box->height == (i == 2 ? 40 : 24));
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    CHECK(test_padding_initial_shorthand() == 0);
+    if (argc == 2 && strcmp(argv[1], "--padding-reset-only") == 0) return 0;
     /* The selector offset and container query share one field. Exercise the
        full admitted offset range so longer ordinary selectors cannot silently
        wrap or overwrite a query id. */

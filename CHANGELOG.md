@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.40 — 2026-10-16
+
+- Download files directly to the Memory Stick with pause, resume, retry, and cancellation; preview and install compatible homebrew ZIPs, and manage downloads and installed apps separately.
+- More responsive browsing, improved page rendering and Basic/Reader views, and reduced memory use with better low-memory recovery.
+
 ## 0.1.39 — 2026-10-15
 
 - More responsive focus navigation and faster loading on complex pages.

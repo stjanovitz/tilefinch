@@ -67,7 +67,8 @@
     CHECK(navigation_init(&navigation, &budget, 2));
     CHECK(navigation_commit_static_html(&navigation, navigation_begin(&navigation),
         "https://pressure.test/", pressure_html, pressure_length,
-        480, NULL, NULL, true));
+        480, NULL, NULL, true)
+          && navigation_complete_layout_sync(&navigation));
     LayoutReuseStats pressure_before = {0}, pressure_after = {0};
     layout_reuse_cache_stats(navigation.page.layout_reuse, &pressure_before);
     CHECK(pressure_before.matched_stores > 1000);
@@ -77,14 +78,16 @@
     CHECK(pressure_remaining > 768u * 1024u);
     void *pressure_charge = budget_malloc(&budget,
         pressure_remaining - 768u * 1024u);
-    CHECK(pressure_charge != NULL && navigation_relayout(&navigation));
+    CHECK(pressure_charge != NULL && navigation_relayout(&navigation)
+          && navigation_complete_layout_sync(&navigation));
     layout_reuse_cache_stats(navigation.page.layout_reuse, &pressure_after);
     CHECK(navigation.performance.layout_reuse_pressure_evictions == 0
         && pressure_after.matched_hits > pressure_before.matched_hits
         && navigation.page.layout.text_fingerprint == pressure_fingerprint
         && navigation.page.layout.height == pressure_height);
     budget_free(&budget, pressure_charge);
-    CHECK(navigation_relayout(&navigation));
+    CHECK(navigation_relayout(&navigation)
+          && navigation_complete_layout_sync(&navigation));
     CHECK(navigation.page.layout.text_fingerprint == pressure_fingerprint);
     navigation_destroy(&navigation);
     CHECK(budget.current == 0);
@@ -3192,16 +3195,113 @@
     }
 
     {
+        puts("test: focus layout retains only exactly unchanged fixed pixels");
+        static const char *const changes[] = {
+            "", "body:focus-within #bar{background:blue}",
+            "body:focus-within #bar{top:8px}",
+            "body:focus-within #clip{clip-path:inset(2px)}",
+            ".changed{height:21px}", ".changed #bar{background:blue}",
+            ".changed{height:21px}", ".changed{height:21px}", "",
+            ".changed{height:21px}", ".changed{height:21px}"
+        };
+        for (size_t variant = 0; variant < sizeof(changes)/sizeof(changes[0]); variant++) {
+            char page[4096], icons[2048] = "";
+            if (variant >= 7) {
+                size_t used = 0;
+                for (size_t i = 0; i < (variant == 9 ? 9u : 1u); i++) {
+                    int size = variant == 10 ? 1 : 100;
+                    int height = variant == 10 ? 1 : 10;
+                    int added = snprintf(icons + used, sizeof(icons) - used,
+                        "<svg width='%d' height='%d' viewBox='0 0 %d %d'>"
+                        "<rect id='glyph' width='%d' height='%d' fill='white'/></svg>",
+                        size, height, size, height, size, height);
+                    CHECK(added > 0 && (size_t)added < sizeof(icons) - used);
+                    used += (size_t)added;
+                }
+            }
+            int length = snprintf(page, sizeof(page),
+                "<!doctype html><style>body{margin:0}"
+                "#bar{position:fixed;top:0;left:0;width:100px;height:10px;background:red}"
+                "button{display:block;margin-top:30px;width:50px;height:20px}"
+                "button:focus{height:21px}%s</style><body>"
+                "<div id=clip><div id=bar>%s</div></div>"
+                "<button id=button>Test</button>", changes[variant], icons);
+            CHECK(length > 0 && (size_t) length < sizeof(page));
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4*MIB, 1000);
+            if (variant >= 7)
+                navigation_enable_external_resources(&session,
+                    2, 32*1024, 32*1024, 4, 64*1024, 32*1024, 64*1024, 1000);
+            CHECK(navigation_commit_html(&session, navigation_begin(&session),
+                "https://focus.test/fixed", page, (size_t)length, 100, NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            uint16_t frame[100*100], oracle[100*100];
+            TileCache cache, control;
+            CHECK(tile_cache_init(&cache, &budget, &session.page.layout, 4)
+                  && tile_cache_set_frame(&cache, frame, 100*100)
+                  && tile_cache_render_frame(&cache, 0, 100, 100, NULL)
+                  && cache.fixed_ready && cache.fixed_cache_builds == 1);
+            if (variant < 4) {
+                CHECK(controller_focus_node(&controller, find_id(
+                    lxb_dom_interface_node(session.page.document.html), "button")));
+            } else {
+                CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+                    variant == 8 ? "document.getElementById('glyph').setAttribute('fill','blue')"
+                    : variant == 5 ? "document.body.className='changed'"
+                        : "document.getElementById('button').className='changed'",
+                    "<fixed-attribute>", &session.page.script_result));
+                CHECK(script_runtime_consume_relayout(session.page.runtime)
+                    && navigation_relayout(&session));
+            }
+            bool retained = session.fixed_paint_relayout_generation != 0
+                && session.fixed_paint_relayout_generation == session.incremental_relayouts;
+            CHECK(retained == (variant == 0 || variant == 4 || variant >= 6));
+            if (variant == 6) {
+                FontSet temporary;
+                CHECK(font_set_load(&temporary, &budget, TILEFINCH_TEST_SANS_FONT,
+                    NULL, NULL, NULL, NULL, NULL, NULL, MIB));
+                font_set_destroy(&temporary);
+            }
+            CHECK(retained
+                ? tile_cache_replace_layout_damage_preserving_fixed(
+                    &cache, &session.page.layout, 0, 0, 100, 100)
+                : tile_cache_replace_layout_damage(
+                    &cache, &session.page.layout, 0, 0, 100, 100));
+            CHECK(tile_cache_render_frame(&cache, 0, 100, 100, NULL));
+            size_t expected_builds = variant == 6 || variant >= 8 ? 2u : 1u;
+            if (retained && cache.fixed_cache_builds
+                != expected_builds)
+                fprintf(stderr, "fixed raster builds variant=%zu actual=%zu images=%zu witness=%d/%u\n",
+                    variant, cache.fixed_cache_builds, session.page.images.count,
+                    cache.fixed_images_valid, cache.fixed_image_count);
+            CHECK(!retained || cache.fixed_cache_builds == expected_builds);
+            CHECK(tile_cache_init(&control, &budget, &session.page.layout, 4)
+                  && tile_cache_set_frame(&control, oracle, 100*100)
+                  && tile_cache_render_frame(&control, 0, 100, 100, NULL));
+            if (memcmp(frame, oracle, sizeof(frame)) != 0)
+                fprintf(stderr, "fixed focus pixel mismatch variant=%zu retained=%d\n", variant, retained);
+            CHECK(memcmp(frame, oracle, sizeof(frame)) == 0);
+            tile_cache_destroy(&control);
+            tile_cache_destroy(&cache);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
+    }
+    {
         puts("test: boolean focus-within carriers do not invalidate unrelated controls");
         static const char *const selectors[] = {
             ".carrier:where([data-state]:focus-within) .target",
             ".carrier:not([loaded],:focus-within) .target",
-            ".carrier:is(:where([data-state]:focus-within),.alternate) .target"
+            ".carrier:is(:where([data-state]:focus-within),.alternate) .target",
+            ".outer:has(.carrier:focus-within) .target",
+            ":is(.outer:has(.carrier:focus-within),.alternate) .target"
         };
         for (size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); i++) {
             char page[1024];
             int length = snprintf(page, sizeof(page),
-                "<!doctype html><style>%s{color:red}</style><body>"
+                "<!doctype html><style>%s{color:red}</style><body class=outer>"
                 "<button id=outside>Outside</button>"
                 "<section class=carrier data-state><button id=inside>Inside</button>"
                 "<span class=target>Target</span></section>", selectors[i]);
@@ -3223,6 +3323,59 @@
             navigation_destroy(&session);
             CHECK(budget.current == 0);
         }
+    }
+    {
+        puts("test: hidden vertical overflow does not become a scroll-handler target");
+        static const char page[] = "<!doctype html><style>"
+            ".clip{overflow:hidden}.auto{overflow-y:auto}"
+            "</style><div class=clip id=wrapper><p id=leaf>Content</p></div>"
+            "<div class=auto id=scroller>Scrollable</div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://scroll.test/hidden", page, sizeof(page)-1u,
+            480, NULL, NULL, true));
+        CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+            "(()=>{let e=document.getElementById('leaf');"
+            "while(e instanceof Element){const s=getComputedStyle(e);"
+            "if(/auto|scroll/.test(s.overflowY))break;e=e.parentNode}"
+            "const s=getComputedStyle(document.getElementById('wrapper'));"
+            "pocSummary=[e===document,s.overflow,s.overflowX,s.overflowY,"
+            "getComputedStyle(document.getElementById('scroller')).overflowY]"
+            ".join('|')})()", "<overflow-scroll-target>",
+            &session.page.script_result)
+            && strcmp(session.page.script_result.summary,
+                "true|hidden|hidden|hidden|auto") == 0);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
+        puts("test: a paint-only focus proof caches absent and transparent outlines");
+        static const char page[] = "<!doctype html><style>"
+            "button{outline:none}button:focus{outline:none}"
+            "button.clear:focus{outline:2px solid transparent}"
+            "</style><button id=plain>Plain</button>"
+            "<button class=clear id=clear>Clear</button>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/absent-outline", page, sizeof(page)-1u, 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        for (unsigned i = 0; i < 2; i++) {
+            lxb_dom_node_t *node = find_id(root, i ? "clear" : "plain");
+            CHECK(navigation_dispatch_node_event(&session, node, "focus")
+                  && session.focus_outline_cache_valid
+                  && session.focus_outline_cache_node == node);
+            CHECK(controller_focus_node(&controller, node)
+                  && !controller.has_authored_focus_outline
+                  && !session.focus_outline_cache_valid);
+        }
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
     }
     {
         puts("test: redundant retained focus values do not require layout");
@@ -3338,7 +3491,7 @@
             StyleFocusPseudoTranslation translation;
             lxb_dom_node_t *selected = find_id(root, move % 2 ? "two" : "one");
             CHECK(style_focus_pseudo_change_classify(&session.page.stylesheet,
-                      selected, NULL, &normal, &focused, &translation)
+                      selected, NULL, &normal, &focused, &translation, NULL)
                       == STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY
                   && layout_apply_focus_pseudo_translation(&session.page.layout,
                       selected, &translation, true, false, NULL, NULL, NULL, NULL));
@@ -3380,6 +3533,51 @@
         CHECK(budget.current == 0);
     }
 
+    {
+        puts("test: layered focus rings retain unchanged shadows and control geometry");
+        static const char page[] = "<!doctype html><style>body{margin:0;height:900px}"
+            "button,input,textarea,select{display:block;width:120px;height:28px;"
+            "margin:10px;border:1px solid gray;border-radius:6px;background:white;"
+            "box-shadow:0 1px 2px #555,1px 2px 3px #aaa;outline:none}"
+            "button:focus,input:focus,textarea:focus,select:focus{"
+            "box-shadow:0 1px 2px #555,1px 2px 3px #aaa,0 0 0 2px blue}"
+            "</style><button id=one>One</button><input id=two value=Two>"
+            "<textarea id=three>Three</textarea><select id=four><option>Four</option></select>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/layered", page, sizeof(page)-1u, 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        uint16_t *fast = budget_malloc(&budget, 480u*272u*sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, 480u*272u*sizeof(*full));
+        CHECK(fast && full);
+        const char *ids[] = {"one", "two", "three", "four", "three", "two", "one"};
+        for (size_t move=0; move<sizeof(ids)/sizeof(ids[0]); move++) {
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller, find_id(root, ids[move]))
+                && session.incremental_relayouts == relayouts
+                && navigation_current(&session)->scroll_y == 0);
+            TileCache cache = {0};
+            CHECK(tile_cache_init(&cache, &budget, &session.page.layout, 8)
+                && tile_cache_set_frame(&cache, fast, 480u*272u)
+                && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+            tile_cache_destroy(&cache);
+            int height = session.page.layout.height;
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session) && session.page.layout.height == height
+                && tile_cache_init(&cache, &budget, &session.page.layout, 8)
+                && tile_cache_set_frame(&cache, full, 480u*272u)
+                && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+                && memcmp(fast, full, 480u*272u*sizeof(*fast)) == 0);
+            tile_cache_destroy(&cache);
+        }
+        budget_free(&budget, fast); budget_free(&budget, full);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
     {
         puts("test: removing an offset shadow preserves cached paint and navigation");
         for (unsigned stretched = 0; stretched < 2; stretched++) {
@@ -3458,6 +3656,15 @@
         CHECK(session.page.layout_reuse != NULL && style_focus_change_is_local(&session.page.stylesheet, target));
         size_t resets = session.performance.layout_reuse_full_resets;
         size_t relayouts = session.incremental_relayouts;
+        ComputedStyle normal, focused;
+        StyleFocusPseudoTranslation translation;
+        bool local = false;
+        /* Unsupported geometry still supplies a locality receipt, so the
+           fallback need not repeat the selector/pseudo proof. */
+        CHECK(style_focus_pseudo_change_classify(&session.page.stylesheet,
+                  target, NULL, &normal, &focused, &translation, &local)
+                  == STYLE_FOCUS_CHANGE_UNSAFE
+              && local && normal.width == 100 && focused.width == 120);
         CHECK(controller_focus_node(&controller, target)
               && session.incremental_relayouts == relayouts + 1u
               && session.performance.layout_reuse_full_resets == resets
@@ -3465,6 +3672,86 @@
               && navigation_current(&session)->scroll_y == 0);
         navigation_destroy(&session);
         CHECK(budget.current == 0);
+    }
+
+    {
+        puts("test: nonlocal focus retains unrelated styles only with inert variables");
+        for (unsigned variant = 0; variant < 4; variant++) {
+            char page[32768];
+            size_t used = (size_t) snprintf(page, sizeof(page),
+                "<!doctype html><meta name=viewport content='width=device-width'>"
+                "<style>body{margin:0}button{width:80px;height:24px}"
+                ".panel .actions{opacity:1;height:20px;background:red}"
+                ".panel:focus-within .actions{opacity:.5}"
+                ".unused:focus+span{--accent:red}%s",
+                variant == 1 ? ".panel:focus-within{--h:30px}.actions{height:var(--h,20px)}"
+                : variant == 2 ? ".panel:not(:focus-within){--h:30px}.actions{height:var(--h,20px)}"
+                : variant == 3 ? ":scope:focus{--accent:red}"
+                : "");
+            /* Self-only rules must not exhaust the nonlocal plan's bounded
+               keyless slots or invalidate unrelated paragraph styles. */
+            for (unsigned i = 0; i < 80; i++) {
+                int added = snprintf(page + used, sizeof(page) - used,
+                    i < 65 ? ":focus{outline:%upx solid blue}"
+                           : ".unused:focus .actions{outline:%upx solid blue}", i + 1u);
+                CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+                used += (size_t) added;
+            }
+            int added = snprintf(page + used, sizeof(page) - used,
+                "</style><section class=panel><button id=inside>Inside</button>"
+                "<div class=actions>Actions</div></section><button id=outside>Outside</button>");
+            CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+            used += (size_t) added;
+            for (unsigned i = 0; i < 300; i++) {
+                added = snprintf(page + used, sizeof(page) - used, "<p>Paragraph %u</p>", i);
+                CHECK(added > 0 && (size_t) added < sizeof(page) - used);
+                used += (size_t) added;
+            }
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4 * MIB, 1000);
+            CHECK(navigation_commit_html(&session, navigation_begin(&session),
+                "https://focus.test/nonlocal-variables", page, used, 480, NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+            lxb_dom_node_t *inside = find_id(root, "inside");
+            CHECK(session.page.layout_reuse != NULL
+                  && !style_focus_change_is_local(&session.page.stylesheet, inside)
+                  && style_focus_custom_properties_unchanged(&session.page.stylesheet, inside)
+                         == (variant == 0));
+            size_t pixels = 480u * 272u;
+            uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+            uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+            CHECK(fast && full);
+            for (unsigned move = 0; move < 4; move++) {
+                LayoutReuseStats before, after;
+                layout_reuse_cache_stats(session.page.layout_reuse, &before);
+                CHECK(controller_focus_node(&controller,
+                    move % 2 ? find_id(root, "outside") : inside));
+                layout_reuse_cache_stats(session.page.layout_reuse, &after);
+                if (variant == 0) CHECK(after.full_resets == before.full_resets
+                    && after.style_hits > before.style_hits + 200u);
+                TileCache cache = {0};
+                CHECK(tile_cache_init(&cache, &budget, &session.page.layout, 8)
+                      && tile_cache_set_frame(&cache, fast, pixels)
+                      && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+                tile_cache_destroy(&cache);
+                int height = session.page.layout.height;
+                session.style_rebuild_required = true;
+                CHECK(navigation_relayout(&session)
+                      && session.page.layout.height == height
+                      && navigation_current(&session)->scroll_y == 0
+                      && tile_cache_init(&cache, &budget, &session.page.layout, 8)
+                      && tile_cache_set_frame(&cache, full, pixels)
+                      && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+                      && memcmp(fast, full, pixels * sizeof(*fast)) == 0);
+                tile_cache_destroy(&cache);
+            }
+            budget_free(&budget, fast); budget_free(&budget, full);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
     }
 
     {
@@ -3519,6 +3806,12 @@
             "button:focus{box-shadow:inset 1px 0 0 2px #36c}",
             "button:focus{box-shadow:inset 0 0 2px 2px #36c}",
             "button:focus{box-shadow:inset 0 0 0 1px #36c,inset 0 0 0 2px #fff}",
+            "button{position:relative;box-shadow:0 1px 2px #555}"
+                "button:focus{z-index:1;box-shadow:0 1px 2px #555,0 0 0 2px blue}",
+            "button{box-shadow:0 1px 2px #555}"
+                "button:focus{box-shadow:0 1px 3px #555,0 0 0 2px blue}",
+            "button{box-shadow:0 1px 2px #555}"
+                "button:focus{box-shadow:0 1px 2px #555,inset 0 0 0 2px blue}",
             "body{opacity:.5}button:focus{box-shadow:inset 0 0 0 1px #36c}",
             "button{background:red;border-color:transparent}button:focus{border-color:blue}",
             "button::after{content:'text'}button:focus::after{transform:translateY(-2px)}",

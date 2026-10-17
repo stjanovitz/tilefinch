@@ -195,9 +195,16 @@ static bool test_single_hop_trace_acquisition(
     CHECK(fetch_request_single_hop(
               budget, url, &request, 64u * 1024u, 5000, &result));
     fetch_result_destroy(&result);
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/trace-cookie-values", port);
+    request.cookie = NULL;
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_request_single_hop(
+              budget, url, &request, 64u * 1024u, 5000, &result)
+          && result.set_cookie_count == 2);
+    fetch_result_destroy(&result);
     fetch_trace_end();
     CHECK(trace_info_contains(trace_directory, "capture-complete=yes")
-          && trace_info_contains(trace_directory, "record-count=2")
+          && trace_info_contains(trace_directory, "record-count=3")
           && trace_meta_contains(trace_directory, "cookie-values=redacted\n")
           && trace_meta_contains(trace_directory, "request-cookie-bytes=0\n")
           && trace_meta_contains(
@@ -216,11 +223,17 @@ static bool test_single_hop_trace_acquisition(
                  "request-cookie-provenance-0="
                  "name:hop,issuer:0:0,exact:1,latest:1,occurrences:1\n")
           && !trace_meta_sequence_has_substring(
-                 trace_directory, 1, "hop=seen"));
+                 trace_directory, 1, "hop=seen")
+          && trace_meta_sequence_contains(trace_directory, 2,
+                 "set-cookie-0=structured=xxxxxxxxxxxxx; Path=/\n")
+          && trace_meta_sequence_contains(trace_directory, 2,
+                 "set-cookie-1=quoted=\"xxxxx\"; Path=/\n"));
     CHECK(trace_remove_file(trace_directory, "0000.meta")
           && trace_remove_file(trace_directory, "0000.body")
           && trace_remove_file(trace_directory, "0001.meta")
           && trace_remove_file(trace_directory, "0001.body")
+          && trace_remove_file(trace_directory, "0002.meta")
+          && trace_remove_file(trace_directory, "0002.body")
           && trace_remove_file(trace_directory, "trace.meta"));
     return budget->current == baseline;
 }

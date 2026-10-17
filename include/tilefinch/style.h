@@ -75,6 +75,8 @@
 #define STYLE_GENERATED_TEXT_BYTE_LIMIT 4096
 #define STYLE_WEB_FONT_NAME_CAPACITY 64
 #define STYLE_WEB_FONT_SOURCE_LIMIT 2
+/* Shared with the font continuation's fixed 64-bit processed-source ledger. */
+#define STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT 64
 #define STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY 40
 
 typedef struct {
@@ -875,6 +877,8 @@ typedef struct {
     /* The element hosts a shadow root (it has a carrier child): its light
        children consult their slot (document_shadow_light_child_rendered). */
     uint16_t shadow_host : 1;
+    /* Preserve the hidden keyword for CSSOM without enlarging the style. */
+    uint16_t overflow_y_hidden : 1;
     /* A single bounded implicit-track size covers the common Level 1 form.
        Lists retain their first value deterministically until cyclic implicit
        track lists can justify additional per-style storage. */
@@ -2192,6 +2196,8 @@ typedef struct {
     /* Sticky demand from font-relative geometry, including empty boxes.
        Text-command admission alone must not omit these web families. */
     uint8_t metric_web_font_families;
+    uint64_t metric_web_font_faces;
+    uint64_t metric_web_font_primary_faces;
     /* Transient layout-owned cooperation state. Unlike resolve_scratch this
        is not saved/restored around nested property reparsing. */
     bool (*selector_cooperate)(
@@ -2567,13 +2573,23 @@ bool stylesheet_add_adopted_sheet(Stylesheet *sheet,
    written to `changed` (up to `capacity`, the count to `changed_count`;
    either may be NULL); `global` reports a change that can reach any
    element (a source gaining or losing document scope) or an overflowed
-   `changed`. False on allocation failure: the scopes are then empty and
-   every adopted rule applies everywhere, as before scoping. */
+   `changed`. False on allocation failure: confined sources are declined;
+   document-adopted rules remain available without a scope-table allocation. */
 bool stylesheet_set_adopted_scopes(Stylesheet *sheet,
                                    const PocDocument *document,
                                    const lxb_dom_node_t **changed,
                                    size_t capacity, size_t *changed_count,
                                    bool *global);
+/* Tracked insertion has already cleared computed values and invalidated
+   selector lists for every appended rule. Compare the old scopes by source
+   identity, not shifted bit positions, so a newly confined source does not
+   discard unrelated selector lists. previous_sources is the pre-insertion
+   adopted tier (at most 64 entries); NULL retains the conservative path. */
+bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global);
 /* Parses the document's whole active adopted tier (inline-only builds; the
    external-resource pipeline admits each sheet itself). */
 bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
@@ -2816,10 +2832,15 @@ StyleFocusChange style_focus_change_classify(
 StyleFocusChange style_focus_pseudo_change_classify(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *normal,
-    ComputedStyle *focused, StyleFocusPseudoTranslation *translation);
+    ComputedStyle *focused, StyleFocusPseudoTranslation *translation,
+    bool *local);
 /* Both marker states leave other elements' selector answers unchanged.
    Concrete changes (including unsupported paint) still require full flow. */
 bool style_focus_change_is_local(const Stylesheet *sheet, lxb_dom_node_t *node);
+/* Conservative proof that toggling this focus marker cannot change any
+   custom-property declaration, including inherited/relative effects. */
+bool style_focus_custom_properties_unchanged(const Stylesheet *sheet,
+                                            lxb_dom_node_t *node);
 /* Layout-only second pass for font-metric-dependent `ch` units. */
 ComputedStyle style_for_node_with_ch_basis(
     const Stylesheet *sheet, lxb_dom_node_t *node,
@@ -3046,6 +3067,9 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet);
    property-specific caller. */
 bool style_length_resolve(const Stylesheet *sheet, StyleLength value,
                           int reference, int *pixels);
+/* Translation percentages and bounded calc() lengths use the final border box. */
+void style_transform_resolve_translation(const Stylesheet *sheet,
+    const ComputedStyle *style, int width, int height, int *x, int *y);
 /* Parses a CSS length into used pixels for sparse, non-cascade consumers.
    Percentages are returned as their numeric percentage and marked through
    percent; callers apply the property-specific reference basis. */

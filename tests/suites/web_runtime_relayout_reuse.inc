@@ -126,13 +126,19 @@ static int test_relayout_style_reuse(void)
        a script block appended for good. The tree renders as before. */
     size_t skips = session.performance.hidden_relayout_skips;
     size_t relayouts = session.incremental_relayouts;
-    CHECK(hidden_mutation_turn(&session,
+    bool measured_probe = hidden_mutation_turn(&session,
               "const s=document.createElement('span');s.textContent='WIDE';"
               "document.body.appendChild(s);globalThis.w=s.offsetWidth;"
               "s.remove();const j=document.createElement('script');"
               "j.type='application/json';j.textContent='{}';"
-              "document.body.appendChild(j)")
-          && session.performance.hidden_relayout_skips == skips + 1
+              "document.body.appendChild(j)");
+    if (!measured_probe || session.performance.hidden_relayout_skips != skips + 1
+        || session.incremental_relayouts != relayouts
+        || relayout_reuse_signature(&session.page.layout) != appended)
+        fprintf(stderr, "reuse probe ok=%d skips=%zu/%zu relayouts=%zu/%zu error=%s\n",
+                measured_probe, session.performance.hidden_relayout_skips, skips,
+                session.incremental_relayouts, relayouts, session.page.script_result.error);
+    CHECK(measured_probe && session.performance.hidden_relayout_skips == skips + 1
           && session.incremental_relayouts == relayouts
           && relayout_reuse_signature(&session.page.layout) == appended);
     CHECK(relayout_reuse_fresh_signature(&session) == appended);

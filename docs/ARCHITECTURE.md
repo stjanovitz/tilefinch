@@ -697,7 +697,8 @@ Platform interfaces are ordinary bootstrap JavaScript, so their brand must not
 be forgeable or breakable from the page. The convention is uniform:
 
 - instance state lives in a closure-held `WeakMap` captured before author code
-  runs, never in `_underscore` properties;
+  runs, or an owner-held private field when the state refers back to its owner;
+  never in `_underscore` properties;
 - constructors reject everything but a private token;
 - receiver checks compare against that captured identity, not `instanceof` or
   a mutable global such as `window.navigator`.
@@ -710,6 +711,18 @@ origin-private file system) before author code runs and passes it through a
 temporary global that is deleted immediately. `Event.isTrusted` is a
 non-configurable own accessor backed by the same private state. New Web API
 surface is expected to follow this pattern.
+
+WeakMap values must not retain their own keys: this collector cannot reclaim
+that ephemeron cycle. Ordinary Attr and NamedNodeMap caches therefore live in a
+private field on their owning node. A retained attribute or map still retains
+its owner, but dropping that whole graph permits ordinary cycle collection.
+Generic EventTarget listener tables use the same owner-private lifetime, so
+callbacks that capture a discarded target do not keep that target alive.
+The document continues to share the native dispatcher's listener table.
+Nonempty namespace mirrors keep their existing lifetime: the native DOM does
+not yet reconstruct all qualified-name and namespace metadata after a wrapper
+is collected. Moving that semantic data requires native-backed persistence,
+not merely weakening the mirror's reference.
 
 ### DOM node handles
 
@@ -1046,7 +1059,11 @@ Simple focus decorations use retained paint when geometry is unchanged. Up to
 inset-ring command. Focus then updates that ring's color, opacity, and
 thickness in place with bounded damage, after a dry run proves every old and
 new focus target, and scaled visual copies keep the correct ring thickness.
-Complex shadows, background-clipping changes, inherited or relational
+An unchanged shadow prefix may remain behind a separately retained final
+outset focus ring; its exact layer order and geometry stay fixed. Focus
+classification performs its pseudo-aware dependency proof once, including
+when a real geometry or stacking-order change requires layout.
+Changing complex shadows, background-clipping changes, inherited or relational
 effects, and exhausted slots fall back to authoritative layout. Expanding a
 section is still a layout operation, not an outline update.
 

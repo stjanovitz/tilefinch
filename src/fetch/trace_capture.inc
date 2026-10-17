@@ -126,8 +126,12 @@ static bool trace_cookie_value(const char *cookie, char *output,
     if (equals == NULL) return true;
     char *end = strchr(equals + 1, ';');
     if (end == NULL) end = output + length;
+    bool quoted = end - (equals + 1) >= 2
+        && equals[1] == '"' && end[-1] == '"';
     for (char *at = equals + 1; at < end; at++) {
-        if (*at != '"') *at = 'x';
+        /* Only outer quotes delimit a quoted cookie. Retaining quotes
+           embedded in a structured value makes redaction unparsable. */
+        if (!quoted || (at != equals + 1 && at != end - 1)) *at = 'x';
     }
     return true;
 }

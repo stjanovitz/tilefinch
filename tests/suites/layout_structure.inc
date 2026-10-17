@@ -138,6 +138,41 @@ static int test_spatial_ranges_service_input_before_finishing(Budget *budget)
     return 0;
 }
 
+static int test_focus_shadowed_opacity_and_empty_images(Budget *budget)
+{
+    const char *html = "<!doctype html><style>"
+        ".card:focus-within .actions{opacity:1}"
+        ".actions{opacity:1}a:focus{outline:2px solid red}"
+        ".real .actions{opacity:0}"
+        ".blur{backdrop-filter:blur(1px);background-position:center}"
+        ".blur:focus{background-position:left top}"
+        ".image{background-image:url(/image.png);background-position:center}"
+        ".image:focus{background-position:left top}"
+        "</style><div class=card><a id=stable href=#>Stable</a>"
+        "<div class=actions>Actions</div></div>"
+        "<div class='card real'><a id=changing href=#>Changed</a>"
+        "<div class=actions>Actions</div></div>"
+        "<a id=empty class=blur href=#>Empty</a>"
+        "<a id=image class='blur image' href=#>Image</a>";
+    PocDocument document = {0}; Stylesheet sheet = {0};
+    CHECK(document_parse(&document,budget,html,strlen(html),31)
+          && stylesheet_build(&sheet,budget,&document,480));
+    lxb_dom_node_t *root=lxb_dom_interface_node(document.html);
+    const char *ids[]={"stable","changing","empty","image"};
+    for(size_t i=0;i<4;i++) {
+        ComputedStyle normal={0},focused={0};
+        StyleFocusChange change=style_focus_change_classify(&sheet,
+            find_id(root,ids[i]),NULL,&normal,&focused);
+        if(change!=((i==0||i==2)?STYLE_FOCUS_CHANGE_OUTLINE_ONLY:STYLE_FOCUS_CHANGE_UNSAFE))
+            fprintf(stderr,"focus-regression id=%s change=%d\n",ids[i],change);
+        CHECK(change==((i==0||i==2)?STYLE_FOCUS_CHANGE_OUTLINE_ONLY
+                                 :STYLE_FOCUS_CHANGE_UNSAFE));
+    }
+    stylesheet_destroy(&sheet);document_destroy(&document);
+    CHECK(budget->current==0);
+    return 0;
+}
+
 static int test_focus_within_unrelated_branches(Budget *budget)
 {
     size_t baseline = budget->current;

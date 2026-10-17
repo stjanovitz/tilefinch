@@ -702,10 +702,12 @@ static void script_profile_sample(ScriptRuntime *owner, uint64_t now_ns)
         if (threshold > 0 && us >= threshold) {
             char line_buf[1800];
             int n = snprintf(line_buf, sizeof(line_buf),
-                             "tilefinch-js-outlier us=%llu phase=%d site=%d job=%llu "
+                             "tilefinch-js-outlier us=%llu phase=%d site=%d job=%llu heap-bytes=%zu handles=%zu "
                              "last-native=%s ago-us=%llu native-us=%llu inside-us=%llu stack=",
                              (unsigned long long) us, phase, profile->micro_site,
                              (unsigned long long) profile->job_begin_ns,
+                             budget_quickjs_pool_js_malloc_current(owner->quickjs_pool),
+                             owner->bridge.node_count,
                              profile->last_native >= 0
                                  && (size_t) profile->last_native < script_profile_native_count
                                  ? script_profile_natives[profile->last_native].name : "-",

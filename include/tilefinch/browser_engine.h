@@ -1142,6 +1142,10 @@ const BrowserSession *browser_engine_session_view(const BrowserEngine *engine);
 /* Transitional mutable accessors retained for tests and unmigrated tools. */
 NavigationSession *browser_engine_navigation(BrowserEngine *engine);
 BrowserController *browser_engine_controller(BrowserEngine *engine);
+/* One-shot native offer after a response interrupted document navigation.
+   No file is saved by navigation itself. New navigation clears an old offer. */
+bool browser_engine_take_download_offer(BrowserEngine *engine,
+    char *url, size_t url_capacity, char *filename, size_t filename_capacity);
 FontSet *browser_engine_fonts(BrowserEngine *engine);
 TileCache *browser_engine_render_shell(BrowserEngine *engine);
 uint16_t *browser_engine_framebuffer(BrowserEngine *engine,

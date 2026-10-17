@@ -117,6 +117,7 @@ typedef struct {
 typedef struct {
     const PocDocument *document;
     const LayoutDocument *source_layout;
+    const Stylesheet *source_stylesheet;
     Budget *budget;
     char *data;
     size_t length;
@@ -553,9 +554,42 @@ static bool reader_attribute_has_any_token(
     return false;
 }
 
+static bool reader_header_is_link_masthead(lxb_dom_node_t *node)
+{
+    if (!reader_name_is(node, "header")) return false;
+    /* A linked-logo masthead remains page chrome even when an author puts
+       the entire page inside main. Do not mistake a byline/title header for
+       it: accept only a small tree of links, images and neutral wrappers. */
+    size_t links = 0, visited = 0;
+    lxb_dom_node_t *part = node->first_child;
+    bool linked_masthead = true;
+    for (; part != NULL && visited < READER_PART_SCAN_LIMIT;
+         part = reader_next_within(part, node), visited++) {
+        if (reader_name_is(part, "a")) links++;
+        else if (part->type == LXB_DOM_NODE_TYPE_ELEMENT
+                 && !reader_name_is(part, "img")
+                 && !reader_name_is(part, "div")
+                 && !reader_name_is(part, "span")
+                 && !reader_name_is(part, "picture")
+                 && !reader_name_is(part, "source")) {
+            linked_masthead = false;
+            break;
+        } else if (part->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(part, &length);
+            if (reader_visible_text_bytes(text, length) != 0) {
+                linked_masthead = false;
+                break;
+            }
+        }
+    }
+    return linked_masthead && part == NULL && links >= 2u;
+}
+
 static bool reader_header_is_page_chrome(lxb_dom_node_t *node)
 {
     if (!reader_name_is(node, "header")) return false;
+    if (reader_header_is_link_masthead(node)) return true;
     lxb_dom_node_t *ancestor = node->parent;
     static const char *const content_roles[] = { "article", "main" };
     for (size_t depth = 0; ancestor != NULL && depth < 64u;
@@ -1386,6 +1420,48 @@ static bool reader_previous_ends_link(lxb_dom_node_t *node)
     return false;
 }
 
+/* Simplification reveals hidden prose for recovery, but revealing alternate
+   responsive logos duplicates branding. Filter only images with positive CSS
+   hiding evidence, never images merely absent from a provisional layout. A
+   disclosure keeps its hidden media available when the reader opens it. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static bool reader_image_style_hidden(const ReaderExtractBuffer *output,
+                                      lxb_dom_node_t *node, bool *cancelled)
+{
+    *cancelled = false;
+    if (output->source_stylesheet == NULL) return false;
+    lxb_dom_node_t *ancestors[READER_EXTRACT_DEPTH_LIMIT];
+    size_t depth = 0;
+    for (lxb_dom_node_t *at = node;
+         at != NULL && !reader_name_is(at, "body")
+             && !reader_name_is(at, "html"); at = at->parent) {
+        if (depth == READER_EXTRACT_DEPTH_LIMIT) return false;
+        if (reader_collapsed_disclosure(at)
+            || reader_name_is(at, "details")) return false;
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        ancestors[depth++] = at;
+    }
+    bool hidden = false, has_parent = false;
+    ComputedStyle style = {0};
+    while (depth != 0) {
+        if ((depth & 15u) == 0u
+            && !tilefinch_platform_cooperate("reader-image-styles", depth)) {
+            *cancelled = true;
+            return false;
+        }
+        style = style_for_node(output->source_stylesheet,
+            ancestors[--depth], has_parent ? &style : NULL);
+        has_parent = true;
+        hidden = hidden || style.display == DISPLAY_NONE
+            || style.opacity == 0;
+    }
+    /* Unlike display and opacity, inherited visibility can be overridden
+       by a visible descendant. Use the image's final inherited value. */
+    return hidden || (has_parent && style.visibility_hidden);
+}
+
 static bool reader_extract_node(ReaderExtractBuffer *output,
                                 lxb_dom_node_t *node, size_t depth,
                                 bool in_admitted_form,
@@ -1443,6 +1519,15 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         || (!output->basic_mode
             && reader_excluded_region(output->document, node)))
         return true;
+    if (reader_name_is(node, "img")) {
+        bool cancelled = false;
+        bool hidden = reader_image_style_hidden(output, node, &cancelled);
+        if (cancelled) {
+            output->bounded_out = true;
+            return false;
+        }
+        if (hidden) return true;
+    }
     /* Form and control admission counts before this node, so a form the
        bound cuts through can be withdrawn whole (see below). */
     const uint16_t forms_checkpoint = output->retained_forms;
@@ -1513,7 +1598,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     }
     bool folded_navigation = output->basic_mode && !in_admitted_form
         && (reader_name_is(node, "nav")
-            || reader_attribute_equals_ci_trimmed(node, "role", "navigation"));
+            || reader_header_is_link_masthead(node)
+            || reader_attribute_equals_ci_trimmed(node, "role", "navigation")
+            || reader_attribute_equals_ci_trimmed(node, "role", "banner"));
     if (folded_navigation) tag = "nav";
     const char *image_source = NULL;
     size_t image_source_length = 0;
@@ -1635,6 +1722,10 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
             const LayoutNodeBox *box = output->source_layout == NULL
                 ? NULL : layout_box_for_node(output->source_layout, node);
             if (box != NULL && box->content_width > 0) {
+                if (box->content_width <= 64
+                    && !reader_extract_literal(output,
+                        " data-tilefinch-reader-compact-image"))
+                    goto append_failed;
                 /* Native simplified-view CSS keeps height auto and caps
                    width at its viewport. Retain only the useful source
                    inline size, not clipping, transforms or cropped height. */
@@ -2322,6 +2413,8 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
     uint32_t best_score = 0;
     uint16_t semantic_winner = READER_INVALID_INDEX;
     uint32_t semantic_score = 0;
+    uint16_t main_winner = READER_INVALID_INDEX;
+    uint32_t main_score = 0;
     for (size_t i = 0; i < count; i++) {
         const ReaderNodeStat *stat = &stats[i];
         if ((stat->flags & READER_STAT_EXCLUDED) != 0
@@ -2335,6 +2428,12 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
         if (content_bytes <= stat->text_bytes / 2u) continue;
         uint32_t score = reader_add_u32(
             content_bytes, (uint32_t) stat->paragraphs * 80u);
+        if ((reader_name_is(stat->node, "main")
+             || reader_attribute_equals_ci_trimmed(stat->node, "role", "main"))
+            && score > main_score) {
+            main_score = score;
+            main_winner = (uint16_t) i;
+        }
         /* Prefer the page's authored semantic article over an otherwise
            identical main/div wrapper. This also gives auto-Reader a concrete
            content-shape signal instead of treating every prose-heavy landing
@@ -2358,6 +2457,11 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
         && winner != READER_INVALID_INDEX
         && reader_descends_from(stats, semantic_winner, winner))
         winner = semantic_winner;
+    else if (main_winner != READER_INVALID_INDEX
+        && winner != READER_INVALID_INDEX
+        && reader_descends_from(stats, main_winner, winner)
+        && (uint64_t) main_score * 4u >= (uint64_t) best_score * 3u)
+        winner = main_winner;
     if (winner == READER_INVALID_INDEX) return true;
     const ReaderNodeStat *selected = &stats[winner];
     uint32_t visible = analysis->visible_text_bytes;
@@ -2495,6 +2599,7 @@ static void reader_forget_generated_media_card(PocDocument *document)
 
 static bool reader_install_extracted_tree(
     PocDocument *document, lxb_dom_node_t *body,
+    const LayoutDocument *source_layout,
     const ReaderNodeStat *stats, size_t count,
     ReaderPageKind kind, uint16_t article_root, uint16_t listing_root,
     const MediaDeclaredVideo *declared_video,
@@ -2510,6 +2615,7 @@ static bool reader_install_extracted_tree(
         || kind == READER_PAGE_RAW) return false;
     ReaderExtractBuffer output;
     if (!reader_extract_begin(&output, document, false)) return false;
+    output.source_layout = source_layout;
     bool okay = reader_extract_literal(
         &output, "<header><strong>Reader</strong></header>");
     if (okay && synthesize_declared_video)
@@ -2518,6 +2624,27 @@ static bool reader_install_extracted_tree(
     if (okay && article_root < count) {
         if (kind == READER_PAGE_ARTICLE) {
             lxb_dom_node_t *parts[3] = {0};
+            /* A page title may be a sibling of the selected prose subtree.
+               Use only its enclosing main landmark, not an unrelated title
+               elsewhere on a multi-article page. */
+            size_t title_start = article_root;
+            for (uint16_t at = stats[article_root].parent;
+                 at != READER_INVALID_INDEX; at = stats[at].parent) {
+                if (reader_name_is(stats[at].node, "article")) break;
+                if (reader_name_is(stats[at].node, "main")
+                    || reader_attribute_equals_ci_trimmed(
+                        stats[at].node, "role", "main")) {
+                    title_start = at;
+                    break;
+                }
+            }
+            for (size_t i = title_start; i < article_root; i++) {
+                if ((stats[i].flags & READER_STAT_EXCLUDED) == 0
+                    && reader_name_is(stats[i].node, "h1")) {
+                    parts[0] = stats[i].node;
+                    break;
+                }
+            }
             size_t end = reader_subtree_end(stats, count, article_root);
             for (size_t i = article_root; i < end; i++) {
                 if ((stats[i].flags & READER_STAT_EXCLUDED) != 0) continue;
@@ -2643,6 +2770,7 @@ static bool reader_install_extracted_tree(
 
 static bool reader_document_prepare_internal(
     PocDocument *document, const Stylesheet *stylesheet,
+    const LayoutDocument *source_layout,
     ReaderDocumentAnalysis *analysis, bool install, bool require_complete,
     bool connect_root, lxb_dom_node_t **prepared_root)
 {
@@ -2652,6 +2780,11 @@ static bool reader_document_prepare_internal(
     lxb_dom_node_t *body = document_body_node(document);
     if (document == NULL || document->budget == NULL || body == NULL)
         return true;
+    if (source_layout != NULL && (stylesheet == NULL
+        || source_layout->image_content_generation != document->content_generation
+        || source_layout->image_style_generation != document_style_generation()
+        || source_layout->image_sheet_generation != stylesheet->build_generation))
+        source_layout = NULL;
     size_t capacity = document->element_count;
     if (capacity == 0) return true;
     if (capacity > READER_NODE_LIMIT) capacity = READER_NODE_LIMIT;
@@ -2976,7 +3109,8 @@ static bool reader_document_prepare_internal(
                 okay = reader_set_marker(
                     &journal, body, "data-tilefinch-reader-kind", kind_name);
                 if (okay) okay = reader_install_extracted_tree(
-                    document, body, stats, count, kind, article, listing,
+                    document, body, source_layout,
+                    stats, count, kind, article, listing,
                     declared_video, declared_watch_root && !primary_media,
                     analysis, install, require_complete,
                     connect_root,
@@ -3050,7 +3184,15 @@ bool reader_document_prepare_with_stylesheet(
     ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, true, false, true, NULL);
+        document, stylesheet, NULL, analysis, true, false, true, NULL);
+}
+
+bool reader_document_prepare_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const LayoutDocument *source_layout, ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_internal(
+        document, stylesheet, source_layout, analysis, true, false, true, NULL);
 }
 
 bool reader_document_prepare_detached_with_stylesheet(
@@ -3058,7 +3200,7 @@ bool reader_document_prepare_detached_with_stylesheet(
     ReaderDocumentAnalysis *analysis, lxb_dom_node_t **prepared_root)
 {
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, true, false, false, prepared_root);
+        document, stylesheet, NULL, analysis, true, false, false, prepared_root);
 }
 
 bool reader_document_analyze_with_stylesheet(
@@ -3066,7 +3208,7 @@ bool reader_document_analyze_with_stylesheet(
     ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, false, false, false, NULL);
+        document, stylesheet, NULL, analysis, false, false, false, NULL);
 }
 
 bool reader_document_prepare_complete_with_stylesheet(
@@ -3075,7 +3217,15 @@ bool reader_document_prepare_complete_with_stylesheet(
 {
     if (analysis == NULL) return false;
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, true, true, true, NULL);
+        document, stylesheet, NULL, analysis, true, true, true, NULL);
+}
+
+bool reader_document_prepare_complete_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const LayoutDocument *source_layout, ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_internal(
+        document, stylesheet, source_layout, analysis, true, true, true, NULL);
 }
 
 static bool reader_exact_root_matches(
@@ -3143,6 +3293,7 @@ static bool reader_document_prepare_basic_internal(
         analysis->bounded_out = true;
         return true;
     }
+    output.source_stylesheet = stylesheet;
     if (source_layout != NULL && stylesheet != NULL
         && source_layout->image_content_generation == document->content_generation
         && source_layout->image_style_generation == document_style_generation()

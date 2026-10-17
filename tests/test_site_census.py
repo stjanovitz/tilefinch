@@ -17,6 +17,7 @@ CENSUS = ROOT / "tools/site-census"
 sys.path.insert(0, str(CENSUS))
 import census  # noqa: E402
 import extract  # noqa: E402
+import classify  # noqa: E402
 
 PAGE = """<!doctype html><html><head><title>start</title></head><body>
 <h1>Census fixture</h1><p>Some article text for the reader analysis.</p>
@@ -65,6 +66,12 @@ def run(lab, root, name, env_extra, probe, source=None):
 
 
 def main():
+    assert classify.classify('https://content.test/packs/audio-abcgga.js',
+                             'https://content.test/') == 'first-party'
+    assert classify.classify('https://cdn.example/ga.js?version=1',
+                             'https://content.test/') == 'analytics'
+    assert classify.classify('https://player.ay.delivery/client.js',
+                             'https://content.test/') == 'ads'
     lab = pathlib.Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)

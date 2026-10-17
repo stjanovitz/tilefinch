@@ -699,7 +699,7 @@ static JSValue js_element_geometry(JSContext *context,
         && (bridge->layout == NULL
             || (bridge->relayout_dirty != NULL
                 && *bridge->relayout_dirty))) {
-        if (js_rt_bridge_flush_synchronous_layout(bridge)) {
+        if (js_rt_bridge_flush_synchronous_layout(bridge, node)) {
             if (bridge->result != NULL)
                 bridge->result->geometry_synchronous_layouts++;
             if (!js_rt_notify_style_flushed(context)) return JS_EXCEPTION;
@@ -2685,6 +2685,28 @@ static JSValue js_callback_checkpoint(JSContext *context,
     return js_rt_throw_task_interruption(context, message);
 }
 
+static JSValue js_microtask_job(JSContext *context, int argc,
+                                JSValueConst *argv)
+{
+    (void) argc;
+    return JS_Call(context, argv[0], JS_UNDEFINED, 0, NULL);
+}
+
+static JSValue js_enqueue_microtask(JSContext *context,
+                                   JSValueConst this_value, int argc,
+                                   JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc != 1 || !JS_IsFunction(context, argv[0]))
+        return JS_ThrowTypeError(context, "callback required");
+    /* Use the ordinary Budget-owned job queue, without creating an author
+       Promise or consulting its constructor/@@species. The bootstrap wrapper
+       reports callback exceptions as uncaught errors, not rejections. */
+    if (JS_EnqueueJob(context, js_microtask_job, 1, argv) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
 static JSValue js_queue_checkpoint_continuation(
     JSContext *context, JSValueConst this_value, int argc,
     JSValueConst *argv)
@@ -2869,6 +2891,7 @@ bool js_rt_install_function(JSContext *context, JSValue global,
             || strcmp(name, "__tilefinchMultiplayerClose") == 0);
     bool transient_bootstrap_bridge =
         strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
+        || strcmp(name, "__tilefinchEnqueueMicrotask") == 0
         || strcmp(name, "__tilefinchMotionSourceBridge") == 0
         || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0
         || strcmp(name, "__tilefinchEncodingName") == 0

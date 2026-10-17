@@ -37,6 +37,7 @@ TRACE_RECORD = re.compile(r"([0-9]{4})\.(meta|body)\Z")
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 MAX_JSON_BYTES = 1024 * 1024
+MAX_REFERENCE_DIAGNOSTIC_BYTES = 8 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_URL_BYTES = 2047
 MAX_RECORDS = 4096
@@ -154,8 +155,8 @@ def _regular_file(path: Path, label: str, maximum: int | None = None) -> int:
     return info.st_size
 
 
-def _load_json(path: Path, label: str) -> dict[str, Any]:
-    _regular_file(path, label, MAX_JSON_BYTES)
+def _load_json(path: Path, label: str, maximum: int = MAX_JSON_BYTES) -> dict[str, Any]:
+    _regular_file(path, label, maximum)
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object
@@ -630,7 +631,8 @@ def _validate_plan(
         raise AcquisitionError(
             f"diagnostic SHA-256 mismatch: expected {contract['diagnostic_sha256']}, got {actual}"
         )
-    diagnostic = _load_json(diagnostic_path, "reference diagnostic")
+    diagnostic = _load_json(diagnostic_path, "reference diagnostic",
+                            MAX_REFERENCE_DIAGNOSTIC_BYTES)
     plan = diagnostic.get("acquisition_plan")
     if not isinstance(plan, dict):
         raise AcquisitionError("reference diagnostic has no acquisition_plan")
@@ -917,8 +919,9 @@ def _validate_response_cookies(
         if same_site is not None and same_site.lower() not in {"strict", "lax", "none"}:
             raise AcquisitionError("response cookie SameSite value is invalid")
         secure = "secure" in attributes
-        if same_site is not None and same_site.lower() == "none" and not secure:
-            raise AcquisitionError("SameSite=None response cookie is not Secure")
+        # SameSite=None without Secure is ignored by the browser. Retain and
+        # validate its exact redacted record, but do not reject its response;
+        # the replay cookie policy explicitly refuses to install it.
         if name.startswith("__Secure-") and not secure:
             raise AcquisitionError("__Secure- response cookie is not Secure")
         if name.startswith("__Host-") and (
@@ -1268,6 +1271,7 @@ def _inspect_reference_trace(node: Path, trace: Path) -> dict[str, Any]:
         "occurrence_routes",
         "route_selection_version",
         "response_cookies",
+        "ignored_response_cookies",
         "clock_origin_ms",
         "urls",
     }
@@ -1279,6 +1283,7 @@ def _inspect_reference_trace(node: Path, trace: Path) -> dict[str, Any]:
         "ambiguous_routes",
         "occurrence_routes",
         "response_cookies",
+        "ignored_response_cookies",
         "clock_origin_ms",
     ):
         maximum = (
@@ -1287,6 +1292,8 @@ def _inspect_reference_trace(node: Path, trace: Path) -> dict[str, Any]:
         _integer(inspected[key], f"reference inspection {key}", 0, maximum)
     if inspected["route_selection_version"] != REFERENCE_ROUTE_SELECTION:
         raise AcquisitionError("authoritative route-selection version changed")
+    if inspected["ignored_response_cookies"] > inspected["response_cookies"]:
+        raise AcquisitionError("ignored cookie count exceeds response cookies")
     if (
         not isinstance(inspected["urls"], list)
         or inspected["urls"] != sorted(set(inspected["urls"]))

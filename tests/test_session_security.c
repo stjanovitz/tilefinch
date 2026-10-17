@@ -2107,6 +2107,10 @@ int main(void)
               &domain_session, "https://alice.github.io/",
               "suffix=bad; Domain=github.io; Path=/; Secure")
           && !browser_session_cookie_set_http(
+              &domain_session,
+              "https://tenant.consent-portal.bedrock-agentcore.us-east-1.amazonaws.com/",
+              "suffix=bad; Domain=consent-portal.bedrock-agentcore.us-east-1.amazonaws.com; Path=/; Secure")
+          && !browser_session_cookie_set_http(
               &domain_session, "https://www.example.com/",
               "unrelated=bad; Domain=example.net; Path=/; Secure")
           && !browser_session_cookie_set_http(

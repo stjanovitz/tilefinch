@@ -75,6 +75,34 @@
     document_destroy(&root_height_document);
     CHECK(budget.current == 0);
 
+    puts("test: auto root height does not make descendant percentages definite");
+    {
+        static const char page[] =
+            "<!doctype html><style>body{margin:0;height:100%}"
+            "#shell{height:100%;display:flex;flex-direction:column}"
+            "#main{height:100%;margin-top:40px}"
+            "#results{height:100%;min-height:30px;display:flex;flex-direction:column}"
+            "#clip{overflow:hidden;display:flex;flex-direction:column;flex:1}"
+            "#list{height:1200px;flex-shrink:0}</style>"
+            "<div id=shell><main id=main><div id=results><div id=clip>"
+            "<div id=list>LISTINGS</div></div></div></main></div>";
+        PocDocument document = {0}; Stylesheet sheet = {0}; LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 41)
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+        const LayoutNodeBox *clip = layout_box_for_node(&layout,
+            find_id(lxb_dom_interface_node(document.html), "clip"));
+        const LayoutNodeBox *list = layout_box_for_node(&layout,
+            find_id(lxb_dom_interface_node(document.html), "list"));
+        if (!clip || !list || clip->height != 1200 || layout.height < 1240)
+            fprintf(stderr, "auto root: clip=%d list=%d document=%d\n",
+                clip ? clip->height : -1, list ? list->height : -1, layout.height);
+        CHECK(clip && list && clip->height == 1200 && list->height == 1200
+            && layout.height >= 1240);
+        layout_destroy(&layout); stylesheet_destroy(&sheet); document_destroy(&document);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: inline ancestry preserves a definite percentage-height basis");
     {
         static const char page[] =
@@ -2071,11 +2099,15 @@
         ".btn{padding:6px 12px;font-size:14px;line-height:20px;"
         "border:1px solid #ccc}"
         "#ib{display:inline-block;width:300px;max-width:50%}"
+        ".single{font-size:14px;line-height:18px;padding:9px 10px;border:0}"
+        "#fixed-field{height:25px;box-sizing:border-box}"
+        "#short-field{line-height:7px}"
         "</style><body><div><input id=field type=text></div>"
         "<div><input id=submit class=btn type=submit value=Go></div>"
         "<div><button id=button class=btn>Go</button></div>"
         "<div><span id=ib>i</span></div><select id=menu>"
-        "<option>One</option></select></body>";
+        "<option>One</option></select><div><input id=tall-field class=single type=email>"
+        "<input id=fixed-field class=single><input id=short-field class=single></div></body>";
     PocDocument fc_document;
     Stylesheet fc_sheet;
     LayoutDocument fc_layout;
@@ -2100,6 +2132,11 @@
     CHECK(fc_submit->width == fc_button->width && fc_submit->width > 26
           && fc_submit->width < 60);
     CHECK(fc_ib->width == 240);
+    const LayoutNodeBox *fc_tall = layout_box_for_node(&fc_layout, find_id(fc_root, "tall-field"));
+    const LayoutNodeBox *fc_fixed = layout_box_for_node(&fc_layout, find_id(fc_root, "fixed-field"));
+    const LayoutNodeBox *fc_short = layout_box_for_node(&fc_layout, find_id(fc_root, "short-field"));
+    CHECK(fc_tall && fc_fixed && fc_short
+          && fc_tall->height == 36 && fc_fixed->height == 25 && fc_short->height == 32);
     ComputedStyle fc_body = style_for_node(
         &fc_sheet, find_id(fc_root, "field")->parent->parent, NULL);
     ComputedStyle fc_menu = style_for_node(

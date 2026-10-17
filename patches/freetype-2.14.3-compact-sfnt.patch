@@ -1,0 +1,18 @@
+--- a/src/sfnt/sfwoff2.c
++++ b/src/sfnt/sfwoff2.c
+@@ -2343,6 +2343,15 @@
+     if ( error )
+       goto Exit;
+ 
++    {
++      extern int tilefinch_font_compact_sfnt( FT_Byte*, FT_ULong* );
++      if ( tilefinch_font_compact_sfnt( sfnt, &woff2.actual_sfnt_size ) )
++      {
++        error = FT_THROW( Invalid_Table );
++        goto Exit;
++      }
++    }
++
+     /* Resize `sfnt' to actual size of sfnt stream. */
+     if ( woff2.actual_sfnt_size < sfnt_size )
+     {

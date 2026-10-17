@@ -41,6 +41,16 @@ source order. Content beyond an extraction bound is never presented as
 complete: manual views show the shortening notice, while automatic admission
 still requires a complete extraction.
 
+Reader recognizes both `<main>` and `role="main"` content landmarks. A
+heading immediately before the selected prose subtree in its enclosing main
+landmark is retained as the reading title. Small linked-logo mastheads do not
+displace the content, even when nested inside that landmark; Basic view keeps
+those links in a collapsed navigation section.
+
+When a matching source layout is available, extracted images retain its useful
+inline size rather than enlarging small header graphics. Reader continues to
+recover illustrations alongside prose from hidden, failed hydration shells.
+
 The pass keeps a scratch record for at most 8,192 elements, visits at most
 65,536 nodes (text nodes need no record, and an encyclopedia article has
 about one per element), tracks at most 128 levels of nesting, and keeps at

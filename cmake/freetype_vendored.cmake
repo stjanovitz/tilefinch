@@ -66,6 +66,27 @@ execute_process(COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
     COMMAND_ERROR_IS_FATAL ANY)
 
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
+    "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-compact-sfnt.patch"
+    "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
+    "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-partial-variation-cleanup.patch"
+    "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
+    "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-variation-retry.patch"
+    "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+
 if(TARGET freetype)
     # ftinit.c includes FT_CONFIG_MODULES_H.  Overriding it here — identically
     # for host and PSP — narrows FT_Add_Default_Modules() to the three modules

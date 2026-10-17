@@ -32,7 +32,8 @@ The extracted tree retains, in document order:
   Basic view retires scripts, so that control could never open it;
 - explicitly authored, labeled `GET` or search forms.
 
-Navigation landmarks (`nav` or `role="navigation"`) become closed, expandable
+Navigation and site-banner landmarks (`nav`, `role="navigation"` or
+`role="banner"`) become closed, expandable
 groups in place, labeled with the page's `aria-label` when supplied. Their
 links remain available without JavaScript, while the main content and search
 form no longer sit behind several screens of menu links. Ordinary inline
@@ -49,6 +50,11 @@ decorations on extracted content. Image width hints remain available so an
 illustration awaiting download keeps a usable layout target.
 If an image is unavailable, its alternative text reserves space before the
 caption or following paragraph instead of painting over it.
+Small images keep settled source widths when that layout still matches the
+document. Small header images keep alternative text on one clipped line rather
+than wrapping vertically; larger image descriptions may still wrap.
+CSS-hidden alternate images are omitted, except
+inside recoverable disclosures; hidden prose remains recoverable.
 Meaningful embedded images remain visible. Lazy sources use the same source
 selection and resource authorization as the full page, including after a
 view switch; the browser never guesses an alternative image URL.

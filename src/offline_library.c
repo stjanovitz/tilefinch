@@ -1,4 +1,7 @@
 #include "tilefinch/offline_library.h"
+#include "tilefinch/ui_language.h"
+#include "tilefinch/file_download.h"
+#include "tilefinch/zip_install.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -13,7 +16,7 @@
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/update.h"
 
-#define OFFLINE_INDEX_VERSION 5u
+#define OFFLINE_INDEX_VERSION 6u
 #define OFFLINE_INDEX_MINIMUM_VERSION 1u
 #define OFFLINE_INDEX_HEADER_BYTES 20u
 #define OFFLINE_ARTICLE_NODE_LIMIT 32768u
@@ -181,7 +184,8 @@ static bool offline_item_valid(const OfflineLibraryItem *item)
     return item != NULL && item->id != 0
         && (item->type == OFFLINE_ITEM_ARTICLE
             || item->type == OFFLINE_ITEM_YOUTUBE
-            || item->type == OFFLINE_ITEM_WEB_APP)
+            || item->type == OFFLINE_ITEM_WEB_APP
+            || item->type == OFFLINE_ITEM_FILE)
         && item->state >= OFFLINE_ITEM_QUEUED
         && item->state <= OFFLINE_ITEM_FAILED
         && item->content_bytes <= UINT64_MAX - item->audio_bytes
@@ -193,6 +197,11 @@ static bool offline_item_valid(const OfflineLibraryItem *item)
         && strnlen(item->title, sizeof(item->title)) < sizeof(item->title)
         && strnlen(item->source_url, sizeof(item->source_url))
                < sizeof(item->source_url)
+        && (item->type != OFFLINE_ITEM_FILE
+            || (file_download_filename_valid(item->title)
+                && file_download_url_supported(item->source_url)
+                && item->content_bytes <= FILE_DOWNLOAD_LIMIT
+                && item->audio_bytes == 0))
         && (item->type != OFFLINE_ITEM_YOUTUBE
             || (item->video_id[0] != '\0'
                 && strnlen(item->video_id, sizeof(item->video_id))
@@ -331,15 +340,19 @@ static bool offline_library_save_with_buffer(
         || library->count > OFFLINE_LIBRARY_ITEM_LIMIT
         || !offline_directory_ready(library)) return false;
     size_t used = OFFLINE_INDEX_HEADER_BYTES;
+    uint32_t version = 5u; /* Existing libraries remain readable by old apps. */
     for (size_t index = 0; index < library->count; index++)
+    {
+        if (library->items[index].type == OFFLINE_ITEM_FILE) version = OFFLINE_INDEX_VERSION;
         if (!encode_item(
                 data, OFFLINE_LIBRARY_INDEX_LIMIT, &used,
                 &library->items[index]))
             return false;
+    }
     memcpy(data, magic, sizeof(magic));
     size_t header_used = sizeof(magic);
     if (!put_u32(data, OFFLINE_INDEX_HEADER_BYTES, &header_used,
-                 OFFLINE_INDEX_VERSION)
+                 version)
         || !put_u32(data, OFFLINE_INDEX_HEADER_BYTES, &header_used,
                     (uint32_t) library->count)
         || !put_u32(data, OFFLINE_INDEX_HEADER_BYTES, &header_used,
@@ -512,6 +525,38 @@ static bool offline_library_load_with_staged(
     bool normalized = recovered;
     for (size_t index = 0; index < staged->count; index++) {
         OfflineLibraryItem *item = &staged->items[index];
+        if (item->type == OFFLINE_ITEM_FILE) {
+            if (item->state == OFFLINE_ITEM_DOWNLOADING) {
+                item->state = OFFLINE_ITEM_PAUSED;
+                normalized = true;
+            }
+            char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u] = {0};
+            struct stat status;
+            /* Use the staged index for lookup before publishing it. */
+            bool was_loaded = staged->loaded;
+            staged->loaded = true;
+            bool exists = file_download_path(staged, item->id, path, sizeof(path))
+                && stat(path, &status) == 0 && S_ISREG(status.st_mode) && status.st_size >= 0;
+            if (!exists && path[0] != '\0' && item->state == OFFLINE_ITEM_READY) {
+                char part[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+                struct stat partial;
+                /* READY was committed only after a complete, flushed stream.
+                   Recover the final rename, never an ordinary partial stream. */
+                exists = offline_library_item_path(staged, item->id, ".file.part", part, sizeof(part))
+                    && stat(path, &status) != 0 && errno == ENOENT
+                    && stat(part, &partial) == 0 && S_ISREG(partial.st_mode)
+                    && partial.st_size >= 0 && (uint64_t) partial.st_size == item->content_bytes
+                    && rename(part, path) == 0 && stat(path, &status) == 0;
+            }
+            staged->loaded = was_loaded;
+            if (item->state == OFFLINE_ITEM_READY
+                && (!exists || (uint64_t) status.st_size != item->content_bytes)) {
+                item->state = OFFLINE_ITEM_FAILED;
+                snprintf(item->failure_reason, sizeof(item->failure_reason), "Saved file is missing or incomplete");
+                normalized = true;
+            }
+            continue;
+        }
         if (item->type != OFFLINE_ITEM_YOUTUBE) continue;
         if (item->state == OFFLINE_ITEM_DOWNLOADING) {
             item->state = OFFLINE_ITEM_PAUSED;
@@ -569,7 +614,8 @@ static bool offline_library_load_with_staged(
                 ".article.html", ".article.tmp", ".article.bak",
                 ".app.html", ".app.pack", ".app.icon",
                 ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
-                ".video.part", ".video.mp4", ".audio.part", ".audio.mp4"
+                ".video.part", ".video.mp4", ".audio.part", ".audio.mp4",
+                ".file.part", ".file.meta", ".file.meta.tmp"
             };
             bool recognized = false;
             for (size_t at = 0; at < sizeof(owned) / sizeof(owned[0]); at++)
@@ -2406,6 +2452,11 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
         library->budget, BUDGET_CATEGORY_SESSION, sizeof(*previous));
     if (previous == NULL) return false;
     *previous = *library;
+    char downloaded_file[OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u];
+    /* A refused destination may belong to somebody else. Only a completed
+       publication owns the final filename; partials have fixed owned paths. */
+    bool have_file = library->items[index].state == OFFLINE_ITEM_READY
+        && file_download_path(library, id, downloaded_file, sizeof(downloaded_file));
     if (index + 1u < library->count)
         memmove(&library->items[index], &library->items[index + 1u],
                 (library->count - index - 1u) * sizeof(library->items[0]));
@@ -2418,12 +2469,13 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
         return false;
     }
     budget_free(library->budget, previous);
+    if (have_file) (void) remove(downloaded_file);
     const char *suffixes[] = {
         ".article.html", ".article.bak", ".article.tmp",
         ".app.html", ".app.pack", ".app.icon",
         ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
         ".video.mp4", ".audio.mp4",
-        ".video.part", ".audio.part"
+        ".video.part", ".audio.part", ".file.part", ".file.meta", ".file.meta.tmp"
     };
     char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     for (size_t at = 0; at < sizeof(suffixes) / sizeof(suffixes[0]); at++)
@@ -2512,6 +2564,81 @@ static bool offline_saved_date(
     return true;
 }
 
+static bool html_label(OfflineHtml *html, const char *key)
+{
+    return html_escape(html, tilefinch_ui_logical_text(key));
+}
+
+bool offline_library_build_homebrew_page(Budget *budget, const char *root,
+    char **output, size_t *length)
+{
+    if (!budget || !root || !output || !length) return false;
+    *output = NULL; *length = 0;
+    char (*names)[64] = budget_calloc_category(budget, BUDGET_CATEGORY_SESSION, 64, 64);
+    size_t count = 0;
+    if (!names || !zip_install_list(root, names, 64, &count)) {
+        budget_free(budget, names); return false;
+    }
+    OfflineHtml html = {.budget = budget};
+    bool okay = html_append(&html, "<!doctype html><meta name=viewport content=\"width=device-width\"><title>")
+        && html_label(&html, "Installed homebrew")
+        && html_append(&html, "</title><style>body{font:16px sans-serif;padding:16px}"
+            "a{display:block;padding:10px;margin:4px 0}</style><body dir=auto><h1>")
+        && html_label(&html, "Installed homebrew") && html_append(&html, "</h1><p>")
+        && html_label(&html, "Only apps installed by Tilefinch appear here.") && html_append(&html, " ")
+        && html_label(&html, "The whole app folder will be deleted.") && html_append(&html, " ")
+        && html_label(&html, "Saved data inside it will also be deleted.") && html_append(&html, " ")
+        && html_label(&html, "Downloaded ZIPs are managed separately.") && html_append(&html, "</p>");
+    if (!count) okay = okay && html_append(&html, "<p>")
+        && html_label(&html, "No installed homebrew found.") && html_append(&html, "</p>");
+    for (size_t i = 0; okay && i < count; i++) {
+        char encoded[127]; size_t n = strlen(names[i]);
+        for (size_t j = 0; j < n; j++) snprintf(encoded+j*2, 3, "%02x", (unsigned char)names[i][j]);
+        okay = html_append(&html, "<a href=\"https://tilefinch.local/offline/remove-homebrew?name=%s\">", encoded)
+            && html_label(&html, "Remove") && html_append(&html, " ")
+            && html_escape(&html, names[i]) && html_append(&html, "...</a>");
+    }
+    okay = okay && html_append(&html, "<a href=\"https://tilefinch.local/offline\">")
+        && html_label(&html, "Downloads") && html_append(&html, "</a>");
+    budget_free(budget, names);
+    if (!okay) { budget_free(budget, html.data); return false; }
+    *output = html.data; *length = html.length; return true;
+}
+
+bool offline_library_build_file_page(const OfflineLibrary *library,
+    Budget *budget, uint32_t id, char **output, size_t *length)
+{
+    if (output != NULL) *output = NULL;
+    if (length != NULL) *length = 0;
+    if (library == NULL || budget == NULL || output == NULL || length == NULL)
+        return false;
+    const OfflineLibraryItem *item = offline_library_find(library, id);
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u];
+    if (item == NULL || item->state != OFFLINE_ITEM_READY
+        || !file_download_path(library, id, path, sizeof(path))) return false;
+    OfflineHtml html = {.budget = budget};
+    bool okay = html_append(&html, "<!doctype html><meta name=viewport content=\"width=device-width\">"
+        "<title>") && html_label(&html, "File download")
+        && html_append(&html, "</title><style>body{font-family:sans-serif;padding:16px;"
+        "background:#f4f4f4;color:#202020}h1{font-size:22px}p{overflow-wrap:anywhere}"
+        "a{display:inline-block;padding:10px;margin:6px 12px 6px 0}</style><body dir=auto><h1>")
+        && html_label(&html, "File saved") && html_append(&html, "</h1><p>")
+        && html_escape(&html, item->title) && html_append(&html, "</p><p>")
+        && html_escape(&html, path) && html_append(&html, "</p><p>%llu ", (unsigned long long)item->content_bytes)
+        && html_label(&html, "bytes") && html_append(&html, ". ")
+        && html_label(&html, "Keep this file, or copy it elsewhere using USB storage.")
+        && html_append(&html, "</p><a href=\"https://tilefinch.local/offline\">")
+        && html_label(&html, "Downloads") && html_append(&html, "</a>");
+    if (okay && zip_install_path_candidate(path))
+        okay = html_append(&html, "<a href=\"https://tilefinch.local/offline/extract?id=%u\">", (unsigned)id)
+            && html_label(&html, "Install homebrew?") && html_append(&html, "</a>");
+    if (okay) okay = html_append(&html, "<a href=\"https://tilefinch.local/offline/homebrew\">")
+        && html_label(&html, "Installed homebrew") && html_append(&html, "</a>");
+    if (!okay) { budget_free(budget, html.data); return false; }
+    *output = html.data; *length = html.length;
+    return true;
+}
+
 bool offline_library_build_page(
     const OfflineLibrary *library, Budget *budget,
     char **output, size_t *length)
@@ -2530,7 +2657,9 @@ bool offline_library_build_page(
         "color:#202020}h1{font-size:22px}.item{background:white;border:1px solid #ccc;"
         "border-radius:8px;padding:10px;margin:9px 0}.meta{color:#666;font-size:13px}"
         "a{color:#0645ad;margin-right:14px}</style><h1>Saved offline</h1>"
-        "<p>Reader articles, offline web apps, and YouTube downloads are stored on the Memory Stick.</p>");
+        "<p>Articles, offline web apps, videos, and downloaded files are stored on the Memory Stick.</p>"
+        "<a href=\"https://tilefinch.local/offline/homebrew\">")
+        && html_label(&html, "Installed homebrew") && html_append(&html, "</a>");
     if (okay && have_free_space)
         okay = html_append(
             &html, "<p class=meta>Free space: %llu.%llu MB</p>",
@@ -2540,7 +2669,8 @@ bool offline_library_build_page(
                  / UINT64_C(1048576)));
     bool have_queued = false;
     for (size_t index = 0; index < library->count; index++)
-        if (library->items[index].type == OFFLINE_ITEM_YOUTUBE
+        if ((library->items[index].type == OFFLINE_ITEM_YOUTUBE
+             || library->items[index].type == OFFLINE_ITEM_FILE)
             && library->items[index].state == OFFLINE_ITEM_QUEUED)
             have_queued = true;
     if (okay && have_queued)
@@ -2568,6 +2698,8 @@ bool offline_library_build_page(
             : item->state == OFFLINE_ITEM_FAILED ? "failed" : "queued";
         unsigned percent = 0;
         uint64_t total = item->content_bytes + item->audio_bytes;
+        if (item->type == OFFLINE_ITEM_FILE && item->state != OFFLINE_ITEM_READY)
+            total = item->downloaded_bytes;
         if (total != 0)
             percent = (unsigned) (item->downloaded_bytes * 100u / total);
         okay = html_append(&html, "<section class=item><strong>")
@@ -2575,6 +2707,7 @@ bool offline_library_build_page(
             && html_append(
                 &html, "</strong><div class=meta>%s &middot; %s",
                 item->type == OFFLINE_ITEM_ARTICLE ? "Reader article"
+                    : item->type == OFFLINE_ITEM_FILE ? "Downloaded file"
                     : item->type == OFFLINE_ITEM_WEB_APP ? "Offline web app"
                                                         : "YouTube video",
                 state);
@@ -2611,9 +2744,11 @@ bool offline_library_build_page(
                     ? "<a href=\"https://tilefinch.local/offline/article?id=%u\">Open</a>"
                     : item->type == OFFLINE_ITEM_WEB_APP
                         ? "<a href=\"https://tilefinch.local/offline/app?id=%u\">Open</a>"
-                        : "<a href=\"https://tilefinch.local/offline/video?id=%u\">Play</a>",
+                        : item->type == OFFLINE_ITEM_FILE
+                            ? "<a href=\"https://tilefinch.local/offline/file?id=%u\">Show file</a>"
+                            : "<a href=\"https://tilefinch.local/offline/video?id=%u\">Play</a>",
                 (unsigned) item->id);
-        if (okay && item->type == OFFLINE_ITEM_YOUTUBE
+        if (okay && (item->type == OFFLINE_ITEM_YOUTUBE || item->type == OFFLINE_ITEM_FILE)
             && item->state != OFFLINE_ITEM_READY)
             okay = html_append(
                 &html, "<a href=\"https://tilefinch.local/offline/resume?id=%u\">%s</a>",

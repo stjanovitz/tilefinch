@@ -13,6 +13,7 @@
  */
 #include "tilefinch/offline_library.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/file_download.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -215,8 +216,30 @@ static int copy_file(const char *from, const char *to)
     return failed;
 }
 
+static int make_file(int argc, char **argv)
+{
+    if (argc != 4 || mkdir(argv[2], 0700)) return 2;
+    long bytes = file_size(argv[3]);
+    if (bytes <= 0 || (uint64_t)bytes > FILE_DOWNLOAD_LIMIT) return 2;
+    Budget budget; budget_init(&budget, 2u*1024u*1024u);
+    OfflineLibrary library; offline_library_init(&library, &budget, argv[2]);
+    char error[128], path[512]; uint32_t id = 0;
+    bool okay = offline_library_load(&library)
+        && file_download_enqueue(&library, "https://downloads.example.test/package.zip", "package.zip", &id, error, sizeof(error))
+        && file_download_path(&library, id, path, sizeof(path)) && !copy_file(argv[3], path);
+    if (okay) {
+        OfflineLibraryItem *item = offline_library_find_mutable(&library, id);
+        item->state = OFFLINE_ITEM_READY;
+        item->content_bytes = item->downloaded_bytes = (uint64_t)bytes;
+        okay = offline_library_save(&library);
+    }
+    if (okay) printf("offline file id=%u url=https://tilefinch.local/offline/file?id=%u\n", (unsigned)id, (unsigned)id);
+    return okay && budget.current == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--file")) return make_file(argc, argv);
     if (argc > 1 && (strcmp(argv[1], "--web-app") == 0
                      || strcmp(argv[1], "--web-app-append") == 0))
         return make_app(argc, argv);

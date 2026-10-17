@@ -36,6 +36,7 @@
     matchedElements = 0,
     transitionSnapshots = 0,
     transitionSnapshotReads = 0,
+    transitionDiscoveryVisits = 0,
     ruleParses = 0,
     ruleCacheHits = 0,
     scanYields = 0,
@@ -58,6 +59,7 @@
       motionCachedFrameProperties: { get: () => ruleCache?.properties || 0 },
       transitionSnapshots: { get: () => transitionSnapshots },
       transitionSnapshotReads: { get: () => transitionSnapshotReads },
+      transitionDiscoveryVisits: { get: () => transitionDiscoveryVisits },
     });
 
   class AnimationEvent extends Event {
@@ -1030,6 +1032,7 @@
    * event timeline). Bounded to the 64 most recently registered elements.
    */
   const TRANSITION_WATCH_LIMIT = 64,
+    selectorsTestAttribute = globalThis.__tilefinchSelectorsTestAttribute,
     TRANSITION_DISCOVERY_LIMIT = 128,
     /* For `all`: properties pages commonly transition whose computed value
        does not follow layout (a used height changing with content is not a
@@ -1102,6 +1105,15 @@
         if (typeof target === "number")
           target = globalThis.__tilefinchWrap?.(target);
         if (!target?.isConnected) continue;
+        /* Root-level author bookkeeping otherwise reaches every watch.
+           Test against the current sheet at flush time, not when queued:
+           a stylesheet installed later in this task may observe it. Engine
+           focus/hover markers and unknown dependency answers stay live. */
+        if (typeof name === "string" && /^data-/i.test(name)
+            && !/^data-tilefinch-/i.test(name)
+            && typeof selectorsTestAttribute === "function"
+            && selectorsTestAttribute(name) === false)
+          continue;
         let scope = target;
         if (name !== null) {
           /* A newly watched element (name null) checks only itself. */
@@ -1141,10 +1153,31 @@
         let remaining = TRANSITION_DISCOVERY_LIMIT;
         for (const [root, state] of Array.from(transitionWatched)) {
           if (!state.observesSubtree || !root.isConnected) continue;
-          if (scopes && !scopes.some((handle) =>
-              root.contains(globalThis.__tilefinchWrap(handle)) ||
-              __tilefinchStyleReach(root.__handle, [handle]))) continue;
-          remaining -= discoverTransitionDescendants(root, remaining);
+          if (!scopes) {
+            remaining -= discoverTransitionDescendants(root, remaining);
+          } else {
+            for (const handle of scopes) {
+              const scope = globalThis.__tilefinchWrap(handle);
+              if (!scope) continue;
+              if (scope === root || scope.contains(root)) {
+                remaining -= discoverTransitionDescendants(root, remaining);
+                break;
+              }
+              if (!root.contains(scope)) continue;
+              /* The changed parent already includes inherited/sibling
+                 effects. Do not restart at the listener's entire subtree;
+                 that can repeatedly miss a late child beyond the bound. */
+              if (root.__tilefinchWebkitTransitionEnd)
+                scope.__tilefinchWebkitTransitionEnd = true;
+              if (transitionWatched.has(scope) ||
+                  __tilefinchTransitionSnapshot(handle, null, true))
+                watchTransitionElement(scope);
+              remaining--;
+              if (remaining > 0)
+                remaining -= discoverTransitionDescendants(scope, remaining);
+              if (remaining <= 0) break;
+            }
+          }
           if (remaining <= 0) break;
         }
       }
@@ -1293,6 +1326,7 @@
     let node = root.firstElementChild, visited = 0, ascents = 0;
     while (node && visited < limit && ascents < limit) {
       visited++;
+      transitionDiscoveryVisits++;
       if (transitionWatched.has(node) ||
           __tilefinchTransitionSnapshot(node.__handle, null, true)) {
         if (root.__tilefinchWebkitTransitionEnd)
@@ -1312,8 +1346,17 @@
   };
   globalThis.__tilefinchWatchTransitions = (target, type) => {
     if (!(target instanceof Element) || !(target.__handle > 0)) return;
-    if (type === "webkitTransitionEnd")
+    const webkit = type === "webkitTransitionEnd",
+      state = transitionWatched.get(target),
+      discover = !state?.observesSubtree ||
+        (webkit && !target.__tilefinchWebkitTransitionEnd);
+    if (webkit)
       target.__tilefinchWebkitTransitionEnd = true;
+    /* Capture/bubble listeners and the four event types share one watch.
+       Mutations rescan affected observer roots in checkTransitionChanges;
+       registering another listener does not change descendant styles. A new
+       WebKit listener still propagates its event alias to descendants. */
+    if (!discover) return;
     watchTransitionElement(target, true);
     discoverTransitionDescendants(target, TRANSITION_DISCOVERY_LIMIT);
     globalThis.__tilefinchTransitionsDirty(target, null);

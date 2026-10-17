@@ -139,16 +139,6 @@ bool document_scripts_finish_streaming(
     FetchScheduler *scheduler, StreamingScriptState *state,
     ExternalScriptMetrics *metrics, ScriptResult *result);
 
-/* Legacy whole-document classic-script entry point.  All three limits remain
-   enforced for compatibility, but new navigation code should configure the
-   realm once and use the document pipeline below. */
-bool external_scripts_load(NavigationSession *navigation,
-                           const char *document_url,
-                           size_t maximum_scripts,
-                           size_t maximum_total_bytes,
-                           size_t maximum_file_bytes,
-                           long timeout_ms,
-                           ExternalScriptMetrics *metrics);
 /* `maximum_scripts` is the realm-wide executable quota. Parser discovery uses
    the fixed hard bound so repeated module roots can share one module-map
    admission and a bounded set of critical bootstrap roots can be reserved

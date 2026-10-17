@@ -91,6 +91,7 @@ class NativeCaptureTests(unittest.TestCase):
             self.lines.extend([position, f'tilefinch-work: label=native-view-{p} counter=1',
                                position, position])
             (self.output / f'view-{p}.ppm').write_bytes(b'P6\n2 8\n255\n' + bytes(48))
+        self.lines.append('loop frame=5 url="https://example.test/" title="Test" scroll=0/100 focus=none:0')
         self.lines.append('interactive teardown=0 active=0 largest=0 peak=1000 allocations=4 frees=4 failures=0 status=PASS')
 
     def validate(self):
@@ -103,6 +104,12 @@ class NativeCaptureTests(unittest.TestCase):
         self.assertEqual(result['document_height'], 108)
         self.assertEqual(len(result['artifacts']), 9)
 
+    def test_byte_truncated_title_does_not_invalidate_ascii_receipts(self):
+        (self.output / 'stdout.log').write_bytes(
+            ('\n'.join(self.lines) + '\n').encode() + b'diagnostic title=\xe2\x80\n')
+        self.assertTrue(validate_native_capture(self.output, 0,
+            viewport_width=2, viewport_height=8)['bottom_verified'])
+
     def test_missing_labels_are_not_recovered_from_status_counts(self):
         self.lines = [s for s in self.lines if 'tilefinch-work:' not in s]
         with self.assertRaisesRegex(ValueError, 'five completed'):
@@ -113,6 +120,19 @@ class NativeCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'truncated'):
             self.validate()
 
+    def test_sweep_resets_scroll_before_followup_views(self):
+        lines = self.commands.splitlines()
+        last_render = next(i for i, line in enumerate(lines)
+                           if line.startswith('render ') and 'view-100.ppm' in line)
+        self.assertEqual(lines[last_render + 1:], [
+            'top', 'tick 19 33', 'drain 4096 0', 'idle 300',
+            'census', 'script-report', 'quit'])
+
+    def test_missing_scroll_reset_receipt_is_refused(self):
+        self.lines.pop(-2)
+        with self.assertRaisesRegex(ValueError, 'reset scroll'):
+            self.validate()
+
     def test_reordered_labels_are_refused(self):
         self.lines[5], self.lines[9] = self.lines[9], self.lines[5]
         with self.assertRaisesRegex(ValueError, 'reordered'):
@@ -120,6 +140,12 @@ class NativeCaptureTests(unittest.TestCase):
 
     def test_stale_intermediate_offsets_are_refused(self):
         self.lines = [s.replace('scroll=25/100', 'scroll=0/100') for s in self.lines]
+        with self.assertRaises(StaleHeightError) as error:
+            self.validate()
+        self.assertEqual(error.exception.height, 108)
+
+    def test_late_lazy_reflow_supplies_extent_but_never_a_success_receipt(self):
+        self.lines = [s.replace('scroll=0/100', 'scroll=0/99') for s in self.lines]
         with self.assertRaises(StaleHeightError) as error:
             self.validate()
         self.assertEqual(error.exception.height, 108)
@@ -163,6 +189,29 @@ class NativeCaptureTests(unittest.TestCase):
         self.assertEqual([s for s in commands.splitlines() if s.startswith('scroll-by ')],
                          ['scroll-by 0', 'scroll-by 3386', 'scroll-by 6773', 'scroll-by 10159'])
         self.assertNotIn('page-down', commands)
+
+    def test_each_view_settles_scroll_motion_on_the_recorded_clock(self):
+        lines = build_five_view_commands(self.output, 13817).splitlines()
+        for percentage in VIEWS:
+            at = lines.index(f'work native-view-{percentage}')
+            self.assertEqual(lines[at - 4:at],
+                             ['tick 19 33', 'drain 4096 0', 'idle 300', 'status'])
+
+    def test_lazy_content_is_revisited_before_the_first_view(self):
+        commands = build_five_view_commands(self.output, 13817, sweep_ticks=3)
+        lines = commands.splitlines()
+        first_view = lines.index('work native-view-0')
+        prep = lines[:first_view]
+        self.assertEqual(prep.count('page-down'), 3)
+        self.assertEqual(prep.count('page-up'), 3)
+        self.assertLess(prep.index('page-down'), prep.index('page-up'))
+        self.assertEqual(prep.count('tick 1 33'), 11)
+        self.assertEqual(prep.count('tick 19 33'), 1)
+        self.assertIn('scroll-by 3386', prep)
+        self.assertIn('scroll-by 6773', prep)
+        self.assertIn('scroll-by 10159', prep)
+        self.assertTrue(all(s.endswith(' 0') for s in prep if s.startswith('drain ')))
+        self.assertLess(prep.index('page-up'), len(prep) - 4)
 
     def test_separate_streams_and_command_failures_are_required(self):
         (self.output / 'stderr.log').write_text('loop command-failed="scroll-by"\n')
@@ -287,7 +336,16 @@ class NativeCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'offline'):
             run_native_capture(['lab', '--url', 'https://example.test'], self.output / 'live', 272)
         with self.assertRaisesRegex(ValueError, 'bound'):
-            build_five_view_commands(self.output, 272, sweep_ticks=257)
+            build_five_view_commands(self.output, 272, sweep_ticks=1281)
+        with self.assertRaisesRegex(ValueError, 'bound'):
+            build_five_view_commands(self.output, 262145)
+
+    def test_long_discussion_capture_remains_bounded(self):
+        commands = build_five_view_commands(self.output, 200000, sweep_ticks=1000)
+        self.assertEqual(commands.count('\npage-down\n'), 1000)
+        self.assertEqual(commands.count('\npage-up\n'), 1000)
+        self.assertIn('scroll-by 149796\n', commands)
+        self.assertLess(len(commands.splitlines()), 8192)
 
 
 if __name__ == '__main__':

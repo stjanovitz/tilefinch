@@ -260,6 +260,69 @@ static void grid_seed_definite_auto_row_contributions(
     }
 }
 
+/* In an indefinite all-fr axis, a definite spanning item establishes an
+   fr fraction from its contribution divided over the spanned weights.
+   Seed that lower bound before laying out/aliging the other items, instead
+   of charging the entire spanning height to its first row. Unknown content
+   still uses the existing bounded content-growth path below. */
+static void grid_seed_indefinite_fraction_rows(
+    LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, FlexOrderPlan *order,
+    const GridPlacementState *placement_template, int rows,
+    int content_width, int row_gap, int *heights)
+{
+    if (rows < 2 || rows > GRID_TRACK_REPEAT_LIMIT) return;
+    unsigned weights[GRID_TRACK_REPEAT_LIMIT];
+    for (int row = 0; row < rows; row++) {
+        if (stylesheet_grid_track_type(context->sheet, style, true,
+                                        (unsigned) row) != GRID_TRACK_FLEX)
+            return;
+        weights[row] = stylesheet_grid_track_value(
+            context->sheet, style, true, (unsigned) row);
+        if (weights[row] == 0) return;
+    }
+    int numerator = 0;
+    unsigned denominator = 1;
+    GridPlacementState placement = *placement_template;
+    FlexItemIterator iterator;
+    FlatItem item;
+    flex_iterator_init(&iterator, context, node, style, order);
+    while (flex_iterator_next(&iterator, &item)) {
+        grid_resolve_item_placement(context, node, style, &item.style);
+        if (item.style.out_of_flow || item.style.fixed_position) continue;
+        GridItemPlacement area;
+        if (!grid_place_item(&placement, &item.style, &area)
+            || item.anonymous_text || !item.style.has_height
+            || item.style.height_percent || area.row < 0
+            || area.row_span > rows - area.row) continue;
+        ComputedStyle measured = item.style;
+        resolve_padding(context->sheet, &measured, content_width);
+        int contribution = style_content_height(
+            context->sheet, &measured, content_width, 0)
+            + measured.padding.top + measured.padding.bottom
+            + measured.border.top + measured.border.bottom
+            + measured.margin.top + measured.margin.bottom
+            - row_gap * (area.row_span - 1);
+        unsigned weight = 0;
+        for (int offset = 0; offset < area.row_span; offset++)
+            weight += weights[area.row + offset];
+        if (weight < 1000u) weight = 1000u;
+        if ((int64_t) contribution * denominator > (int64_t) numerator * weight) {
+            numerator = contribution;
+            denominator = weight;
+        }
+    }
+    unsigned cumulative = 0;
+    int previous = 0;
+    for (int row = 0; row < rows; row++) {
+        cumulative += weights[row];
+        int edge = (int) (((int64_t) numerator * cumulative + denominator / 2u)
+                           / denominator);
+        if (edge - previous > heights[row]) heights[row] = edge - previous;
+        previous = edge;
+    }
+}
+
 /* A grid item as laid out, for the fr re-share after layout. */
 typedef struct {
     int row;
@@ -1133,6 +1196,12 @@ bool layout_block_grid_section(LayoutContext *context,
         }
         uint16_t second_implicit_row =
             !inherited_grid_rows ? style->grid_auto_row_second : 0;
+        if (!inherited_grid_rows && !flex_track_space_definite
+            && placement_rows == explicit_grid_rows && grid_row_origin == 0)
+            grid_seed_indefinite_fraction_rows(
+                context, node, style, grid_order, &placement_template,
+                explicit_grid_rows, content_width, grid_row_gap_base,
+                row_track_heights);
         if (inherited_grid_rows) {
             for (unsigned row = 0;
                  row < explicit_rows

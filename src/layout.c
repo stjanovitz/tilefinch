@@ -267,10 +267,7 @@ bool style_uses_synthetic_weight(const FontSet *fonts,
                                         const FontFace *face)
 {
     unsigned weight = style_font_weight(style);
-    return weight >= LAYOUT_SYNTHETIC_WEIGHT
-           && (face == NULL || face->authored_weight != weight)
-           && (weight < LAYOUT_BOLD_FACE_WEIGHT
-               || !font_context_face_is_bold(fonts, web_fonts, face));
+    return font_face_needs_synthetic_bold(fonts, web_fonts, face, weight);
 }
 
 /* DrawCommand is deliberately compact on PSP. Store CSS weights in ten-unit
@@ -2040,6 +2037,17 @@ void layout_reuse_cache_set_focus_scroll(LayoutReuseCache *cache, int top)
     if (cache != NULL) cache->focus_scroll = top < 0 ? 0 : top;
 }
 
+void layout_reuse_cache_invalidate_local_focus(
+    LayoutReuseCache *cache, lxb_dom_node_t *node)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_drop_subtree(cache, node, true);
+    layout_reuse_cache_invalidate_measurements(cache, node);
+}
+
 void layout_reuse_cache_invalidate_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node)
 {
@@ -2051,8 +2059,7 @@ void layout_reuse_cache_invalidate_focus(
        unrelated selector answers. Keep full flow, but not a whole-page
        cascade reset caused by an unrelated :has() or custom focus rule. */
     if (style_focus_change_is_local(cache->sheet, node)) {
-        layout_reuse_drop_subtree(cache, node, true);
-        layout_reuse_cache_invalidate_measurements(cache, node);
+        layout_reuse_cache_invalidate_local_focus(cache, node);
         return;
     }
     if (cache->selector_focus_has_sibling) {
@@ -2061,28 +2068,44 @@ void layout_reuse_cache_invalidate_focus(
            lists and unrelated styles. Parent-style keys propagate inherited
            changes; sizing and geometry still take the complete flow. */
         uint32_t custom[64];
+        uint32_t focus_rules[128];
         StyleRuleCandidatePlan plan;
         size_t custom_count = 0;
         bool bounded = true;
+        bool variables_checked = false;
         for (size_t i = 0; i < cache->sheet->custom_rule_count; i++) {
             const StyleCustomRule *rule = &cache->sheet->custom_rules[i];
             if (!style_selector_reads_focus(rule->selector)) continue;
             /* Variable inheritance is not represented by the parent style
-               key. Keep its existing whole-cache invalidation. */
-            if (strncmp(rule->name, "--", 2) == 0 || custom_count == 64u) {
+               key. Only keep unrelated styles when no variable selector can
+               change in either state, not merely when it currently misses. */
+            if (strncmp(rule->name, "--", 2) == 0) {
+                if (!variables_checked
+                    && !style_focus_custom_properties_unchanged(cache->sheet, node)) {
+                    bounded = false;
+                    break;
+                }
+                variables_checked = true;
+                continue;
+            }
+            if (custom_count == 64u) {
                 bounded = false;
                 break;
             }
             custom[custom_count++] = (uint32_t) i;
         }
-        if (!bounded || !stylesheet_prepare_focus_rule_index(cache->sheet)
+        size_t focus_count = bounded ? style_focus_nonlocal_rules(
+            cache->sheet, node, focus_rules, 128u) : SIZE_MAX;
+        if (focus_count == SIZE_MAX
             || !style_rule_candidate_plan(cache->sheet,
-                cache->sheet->focus_rule_indices,
-                cache->sheet->focus_rule_count, &plan)) {
+                focus_rules, focus_count, &plan)) {
             layout_reuse_cache_reset(cache);
             return;
         }
         layout_reuse_cache_flush_invalidations(cache);
+        /* Self-only focus rules cannot change another subject's answer.
+           Descendant inheritance still follows the changed parent style. */
+        layout_reuse_drop_subtree(cache, node, true);
         layout_reuse_clear_counters(cache);
         for (size_t i = 0; i <= cache->style_mask; i++) {
             LayoutReuseStyleEntry *entry = &cache->styles[i];
@@ -2094,7 +2117,7 @@ void layout_reuse_cache_invalidate_focus(
         }
         layout_reuse_clear_sizing_entries(cache);
         style_retained_matches_invalidate_rules(cache->matches, cache->sheet,
-            cache->sheet->focus_rule_indices, cache->sheet->focus_rule_count);
+            focus_rules, focus_count);
         cache->stats.scoped_invalidations++;
         return;
     }
@@ -4084,7 +4107,10 @@ static bool layout_job_init(LayoutBuildJob *job)
         job->viewport_height);
     if (!(job->html_style.has_height
           && (!job->html_style.height_percent || job->html_height > 0))) {
-        job->html_height = job->viewport_height;
+        /* The initial containing block is definite, but an auto-height html
+           element does not pass that definiteness through to normal-flow
+           percentage heights on body and its descendants. */
+        job->html_height = 0;
     }
     if (job->html_style.has_background) {
         layout->page_background = blend_color_over(
@@ -4139,10 +4165,11 @@ static bool layout_job_flow(LayoutBuildJob *job)
     LayoutContext *context = job->context;
     PositionedBox initial_positioned_box = {
         .node = NULL, .x = 0, .y = 0,
-        .width = job->viewport_width, .height = job->html_height,
+        .width = job->viewport_width,
+        .height = job->html_height > 0 ? job->html_height : job->viewport_height,
         .fixed_node = NULL, .fixed_x = 0, .fixed_y = 0,
         .fixed_width = job->viewport_width,
-        .fixed_height = job->html_height
+        .fixed_height = job->html_height > 0 ? job->html_height : job->viewport_height
     };
     if (!layout_block(context, job->body, &job->html_style,
                       0, 0, job->viewport_width, job->html_height, false,
@@ -5320,35 +5347,14 @@ const char *layout_retain_generated_text(
     return retained;
 }
 
-static void layout_node_box_clip_rect(const LayoutNodeBox *box,
-                                      int *left, int *top,
-                                      int *right, int *bottom)
-{
-    StyleOverflowClipBox clip_box = layout_node_box_clip_box(box);
-    int margin = (int) layout_node_box_clip_margin(box);
-    int width = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->width
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->width - 2 * box->clip_inset_left : box->client_width);
-    int height = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->height
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->height - 2 * box->clip_inset_top : box->client_height);
-    if (width < 0) width = 0;
-    if (height < 0) height = 0;
-    *left = box->x + box->clip_inset_left - margin;
-    *top = box->y + box->clip_inset_top - margin;
-    *right = *left + width + 2 * margin;
-    *bottom = *top + height + 2 * margin;
-}
-
 static bool point_in_rounded_clip(const LayoutDocument *layout,
                                   const LayoutNodeBox *box, int x, int y)
 {
     if (box == NULL || !box->clips_x || !box->clips_y
         || layout_node_box_clip_radius(box) == 0) return true;
     int left, top, right, bottom;
-    layout_node_box_clip_rect(box, &left, &top, &right, &bottom);
+    layout_node_box_clip_rect(box, box->x, box->y,
+                              &left, &top, &right, &bottom);
     int radius_code =
         layout_node_box_effective_clip_radius_code(layout, box);
     int width = right - left;
@@ -5408,7 +5414,8 @@ static bool layout_region_hit(const LayoutDocument *layout,
         if (box == NULL) continue;
         int clip_left, clip_top, clip_right, clip_bottom;
         layout_node_box_clip_rect(
-            box, &clip_left, &clip_top, &clip_right, &clip_bottom);
+            box, box->x, box->y,
+            &clip_left, &clip_top, &clip_right, &clip_bottom);
         bool outside = (box->clips_x
                         && (x < clip_left || x >= clip_right))
                        || (box->clips_y
@@ -5561,9 +5568,12 @@ bool layout_apply_focus_border_paint(
     if (inset_changed || outset_changed) {
         if (inset == SIZE_MAX) return false;
         size_t count = stylesheet_box_shadow_count(stylesheet, style);
-        if (count > 1) return false;
-        if (count == 1) {
-            const StyleBoxShadow *shadow = stylesheet_box_shadow(stylesheet, style, 0);
+        size_t layer = outset_changed
+            ? (layout->commands[inset].font_weight & LAYOUT_COMMAND_FONT_WEIGHT_MASK) : 0u;
+        layer = layer == 0 ? 0 : layer - 1u;
+        if (count != layer && count != layer + 1u) return false;
+        if (count == layer + 1u) {
+            const StyleBoxShadow *shadow = stylesheet_box_shadow(stylesheet, style, layer);
             if (shadow == NULL || style_box_shadow_is_inset(shadow) != inset_changed
                 || style_box_shadow_blur(shadow) != 0
                 || (inset_changed && (shadow->offset_x != 0

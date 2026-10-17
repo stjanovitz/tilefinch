@@ -9213,8 +9213,11 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
         JSVarRef *var_ref;
         /* in the global object we use references */
         var_ref = js_create_var_ref(ctx, FALSE);
-        if (!var_ref)
+        if (!var_ref) {
+            /* The lazy initializer already returned an owned value. */
+            JS_FreeValue(ctx, val);
             return -1;
+        }
         prs->flags |= JS_PROP_VARREF;
         pr->u.var_ref = var_ref;
         var_ref->value = val; 

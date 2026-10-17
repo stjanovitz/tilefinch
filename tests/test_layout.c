@@ -421,6 +421,19 @@ static int test_oversized_style_cache_scan(void)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && strcmp(argv[1], "--page-font-leading-only") == 0)
+        return test_page_font_normal_leading();
+    if (argc == 2 && strcmp(argv[1], "--generated-padding-only") == 0)
+        return test_generated_inline_padding();
+    if (argc == 2 && strcmp(argv[1], "--positioned-percentage-only") == 0)
+        return test_positioned_percentage_height_after_flow();
+    if (argc == 2 && strcmp(argv[1], "--nowrap-boundary-only") == 0)
+        return test_adjacent_nowrap_inline_boundaries();
+    if (argc == 2 && strcmp(argv[1], "--inline-boundaries-only") == 0) {
+        int icon = test_generated_icon_intrinsic_space();
+        int nowrap = test_adjacent_nowrap_inline_boundaries();
+        return icon != 0 || nowrap != 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--grid-ratio-margin-only") == 0)
         return test_grid_intrinsic_height_and_margin_alignment();
     if (argc == 2 && strcmp(argv[1], "--flex-separator-only") == 0)

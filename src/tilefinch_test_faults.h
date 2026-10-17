@@ -47,6 +47,9 @@ typedef struct {
     bool refuse_next_background_font_relayout;
     /* Same-binary host control for page-font cost comparisons. */
     bool legacy_web_font_work;
+    /* Observe cache churn across identical versus distinct script plans. */
+    unsigned web_font_kerning_cache_resets;
+    unsigned web_font_charmap_lookups;
     /* Refuse one validated optional image-loader setup. */
     bool refuse_next_image_load_setup;
     /* Refuse the next render-shell initialization once. */

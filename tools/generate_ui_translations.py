@@ -31,7 +31,8 @@ for _, languages in CATALOGS:
     for language in languages:
         latest_languages[language[0]] = language
 CATALOGS.append((10, list(latest_languages.values())))
-ACTIVE_VERSION = 10
+CATALOGS.append((11, list(latest_languages.values())))
+ACTIVE_VERSION = 11
 
 def read_rows(version, languages):
     source = ROOT / f"translations/ui/v{version}/source.tsv"
@@ -39,7 +40,7 @@ def read_rows(version, languages):
     if lines[0] != "\t".join(["English"] + [label for _, label, _ in languages]):
         raise ValueError("unexpected language columns")
     rows = [line.split("\t") for line in lines[1:]]
-    if not 0 < len(rows) <= 336 or any(len(r) != len(languages) + 1 for r in rows):
+    if not 0 < len(rows) <= 400 or any(len(r) != len(languages) + 1 for r in rows):
         raise ValueError("invalid row count or columns")
     rows.sort(key=lambda row: row[0].lower().encode("ascii"))
     if len({r[0].lower() for r in rows}) != len(rows):
@@ -81,7 +82,7 @@ def outputs(resource_dir=None):
             if resource_dir is not None:
                 result[resource_dir / resource_key] = data
             if version <= ACTIVE_VERSION:
-                minimum_glyph_sequence = (5 if version >= 10 else 4 if version >= 7 else 3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else 1
+                minimum_glyph_sequence = (6 if version >= 11 else 5 if version >= 10 else 4 if version >= 7 else 3 if version >= 5 else 2) if glyphs == "DEVANAGARI" else (2 if version >= 11 and glyphs == "BENGALI_ASSAMESE" else 1)
                 active[code] = (f'    {{"{code}", "{label}", BROWSER_GLYPH_LANGUAGE_{glyphs}, '
                                 f'"{hashlib.sha256(data).hexdigest()}", {version}, {minimum_glyph_sequence}, '
                                 f'"{resource_key}"}},')

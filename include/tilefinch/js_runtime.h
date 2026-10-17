@@ -2172,6 +2172,19 @@ void script_runtime_set_stylesheet(ScriptRuntime *runtime,
 void script_runtime_set_synchronous_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
     void *opaque);
+/* A geometry-only owner callback flows the already installed cascade; it
+   cannot install pending stylesheet resources. Non-container-dependent
+   style-only reads need no such flow. Other callbacks retain the conservative
+   contract above, including hosts that install new sheets while flushing. */
+void script_runtime_set_geometry_layout_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque);
+/* Candidate-only image sizing, before a complete page layout is published.
+   Other measurement probes retain their existing fallback; installing the
+   ordinary callback at commit restores full geometry support. */
+void script_runtime_set_image_sizing_layout_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque);
 /* Bounded, runtime-owned geometry view using already admitted styles and
    resources. Does not retire the page, fetch resources, replace presentation,
    or consume the pending mutation journal. Normal layout adoption releases it. */
@@ -2179,9 +2192,13 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
                                           const ViewportContext *viewport);
 /* Called only when a fresh geometry snapshot is needed. The owner prepares
    its existing cache against this unconsumed journal before lending it to
-   the build. Neither the callback nor the build may run author code. */
+   the build. It may instead prove that the pending journal leaves all
+   committed geometry unchanged when geometry_unchanged is non-NULL; this
+   does not adopt stale paint or consume
+   the journal. Neither the callback nor the build may run author code. */
 typedef LayoutReuseCache *(*ScriptGeometryReuseCallback)(
-    void *opaque, const ScriptMutationJournal *mutations);
+    void *opaque, const ScriptMutationJournal *mutations,
+    bool *geometry_unchanged);
 bool script_runtime_flush_geometry_layout_reuse(
     ScriptRuntime *runtime, const ViewportContext *viewport,
     ScriptGeometryReuseCallback prepare, void *opaque);

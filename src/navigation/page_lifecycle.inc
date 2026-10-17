@@ -811,43 +811,74 @@ static ScriptRuntime *navigation_create_runtime(
 
 static void navigation_prepare_layout_reuse(
     NavigationSession *session, const ScriptMutationJournal *mutations,
-    bool full_rebuild);
+    bool full_rebuild, const bool *local_focus);
+static bool navigation_focus_geometry_unchanged(
+    NavigationSession *session, const ScriptMutationJournal *mutations);
 
 static LayoutReuseCache *navigation_prepare_geometry_reuse(
-    void *opaque, const ScriptMutationJournal *mutations)
+    void *opaque, const ScriptMutationJournal *mutations,
+    bool *geometry_unchanged)
 {
     NavigationSession *session = opaque;
+    if (geometry_unchanged != NULL) {
+        *geometry_unchanged = navigation_focus_geometry_unchanged(session, mutations);
+        if (*geometry_unchanged) return NULL;
+    }
     /* The normal publication still consumes these mutations later. Apply
        its exact invalidation now as well, rather than using stale styles
        or resolving the entire document anew inside a geometry accessor. */
     /* A queued resource/style rebuild does not change this build's installed
        cascade. Its generation guards invalidate the cache when replacement
        rules actually arrive; the journal still invalidates changed DOM now. */
-    navigation_prepare_layout_reuse(session, mutations, false);
+    navigation_prepare_layout_reuse(session, mutations, false, NULL);
     return session->page.layout_reuse;
+}
+
+static bool navigation_flush_candidate_geometry(void *opaque)
+{
+    NavigationSession *session = opaque;
+    return session != NULL && session->page.runtime != NULL
+        && script_runtime_flush_geometry_layout_reuse(session->page.runtime,
+            &session->viewport, navigation_prepare_geometry_reuse, session);
 }
 
 static bool navigation_flush_committed_geometry(void *opaque)
 {
     NavigationSession *session = opaque;
     return session != NULL && session->page.loaded
-        && script_runtime_flush_geometry_layout_reuse(session->page.runtime,
-            &session->viewport, navigation_prepare_geometry_reuse, session);
+        && navigation_flush_candidate_geometry(session);
 }
 
-static void navigation_attach_layout(NavigationSession *session)
+static void navigation_update_font_usage(NavigationSession *session)
 {
     if (session != NULL && session->web_fonts_enabled) {
-        uint8_t required = session->page.stylesheet.metric_web_font_families;
+        uint64_t required = session->page.stylesheet.metric_web_font_faces;
+        uint64_t preferred = session->page.stylesheet.metric_web_font_primary_faces;
+        const WebFontSet *fonts = stylesheet_web_font_set(&session->page.stylesheet);
         for (size_t at = 0; at < session->page.layout.count; at++) {
             const DrawCommand *command = &session->page.layout.commands[at];
             if (command->type != DRAW_TEXT) continue;
             unsigned slot = font_family_web_slot(draw_command_font_family(command));
-            if (slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) required |= (uint8_t) (1u << slot);
+            if (fonts == NULL || slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT) continue;
+            const WebFontFamilyFaces *family = &fonts->families[slot];
+            /* Keep one normal fallback admissible if the requested face's
+               own sources fail. Later layouts reconsider newly used weights. */
+            required |= (uint64_t)font_family_face_usage_mask(
+                family, draw_command_font_weight(command))
+                << (slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT);
+            size_t primary = font_family_face_slot_at_weight(family,
+                draw_command_font_weight(command), false);
+            if (primary != SIZE_MAX) preferred |= UINT64_C(1)
+                << (slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT + primary);
         }
-        fonts_external_loader_set_usage(&session->page.external_font_loader,
-            &session->page.stylesheet, required);
+        fonts_external_loader_prioritize_faces(&session->page.external_font_loader,
+            &session->page.stylesheet, required, preferred);
     }
+}
+
+static void navigation_attach_layout(NavigationSession *session)
+{
+    navigation_update_font_usage(session);
     if (session != NULL) {
         session->page.visual_image_publication_pending = false;
         session->page.layout_provisional =
@@ -871,7 +902,7 @@ static void navigation_attach_layout(NavigationSession *session)
         /* Commit installs the default once. Subsequent ordinary relayouts
            must preserve an explicitly supplied synchronous-layout callback. */
         if (!session->page.loaded)
-            script_runtime_set_synchronous_layout_callback(session->page.runtime,
+            script_runtime_set_geometry_layout_callback(session->page.runtime,
                 navigation_flush_committed_geometry, session);
         script_runtime_set_images(session->page.runtime,
                                   &session->page.images);
@@ -1296,6 +1327,82 @@ static bool navigation_damage_commands_equal(const LayoutDocument *old,
             || (i >= before->command_start && i < before->command_end)
               != (j >= after->command_start && j < after->command_end))
             return false;
+    }
+    return true;
+}
+
+/* Retain a fixed raster only with exact sidecar/command equality, not a
+   fingerprint or a disjoint damage guess (fixed commands retain in-flow
+   coordinates). Non-focus changes also require the renderer's immutable
+   image-lifetime witness; the retired image table is never dereferenced here.
+   Ambiguous contexts fall back to replacement. This proof allocates nothing. */
+static bool navigation_fixed_focus_context_equal(
+    const LayoutDocument *old, const LayoutDocument *next,
+    bool resource_bodies_unchanged)
+{
+    if (old->fixed_count == 0 || old->fixed_count != next->fixed_count
+        || old->fonts != next->fonts || old->web_fonts != next->web_fonts
+        || old->width != next->width
+        || memcmp(&old->viewport, &next->viewport, sizeof(old->viewport)) != 0
+        || old->scroll_generation != next->scroll_generation
+        || old->node_box_count != next->node_box_count
+        || old->sticky_count != 0 || next->sticky_count != 0
+        || old->bidi_command_count != 0 || next->bidi_command_count != 0
+        || old->gradient_count != next->gradient_count
+        || memcmp(old->gradients, next->gradients,
+                  old->gradient_count * sizeof(*old->gradients)) != 0
+        || memcmp(old->fixed_ranges, next->fixed_ranges,
+                  old->fixed_count * sizeof(*old->fixed_ranges)) != 0
+        || old->scroll_container_count != next->scroll_container_count
+        || (old->scroll_container_count != 0
+            && memcmp(old->scroll_containers, next->scroll_containers,
+                old->scroll_container_count * sizeof(*old->scroll_containers)) != 0))
+        return false;
+    for (size_t i = 0; i < old->node_box_count; i++) {
+        const LayoutNodeBox *a = &old->node_boxes[i], *b = &next->node_boxes[i];
+        if ((a->clips_x || a->clips_y || a->clip_path_clip
+             || b->clips_x || b->clips_y || b->clip_path_clip)
+            && memcmp(a, b, sizeof(*a)) != 0) return false;
+    }
+    if ((old->node_clip_radius_codes == NULL) != (next->node_clip_radius_codes == NULL)
+        || (old->node_clip_radius_codes != NULL
+            && memcmp(old->node_clip_radius_codes, next->node_clip_radius_codes,
+                old->node_box_count * sizeof(*old->node_clip_radius_codes)) != 0))
+        return false;
+    for (size_t r = 0; r < old->fixed_count; r++) {
+        const FixedRange *range = &old->fixed_ranges[r];
+        if (range->command_end > old->count || range->command_end > next->count)
+            return false;
+        for (size_t i = range->command_start; i < range->command_end; i++) {
+            DrawCommand before = old->commands[i], after = next->commands[i];
+            /* The old table may already have retired. Compare only command
+               geometry here; the renderer verifies the new image against
+               exact immutable-body lifetimes saved at raster construction. */
+            if (!resource_bodies_unchanged && before.type == DRAW_IMAGE
+                && after.type == DRAW_IMAGE) before.image = after.image = NULL;
+            if (!draw_command_equal(&before, &after))
+                return false;
+            uint8_t a = old->command_flags == NULL ? 0 : old->command_flags[i];
+            uint8_t b = next->command_flags == NULL ? 0 : next->command_flags[i];
+            if (a != b) return false;
+        }
+    }
+    /* A flow outline may be inserted after the header. Compare fixed paint
+       order independently; the renderer still checks whether the new whole
+       page can compose a fixed overlay before using its retained raster. */
+    if (old->paint_order_count != old->count
+        || next->paint_order_count != next->count
+        || old->command_flags == NULL || next->command_flags == NULL)
+        return false;
+    size_t a = 0, b = 0;
+    while (a < old->count || b < next->count) {
+        while (a < old->count
+            && (old->command_flags[old->paint_order[a]] & LAYOUT_COMMAND_FIXED) == 0) a++;
+        while (b < next->count
+            && (next->command_flags[next->paint_order[b]] & LAYOUT_COMMAND_FIXED) == 0) b++;
+        if (a == old->count || b == next->count)
+            return a == old->count && b == next->count;
+        if (old->paint_order[a++] != next->paint_order[b++]) return false;
     }
     return true;
 }

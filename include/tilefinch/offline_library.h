@@ -36,7 +36,8 @@
 typedef enum {
     OFFLINE_ITEM_ARTICLE = 1,
     OFFLINE_ITEM_YOUTUBE = 2,
-    OFFLINE_ITEM_WEB_APP = 3
+    OFFLINE_ITEM_WEB_APP = 3,
+    OFFLINE_ITEM_FILE = 4
 } OfflineItemType;
 
 typedef enum {
@@ -175,6 +176,11 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id);
 
 bool offline_library_build_page(
     const OfflineLibrary *library, Budget *budget,
+    char **html, size_t *length);
+/* Shows a completed file's safe local path, never executes its contents. */
+bool offline_library_build_file_page(const OfflineLibrary *library,
+    Budget *budget, uint32_t id, char **html, size_t *length);
+bool offline_library_build_homebrew_page(Budget *budget, const char *game_directory,
     char **html, size_t *length);
 bool offline_library_item_path(
     const OfflineLibrary *library, uint32_t id, const char *suffix,

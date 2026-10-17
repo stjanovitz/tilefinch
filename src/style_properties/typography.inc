@@ -90,6 +90,19 @@ static bool style_property_font_size(const StylePropertyParse *parse)
 
 static bool style_property_text_indent(const StylePropertyParse *parse)
 {
+    if (span_case_equal(parse->value, parse->value_length, "inherit")
+        || span_case_equal(parse->value, parse->value_length, "unset")) {
+        /* The length sentinel is only retained in declarations; computed
+           styles resolve it against the parent before layout sees it. */
+        parse->style->text_indent = STYLE_LENGTH_NONE;
+        *parse->mask_high |= S2_TEXT_INDENT;
+        return true;
+    }
+    if (span_case_equal(parse->value, parse->value_length, "initial")) {
+        parse->style->text_indent = 0;
+        *parse->mask_high |= S2_TEXT_INDENT;
+        return true;
+    }
     Stylesheet *sheet = parse->sheet;
     const char *value = parse->value;
     size_t value_length = parse->value_length;

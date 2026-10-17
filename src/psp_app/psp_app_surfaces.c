@@ -5,6 +5,7 @@
 #include "psp_app_internal.h"
 
 #include "tilefinch/pixel_math.h"
+#include "tilefinch/ui_language.h"
 
 #define PSP_TAB_INDEX_NONE ((size_t) -1)
 
@@ -565,7 +566,7 @@ void psp_collections_sync_ui(
         || section == PSP_UI_COLLECTION_DOWNLOADS) {
         bool is_downloads = section == PSP_UI_COLLECTION_DOWNLOADS;
         surface->view.empty_message = is_downloads
-            ? "NO VIDEO DOWNLOADS YET" : "NOTHING SAVED YET";
+            ? "NO DOWNLOADS YET" : "NOTHING SAVED YET";
         const OfflineLibrary *library = offline_store == NULL
             ? NULL : &offline_store->library;
         const OfflineDownloadManager *downloads = offline_store == NULL
@@ -574,9 +575,13 @@ void psp_collections_sync_ui(
         for (size_t at = 0;
              at < count && rows < PSP_UI_COLLECTIONS_ROW_LIMIT; at++) {
             const OfflineLibraryItem *item = &library->items[at];
-            if (is_downloads != (item->type == OFFLINE_ITEM_YOUTUBE)) continue;
+            if (is_downloads != (item->type == OFFLINE_ITEM_YOUTUBE
+                                || item->type == OFFLINE_ITEM_FILE)) continue;
             surface->view.rows[rows].title = item->title;
             surface->view.rows[rows].detail = item->source_url;
+            surface->view.rows[rows].is_file = item->type == OFFLINE_ITEM_FILE;
+            if (item->type == OFFLINE_ITEM_FILE)
+                surface->view.rows[rows].detail = tilefinch_ui_text("Memory Stick file");
             if (item->type == OFFLINE_ITEM_WEB_APP)
                 surface->view.rows[rows].icon_rgba =
                     psp_offline_store_app_icon(offline_store, item->id);
@@ -623,15 +628,15 @@ void psp_collections_sync_ui(
                     && snapshot.available_bytes != 0) {
                     snprintf(surface->download_detail[rows],
                              sizeof(surface->download_detail[rows]),
-                             "%lu KB/s  |  %llu MB free",
+                             "%lu KB/s  |  %llu %s",
                              (unsigned long)
                                  (snapshot.bytes_per_second / 1024u),
                              (unsigned long long)
-                                 (snapshot.available_bytes / UINT64_C(1048576)));
+                                 (snapshot.available_bytes / UINT64_C(1048576)), tilefinch_ui_text("MB free"));
                 } else {
                     snprintf(surface->download_detail[rows],
                              sizeof(surface->download_detail[rows]),
-                             "Preparing resumable download");
+                             "%s", tilefinch_ui_text("Preparing resumable download"));
                 }
                 surface->view.rows[rows].detail =
                     surface->download_detail[rows];
@@ -669,6 +674,13 @@ void psp_collections_sync_ui(
             }
             surface->id[rows] = item->id;
             rows++;
+        }
+        if (is_downloads && offline_store != NULL && offline_store->game_directory != NULL
+            && rows < PSP_UI_COLLECTIONS_ROW_LIMIT) {
+            surface->view.rows[rows].title = tilefinch_ui_text("Installed homebrew");
+            surface->view.rows[rows].detail = tilefinch_ui_text("Manage apps installed by Tilefinch");
+            surface->view.rows[rows].offline_state = UINT8_MAX; /* Navigation, not a transfer. */
+            surface->id[rows++] = 0;
         }
     } else if (section == PSP_UI_COLLECTION_BOOKMARKS) {
         surface->view.empty_message = "NO BOOKMARKS YET";

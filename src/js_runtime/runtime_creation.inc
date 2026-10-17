@@ -717,6 +717,175 @@ static void runtime_remove_lazy_bootstrap_properties(
 static bool runtime_install_lazy_bootstrap_feature(
     ScriptRuntime *runtime, LazyBootstrapFeature feature);
 
+/* Only the initial trusted bootstrap receives this temporary channel entry.
+   Keep descriptor hardening out of JS reflection: a keys array and its
+   enumeration table overlap at exactly the smallest realm's memory peak. */
+static JSValue runtime_harden_global_hooks(JSContext *context,
+    JSValueConst this_value, int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    /* These names are bootstrap metadata, not page heap state. Keep their
+       single source here so even the smallest realm retains DOM headroom. */
+    static const char *const protected_names[] = {
+        "__tilefinchBoundedAncestorPath",
+        "__tilefinchBlobBytes",
+        "__tilefinchBlobForURL",
+        "__tilefinchCloneWorkerValue",
+        "__tilefinchAbortFileReaderForWorker",
+        "__tilefinchAbortIndexedDBForWorker",
+        "__tilefinchAbortSignalBrand",
+        "__tilefinchBlobTextForWorker",
+        "__tilefinchAbortXHRForWorker",
+        "__tilefinchCloseWebSocketForWorker",
+        "__tilefinchDetachArrayBuffer",
+        "__tilefinchPrepareMessagePortTransfer",
+        "__tilefinchCreatePrivateWeakMap",
+        "__tilefinchCreateMessageEvent",
+        "__tilefinchCreateWorkerCrypto",
+        "__tilefinchSetCryptoBufferNormalizer",
+        "__tilefinchCreateWorkerPerformance",
+        "__tilefinchWorkerCloneIntrinsics",
+        "__tilefinchCurrentScriptForStable",
+        "__tilefinchCurrentDocumentURL",
+        "__tilefinchSecureContext",
+        "__tilefinchDocumentDomainValid",
+        "__tilefinchDiagnosticLookup",
+        "__tilefinchDispatchActivationHandle",
+        "__tilefinchDispatchAt",
+        "__tilefinchDispatchDOMContentLoaded",
+        "__tilefinchDispatchHandle",
+        "__tilefinchDispatchInputHandle",
+        "__tilefinchDispatchSubmitHandle",
+        "__tilefinchDispatchWindowEventCheckpointed",
+        "__tilefinchDispatchEventTargetCheckpointed",
+        "__tilefinchEventObserverDelta",
+        "__tilefinchFetchForWorker",
+        "__tilefinchFetchWorkerScript",
+        "__tilefinchFetchWorkerScriptSync",
+        "__tilefinchFocusEventsObserved",
+        "__tilefinchInvokeEventTargetCheckpointed",
+        "__tilefinchIsProxy",
+        "__tilefinchGetTextPrefix",
+        "__tilefinchGetStyleAttributePrefix",
+        "__tilefinchMarkNativeFunction",
+        "__tilefinchNormalizeTimerDelay",
+        "__tilefinchScheduleTimeout",
+        "__tilefinchScheduleInterval",
+        "__tilefinchScheduleTask",
+        "__tilefinchCancelTimer",
+        "__tilefinchSchedulerTime",
+        "__tilefinchScheduleReservedTask",
+        "__tilefinchScheduleReservedFrame",
+        "__tilefinchPointerHoverEventsObserved",
+        "__tilefinchPointerMarkupChanged",
+        "__tilefinchPointerMoveEventsObserved",
+        "__tilefinchRecordEventHandler",
+        "__tilefinchCompressionRun",
+        "__tilefinchWasmCompile",
+        "__tilefinchWasmGlobalGet",
+        "__tilefinchWasmGlobalSet",
+        "__tilefinchWasmValidate",
+        "__tilefinchRegisterNativeNodeStateCleanup",
+        "__tilefinchReportUncaught",
+        "__tilefinchRetireNativeNodeState",
+        "__tilefinchRunTask",
+        "__tilefinchSchedulerNow",
+        "__tilefinchSetFocusHandle",
+        "__tilefinchWrap",
+        "__tilefinchWrapRemote",
+        "__tilefinchWrapRemoteRelation",
+        "__tilefinchWrapRemoteSelector",
+        "__tilefinchWrapRemoteStable",
+        /* Invoked by native code or later bootstrap modules by name.
+           ReceiveMessage deliberately remains replaceable for failure tests. */
+        "__tilefinchCommitSameDocument",
+        "__tilefinchDeliverEventSource",
+        "__tilefinchDeliverWebSocket",
+        "__tilefinchDeliverMultiplayer",
+        "__tilefinchDeliverNetwork",
+        "__tilefinchDocumentURLRevision",
+        "__tilefinchDetachNetwork",
+        "__tilefinchIntersectionRecheck",
+        "__tilefinchMediaRecheck",
+        "__tilefinchMaybeStartMotion",
+        "__tilefinchMotionRecheck",
+        "__tilefinchBeginMotionObservation",
+        "__tilefinchParserMutationCheckpoint",
+        "__tilefinchPumpTimers",
+        "__tilefinchSchedulerSnapshot",
+        "__tilefinchRebindDocument",
+        "__tilefinchRecordNavigationTiming",
+        "__tilefinchRecordResourceTiming",
+        "__tilefinchRefreshNamedProperties",
+        "__tilefinchResizeRecheck",
+        "__tilefinchRestoreSameDocument",
+        "__tilefinchRestoreSectionState",
+        "__tilefinchSaveSectionState",
+        "__tilefinchSetFrameWindowState",
+        "__tilefinchStylesheetHasMotionKeyframes",
+        "__tilefinchTrustedEvent",
+        "__tilefinchTrustedString",
+        "__tilefinchUpdateGamepad",
+    };
+    JSAtom protected_atoms[128];
+    const uint32_t count = sizeof(protected_names) / sizeof(protected_names[0]);
+    _Static_assert(sizeof(protected_names) / sizeof(protected_names[0]) <= 128,
+                   "bootstrap hook atom bound");
+    uint32_t retained = 0, key_count = 0;
+    JSPropertyEnum *keys = NULL;
+    JSValue global = JS_UNDEFINED;
+    JSValue result = JS_EXCEPTION;
+    for (; retained < count; retained++) {
+        JSAtom atom = JS_NewAtom(context, protected_names[retained]);
+        if (atom == JS_ATOM_NULL) {
+            if (!JS_HasException(context))
+                JS_ThrowTypeError(context, "Invalid bootstrap hook name");
+            goto done;
+        }
+        protected_atoms[retained] = atom;
+    }
+    global = JS_GetGlobalObject(context);
+    if (JS_GetOwnPropertyNames(context, &keys, &key_count, global,
+                              JS_GPN_STRING_MASK) < 0) goto done;
+    if (key_count > 8192u) {
+        JS_ThrowRangeError(context, "Bootstrap global table exceeds bound");
+        goto done;
+    }
+    for (uint32_t at = 0; at < key_count; at++) {
+        JSAtom atom = keys[at].atom;
+        bool protect = false;
+        for (uint32_t i = 0; i < count; i++)
+            if (protected_atoms[i] == atom) { protect = true; break; }
+        const char *name = JS_AtomToCString(context, atom);
+        if (name == NULL) goto done;
+        bool hook = strncmp(name, "__tilefinch", sizeof("__tilefinch") - 1u) == 0;
+        JS_FreeCString(context, name);
+        if (!hook) continue;
+        JSPropertyDescriptor descriptor;
+        int found = JS_GetOwnProperty(context, &descriptor, global, atom);
+        if (found < 0) goto done;
+        if (!found) continue;
+        protect = protect && JS_IsFunction(context, descriptor.value);
+        bool enumerable = (descriptor.flags & JS_PROP_ENUMERABLE) != 0;
+        JS_FreeValue(context, descriptor.value);
+        JS_FreeValue(context, descriptor.getter);
+        JS_FreeValue(context, descriptor.setter);
+        if (!enumerable && !protect) continue;
+        int flags = JS_PROP_HAS_ENUMERABLE;
+        if (protect) flags |= JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE;
+        if (JS_DefineProperty(context, global, atom, JS_UNDEFINED,
+                              JS_UNDEFINED, JS_UNDEFINED, flags) < 0) goto done;
+    }
+    result = JS_UNDEFINED;
+done:
+    JS_FreePropertyEnum(context, keys, key_count);
+    JS_FreeValue(context, global);
+    for (uint32_t i = 0; i < retained; i++) JS_FreeAtom(context, protected_atoms[i]);
+    return result;
+}
+
 /* Trusted bootstrap attaches its native-readable state (see
    ScriptRuntime.host_state) to this null-prototype object, which exists only
    while that bootstrap evaluates. With `with_state`, `state` is a
@@ -728,6 +897,11 @@ static bool runtime_define_host_channel(ScriptRuntime *runtime,
     JSValue channel = JS_NewObjectProto(context, JS_NULL);
     if (JS_IsException(channel)) return false;
     if (with_state) {
+        if (!js_rt_install_function(context, channel, "hardenGlobalHooks",
+                                    runtime_harden_global_hooks, 0)) {
+            JS_FreeValue(context, channel);
+            return false;
+        }
         JSValue buffer = JS_NewArrayBuffer(
             context, (uint8_t *) runtime->host_state,
             sizeof(runtime->host_state), NULL, NULL, false);
@@ -2773,6 +2947,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchQueueCheckpointContinuation",
                                        js_queue_checkpoint_continuation, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchEnqueueMicrotask",
+                                       js_enqueue_microtask, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDateNow",
                                        js_date_now, 1)

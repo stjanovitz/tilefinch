@@ -1,0 +1,12 @@
+--- a/src/truetype/ttgxvar.c
++++ b/src/truetype/ttgxvar.c
+@@ -2027,6 +2027,9 @@
+ 
+   Fail:
+     FT_FREE( blend->glyphoffsets );
++    FT_FREE( blend->tuplecoords );
++    FT_FREE( blend->tuplescalars );
++    blend->tuplecount = 0;
+     blend->gv_glyphcnt = 0;
+     goto Exit;
+   }

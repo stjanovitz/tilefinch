@@ -1591,12 +1591,9 @@ static bool paint_pseudo_internal(LayoutContext *context, lxb_dom_node_t *node,
                 pseudo_command_start, visual_end, origin_x_twice,
                 origin_y_twice, paint->rotation_q6);
         }
-        int dx = style.transform_x_percent
-                 ? pseudo_width * style.transform_x / 100
-                 : style.transform_x;
-        int dy = style.transform_y_percent
-                 ? pseudo_height * style.transform_y / 100
-                 : style.transform_y;
+        int dx, dy;
+        style_transform_resolve_translation(context->sheet, &style,
+            pseudo_width, pseudo_height, &dx, &dy);
         layout_transform_command_span(
             context->layout, pseudo_command_start,
             visual_end,
@@ -2321,10 +2318,8 @@ static int line_clamp_measure_text(const LayoutDocument *layout,
     FontFamily family = font_context_metric_family(
         layout->web_fonts, draw_command_font_family(command), face);
     unsigned weight = (unsigned) draw_command_font_weight_code(command) * 10u;
-    bool synthetic_bold = weight >= 550u
-        && (weight < 650u
-            || !font_context_face_is_bold(
-                   layout->fonts, layout->web_fonts, face));
+    bool synthetic_bold = font_face_needs_synthetic_bold(
+        layout->fonts, layout->web_fonts, face, weight);
     return measured_flow_text_width_fixed(
         face, family, text, length,
         draw_command_text_font_size_fixed(command),
@@ -2333,47 +2328,40 @@ static int line_clamp_measure_text(const LayoutDocument *layout,
         !draw_command_text_kerning_none(command));
 }
 
-bool layout_line_clamp_overflow(LineState *line)
+static bool line_ellipsis_marker(LayoutDocument *layout,
+    size_t start, size_t end, size_t link_start, size_t link_end, int right)
 {
-    if (line == NULL || !line->clamp_pending || line->text_overflow_ended) {
-        return line != NULL;
-    }
-    line->clamp_pending = false;
-    line->text_overflow_ended = true;
-    if (line->layout == NULL
-        || line->clamp_command_start >= line->clamp_command_end
-        || line->clamp_command_end > line->layout->count) return true;
+    if (layout == NULL || start >= end || end > layout->count) return true;
     DrawCommand *last = NULL;
-    for (size_t i = line->clamp_command_end;
-         i-- > line->clamp_command_start;) {
-        DrawCommand *candidate = &line->layout->commands[i];
+    size_t last_index = 0;
+    for (size_t i = end; i-- > start;) {
+        DrawCommand *candidate = &layout->commands[i];
         if (candidate->type == DRAW_TEXT
             && !draw_command_is_text_shadow(candidate)) {
             last = candidate;
+            last_index = i;
             break;
         }
     }
     if (last == NULL) return true;
     static const char marker_text[] = "\xe2\x80\xa6";
     int marker_fixed = line_clamp_measure_text(
-        line->layout, last, marker_text, sizeof(marker_text) - 1,
+        layout, last, marker_text, sizeof(marker_text) - 1,
         TEXT_TRANSFORM_NONE);
     int marker_width = layout_fixed_ceil(marker_fixed);
     if (marker_width < 1) marker_width = 1;
-    int available = line->clamp_right - last->x - marker_width;
+    int available = right - last->x - marker_width;
     if (available < 0) available = 0;
     bool bold_face = draw_uses_bold_face(last);
     const FontFace *face = font_context_face_at_weight(
-        line->layout->fonts, line->layout->web_fonts,
+        layout->fonts, layout->web_fonts,
         draw_command_font_family(last), draw_command_font_italic(last),
         bold_face, draw_command_font_weight(last));
     FontFamily family = font_context_metric_family(
-        line->layout->web_fonts, draw_command_font_family(last), face);
+        layout->web_fonts, draw_command_font_family(last), face);
     unsigned weight = (unsigned) draw_command_font_weight_code(last) * 10u;
-    bool synthetic_bold = weight >= 550u
-        && (weight < 650u
-            || !font_context_face_is_bold(
-                   line->layout->fonts, line->layout->web_fonts, face));
+    bool synthetic_bold = font_face_needs_synthetic_bold(
+        layout->fonts, layout->web_fonts, face, weight);
     size_t prefix = available <= 0 ? 0 : fitting_text_prefix(
         face, family, last->text, last->text_length,
         draw_command_text_font_size_fixed(last), synthetic_bold, bold_face,
@@ -2383,14 +2371,12 @@ bool layout_line_clamp_overflow(LineState *line)
         !draw_command_text_kerning_none(last));
     if (prefix > last->text_length) prefix = last->text_length;
     int prefix_fixed = prefix == 0 ? 0 : line_clamp_measure_text(
-        line->layout, last, last->text, prefix,
+        layout, last, last->text, prefix,
         draw_command_text_transform(last));
     if (prefix_fixed > layout_fixed_from_integer(available)) {
         prefix = 0;
         prefix_fixed = 0;
     }
-    last->text_length = (uint32_t) prefix;
-    last->width = layout_fixed_ceil(prefix_fixed);
     /* Preserve the prefix's 26.6 advance.  Rounding it to an integer before
        positioning the marker shifts an injected ellipsis by one pixel for
        common fractional glyph advances, even though an authored ellipsis on
@@ -2399,12 +2385,6 @@ bool layout_line_clamp_overflow(LineState *line)
                             + prefix_fixed;
     int marker_x_fixed = marker_x_wide > INT_MAX ? INT_MAX
         : (marker_x_wide < INT_MIN ? INT_MIN : (int) marker_x_wide);
-    for (size_t i = line->clamp_link_start;
-         i < line->clamp_link_end && i < line->layout->link_count; i++) {
-        LinkRegion *link = &line->layout->links[i];
-        if (link->x == last->x && link->y == last->y
-            && link->width > last->width) link->width = last->width;
-    }
     DrawCommand marker = *last;
     draw_command_set_text_x_fixed(&marker, marker_x_fixed);
     marker.width = marker_width;
@@ -2414,7 +2394,71 @@ bool layout_line_clamp_overflow(LineState *line)
     marker.radius &= ~(LAYOUT_TEXT_FIND_SPACE_BEFORE
                        | LAYOUT_TEXT_FIND_BLOCK_START);
     marker.z_index = 0;
-    return layout_add_command(line->layout, marker) != NULL;
+    /* Admit before trimming: failure leaves both text and hit regions intact.
+       The append can move the command array, so reacquire by stable index. */
+    if (layout_add_command(layout, marker) == NULL) return false;
+    last = &layout->commands[last_index];
+    last->text_length = (uint32_t) prefix;
+    last->width = layout_fixed_ceil(prefix_fixed);
+    for (size_t i = link_start; i < link_end && i < layout->link_count; i++) {
+        LinkRegion *link = &layout->links[i];
+        if (link->x == last->x && link->y == last->y
+            && link->width > last->width) link->width = last->width;
+    }
+    return true;
+}
+
+bool layout_line_clamp_overflow(LineState *line)
+{
+    if (line == NULL || !line->clamp_pending || line->text_overflow_ended)
+        return line != NULL;
+    line->clamp_pending = false;
+    line->text_overflow_ended = true;
+    return line_ellipsis_marker(line->layout, line->clamp_command_start,
+        line->clamp_command_end, line->clamp_link_start, line->clamp_link_end,
+        line->clamp_right);
+}
+
+/* text-overflow belongs to the block's line, not its descendants' inherited
+   style. A normal-wrapping block can still overflow through joined no-wrap
+   inlines. Reuse the bounded clamp marker without ending subsequent lines. */
+static void line_inline_overflow_ellipsis(LineState *line)
+{
+    if (!line->inline_overflow_ellipsis || line->direction_rtl
+        || line->bidi_pipeline_expected || line->clamp_limit != 0
+        || line_cursor_fixed(line) <= (int64_t) line->right * 64) return;
+    size_t end = line->layout->count, selected = SIZE_MAX;
+    bool overflow = false;
+    for (size_t i = line->command_start; i < end; i++) {
+        const DrawCommand *command = &line->layout->commands[i];
+        if (command->type != DRAW_TEXT || command->text_length == 0
+            || draw_command_is_text_shadow(command)) continue;
+        if ((int64_t) command->x + command->width > line->right)
+            overflow = true;
+        static const char marker[] = "\xe2\x80\xa6";
+        int width = layout_fixed_ceil(line_clamp_measure_text(
+            line->layout, command, marker, sizeof(marker) - 1u,
+            TEXT_TRANSFORM_NONE));
+        if (selected == SIZE_MAX || command->x < line->right - width)
+            selected = i;
+        if (overflow) break;
+    }
+    if (!overflow || selected == SIZE_MAX) return;
+    /* Marker admission is optional paint. A refusal retains ordinary box
+       clipping, never fails the document or changes its layout geometry. */
+    if (!line_ellipsis_marker(line->layout, line->command_start, selected + 1u,
+            line->link_start, line->layout->link_count, line->right)) return;
+    int right = line->layout->commands[line->layout->count - 1u].x;
+    for (size_t i = line->command_start; i < end; i++) {
+        DrawCommand *command = &line->layout->commands[i];
+        if (i > selected && command->x >= right) command->opacity_scale = 0;
+    }
+    for (size_t i = line->link_start; i < line->layout->link_count; i++) {
+        LinkRegion *link = &line->layout->links[i];
+        if (link->x >= right) link->width = 0;
+        else if ((int64_t) link->x + link->width > right)
+            link->width = right - link->x;
+    }
 }
 
 void layout_flush_line(LineState *line)
@@ -2489,6 +2533,7 @@ void layout_flush_line(LineState *line)
             }
         }
         align_line_text_baselines(line);
+        line_inline_overflow_ellipsis(line);
         int64_t right_fixed = (int64_t) line->right * 64;
         int64_t cursor_fixed = line_cursor_fixed(line);
         int64_t remaining_fixed = right_fixed - cursor_fixed;
@@ -4169,6 +4214,22 @@ typedef struct {
     unsigned nodes, bytes, state;
 } InlineWordProbe;
 
+/* An ordinary inline boundary does not itself create a break. Preserve the
+   existing conservative behavior for Unicode/punctuation opportunities and
+   atomic inlines, but keep joined Latin no-wrap fragments on the same line. */
+static bool inline_nowrap_boundary_can_wrap(const LineState *line)
+{
+    if (line->pending_space || line->previous_atomic
+        || !line->has_text_character) return true;
+    for (size_t i = line->layout->count; i-- > line->command_start;) {
+        const DrawCommand *command = &line->layout->commands[i];
+        if (command->type != DRAW_TEXT || command->text_length == 0) continue;
+        unsigned char last = (unsigned char) command->text[command->text_length - 1u];
+        return last >= 0x80u || last == '-' || last == '/';
+    }
+    return true;
+}
+
 /* Markup is not a word-break opportunity. Recognize short ordinary inline
    words before any fragment is painted, so emphasis/link boundaries cannot
    strand an opening bracket or half a word on the preceding line. Decline
@@ -4715,12 +4776,15 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (text_height < 1) text_height = 7 * style.font_scale;
             outer_height = text_height + vertical_edges;
         } else {
-            /* Native single-line text controls size their content box from
-               the used font size, not from a downloadable face's internal
-               line gap. This keeps their UA geometry stable across fallback
-               faces. */
+            /* Honor an authored line-height, while `normal` keeps the UA
+               geometry independent of a downloaded face's internal gap. */
             int text_height = layout_fixed_ceil(
                 computed_style_font_size_fixed(&style));
+            if (style.line_height > 0) {
+                int authored = layout_fixed_ceil(
+                    inline_style_line_height_fixed(context, &style));
+                if (authored > text_height) text_height = authored;
+            }
             if (text_height < 1) text_height = 7 * style.font_scale;
             outer_height = text_height + vertical_edges;
         }
@@ -4759,6 +4823,20 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         if (!special_input) {
         int border_radius_code = stylesheet_border_radius_code(
             context->sheet, &style);
+        bool authored_decoration = border_radius_code != 0
+            || style.background_image_kind != STYLE_BACKGROUND_IMAGE_NONE;
+        if (authored_decoration) {
+            /* Input controls need the same rounded border and background
+               layers as ordinary boxes, not a flat four-side approximation.
+               Their final size is known already: patch before adding text. */
+            LayoutBlockPaintPlan plan;
+            if (!layout_block_emit_decoration(context, node, &style, parent,
+                    outer_x, outer_y, outer_width, &plan)) return false;
+            size_t insertion = context->layout->count, scroll_start = insertion;
+            if (!layout_block_patch_decoration(context, node, &style, &plan,
+                    outer_x, outer_y, outer_width, outer_y + outer_height,
+                    outer_height, false, &insertion, &scroll_start)) return false;
+        }
         DrawCommand background = {
             .type = DRAW_FILL_RECT,
             .x = outer_x + style.border.left,
@@ -4776,7 +4854,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
            paint a second white fallback. That fallback used to cover sprite-
            backed submit buttons whose transparent hit target sits above the
            authored parent surface. */
-        if (style.has_background
+        if (!authored_decoration && style.has_background
             && layout_add_command(context->layout, background) == NULL) {
             return false;
         }
@@ -4847,7 +4925,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (layout_control_text_style(context, node, &style, placeholder_value, &text)
                 && layout_add_command(context->layout, text) == NULL) return false;
         }
-        if (!layout_inline_paint_borders(
+        if (!authored_decoration && !layout_inline_paint_borders(
                 context->layout, &style, outer_x, outer_y,
                 outer_width, outer_height)) return false;
         }
@@ -5320,12 +5398,6 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                                      line, &inline_before)) {
         return false;
     }
-    if (!inline_before.active
-        && !flow_generated_inline_pseudo(
-            context, node, &style, PSEUDO_BEFORE, line, link_url,
-            link_url_length, link_node, NULL)) {
-        return false;
-    }
     int control_x = line->x;
     int control_y = line->y;
     size_t inline_command_start = context->layout->count;
@@ -5357,6 +5429,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
           || style.white_space_mode == WHITE_SPACE_PRE) || word_group)
         && parent->white_space_mode != WHITE_SPACE_NOWRAP
         && parent->white_space_mode != WHITE_SPACE_PRE
+        && (word_group || inline_nowrap_boundary_can_wrap(line))
         && line_cursor_fixed(line)
                != layout_fixed_from_integer(line->start_x)) {
         int line_width = line->right - line->start_x;
@@ -5391,6 +5464,14 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         inline_background_index = context->layout->count;
         if (layout_add_command(context->layout, placeholder) == NULL)
             return false;
+    }
+    /* Generated inline content belongs inside the originating inline's
+       left padding/border and background, just like its real children. */
+    if (!inline_before.active
+        && !flow_generated_inline_pseudo(
+            context, node, &style, PSEUDO_BEFORE, line, link_url,
+            link_url_length, link_node, NULL)) {
+        return false;
     }
     if (select_control) {
         lxb_dom_node_t *option = select_display_option(node);

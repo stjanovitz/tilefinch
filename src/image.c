@@ -41,12 +41,15 @@
 #define budget_realloc(b, p, s) \
     budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
-#define MAX_TRACKED_IMAGE_NODES 128
+#define MAX_IMAGE_FETCH_ATTEMPTS 128
+#define MAX_TRACKED_IMAGE_NODES 192
 /* Image-count policy. The per-page image count (24 on the PSP) bounds the
    work a page can start against the network: every counted attempt may hold
    a fetch slot, an encoded-byte reservation and a full raster decode. Memory
    is bounded separately and honestly by the decoded- and encoded-byte quotas
-   and by MAX_TRACKED_IMAGE_NODES, which every image still pays. Icons that
+   and by MAX_TRACKED_IMAGE_NODES, which every image still pays. The table
+   includes shared-source aliases, so its metadata bound is independent of
+   the unchanged network-attempt bound. Icons that
    never touch the network would otherwise exhaust the count before the first
    real photograph (a news header carries twenty-odd inline-SVG glyphs), so
    an inline SVG whose raster is no larger than a 64x64 icon, and a data: URL
@@ -2543,8 +2546,14 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
         images->stats.encoded_bytes += resource.encoded_length;
     }
     budget_free(context->budget, source.data);
+    /* These pixels are immutable until retargeting replaces the surface.
+       A shared lifetime lets render caches recognize an unchanged raster
+       borrowed by a later resource table, without relying on its address. */
+    if (resource.encoded != NULL)
+        resource.pixel_body = browser_shared_body_take(
+            context->budget, pixels, decoded);
     if (!image_add(images, resource)) {
-        budget_free(context->budget, pixels);
+        image_resource_release_owned_pixels(context->budget, &resource);
         budget_free(context->budget, resource.encoded);
         return false;
     }
@@ -4345,8 +4354,15 @@ static bool load_image_node_with_provenance_impl(
     }
     size_t remaining = context->maximum_total_encoded_bytes
                        - images->stats.encoded_bytes;
+    /* Do not admit a new response with only the crumbs left behind other
+       requests' worst-case reservations. A small preceding image can release
+       enough room for the next whole response; prematurely shrinking its
+       cap instead guarantees a needless refusal on otherwise affordable
+       bodies. Preserve concurrency whenever one full per-file allowance fits. */
     while (context->pending_count != 0
-           && context->pending_reserved_bytes >= remaining) {
+           && context->pending_reserved_bytes > remaining
+               - (context->maximum_single_encoded_bytes < remaining
+                   ? context->maximum_single_encoded_bytes : remaining)) {
         if (!finish_one_pending(context, true)) return false;
         if (image_stage_expired(context)
             || images->stats.encoded_bytes
@@ -5147,11 +5163,10 @@ static bool images_load_external_impl(
        reference-scoring profile can raise the count to fit a busy 106-image
        page).  Exceeding a limit must soft-skip, never fail the
        navigation: the per-image budgets already skip past their ceilings, so
-       clamp the request down to the bounded node table rather than returning
-       false.  MAX_TRACKED_IMAGE_NODES stays the hard structural cap the PSP
-       device profiles depend on. */
-    if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
-        maximum_count = MAX_TRACKED_IMAGE_NODES;
+       clamp network attempts rather than returning false. The independently
+       bounded node table also admits aliases that share decoded pixels. */
+    if (maximum_count > MAX_IMAGE_FETCH_ATTEMPTS) {
+        maximum_count = MAX_IMAGE_FETCH_ATTEMPTS;
     }
     /* Selected refresh prepared this cache against the stable outgoing table
        before creating its transactional replacement. Never retain a pointer
@@ -6021,8 +6036,8 @@ ImagePriorityLoadJob *images_priority_load_begin_batch(
             || (targets[at].kind != IMAGE_PRIORITY_KIND_DOCUMENT
                 && targets[at].kind != IMAGE_PRIORITY_KIND_LINKED_VIDEO)) return NULL;
     }
-    if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
-        maximum_count = MAX_TRACKED_IMAGE_NODES;
+    if (maximum_count > MAX_IMAGE_FETCH_ATTEMPTS) {
+        maximum_count = MAX_IMAGE_FETCH_ATTEMPTS;
     }
     if (images->budget == NULL) {
         memset(images, 0, sizeof(*images));

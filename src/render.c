@@ -883,6 +883,54 @@ static bool fixed_cache_composition_order(const LayoutDocument *layout,
     return true;
 }
 
+static bool fixed_cache_image_witness(TileCache *cache,
+                                      const LayoutDocument *layout, bool store)
+{
+    if (!store && !cache->fixed_images_valid) return false;
+    size_t count = 0;
+    if (store) cache->fixed_images_valid = false;
+    for (size_t r = 0; r < layout->fixed_count; r++) {
+        const FixedRange *range = &layout->fixed_ranges[r];
+        if (range->scroll_end != INT_MAX) continue;
+        if (range->command_end > layout->count) return false;
+        for (size_t i = range->command_start; i < range->command_end; i++) {
+            const DrawCommand *command = &layout->commands[i];
+            if (command->type != DRAW_IMAGE) continue;
+            const ImageResource *image = command->image;
+            if (image == NULL || count == sizeof(cache->fixed_images)
+                / sizeof(cache->fixed_images[0])) return false;
+            uint64_t serial = image_cache_serial(cache, image);
+            if (serial == 0) return false;
+            const void *identity = image_resource_backing_identity(image);
+            if (store) {
+                cache->fixed_images[count].identity = identity;
+                cache->fixed_images[count].serial = serial;
+                cache->fixed_images[count].width = image->width;
+                cache->fixed_images[count].height = image->height;
+                cache->fixed_images[count].source_width = image->source_width;
+                cache->fixed_images[count].source_height = image->source_height;
+                cache->fixed_images[count].mask = image->is_mask;
+                cache->fixed_images[count].retarget_flags = image->retarget_flags;
+            } else if (count >= cache->fixed_image_count
+                || cache->fixed_images[count].identity != identity
+                || cache->fixed_images[count].serial != serial
+                || cache->fixed_images[count].width != image->width
+                || cache->fixed_images[count].height != image->height
+                || cache->fixed_images[count].source_width != image->source_width
+                || cache->fixed_images[count].source_height != image->source_height
+                || cache->fixed_images[count].mask != image->is_mask
+                || cache->fixed_images[count].retarget_flags != image->retarget_flags)
+                return false;
+            count++;
+        }
+    }
+    if (store) {
+        cache->fixed_image_count = (uint8_t) count;
+        cache->fixed_images_valid = true;
+    }
+    return store || count == cache->fixed_image_count;
+}
+
 static bool build_fixed_cache(TileCache *cache, int viewport_width,
                               int viewport_height)
 {
@@ -900,7 +948,8 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     }
     if (cache->fixed_ready
         && cache->fixed_viewport_width == viewport_width
-        && cache->fixed_viewport_height == viewport_height) return true;
+        && cache->fixed_viewport_height == viewport_height
+        && cache->fixed_font_generation == font_generation()) return true;
 
     budget_free(cache->budget, cache->fixed_alpha);
     budget_free(cache->budget, cache->fixed_pixels);
@@ -957,6 +1006,8 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         cache->fixed_ready = true;
         cache->fixed_viewport_width = viewport_width;
         cache->fixed_viewport_height = viewport_height;
+        cache->fixed_font_generation = font_generation();
+        (void) fixed_cache_image_witness(cache, cache->layout, true);
         return true;
     }
     size_t width = (size_t) (right - left);
@@ -1047,6 +1098,8 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         cache->fixed_row_last[y] = last;
     }
     cache->fixed_ready = true;
+    cache->fixed_font_generation = font_generation();
+    (void) fixed_cache_image_witness(cache, cache->layout, true);
     size_t cacheable_ranges = 0;
     for (size_t i = 0; i < cache->layout->fixed_count; i++) {
         if (cache->layout->fixed_ranges[i].scroll_end == INT_MAX)
@@ -4193,11 +4246,8 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
         *text_offset += used;
     }
     unsigned weight = draw_font_weight(command);
-    bool synthetic_bold = weight >= 550u
-        && (face == NULL || face->authored_weight != weight)
-        && (weight < 650u
-            || !font_context_face_is_bold(cache->layout->fonts,
-                                          cache->layout->web_fonts, face));
+    bool synthetic_bold = font_face_needs_synthetic_bold(
+        cache->layout->fonts, cache->layout->web_fonts, face, weight);
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
@@ -4652,8 +4702,11 @@ static bool tile_cache_sync_image_pixels(TileCache *cache, int left, int top,
             const DrawCommand *command = &cache->layout->commands[i];
             /* Same-geometry publication also admits newly decoded fixed
                document images. Their raster must not retain the placeholder. */
-            if (command->type == DRAW_IMAGE && (document_images
-                || (command->image != NULL && command->image->is_canvas))) {
+            if (command->type == DRAW_IMAGE
+                && intersects(command, visual_left, visual_top,
+                              visual_right, visual_bottom)
+                && (document_images
+                    || (command->image != NULL && command->image->is_canvas))) {
                 retained_overlay_samples_canvas = true;
                 break;
             }
@@ -4700,7 +4753,8 @@ void tile_cache_invalidate_image_identity(TileCache *cache,
     }
 }
 
-static void tile_cache_clear_layout_transients(TileCache *cache, bool retain_images)
+static void tile_cache_clear_layout_transients(TileCache *cache, bool retain_images,
+                                               bool retain_fixed)
 {
     for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
         if (!retain_images || cache->scaled_images[i].serial == 0)
@@ -4709,12 +4763,13 @@ static void tile_cache_clear_layout_transients(TileCache *cache, bool retain_ima
             decoded_image_evict(cache, i);
     }
     budget_free(cache->budget, cache->gradient_cache);
+    cache->gradient_cache = NULL;
+    if (retain_fixed) return;
     budget_free(cache->budget, cache->fixed_alpha);
     budget_free(cache->budget, cache->fixed_pixels);
     budget_free(cache->budget, cache->fixed_row_last);
     budget_free(cache->budget, cache->fixed_row_first);
     cache->fixed_alpha = NULL;
-    cache->gradient_cache = NULL;
     cache->fixed_pixels = NULL;
     cache->fixed_row_first = NULL;
     cache->fixed_row_last = NULL;
@@ -4735,7 +4790,7 @@ size_t tile_cache_reclaim_optional(TileCache *cache)
      * it through the normal cancellation API.
      */
     tile_cache_cancel_idle_work(cache);
-    tile_cache_clear_layout_transients(cache, false);
+    tile_cache_clear_layout_transients(cache, false, false);
     canvas_overlay_cache_clear(cache);
     glyph_cache_clear(cache, true);
     cache->prefetch_done = false;
@@ -4767,8 +4822,11 @@ static bool tile_cache_stage_layout(TileCache *cache,
 
 static void tile_cache_commit_layout(TileCache *cache,
                                      const LayoutDocument *layout,
-                                     LayoutDocument *visual)
+                                     LayoutDocument *visual, bool retain_fixed)
 {
+    retain_fixed = retain_fixed
+        && cache->fixed_font_generation == font_generation()
+        && fixed_cache_image_witness(cache, layout, false);
     tile_cache_cancel_idle_work(cache);
     const FontSet *old_fonts = cache->source_layout != NULL
                                ? cache->source_layout->fonts : NULL;
@@ -4789,7 +4847,17 @@ static void tile_cache_commit_layout(TileCache *cache,
         cache->layout = layout;
         cache->owns_visual_layout = false;
     }
-    tile_cache_clear_layout_transients(cache, cache->retain_layout_rasters);
+    tile_cache_clear_layout_transients(cache, cache->retain_layout_rasters,
+                                       retain_fixed);
+    if (retain_fixed && cache->fixed_ready) {
+        /* Rebuild the new display list's optional clip accelerator now.
+           Its fresh-cache path normally retires fixed pixels; this caller
+           supplied an exact fixed-context proof. Accelerator refusal uses
+           the same exact clip scan and must not retire these valid pixels. */
+        tile_cache_sync_visual_scroll(cache);
+        (void) overflow_cache_prepare(cache);
+        cache->fixed_ready = true;
+    }
     /* Face lifetime serials reject address reuse without discarding unchanged
        glyphs. Entries own their raster, not the retired font or image body. */
     if (!cache->retain_layout_rasters || old_fonts != layout->fonts) {
@@ -4805,7 +4873,7 @@ bool tile_cache_replace_layout(TileCache *cache,
     if (!tile_cache_stage_layout(cache, layout, &visual)) {
         return false;
     }
-    tile_cache_commit_layout(cache, layout, &visual);
+    tile_cache_commit_layout(cache, layout, &visual, false);
     canvas_overlay_cache_clear(cache);
     for (size_t i = 0; i < cache->tile_capacity; i++) {
         if (cache->tiles[i] != NULL) cache->tiles[i]->valid = false;
@@ -4832,10 +4900,10 @@ static bool canvas_fast_same_surface(
         && left->clip_bottom == right->clip_bottom;
 }
 
-bool tile_cache_replace_layout_damage(TileCache *cache,
+static bool tile_cache_replace_layout_damage_internal(TileCache *cache,
                                       const LayoutDocument *layout,
                                       int left, int top,
-                                      int right, int bottom)
+                                      int right, int bottom, bool retain_fixed)
 {
     if (cache == NULL || layout == NULL) return false;
     bool preserve_canvas_overlay = cache->canvas_overlay_ready
@@ -4860,7 +4928,7 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
         visual_right = viewport_css_to_device(&layout->viewport, right) + 1;
         visual_bottom = viewport_css_to_device(&layout->viewport, bottom) + 1;
     }
-    tile_cache_commit_layout(cache, layout, &visual);
+    tile_cache_commit_layout(cache, layout, &visual, retain_fixed);
     if (preserve_canvas_overlay) {
         cache->last_frame_scroll_y = cache->canvas_overlay_scroll_y;
         cache->last_frame_viewport_width = cache->canvas_overlay_viewport_width;
@@ -4893,4 +4961,18 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
     if (preserve_canvas_overlay && cache->last_frame_scroll_valid)
         cache->canvas_paint_pending = true;
     return true;
+}
+
+bool tile_cache_replace_layout_damage(TileCache *cache,
+    const LayoutDocument *layout, int left, int top, int right, int bottom)
+{
+    return tile_cache_replace_layout_damage_internal(
+        cache, layout, left, top, right, bottom, false);
+}
+
+bool tile_cache_replace_layout_damage_preserving_fixed(TileCache *cache,
+    const LayoutDocument *layout, int left, int top, int right, int bottom)
+{
+    return tile_cache_replace_layout_damage_internal(
+        cache, layout, left, top, right, bottom, true);
 }

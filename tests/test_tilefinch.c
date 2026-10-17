@@ -1984,12 +1984,14 @@ static bool test_streaming_navigation_optional_work_shed(Budget *main_budget)
     return ok && budget.current == 0;
 }
 
-static bool test_image_node_cap_ownership(Budget *budget)
+static bool test_image_alias_admission(Budget *budget, size_t aliases,
+                                      size_t expected_count,
+                                      size_t expected_loaded)
 {
     char html[8192];
     size_t used = (size_t) snprintf(html, sizeof(html),
                                    "<!doctype html><body>");
-    for (size_t i = 0; i < 128 && used < sizeof(html); i++) {
+    for (size_t i = 0; i < aliases && used < sizeof(html); i++) {
         int written = snprintf(html + used, sizeof(html) - used,
                                "<img src=/a.svg>");
         if (written < 0 || (size_t) written >= sizeof(html) - used) {
@@ -2016,8 +2018,9 @@ static bool test_image_node_cap_ownership(Budget *budget)
             "https://image-cap.test/", "https://image-cap.test/", NULL,
             2, 4096, 2048, 1024,
             1000, NULL, NULL)
-        && images.count == 128 && images.stats.loaded == 1
-        && images.stats.skipped_limit >= 1;
+        && images.count == expected_count
+        && images.stats.loaded == expected_loaded
+        && (expected_count > aliases || images.stats.skipped_limit >= 1);
     fetch_trace_end();
     images_destroy(&images);
     /* A request for more images than the bounded node table can track must
@@ -2035,13 +2038,23 @@ static bool test_image_node_cap_ownership(Budget *budget)
             "https://image-cap.test/", "https://image-cap.test/", NULL,
             200, 4096, 2048, 1024,
             1000, NULL, NULL)
-        && over_budget.count == 128 && over_budget.stats.loaded == 1
-        && over_budget.stats.skipped_limit >= 1;
+        && over_budget.count == expected_count
+        && over_budget.stats.loaded == expected_loaded
+        && (expected_count > aliases || over_budget.stats.skipped_limit >= 1);
     fetch_trace_end();
     images_destroy(&over_budget);
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
     return ok && budget->current == 0;
+}
+
+static bool test_image_node_cap_ownership(Budget *budget)
+{
+    /* Aliases share pixels and must not exhaust the network-attempt quota
+       before a later distinct image. The metadata table is independently
+       bounded, including on scoring profiles requesting more downloads. */
+    return test_image_alias_admission(budget, 128, 129, 2)
+        && test_image_alias_admission(budget, 192, 192, 1);
 }
 
 static bool test_image_refresh_transfers_shared_ownership(Budget *budget)
@@ -4645,7 +4658,12 @@ static bool test_zero_font_background_anchor_paints(Budget *budget,
         "<h2 class=wordmark><a id=logo href=/>Brand</a></h2></div>",
         pseudo, mode == 0 ? "}#header .wordmark a{" : ";",
         generated_stack ? ";background-position:center center;background-repeat:no-repeat"
-                       : mode == 3 ? ";background-size:10px invalid" : "");
+                       : mode == 3 ? ";background-size:10px invalid"
+                       : mode == 4 ? ";background:no-repeat center/auto 20px "
+                         "url(\"data:image/svg+xml,"
+                         "%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E"
+                         "%3Crect width='8' height='8' fill='red'/%3E%3C/svg%3E\"),"
+                         "linear-gradient(transparent,transparent)" : "");
     if (length < 0 || (size_t) length >= sizeof(html)) return false;
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -4678,6 +4696,8 @@ static bool test_zero_font_background_anchor_paints(Budget *budget,
         && (!generated_stack || frame[21u * 480u + 1u] == UINT16_C(0x07e0))
         && frame[5u * 480u + 40u] != UINT16_C(0xf800)
         && frame[38u * 480u + 40u] != UINT16_C(0xf800)
+        && (mode != 4 || (frame[20u * 480u + 32u] == UINT16_C(0xf800)
+                         && frame[20u * 480u + 25u] != UINT16_C(0xf800)))
         && (!generated_stack || (frame[5u * 480u + 40u] == UINT16_C(0x001f)
                                 && frame[38u * 480u + 40u] == UINT16_C(0x001f)));
     if (!ok && frame != NULL) fprintf(stderr,

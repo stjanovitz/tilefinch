@@ -67,6 +67,12 @@ initialization allocation with both single and persistent refusal, checking
 guard bytes and complete release. The lab variants retain this fix, and their
 scope-OOM patch has anchored context so it cannot land in a neighboring function.
 
+Lazy global initialization releases the newly created value if allocating its
+global-variable reference fails. Otherwise a refused first access to a built-in
+can retain that function and its realm through teardown.
+`test_quickjs_oom --global-autoinit-only` sweeps single and persistent refusals
+while materializing enough lazy globals to cross the allocator's arena boundaries.
+
 Numeric primitive indexed writes to in-bounds Float32Array/Float64Array views
 run directly in the interpreter. Int32-to-float32 writes avoid an unnecessary
 intermediate double conversion on soft-float targets. Non-numeric values and

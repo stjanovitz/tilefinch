@@ -1,3 +1,37 @@
+    {
+        puts("test: mixed-unit centering and authored native-input decorations");
+        static const char html[] = "<!doctype html><style>body{margin:0}"
+            "#host{position:relative;width:100px;height:100px}"
+            "#center{position:absolute;top:50%;width:28px;height:28px;"
+            "transform:translateY(calc(-50% - 5px));background:red}"
+            "input{width:80px;height:30px;box-sizing:border-box;"
+            "border:1px solid #444;border-radius:4px;"
+            "background:linear-gradient(red,blue)}</style>"
+            "<div id=host><div id=center></div></div><input value=Text>";
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 23)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *box = layout_box_for_node(&layout, find_id(root, "center"));
+        CHECK(box != NULL && box->y == 31 && box->height == 28);
+        bool gradient = false, rounded_border = false;
+        for (size_t i = 0; i < layout.count; i++) {
+            const DrawCommand *command = &layout.commands[i];
+            size_t slot = 0;
+            gradient |= draw_command_fill_gradient(command, &slot)
+                && command->width == 80 && command->height == 30;
+            rounded_border |= command->type == DRAW_STROKE_RECT
+                && command->width == 80 && command->height == 30
+                && command->radius == 4;
+        }
+        CHECK(gradient && rounded_border);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
     puts("test: intrinsic max-content and collapsed visual affordances");
     static const char collapsed_page[] =
         "<!doctype html><style>body{margin:0;padding:0}"
@@ -1124,6 +1158,14 @@
           == &fonts.sans_bold);
     CHECK(font_set_face_variant(&fonts, FONT_SERIF, false, true)
           == &fonts.serif_bold);
+    CHECK(font_set_face_variant(&fonts, FONT_SERIF, true, true)
+          == &fonts.serif_bold);
+    CHECK(font_set_face_variant(&fonts, FONT_METRIC_SANS, true, true)
+          == &fonts.metric_sans_bold);
+    CHECK(font_set_face_variant(&fonts, FONT_SYSTEM_SANS, true, true)
+          == &fonts.metric_sans_bold);
+    CHECK(font_set_face_variant(&fonts, FONT_SANS, true, true)
+          == &fonts.sans_italic);
     CHECK(font_set_face(&fonts, FONT_METRIC_SANS) == &fonts.metric_sans
           && font_set_face_variant(&fonts, FONT_METRIC_SANS, false, true)
                  == &fonts.metric_sans_bold);
@@ -1153,6 +1195,32 @@
     int metric_width = font_text_width_at_size_fixed(
         &fonts.metric_sans_bold, "Modern system text", 18, 22 * 64, false);
     CHECK(system_width > 0 && system_width < metric_width);
+    /* Independent system-font pair oracle: isolated character advances are
+       insufficient for comma/number labels which fit at their true width. */
+    CHECK(font_text_width_for_family_at_size_fixed_mode(
+        &fonts.metric_sans, FONT_SYSTEM_SANS, "7,", 2, 13 * 64,
+        false, false, true) == 622);
+    CHECK(font_text_width_for_family_at_size_fixed_mode(
+        &fonts.metric_sans, FONT_SYSTEM_SANS, "7,", 2, 13 * 64,
+        false, false, false) == 711);
+    CHECK(font_kerning_for_family_at_size_fixed(&fonts.metric_sans,
+        FONT_SYSTEM_SANS, '7', ',', 13 * 64, false) == -89);
+    for (unsigned bold = 0; bold < 2; bold++) {
+        const FontFace *face = font_set_face_variant(
+            &fonts, FONT_SYSTEM_SANS, false, bold != 0);
+        for (unsigned a = 32; a < 127; a++) for (unsigned b = 32; b < 127; b++) {
+            char pair[2] = {(char) a, (char) b};
+            int measured = font_text_width_for_family_at_size_fixed_mode(
+                face, FONT_SYSTEM_SANS, pair, 2, 13 * 64, false, bold, true);
+            int drawn = font_glyph_advance_for_family_at_size_fixed(
+                FONT_SYSTEM_SANS, a, 13 * 64, false, bold, 0)
+                + font_glyph_advance_for_family_at_size_fixed(
+                    FONT_SYSTEM_SANS, b, 13 * 64, false, bold, 0)
+                + font_kerning_for_family_at_size_fixed(face, FONT_SYSTEM_SANS,
+                    a, b, 13 * 64, bold);
+            CHECK(abs(measured - drawn) <= 1);
+        }
+    }
     CHECK(font_set_face(&fonts, FONT_HUMANIST_SANS) == sans
           && font_set_face_style(&fonts, FONT_HUMANIST_SANS, true)
                  == &fonts.sans_italic

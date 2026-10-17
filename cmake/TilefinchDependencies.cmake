@@ -430,7 +430,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-            "89edfe1914d0cdf4dbf58aeb9fb6855e42d9e359f47bad4a41ba22d5e994fdc9")
+            "8f631504b07ce22eeb8344a74b25dff33fc14b413d1f166fbfdc815854882a1d")
     set(tilefinch_quickjs_vendor_h_sha256
             "e6ad7449c0c79e298bbfbddcc9d5ad6cc9b0291f5223ae7ed83cd5ba99fba656")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
@@ -513,19 +513,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "3b66d8069892a25debbe769f894e5e55e5fdd8492884dd56e1e8c95f881d386e")
+            "dfbeecd890d21774c58b2e66f7e2524537e7b8380977a286f8fa89168a0a2096")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "44acab646c14a94412630862be45c3f6700b36d3dc6cccce96eb33b909a16795")
+            "fb60b0b2009dfc3c2c5189cf7fe5ea7ffe38c0e57e90d94c401e396739f35952")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "a1c127c784be2773c9cf7e740d1425437c5fd58453c26a04c99a031bef233b09")
+            "d6d23501f3be4dbd521c67100c1396e4982cc85d63d3506bd5c2196f50cc4a8d")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "82e15d2867ae3ef85586bec5227d3b9a3433fe6181f3b32a7fb71728716b19f4")
+            "aab0a42eb1f877d9e0436105f6906d2e6cf81178c954077dc0e4731701786a44")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "5bf815bb8e425a7cb6d81ec1408c9665f6267c0d64b94aa10d5f760abd732edc")
+            "260d4bb82acd5032e8f02c426e5be2068706248a2087c33738696e1b13bc4559")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "624c5dc532d31afb9106d6c6fb5940a0a3e3bcbc5bd56e7c39ecf2d103e6720b")
+            "9eb87333efa56f2415c07005956a34c6521351221dcfc022ceb07ec575ef8cba")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "9ce7c71a6c3eb0e72087bcd561b1bc18df7c7ffbcc9288811e7b0b690ac0dd49")
+            "64f9ecc23f45d78538202505ef3273a60ec5f811b53d97650332aad9331be8ba")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -574,7 +574,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "8baa2922466d7c62b4d27be910944e00817fd0e5e9faa9d1999e68621d25c53d")
+                   "0c8e4b3b4042537398dd389c2d7363e41942d00710f101afbdc483a52e7912bd")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack reached "
                     "${tilefinch_quickjs_variant_baseline}, not the pinned "

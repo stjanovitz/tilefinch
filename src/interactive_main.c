@@ -2734,9 +2734,9 @@ int main(int argc, char **argv)
                     const DrawCommand *command = &navigation.page.layout.commands[at];
                     if (command->type != DRAW_TEXT) continue;
                     unsigned weight = draw_command_font_weight(command);
-                    if (font_context_face_at_weight(browser_engine_fonts(engine), reported_fonts,
-                            draw_command_font_family(command), draw_command_font_italic(command),
-                            weight >= 650u, weight) != face) continue;
+                    if (font_family_web_slot(draw_command_font_family(command)) != family
+                        || font_family_face_slot_at_weight(&reported_fonts->families[family],
+                            weight, true) != slot) continue;
                     commands++;
                     if (command->y < navigation.viewport.css_height
                         && (int64_t) command->y + command->height > 0) visible++;

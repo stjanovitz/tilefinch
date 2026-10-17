@@ -78,6 +78,8 @@ set(TILEFINCH_CORE_SOURCES
     src/multiplayer_protocol.c
     src/omnibox.c
     src/offline_download.c
+    src/file_download.c
+    src/zip_install.c
     src/offline_library.c
     src/page_find.c
     src/platform.c

@@ -3704,7 +3704,7 @@ static int test_computed_style_keywords_without_layout(void)
     ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
         "<!doctype html><style>.on{position:relative;overflow:clip;"
         "box-sizing:border-box;z-index:7;display:flex;flex-direction:column;"
-        "flex-wrap:wrap;align-items:center;align-self:center;"
+        "flex-wrap:wrap;transform:translateX(12px);align-items:center;align-self:center;"
         "align-content:center;justify-content:center;order:3}</style>"
         "<body><div id=p>x</div></body>");
     CHECK(runtime != NULL);
@@ -3749,6 +3749,21 @@ static int test_computed_style_keywords_without_layout(void)
     flushes = 0;
     runtime->bridge.mutations.conservative_resource_scan = true;
     CHECK(var_cache_eval(runtime, "pocSummary=cs.position", "relative"));
+    CHECK(flushes != 0);
+    /* A geometry-only callback cannot install stylesheets. Journal overflow
+       must not turn a cascade-only read or transition snapshot into a fresh
+       scratch layout for each property. Actual geometry reads still flush. */
+    script_runtime_set_geometry_layout_callback(runtime,
+        count_style_layout_flush, &flushes);
+    runtime->bridge.mutations.overflowed = true;
+    flushes = 0;
+    CHECK(var_cache_eval(runtime, "pocSummary=cs.transform", "translate(12px, 0px)"));
+    CHECK(flushes == 0);
+    CHECK(var_cache_eval(runtime,
+        "__tilefinchTransitionSnapshot(p.__handle,['display','opacity','transform']);"
+        "pocSummary='CASCADE-SNAPSHOT'", "CASCADE-SNAPSHOT"));
+    CHECK(flushes == 0);
+    CHECK(var_cache_eval(runtime, "pocSummary=cs.width", "auto"));
     CHECK(flushes != 0);
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
@@ -4529,6 +4544,235 @@ static int test_synthetic_network_queue(ScriptRuntime *runtime,
     return 0;
 }
 
+static int test_shared_inline_style_state(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptRuntimeOptions options = {.defer_document_scripts = true};
+    ScriptResult result = {0};
+    CHECK(viewport_context_init(&options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 4000, "https://style-state.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const original=Object.getOwnPropertyDescriptors,"
+        "map=globalThis.WeakMap;Object.getOwnPropertyDescriptors=()=>{"
+        "throw Error('author descriptors')};globalThis.WeakMap=()=>{"
+        "throw Error('author WeakMap')};try{document.body.style.color='red'}"
+        "finally{Object.getOwnPropertyDescriptors=original;globalThis.WeakMap=map}})()",
+        "<style-state-warm>", &result));
+    JS_RunGC(runtime->runtime);
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(runtime->runtime, &before);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.styleNodes=[];for(let i=0;i<512;i++){"
+        "const n=document.createElement('div');styleNodes.push(n);"
+        "document.body.appendChild(n);n.style.color='red';n.style.marginLeft=i+'px';}"
+        "const a=styleNodes[0].style,b=styleNodes[1].style;"
+        "a.setProperty('height',{toString(){b.width='23px';return '17px'}});"
+        "b.setProperty('padding-left','5px','important');"
+        "b.setProperty('place-items','center start');"
+        "const same=styleNodes.every((n,i)=>n.style===n.style&&n.style.color==='red'"
+        "&&n.style.marginLeft===i+'px');"
+        "pocSummary=same&&a.height==='17px'&&b.width==='23px'&&a.width===''"
+        "&&b.getPropertyValue('padding-left')==='5px'"
+        "&&b.getPropertyPriority('padding-left')==='important'"
+        "&&b.getPropertyValue('place-items')==='center start'"
+        "&&Object.getOwnPropertyDescriptor(a,'cssText').enumerable"
+        "&&Object.hasOwn(a,'setProperty')?'STYLE-STATE-OK':'STYLE-STATE-BAD'",
+        "<style-state-many>", &result));
+    CHECK(!strcmp(result.summary, "STYLE-STATE-OK"));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &after);
+    printf("inline-style-state nodes=512 retained-delta=%lld\n",
+           (long long) (after.memory_used_size - before.memory_used_size));
+    CHECK(after.memory_used_size - before.memory_used_size < MIB);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const a=styleNodes[0].style,b=styleNodes[1].style;"
+        "a.setProperty.call(b,'height','29px');"
+        "const d=Object.getOwnPropertyDescriptor(globalThis,'__tilefinchDispatchHandle');"
+        "pocSummary=a.height==='17px'&&b.height==='29px'"
+        "&&b.item(0)==='color'&&[...b].includes('height')"
+        "&&typeof __tilefinchHostChannel==='undefined'"
+        "&&d&&!d.enumerable&&!d.writable&&!d.configurable"
+        "?'STYLE-RECEIVERS-OK':'STYLE-RECEIVERS-BAD'})()",
+        "<style-state-receivers>", &result));
+    CHECK(!strcmp(result.summary, "STYLE-RECEIVERS-OK"));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &before);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.attributeLists=styleNodes.map(n=>n.attributes);"
+        "styleNodes[0].setAttribute('title','first');"
+        "styleNodes[1].setAttribute('title','second');"
+        "pocSummary=attributeLists[0].getNamedItem('title').value==='first'"
+        "&&attributeLists[1].getNamedItem('title').value==='second'"
+        "&&attributeLists[0]===styleNodes[0].attributes"
+        "?'ATTRIBUTE-MAPS-OK':'ATTRIBUTE-MAPS-BAD'",
+        "<attribute-map-state>", &result));
+    CHECK(!strcmp(result.summary, "ATTRIBUTE-MAPS-OK"));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &after);
+    printf("attribute-map-state nodes=512 retained-delta=%lld\n",
+           (long long) (after.memory_used_size - before.memory_used_size));
+    CHECK(after.memory_used_size - before.memory_used_size < 256 * 1024);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_event_target_listener_ownership(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const t=new EventTarget();t.addEventListener('warm',()=>{});"
+        "pocSummary='WARM'})()", "WARM"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = script_runtime_heap_used(runtime);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<128;i++){const t=new EventTarget();"
+        "t.payload=new Uint8Array(4096);t.addEventListener('probe',()=>t.payload);"
+        "if(!i)globalThis.deadEventTarget=new WeakRef(t)}pocSummary='DROPPED'})()",
+        "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = script_runtime_heap_used(runtime);
+    printf("event-target dropped=128 retained-delta=%lld\n",
+        (long long) after - (long long) before);
+    CHECK(after < before + 128u * 1024u);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=deadEventTarget.deref()===undefined?'COLLECTED':'RETAINED'",
+        "COLLECTED"));
+    CHECK(var_cache_eval(runtime,
+        "globalThis.liveEventTarget=new EventTarget();"
+        "globalThis.eventCalls=0;const keys=Reflect.ownKeys(liveEventTarget);"
+        "Object.freeze(liveEventTarget);"
+        "liveEventTarget.addEventListener('probe',()=>eventCalls++);"
+        "pocSummary=Reflect.ownKeys(liveEventTarget).length===keys.length?'PRIVATE':'EXPOSED'",
+        "PRIVATE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "liveEventTarget.dispatchEvent(new Event('probe'));"
+        "pocSummary=eventCalls===1?'DELIVERED':'LOST'", "DELIVERED"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_attribute_cache_ownership(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=document.createElement('div');n.setAttribute('title','warm');"
+        "n.attributes.getNamedItem('title');pocSummary='WARM'})()", "WARM"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = script_runtime_heap_used(runtime);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<128;i++){const n=document.createElement('div');"
+        "n.payload=new Uint8Array(4096);n.setAttribute('title','value');"
+        "n.attributes.getNamedItem('title');if(!i)globalThis.deadAttributeOwner=new WeakRef(n)}"
+        "pocSummary='DROPPED'})()", "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = script_runtime_heap_used(runtime);
+    printf("attribute-cache dropped=128 retained-delta=%lld\n",
+           (long long) after - (long long) before);
+    CHECK(after < before + 128u * 1024u);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=deadAttributeOwner.deref()===undefined?'COLLECTED':'RETAINED'",
+        "COLLECTED"));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=document.createElement('div');n.setAttribute('title','live');"
+        "const keys=Reflect.ownKeys(n);Object.freeze(n);"
+        "globalThis.liveAttributeMap=n.attributes;globalThis.liveAttribute=liveAttributeMap.item(0);"
+        "pocSummary=Reflect.ownKeys(n).length===keys.length&&liveAttribute.ownerElement===n"
+        "&&liveAttributeMap.getNamedItem('title')===liveAttribute?'PRIVATE':'EXPOSED'})()",
+        "PRIVATE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "liveAttribute.value='updated';pocSummary=liveAttribute.ownerElement.getAttribute('title')"
+        "==='updated'&&liveAttributeMap.item(0)===liveAttribute?'LIVE':'LOST'", "LIVE"));
+    CHECK(var_cache_eval(runtime,
+        "globalThis.attributeMapReference=new WeakRef(liveAttributeMap);"
+        "globalThis.attributeOwnerReference=new WeakRef(liveAttribute.ownerElement);"
+        "liveAttributeMap=null;pocSummary='ATTR-ONLY'", "ATTR-ONLY"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=liveAttribute.ownerElement.attributes===attributeMapReference.deref()"
+        "?'SAME-MAP':'LOST-MAP';liveAttribute=null", "SAME-MAP"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=attributeOwnerReference.deref()===undefined?'RELEASED':'RETAINED'",
+        "RELEASED"));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{let reads=0;const map=__tilefinchNamedNodeMapFor({},()=>{reads++;return []});"
+        "void map.item;void map.getNamedItem;const iterate=map[Symbol.iterator];"
+        "if(reads)throw Error('method lookup read attributes');"
+        "const empty=map.length===0&&iterate().next().done;"
+        "pocSummary=empty&&reads===2?'LAZY-READ':'EAGER-READ'})()", "LAZY-READ"));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=document.createElementNS('http://www.w3.org/2000/svg','svg');"
+        "n.setAttribute('viewBox','0 0 10 20');n.setAttributeNS('urn:test','p:value','first');"
+        "const a=n.getAttributeNodeNS('urn:test','value');"
+        "n.setAttributeNS('urn:test','p:value','second');"
+        "const ok=n.getAttribute('viewBox')==='0 0 10 20'&&a.value==='second'"
+        "&&n.attributes.getNamedItemNS('urn:test','value')===a;"
+        "n.removeAttributeNS('urn:test','value');n.setAttributeNS('urn:test','q:value','third');"
+        "pocSummary=ok&&a.ownerElement===null&&n.getAttributeNS('urn:test','value')==='third'"
+        "?'MIRRORS-LIVE':'MIRRORS-LOST'})()", "MIRRORS-LIVE"));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=document.createElementNS('http://www.w3.org/2000/svg','svg');"
+        "n.id='attribute-ns-probe';n.setAttributeNS('urn:test','p:CaseSensitive','kept');"
+        "document.body.appendChild(n);pocSummary='NS-CONNECTED'})()", "NS-CONNECTED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=document.getElementById('attribute-ns-probe');"
+        "pocSummary=n.getAttributeNS('urn:test','CaseSensitive')==='kept'"
+        "?'NS-PRESERVED':'NS-LOST';n.remove()})()", "NS-PRESERVED"));
+    CHECK(var_cache_eval(runtime,
+        "globalThis.namespaceProbeNodes=Array.from({length:256},()=>"
+        "document.createElementNS('http://www.w3.org/2000/svg','g'));"
+        "pocSummary='NODES'", "NODES"));
+    JS_RunGC(runtime->runtime);
+    JSMemoryUsage usage_before, usage_after;
+    JS_ComputeMemoryUsage(runtime->runtime, &usage_before);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=namespaceProbeNodes.every(n=>n.getAttribute('missing')===null)"
+        "?'EMPTY':'FOUND'", "EMPTY"));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &usage_after);
+    printf("attribute-cache empty-namespace=256 retained-delta=%lld\n",
+        (long long) usage_after.memory_used_size -
+        (long long) usage_before.memory_used_size);
+    CHECK(usage_after.memory_used_size - usage_before.memory_used_size < 16384);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_buffered_xhr_event_stack(void)
 {
     Budget budget;
@@ -4551,6 +4795,34 @@ static int test_buffered_xhr_event_stack(void)
         &options, &result);
     CHECK(runtime != NULL);
     int failed = test_synthetic_network_queue(runtime, &result);
+    /* The transport has already admitted this body. A larger configured
+       response must not fall into the smaller public TextDecoder limit. */
+    size_t large_length = 1536u * 1024u;
+    char *large_body = budget_malloc(&budget, large_length);
+    CHECK(large_body != NULL);
+    memset(large_body, 'x', large_length);
+    memcpy(large_body, "\xef\xbb\xbf", 3u);
+    FetchResult fetched = {.data = large_body, .length = large_length};
+    JSValue payload = JS_NewObject(runtime->context);
+    CHECK(!JS_IsException(payload));
+    CHECK(js_rt_script_set_response_body(runtime->context, payload, &fetched, true));
+    budget_free(&budget, large_body);
+    CHECK(JS_SetPropertyStr(runtime->context, payload, "status",
+                           JS_NewInt32(runtime->context, 200)) >= 0);
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    CHECK(JS_SetPropertyStr(runtime->context, global, "largeTextPayload", payload) >= 0);
+    JS_FreeValue(runtime->context, global);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.__tilefinchFetchAsync=()=>3000;"
+        "globalThis.largeXHR=new XMLHttpRequest;largeXHR.open('GET','/large');"
+        "largeXHR.onload=()=>pocSummary=largeXHR.responseText.length===1572861"
+        "&&largeXHR.responseText[0]==='x'?'LARGE-XHR-OK':'LARGE-XHR-BAD';"
+        "largeXHR.onerror=()=>pocSummary='LARGE-XHR-ERROR';largeXHR.send();"
+        "__tilefinchDeliverNetwork(3000,true,largeTextPayload);delete globalThis.largeTextPayload;",
+        "<large-buffered-xhr>", &result));
+    for (unsigned tick = 0; tick < 16 && strcmp(result.summary, "LARGE-XHR-OK"); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 64, &result));
+    CHECK(!strcmp(result.summary, "LARGE-XHR-OK"));
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -5473,8 +5745,58 @@ static int test_motion_rule_cache_and_yield(void)
     return 0;
 }
 
+static int test_microtask_queue_ignores_promise_species(void)
+{
+    Budget budget; budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><body><p>Microtasks</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptRuntimeOptions options = {.defer_document_scripts = true};
+    CHECK(viewport_context_init(&options.viewport, 480, 272, 480, 272));
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(&document, &budget,
+        8u * MIB, 2000, "https://microtasks.test/", &options, &result);
+    CHECK(runtime);
+    static const char probe[] =
+        "(()=>{const P=Promise,descriptor=Object.getOwnPropertyDescriptor(P,Symbol.species);"
+        "let species=0,order=[];"
+        "Object.defineProperty(P,Symbol.species,{configurable:true,get(){species++;return P}});"
+        "queueMicrotask(()=>{order.push('first');queueMicrotask(()=>{"
+        "order.push('nested');Object.defineProperty(P,Symbol.species,descriptor);"
+        "pocSummary=species===0&&order.join(',')==='first,second,nested'"
+        "?'MICROTASK-INTRINSICS-OK':'MICROTASK-INTRINSICS-FAILED:'+species+':'+order.join(',')})});"
+        "queueMicrotask(()=>order.push('second'));})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, probe, "<microtask-intrinsics>", &result));
+    for (unsigned tick = 0; tick < 8 && strcmp(result.summary, "MICROTASK-INTRINSICS-OK"); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 16, &result));
+    if (strcmp(result.summary, "MICROTASK-INTRINSICS-OK"))
+        fprintf(stderr, "microtask intrinsic probe: %s %s\n", result.summary, result.error);
+    CHECK(!strcmp(result.summary, "MICROTASK-INTRINSICS-OK"));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "pocSummary=typeof __tilefinchEnqueueMicrotask==='undefined'?'hidden':'exposed'",
+        "<microtask-hook-hidden>", &result) && !strcmp(result.summary, "hidden"));
+    script_runtime_destroy(runtime); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--event-target-ownership-only") == 0)
+        return test_event_target_listener_ownership();
+    CHECK(test_event_target_listener_ownership() == 0);
+    if (argc == 2 && strcmp(argv[1], "--attribute-cache-only") == 0)
+        return test_attribute_cache_ownership();
+    CHECK(test_attribute_cache_ownership() == 0);
+    if (argc == 2 && strcmp(argv[1], "--heap-startup-only") == 0)
+        return test_heap_return_checks_back_off();
+    if (argc == 2 && strcmp(argv[1], "--inline-style-state-only") == 0)
+        return test_shared_inline_style_state();
+    CHECK(test_shared_inline_style_state() == 0);
+    if (argc == 2 && strcmp(argv[1], "--microtask-intrinsics-only") == 0)
+        return test_microtask_queue_ignores_promise_species();
+    CHECK(test_microtask_queue_ignores_promise_species() == 0);
     if (argc == 2 && strcmp(argv[1], "--xhr-buffered-events-only") == 0)
         return test_buffered_xhr_event_stack();
     CHECK(test_buffered_xhr_event_stack() == 0);

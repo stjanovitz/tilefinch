@@ -1171,7 +1171,7 @@ static void loop_help(void)
          "focus-up|focus-down|focus-left|focus-right, "
          "focus-id ID, focus-url URL, link-urls, body-contains TEXT, "
          "history-controls, "
-         "anchor ID, node-text ID, node-attribute ID NAME, "
+         "anchor ID, node-text ID, text-checksum TAG, node-attribute ID NAME, "
          "tap X Y, cross|activate, "
          "type TEXT, backspace, profile [LABEL], work [LABEL], census, "
          "click SELECTOR, tick [COUNT [MS]], pump [COUNT [MS]], "
@@ -2077,6 +2077,14 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 printf("experimental-control id=\"%s\" value=\"%.*s\"\n",
                        argument, (int) value_length, value);
             }
+        } else if (strcmp(line, "text-checksum") == 0 && argument != NULL) {
+            lxb_dom_node_t *node = experimental_find_element_tag(
+                lxb_dom_interface_node(navigation->page.document.html), argument);
+            size_t bytes = 0;
+            uint32_t hash = 0;
+            ok = node != NULL && diagnostic_text_checksum(node, &bytes, &hash);
+            printf("loop-text-checksum ok=%s bytes=%zu hash=%u\n",
+                   ok ? "yes" : "no", bytes, (unsigned) hash);
         } else if (strcmp(line, "node-text") == 0 && argument != NULL) {
             lxb_dom_node_t *node = find_element_id(
                 lxb_dom_interface_node(navigation->page.document.html),

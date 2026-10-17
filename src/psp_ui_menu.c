@@ -175,6 +175,14 @@ static bool menu_handle_escape(
             intent->action = PSP_UI_ACTION_RECOVERY_RETURN;
         else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW)
             intent->action = PSP_UI_ACTION_CANCEL_OFFLINE_APP;
+        else if (ui->screen == PSP_UI_SCREEN_FILE_DOWNLOAD) {
+            intent->action = PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD;
+            ui->file_download_preview = NULL;
+        }
+        else if (ui->screen == PSP_UI_SCREEN_ZIP_INSTALL) {
+            intent->action = PSP_UI_ACTION_CANCEL_ZIP_INSTALL;
+            ui->zip_install_preview = NULL;
+        }
         else if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS)
             intent->update_versions_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_THEME_OPTIONS)
@@ -521,7 +529,8 @@ static void menu_update_page_tools(
                 intent->visual_changed = true;
                 return;
             case 7: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
-            case 8: intent->action = PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE; break;
+            case 8: intent->action = PSP_UI_ACTION_DOWNLOAD_LINK; break;
+            case 9: intent->action = PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE; break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         menu_close(ui);
@@ -706,6 +715,24 @@ bool psp_ui_menu_update(
     if (ui == NULL || intent == NULL) return false;
     if (menu_handle_escape(ui, pressed, intent)) return true;
     switch (ui->screen) {
+        case PSP_UI_SCREEN_ZIP_INSTALL:
+            if (pressed & (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_CANCEL)) {
+                intent->action = (pressed & PSP_UI_BUTTON_CANCEL)
+                    ? PSP_UI_ACTION_CANCEL_ZIP_INSTALL : PSP_UI_ACTION_CONFIRM_ZIP_INSTALL;
+                ui->zip_install_preview = NULL;
+                menu_close(ui);
+                intent->visual_changed = true;
+            }
+            return true;
+        case PSP_UI_SCREEN_FILE_DOWNLOAD:
+            if (pressed & (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_CANCEL)) {
+                intent->action = (pressed & PSP_UI_BUTTON_CANCEL)
+                    ? PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD : PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD;
+                ui->file_download_preview = NULL;
+                menu_close(ui);
+                intent->visual_changed = true;
+            }
+            return true;
         case PSP_UI_SCREEN_OFFLINE_APP_PREVIEW:
             menu_update_offline_app_preview(ui, pressed, intent);
             return true;

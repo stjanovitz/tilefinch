@@ -82,9 +82,14 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
         JS_NewString(runtime->context, event_type)
     };
     JSValue returned = JS_UNDEFINED;
+    bool trace_dispatch = runtime_trace_dispatch_enabled();
+    uint64_t dispatch_begin = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_handle, "__tilefinchDispatchHandle", 2,
         arguments, &returned);
+    uint64_t dispatch_call = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     const char *failure = ok ? NULL : "call";
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
@@ -95,10 +100,15 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
         ok = false;
         failure = "jobs";
     }
+    uint64_t dispatch_jobs = trace_dispatch
+        ? tilefinch_platform_monotonic_time_us() : 0;
     if (ok && !js_rt_runtime_refresh(runtime)) {
         ok = false;
         failure = "refresh";
     }
+    if (trace_dispatch) runtime_trace_dispatch(event_type, 0,
+        dispatch_begin, dispatch_call, dispatch_jobs,
+        tilefinch_platform_monotonic_time_us());
     if (!ok && trace_failure) {
         fprintf(stderr, "tilefinch-dispatch-node: failure=%s handle=%lld "
                 "event=%s error=\"%s\"\n",
@@ -575,6 +585,19 @@ bool script_runtime_consume_scroll(ScriptRuntime *runtime, int *scroll_y)
     return true;
 }
 
+static void geometry_inputs_capture(ScriptRuntime *runtime)
+{
+    const DomBridge *bridge = &runtime->bridge;
+    runtime->geometry_content_generation = bridge->document == NULL ? 0
+        : bridge->document->content_generation;
+    runtime->geometry_style_generation = document_style_generation();
+    runtime->geometry_sheet_generation = bridge->stylesheet == NULL ? 0
+        : bridge->stylesheet->build_generation;
+    runtime->geometry_container_generation = bridge->stylesheet == NULL ? 0
+        : bridge->stylesheet->container_state_generation;
+    runtime->geometry_font_generation = font_generation();
+}
+
 void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                int viewport_height)
 {
@@ -586,7 +609,9 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
         runtime->geometry_incumbent = NULL;
     }
     runtime->bridge.layout = layout;
+    runtime->geometry_incumbent = NULL;
     runtime->geometry_paint_stale = false;
+    geometry_inputs_capture(runtime);
     runtime->bridge.viewport_height = viewport_height > 0
                                       ? viewport_height : 272;
     if (layout != NULL) {
@@ -599,15 +624,13 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
     }
 }
 
-static bool geometry_layout_current(const ScriptRuntime *runtime,
-                                     const ViewportContext *viewport)
+static bool geometry_environment_current(const ScriptRuntime *runtime,
+    const ViewportContext *viewport, const LayoutDocument *layout)
 {
     const DomBridge *bridge = &runtime->bridge;
-    const LayoutDocument *layout = runtime->geometry_layout;
-    return layout != NULL && layout->budget != NULL
-        && bridge->layout == layout
+    return layout != NULL && bridge->layout == layout
         && bridge->document != NULL && bridge->stylesheet != NULL
-        && runtime->geometry_content_generation == bridge->document->content_generation
+        && layout->budget != NULL
         && runtime->geometry_style_generation == document_style_generation()
         && runtime->geometry_sheet_generation == bridge->stylesheet->build_generation
         && runtime->geometry_container_generation == bridge->stylesheet->container_state_generation
@@ -622,12 +645,23 @@ static bool geometry_layout_current(const ScriptRuntime *runtime,
         && layout->viewport.scale_denominator == viewport->scale_denominator;
 }
 
+static bool geometry_layout_current(const ScriptRuntime *runtime,
+                                     const ViewportContext *viewport)
+{
+    const LayoutDocument *layout = runtime->geometry_layout != NULL
+        ? runtime->geometry_layout : runtime->geometry_incumbent;
+    return geometry_environment_current(runtime, viewport, layout)
+        && runtime->geometry_content_generation
+            == runtime->bridge.document->content_generation;
+}
+
 bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
                                          const ViewportContext *viewport,
                                          LayoutDocument *layout)
 {
     if (runtime == NULL || viewport == NULL || layout == NULL
-        || layout->budget != NULL || runtime->geometry_paint_stale
+        || layout->budget != NULL || runtime->geometry_layout == NULL
+        || runtime->geometry_paint_stale
         || !geometry_layout_current(runtime, viewport))
         return false;
 #ifndef TILEFINCH_NO_TRACE
@@ -654,6 +688,30 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
         return true;
     }
+#ifndef TILEFINCH_NO_TRACE
+    bool trace_geometry = tilefinch_trace_runtime_steps();
+    uint64_t trace_begin = trace_geometry
+        ? tilefinch_platform_monotonic_time_us() : 0;
+#endif
+    bool unchanged = false;
+    LayoutReuseCache *reuse = prepare == NULL ? NULL
+        : prepare(opaque, bridge->mutations.count != 0
+            || bridge->mutations.overflowed ? &bridge->mutations : NULL,
+            geometry_environment_current(runtime, viewport, bridge->layout)
+                ? &unchanged : NULL);
+    if (unchanged && bridge->layout != NULL && bridge->layout->budget != NULL) {
+        /* Borrow only: never install this old paint as a fresh publication.
+           The existing input generations cache the proof across subsequent
+           reads in this turn; any new DOM/style/font/viewport input breaks it. */
+        if (runtime->geometry_layout == NULL)
+            runtime->geometry_incumbent = bridge->layout;
+        geometry_inputs_capture(runtime);
+        runtime->geometry_paint_stale = true;
+#ifndef TILEFINCH_NO_TRACE
+        if (bridge->result != NULL) bridge->result->geometry_snapshot_hits++;
+#endif
+        return true;
+    }
     if (runtime->geometry_layout == NULL) {
         runtime->geometry_layout = budget_calloc_category(
             runtime->budget, BUDGET_CATEGORY_LAYOUT, 1,
@@ -667,9 +725,10 @@ bool script_runtime_flush_geometry_layout_reuse(
         layout_destroy(runtime->geometry_layout);
         memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
     }
-    LayoutReuseCache *reuse = prepare == NULL ? NULL
-        : prepare(opaque, bridge->mutations.count != 0
-            || bridge->mutations.overflowed ? &bridge->mutations : NULL);
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t trace_prepared = trace_geometry
+        ? tilefinch_platform_monotonic_time_us() : 0;
+#endif
     if (!layout_build_context_reuse(runtime->geometry_layout, runtime->budget,
             bridge->document, bridge->stylesheet, bridge->fonts,
             bridge->images, viewport, reuse)) {
@@ -677,11 +736,24 @@ bool script_runtime_flush_geometry_layout_reuse(
         memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
         return false;
     }
-    runtime->geometry_content_generation = bridge->document->content_generation;
-    runtime->geometry_style_generation = document_style_generation();
-    runtime->geometry_sheet_generation = bridge->stylesheet->build_generation;
-    runtime->geometry_container_generation = bridge->stylesheet->container_state_generation;
-    runtime->geometry_font_generation = font_generation();
+#ifndef TILEFINCH_NO_TRACE
+    if (trace_geometry) {
+        const LayoutPerformance *p = &runtime->geometry_layout->performance;
+        fprintf(stderr, "geometry-snapshot prepare-us=%llu build-us=%llu "
+            "flow-us=%llu style-us=%llu styles=%llu/%llu mutations=%zu "
+            "overflow=%d resource=%d commands=%zu\n",
+            (unsigned long long)(trace_prepared - trace_begin),
+            (unsigned long long)(tilefinch_platform_monotonic_time_us() - trace_prepared),
+            (unsigned long long)p->flow_us,
+            (unsigned long long)p->style_resolve_us,
+            (unsigned long long)p->style_cache_hits,
+            (unsigned long long)p->style_cache_misses,
+            bridge->mutations.count, (int)bridge->mutations.overflowed,
+            (int)bridge->mutations.resource_rebuild_required,
+            runtime->geometry_layout->count);
+    }
+#endif
+    geometry_inputs_capture(runtime);
     runtime->geometry_paint_stale = false;
 #ifndef TILEFINCH_NO_TRACE
     if (bridge->result != NULL) bridge->result->geometry_snapshot_builds++;
@@ -880,6 +952,26 @@ void script_runtime_set_synchronous_layout_callback(
     runtime->bridge.synchronous_layout = callback;
     runtime->bridge.synchronous_layout_opaque =
         callback == NULL ? NULL : opaque;
+    runtime->bridge.synchronous_layout_images_only = false;
+    runtime->bridge.synchronous_layout_geometry_only = false;
+}
+
+void script_runtime_set_geometry_layout_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque)
+{
+    script_runtime_set_synchronous_layout_callback(runtime, callback, opaque);
+    if (runtime != NULL)
+        runtime->bridge.synchronous_layout_geometry_only = callback != NULL;
+}
+
+void script_runtime_set_image_sizing_layout_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque)
+{
+    script_runtime_set_synchronous_layout_callback(runtime, callback, opaque);
+    if (runtime != NULL)
+        runtime->bridge.synchronous_layout_images_only = callback != NULL;
 }
 
 void script_runtime_set_node_retirement_callback(

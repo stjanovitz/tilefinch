@@ -1,4 +1,5 @@
 #include "tilefinch/offline_download.h"
+#include "tilefinch/file_download.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -195,6 +196,31 @@ bool offline_download_manager_start(
         || !offline_library_load(manager->library)) return false;
     OfflineLibraryItem *item = offline_library_find_mutable(
         manager->library, id);
+    if (item != NULL && item->type == OFFLINE_ITEM_FILE) {
+        if (manager->active_id != 0 || item->state == OFFLINE_ITEM_READY) return false;
+        /* The two formats share one transfer lane, not two retained network
+           schedulers. Give an idle video lane back before admitting a file. */
+        if (manager->scheduler != NULL) {
+            fetch_scheduler_destroy(manager->scheduler);
+            manager->scheduler = NULL;
+        }
+        if (manager->completion != NULL) {
+            fetch_result_destroy(manager->completion);
+            budget_free(manager->budget, manager->completion);
+            manager->completion = NULL;
+        }
+        if (manager->file == NULL)
+            manager->file = file_download_create(manager->budget, manager->session, manager->library);
+        if (manager->file == NULL || !file_download_start(manager->file, id)) {
+            file_download_destroy(manager->file);
+            manager->file = NULL;
+            return false;
+        }
+        manager->active_id = id;
+        manager->phase = OFFLINE_DOWNLOAD_FILE;
+        manager->error[0] = '\0';
+        return true;
+    }
     if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE
         || item->state == OFFLINE_ITEM_READY) return false;
     if (manager->active_id != 0 && manager->active_id != id) return false;
@@ -237,7 +263,7 @@ bool offline_download_manager_start_next_queued(
         || !offline_library_load(manager->library)) return false;
     for (size_t index = 0; index < manager->library->count; index++) {
         OfflineLibraryItem *item = &manager->library->items[index];
-        if (item->type != OFFLINE_ITEM_YOUTUBE
+        if ((item->type != OFFLINE_ITEM_YOUTUBE && item->type != OFFLINE_ITEM_FILE)
             || item->state != OFFLINE_ITEM_QUEUED) continue;
         if (!offline_download_manager_start(manager, item->id)) return false;
         if (started_id != NULL) *started_id = item->id;
@@ -564,6 +590,18 @@ static bool download_advance_part(OfflineDownloadManager *manager)
 bool offline_download_manager_pump(OfflineDownloadManager *manager)
 {
     if (manager == NULL || manager->active_id == 0) return false;
+    if (manager->phase == OFFLINE_DOWNLOAD_FILE) {
+        bool changed = file_download_pump(manager->file);
+        if (!file_download_active(manager->file, NULL)) {
+            const OfflineLibraryItem *item = offline_library_find(manager->library, manager->active_id);
+            snprintf(manager->error, sizeof(manager->error), "%s", item == NULL ? "Download stopped" : item->failure_reason);
+            manager->active_id = 0;
+            manager->phase = OFFLINE_DOWNLOAD_IDLE;
+            file_download_destroy(manager->file);
+            manager->file = NULL;
+        }
+        return changed;
+    }
     if (manager->phase == OFFLINE_DOWNLOAD_RESOLVE)
         return download_resolve(manager);
     if (manager->request_id == 0) {
@@ -646,6 +684,19 @@ bool offline_download_manager_pause(
     if (manager == NULL || id == 0) return false;
     OfflineLibraryItem *item = offline_library_find_mutable(
         manager->library, id);
+    if (item != NULL && item->type == OFFLINE_ITEM_FILE) {
+        if (manager->active_id == id) {
+            if (!file_download_pause(manager->file, id)) return false;
+            file_download_destroy(manager->file);
+            manager->file = NULL;
+            manager->active_id = 0;
+            manager->phase = OFFLINE_DOWNLOAD_IDLE;
+            return true;
+        }
+        if (item->state == OFFLINE_ITEM_READY) return false;
+        item->state = OFFLINE_ITEM_PAUSED;
+        return offline_library_save(manager->library);
+    }
     if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE
         || item->state == OFFLINE_ITEM_READY) return false;
     if (manager->active_id == id) {
@@ -680,12 +731,16 @@ bool offline_download_manager_snapshot(
         || id == 0) return false;
     const OfflineLibraryItem *item = offline_library_find(
         manager->library, id);
-    if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE) return false;
+    if (item != NULL && item->type == OFFLINE_ITEM_FILE && manager->file != NULL)
+        return file_download_snapshot(manager->file, id, snapshot);
+    if (item == NULL || (item->type != OFFLINE_ITEM_YOUTUBE && item->type != OFFLINE_ITEM_FILE)) return false;
     snapshot->id = id;
     snapshot->phase = manager->active_id == id
         ? manager->phase : OFFLINE_DOWNLOAD_IDLE;
     snapshot->downloaded_bytes = item->downloaded_bytes;
     snapshot->total_bytes = item->content_bytes + item->audio_bytes;
+    if (item->type == OFFLINE_ITEM_FILE && item->state != OFFLINE_ITEM_READY)
+        snapshot->total_bytes = 0;
     snapshot->available_bytes = manager->active_id == id
         ? manager->available_bytes : 0;
     snapshot->bytes_per_second = manager->active_id == id
@@ -702,6 +757,8 @@ void offline_download_manager_destroy(OfflineDownloadManager *manager)
     if (manager->active_id != 0)
         (void) offline_download_manager_pause(
             manager, manager->active_id);
+    file_download_destroy(manager->file);
+    manager->file = NULL;
     if (manager->completion != NULL) {
         fetch_result_destroy(manager->completion);
         budget_free(manager->budget, manager->completion);

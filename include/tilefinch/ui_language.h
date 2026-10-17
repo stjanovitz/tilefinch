@@ -6,7 +6,7 @@
 #include "tilefinch/install_paths.h"
 
 #define TILEFINCH_UI_TRANSLATION_BYTES (32u * 1024u)
-#define TILEFINCH_UI_TRANSLATION_ROWS 336u
+#define TILEFINCH_UI_TRANSLATION_ROWS 400u
 
 typedef enum {
     TILEFINCH_UI_LANGUAGE_ENGLISH,

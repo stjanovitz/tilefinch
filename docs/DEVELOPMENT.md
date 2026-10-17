@@ -69,6 +69,12 @@ Do not add a bare `add_executable` there, which could leave `dev.sh test` runnin
 a stale executable. Release tests using C `assert` must undefine `NDEBUG` before
 including `<assert.h>`.
 
+For the standalone macOS allocator/JavaScriptCore PGO comparison, run
+`scripts/benchmark_allocator_pgo.sh [CMake options...]`. It creates both
+experimental build trees and profile data in a fresh temporary directory
+outside the checkout, and removes that directory on success or failure. This
+is an optional research tool, not part of the release PGO workflow.
+
 ### Optional private tests
 
 The default configure, build, and CTest suite need only the public source tree.
@@ -148,6 +154,15 @@ These run one behavior in isolation; they do not replace the complete suite.
   checks center/end alignment after content-sized grid rows finish sizing.
 - `build-preset-release/tilefinch-layout-tests --fractional-tracking-only`
   checks signed fractional tracking across inline boundaries and wrapping.
+- `build-preset-release/tilefinch-layout-tests --inline-boundaries-only`
+  checks intrinsic spacing after generated glyphs, joined no-wrap fragments,
+  valid whitespace/punctuation breaks, per-line ellipsis and marker refusal.
+  `--nowrap-boundary-only` selects the latter checks without icon sizing.
+- `build-preset-release/tilefinch-layout-tests --generated-padding-only`
+  checks that generated glyphs stay inside their inline owner's padding.
+  `--page-font-leading-only` checks downloaded-face line metrics without
+  changing fallback leading; `--positioned-percentage-only` checks percentage
+  heights and vertical insets against an auto-height containing block.
 - `build-preset-release/tilefinch-layout-tests --nested-flex-baseline-only`
   checks first-item baseline propagation through an inline-block wrapper.
 - `build-preset-release/tilefinch-layout-tests --css-replacement-image-only`
@@ -189,6 +204,20 @@ These run one behavior in isolation; they do not replace the complete suite.
   `tilefinch-web-font-tests --font-perf-only` checks style retention, deferred
   family activation, shared-face lifetimes and exact cached advances. The
   `--legacy-font-perf-only` negative control must fail those new expectations.
+  `tilefinch-web-font-tests --variations-only` checks authored two-axis
+  fixtures, weight/optical metrics, bounded instance reuse, dead-table removal,
+  and allocation refusals during opening, coordinate changes and glyph loads.
+  `tilefinch-web-font-tests --opentype-kerning-only` checks bounded horizontal
+  GPOS pairs/classes and extension tables across TTF, WOFF and WOFF2, script
+  selection, shared-font lifetime, cache sizing, malformed tables and Budget
+  refusals. The page-font path borrows FreeType's immutable decoded tables;
+  it does not copy GPOS or expand class matrices. Default-language `kern`
+  plans support Latin, Greek and Cyrillic (falling back to DFLT when absent).
+  Contextual, mark-filtered, placement and variation positioning remain outside
+  this pair-advance API and keep the legacy kerning fallback.
+  The same suite checks reuse across equivalent script plans and pixel sizes,
+  independent rounding for multiple lookups, and a 256-byte immutable ASCII
+  glyph-index cache (including missing glyphs and shared-face lifetime).
   `--web-font-mode on|smart|off` exercises the persisted menu policy (the lab
   defaults to Smart); use explicit `on` for font-completion comparisons.
   Smart reserves one eighth of the page budget, bounded to 512 KiB–3 MiB,

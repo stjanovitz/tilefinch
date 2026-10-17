@@ -19,7 +19,13 @@ from native_visual_trace import prepare_native_visual_trace
 
 VIEWS = (0, 25, 50, 75, 100)
 MAX_LOG_BYTES = 64 * 1024 * 1024
-MAX_COMMANDS = 4096
+MAX_COMMANDS = 8192
+MAX_DOCUMENT_HEIGHT = 262144
+MAX_SWEEP_TICKS = 1280
+# Scroll handlers can start finite transitions after positioning. Advance the
+# recorded clock before taking pixels, rather than freezing the first frame
+# while Chrome's animation-disabled screenshot captures a settled endpoint.
+VIEW_MOTION_SETTLE_MS = 600
 POSITION = re.compile(r'^loop frame=(\d+) .* scroll=(\d+)/(\d+) .+$')
 MARKER = re.compile(r'^tilefinch-work: label=native-view-(\d+)(?: |$)')
 TEARDOWN = re.compile(
@@ -82,14 +88,31 @@ def build_five_view_commands(output: Path, height_estimate: int,
                              sweep_ticks: int = 0, tick_ms: int = 33,
                              viewport_height: int = 272) -> str:
     """Sweep on the recorded clock, then position via the native facade."""
-    if (not viewport_height <= height_estimate <= 61440
-            or not 0 <= sweep_ticks <= 256 or not 1 <= tick_ms <= 1000):
+    if (not viewport_height <= height_estimate <= MAX_DOCUMENT_HEIGHT
+            or not 0 <= sweep_ticks <= MAX_SWEEP_TICKS or not 1 <= tick_ms <= 1000):
         raise ValueError('native capture geometry/clock exceeds its bound')
     if '\n' in str(output) or '\r' in str(output):
         raise ValueError('capture output path contains a command separator')
     lines = ['drain 4096 0', 'idle 300', 'status', 'top']
     for _ in range(sweep_ticks):
         lines.extend(['page-down', f'tick 1 {tick_ms}', 'drain 2048 0'])
+    # A downward sweep can admit lazy content after earlier viewports have
+    # already passed. Revisit those viewports before freezing the five views;
+    # never accept a changing extent merely because the final bottom settled.
+    for _ in range(sweep_ticks):
+        lines.extend(['page-up', f'tick 1 {tick_ms}', 'drain 2048 0'])
+    if sweep_ticks:
+        lines.extend(['top', 'drain 4096 0', 'idle 300', 'status'])
+        # Visit the actual capture anchors too: a lazy observer's admission
+        # window can fall between the page-step positions used by the sweep.
+        for percentage in VIEWS:
+            if percentage == 100:
+                lines.append('bottom')
+            else:
+                target = ((height_estimate - viewport_height) * percentage + 50) // 100
+                lines.extend(['top', f'scroll-by {target}'])
+            lines.extend([f'tick 1 {tick_ms}', 'drain 4096 0', 'idle 300'])
+        lines.extend(['top', 'drain 4096 0', 'idle 300'])
     for percentage in VIEWS:
         if percentage == 100:
             lines.append('bottom')
@@ -97,10 +120,19 @@ def build_five_view_commands(output: Path, height_estimate: int,
             lines.append('top')
             target = ((height_estimate - viewport_height) * percentage + 50) // 100
             lines.append(f'scroll-by {target}')
-        lines.extend(['drain 4096 0', 'idle 300', 'status',
+        settle_ticks = (VIEW_MOTION_SETTLE_MS + tick_ms - 1) // tick_ms
+        lines.extend([f'tick {settle_ticks} {tick_ms}',
+                      'drain 4096 0', 'idle 300', 'status',
                       f'work native-view-{percentage}',
                       f'render {output / ("view-" + str(percentage) + ".ppm")}'])
-    lines.extend(['census', 'script-report', 'quit'])
+    # Chrome's full-document capture resets scroll after its five views.
+    # Restore the same direction/history before supplemental content anchors;
+    # otherwise the first anchor approaches from below only in the native
+    # replay and scroll-linked toolbars legitimately differ.
+    settle_ticks = (VIEW_MOTION_SETTLE_MS + tick_ms - 1) // tick_ms
+    lines.extend(['top', f'tick {settle_ticks} {tick_ms}',
+                  'drain 4096 0', 'idle 300',
+                  'census', 'script-report', 'quit'])
     if len(lines) > MAX_COMMANDS:
         raise ValueError('native capture command cap exceeded')
     return '\n'.join(lines) + '\n'
@@ -128,7 +160,7 @@ def validate_native_capture(output: Path, exit_code: int,
     if not lines or lines[-1] != 'quit' or len(lines) > MAX_COMMANDS:
         raise ValueError('native capture commands are incomplete or oversized')
     allowed = {'drain', 'idle', 'status', 'top', 'bottom', 'scroll-by',
-               'page-down', 'tick', 'work', 'render', 'census', 'script-report', 'quit'}
+               'page-down', 'page-up', 'tick', 'work', 'render', 'census', 'script-report', 'quit'}
     if any(c.split(' ', 1)[0] not in allowed for c in lines):
         raise ValueError('native capture positioning must not depend on page JS')
     if any(c.startswith('drain ') and c.split()[-1] != '0' for c in lines):
@@ -149,7 +181,9 @@ def validate_native_capture(output: Path, exit_code: int,
     pending = None
     following = 0
     teardown = []
-    for line in stdout.decode('utf-8').splitlines():
+    # Human-readable C diagnostics can end a byte-limited title mid-codepoint.
+    # Preserve those bytes; all receipt markers and numeric fields stay strict.
+    for line in stdout.decode('utf-8', errors='surrogateescape').splitlines():
         match = POSITION.fullmatch(line)
         if line.startswith('loop frame=') and match is None:
             raise ValueError('native status line is truncated or interleaved')
@@ -193,11 +227,16 @@ def validate_native_capture(output: Path, exit_code: int,
         raise ValueError('native capture lacks a unique clean teardown receipt')
     maximum = positions[-1]['maximum']
     if any(p['maximum'] != maximum for p in positions):
-        raise ValueError('native document geometry changed between views')
+        # Preserve this failed sweep and permit the existing one fresh retry
+        # to previsit anchors using the actual final extent. The retry itself
+        # must have stable geometry and exactly the same final height.
+        raise StaleHeightError(maximum + viewport_height)
     if positions[0]['y'] != 0 or positions[-1]['y'] != maximum:
         raise ValueError('native top/bottom offsets do not reach both document edges')
     if any(a['y'] > b['y'] for a, b in zip(positions, positions[1:])):
         raise ValueError('native actual offsets are reordered')
+    if last_position is None or last_position['y'] != 0:
+        raise ValueError('native capture did not reset scroll after its views')
     hashes = {'commands.txt': digest(commands), 'stdout.log': digest(stdout),
               'stderr.log': digest(stderr)}
     invocation = read_bounded(output / 'invocation.json', 1024 * 1024)
@@ -222,6 +261,7 @@ def validate_native_capture(output: Path, exit_code: int,
             'resource_completion': 'not-qualified-by-this-diagnostic',
             'method': 'native top/bottom and exact bounded scroll-by offsets',
             'positions': positions, 'top_verified': True, 'bottom_verified': True,
+            'reset_scroll_verified': True,
             'zero_elapsed_drains': True, 'teardown_bytes': 0,
             'document_height': maximum + viewport_height,
             'artifacts': hashes}
@@ -256,6 +296,7 @@ def _run_attempt(arguments: list[str], output: Path, height_estimate: int,
     (output / 'invocation.json').write_text(json.dumps(
         {'args': command, 'exit': code, 'height_estimate': height_estimate,
          'extra_clock_turns': sweep_ticks, 'tick_ms': tick_ms,
+         'view_motion_settle_ms': VIEW_MOTION_SETTLE_MS,
          'visual_trace_adapter': adaptation}, indent=2) + '\n')
     return validate_native_capture(output, code)
 
@@ -309,7 +350,8 @@ def run_native_capture(arguments: list[str], output: Path, height_estimate: int,
         attempts.append({'attempt': destination.name, 'status': 'complete',
                          'height_estimate': height_estimate, 'artifacts': receipt['artifacts']})
         receipt.update(identity, exit=0, attempts=attempts,
-                       extra_clock_turns=sweep_ticks, tick_ms=tick_ms)
+                       extra_clock_turns=sweep_ticks, tick_ms=tick_ms,
+                       view_motion_settle_ms=VIEW_MOTION_SETTLE_MS)
         (output / 'native-capture.json').write_text(json.dumps(receipt, indent=2) + '\n')
         return receipt
     raise ValueError('native capture exhausted its bounded fresh attempts')

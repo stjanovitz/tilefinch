@@ -106,6 +106,25 @@
     CHECK(fixed_cache.fixed_cache_builds == 1
           && fixed_cache.fixed_cache_blits == 2
           && fixed_cache.fixed_cache_bytes > 0);
+    /* A newly published document image elsewhere must not decode/rasterize
+       an unchanged header image again. Conversely its own damaged image
+       must still retire the retained placeholder pixels. */
+    DrawCommand saved_fixed_command = responsive_layout.commands[
+        fixed_range->command_start];
+    responsive_layout.commands[fixed_range->command_start].type = DRAW_IMAGE;
+    if (fixed_cache.owns_visual_layout)
+        fixed_cache.visual_layout.commands[fixed_range->command_start].type = DRAW_IMAGE;
+    CHECK(tile_cache_sync_document_image_paint(&fixed_cache,
+              0, responsive_layout.height + 10, 480, responsive_layout.height + 20)
+          && fixed_cache.fixed_ready);
+    CHECK(tile_cache_sync_document_image_paint(&fixed_cache,
+              saved_fixed_command.x, saved_fixed_command.y,
+              saved_fixed_command.x + saved_fixed_command.width,
+              saved_fixed_command.y + saved_fixed_command.height)
+          && !fixed_cache.fixed_ready);
+    responsive_layout.commands[fixed_range->command_start] = saved_fixed_command;
+    if (fixed_cache.owns_visual_layout)
+        fixed_cache.visual_layout.commands[fixed_range->command_start].type = saved_fixed_command.type;
     int background_scroll = background_image_command->y - 40;
     if (background_scroll < 0) background_scroll = 0;
     if (background_scroll > responsive_layout.height - 272) {

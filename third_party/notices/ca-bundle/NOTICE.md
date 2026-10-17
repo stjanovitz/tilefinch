@@ -1,6 +1,6 @@
 # TLS CA-bundle provenance and redistribution
 
-Tilefinch distributes `certs/roots.pem` as TLS trust data. It contains 26
+Tilefinch distributes `certs/roots.pem` as TLS trust data. It contains 27
 public root certificates, not private keys. Certificate names identify their
 issuers; inclusion does not imply endorsement by those issuers. Tilefinch's
 MIT license does not supersede third-party rights in certificate data.
@@ -24,7 +24,7 @@ The complete license accompanies this source tree at
 List rather than duplicated. This is a notice for Mozilla-derived data, not
 a blanket assertion that every direct CA download is MPL-licensed.
 
-Twenty-two retained certificates are byte-identical to entries in the Mozilla
+Twenty-three retained certificates are byte-identical to entries in the Mozilla
 PEM bundle dated 2026-09-25 (bundle SHA-256
 `a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505`):
 
@@ -40,6 +40,7 @@ PEM bundle dated 2026-09-25 (bundle SHA-256
 - Sectigo Public Server Authentication Root R46
 - SSL.com Root Certification Authority ECC, TLS ECC Root CA 2022, and TLS RSA Root CA 2022
 - Starfield Root Certificate Authority G2
+- Starfield Services Root Certificate Authority G2
 - USERTrust RSA and ECC Certification Authorities
 
 The Microsoft certificate matches its issuer's MPL-2.0 Azure Linux CA package,
@@ -82,6 +83,7 @@ certificate's validity, trust status, and permitted uses.
 | SSL.com TLS ECC Root CA 2022 | `c32ffd9f46f936d16c3673990959434b9ad60aafbb9e7cf33654f144cc1ba143` | Mozilla MPL; SSL.com grant |
 | SSL.com TLS RSA Root CA 2022 | `8faf7d2e2cb4709bb8e0b33666bf75a5dd45b5de480f8ea8d4bfe6bebc17f2ed` | Mozilla MPL; SSL.com grant |
 | Starfield Root Certificate Authority G2 | `2ce1cb0bf9d2f9e102993fbe215152c3b2dd0cabde1c68e5319b839154dbb7f5` | Mozilla MPL; Starfield grant |
+| Starfield Services Root Certificate Authority G2 | `568d6905a2c88708a4b3025190edcfedb1974a606a13c6e5290fcb2ae63edab5` | Mozilla MPL; Amazon grant |
 | USERTrust RSA Certification Authority | `e793c9b02fd8aa13e21c31228accb08119643b749c898964b1746d46c3d4cbd2` | Mozilla MPL; Sectigo grant |
 | USERTrust ECC Certification Authority | `4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a` | Mozilla MPL; Sectigo grant |
 
@@ -92,6 +94,9 @@ certificate's validity, trust status, and permitted uses.
 [ATS CP/CPS v2.7, section 9.5](https://www.amazontrust.com/repository/ats-cp-cps-2.7.pdf)
 allows royalty-free, nonexclusive reproduction and distribution of complete
 certificates. Amazon retains its intellectual property rights.
+The Starfield Services Root G2 bytes also match Mozilla's MPL-2.0 bundle and
+[Amazon's authoritative certificate](https://www.amazontrust.com/repository/SFSRootCAG2.pem).
+The complete signed DER bytes are unchanged; this is not Starfield Root G2.
 
 ### DigiCert
 

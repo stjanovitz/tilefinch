@@ -184,8 +184,10 @@ typedef struct {
        generated-pseudo fill borrows its owner here, with text_length equal
        to PSEUDO_BEFORE/AFTER, for exact paint-only focus translation.
        Its otherwise unused font_weight records the painted focus state.
-       A single unblurred DRAW_SHADOW_RECT also borrows its owner identity
+       An unblurred DRAW_SHADOW_RECT also borrows its owner identity
        and retains its spread in font_size for paint-only focus changes.
+       A reserved focus layer records its one-based shadow index in the low
+       font_weight bits (the positioned-phase bit remains independent).
        Rounded borders and reserved inset DRAW_STROKE_RECT slots borrow
        their owner too; their formatter geometry can precede flex stretching. */
     const char *text;
@@ -934,6 +936,30 @@ static inline StyleOverflowClipBox layout_node_box_clip_box(
         : (StyleOverflowClipBox) (box->clip_flags_reserved & 3u);
 }
 
+/* The caller supplies a document or scroll-adjusted origin; painting and
+   hit testing must otherwise use exactly the same overflow geometry. */
+static inline void layout_node_box_clip_rect(
+    const LayoutNodeBox *box, int origin_x, int origin_y,
+    int *left, int *top, int *right, int *bottom)
+{
+    StyleOverflowClipBox clip_box = layout_node_box_clip_box(box);
+    int margin = (int) layout_node_box_clip_margin(box);
+    int width = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
+        ? box->width
+        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
+           ? box->width - 2 * box->clip_inset_left : box->client_width);
+    int height = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
+        ? box->height
+        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
+           ? box->height - 2 * box->clip_inset_top : box->client_height);
+    if (width < 0) width = 0;
+    if (height < 0) height = 0;
+    *left = origin_x + box->clip_inset_left - margin;
+    *top = origin_y + box->clip_inset_top - margin;
+    *right = *left + width + 2 * margin;
+    *bottom = *top + height + 2 * margin;
+}
+
 static inline void layout_node_box_set_clip_geometry(
     LayoutNodeBox *box, unsigned radius, unsigned margin,
     StyleOverflowClipBox clip_box)
@@ -1486,6 +1512,10 @@ void layout_reuse_cache_invalidate_inline_style(
     LayoutReuseCache *cache, lxb_dom_node_t *node, const char *property,
     bool relational);
 void layout_reuse_cache_invalidate_focus(
+    LayoutReuseCache *cache, lxb_dom_node_t *node);
+/* The caller has just proved locality for both marker states against this
+   same stylesheet and DOM. This still invalidates geometry and measurements. */
+void layout_reuse_cache_invalidate_local_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node);
 /* The checked state of the given checkboxes/radios changed (attribute and
    checkedness together). Drops the retained matched-rule lists of those

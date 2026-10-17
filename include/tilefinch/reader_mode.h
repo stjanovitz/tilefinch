@@ -53,6 +53,15 @@ bool reader_document_prepare(PocDocument *document,
 bool reader_document_prepare_with_stylesheet(
     PocDocument *document, const Stylesheet *stylesheet,
     ReaderDocumentAnalysis *analysis);
+/* Settled source sizing is optional and checked against the source revisions.
+   It prevents small header images expanding when wrappers are flattened. */
+struct LayoutDocument;
+bool reader_document_prepare_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const struct LayoutDocument *layout, ReaderDocumentAnalysis *analysis);
+bool reader_document_prepare_complete_with_layout(
+    PocDocument *document, const Stylesheet *stylesheet,
+    const struct LayoutDocument *layout, ReaderDocumentAnalysis *analysis);
 /* Commit-time recovery keeps the native extracted tree private until author
    work has settled. The returned root is detached, document-owned, and must
    be connected or discarded through the exact-root helpers below. */
@@ -92,7 +101,6 @@ bool reader_document_prepare_basic_complete_with_stylesheet(
 /* Optional settled source geometry keeps small CSS-sized images from
    expanding to their intrinsic size when layout wrappers are flattened.
    The caller must not supply a layout with unpublished DOM mutations. */
-struct LayoutDocument;
 bool reader_document_prepare_basic_complete_with_layout(
     PocDocument *document, const Stylesheet *stylesheet,
     const struct LayoutDocument *layout, ReaderDocumentAnalysis *analysis);

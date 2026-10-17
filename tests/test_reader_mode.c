@@ -289,6 +289,25 @@ static bool test_reading_identity_and_semantic_selection(void)
         && subtree_contains_text(first->next->next, "OPENING PROSE"));
     document_destroy(&document);
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+
+    used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><body><main><header>"
+        "<a href=/one><img src=/one.png></a>"
+        "<a href=/two><img src=/two.png></a></header>"
+        "<h1>LANDMARK TITLE</h1><div>%s%s%s%s"
+        "<p>FINAL LANDMARK SENTINEL.</p></div></main></body>",
+        paragraph, paragraph, paragraph, paragraph);
+    CHECK(used < sizeof(html));
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    CHECK(analyze(html, &analysis, &document, &budget));
+    root = find_reader_root(&document);
+    CHECK(root != NULL && count_named_within(root, "h1") == 1u
+          && subtree_contains_text(root, "LANDMARK TITLE")
+          && subtree_contains_text(root, "FINAL LANDMARK SENTINEL")
+          && count_named_within(root, "img") == 0u);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
     return true;
 }
 
@@ -1219,6 +1238,62 @@ static bool test_basic_images_keep_settled_inline_size(void)
     return true;
 }
 
+static bool test_simplified_images_respect_visibility_and_size(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.alternate{display:none}.small{width:32px;height:24px}"
+        ".hidden-parent{visibility:hidden}.visible-child{visibility:visible}"
+        "</style><body><main><article><h1>Reading content</h1>"
+        "<img class=small src='/mark.png' alt='A long brand label'>"
+        "<div class=alternate><img src='/alternate.png' alt='Duplicate'></div>"
+        "<div class=hidden-parent><img class=visible-child src='/visible.png' alt='Visible'></div>"
+        "<details><summary>Diagram</summary><img class=alternate src='/closed.png'></details>"
+        "<p>This substantial paragraph describes a portable system with enough "
+        "ordinary prose to make a useful reading view. The source heading and "
+        "all the following article paragraphs must remain available.</p>"
+        "<p>A second substantial paragraph describes how images should preserve "
+        "their useful source width rather than growing across the page when "
+        "the presentation wrappers are removed from a reading view.</p>"
+        "<p>The final substantial paragraph supplies enough continuous prose "
+        "to classify this as an article rather than a navigation listing. "
+        "Its content must not disappear when hidden alternate images are omitted.</p>"
+        "</article></main></body>";
+    for (unsigned basic = 0; basic < 2; basic++) {
+        Budget budget;
+        budget_init(&budget, 16u * 1024u * 1024u);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        ReaderDocumentAnalysis analysis = {0};
+        CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 113u)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+        CHECK(basic
+            ? reader_document_prepare_basic_complete_with_layout(
+                  &document, &sheet, &layout, &analysis)
+            : reader_document_prepare_with_layout(
+                  &document, &sheet, &layout, &analysis));
+        lxb_dom_node_t *root = find_direct_reader_root(&document);
+        CHECK(root != NULL
+              && count_attribute_value_within(root, "src", "/alternate.png") == (basic ? 0u : 1u)
+              && count_attribute_value_within(root, "src", "/closed.png") == 1
+              && count_attribute_value_within(root, "src", "/visible.png") == 1
+              && count_attribute_value_within(root, "style", "width:32px!important") == 1
+              && count_attribute_value_within(root, "data-tilefinch-reader-compact-image", NULL) == 1
+              && subtree_contains_text(root, "final substantial paragraph"));
+        char css[SITE_ADAPTER_READER_CSS_LIMIT], name[32];
+        CHECK(site_adapter_reader_css("https://example.test/", 0, 100,
+                                     css, sizeof(css), name, sizeof(name))
+              && strstr(css, "white-space:nowrap!important;word-break:normal!important;overflow:hidden!important") != NULL);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    }
+    return true;
+}
+
 static bool test_reader_heading_sizes_are_bounded(void)
 {
     char css[SITE_ADAPTER_READER_CSS_LIMIT];
@@ -1230,7 +1305,7 @@ static bool test_reader_heading_sizes_are_bounded(void)
           && strstr(css, "h1{font-size:1.55rem!important}") != NULL
           && strstr(css, "h2{font-size:1.3rem!important}") != NULL
           && strstr(css, "h3{font-size:1.15rem!important}") != NULL
-          && strstr(css, "h6{font-size:1.05rem!important}") != NULL);
+          && strstr(css, ":is(h4,h5,h6){font-size:1.05rem!important}") != NULL);
     return true;
 }
 
@@ -1880,6 +1955,9 @@ static bool test_basic_navigation_and_link_boundaries(void)
         "<!doctype html><body><nav aria-label='Browse &amp; explore'>"
         "<a href='/one'>One</a><a href='/two'>Two</a></nav>"
         "<div role='navigation'><a href='/three'>Three</a></div>"
+        "<header role=banner><a href='/account'>Account</a></header>"
+        "<main><header><a href=/brand-one><img src=/brand-one.png></a>"
+        "<a href=/brand-two><img src=/brand-two.png></a></header></main>"
         "<main><p><span>word</span><span>piece</span> "
         "<a href='/four'>Four</a><a href='/five'>Five</a> "
         "<b><a href='/six'>Six</a></b><a href='/seven'>Seven</a></p>"
@@ -1897,8 +1975,8 @@ static bool test_basic_navigation_and_link_boundaries(void)
     lxb_dom_node_t *root = find_direct_reader_root(&document);
     CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC
           && !analysis.bounded_out && !analysis.extraction_truncated
-          && count_named_within(root, "details") == 2u
-          && count_named_within(root, "summary") == 2u
+          && count_named_within(root, "details") == 4u
+          && count_named_within(root, "summary") == 4u
           && !has_attribute(find_named_within(root, "details"), "open")
           && subtree_contains_text(root, "Browse & explore")
           && subtree_text_contains_words(root, "One Two")
@@ -1908,6 +1986,7 @@ static bool test_basic_navigation_and_link_boundaries(void)
           && count_named_within(root, "select") == 1u
           && count_named_within(root, "option") == 1u
           && find_attribute_value_within(root, "href", "/three") != NULL
+          && find_attribute_value_within(root, "href", "/account") != NULL
           && analysis.retained_forms == 1u);
     document_destroy(&document);
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
@@ -2615,6 +2694,7 @@ int main(void)
         || !test_primary_media_requires_visible_authored_source()
         || !test_auto_article_requires_semantic_root()
         || !test_basic_images_keep_settled_inline_size()
+        || !test_simplified_images_respect_visibility_and_size()
         || !test_reader_heading_sizes_are_bounded()
         || !test_hidden_prose_is_manual_only_evidence()
         || !test_reader_references_remain_inline()

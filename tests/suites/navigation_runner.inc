@@ -62,6 +62,9 @@ int main(int argc, char **argv)
         RUN_TEST(test_style_preload_event_promotion);
         RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
         RUN_TEST(test_stylesheet_sources_insert_in_document_order);
+        RUN_TEST(test_adopted_sources_insert_between_existing);
+        RUN_TEST(test_confined_style_append_keeps_selector_cache);
+        RUN_TEST(test_stylesheet_completion_waits_for_checkpoint);
         RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
         RUN_TEST(test_image_only_changes_rebuild_images_alone);
         RUN_TEST(test_identical_attribute_writes_need_no_relayout);
@@ -155,6 +158,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_style_preload_event_promotion);
     RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
     RUN_TEST(test_stylesheet_sources_insert_in_document_order);
+    RUN_TEST(test_adopted_sources_insert_between_existing);
+    RUN_TEST(test_confined_style_append_keeps_selector_cache);
+    RUN_TEST(test_stylesheet_completion_waits_for_checkpoint);
     RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
     RUN_TEST(test_image_only_changes_rebuild_images_alone);
     RUN_TEST(test_identical_attribute_writes_need_no_relayout);

@@ -166,12 +166,14 @@ static int test_ua_body_spacing(Budget *budget)
 
     static const char ua_block_margin_page[] =
         "<!doctype html><style>body{margin:0}"
-        "#ua-p-large{font-size:20px}</style><body>"
+        "#ua-p-large{font-size:20px}#resized-h1{font-size:24px}"
+        "#reset-h1{margin:0}</style><body>"
         "<p id=ua-p>UA-P</p><p id=ua-p-large>UA-P-LARGE</p>"
         "<h1 id=ua-h1>UA-H1</h1>"
         "<h2 id=ua-h2>UA-H2</h2><h3 id=ua-h3>UA-H3</h3>"
         "<h4 id=ua-h4>UA-H4</h4><h5 id=ua-h5>UA-H5</h5>"
-        "<h6 id=ua-h6>UA-H6</h6></body>";
+        "<h6 id=ua-h6>UA-H6</h6><h1 id=resized-h1>RESIZED</h1>"
+        "<h1 id=reset-h1>RESET</h1></body>";
     static const struct {
         const char *id;
         const char *text;
@@ -180,12 +182,14 @@ static int test_ua_body_spacing(Budget *budget)
     } ua_blocks[] = {
         {"ua-p", "UA-P", 16, 16},
         {"ua-p-large", "UA-P-LARGE", 20, 20},
-        {"ua-h1", "UA-H1", 5, 5},
-        {"ua-h2", "UA-H2", 4, 4},
-        {"ua-h3", "UA-H3", 4, 4},
+        {"ua-h1", "UA-H1", 19, 19},
+        {"ua-h2", "UA-H2", 17, 17},
+        {"ua-h3", "UA-H3", 20, 20},
         {"ua-h4", "UA-H4", 0, 0},
         {"ua-h5", "UA-H5", 0, 0},
-        {"ua-h6", "UA-H6", 0, 0}
+        {"ua-h6", "UA-H6", 0, 0},
+        {"resized-h1", "RESIZED", 16, 16},
+        {"reset-h1", "RESET", 0, 0}
     };
     PocDocument ua_block_margin_document = {0};
     Stylesheet ua_block_margin_sheet = {0};

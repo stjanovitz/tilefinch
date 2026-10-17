@@ -635,6 +635,8 @@ typedef struct DomBridge {
     ImageResources *images;
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
+    bool synchronous_layout_images_only;
+    bool synchronous_layout_geometry_only;
     /* Layout the page forced from script (geometry reads, scrollIntoView):
        engine work inside a script entry that its watchdog also counts. */
     size_t synchronous_layout_calls;
@@ -1479,7 +1481,8 @@ void js_rt_script_element_states_purge_marked(
    chain and shared node/mutation machinery). */
 void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot);
 void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle);
-bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge);
+bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
+                                           lxb_dom_node_t *node);
 bool js_rt_notify_style_flushed(JSContext *context);
 bool bridge_node_is_connected(const lxb_dom_node_t *node);
 void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,

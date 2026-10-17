@@ -1,8 +1,10 @@
 #include "tilefinch/controller.h"
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/file_download.h"
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/url.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1388,7 +1390,10 @@ static void controller_refresh_authored_focus_outline_impl(
             .width = controller->navigation->focus_outline_cache_width,
             .style = controller->navigation->focus_outline_cache_style
         };
-        controller->has_authored_focus_outline = true;
+        controller->has_authored_focus_outline =
+            controller->authored_focus_outline.alpha != 0
+            && controller->authored_focus_outline.width != 0
+            && controller->authored_focus_outline.style != STYLE_OUTLINE_NONE;
         controller->navigation->focus_outline_cache_valid = false;
         controller->navigation->focus_outline_cache_node = NULL;
         return;
@@ -3066,6 +3071,22 @@ bool controller_focused_outline_style(
     return true;
 }
 
+bool controller_focused_download_url(BrowserController *controller,
+                                     char *url, size_t capacity)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || controller->focus_kind != CONTROLLER_FOCUS_LINK
+        || controller->focus_index >= controller->navigation->page.layout.link_count)
+        return false;
+    NavigationSession *navigation = controller->navigation;
+    const NavigationEntry *entry = navigation_current(navigation);
+    const char *base = navigation->page.resource_base_url[0]
+        ? navigation->page.resource_base_url : (entry == NULL ? NULL : entry->url);
+    const LinkRegion *link = &navigation->page.layout.links[controller->focus_index];
+    return base != NULL && fetch_resolve_url(base, link->url, url, capacity)
+        && file_download_url_supported(url);
+}
+
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action)
 {
@@ -3103,6 +3124,11 @@ bool controller_activate(BrowserController *controller,
         if (javascript_reference) action->url[0] = '\0';
         action->prefer_native_media = has_attribute(
             node, "data-tilefinch-provider-media");
+        action->prefer_download = !javascript_reference
+            && (file_download_url_candidate(action->url)
+                || (current != NULL && has_attribute(node, "download")
+                    && file_download_url_supported(action->url)
+                    && tilefinch_url_same_origin(current->url, action->url)));
         controller->activations++;
         action->activation_outcome =
             controller_dispatch_activation(controller, node);

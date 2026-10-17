@@ -6,6 +6,7 @@
     CHECK(test_layout_elapsed_input_checkpoint(&budget) == 0);
     CHECK(test_scroll_extent_linear_and_interruptible(&budget) == 0);
     CHECK(test_focus_within_unrelated_branches(&budget) == 0);
+    CHECK(test_focus_shadowed_opacity_and_empty_images(&budget) == 0);
     CHECK(test_spatial_ranges_service_input_before_finishing(&budget) == 0);
     CHECK(test_long_text_input_checkpoint(&budget) == 0);
     CHECK(test_font_publication_style_reuse(&budget) == 0);

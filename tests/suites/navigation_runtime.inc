@@ -249,7 +249,7 @@ static bool test_canvas_surface_count_is_bounded(void)
 static bool test_image_load_tasks_case(bool deferred)
 {
     static const char format[] =
-        "<!doctype html><body><img id=source class=loading width=1 height=1 "
+        "<!doctype html><body><img id=source %s class=loading width=1 height=1 "
         "src='%s' "
         "onload=\"document.getElementById('retired')?.remove();"
         "this.classList.remove('loading');globalThis.loads++;"
@@ -261,10 +261,11 @@ static bool test_image_load_tasks_case(bool deferred)
         "setInterval(()=>{},1000)</script></body>";
     char html[2048];
     const char *source = deferred
-        ? ""
+        ? "https://interactive-images.test/hero.svg"
         : "data:image/webp;base64,"
           "UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAAAfQssI0uf+BiOh/AAA=";
-    snprintf(html, sizeof(html), format, source, source);
+    snprintf(html, sizeof(html), format, deferred ? "loading=lazy" : "",
+             source, deferred ? "" : source);
     Budget budget;
     budget_init(&budget, 16 * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -278,7 +279,7 @@ static bool test_image_load_tasks_case(bool deferred)
         navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
-        navigation_enable_external_resources(
+        if (!deferred) navigation_enable_external_resources(
             &navigation, 2, 32 * 1024, 16 * 1024,
             2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
     }
@@ -288,15 +289,41 @@ static bool test_image_load_tasks_case(bool deferred)
         "https://interactive-images.test/page", html, strlen(html),
         480, NULL, NULL, true);
     if (ok && deferred) {
-        ScriptResult mutation = {0};
-        ok = script_runtime_evaluate_diagnostic(navigation.page.runtime,
-            "document.getElementById('source').src="
-            "'https://interactive-images.test/hero.svg'", "<late-image>", &mutation)
-            && navigation_relayout(&navigation);
+        /* Start the actual deferred transport after the runtime and fixed
+           placeholder exist; an eager commit must not satisfy this test. */
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation.page.deferred_image_targets = budget_calloc_category(
+            &budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(ImagePriorityTarget));
+        lxb_dom_node_t *source_node = test_find_id(
+            lxb_dom_interface_node(navigation.page.document.html), "source");
+        ok = navigation.page.deferred_image_targets != NULL && source_node != NULL;
+        if (ok) {
+            navigation.page.deferred_image_targets[0] = (ImagePriorityTarget) {
+                .node = source_node, .kind = IMAGE_PRIORITY_KIND_DOCUMENT,
+                .weak_handle = script_runtime_node_weak_handle(navigation.page.runtime, source_node)
+            };
+            navigation.page.deferred_image_count = 1;
+            navigation.page.image_continuation_pending = true;
+        }
+        const DrawCommand *commands = navigation.page.layout.commands;
+        size_t image_relayouts = navigation.performance.background_image_relayouts;
+        ok = ok && navigation.page.images.stats.loaded == 0
+            && navigation.page.image_continuation_pending
+            && script_runtime_flush_geometry_layout(navigation.page.runtime,
+                                                     &navigation.viewport);
         for (size_t i = 0; ok && i < 256
              && navigation.page.image_continuation_pending; i++)
             ok = navigation_run_deferred_image_work(&navigation);
-        ok = ok && !navigation.page.image_continuation_pending;
+        ok = ok && !navigation.page.image_continuation_pending
+            && navigation.page.layout.commands == commands
+            && navigation.performance.background_image_relayouts == image_relayouts;
+        LayoutDocument stale = {0};
+        bool adopted = script_runtime_take_geometry_layout(navigation.page.runtime,
+            &navigation.viewport, &stale);
+        layout_destroy(&stale);
+        ok = ok && !adopted;
     }
     ScriptResult result = {0};
     if (ok) ok = script_runtime_evaluate_diagnostic(navigation.page.runtime,
@@ -333,9 +360,46 @@ static bool test_image_load_tasks_case(bool deferred)
     return ok && clean;
 }
 
+static bool test_candidate_ready_event_reads_used_geometry(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.frame{width:240px;height:135px}"
+        ".frame img{display:block;width:100%;height:100%}</style>"
+        "<div class=frame><img id=poster></div><script>"
+        "document.addEventListener('DOMContentLoaded',()=>{"
+        "const image=document.getElementById('poster');"
+        "globalThis.pocSummary=image.clientWidth+'x'+image.clientHeight"
+        "})</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    bool ok = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://geometry.test/candidate", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && strcmp(navigation.page.script_result.summary, "240x135") == 0;
+    ScriptResult result = {0};
+    if (ok) ok = script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "const frame=document.querySelector('.frame');frame.style.width='200px';"
+        "globalThis.pocSummary=frame.clientWidth+'x'+document.getElementById('poster').clientWidth",
+        "<committed-geometry>", &result) && strcmp(result.summary, "200x200") == 0;
+    if (!ok) fprintf(stderr, "candidate geometry summary=%s error=%s\n",
+        navigation.page.script_result.summary, navigation.page.script_result.error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_image_load_tasks_follow_publication(void)
 {
-    return test_image_load_tasks_case(false) && test_image_load_tasks_case(true);
+    return test_candidate_ready_event_reads_used_geometry()
+        && test_image_load_tasks_case(false) && test_image_load_tasks_case(true);
 }
 
 static bool test_canvas_draw_image_accepts_loaded_html_image(void)

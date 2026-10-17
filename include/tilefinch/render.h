@@ -293,6 +293,18 @@ typedef struct {
     int fixed_height;
     int fixed_viewport_width;
     int fixed_viewport_height;
+    uint64_t fixed_font_generation;
+    /* Exact immutable image lifetimes used by the retained fixed raster.
+       Raw/mutable or over-cap lists decline cross-layout reuse. */
+    struct {
+        const void *identity;
+        uint64_t serial;
+        int width, height, source_width, source_height;
+        uint8_t retarget_flags;
+        bool mask;
+    } fixed_images[8];
+    uint8_t fixed_image_count;
+    bool fixed_images_valid;
     bool fixed_ready;
     bool fixed_backdrop;
     bool fixed_backdrop_masked;
@@ -597,5 +609,9 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
                                       const LayoutDocument *layout,
                                       int left, int top,
                                       int right, int bottom);
+/* The caller must prove identical fixed commands, ordering, resources and
+   clipping against the cache's immediately preceding layout generation. */
+bool tile_cache_replace_layout_damage_preserving_fixed(TileCache *cache,
+    const LayoutDocument *layout, int left, int top, int right, int bottom);
 
 #endif

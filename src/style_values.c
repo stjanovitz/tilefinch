@@ -355,6 +355,28 @@ void style_parse_transform_translation(Stylesheet *sheet,
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)
         || strcmp(value, "none") == 0) return;
 
+    /* A single reference-dependent translation fits the existing tagged
+       length representation. Keep its bounded math program until the box
+       size is known, rather than dropping a mixed percent/pixel calc().
+       General matrix composition below still accepts only its exact compact
+       subset; a tagged length is never fed into that numeric arithmetic. */
+    size_t value_length = strlen(value);
+    bool single_x = strncasecmp(value, "translateX(", 11) == 0;
+    bool single_y = strncasecmp(value, "translateY(", 11) == 0;
+    if ((single_x || single_y) && value_length > 12u
+        && value[value_length - 1u] == ')'
+        && strncasecmp(value + 11, "calc(", 5) == 0) {
+        StyleLength translated;
+        bool has_percent = false;
+        if (parse_style_length(sheet, value + 11, value_length - 12u,
+                               &translated, &has_percent)) {
+            style->transform_x = single_x ? translated : 0;
+            style->transform_y = single_y ? translated : 0;
+            style->has_transform = true;
+        }
+        return;
+    }
+
     double a = 1.0, b = 0.0, c = 0.0, d = 1.0;
     double tx = 0.0, ty = 0.0;
     double pxw = 0.0, pxh = 0.0, pyw = 0.0, pyh = 0.0;
@@ -558,6 +580,25 @@ void style_parse_transform_translation(Stylesheet *sheet,
         if (!style_apply_paint_stack(sheet, style, &stack, &retained)
             || !retained) style->has_transform = false;
     }
+}
+
+void style_transform_resolve_translation(const Stylesheet *sheet,
+    const ComputedStyle *style, int width, int height, int *x, int *y)
+{
+    int values[2] = {style->transform_x, style->transform_y};
+    const bool percent[2] = {style->transform_x_percent, style->transform_y_percent};
+    const int basis[2] = {width, height};
+    for (unsigned i = 0; i < 2; i++) {
+        if (percent[i]) {
+            int64_t pixels = (int64_t) basis[i] * values[i] / 100;
+            values[i] = pixels > INT_MAX ? INT_MAX
+                : pixels < INT_MIN ? INT_MIN : (int) pixels;
+        } else if (!style_length_resolve(sheet, values[i], basis[i], &values[i])) {
+            values[i] = 0;
+        }
+    }
+    *x = values[0];
+    *y = values[1];
 }
 
 static void skip_color_separator(const char **cursor)
@@ -3182,9 +3223,49 @@ static void style_parse_background_layer_shorthand_geometry(
     char copy[STYLE_CUSTOM_RESOLVED_CAPACITY];
     memcpy(copy, text, length);
     copy[length] = '\0';
+    /* The slash is punctuation, not a whitespace-delimited token. Collect
+       its one/two size components without swallowing following repeat/image
+       tokens; slashes inside URLs and functions are not separators. */
+    char position[96] = {0}, size[96] = {0};
+    size_t position_length = 0, size_length = 0;
+    bool after_slash = false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at == length) break;
+        if (text[at] == '/') { after_slash = true; at++; continue; }
+        size_t start = at;
+        unsigned depth = 0;
+        char quote = 0;
+        while (at < length) {
+            char c = text[at];
+            if (c == '\\' && at + 1u < length) { at += 2u; continue; }
+            if (quote) { if (c == quote) quote = 0; at++; continue; }
+            if (c == '\'' || c == '"') { quote = c; at++; continue; }
+            if (c == '(') depth++;
+            else if (c == ')' && depth != 0) depth--;
+            else if (depth == 0 && (c == '/' || isspace((unsigned char) c))) break;
+            at++;
+        }
+        size_t n = at - start;
+        bool dimension = background_length_token(text + start, n)
+            || (n == 4 && memcmp(text + start, "auto", 4) == 0)
+            || (n == 5 && memcmp(text + start, "cover", 5) == 0)
+            || (n == 7 && memcmp(text + start, "contain", 7) == 0);
+        bool coordinate = background_position_keyword(text + start, n)
+            || background_length_token(text + start, n);
+        char *out = after_slash ? size : position;
+        size_t *used = after_slash ? &size_length : &position_length;
+        if ((after_slash ? dimension : coordinate)
+            && n + (*used != 0) < 96u - *used) {
+            if (*used != 0) out[(*used)++] = ' ';
+            memcpy(out + *used, text + start, n);
+            *used += n;
+            out[*used] = '\0';
+        }
+    }
     ComputedStyle parsed = {0};
-    if (style_parse_background_shorthand_position(
-            sheet, copy, length, &parsed)) {
+    if (position_length != 0 && style_parse_background_position(
+            sheet, position, position_length, &parsed)) {
         layer->position_x = parsed.background_position_x;
         layer->position_y = parsed.background_position_y;
         layer->flags = (uint8_t) (
@@ -3200,8 +3281,13 @@ static void style_parse_background_layer_shorthand_geometry(
     } else if (strstr(copy, "repeat-y") != NULL) {
         layer->flags |= STYLE_BACKGROUND_NO_REPEAT_X;
     }
-    if (strstr(copy, "cover") != NULL) layer->fit = 1;
-    else if (strstr(copy, "contain") != NULL) layer->fit = 2;
+    if (size_length != 0 && style_parse_background_size(
+            sheet, size, size_length, &parsed)) {
+        layer->width = parsed.background_width;
+        layer->height = parsed.background_height;
+        layer->fit = parsed.background_fit;
+        layer->flags |= parsed.background_size_flags;
+    }
 }
 
 bool style_parse_background_shorthand_image(Stylesheet *sheet,
@@ -3339,135 +3425,33 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                 sheet, style, &stack, &retained)) return false;
         return gradient_count != 0 && retained;
     }
-    const char *layer = resolved + chosen_start;
-    size_t layer_length = chosen_end - chosen_start;
-    (void) style_parse_image_url(
-        sheet, resolved + chosen_image_start,
+    (void) style_parse_image_url(sheet, resolved + chosen_image_start,
         chosen_image_end - chosen_image_start, &style->background_image);
-    /* Under the three-layer PSP cap, preserve a trailing authored bitmap
-       rather than spending every retained slot on decorative gradients.
-       Hero art and sprites are commonly the final layer beneath several
-       translucent overlays; dropping that final URL produces a readable but
-       visibly empty panel. The first two (topmost) layers retain ordering and
-       the bottom retained slot becomes the asset-bearing layer. */
+    /* Keep the trailing asset under the bounded layer cap, with that
+       asset's own geometry rather than an earlier decoration's size. */
     size_t retained_chosen_layer = chosen_layer;
     if (chosen_layer >= STYLE_PAINT_LAYER_LIMIT
         && style->background_image != NULL) {
         retained_chosen_layer = STYLE_PAINT_LAYER_LIMIT - 1u;
-        StylePaintLayer *paint =
-            &stack.backgrounds[retained_chosen_layer];
+        StylePaintLayer *paint = &stack.backgrounds[retained_chosen_layer];
         memset(paint, 0, sizeof(*paint));
         paint->kind = STYLE_PAINT_IMAGE_URL;
         paint->image = style->background_image;
         paint->origin = STYLE_PAINT_BOX_PADDING;
         paint->clip = STYLE_PAINT_BOX_BORDER;
         stack.background_count = STYLE_PAINT_LAYER_LIMIT;
-    }
-    /* Tokenize the chosen layer: url()/color are consumed elsewhere, size
-       keywords ride behind a slash, repeat keywords toggle the repeat
-       flags, and the remaining keyword/length tokens are the position. */
-    char position[96];
-    size_t position_length = 0;
-    bool after_slash = false;
-    style->background_fit = 0;
-    for (size_t at = 0; at < layer_length;) {
-        while (at < layer_length
-               && isspace((unsigned char) layer[at])) at++;
-        size_t token_start = at;
-        int token_depth = 0;
-        char token_quote = 0;
-        while (at < layer_length) {
-            char c = layer[at];
-            if (token_quote != 0) {
-                if (c == token_quote) token_quote = 0;
-                at++;
-                continue;
-            }
-            if (c == '\'' || c == '"') { token_quote = c; at++; continue; }
-            if (c == '(') token_depth++;
-            else if (c == ')' && token_depth > 0) token_depth--;
-            else if (token_depth == 0 && isspace((unsigned char) c)) break;
-            at++;
-        }
-        const char *token = layer + token_start;
-        size_t token_length = at - token_start;
-        if (token_length == 0) continue;
-        if (token_length == 1 && token[0] == '/') { after_slash = true; continue; }
-        if (token_length >= 4 && memcmp(token, "url(", 4) == 0) continue;
-        const char *slash = memchr(token, '/', token_length);
-        if (slash != NULL) {
-            size_t before_length = (size_t) (slash - token);
-            const char *after = slash + 1;
-            size_t after_length = token_length - before_length - 1u;
-            if (before_length != 0
-                && (background_position_keyword(token, before_length)
-                    || background_length_token(token, before_length))) {
-                if (position_length != 0
-                    && position_length + 1 < sizeof(position)) {
-                    position[position_length++] = ' ';
-                }
-                if (position_length + before_length < sizeof(position)) {
-                    memcpy(position + position_length, token, before_length);
-                    position_length += before_length;
-                }
-            }
-            if (after_length == 5 && memcmp(after, "cover", 5) == 0) {
-                style->background_fit = 1;
-            } else if (after_length == 7
-                       && memcmp(after, "contain", 7) == 0) {
-                style->background_fit = 2;
-            }
-            after_slash = true;
-            continue;
-        }
-        if (token_length == 5 && memcmp(token, "cover", 5) == 0) {
-            style->background_fit = 1;
-            continue;
-        }
-        if (token_length == 7 && memcmp(token, "contain", 7) == 0) {
-            style->background_fit = 2;
-            continue;
-        }
-        if (after_slash) continue;
-        if (token_length == 9 && memcmp(token, "no-repeat", 9) == 0) {
-            style->background_size_flags |= STYLE_BACKGROUND_NO_REPEAT_X
-                                            | STYLE_BACKGROUND_NO_REPEAT_Y;
-            continue;
-        }
-        if (token_length == 8 && memcmp(token, "repeat-x", 8) == 0) {
-            style->background_size_flags |= STYLE_BACKGROUND_NO_REPEAT_Y;
-            continue;
-        }
-        if (token_length == 8 && memcmp(token, "repeat-y", 8) == 0) {
-            style->background_size_flags |= STYLE_BACKGROUND_NO_REPEAT_X;
-            continue;
-        }
-        if (background_position_keyword(token, token_length)
-            || background_length_token(token, token_length)) {
-            if (position_length != 0
-                && position_length + 1 < sizeof(position)) {
-                position[position_length++] = ' ';
-            }
-            if (position_length + token_length < sizeof(position)) {
-                memcpy(position + position_length, token, token_length);
-                position_length += token_length;
-            }
-        }
-    }
-    if (position_length != 0) {
-        position[position_length] = '\0';
-        (void) style_parse_background_position(sheet, position,
-                                               position_length, style);
+        style_parse_background_layer_shorthand_geometry(
+            sheet, resolved + chosen_start, chosen_end - chosen_start, paint);
     }
     if (retained_chosen_layer < stack.background_count
         && retained_chosen_layer < STYLE_PAINT_LAYER_LIMIT) {
         StylePaintLayer *paint = &stack.backgrounds[retained_chosen_layer];
-        paint->width = style->background_width;
-        paint->height = style->background_height;
-        paint->position_x = style->background_position_x;
-        paint->position_y = style->background_position_y;
-        paint->fit = style->background_fit;
-        paint->flags = style->background_size_flags;
+        style->background_width = paint->width;
+        style->background_height = paint->height;
+        style->background_position_x = paint->position_x;
+        style->background_position_y = paint->position_y;
+        style->background_fit = paint->fit;
+        style->background_size_flags = paint->flags;
     }
     bool retained = false;
     return style_apply_paint_stack(sheet, style, &stack, &retained)
@@ -3532,6 +3516,14 @@ static bool parse_style_length_components(Stylesheet *sheet,
 uint64_t style_parse_padding_box(Stylesheet *sheet, const char *text,
                                   size_t length, StyleEdges *edges)
 {
+    trim(&text, &length);
+    /* Padding is not inherited: these whole-shorthand keywords reset all
+       four sides, including previously cascaded control/author padding. */
+    if (span_case_equal(text, length, "initial")
+        || span_case_equal(text, length, "unset")) {
+        *edges = (StyleEdges) {0};
+        return S_PADDING_ALL;
+    }
     StyleLength values[4] = {0};
     size_t count = 0;
     if (!parse_style_length_components(sheet, text, length, values, 4,

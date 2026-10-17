@@ -2942,16 +2942,47 @@ static bool test_youtube_signin_continue_menu(void)
     PspUiState ui; psp_ui_init(&ui);
     ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
     ui.youtube_signin_continue = true;
-    ui.menu_selection = 7;
+    ui.menu_selection = 8;
     PspUiInput input = {.pressed = PSP_UI_BUTTON_DOWN, .analog_x = 128, .analog_y = 128};
     (void) psp_ui_update(&ui, &input);
-    CHECK(ui.menu_selection == 8);
+    CHECK(ui.menu_selection == 9);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE);
     ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
     ui.youtube_signin_continue = false;
-    ui.menu_selection = 8; /* Availability can change while a menu is open. */
+    ui.menu_selection = 9; /* Availability can change while a menu is open. */
     CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_OPEN_FIND);
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.menu_selection = 8;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_DOWNLOAD_LINK);
+    PspUiFileDownloadPreview preview = {.name = "homebrew.zip", .origin = "https://downloads.example.test"};
+    ui.scroll_y = 43;
+    psp_ui_show_file_download(&ui, &preview);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.scroll_y == 43
+        && ui.file_download_preview == NULL);
+    psp_ui_show_file_download(&ui, &preview);
+    input.pressed = PSP_UI_BUTTON_MENU;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.file_download_preview == NULL);
+    psp_ui_show_file_download(&ui, &preview);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.file_download_preview == NULL);
+    ZipInstallPreview zip = {.name = "Homebrew", .destination = "ms0:/PSP/GAME/Homebrew", .files = 3};
+    psp_ui_show_zip_install(&ui, &zip);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CANCEL_ZIP_INSTALL);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.zip_install_preview == NULL && ui.scroll_y == 43);
+    psp_ui_show_zip_install(&ui, &zip);
+    input.pressed = PSP_UI_BUTTON_MENU;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CANCEL_ZIP_INSTALL);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.zip_install_preview == NULL);
+    psp_ui_show_zip_install(&ui, &zip);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_update(&ui, &input).action == PSP_UI_ACTION_CONFIRM_ZIP_INSTALL);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.zip_install_preview == NULL);
     return true;
 }
 
@@ -6307,6 +6338,19 @@ static bool test_media_progress_mixed_glyph_baseline(void)
         NULL, NULL, NULL, NULL, NULL, NULL, 1024u * 1024u));
     const FontFace *face = font_set_face(&fonts, FONT_SANS);
     psp_ui_set_chrome_fonts(face, NULL, 2u);
+    /* Unicode geometry symbols must remain useful without an optional pack.
+       The outlined and filled forms share metrics, not their interior ink. */
+    FontGlyph outline = {0}, filled = {0};
+    CHECK(font_face_has_codepoint(face, 0x25b3u)
+          && font_face_has_codepoint(face, 0x25b2u)
+          && font_glyph_load(face, 0x25b3u, 16, false, &outline)
+          && font_glyph_load(face, 0x25b2u, 16, false, &filled));
+    CHECK(outline.width == filled.width && outline.height == filled.height
+          && outline.advance_fixed == filled.advance_fixed
+          && outline.pixels[8u * outline.width + 8u] == 0
+          && filled.pixels[8u * filled.width + 8u] != 0);
+    font_glyph_destroy(face, &filled);
+    font_glyph_destroy(face, &outline);
     FontGlyph zero = {0}, percent = {0};
     CHECK(font_glyph_load(face, '0', 11, false, &zero));
     CHECK(font_glyph_load(face, '%', 11, false, &percent));

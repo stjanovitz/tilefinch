@@ -45,10 +45,14 @@ bool layout_block_emit_decoration(
     /* Resolve optional focus geometry before borrowing any paint-stack
        pointers: resolving a new focus value can intern another stack. */
     StyleBoxShadow focus_shadow;
+    size_t focus_shadow_index = 0;
     bool outset_slot = context->focus_inset_slot_count < 64u
         && (node->local_name == LXB_TAG_A || node->local_name == LXB_TAG_BUTTON
+            || node->local_name == LXB_TAG_INPUT || node->local_name == LXB_TAG_TEXTAREA
+            || node->local_name == LXB_TAG_SELECT
             || document_attribute(node, "tabindex", NULL) != NULL)
-        && style_node_focus_outset_shadow(context->sheet, node, parent, style, &focus_shadow);
+        && style_node_focus_outset_shadow(context->sheet, node, parent, style,
+                                         &focus_shadow, &focus_shadow_index);
     if (outset_slot) context->focus_inset_slot_count++;
     const StylePaintStack *paint_stack = stylesheet_paint_stack(
         context->sheet, computed_style_paint_stack_id(style));
@@ -182,8 +186,10 @@ bool layout_block_emit_decoration(
     size_t shadow_command_count = 0;
     size_t box_shadow_count = stylesheet_box_shadow_count(
         context->sheet, style);
-    for (size_t i = outset_slot ? 1u : box_shadow_count; i-- > 0;) {
-        const StyleBoxShadow *shadow = outset_slot && box_shadow_count == 0 ? &focus_shadow
+    for (size_t i = box_shadow_count + (outset_slot && box_shadow_count == focus_shadow_index);
+         i-- > 0;) {
+        bool focus_layer = outset_slot && i == focus_shadow_index;
+        const StyleBoxShadow *shadow = focus_layer && i == box_shadow_count ? &focus_shadow
             : stylesheet_box_shadow(context->sheet, style, i);
         if (shadow == NULL) continue;
         if (style_box_shadow_is_inset(shadow)) continue;
@@ -193,8 +199,8 @@ bool layout_block_emit_decoration(
             color = style->color;
             alpha = style->color_alpha;
         }
-        if (outset_slot && box_shadow_count == 0) alpha = 0;
-        if (alpha == 0 && !outset_slot) continue;
+        if (focus_layer && i == box_shadow_count) alpha = 0;
+        if (alpha == 0 && !focus_layer) continue;
         int blur = style_box_shadow_blur(shadow);
         int spread = shadow->spread;
         int inflate = spread + blur;
@@ -219,8 +225,9 @@ bool layout_block_emit_decoration(
             && ((shadow->offset_x != 0) != (shadow->offset_y != 0));
         DrawCommand layer = {
             .type = DRAW_SHADOW_RECT,
-            .text = outset_slot || (box_shadow_count == 1 && blur == 0)
+            .text = focus_layer || (!outset_slot && box_shadow_count == 1 && blur == 0)
                 ? (const char *) node : NULL,
+            .font_weight = focus_layer ? (uint8_t) (i + 1u) : 0,
             .font_size = spread,
             .text_length = (uint16_t) (int16_t) shadow->offset_x
                 | ((uint32_t) (uint16_t) (int16_t) shadow->offset_y << 16),
@@ -236,7 +243,7 @@ bool layout_block_emit_decoration(
                          : outside_box ? LAYOUT_SHADOW_OUTSIDE_BOX : 0
         };
         if (layout_add_command(context->layout, layer) == NULL) {
-            if (outset_slot && alpha == 0) break;
+            if (focus_layer && alpha == 0) continue;
             return false;
         }
         shadow_command_count++;

@@ -1,3 +1,4 @@
+tilefinch-input-script: text-entry=danzeff
 tilefinch-input-script: armed script=input-script.txt steps=20 stall-limit=1800
 tilefinch-input-script: mark=glyph-options step=8 screen=glyph-options
 tilefinch-input-script: mark=removed step=14 screen=glyph-options

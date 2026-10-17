@@ -56,6 +56,34 @@ class CaptureReceiptTests(unittest.TestCase):
             self.assertFalse(census.complete_state(value))
             self.assertFalse(census.receipt_valid(value, {}, Path("/tmp")))
 
+    def test_receipt_accounts_only_proven_denied_preflight_parents(self):
+        state = self.complete_state()
+        audit = state['browser_request_audit']
+        audit.update(version='browser-request-audit-v3', observed=2,
+            preflight_denied_parents=1, failures=[dict(expected=True,
+                reason='denied-preflight-parent', method='GET', type='fetch',
+                error='net::ERR_BLOCKED_BY_CLIENT')])
+        self.assertTrue(census.complete_state(state))
+        for field, value in [('preflight_denied_parents', True),
+                             ('preflight_denied_parents', -1),
+                             ('preflight_denied_parents', 2),
+                             ('observed', 3), ('intercepted', True),
+                             ('version', 'browser-request-audit-v2'),
+                             ('ready', False), ('pending', 1), ('overflow', True)]:
+            original = audit[field]
+            audit[field] = value
+            self.assertFalse(census.complete_state(state), (field, value))
+            audit[field] = original
+        failure = audit['failures'][0]
+        for field, value in [('reason', 'declared-policy'), ('expected', False),
+                             ('method', 'POST'), ('error', 'net::ERR_FAILED')]:
+            original = failure[field]
+            failure[field] = value
+            self.assertFalse(census.complete_state(state), (field, value))
+            failure[field] = original
+        audit['failures'] = []
+        self.assertFalse(census.complete_state(state))
+
     def test_whole_attempt_timeout_is_terminal(self):
         with tempfile.TemporaryFile() as log:
             self.assertEqual(census.run_bounded([sys.executable, "-c", "import time;time.sleep(60)"],
@@ -111,6 +139,24 @@ class CaptureReceiptTests(unittest.TestCase):
         state["full_document"]["full_screenshot"] = True
         self.assertFalse(census.complete_state(state))
 
+    def test_long_discussion_receipt_requires_all_views_and_bounded_extent(self):
+        state = self.complete_state()
+        full = state['full_document']
+        for view in full['viewports']:
+            view.update(document_height=200000, maximum=199728,
+                        scroll_y=int(199728 * view['fraction']),
+                        requested=int(199728 * view['fraction']))
+        full['final_extent'].update(height=200000, maximum=199728)
+        self.assertTrue(census.complete_state(state))
+        full['viewports'][2]['document_height'] = 199999
+        self.assertFalse(census.complete_state(state))
+        for view in full['viewports']:
+            view.update(document_height=262145, maximum=261873,
+                        scroll_y=int(261873 * view['fraction']),
+                        requested=int(261873 * view['fraction']))
+        full['final_extent'].update(height=262145, maximum=261873)
+        self.assertFalse(census.complete_state(state))
+
     def test_geometry_retry_requires_preserved_screenshots(self):
         state = {"checkpoints": [], "full_document": {"geometry_attempts": [{
             "directory": "geometry-attempt-1", "views": [
@@ -147,7 +193,7 @@ class BrowserCaptureTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def capture(self, directory, *, missing=False, full=True, iframe=False, viewport_units=False, corrupt_frame_image=False, hidden_frame=False, pointer_media=False):
+    def capture(self, directory, *, missing=False, full=True, iframe=False, viewport_units=False, corrupt_frame_image=False, hidden_frame=False, pointer_media=False, long_document=False):
         trace = directory / "trace"
         trace.mkdir()
         # Native lazy loading requires the scroll sweep; the hidden broken
@@ -159,6 +205,8 @@ class BrowserCaptureTests(unittest.TestCase):
 document.title='Capture fixture invalid input';</script>
 <h1>Fixture ready</h1><img src="/redirect.svg"><div style="height:800px"></div>
 <img loading="lazy" src="/lazy.svg"><img hidden src="/hidden.svg">'''
+        if long_document:
+            html += b'<div style="height:65000px"></div><p>Discussion end</p>'
         if viewport_units:
             html += (b'<div style="height:100vh;background:#00ff00"></div>'
                      b'<div style="height:16px;background:#0000ff"></div>')
@@ -234,6 +282,15 @@ document.title='Capture fixture invalid input';</script>
             self.assertEqual(state["full_document"]["full_screenshot_status"], "omitted-mobile-emulation")
             self.assertEqual(state["full_document"]["viewports"][-1]["incomplete"], 0)
             self.assertEqual(state["replay_ledger"]["requests"], 5)
+
+    def test_long_discussion_is_swept_without_allocating_a_full_page_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, state, output = self.capture(Path(temp), long_document=True)
+            self.assertEqual(result.returncode, 0, json.dumps(state, indent=2))
+            self.assertGreater(state['full_document']['steps'], 256)
+            self.assertGreater(state['full_document']['final_extent']['height'], 65000)
+            self.assertTrue(census.complete_state(json.loads((output / 'reference-state.json').read_text())))
+            self.assertFalse((output / 'full-page.png').exists())
 
     def test_corrupt_painted_child_image_refuses_complete_capture(self):
         for full in (False, True):

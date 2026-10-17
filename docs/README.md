@@ -48,8 +48,8 @@ Tilefinch's documentation has three layers:
   proposals/import kinds.
 - [Direct multiplayer](MULTIPLAYER.md): the RTCDataChannel-shaped installed-game
   API, LAN discovery, numeric invites, UDP hole punching, bounds, and limits.
-- [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots and
-  resumable YouTube downloads, including storage and trust boundaries.
+- [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots, offline
+  apps, and resumable file/video downloads, including storage and trust boundaries.
 - [Memory Stick storage](STORAGE.md): the complete on-stick layout map,
   per-file size bounds and eviction, crash-safety disciplines, and
   free-space requirements.

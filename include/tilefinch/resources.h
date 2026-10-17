@@ -200,8 +200,11 @@ typedef struct {
     double started_ms;
     double deadline_ms;
     uint64_t processed_sources;
+    uint64_t required_faces;
+    uint64_t preferred_faces;
     uint8_t required_families;
     bool usage_filter;
+    bool face_usage_filter;
     bool cancelled;
     bool active;
 } ExternalFontLoader;
@@ -637,6 +640,10 @@ bool fonts_external_loader_pending(const ExternalFontLoader *loader);
    Standalone loaders retain declaration-order behavior until this is set. */
 void fonts_external_loader_set_usage(ExternalFontLoader *loader,
     const Stylesheet *sheet, uint8_t required_families);
+void fonts_external_loader_set_face_usage(ExternalFontLoader *loader,
+    const Stylesheet *sheet, uint64_t required_faces);
+void fonts_external_loader_prioritize_faces(ExternalFontLoader *loader,
+    const Stylesheet *sheet, uint64_t required_faces, uint64_t preferred_faces);
 
 bool images_load_external(const PocDocument *document, Stylesheet *stylesheet,
                           ImageResources *images,

@@ -18,21 +18,36 @@ class ResourceTests(unittest.TestCase):
         resources = ROOT / "_resource_identity_probe"
         historical = hashlib.sha256()
         for path, data in sorted(generator.outputs(resources).items()):
-            if path.is_relative_to(resources) and path.parent.name != "v10":
+            if path.is_relative_to(resources) and int(path.parent.name[1:]) <= 10:
                 historical.update(path.relative_to(resources).as_posix().encode() + b"\0" + data)
-        # Fixed before v10: every previously published resource remains exact.
+        # Fixed before v11: every previously published resource remains exact.
         self.assertEqual(historical.hexdigest(),
-            "4d5ee67d4d2d0c381067921cde86afea008cc03403f5d6654dccbf8201760947")
+            "43644306dca44836cd686c6556e914169eea13723bcdec28d755e3d33f503b7f")
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v10/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v10/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v11/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v11/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v10/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v10/as.tful"', manifest)
+        self.assertIn('"translations/ui/v11/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v11/as.tful"', manifest)
+
+    def test_download_labels_have_translations(self):
+        rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
+        labels = {row[0]: row[1:] for row in rows}
+        required = {"Save file?", "Install homebrew?", "Remove homebrew?",
+            "Installed homebrew", "Manage apps installed by Tilefinch", "Downloads",
+            "The whole app folder will be deleted.", "Saved data inside it will also be deleted.",
+            "Downloaded ZIP files are kept.", "X Save   O Cancel", "X Install   O Cancel",
+            "X Remove   O Cancel", "PRESS SQUARE AGAIN TO DELETE", "File saved",
+            "X DETAILS   SQUARE DELETE   L/R SECTION", "SQUARE DELETE   O CANCEL"}
+        self.assertLessEqual(required, labels.keys())
+        for key in required - {"Downloads"}:
+            self.assertTrue(all(value != key for value in labels[key]), key)
+        header = (ROOT / "include/tilefinch/ui_language.h").read_text()
+        self.assertLessEqual(len(rows), int(re.search(r"TILEFINCH_UI_TRANSLATION_ROWS (\d+)u", header).group(1)))
 
     def test_build_resource_list_includes_each_immutable_download(self):
         listed = subprocess.check_output([sys.executable, str(ROOT / "tools/generate_ui_translations.py"),

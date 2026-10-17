@@ -81,10 +81,30 @@ def complete_state(state) -> bool:
         return False
     audit, targets, full = (state.get(name) for name in
                             ("browser_request_audit", "target_interception", "full_document"))
+    if not isinstance(audit, dict):
+        return False
+    # CDP never intercepts a parent whose exact preflight was denied. The
+    # browser audit proves that linkage and its blocked completion; require
+    # the v3 count and each matching failure, not an arbitrary count waiver.
+    denied = audit.get("preflight_denied_parents", 0)
+    failures = audit.get("failures")
+    if (type(denied) is not int or not 0 <= denied <= 512
+            or not isinstance(failures, list)
+            or any(not isinstance(failure, dict) for failure in failures)):
+        return False
+    parents = [failure for failure in failures
+               if failure.get("reason") == "denied-preflight-parent"]
+    if (len(parents) != denied
+            or (denied and audit.get("version") != "browser-request-audit-v3")
+            or any(failure.get("method") not in ("GET", "HEAD")
+                   or failure.get("error") != "net::ERR_BLOCKED_BY_CLIENT"
+                   for failure in parents)):
+        return False
     if (not isinstance(audit, dict) or audit.get("ready") is not True
             or audit.get("pending") != 0 or audit.get("overflow") is not False
             or type(audit.get("observed")) is not int or audit["observed"] < 1
-            or audit.get("intercepted") != audit["observed"]
+            or type(audit.get("intercepted")) is not int or audit["intercepted"] < 0
+            or audit["intercepted"] + denied != audit["observed"]
             or not isinstance(audit.get("failures"), list)
             or any(not isinstance(failure, dict) or failure.get("expected") is not True
                    for failure in audit["failures"])
@@ -108,8 +128,8 @@ def complete_state(state) -> bool:
                 or view.get("frame") != f"view-{percentage}.png" or view.get("ready") is not True
                 or view.get("incomplete") != 0 or view.get("truncated") is not False):
             return False
-        for field, maximum in (("document_width", 2048), ("document_height", 61440),
-                               ("maximum", 61440), ("scroll_y", 61440), ("requested", 61440)):
+        for field, maximum in (("document_width", 2048), ("document_height", 262144),
+                               ("maximum", 262144), ("scroll_y", 262144), ("requested", 262144)):
             if type(view.get(field)) is not int or not 0 <= view[field] <= maximum:
                 return False
         if (view["document_width"] < 1 or view["document_height"] < 1

@@ -99,7 +99,7 @@ int test_deferred_startup_journey(void)
             }
             CHECK(!nav->page.image_continuation_pending
                 && nav->performance.background_images_loaded == 3u
-                && nav->performance.background_image_relayouts == 2u
+                && nav->performance.background_image_relayouts == 0u
                 && images_find_node(&nav->page.images,
                     test_reader_find_id(root, "hidden")) == NULL
                 && images_find_node(&nav->page.images,
@@ -121,7 +121,7 @@ int test_deferred_startup_journey(void)
             }
             CHECK(!nav->page.image_continuation_pending
                 && image_resource_available(images_find_node(&nav->page.images, tail))
-                && nav->performance.background_image_relayouts == 2);
+                && nav->performance.background_image_relayouts == 0);
             fprintf(stderr, "image-queue-settle: loaded=%zu relayouts=%zu rank-scans=%zu layout-us=%llu\n",
                 nav->performance.background_images_loaded,
                 nav->performance.background_image_relayouts,

@@ -12,12 +12,14 @@
 #include "tilefinch/psp_ui.h"
 
 typedef struct PspOfflineAppPreparation PspOfflineAppPreparation;
+typedef struct PspFileDownloadOffer PspFileDownloadOffer;
 
 typedef enum {
     PSP_OFFLINE_ROUTE_NONE = 0,
     PSP_OFFLINE_ROUTE_PAGE,
     PSP_OFFLINE_ROUTE_STATE_CHANGED,
-    PSP_OFFLINE_ROUTE_ERROR
+    PSP_OFFLINE_ROUTE_ERROR,
+    PSP_OFFLINE_ROUTE_ZIP_PREVIEW
 } PspOfflineRouteResult;
 
 typedef struct {
@@ -27,6 +29,9 @@ typedef struct {
     unsigned char *app_icon_cache;
     uint32_t app_icon_ids[OFFLINE_LIBRARY_ITEM_LIMIT];
     PspOfflineAppPreparation *app_preparation;
+    PspFileDownloadOffer *file_offer;
+    ZipInstall *zip_install;
+    const char *game_directory; /* Trusted frontend path; borrowed lifetime. */
     uint32_t last_active_id;
     char status[80];
     /* Optional: shows progress text (install, preview, recompile) while
@@ -58,6 +63,15 @@ const PspUiOfflineAppPreview *psp_offline_store_app_preview(
     const PspOfflineStore *store);
 bool psp_offline_store_open_library(
     PspOfflineStore *store, BrowserEngine *engine, bool record_history);
+/* No filesystem or network access until the native confirmation is accepted. */
+bool psp_offline_store_offer_file(PspOfflineStore *store,
+                                 BrowserEngine *engine, const char *url);
+bool psp_offline_store_take_download_offer(PspOfflineStore *store, BrowserEngine *engine);
+const PspUiFileDownloadPreview *psp_offline_store_file_preview(const PspOfflineStore *store);
+bool psp_offline_store_accept_file(PspOfflineStore *store);
+void psp_offline_store_discard_file(PspOfflineStore *store);
+bool psp_offline_store_install_prepared_zip(PspOfflineStore *store);
+void psp_offline_store_discard_zip(PspOfflineStore *store);
 PspOfflineRouteResult psp_offline_store_handle_url(
     PspOfflineStore *store, BrowserEngine *engine,
     const BrowserProfile *profile, const char *url, const char *source_title,

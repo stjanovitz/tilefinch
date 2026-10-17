@@ -257,28 +257,6 @@ static void box_visual_origin(const LayoutDocument *layout,
     }
 }
 
-static void overflow_clip_rect(const LayoutNodeBox *box, int visual_x,
-                               int visual_y, int *left, int *top,
-                               int *right, int *bottom)
-{
-    StyleOverflowClipBox clip_box = layout_node_box_clip_box(box);
-    int margin = (int) layout_node_box_clip_margin(box);
-    int width = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->width
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->width - 2 * box->clip_inset_left : box->client_width);
-    int height = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->height
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->height - 2 * box->clip_inset_top : box->client_height);
-    if (width < 0) width = 0;
-    if (height < 0) height = 0;
-    *left = visual_x + box->clip_inset_left - margin;
-    *top = visual_y + box->clip_inset_top - margin;
-    *right = *left + width + 2 * margin;
-    *bottom = *top + height + 2 * margin;
-}
-
 static int overflow_clip_radius(const LayoutDocument *layout,
                                 const LayoutNodeBox *box)
 {
@@ -310,7 +288,7 @@ static bool overflow_command_geometry(const LayoutDocument *layout,
         int x = 0, y = 0;
         box_visual_origin(layout, box, &x, &y);
         int left, top, right, bottom;
-        overflow_clip_rect(box, x, y, &left, &top, &right, &bottom);
+        layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         if (box->clips_x) {
             if (left > *clip_left) *clip_left = left;
             if (right < *clip_right) *clip_right = right;
@@ -632,7 +610,7 @@ static size_t overflow_rounded_clips(const LayoutDocument *layout,
         int x = 0, y = 0;
         box_visual_origin(layout, box, &x, &y);
         int left, top, right, bottom;
-        overflow_clip_rect(box, x, y, &left, &top, &right, &bottom);
+        layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         int radius = overflow_clip_radius(layout, box);
         if (style_border_radius_maximum(radius) <= 0) continue;
         clips[count++] = (RoundedClip) {
@@ -1029,8 +1007,8 @@ static bool overflow_cache_prepare(TileCache *cache)
             geometry->dx -= box->scroll_x;
             geometry->dy -= box->scroll_y;
             int left, top, right, bottom;
-            overflow_clip_rect(box, clip->visual_x, clip->visual_y,
-                               &left, &top, &right, &bottom);
+            layout_node_box_clip_rect(box, clip->visual_x, clip->visual_y,
+                                      &left, &top, &right, &bottom);
             if (box->clips_x) {
                 if (left > geometry->clip_left) {
                     geometry->clip_left = left;
@@ -1100,8 +1078,8 @@ static bool append_cached_rounded_clip(const LayoutDocument *layout,
         || layout_node_box_clip_radius(box) == 0) return true;
     if (*count >= capacity) return false;
     int left, top, right, bottom;
-    overflow_clip_rect(box, clip->visual_x, clip->visual_y,
-                       &left, &top, &right, &bottom);
+    layout_node_box_clip_rect(box, clip->visual_x, clip->visual_y,
+                              &left, &top, &right, &bottom);
     int radius = overflow_clip_radius(layout, box);
     if (style_border_radius_maximum(radius) <= 0) return true;
     clips[(*count)++] = (RoundedClip) {

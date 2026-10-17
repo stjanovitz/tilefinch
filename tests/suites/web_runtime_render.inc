@@ -670,6 +670,46 @@ static int test_web_runtime(void)
     CHECK(budget.current == 0);
 #endif
 
+    puts("test: pending reservations do not truncate otherwise affordable images");
+    static const char reserved_image_page[] =
+        "<!doctype html><body><img src='https://interactive-images.test/hero.svg'>"
+        "<img src='https://interactive-images.test/tail.svg'>";
+    PocDocument reserved_document = {0};
+    Stylesheet reserved_sheet = {0};
+    char reserved_error[256] = {0};
+    CHECK(document_parse(&reserved_document, &budget, reserved_image_page,
+                         sizeof(reserved_image_page) - 1u, 17)
+          && stylesheet_build(&reserved_sheet, &budget, &reserved_document, 480));
+    /* The 107- and 109-byte responses fit together. Reserving the first
+       request's 160-byte ceiling must not give the second an 80-byte cap.
+       Exact-fit admission succeeds too; a genuinely insufficient total
+       still refuses the second response and releases every reservation. */
+    const size_t reserved_limits[] = {240, 216, 215};
+    const size_t reserved_retained = budget.current;
+    for (size_t at = 0; at < sizeof(reserved_limits) / sizeof(reserved_limits[0]); at++) {
+        ImageResources reserved_images = {0};
+        bool fits = reserved_limits[at] >= 216;
+        CHECK(fetch_trace_replay_begin_response_keyed(
+                  TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
+                  reserved_error, sizeof(reserved_error))
+              && images_load_external(&reserved_document, &reserved_sheet,
+                  &reserved_images, &budget, "https://interactive-images.test/page",
+                  "https://interactive-images.test/page", NULL,
+                  2, reserved_limits[at], 160, 4096, 1000, NULL, NULL));
+        FetchTraceReplayStats reserved_ledger = {0};
+        CHECK(fetch_trace_replay_stats(&reserved_ledger)
+              && reserved_images.stats.loaded == (fits ? 2u : 1u)
+              && reserved_images.stats.encoded_bytes == (fits ? 216u : 107u)
+              && reserved_ledger.invalid_route_request_count == (fits ? 0u : 1u)
+              && reserved_ledger.unmatched_request_count == 0);
+        fetch_trace_end();
+        images_destroy(&reserved_images);
+        CHECK(budget.current == reserved_retained);
+    }
+    stylesheet_destroy(&reserved_sheet);
+    document_destroy(&reserved_document);
+    CHECK(budget.current == 0);
+
     puts("test: layout-sized priority raster decode");
     static const char layout_sized_page[] =
         "<!doctype html><body><img id=thumb width=1 height=1 "

@@ -21,7 +21,11 @@
     }
     return start === 0 ? text : output + text.slice(start);
   };
-  const cssName = globalThis.__tilefinchCssName;
+  const cssName = globalThis.__tilefinchCssName,
+    NativeWeakMap = WeakMap,
+    defineProperties = Object.defineProperties,
+    ownDescriptors = Object.getOwnPropertyDescriptors,
+    createObject = Object.create;
   const activeEffects = new Map(),
     authoredTargets = new Map(),
     effectLimit = 32,
@@ -1442,46 +1446,59 @@
     }
     return raw;
   };
-  globalThis.__tilefinchMakeStyle = (handle) => {
-    let cssomFallback = null;
-    const authoredStyle = () =>
-        __tilefinchGetAttribute(handle, "style") || "",
+  /* Most small documents never read an inline declaration. Keep the shared
+     implementation lazy too, rather than increasing their startup heap. */
+  const makeInlineStyleFactory = () => {
+  const states = new NativeWeakMap(),
+    placeLonghands = {
+      "place-items": ["align-items", "justify-items"],
+      "place-self": ["align-self", "justify-self"],
+      "place-content": ["align-content", "justify-content"],
+    };
+  /* A style declaration retains its handle and optional fallback values,
+     not a fresh collection of executable closures for every DOM element. */
+  const prototype = {
+    authoredStyle() {
+      return __tilefinchGetAttribute(this.handle, "style") || "";
+    },
       /* Only a custom element observes its style attribute. Others need
          no before/after snapshot, which costs two attribute reads per
          write; undefined marks "not observed" for notifyStyle. */
-      observedStyle = () =>
-        globalThis.__tilefinchCustomElementAttributeChanged &&
-        globalThis.__tilefinchWrap?.(handle)
+    observedStyle() {
+      return globalThis.__tilefinchCustomElementAttributeChanged &&
+        globalThis.__tilefinchWrap?.(this.handle)
           ?.__tilefinchCustomElementState === "custom"
-          ? authoredStyle()
-          : undefined,
-      notifyStyle = (oldValue) => {
+          ? this.authoredStyle()
+          : undefined;
+    },
+    notifyStyle(oldValue) {
         if (oldValue === undefined) return;
-        const newValue = authoredStyle();
+        const newValue = this.authoredStyle();
         if (newValue === oldValue) return;
         globalThis.__tilefinchCustomElementAttributeChanged?.(
-          globalThis.__tilefinchWrap?.(handle),
+          globalThis.__tilefinchWrap?.(this.handle),
           "style",
           oldValue || null,
           newValue || null,
           null,
         );
-      };
-    const writeRaw = (name, value) => {
+    },
+    writeRaw(name, value) {
         try {
-          if (__tilefinchStyleSet(handle, name, value)) {
-            cssomFallback?.delete(name);
-            globalThis.__tilefinchQueueFocusFixup?.(handle);
+          if (__tilefinchStyleSet(this.handle, name, value)) {
+            this.cssomFallback?.delete(name);
+            globalThis.__tilefinchQueueFocusFixup?.(this.handle);
             return true;
           }
         } catch (error) {
           if (error !== null) throw error;
         }
-        if (value === "") cssomFallback?.delete(name);
-        else (cssomFallback || (cssomFallback = new Map())).set(name, value);
+        if (value === "") this.cssomFallback?.delete(name);
+        else (this.cssomFallback || (this.cssomFallback = new Map())).set(name, value);
         return true;
-      },
-      write = (name, value) => {
+    },
+    write(name, value) {
+        const handle = this.handle;
         const key = effectKey(handle, name);
         cancelEffect(key);
         if (
@@ -1489,7 +1506,7 @@
           name.startsWith("transition") ||
           name.startsWith("animation")
         ) {
-          const written = writeRaw(name, value);
+          const written = this.writeRaw(name, value);
           if (name.startsWith("animation")) {
             try {
               globalThis.__tilefinchEnsureMotionBootstrap?.();
@@ -1506,13 +1523,13 @@
            one read and a case-insensitive scan rule them out before the two
            declaration lookups. */
         const transitionHint =
-          (/transition/i.test(authoredStyle()) &&
+          (/transition/i.test(this.authoredStyle()) &&
             (__tilefinchStyleGet(handle, "transition-duration") ||
               __tilefinchStyleGet(handle, "transition"))) ||
-          cssomFallback?.get("transition-duration") ||
-          cssomFallback?.get("transition");
+          this.cssomFallback?.get("transition-duration") ||
+          this.cssomFallback?.get("transition");
         if (!transitionHint) {
-          const written = writeRaw(name, value);
+          const written = this.writeRaw(name, value);
           globalThis.__tilefinchTransitionsDirty?.(handle);
           return written;
         }
@@ -1520,7 +1537,7 @@
           before = node
             ? getComputedStyle(node).getPropertyValue(name)
             : "";
-        if (!writeRaw(name, value) || !node) return true;
+        if (!this.writeRaw(name, value) || !node) return true;
         const timing = computedTransitionTiming(node, name);
         if (
           timing &&
@@ -1530,7 +1547,7 @@
         ) {
           let effect = null;
           if (timing.duration > 0) {
-            writeRaw(name, before);
+            this.writeRaw(name, before);
             effect = scheduleEffect({
               handle,
               property: name,
@@ -1539,47 +1556,43 @@
               duration: Math.min(durationLimit, timing.duration),
               /* A negative delay starts the effect part-way through. */
               delay: Math.min(durationLimit, timing.delay),
-              writeRaw,
+              writeRaw: (property, next) => this.writeRaw(property, next),
             });
-            if (!effect) writeRaw(name, value);
+            if (!effect) this.writeRaw(name, value);
           }
           startTransition(node, name, timing.duration, timing.delay, "inline",
             effect);
         }
         globalThis.__tilefinchTransitionsDirty?.(handle);
         return true;
-      },
-      clearFlex = () => {
-        write("flex", "");
-        write("flex-grow", "");
-        write("flex-shrink", "");
-        write("flex-basis", "");
-      },
-      placeLonghands = {
-        "place-items": ["align-items", "justify-items"],
-        "place-self": ["align-self", "justify-self"],
-        "place-content": ["align-content", "justify-content"],
-      },
-      clearPlace = (name) => {
+    },
+    clearFlex() {
+        this.write("flex", "");
+        this.write("flex-grow", "");
+        this.write("flex-shrink", "");
+        this.write("flex-basis", "");
+    },
+    clearPlace(name) {
         const longhands = placeLonghands[name];
-        write(name, "");
-        write(longhands[0], "");
-        write(longhands[1], "");
-      };
-    const base = {
+        this.write(name, "");
+        this.write(longhands[0], "");
+        this.write(longhands[1], "");
+    },
+  };
+  const descriptors = ownDescriptors({
       get cssText() {
-        return authoredStyle();
+        return states.get(this).authoredStyle();
       },
       set cssText(value) {
-        const oldValue = observedStyle();
+        const state = states.get(this), oldValue = state.observedStyle();
         value = String(value);
-        __tilefinchSetAttribute(handle, "style", value);
-        globalThis.__tilefinchTransitionsDirty?.(handle);
-        globalThis.__tilefinchQueueFocusFixup?.(handle);
-        notifyStyle(oldValue);
+        __tilefinchSetAttribute(state.handle, "style", value);
+        globalThis.__tilefinchTransitionsDirty?.(state.handle);
+        globalThis.__tilefinchQueueFocusFixup?.(state.handle);
+        state.notifyStyle(oldValue);
       },
       setProperty(name, value, priority = "") {
-        const oldValue = observedStyle();
+        const state = states.get(this), oldValue = state.observedStyle();
         try {
         name = cssName(name);
         if (name === "--") return false;
@@ -1595,11 +1608,11 @@
         if (name === "flex") {
           const parsed = canonicalFlex(value);
           if (parsed === null) return false;
-          write("flex", "");
+          state.write("flex", "");
           return (
-            write("flex-grow", prioritized(parsed.grow)) &&
-            write("flex-shrink", prioritized(parsed.shrink)) &&
-            write("flex-basis", prioritized(parsed.basis))
+            state.write("flex-grow", prioritized(parsed.grow)) &&
+            state.write("flex-shrink", prioritized(parsed.shrink)) &&
+            state.write("flex-basis", prioritized(parsed.basis))
           );
         }
         if (placeLonghands[name]) {
@@ -1610,28 +1623,29 @@
               longhands[1],
             );
           if (parsed === null) return false;
-          write(name, "");
+          state.write(name, "");
           return (
-            write(longhands[0], prioritized(parsed[0])) &&
-            write(longhands[1], prioritized(parsed[1]))
+            state.write(longhands[0], prioritized(parsed[0])) &&
+            state.write(longhands[1], prioritized(parsed[1]))
           );
         }
         if (scrollBoxLonghands[name]) {
           const parsed = canonicalScrollBox(name, value);
           if (parsed === null) return false;
           const expanded = expandScrollBox(parsed);
-          write(name, "");
+          state.write(name, "");
           return scrollBoxLonghands[name].every((longhand, index) =>
-            write(longhand, prioritized(expanded[index])),
+            state.write(longhand, prioritized(expanded[index])),
           );
         }
         const canonical = canonicalValue(name, value);
-        return canonical === null ? false : write(name, prioritized(canonical));
+        return canonical === null ? false : state.write(name, prioritized(canonical));
         } finally {
-          notifyStyle(oldValue);
+          state.notifyStyle(oldValue);
         }
       },
       getPropertyValue(name) {
+        const state = states.get(this);
         name = cssName(name);
         if (name === "flex") {
           const grow = this.getPropertyValue("flex-grow"),
@@ -1659,16 +1673,17 @@
               this.getPropertyValue(longhand),
             ),
           );
-        const target = authoredTargets.get(effectKey(handle, name));
+        const target = authoredTargets.get(effectKey(state.handle, name));
         const value = (
           target ??
-          __tilefinchStyleGet(handle, name) ??
-          cssomFallback?.get(name) ??
+          __tilefinchStyleGet(state.handle, name) ??
+          state.cssomFallback?.get(name) ??
           ""
         );
         return String(value).replace(/\s*!\s*important\s*$/i, "");
       },
       getPropertyPriority(name) {
+        const state = states.get(this);
         name = cssName(name);
         const longhands = name === "flex"
           ? ["flex-grow", "flex-shrink", "flex-basis"]
@@ -1679,36 +1694,48 @@
             this.getPropertyPriority(longhand) === "important")
             ? "important" : "";
         const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-          match = authoredStyle().match(
+          match = state.authoredStyle().match(
             new RegExp("(?:^|;)\\s*" + escaped +
               "\\s*:[^;]*!\\s*important\\s*(?:;|$)", "i"));
         return match ? "important" : "";
       },
       removeProperty(name) {
-        const oldStyle = observedStyle();
+        const state = states.get(this), oldStyle = state.observedStyle();
         name = cssName(name);
         const old = this.getPropertyValue(name);
-        if (name === "flex") clearFlex();
-        else if (placeLonghands[name]) clearPlace(name);
+        if (name === "flex") state.clearFlex();
+        else if (placeLonghands[name]) state.clearPlace(name);
         else if (scrollBoxLonghands[name]) {
-          write(name, "");
+          state.write(name, "");
           for (const longhand of scrollBoxLonghands[name])
-            write(longhand, "");
+            state.write(longhand, "");
         }
-        else write(name, "");
-        notifyStyle(oldStyle);
+        else state.write(name, "");
+        state.notifyStyle(oldStyle);
         return old;
       },
-    };
-    return declarationProxy(base, () => declaredNames(authoredStyle()), (
-      target, name, value) => {
-        if (name === "cssText") {
-          target.cssText = value;
-          return true;
-        }
-        target.setProperty(name, value);
-        return true;
-      });
+    });
+  const setDeclaration = (target, name, value) => {
+    if (name === "cssText") target.cssText = value;
+    else target.setProperty(name, value);
+    return true;
+  };
+  return (handle) => {
+    const state = createObject(prototype),
+      base = defineProperties({}, descriptors);
+    state.handle = handle;
+    state.cssomFallback = null;
+    states.set(base, state);
+    const proxy = declarationProxy(base, () => declaredNames(state.authoredStyle()),
+                                   setDeclaration);
+    states.set(proxy, state);
+    return proxy;
+  };
+  };
+  let inlineStyleFactory;
+  globalThis.__tilefinchMakeStyle = (handle) => {
+    inlineStyleFactory ||= makeInlineStyleFactory();
+    return inlineStyleFactory(handle);
   };
   globalThis.__tilefinchMakeDetachedStyle = (node) => {
     let text = "", values = Object.create(null), priorities = Object.create(null),

@@ -220,11 +220,8 @@ static bool dump_text_metrics(const char *path, const LayoutDocument *layout)
             layout->fonts, layout->web_fonts,
             draw_command_font_family(command),
             draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
-        bool synthetic_bold = weight >= 550u
-            && (face == NULL || face->authored_weight != weight)
-            && (weight < 650u
-                || !font_context_face_is_bold(
-                    layout->fonts, layout->web_fonts, face));
+        bool synthetic_bold = font_face_needs_synthetic_bold(
+            layout->fonts, layout->web_fonts, face, weight);
         int advance_fixed = text_metrics_advance_fixed(
             layout, command, face, synthetic_bold);
         int line_baseline = font_line_baseline_at_size(

@@ -1,6 +1,13 @@
-bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge)
+bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
+                                           lxb_dom_node_t *node)
 {
     if (bridge == NULL || bridge->synchronous_layout == NULL) return false;
+    if (bridge->synchronous_layout_images_only) {
+        size_t length = 0;
+        const char *name = document_element_name(node, &length);
+        if (name == NULL || length != 3 || memcmp(name, "img", 3) != 0)
+            return false;
+    }
     uint64_t started = js_rt_monotonic_time_ns();
     unsigned split = script_split_enter(SCRIPT_SPLIT_LAYOUT);
     bool flushed = bridge->synchronous_layout(bridge->synchronous_layout_opaque);

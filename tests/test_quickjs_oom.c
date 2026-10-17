@@ -2900,6 +2900,67 @@ static int run_context_creation_refusals(void)
     return 0;
 }
 
+static JSValue autoinit_fixture_function(JSContext *context, JSValueConst self,
+                                         int argc, JSValueConst *argv)
+{
+    (void) context; (void) self; (void) argc; (void) argv;
+    return JS_UNDEFINED;
+}
+
+static int run_global_autoinit_refusals(void)
+{
+    for (unsigned once = 0; once < 2; once++) {
+        bool reached = true;
+        size_t point;
+        for (point = 0; reached && point < 64; point++) {
+            RegexpGuardState state = { .refuse_from = SIZE_MAX };
+            JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+            JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
+            if (context == NULL) return 1;
+            JSValue global = JS_GetGlobalObject(context);
+            /* A single built-in may fit in existing arenas. Materialize
+               enough lazy global functions to cross every arena boundary. */
+            char names[128][24];
+            JSCFunctionListEntry entries[128];
+            for (unsigned i = 0; i < 128; i++) {
+                snprintf(names[i], sizeof(names[i]), "autoinitFixture%u", i);
+                entries[i] = (JSCFunctionListEntry) JS_CFUNC_DEF(
+                    names[i], 0, autoinit_fixture_function);
+            }
+            if (JS_SetPropertyFunctionList(context, global, entries, 128) < 0)
+                return 1;
+            size_t start = state.calls;
+            state.refuse_from = start + point;
+            state.refuse_count = once ? 1u : 0u;
+            bool okay = true;
+            for (unsigned i = 0; i < 128; i++) {
+                JSValue value = JS_GetPropertyStr(context, global, names[i]);
+                bool exception = JS_IsException(value);
+                okay = exception || JS_IsFunction(context, value);
+                JS_FreeValue(context, value);
+                if (exception || !okay) break;
+            }
+            reached = state.calls > start + point;
+            state.refuse_from = SIZE_MAX;
+            if (JS_HasException(context)) {
+                JSValue exception = JS_GetException(context);
+                okay = !JS_IsUndefined(exception);
+                JS_FreeValue(context, exception);
+            }
+            JS_FreeValue(context, global);
+            JS_FreeContext(context);
+            JS_FreeRuntime(runtime);
+            if (!okay || state.corrupted != 0 || state.live != 0) {
+                fprintf(stderr, "global autoinit refusal once=%u point=%zu live=%zu\n",
+                        once, point, state.live);
+                return 1;
+            }
+        }
+        if (reached) return 1;
+    }
+    return 0;
+}
+
 static int run_bound_function_refusals(void)
 {
     bool reached = true;
@@ -2948,6 +3009,8 @@ static int run_bound_function_refusals(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--global-autoinit-only") == 0)
+        return run_global_autoinit_refusals();
     if (argc == 2 && strcmp(argv[1], "--string-buffer-growth-only") == 0)
         return run_string_buffer_growth_collection() || run_utf8_pressure_sizing();
     if (argc == 2 && strcmp(argv[1], "--context-refusal-only") == 0)
@@ -2962,6 +3025,7 @@ int main(int argc, char **argv)
     }
     if (argc != 1) return 2;
     if (run_context_creation_refusals() != 0) return 1;
+    if (run_global_autoinit_refusals() != 0) return 1;
     if (run_bound_function_refusals() != 0) return 1;
     if (run_float_array_indexed_stores() != 0) return 1;
 

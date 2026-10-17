@@ -8,8 +8,10 @@ import re
 import sys
 
 
-EXPECTED_CERTIFICATE_COUNT = 26
+EXPECTED_CERTIFICATE_COUNT = 27
 REQUIRED_SHA256_FINGERPRINTS = {
+    # Official self-signed Starfield Services root; also in Mozilla's store.
+    "568d6905a2c88708a4b3025190edcfedb1974a606a13c6e5290fcb2ae63edab5",
     # September 2026 native-Mbed-TLS census: public modern trust anchors.
     "8fe4fb0af93a4d0d67db0bebb23e37c71bf325dcbcdd240ea04daf58b47e1840",
     "371a00dc0533b3721a7eeb40e8419e70799d2b0a0f2c1d80693165f7cec4ad75",

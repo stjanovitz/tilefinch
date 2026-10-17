@@ -125,6 +125,7 @@ void js_rt_record_network_response(ScriptResult *result,
 #endif
 
 #define JS_FETCH_MAXIMUM_BYTES (1024u * 1024u)
+#define JS_FETCH_RESPONSE_CEILING (8u * 1024u * 1024u)
 
 /* Keep exactly one eager JavaScript representation of a native response.
    Fetch bodies are byte sequences regardless of MIME type.  Decoding here
@@ -147,7 +148,10 @@ bool js_rt_script_set_response_body(JSContext *context, JSValue response,
        native response and final string each fit independently. Keep Fetch
        byte-canonical, and keep malformed XHR input on the JavaScript
        decoder so its replacement behavior remains exact. */
-    if (prefer_text && fetched->length <= JS_FETCH_MAXIMUM_BYTES
+    /* Admission has already enforced the configured/Budget-derived limit.
+       The 1 MiB floor is not a decoding ceiling: a larger admitted text XHR
+       otherwise becomes byte-backed and fails the public decoder's bound. */
+    if (prefer_text && fetched->length <= JS_FETCH_RESPONSE_CEILING
         && tilefinch_utf8_valid((const unsigned char *) fetched->data,
                                 fetched->length)) {
         const uint8_t *bytes = (const uint8_t *) fetched->data;
@@ -174,7 +178,7 @@ static size_t js_fetch_response_limit(const DomBridge *bridge)
     size_t limit = JS_FETCH_MAXIMUM_BYTES;
     if (bridge != NULL && bridge->maximum_script_file_bytes > limit) {
         limit = bridge->maximum_script_file_bytes;
-        if (limit > 8u * 1024u * 1024u) limit = 8u * 1024u * 1024u;
+        if (limit > JS_FETCH_RESPONSE_CEILING) limit = JS_FETCH_RESPONSE_CEILING;
         /* The script ceiling is a sanity bound now, not a memory budget:
            above the 1 MiB floor, a response may use only what the page
            Budget can stage beside its presentation reserve. Unlike a

@@ -2,17 +2,22 @@
 set -euo pipefail
 
 root_dir=$(cd "$(dirname "$0")/.." && pwd)
-training_build="${root_dir}/build-allocator-pgo-training"
-optimized_build="${root_dir}/build-allocator-pgo"
 script_file="${root_dir}/fixtures/js-closure-vm-benchmark.js"
-profile_dir=$(mktemp -d "${TMPDIR:-/tmp}/psp-browser-pgo.XXXXXX")
-profile_data="${optimized_build}/allocator-$$.profdata"
-trap 'rm -rf "${profile_dir}"' EXIT
 
 if [[ $(uname -s) != Darwin ]]; then
     echo "allocator PGO comparison requires macOS JavaScriptCore" >&2
     exit 2
 fi
+
+# Keep both builds and the profile outside the checkout, and remove them even
+# when configuration or the comparison fails. Only this fresh directory is ours.
+experiment_dir=$(mktemp -d "${TMPDIR:-/tmp}/tilefinch-allocator-pgo.XXXXXX")
+trap 'rm -rf -- "${experiment_dir}"' EXIT
+training_build="${experiment_dir}/training"
+optimized_build="${experiment_dir}/optimized"
+profile_dir="${experiment_dir}/profiles"
+profile_data="${experiment_dir}/allocator.profdata"
+mkdir -p "${profile_dir}"
 
 cmake -S "${root_dir}" -B "${training_build}" \
     -DCMAKE_BUILD_TYPE=Release \

@@ -1089,6 +1089,7 @@ static bool style_property_overflow(const StylePropertyParse *parse)
             if (!span_equal(name, name_length, "overflow-x")) {
                 style->overflow_y_scroll = scroll;
                 style->overflow_y_clip_only = clip_only;
+                style->overflow_y_hidden = hidden;
                 *mask |= S_OVERFLOW_Y;
             }
         }

@@ -78,6 +78,7 @@ typedef struct {
        canonical web URL; frontends which do not implement the native route
        can execute the action as an ordinary navigation. */
     bool prefer_native_media;
+    bool prefer_download;
     /* True for authored page audio or a high-confidence structured audio
        preview. The platform route uses the same player lifecycle, controls,
        clock, and seek machinery as video, but opens only the AAC/MP4 track. */
@@ -229,6 +230,9 @@ bool controller_focused_outline_style(
     BrowserController *controller, ControllerFocusOutline *outline);
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action);
+/* Inspect a focused link without dispatching a page click or starting I/O. */
+bool controller_focused_download_url(BrowserController *controller,
+                                     char *url, size_t capacity);
 /* Bounded selectedness snapshot, by option ordinal rather than value (values
    may be duplicated). Neither mode dispatches input. Zero means inapplicable
    or a successful unchanged restore; a changed restore returns the count.

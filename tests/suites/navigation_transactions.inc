@@ -1110,6 +1110,185 @@ static bool append_order_matches_rebuild(NavigationSession *navigation,
     return ok;
 }
 
+static bool test_adopted_sources_insert_between_existing(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=probe>Ordered</p><script>"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('#probe{color:#112233}');"
+        "globalThis.c=new CSSStyleSheet();c.replaceSync('#probe{color:#334455}');"
+        "document.adoptedStyleSheets=[a,c];</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://adoption-order.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    size_t full = navigation.performance.full_relayouts;
+    size_t appends = navigation.performance.mutation_style_appends;
+    ok = ok && append_order_mutate(&navigation,
+        "globalThis.b=new CSSStyleSheet();b.replaceSync('#probe{color:#223344}');"
+        "document.adoptedStyleSheets=[a,b,c]", "<interleaved-adoption>")
+        && navigation.performance.full_relayouts == full
+        && navigation.performance.mutation_style_appends == appends + 1
+        && append_order_text_color(&navigation.page.layout, "Ordered") == 0x334455;
+    /* A second insertion must accept the signature in final source order,
+       not the order in which each new source happened to be parsed. */
+    full = navigation.performance.full_relayouts;
+    appends = navigation.performance.mutation_style_appends;
+    ok = ok && append_order_mutate(&navigation,
+        "globalThis.d=new CSSStyleSheet();d.replaceSync('#probe{color:#445566}');"
+        "document.adoptedStyleSheets=[a,b,d,c]", "<second-interleaved-adoption>")
+        && navigation.performance.full_relayouts == full
+        && navigation.performance.mutation_style_appends == appends + 1
+        && append_order_text_color(&navigation.page.layout, "Ordered") == 0x334455
+        && append_order_matches_rebuild(&navigation, "second interleaved adoption");
+    if (!ok) fprintf(stderr, "interleaved adopted append failed: %s\n",
+                     navigation.last_error);
+    navigation_destroy(&navigation);
+    return ok && budget.current == 0;
+}
+
+static bool test_confined_style_append_keeps_selector_cache(void)
+{
+    static const char html[] =
+        "<!doctype html><p class=sample>Outside</p><div id=ha></div>"
+        "<div id=hc></div><script>"
+        "let style=document.createElement('style');let css='.sample{color:#010203}';"
+        "for(let i=0;i<80;i++)css+='.unused'+i+'{color:red}';"
+        "style.textContent=css;document.head.appendChild(style);"
+        "for(let i=0;i<140;i++){let p=document.createElement('p');"
+        "p.textContent='Filler';document.body.appendChild(p);}"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('.sample{color:#112233}');"
+        "globalThis.c=new CSSStyleSheet();c.replaceSync('.sample{color:#334455}');"
+        "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
+        "globalThis.rc=document.getElementById('hc').attachShadow({mode:'open'});"
+        "ra.innerHTML='<span class=sample>InsideA</span>';"
+        "rc.innerHTML='<span class=sample>InsideC</span>';"
+        "ra.adoptedStyleSheets=[a];rc.adoptedStyleSheets=[c];</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://confined-append.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    LayoutReuseStats before = {0}, after = {0};
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
+    size_t appends = navigation.performance.mutation_style_appends;
+    /* b is inserted before c in the source tier. c's bit moves, but its
+       scope and selector answers do not. b must never restyle Outside. */
+    ok = ok && navigation.page.layout_reuse != NULL && append_order_mutate(&navigation,
+        "globalThis.b=new CSSStyleSheet();b.replaceSync('.sample{color:#223344}'"
+        "+':host::before{content:\"Host\";color:#556677}');"
+        "ra.adoptedStyleSheets=[a,b]", "<confined-middle-append>");
+    layout_reuse_cache_stats(navigation.page.layout_reuse, &after);
+    ok = ok && navigation.performance.mutation_style_appends == appends + 1
+        && before.full_resets == after.full_resets
+        && after.matched_hits > before.matched_hits
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_text_color(&navigation.page.layout, "InsideA") == 0x223344
+        && append_order_text_color(&navigation.page.layout, "InsideC") == 0x334455
+        && append_order_text_color(&navigation.page.layout, "Host") == 0x556677
+        && append_order_matches_rebuild(&navigation, "confined middle append");
+    /* A real scope transfer still invalidates both roots, even though no
+       source is new and the confined-source mask itself is unchanged. */
+    ok = ok && append_order_mutate(&navigation,
+        "ra.adoptedStyleSheets=[a];rc.adoptedStyleSheets=[b,c]",
+        "<confined-scope-transfer>")
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233
+        && append_order_text_color(&navigation.page.layout, "InsideC") == 0x334455
+        && append_order_matches_rebuild(&navigation, "confined scope transfer");
+    /* Gaining document scope really can restyle the whole document. */
+    ok = ok && append_order_mutate(&navigation,
+        "document.adoptedStyleSheets=[b]", "<adopted-document-promotion>")
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x223344
+        && append_order_matches_rebuild(&navigation, "document promotion");
+    if (!ok) fprintf(stderr, "confined append failed: resets=%zu/%zu "
+        "matches=%zu/%zu error=%s\n", before.full_resets, after.full_resets,
+        before.matched_hits, after.matched_hits, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_stylesheet_completion_waits_for_checkpoint(void)
+{
+    static const char html[] =
+        "<!doctype html><style>#probe{color:#010203}</style>"
+        "<p id=probe>Before</p><script>"
+        "globalThis.jobs=0;globalThis.loads=0;globalThis.atLoad=0;</script>";
+    static const unsigned char css[] = "#probe{color:#123456}";
+    static const char url[] = "https://completion-order.test/";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && put_stylesheet_cache(&browser, url,
+        "https://completion-order.test/late.css", css, sizeof(css) - 1)
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+        navigation_enable_external_resources(&navigation, 16, 64 * 1024,
+            16 * 1024, 1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        url, html, sizeof(html) - 1, 480, NULL, NULL, true);
+    ScriptResult result = {0};
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "const link=document.createElement('link');link.rel='stylesheet';"
+        "link.href='/late.css';link.onload=()=>{loads++;atLoad=jobs;"
+        "document.getElementById('probe').textContent='After';};"
+        "document.head.appendChild(link);"
+        "function more(){if(++jobs<192)queueMicrotask(more);}queueMicrotask(more);",
+        "<pending-completion-checkpoint>", &result)
+        && !script_runtime_message_dispatch_ready(navigation.page.runtime)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation)
+        && navigation.performance.stylesheet_event_dispatches == 0;
+    /* The remaining checkpoint has no DOM writes. Completion must still be
+       retried, and its destructive text replacement settled before paint. */
+    for (size_t i = 0; ok && i < 8; i++)
+        ok = navigation_advance_runtime(&navigation, 16, 8);
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "pocSummary=loads+':'+atLoad+':'+jobs", "<completion-result>", &result)
+        && strcmp(result.summary, "1:192:192") == 0
+        && navigation.performance.stylesheet_event_dispatches == 1
+        && append_order_text_color(&navigation.page.layout, "After") == 0x123456;
+    if (!ok) fprintf(stderr, "completion checkpoint failed: %s / %s "
+                     "ready=%d loaded=%d events=%zu full=%zu appends=%zu\n",
+                     result.summary, result.error, (int) ready,
+                     (int) navigation.page.loaded,
+                     navigation.performance.stylesheet_event_dispatches,
+                     navigation.performance.full_relayouts,
+                     navigation.performance.mutation_style_appends);
+    navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    return ok && budget.current == 0;
+}
+
 static bool test_stylesheet_sources_insert_in_document_order(void)
 {
     static const char html[] =

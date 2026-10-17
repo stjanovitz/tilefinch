@@ -130,6 +130,8 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_PAGE_INFORMATION: return "page-information";
         case PSP_UI_SCREEN_OFFLINE_APP_PREVIEW:
             return "offline-app-preview";
+        case PSP_UI_SCREEN_FILE_DOWNLOAD: return "file-download";
+        case PSP_UI_SCREEN_ZIP_INSTALL: return "zip-install";
         case PSP_UI_SCREEN_FAILURE_RECOVERY: return "failure-recovery";
         case PSP_UI_SCREEN_HELP: return "help";
         case PSP_UI_SCREEN_HELP_DETAIL: return "help-detail";

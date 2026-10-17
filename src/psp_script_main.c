@@ -1642,6 +1642,11 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
 {
     if (process == NULL || browser == NULL || views == NULL
         || views->navigation == NULL || interactive == NULL) return;
+    if (psp_offline_store_take_download_offer(&browser->offline_store, browser->engine)) {
+        psp_ui_show_file_download(&process->presentation.ui,
+            psp_offline_store_file_preview(&browser->offline_store));
+        return;
+    }
     /* A hard/cancelled navigation failure still overlays its incumbent; only
        post-commit blank recovery may route Return through history. */
     interactive->recovery_offer =
@@ -7610,7 +7615,7 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
     interactive->navigation_job_started_us = 0;
 }
 
-/* One admitted slice of the queued video download. */
+/* One admitted slice of the shared file/video download lane. */
 static TILEFINCH_OUT_OF_LINE void psp_loop_pump_offline_download(
     PspLoop *loop, uint32_t offline_download_id)
 {
@@ -7621,7 +7626,7 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_pump_offline_download(
     PspEngineViews *const engine_views = loop->app.views;
     if (!psp_app_frame_pump_run(app, FRAME_PUMP_OFFLINE_DOWNLOAD)) return;
     psp_ui_set_loading(&process->presentation.ui, true, -1);
-    psp_ui_keep_status(&process->presentation.ui, "SAVING VIDEO  O PAUSE", 120);
+    psp_ui_keep_status(&process->presentation.ui, "SAVING DOWNLOAD  O PAUSE", 120);
     psp_work_cooperate_begin(
         &process->presentation.ui, engine_views->frame, true, true, false,
         "PAUSING DOWNLOAD...", "offline-download", NULL, NULL);
@@ -7661,7 +7666,7 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_pump_offline_download(
     psp_ui_set_loading(&process->presentation.ui, remains_active, progress);
     if (cancelled || completed || !remains_active)
         psp_ui_show_status(
-            &process->presentation.ui, cancelled ? "VIDEO DOWNLOAD PAUSED"
+            &process->presentation.ui, cancelled ? "DOWNLOAD PAUSED"
                            : psp_offline_store_status(
                                  &browser->offline_store),
             240);
@@ -10701,6 +10706,14 @@ int main(int argc, char *argv[])
     psp_validation_cancel_after_ms = 0;
     psp_validation_preview_scroll = 0;
     __sync_synchronize();
+    bool initial_download_offer = !loaded && psp_offline_store_take_download_offer(
+        &browser.offline_store, browser.engine);
+    if (initial_download_offer) {
+        /* A binary startup URL has no incumbent page. Use the local library
+           beneath its confirmation, not a failed HTML view of the file. */
+        loaded = psp_offline_store_open_library(
+            &browser.offline_store, browser.engine, true);
+    }
     bool initial_error_page = false;
     uint64_t load_elapsed_ms =
         ((uint64_t) sceKernelGetSystemTimeWide() - load_started_us) / 1000u;
@@ -10805,6 +10818,9 @@ int main(int argc, char *argv[])
     }
     if (loaded && browser_engine_render_frame(browser.engine, NULL)) {
         psp_sync_ui(&process.presentation.ui, browser.engine, browser.profile);
+        if (initial_download_offer)
+            psp_ui_show_file_download(&process.presentation.ui,
+                psp_offline_store_file_preview(&browser.offline_store));
         psp_present(engine_views.frame, &process.presentation.ui);
     }
     if (!loaded) goto report;

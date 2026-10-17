@@ -257,8 +257,9 @@ static bool validate_frame_geometry(const PspUiState *ui, int width, int height,
             if (!known && !catalog_text(b->text)) continue;
             bool y_overlap = a->top < b->bottom && b->top < a->bottom;
             if (y_overlap && a->left < b->right && b->left < a->right) {
-                fprintf(stderr, "locale=%s screen=%u overlapping '%s' and '%s'\n",
-                    language_code, ui->screen, a->text, b->text);
+                fprintf(stderr, "locale=%s screen=%u overlapping '%s' (%d,%d..%d,%d) and '%s' (%d,%d..%d,%d)\n",
+                    language_code, ui->screen, a->text, a->left, a->top, a->right, a->bottom,
+                    b->text, b->left, b->top, b->right, b->bottom);
                 return false;
             }
             /* Same-row label/value pairs and breadcrumbs retain a readable gap. */
@@ -573,6 +574,58 @@ static bool snapshot_geometry(const char *name, int width, int height, int strid
 static bool snapshot(const char *name)
 {
     return snapshot_geometry(name, WIDTH, HEIGHT, STRIDE);
+}
+
+static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    PspUiFileDownloadPreview file = {.name="Settings.zip", .origin="https://downloads.example.test"};
+    psp_ui_show_file_download(ui, &file);
+    ui->overlay_animation_frames = 0;
+    CHECK(paint(ui, provider));
+    CHECK(player_has_text("Save file?") && player_has_text("X Save   O Cancel"));
+    /* Author filenames must never be translated as UI keys. */
+    bool name = false;
+    for (size_t i = 0; i < run_count; i++) if (!strcmp(runs[i].text, "Settings.zip")) name = true;
+    CHECK(name);
+    CHECK(snapshot("download-save"));
+    ZipInstallPreview zip = {.name="Homebrew", .destination="ms0:/PSP/GAME/Homebrew",
+        .files=512, .skipped_files=511, .unpacked_bytes=ZIP_INSTALL_UNPACKED_LIMIT};
+    for (unsigned removing=0; removing<2; removing++) {
+        zip.removing = removing != 0;
+        psp_ui_show_zip_install(ui, &zip);
+        ui->overlay_animation_frames = 0;
+        CHECK(paint(ui, provider));
+        CHECK(player_has_text(removing ? "Remove homebrew?" : "Install homebrew?"));
+        CHECK(player_has_text(removing ? "X Remove   O Cancel" : "X Install   O Cancel"));
+        CHECK(player_has_text(removing ? "Saved data inside it will also be deleted." : "Only install software you trust."));
+        CHECK(snapshot(removing ? "homebrew-remove" : "homebrew-install"));
+    }
+    PspUiCollectionsView view = {.section=PSP_UI_COLLECTION_DOWNLOADS, .count=2};
+    view.rows[0] = (PspUiCollectionsRow){.title="Settings.zip", .detail=tilefinch_ui_text("Memory Stick file"),
+        .deletable=true, .is_file=true, .offline_state=OFFLINE_ITEM_READY};
+    view.rows[1] = (PspUiCollectionsRow){.title=tilefinch_ui_text("Installed homebrew"),
+        .detail=tilefinch_ui_text("Manage apps installed by Tilefinch"), .offline_state=UINT8_MAX};
+    psp_ui_show_collections(ui, PSP_UI_COLLECTION_DOWNLOADS);
+    ui->overlay_animation_frames = 0;
+    psp_ui_set_collections(ui, &view);
+    for (unsigned row=0; row<2; row++) {
+        ui->collections_selection = row;
+        CHECK(paint(ui, provider));
+        CHECK(player_has_text("Downloads"));
+        CHECK(player_has_text(row ? "X OPEN   L/R SECTION" : "X DETAILS   SQUARE DELETE   L/R SECTION"));
+        CHECK(snapshot(row ? "homebrew-manager-entry" : "downloads"));
+    }
+    ui->collections_selection = 0;
+    ui->collections_delete_confirmation = 1;
+    CHECK(paint(ui, provider));
+    CHECK(player_has_text("PRESS SQUARE AGAIN TO DELETE") && player_has_text("SQUARE DELETE   O CANCEL"));
+    CHECK(snapshot("download-delete"));
+    ui->collections_delete_confirmation = 0;
+    ui->collections = NULL;
+    ui->file_download_preview = NULL;
+    ui->zip_install_preview = NULL;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
 }
 
 static bool test_square_button_symbol(void)
@@ -1002,6 +1055,7 @@ static bool test_all_languages(void)
             ui.chrome_theme = theme ? BROWSER_CHROME_THEME_LIGHT : BROWSER_CHROME_THEME_FINCH;
             ui.ui_language = language;
             CHECK(test_player_language(&ui, provider));
+            CHECK(test_download_language(&ui, provider));
             ui.screen = PSP_UI_SCREEN_PAGE;
             ui.chrome_visible = true;
             ui.focus_label_valid = true;

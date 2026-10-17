@@ -131,15 +131,14 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_HOME_CONTINUE_HEIGHT 19
 #define UI_HOME_CONTINUE_STRIDE 20
 
-/* COLLECTIONS geometry: a section strip, then a fixed window of rows. Rows
-   carry a 15px title over a 15px detail, so the box is tall enough for two
-   scale-2 lines with a little air between them and between neighbours. */
+/* COLLECTIONS geometry: a full-size title and compact secondary line.
+   Descenders and optional-script glyphs must not meet between the lines. */
 #define UI_COLLECTIONS_SECTION_TOP 22
 #define UI_COLLECTIONS_SECTION_HEIGHT 16
 #define UI_COLLECTIONS_ROW_TOP 46
-#define UI_COLLECTIONS_ROW_HEIGHT 32
+#define UI_COLLECTIONS_ROW_HEIGHT 34
 #define UI_COLLECTIONS_ROW_STRIDE 35
-#define UI_COLLECTIONS_ROW_DETAIL_DY 17
+#define UI_COLLECTIONS_ROW_DETAIL_DY 20
 #define UI_COLLECTIONS_VISIBLE_ROWS 6u
 
 #define UI_CHROME_GLYPH_FIRST 32u
@@ -2528,6 +2527,23 @@ void psp_ui_show_collections(
     ui->collections_delete_confirmation = 0;
     ui_open_overlay(ui, PSP_UI_SCREEN_COLLECTIONS);
     ui->base_screen = (uint8_t) PSP_UI_SCREEN_COLLECTIONS;
+}
+
+void psp_ui_show_file_download(PspUiState *ui,
+                               const PspUiFileDownloadPreview *preview)
+{
+    if (ui == NULL || preview == NULL) return;
+    ui->base_screen = PSP_UI_SCREEN_PAGE;
+    ui->file_download_preview = preview;
+    ui_open_overlay(ui, PSP_UI_SCREEN_FILE_DOWNLOAD);
+}
+
+void psp_ui_show_zip_install(PspUiState *ui, const ZipInstallPreview *preview)
+{
+    if (ui == NULL || preview == NULL) return;
+    ui->base_screen = PSP_UI_SCREEN_PAGE;
+    ui->zip_install_preview = preview;
+    ui_open_overlay(ui, PSP_UI_SCREEN_ZIP_INSTALL);
 }
 
 void psp_ui_show_offline_app_preview(
@@ -5365,11 +5381,12 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
     static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
         "Find in page", "Reader mode", "Basic view",
         "Add/remove bookmark", "Save article", "Save screenshot",
-        "Site information", "Install offline app", "Continue to YouTube"
+        "Site information", "Install offline app", "Download focused link",
+        "Continue to YouTube"
     };
     const char *values[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
         ">", ui->reader_mode ? "On" : "Off",
-        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">"
+        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">", ">"
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
@@ -5494,6 +5511,70 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
         box.x + 16, box.y + box.height - 20,
         tilefinch_ui_text("X Open / confirm   O Back"),
         box.x + box.width - 16, muted, 1, false);
+}
+
+static void draw_file_download(const PspUiState *ui, uint16_t *pixels,
+    int width, int height, int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    const PspUiFileDownloadPreview *view = ui->file_download_preview;
+    if (view == NULL) return;
+    UiRect box = {42, 22, width - 84, 228};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
+    int left = box.x + 16, right = box.x + box.width - 16;
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 14,
+        tilefinch_ui_text("Save file?"), right, text, 2, true);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 54,
+        view->name, right, accent, 2, true);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 82,
+        view->origin, right, muted, 1, false);
+    static const char *const notes[] = {
+        "Save to the Memory Stick.", "The server may change the filename.",
+        "Files are not installed or run.", "The link is kept for retry."
+    };
+    for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++)
+        draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 110 + (int)i * 20,
+            tilefinch_ui_text(notes[i]), right, muted, 1, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + box.height - 20,
+        tilefinch_ui_text("X Save   O Cancel"), right, muted, 1, false);
+}
+
+static void draw_zip_install(const PspUiState *ui, uint16_t *pixels,
+    int width, int height, int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    const ZipInstallPreview *view = ui->zip_install_preview;
+    if (view == NULL) return;
+    UiRect box = {42, 16, width - 84, 240};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_furniture(pixels, width, height, stride, box, 40, 20);
+    int left = box.x + 16, right = box.x + box.width - 16;
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 14,
+        tilefinch_ui_text(view->removing ? "Remove homebrew?" : "Install homebrew?"), right, text, 2, true);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 54,
+        view->name, right, accent, 2, true);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 82,
+        view->destination, right, muted, 1, false);
+    char counts[320];
+    snprintf(counts, sizeof(counts), "%u %s | %lu KB", (unsigned)view->files,
+        tilefinch_ui_text("files"), (unsigned long)((view->unpacked_bytes + 1023u)/1024u));
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 106,
+        counts, right, muted, 1, false);
+    if (!view->removing) {
+        snprintf(counts, sizeof(counts), "%u %s", (unsigned)view->skipped_files,
+            tilefinch_ui_text("extras kept in ZIP"));
+        draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 124,
+            counts, right, muted, 1, false);
+    }
+    static const char *const notes[] = {
+        "Only install software you trust.", "Existing folders are not replaced.",
+        "The ZIP is kept. Nothing runs automatically."
+    };
+    for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++)
+        draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 146 + (int)i * 20,
+            tilefinch_ui_text(view->removing ? (i == 0 ? "The whole app folder will be deleted." : i == 1
+                ? "Saved data inside it will also be deleted." : "Downloaded ZIP files are kept.") : notes[i]), right, muted, 1, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + box.height - 20,
+        tilefinch_ui_text(view->removing ? "X Remove   O Cancel" : "X Install   O Cancel"), right, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
@@ -7615,7 +7696,8 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
     /* Section strip: the same L/R convention the options overlay uses. */
     int section_x = UI_HOME_MARGIN;
     for (unsigned at = 0; at < PSP_UI_COLLECTION_SECTION_COUNT; at++) {
-        const char *name = ui_collection_section_name(at);
+        const char *name = at == PSP_UI_COLLECTION_DOWNLOADS
+            ? tilefinch_ui_text("Downloads") : ui_collection_section_name(at);
         int text_width = chrome_text_width_bytes(name, strlen(name), 1, true);
         UiRect chip = {
             section_x, UI_COLLECTIONS_SECTION_TOP,
@@ -7628,7 +7710,7 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
                 PSP_THEME_RADIUS_CHIP, accent.accent, 4);
         draw_text_with_font(
             pixels, width, height, stride,
-            chip.x + PSP_THEME_SPACE_M, chip.y + 3, name, 12,
+            chip.x + PSP_THEME_SPACE_M, chip.y + 3, name, TILEFINCH_UI_TRANSLATION_BYTES,
             /* The chip is sized to its own label, so the ellipsis reserve
                the shared text helper applies would clip a name that fits. */
             chip.x + chip.width + 3 * ui_ellipsis_advance(1, active, NULL),
@@ -7720,10 +7802,10 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
             content_x, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
             confirm
                 ? (row->is_web_app ? "PRESS SQUARE AGAIN TO UNINSTALL"
-                                   : "PRESS SQUARE AGAIN TO DELETE")
+                                   : tilefinch_ui_text("PRESS SQUARE AGAIN TO DELETE"))
                 : row->detail, 64,
             box.x + box.width - PSP_THEME_SPACE_M - trailing_width,
-            confirm ? PSP_THEME_WARN : PSP_THEME_TEXT_MUTED, 2, NULL,
+            confirm ? PSP_THEME_WARN : PSP_THEME_TEXT_MUTED, 1, NULL,
             false);
         if (row->trailing[0] != '\0')
             draw_text_right_aligned(
@@ -7757,11 +7839,11 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
     const char *primary = selected != NULL && selected->needs_recompile
         ? "X RECOMPILE" : "X OPEN";
     if (ui->collections_section == PSP_UI_COLLECTION_DOWNLOADS
-        && selected != NULL) {
+        && selected != NULL && selected->offline_state != UINT8_MAX) {
         if (selected->offline_state == OFFLINE_ITEM_DOWNLOADING)
             primary = "X PAUSE";
         else if (selected->offline_state == OFFLINE_ITEM_READY)
-            primary = "X PLAY";
+            primary = selected->is_file ? "X DETAILS" : "X PLAY";
         else
             primary = "X RESUME";
     }
@@ -7775,8 +7857,8 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
         confirming
             ? (selected != NULL && selected->is_web_app
                    ? "SQUARE UNINSTALL   O CANCEL"
-                   : "SQUARE DELETE   O CANCEL")
-            : hint, 2u);
+                   : tilefinch_ui_text("SQUARE DELETE   O CANCEL"))
+            : tilefinch_ui_text(hint), 2u);
 }
 
 /*
@@ -8238,8 +8320,10 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
             draw_glyph_offer(ui, pixels, width, height, stride, accent);
         return;
     }
-    char presented[PSP_UI_STATUS_CAPACITY];
-    copy_string(presented, sizeof(presented), ui->status);
+    /* Translate only the presentation copy: callers use stable English
+       status keys for progress/expiry comparisons. Catalog values are bounded. */
+    char presented[257];
+    copy_string(presented, sizeof(presented), tilefinch_ui_text(ui->status));
     psp_ui_status_sentence_case(presented);
     char *embedded_second_line = strchr(presented, '\n');
     const char *second_line = embedded_second_line;
@@ -8487,6 +8571,10 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     } else if (ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION) {
         draw_page_information(
             ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_ZIP_INSTALL) {
+        draw_zip_install(ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_FILE_DOWNLOAD) {
+        draw_file_download(ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW) {
         draw_offline_app_preview(
             ui, pixels, width, height, stride, accent, text, muted);

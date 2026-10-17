@@ -56,6 +56,9 @@ runtime assets or immutable engine data.
   zlib-licensed gzip code and Old-MIT HarfBuzz-derived autofit sources; carry
   those notices too. Complete texts are in the checkout's `LICENSE.TXT` and
   `docs/FTL.TXT`.
+  Local patches route WOFF2 allocation and cancellation through the browser,
+  compact tables not consumed by its outline backend, and make partial
+  variation initialization and retries safe after allocation refusal.
 - **Public Suffix List** snapshot `f540a06159213b6e8ed9c87d2dd3a52373637e92`:
   MPL-2.0 data encoded as a checked-in DAFSA. The fixed-set decoder in
   `src/public_suffix.c` was adapted from libpsl/Chromium under its
@@ -185,12 +188,12 @@ notice in this file.
   (distributed by PSPDEV under its own GPL-3.0-only and MIT licensing
   metadata); the installed custom firmware supplies the implementation used
   to hand off to a slot EBOOT.
-- **TLS trust bundle**: the PSP package stages the 26 public CA root
+- **TLS trust bundle**: the PSP package stages the 27 public CA root
   certificates listed in `certs/README.md`; they contain no private keys.
   Mozilla- and Microsoft Azure Linux-derived CA-store data is MPL-2.0,
   not covered by Tilefinch's MIT license. The license text is included at
   `third_party/public_suffix/LICENSE.MPL-2.0`. Certificate sources,
-  issuer-specific terms, and a fingerprint inventory covering all 26 roots
+  issuer-specific terms, and a fingerprint inventory covering all 27 roots
   are recorded in `third_party/notices/ca-bundle/NOTICE.md`, staged as
   `NOTICES/ca-bundle/NOTICE.md`. The Microsoft root matches its issuer's
   MPL-2.0 Azure Linux CA package, not a license inferred from a website or
