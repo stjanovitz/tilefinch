@@ -8,6 +8,7 @@
 
 #include "tilefinch/build_version.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/psp_boot_cache.h"
 #include "tilefinch/swdec_component_store.h"
 
 #define PSP_UPDATE_INSTALL_PUMP_BUDGET_US UINT64_C(2000)
@@ -504,7 +505,8 @@ static bool psp_update_session_begin_install(
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             : TILEFINCH_UPDATE_TRUST_SIGNED,
         .allow_downgrade = update->allow_downgrade,
-        .download_proof = have_download_proof ? &download_proof : NULL
+        .download_proof = have_download_proof ? &download_proof : NULL,
+        .prepare_startup = true
     };
     update->install_maximum_unit_us = 0;
     update->install_units = 0;
@@ -572,6 +574,19 @@ PspUpdatePrimaryResult psp_update_session_primary(
         case TILEFINCH_UPDATE_CLIENT_UP_TO_DATE:
             return PSP_UPDATE_PRIMARY_CHECK_REQUIRED;
         case TILEFINCH_UPDATE_CLIENT_AVAILABLE:
+            /* The module is already resident. Its derived disk copy must
+               not crowd out the explicitly approved signed update. Checks
+               for metadata alone never delete or rewrite this cache. */
+            if (paths != NULL && paths->slotted) {
+                psp_boot_cache_discard(paths->data_dir);
+                for (unsigned slot = 0; slot < 2u; slot++) {
+                    char directory[TILEFINCH_INSTALL_PATH_LIMIT];
+                    int n = snprintf(directory, sizeof(directory), "%s/slot-%c",
+                                     paths->install_root, 'a' + slot);
+                    if (n > 0 && (size_t)n < sizeof(directory))
+                        (void)psp_boot_prepackaged_discard(directory);
+                }
+            }
             (void) tilefinch_update_client_begin_download(session->client);
             break;
         case TILEFINCH_UPDATE_CLIENT_DOWNLOADED:

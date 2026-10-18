@@ -136,6 +136,1276 @@ def frame_pump_policy(name):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_serviced_scanout_wait_requires_actual_front_or_firmware_fence(self):
+        source = (ROOT / "src/psp_display.c").read_text()
+        start = source.index("static void system_wait_vblank_serviced(")
+        body = source[start:source.index("\nstatic const PspDisplayBackend system_backend", start)]
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef void (*PspDisplayWaitService)(void *);
+static unsigned queries,delays,services,fallbacks,latch_after;
+static int bad_query,bad_delay,bad_stride,bad_format;
+static int sceDisplayGetFrameBuf(void **front,int *stride,int *format,int sync) {
+    if(sync!=0)return -1;
+    queries++;
+    if(bad_query)return -1;
+    *front=(void *)(uintptr_t)(queries>latch_after?0x44088000u:0x44000000u);
+    *stride=bad_stride?256:512;*format=bad_format?0:3;return 0;
+}
+static int sceKernelDelayThread(unsigned us) {
+    delays++;return bad_delay || us!=500?-1:0;
+}
+static void system_wait_vblank(void) { fallbacks++; }
+static void service(void *context) { (*(unsigned *)context)++; }
+''' + body + r'''
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"scanout line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    for(latch_after=0;latch_after<40;latch_after++)for(unsigned flags=0;flags<16;flags++) {
+        queries=delays=services=fallbacks=0;
+        bad_query=flags&1;bad_delay=flags&2;bad_stride=flags&4;bad_format=flags&8;
+        system_wait_vblank_serviced((void *)(uintptr_t)0x04088000u,512,3,service,&services);
+        CHECK(queries<=32 && delays<=32 && services<=16);
+        if(!flags && latch_after<32) {
+            CHECK(!fallbacks && queries==latch_after+1);
+        } else if(latch_after==0 && !bad_query && !bad_stride && !bad_format) {
+            CHECK(!fallbacks && !services && !delays);
+        } else CHECK(fallbacks==1);
+        if(bad_query)CHECK(!services && !delays);
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "wait.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                str(path / "wait.c"), "-o", str(path / "wait")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "wait")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_video_timing_window_avoids_live_loop_formatting(self):
+        source = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text())
+        begin = source.index("void psp_webgl_measurement_main_frame(void)")
+        window = source[begin:source.index(
+            "void psp_webgl_measurement_mark(", begin)]
+        self.assertIn("psp_validation_video_timing_window = "
+                      "psp_log_begin_timing_window()", window)
+        self.assertIn("psp_validation_video_suppressed_loops = 0", window)
+        self.assertIn("psp_validation_video_suppressed_publications = 0", window)
+        self.assertIn("suppressed-loops=%u", window)
+        self.assertIn("psp_log_end_timing_window()", window)
+        begin = source.index("static void psp_loop_timing_end(void)")
+        timing = source[begin:source.index(
+            "static PspBrowserResources *psp_loop_timing_browser", begin)]
+        begin = timing.index("if (psp_validation_video_timing_window) {")
+        quiet = timing[begin:timing.index("\n    }", begin)]
+        self.assertIn("psp_validation_video_suppressed_loops++", quiet)
+        self.assertIn("psp_loop_timing.active = false", quiet)
+        self.assertIn("return;", quiet)
+        self.assertNotIn("printf", quiet)
+        self.assertLess(begin, timing.index('printf("tilefinch-loop-timing:'))
+        begin = source.index('printf("tilefinch-page-publication:')
+        guard = source[source.rindex("#ifdef TILEFINCH_PSP_VALIDATION_LOG", 0, begin):begin]
+        self.assertIn("&& !psp_validation_video_timing_window", guard)
+        self.assertIn("psp_validation_video_suppressed_publications++", guard)
+
+    def test_video_priority_scope_preserves_higher_threads_and_refusals(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        start = runtime.index("static bool psp_present_video_surface(void)")
+        video = runtime[start:runtime.index(
+            "static bool psp_media_seek_holds_scanout(", start)]
+        start = video.index("psp_thread_priority_raise(")
+        scope = video[start:]
+        self.assertEqual(scope.count(
+            "psp_thread_priority_restore(previous_priority)"), 2)
+        failed = scope.index("return false;")
+        self.assertLess(scope.index("psp_thread_priority_restore("), failed)
+        publish = scope.index("psp_display_publish_serviced(")
+        self.assertLess(publish, scope.rindex("psp_thread_priority_restore("))
+        self.assertLess(scope.rindex("psp_thread_priority_restore("),
+                        scope.index("    if (published) {"))
+
+        source = (ROOT / "src/psp_thread_contract.h").read_text()
+        start = source.index("static inline int psp_thread_priority_raise(")
+        helpers = source[start:source.index("#endif", start)]
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include <stdio.h>
+#include <stdbool.h>
+typedef int SceUID;
+typedef struct { int currentPriority; } SceKernelThreadInfo;
+static int priority,calls;
+static bool snapshot_failure,change_failure;
+static int sceKernelGetThreadId(void) { return 17; }
+static int psp_thread_snapshot(SceUID id,SceKernelThreadInfo *info) {
+    if(id!=17)return -9;
+    if(snapshot_failure)return -8;
+    info->currentPriority=priority;return 0;
+}
+static int sceKernelChangeThreadPriority(SceUID id,int next) {
+    calls++;
+    if(id!=17)return -9;
+    if(change_failure)return -7;
+    priority=next;return 0;
+}
+''' + helpers + r'''
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"priority line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    for(int old=1;old<128;old++)for(unsigned flags=0;flags<4;flags++) {
+        priority=old;calls=0;snapshot_failure=flags&1;change_failure=flags&2;
+        int previous=psp_thread_priority_raise(0x1e);
+        bool raised=!flags && old>0x1e;
+        CHECK(previous==(raised?old:-1));
+        CHECK(priority==(raised?0x1e:old));
+        CHECK(calls==(!snapshot_failure && old>0x1e));
+        change_failure=false;
+        CHECK(psp_thread_priority_restore(previous)==0);
+        CHECK(priority==old);
+    }
+    priority=0x20;calls=0;snapshot_failure=change_failure=false;
+    int previous=psp_thread_priority_raise(0x1e);
+    CHECK(previous==0x20 && priority<0x1f); /* draw completion outranks transport */
+    change_failure=true;
+    CHECK(psp_thread_priority_restore(previous)==-7); /* not a false success */
+    change_failure=false;
+    CHECK(psp_thread_priority_restore(previous)==0 && priority==0x20);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "priority.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                str(path / "priority.c"), "-o", str(path / "priority")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "priority")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_startup_audio_release_uses_successful_picture_publication(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        video = runtime[runtime.index("static bool psp_present_video_surface(void)"):
+            runtime.index("static bool psp_media_seek_holds_scanout(")]
+        receipt = video[video.index("    if (published) {"):]
+        self.assertIn("psp_media_presented(psp_active_media)", receipt)
+        fallback = runtime[runtime.index("bool psp_present_internal("):
+            runtime.index("static unsigned psp_local_hour(void)")]
+        self.assertIn("if (published && media_replaces_page)\n"
+                      "        psp_media_presented(psp_active_media)", fallback)
+        source = (ROOT / "src/psp_media_session.c").read_text()
+        start = source.index("void psp_media_presented(")
+        body = source[start:source.index("\n}\n", start) + 3]
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include "tilefinch/psp_media_presentation_gate.h"
+#include <stdio.h>
+typedef struct {
+    void *playback;
+    struct { bool visible; } ui;
+    bool have_frame;
+    bool presentation_deferred;
+    PspMediaStartupPreroll startup;
+} PspMediaSession;
+static unsigned completions;
+static void psp_media_complete_priming_if_ready(PspMediaSession *m,const char *why) {
+    (void)why;
+    if(psp_media_startup_presented(&m->startup,8))completions++;
+}
+''' + body + r'''
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"receipt line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    psp_media_presented(NULL);CHECK(!completions);
+    for(unsigned mask=0;mask<16;mask++) {
+        PspMediaSession m={.playback=(mask&1)?NULL:&m,
+            .ui={!(mask&2)},.have_frame=!(mask&4),.presentation_deferred=true};
+        psp_media_startup_begin(&m.startup,7);
+        if(!(mask&8))psp_media_startup_claim(&m.startup);
+        completions=0;
+        psp_media_presented(&m);
+        CHECK(m.presentation_deferred==((mask&7u)!=0));
+        CHECK(completions==(mask?0u:1u));
+        CHECK(psp_media_startup_presented(&m.startup,8)==!mask);
+        psp_media_presented(&m); /* idempotent, even if completion is deferred */
+        CHECK(completions==(mask?0u:1u));
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "receipt.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                "-I", str(ROOT / "include"), str(path / "receipt.c"),
+                "-o", str(path / "receipt")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "receipt")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_present_feeds_zero_picture_units_before_overlay_and_scanout(self):
+        source = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        start = source.index("static bool psp_present_video_surface(void)")
+        present = source[start:source.index(
+            "static bool psp_media_seek_holds_scanout(", start)]
+        feed = "psp_media_feed_before_blocking(psp_active_media, false)"
+        self.assertEqual(present.count(feed), 2)
+        first = present.index(feed)
+        overlay = present.index("psp_ui_media_composite_8888_cached(")
+        second = present.index(feed, first + len(feed))
+        publish = present.index("psp_display_publish_serviced(")
+        self.assertLess(present.index("psp_present_media_frame_video("), first)
+        self.assertLess(first, overlay)
+        self.assertLess(overlay, second)
+        self.assertLess(second, publish)
+
+        # Execute the actual bounded feed, including all ownership/lifecycle
+        # guards. Present-time servicing must never re-enter a seek/open job,
+        # release a picture, wait for firmware, or advance the public clock.
+        source = (ROOT / "src/psp_media_present_session.c").read_text()
+        begin = source.index("size_t psp_media_feed_before_blocking(")
+        body = source[begin:source.index(
+            "void psp_media_present_texture_release(", begin)]
+        begin = source.index("void psp_media_defer_present_error(")
+        defer_error = source[begin:source.index("\n}\n", begin) + 3]
+        session = (ROOT / "src/psp_media_session.c").read_text()
+        begin = session.index("    MediaPlaybackAdvanceResult advance;\n")
+        consume_error = session[begin:session.index("    /*", begin)]
+        self.assertIn("media->present_error[0] = '\\0'", consume_error)
+        self.assertIn("MEDIA_PLAYBACK_ADVANCE_ERROR", consume_error)
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+enum { PSP_MEDIA_LOOP_PHASE_VBLANK, PSP_MEDIA_SESSION_OPENING=1,
+       PSP_MEDIA_JOB_NONE=0, PSP_MEDIA_JOB_MAXIMUM_PACKETS=2,
+       MEDIA_PLAYBACK_ADVANCE_ERROR=-1 };
+typedef int MediaPlaybackAdvanceResult;
+typedef struct { size_t packets_submitted; } MediaPlaybackJobStats;
+typedef struct {
+    void *playback;
+    struct { bool visible,playing; } ui;
+    struct { int state; } machine;
+    int job_phase;
+    bool pause_boundary_pending;
+    size_t prevblank_frames,prevblank_submitted;
+    char present_error[192];
+} PspMediaSession;
+static size_t calls,packets;
+static int invalid,next_result;
+static void media_psp_backend_set_loop_phase(int p) { (void)p; }
+static void media_playback_job_stats(void *p,MediaPlaybackJobStats *s) {
+    (void)p;s->packets_submitted=packets;
+}
+static uint64_t psp_media_session_decode_clock_us(PspMediaSession *m,bool first) {
+    (void)m;if(first)invalid=1;return 12345;
+}
+static int media_playback_advance_bounded_cancelable(void *p,uint64_t clock,
+    size_t maximum,void *cancel,char *error,size_t size) {
+    (void)p;(void)error;(void)size;
+    if(clock!=12345 || maximum!=2 || cancel!=NULL)invalid=1;
+    calls++;
+    if(next_result==MEDIA_PLAYBACK_ADVANCE_ERROR) {
+        snprintf(error,size,"synthetic codec failure");return next_result;
+    }
+    packets+=2;return 0;
+}
+static int media_playback_advance_prepared(void *p,uint64_t clock,
+    size_t maximum,char *error,size_t size) {
+    return media_playback_advance_bounded_cancelable(p,clock,maximum,NULL,error,size);
+}
+''' + defer_error + body + r'''
+static char consumed[256];
+static int consume(PspMediaSession *media) {
+    char error[256]={0};uint64_t decode_clock_us=12345;void *cancellation=NULL;
+''' + consume_error + r'''
+    snprintf(consumed,sizeof(consumed),"%s",error);return advance;
+}
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"feed line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    CHECK(psp_media_feed_before_blocking(NULL,false)==0);
+    for(unsigned mask=0;mask<64;mask++) {
+        PspMediaSession m={.playback=(mask&1)?NULL:&m,
+            .ui={!(mask&2),!(mask&4)},.machine={(mask&8)?1:2},
+            .job_phase=(mask&16)?1:0,.pause_boundary_pending=!!(mask&32)};
+        calls=packets=0;
+        CHECK(psp_media_feed_before_blocking(&m,false)==(mask?0u:2u));
+        CHECK(calls==(mask?0u:1u));
+        CHECK(m.prevblank_frames==calls && m.prevblank_submitted==packets);
+        CHECK(!invalid);
+    }
+    PspMediaSession m={.playback=&m,.ui={true,true},.machine={2}};
+    next_result=MEDIA_PLAYBACK_ADVANCE_ERROR;calls=packets=0;
+    CHECK(psp_media_feed_before_blocking(&m,true)==0 && calls==1);
+    CHECK(!strcmp(m.present_error,"synthetic codec failure"));
+    CHECK(psp_media_feed_before_blocking(&m,true)==0 && calls==1);
+    psp_media_defer_present_error(&m,"must not replace first failure");
+    CHECK(consume(&m)==MEDIA_PLAYBACK_ADVANCE_ERROR && calls==1);
+    CHECK(!strcmp(consumed,"synthetic codec failure") && !m.present_error[0]);
+    next_result=0;
+    CHECK(consume(&m)==0 && calls==2); /* recovery/new epoch can advance */
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "feed.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                str(path / "feed.c"), "-o", str(path / "feed")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "feed")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_playing_menu_waits_for_picture_with_bounded_retry(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        source = (ROOT / "src/psp_app/psp_app_runtime.c").read_text()
+        begin = source.index("bool psp_media_menu_feedback_pending(void)")
+        end = source.index("\n}\n", source.index(
+            "static bool psp_media_menu_feedback_wait(", begin)) + 3
+        callbacks = source[begin:end]
+        main = (ROOT / "src/psp_script_main.c").read_text()
+        self.assertIn("|| psp_media_menu_feedback_pending()", main)
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef struct { struct { bool visible,playing; } ui; uint64_t generation; } Media;
+static Media active={{true,true},7},*psp_active_media=&active;
+static uint64_t psp_media_front_menu_generation=7,psp_media_menu_deferred_us,now;
+static uint64_t sceKernelGetSystemTimeWide(void) { return now; }
+''' + callbacks + r'''
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"menu coalescing line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    CHECK(!psp_media_menu_feedback_pending());
+    now=100000;
+    CHECK(psp_media_menu_feedback_wait(true));
+    CHECK(psp_media_menu_feedback_pending());
+    now+=33333;
+    CHECK(psp_media_menu_feedback_wait(true));
+    now++;
+    CHECK(!psp_media_menu_feedback_wait(true)); /* stalled source: show controls */
+    CHECK(psp_media_menu_feedback_pending()); /* publication refusal must retry */
+    CHECK(!psp_media_menu_feedback_wait(false)); /* fresh picture/closing/seek */
+    CHECK(psp_media_menu_feedback_pending()); /* fresh pixels are not a swap receipt */
+    active.ui.playing=false;
+    CHECK(!psp_media_menu_feedback_wait(true)); /* paused menu is immediate */
+    for(unsigned reason=0;reason<4;reason++) {
+        active=(Media){{true,true},7};psp_active_media=&active;
+        CHECK(psp_media_menu_feedback_wait(true));
+        if(reason==0)active.ui.visible=false;
+        if(reason==1)active.ui.playing=false;
+        if(reason==2)active.generation++;
+        if(reason==3)psp_active_media=NULL;
+        CHECK(!psp_media_menu_feedback_pending());
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "coalescing.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                str(path / "coalescing.c"), "-o", str(path / "coalescing")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "coalescing")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_menu_feedback_never_replaces_a_new_decoded_picture(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        source = (ROOT / "src/psp_app/psp_app_runtime.c").read_text()
+        needle = "    bool current_picture = psp_media_front_menu_generation"
+        start = source.index(needle if needle in source else
+            "    bool menu_feedback = psp_media_front_menu_generation")
+        decision = source[start:source.index("    if (menu_feedback)", start)]
+        start = source.index("    if (published) {", start)
+        receipt = source[start:source.index("\n    }\n", start) + 7]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#define PSP_VRAM_STRIDE 512
+#define PSP_SCREEN_HEIGHT 272
+typedef struct { uint64_t epoch,identity; } Frame;
+typedef struct { uint64_t generation; Frame frame; struct { bool buffering,ended; } ui; } Media;
+static Media active={7,{11,13},{false,false}},*psp_active_media=&active;
+static uint64_t psp_media_menu_deferred_us;
+static uint64_t psp_media_front_menu_generation,psp_media_front_frame_epoch,psp_media_front_frame_identity;
+static uint32_t psp_media_front_menu_epoch,psp_media_front_menu_key;
+static uint32_t feedback_epoch=17,feedback_key=2;
+static int psp_display;
+static uint32_t *vram;
+static bool covered,copy_ok;
+static bool waiting_for_picture;
+static unsigned copies;
+static void *psp_display_video_front_buffer(int *d) { (void)d;return 0; }
+static bool psp_ui_media_menu_feedback_reuse(uint32_t a,uint32_t b) { (void)a;(void)b;return covered; }
+static bool psp_media_present_ge_stage_rows(void *d,const void *s,int a,int b,int h) {
+    (void)d;(void)s;(void)a;(void)b;(void)h;copies++;return copy_ok;
+}
+static bool psp_media_menu_feedback_wait(bool reuse) { waiting_for_picture=reuse;return false; }
+static void psp_media_presented(Media *m) { (void)m; }
+static bool decide(void) {
+''' + decision + r'''
+    return menu_feedback;
+}
+static void publish(bool published,bool menu_feedback) {
+''' + receipt + r'''
+}
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"picture feedback line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void) {
+    for(unsigned flags=0;flags<64;flags++) {
+        psp_media_front_menu_generation=active.generation+!!(flags&1);
+        psp_media_front_menu_epoch=feedback_epoch+!!(flags&2);
+        psp_media_front_frame_epoch=active.frame.epoch+!!(flags&4);
+        psp_media_front_frame_identity=active.frame.identity+!!(flags&8);
+        covered=!(flags&16);copy_ok=!(flags&32);copies=0;
+        CHECK(decide()==(flags==0));
+        CHECK(copies==((flags&31)?0u:1u));
+        CHECK(waiting_for_picture==!(flags&15));
+    }
+    psp_media_front_menu_generation=active.generation;
+    psp_media_front_menu_epoch=feedback_epoch;
+    psp_media_front_frame_epoch=active.frame.epoch;
+    psp_media_front_frame_identity=active.frame.identity;
+    covered=false;copy_ok=true;
+    for(unsigned reason=0;reason<4;reason++) {
+        feedback_key=reason==0?0:1;
+        active.ui.buffering=reason==1;active.ui.ended=reason==2;
+        CHECK(!decide());
+        CHECK(waiting_for_picture==(reason==3));
+    }
+    psp_media_front_frame_identity=99;psp_media_front_frame_epoch=98;
+    psp_media_menu_deferred_us=777;
+    publish(false,false);
+    CHECK(psp_media_front_frame_identity==99 && psp_media_front_frame_epoch==98);
+    CHECK(psp_media_menu_deferred_us==777);
+    publish(true,true); /* copying chrome cannot forge a new picture receipt */
+    CHECK(psp_media_front_frame_identity==99 && psp_media_front_frame_epoch==98);
+    CHECK(psp_media_menu_deferred_us==0);
+    publish(true,false);
+    CHECK(psp_media_front_frame_identity==13 && psp_media_front_frame_epoch==11);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "picture.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3", str(path / "picture.c"),
+                "-o", str(path / "picture")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "picture")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_chooser_feedback_precedes_media_dispatch_and_retries_refusal(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        source = (ROOT / "src/psp_script_main.c").read_text()
+        callback = "static bool " + loop_step(source, "psp_loop_media_input") + "\n}\n"
+        ui = (ROOT / "src/psp_ui.c").read_text()
+        begin = ui.index("bool psp_ui_media_intent_has_predispatch_visual(")
+        policy = ui[begin:ui.index("\n}\n", begin) + 3]
+        bridge = (ROOT / "src/psp_ui_media_8888.c").read_text()
+        begin = bridge.index("bool psp_ui_media_menu_feedback_reuse(")
+        policy += bridge[begin:bridge.index("\n}\n", begin) + 3]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#define TILEFINCH_HOT_BOUNDARY
+#define PSP_UI_MEDIA_ACTION_NONE 0
+#define PSP_UI_MEDIA_ACTION_PLAY_PAUSE 1
+#define PSP_UI_MEDIA_ACTION_ROTATE 2
+#define PSP_LOG_PHASE_MEDIA 1
+#define PSP_LOG_PHASE_INTERACTIVE 2
+typedef struct { unsigned action; bool visual_changed; } PspUiMediaIntent;
+typedef struct { unsigned pressed; } PspUiInput;
+typedef struct { uint32_t key; bool playing; } MediaUi;
+typedef struct { MediaUi ui; } Media;
+typedef struct { struct { int ui; } presentation; } PspProcessResources;
+typedef struct { Media media; } PspBrowserResources;
+typedef struct { int unused; } PspInteractiveState;
+typedef struct { const uint16_t *frame; } PspEngineViews;
+typedef struct { struct { PspProcessResources *process; PspBrowserResources *browser;
+    PspInteractiveState *interactive; PspEngineViews *views; } app; } PspLoop;
+static bool deferred, supervised, publication, expect_present;
+static unsigned calls, failures;
+static uint32_t next_key;
+static PspUiMediaIntent next_intent;
+#define CHECK(x) do { if(!(x)) { if(failures<4)fprintf(stderr,"menu dispatch line %d: %s\n",__LINE__,#x);failures++; } } while(0)
+static void psp_cursor_latency_idle(void) {}
+static bool psp_app_dispatch_deferred_media_intent(Media *m,PspInteractiveState *i) {
+    (void)m;(void)i;return deferred;
+}
+static uint32_t psp_ui_media_menu_feedback_key(const MediaUi *m) { return m->key; }
+static PspUiMediaIntent psp_ui_media_update(MediaUi *m,PspUiInput *i) {
+    (void)i;m->key=next_key;return next_intent;
+}
+static const char *psp_media_action_name(unsigned a) { return a?"action":NULL; }
+static void psp_log_set_phase(unsigned p) { (void)p; }
+static unsigned psp_log_operation_begin(const char *a) { (void)a;return 1; }
+static void psp_log_operation_end(unsigned n,const char *a,const char *r) { (void)n;(void)a;(void)r; }
+static bool psp_navigation_cooperate_supervised(void) { return supervised; }
+static bool psp_present(const uint16_t *f,const int *ui) { (void)f;(void)ui;calls++;return publication; }
+static void psp_media_execute_intent(Media *m,PspUiMediaIntent i) {
+    (void)m;(void)i;CHECK(calls==(unsigned)expect_present);
+}
+''' + policy + callback + r'''
+int main(void) {
+    uint32_t keys[]={0,1,(176u<<16)|1u,(176u<<16)|1025u,(208u<<16)|3073u};
+    for(unsigned a=0;a<5;a++)for(unsigned b=0;b<5;b++)
+    for(unsigned action=0;action<4;action++)for(unsigned flags=0;flags<32;flags++) {
+        PspProcessResources process={0};PspBrowserResources browser={.media={.ui={.key=keys[a]}}};
+        PspInteractiveState interactive={0};PspEngineViews views={0};
+        PspLoop loop={.app={&process,&browser,&interactive,&views}};
+        PspUiInput input={0};next_key=keys[b];
+        bool visual=!!(flags&1);supervised=!!(flags&2);
+        publication=!!(flags&4);deferred=!!(flags&8);
+        browser.media.ui.playing=!!(flags&16);
+        next_intent=(PspUiMediaIntent){action,visual};calls=0;
+        bool menu=visual && !(flags&16) && action==0 && keys[a]!=0 && keys[b]!=keys[a]
+            && (keys[b]>>16)!=0 && (keys[b]>>16)>=(keys[a]>>16);
+        expect_present=!supervised && (menu || (visual && action==3));
+        bool expected=deferred || (visual && !(menu && expect_present && publication));
+        CHECK(psp_loop_media_input(&loop,&input)==expected);
+        CHECK(calls==(unsigned)expect_present);
+    }
+    return failures?1:0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "dispatch.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3", str(path / "dispatch.c"),
+                "-o", str(path / "dispatch")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "dispatch")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_blocked_video_replenishes_a_low_audio_reserve(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        source = (ROOT / "src/media_backend_psp.c").read_text()
+        begin = source.index("static bool psp_media_allow_submit_bypass(")
+        callback = source[begin:source.index("static bool psp_media_wants_paired_submit(", begin)]
+        fixture = r'''
+#include "media_backend_psp_policy.h"
+#include <stdio.h>
+#include <string.h>
+#define MEDIA_MP4_TRACK_VIDEO 1
+typedef struct {
+    bool have_audio, admissions_closed;
+    atomic_bool playing, buffering, video_refusal_dirty, audio_origin_initialized;
+    atomic_uint audio_queue_write, audio_queue_read;
+    unsigned pending;
+    uint64_t session_epoch, audio_cursor_elapsed_us, audio_origin_us;
+    PspMediaSurfaceSlot slots[PSP_MEDIA_SURFACE_SLOTS];
+} PspMediaBackend;
+static atomic_bool psp_media_video_refusal_hold;
+static unsigned psp_media_audio_pending_count(const PspMediaBackend *b) { return b->pending; }
+''' + callback + r'''
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"audio reserve line %d: %s\n",__LINE__,#x);return 1; } } while(0)
+int main(void) {
+    PspMediaBackend b={.have_audio=true,.playing=true,
+        .session_epoch=PSP_MEDIA_EPOCH_FIRST,.audio_cursor_elapsed_us=80000};
+    b.slots[0].epoch=b.session_epoch;b.slots[0].pts_us=40000;b.slots[0].sequence=1;
+    psp_media_slot_publish(&b.slots[0],PSP_MEDIA_SLOT_READY);
+    /* A due picture used to block audio supply, even with an empty DAC queue.
+       The decision must not release/change that picture or start native work. */
+    PspMediaBackend before=b;
+    CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    CHECK(memcmp(&before,&b,sizeof(b))==0);
+    psp_media_slot_publish(&b.slots[0],PSP_MEDIA_SLOT_ME_WRITING);
+    before=b;
+    CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    CHECK(memcmp(&before,&b,sizeof(b))==0);
+    psp_media_slot_publish(&b.slots[0],PSP_MEDIA_SLOT_READY);
+    for(unsigned queued=0;queued<=PSP_MEDIA_AUDIO_PENDING_LOW_WATER;queued++) {
+        b.audio_queue_write=queued;
+        for(unsigned pending=0;pending<=PSP_MEDIA_AUDIO_PENDING_SLOTS;pending++) {
+            b.pending=pending;
+            CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO)
+                ==(queued<PSP_MEDIA_AUDIO_PENDING_LOW_WATER && pending<PSP_MEDIA_AUDIO_PENDING_SLOTS));
+        }
+    }
+    b.pending=0;b.audio_queue_read=UINT32_MAX-1u;b.audio_queue_write=1u;
+    CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO)); /* wrapped depth 3 */
+    b.audio_queue_write=2u;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    b.audio_queue_read=0;b.audio_queue_write=0;
+    b.playing=false;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));b.playing=true;
+    b.buffering=true;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));b.buffering=false;
+    b.admissions_closed=true;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));b.admissions_closed=false;
+    b.video_refusal_dirty=true;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));b.video_refusal_dirty=false;
+    psp_media_video_refusal_hold=true;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));psp_media_video_refusal_hold=false;
+    CHECK(!psp_media_allow_submit_bypass(&b,2));
+    b.have_audio=false;CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));b.have_audio=true;
+    /* With a healthy reserve, retain the existing future-picture clock escape. */
+    b.audio_queue_write=8;b.slots[0].pts_us=120000;
+    b.slots[1].epoch=b.session_epoch;b.slots[1].pts_us=160000;b.slots[1].sequence=2;
+    psp_media_slot_publish(&b.slots[1],PSP_MEDIA_SLOT_READY);
+    CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    /* Transition matrix: the clock escape is needed before playback starts,
+       but neither exception can offer packets into recovery/reset/full staging. */
+    for(unsigned flags=0;flags<128;flags++) {
+        b.playing=!(flags&1);b.buffering=!!(flags&2);
+        b.admissions_closed=!!(flags&4);b.video_refusal_dirty=!!(flags&8);
+        psp_media_video_refusal_hold=!!(flags&16);
+        b.pending=(flags&32)?PSP_MEDIA_AUDIO_PENDING_SLOTS:0;
+        b.audio_queue_write=(flags&64)?0:8;
+        before=b;
+        CHECK(psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO)
+            ==!(flags&(4|8|16|32)));
+        CHECK(memcmp(&before,&b,sizeof(b))==0);
+    }
+    b.playing=true;b.buffering=false;b.admissions_closed=false;
+    b.video_refusal_dirty=false;psp_media_video_refusal_hold=false;b.pending=0;
+    b.audio_queue_write=8;
+    /* No ready current-epoch picture, or an overflowing clock, cannot escape. */
+    b.slots[0].epoch=b.session_epoch+1;b.slots[1].epoch=b.session_epoch+1;
+    CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    b.slots[0].epoch=b.session_epoch;b.slots[1].epoch=b.session_epoch;
+    b.audio_origin_initialized=true;b.audio_origin_us=UINT64_MAX;
+    CHECK(!psp_media_allow_submit_bypass(&b,MEDIA_MP4_TRACK_VIDEO));
+    CHECK(!psp_media_allow_submit_bypass(NULL,MEDIA_MP4_TRACK_VIDEO));
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "reserve.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-O3", "-std=c11", "-I", str(ROOT / "src"),
+                str(path / "reserve.c"), "-o", str(path / "reserve")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "reserve")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_audio_output_owns_queue_until_bookkeeping_completes(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        source = (ROOT / "src/media_backend_psp.c").read_text()
+        begin = source.index("static int psp_media_audio_thread(")
+        worker = source[begin:source.index("\n#ifdef TILEFINCH_PSP_VALIDATION_LOG", source.index("\n    return 0;\n}", begin))]
+        fixture = r'''
+#include "media_backend_psp_policy.h"
+#include <string.h>
+#include <stdio.h>
+typedef unsigned SceSize;
+#define PSP_MEDIA_AUDIO_EVENT_READY 1
+#define PSP_MEDIA_AUDIO_EVENT_STOP 2
+#define PSP_EVENT_WAITOR 1
+#define PSP_EVENT_WAITCLEAR 2
+#define PSP_AUDIO_VOLUME_MAX 32768
+#define PSP_MEDIA_AUDIO_OUTPUT_PENDING 999
+#define PSP_MEDIA_AUDIO_WORKER_WAIT 1
+#define PSP_MEDIA_AUDIO_WORKER_OUTPUT 2
+typedef struct {
+    atomic_bool audio_stop, playing, buffering, audio_resetting;
+    atomic_uint audio_queue_read, audio_queue_write, audio_queue_generation;
+    atomic_uint audio_output_in_flight_slot, audio_output_starves, audio_output_blocks;
+    atomic_uint audio_first_output_us;
+    atomic_int audio_worker_stage, audio_worker_error, audio_output_first_status;
+    int audio_event, audio_channel;
+    struct { unsigned sample_rate; } audio;
+    PspMediaAudioDelivery audio_delivery;
+    atomic_bool audio_delivery_discontinuity;
+} PspMediaBackend;
+static PspMediaBackend *active;
+static unsigned mode, waits, outputs, queries, failures, ticks;
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"worker line %d: %s\n",__LINE__,#x);failures++; } } while(0)
+static int sceKernelWaitEventFlag(int event,int mask,int options,uint32_t *bits,void *timeout) {
+    (void)event;(void)mask;(void)options;(void)timeout;
+    if(mode==5)return -7;
+    *bits=waits++ || mode==6?PSP_MEDIA_AUDIO_EVENT_STOP:PSP_MEDIA_AUDIO_EVENT_READY;
+    if(mode==2)active->playing=false;
+    if(mode==3)active->buffering=true;
+    if(mode==4)active->audio_resetting=true;
+    return 0;
+}
+static void *psp_media_audio_queue_slot(PspMediaBackend *b,unsigned slot) {
+    CHECK(b==active && slot==0 && b->audio_output_in_flight_slot==1);return b;
+}
+static int output(void *pcm) {
+    CHECK(pcm==active && active->audio_output_in_flight_slot==1);
+    CHECK(active->audio_queue_read==0);outputs++;
+    if(mode==8)active->playing=false;
+    if(mode==9)active->buffering=true;
+    if(mode==10)active->audio_resetting=true;
+    return mode==1?-8:0;
+}
+static int sceAudioOutputBlocking(int channel,int volume,void *pcm) {
+    CHECK(channel==0 && volume==PSP_AUDIO_VOLUME_MAX);return output(pcm);
+}
+static int sceAudioSRCOutputBlocking(int volume,void *pcm) {
+    CHECK(volume==PSP_AUDIO_VOLUME_MAX);return output(pcm);
+}
+static int sceAudioGetChannelRestLen(int channel) {
+    CHECK(channel==0 && active->audio_output_in_flight_slot==1);
+    CHECK(active->audio_queue_read==0);queries++;return outputs?1024:0;
+}
+static uint32_t psp_media_stamp_us(void) {
+    CHECK(active->audio_output_in_flight_slot==1);return ++ticks*100;
+}
+''' + worker + r'''
+int main(void) {
+    CHECK(psp_media_audio_thread(0,NULL)==-1);
+    for(mode=0;mode<12;mode++) {
+        PspMediaBackend b={.playing=true,.audio_queue_write=1,
+            .audio_channel=mode==7?-2:0,.audio={.sample_rate=44100},
+            .audio_output_first_status=PSP_MEDIA_AUDIO_OUTPUT_PENDING,
+            .audio_delivery_discontinuity=true};
+        active=&b;waits=outputs=queries=ticks=0;
+        if(mode==11)b.audio_queue_write=0;
+        PspMediaBackend *argument=&b;
+        CHECK(psp_media_audio_thread(sizeof(argument),&argument)==0);
+        CHECK(b.audio_output_in_flight_slot==0);
+        bool attempted=mode==0 || mode==1 || (mode>=7 && mode<=10);
+        bool accepted=attempted && mode!=1;
+        CHECK(outputs==(unsigned)attempted);
+        CHECK(b.audio_queue_read==(unsigned)accepted);
+        CHECK(b.audio_output_blocks==(unsigned)accepted);
+        CHECK(b.audio_output_first_status==(mode==1?-8:accepted?0:PSP_MEDIA_AUDIO_OUTPUT_PENDING));
+        CHECK(b.audio_worker_error==(mode==1?-8:mode==5?-7:0));
+        CHECK(b.audio_output_starves==(mode==11?1u:0u));
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        CHECK(queries==(accepted && mode!=7?2u:mode==1?1u:0u));
+        CHECK(b.audio_delivery.blocks==(accepted && mode!=7?1u:0u));
+#else
+        CHECK(queries==0);
+#endif
+    }
+    return failures?1:0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "worker.c").write_text(fixture)
+            for defines in ([], ["-DTILEFINCH_PSP_VALIDATION_LOG"]):
+                compiled = subprocess.run([compiler, "-O3", "-std=c11", *defines,
+                    "-I", str(ROOT / "src"), str(path / "worker.c"),
+                    "-o", str(path / "worker")], capture_output=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                result = subprocess.run([str(path / "worker")], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cache_preparation_retains_the_launcher_mark(self):
+        source = (ROOT / "src/update_launcher_psp.c").read_text()
+        start = source.index("static void launcher_cache_work_started(")
+        callback = source[start:source.index("\nstatic bool launcher_boot_slot(", start)]
+        self.assertNotIn("launcher_clear(", without_comments(callback))
+        self.assertEqual(callback.count("launcher_publish_prepared();"), 1)
+        labels = list(call_arguments(callback, "launcher_draw_text_at"))
+        self.assertEqual(len(labels), 3)
+        for label in labels:
+            x, y, text, _, scale = split_arguments(label)
+            self.assertEqual(scale, "1")
+            self.assertGreaterEqual(int(y), 160)  # below the ordinary 48px mark
+            self.assertLess(int(y) + 8, 248)      # above the safe-start hint
+            self.assertGreaterEqual(int(x), 0)
+            self.assertLessEqual(int(x) + len(json.loads(text)) * 6, 480)
+
+    def test_player_first_picture_measurement_is_bounded_and_deferred(self):
+        source = (ROOT / "src/psp_app/psp_app_runtime.c").read_text()
+        self.assertIn("PspMenuPhaseClock clocks[8][5]", source)
+        self.assertIn("psp_player_start.count < 8u", source)
+        self.assertIn("*samples < 4u", source)
+        start = source.index("static void psp_player_start_report(")
+        report = source[start:source.index("static void psp_menu_phase_report(", start)]
+        self.assertIn('"surface", "video", "overlay", "publish"', report)
+        self.assertIn("clock-query=", report)
+        present = source[source.index("static bool psp_present_video_surface("):
+                         source.index("static bool psp_media_seek_holds_scanout(")]
+        self.assertNotIn("psp_player_start_report(", present)
+        self.assertIn("psp_player_start_clocks[4] = psp_menu_phase_clock();", present)
+
+    def test_entropy_warmup_is_bounded_and_requires_unchanged_credit(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("A C compiler is required")
+        fixture = r'''
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+typedef int SceUID;
+static uint64_t clock_us;
+static uint32_t random_state=1;
+static unsigned lows, sleeps, waits;
+static bool unpredictable, busy;
+static int sceKernelCreateSema(const char *n,int a,int b,int c,void *d)
+{ (void)n;(void)a;(void)b;(void)c;(void)d;return 1; }
+static int sceKernelWaitSema(int s,int n,void *p)
+{ (void)s;(void)n;(void)p;waits++;return busy?-1:0; }
+static int sceKernelPollSema(int s,int n) { (void)s;(void)n;return busy?-1:0; }
+static int sceKernelSignalSema(int s,int n) { (void)s;(void)n;return 0; }
+static uint64_t sceKernelGetSystemTimeWide(void) { return clock_us+=10; }
+static uint32_t sceKernelGetSystemTimeLow(void) {
+    lows++;random_state=random_state*1664525u+1013904223u;
+    clock_us+=unpredictable?1u+(random_state>>24):10u;return (uint32_t)clock_us;
+}
+static int sceKernelDelayThread(unsigned n) { sleeps++;clock_us+=n;return 0; }
+static int sceKernelGetThreadId(void) { return 1; }
+static unsigned sceKernelTotalFreeMemSize(void) { return 1024u*1024u; }
+static void sceKernelDcacheWritebackInvalidateRange(void *p,size_t n) { (void)p;(void)n; }
+#include "src/psp_entropy.c"
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"entropy line %d: %s\n",__LINE__,#x);return 1; } } while(0)
+static void quiet(const char *p) { (void)p; }
+static void reset(bool random) {
+    psp_entropy=(PspEntropyState){.lock=-1,.seed_status="none"};
+    clock_us=0;random_state=1;lows=sleeps=waits=0;busy=false;unpredictable=random;
+    psp_entropy_configure(NULL,PSP_ENTROPY_REQUIRE_CREDIT,quiet);
+}
+int main(void) {
+    reset(true);
+    busy=true;CHECK(psp_entropy_prepare_step()==PSP_ENTROPY_PREPARE_PENDING && waits==0 && lows==0);
+    busy=false;
+    PspEntropyPreparation status=PSP_ENTROPY_PREPARE_PENDING;
+    for(unsigned i=0;i<132 && status==PSP_ENTROPY_PREPARE_PENDING;i++) {
+        unsigned before=lows, delay=sleeps;
+        status=psp_entropy_prepare_step();
+        CHECK(lows-before<=512 && sleeps-delay<=64);
+    }
+    CHECK(status==PSP_ENTROPY_PREPARE_READY && psp_entropy.released_credited);
+    CHECK(psp_entropy_pool_ready(&psp_entropy.pool));
+    unsigned before=lows, delay=sleeps;
+    unsigned char output[32]={0};
+    CHECK(psp_entropy_prepare_step()==PSP_ENTROPY_PREPARE_READY && psp_entropy_fill(output,sizeof(output)));
+    CHECK(lows==before && sleeps==delay);
+    reset(false);
+    status=PSP_ENTROPY_PREPARE_PENDING;
+    for(unsigned i=0;i<132 && status==PSP_ENTROPY_PREPARE_PENDING;i++)status=psp_entropy_prepare_step();
+    CHECK(status==PSP_ENTROPY_PREPARE_REFUSED && !psp_entropy.released);
+    memset(output,0xa5,sizeof(output));
+    CHECK(!psp_entropy_fill(output,sizeof(output)) && output[0]==0xa5);
+    reset(false);psp_entropy.policy=PSP_ENTROPY_PERMIT_UNCREDITED;
+    status=PSP_ENTROPY_PREPARE_PENDING;
+    for(unsigned i=0;i<132 && status==PSP_ENTROPY_PREPARE_PENDING;i++)status=psp_entropy_prepare_step();
+    CHECK(status==PSP_ENTROPY_PREPARE_REFUSED && !psp_entropy.released);
+    CHECK(psp_entropy_fill(output,sizeof(output)) && psp_entropy.released && !psp_entropy.released_credited);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tilefinch-entropy-step-") as directory:
+            work = Path(directory)
+            for name in ("pspkernel.h", "pspsysmem.h", "pspthreadman.h", "psputils.h"):
+                (work / name).write_text("")
+            source = work / "test.c"
+            source.write_text(fixture)
+            binary = work / "test"
+            subprocess.run([compiler, "-std=c11", "-I", str(work), "-I", str(ROOT),
+                "-I", str(ROOT / "include"), str(source), str(ROOT / "src/psp_entropy_pool.c"),
+                str(ROOT / "src/sha256.c"), "-o", str(binary)], check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True, capture_output=True, timeout=10)
+
+    def test_home_input_precedes_optional_profile_name_and_second_present(self):
+        source = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        begin = source.index("static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(")
+        loop = source[begin:source.index("static TILEFINCH_OUT_OF_LINE bool psp_loop_page_work_waiting(", begin)]
+        self.assertNotIn("psp_app_refresh_network_profile_label(", loop)
+        frame = source[source.index("static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)\n{"):]
+        lazy = frame[:frame.index("psp_log_heartbeat();")]
+        self.assertIn("PSP_UI_SCREEN_OPTION_ITEMS", lazy)
+        self.assertIn("!process->presentation.ui.network_profile_label_valid", lazy)
+        self.assertIn("psp_app_refresh_network_profile_label(", lazy)
+        self.assertIn("if (!native_home_boot || PSP_VALIDATION_KNOB(process.config.dump_frame != 0))", source)
+
+    def test_post_paint_transport_preparation_keeps_provider_open_eligible(self):
+        source = without_comments((ROOT / "src/psp_app/psp_app_network.c").read_text())
+        prepare = source[source.index("void psp_app_prepare_transport("):]
+        self.assertIn("PSP_UI_SCREEN_HOME", prepare)
+        self.assertIn('site_adapter_handles_navigation("GET",', prepare)
+        self.assertIn("FRAME_PUMP_TRANSPORT_PREPARE, facts", prepare)
+        for function in ("psp_entropy_prepare_step", "fetch_prepare_tls_session_store",
+                         "fetch_prepare_ca_bundle_step", "fetch_background_transport_initialize"):
+            self.assertEqual(prepare.count(function + "("), 1)
+        self.assertIn("if (!network->inet_initialized) break;", prepare)
+        self.assertIn("fetch_cancel_ca_bundle_preparation();", prepare)
+        self.assertIn("owner->transport_prepare_pending = false;", prepare)
+        self.assertNotIn("fetch_get(", prepare)
+        self.assertNotIn("psp_entropy_fill(", prepare)
+        pump = without_comments((ROOT / "src/psp_app/psp_app_frame_pumps.c").read_text())
+        self.assertIn("YIELD_IF_ACTIVE(FRAME_PUMP_TRANSPORT_PREPARE,", pump)
+        self.assertIn("app->interactive->transport_prepare_pending", pump)
+        connection = source[source.index("static bool psp_connect_network_prepared("):
+                            source.index("bool psp_connect_network(")]
+        self.assertLess(connection.index("PSP_CTRL_CIRCLE"),
+                        connection.index("psp_app_prepare_transport("))
+        self.assertIn("!terminal && preparation_app != NULL && pad.Buttons == 0", connection)
+        actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text())
+        self.assertIn("psp_app_ensure_network_for_navigation(app, method, url, engine_frame)", actions)
+
+    def test_native_ca_preparation_bounds_reads_and_closes_partial_state(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("A C compiler is required")
+        source = (ROOT / "src/fetch.c").read_text()
+        def function(signature):
+            begin = source.index(signature + "\n{")
+            cursor = source.index("{", begin)
+            depth = 1
+            end = cursor + 1
+            while depth:
+                depth += (source[end] == "{") - (source[end] == "}")
+                end += 1
+            return source[begin:end]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include "tilefinch/sha256.h"
+#define TILEFINCH_FETCH_CA_BLOB 1
+#define __PSP__ 1
+#define PSP_O_RDONLY 1
+#define TILEFINCH_CA_BUNDLE_SHA256_BYTES 32
+typedef int SceUID;
+typedef struct { int64_t st_size; } SceIoStat;
+static unsigned char input[65537], fetch_ca_blob_psp_storage[65536];
+static unsigned char *fetch_ca_blob_data;
+static size_t fetch_ca_blob_length, fetch_ca_read_size, fetch_ca_read_offset;
+static uint8_t fetch_ca_blob_digest[32];
+static bool fetch_ca_blob_digest_valid;
+static char fetch_ca_bundle[1024], fetch_ca_blob_source[1024];
+static SceUID fetch_ca_read_file=-1;
+static size_t curl_global_users, input_size, position, maximum_read, short_read;
+static unsigned opens, closes;
+static bool io_failure, close_failure, extra;
+static int sceIoGetstat(const char *p,SceIoStat *s) { (void)p;s->st_size=(int64_t)input_size;return 0; }
+static int sceIoOpen(const char *p,int f,int m) { (void)p;(void)f;(void)m;opens++;position=0;return 1; }
+static int sceIoClose(int f) { (void)f;closes++;return close_failure?-1:0; }
+static int sceIoRead(int f,void *out,size_t n) {
+    (void)f;if(n>maximum_read)maximum_read=n;
+    if(io_failure)return -1;
+    size_t available=input_size+(extra?1u:0u)-position;
+    if(n>available)n=available;
+    if(short_read && n>short_read)n=short_read;
+    memcpy(out,input+position,n);position+=n;return (int)n;
+}
+'''
+        for signature in ("static void fetch_ca_blob_reset(void)",
+                          "bool fetch_set_ca_bundle_path(const char *path)",
+                          "void fetch_cancel_ca_bundle_preparation(void)",
+                          "bool fetch_prepare_ca_bundle_step(bool *complete)"):
+            fixture += "\n" + function(signature) + "\n"
+        fixture += r'''
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"ca line %d: %s\n",__LINE__,#x);return 1; } } while(0)
+static void reset(size_t size) {
+    fetch_ca_blob_reset();input_size=size;opens=closes=0;position=maximum_read=short_read=0;
+    io_failure=close_failure=extra=false;
+    for(size_t i=0;i<sizeof(input);i++)input[i]=(unsigned char)i;
+    fetch_set_ca_bundle_path("ms0:/fixture/roots.pem");
+}
+int main(void) {
+    for(unsigned lane=0;lane<2;lane++) {
+        reset(65536);short_read=lane?127:0;
+        bool complete=false;unsigned steps=0;
+        while(!complete && steps++<65540) {
+            CHECK(fetch_prepare_ca_bundle_step(&complete));
+            CHECK(complete || fetch_ca_blob_data==NULL);
+        }
+        CHECK(complete && maximum_read<=4096 && opens==1 && closes==1);
+        CHECK(fetch_ca_blob_length==input_size && !memcmp(fetch_ca_blob_data,input,input_size));
+        unsigned char hash[32];CHECK(tilefinch_sha256_digest(input,input_size,hash));
+        CHECK(!memcmp(hash,fetch_ca_blob_digest,32));
+        CHECK(fetch_prepare_ca_bundle_step(&complete) && complete && opens==1);
+    }
+    bool complete=false;
+    reset(8192);CHECK(fetch_prepare_ca_bundle_step(&complete));
+    CHECK(fetch_prepare_ca_bundle_step(&complete));fetch_cancel_ca_bundle_preparation();
+    CHECK(opens==closes && fetch_ca_read_file<0 && !fetch_ca_blob_data);
+    CHECK(fetch_prepare_ca_bundle_step(&complete));
+    CHECK(fetch_set_ca_bundle_path("ms0:/fixture/other.pem") && opens==closes);
+    for(unsigned kind=0;kind<3;kind++) {
+        reset(4096);CHECK(fetch_prepare_ca_bundle_step(&complete));
+        if(kind==0)io_failure=true;
+        else { CHECK(fetch_prepare_ca_bundle_step(&complete));extra=kind==1;close_failure=kind==2; }
+        CHECK(!fetch_prepare_ca_bundle_step(&complete) && !complete && !fetch_ca_blob_data);
+        CHECK(opens==closes && fetch_ca_read_file<0);
+    }
+    reset(65537);CHECK(!fetch_prepare_ca_bundle_step(&complete) && !opens);
+    reset(0);CHECK(!fetch_prepare_ca_bundle_step(&complete) && !opens);
+    CHECK(!fetch_prepare_ca_bundle_step(NULL));
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tilefinch-ca-step-") as directory:
+            work = Path(directory)
+            path, binary = work / "test.c", work / "test"
+            path.write_text(fixture)
+            subprocess.run([compiler, "-std=c11", "-I", str(ROOT / "include"),
+                str(path), str(ROOT / "src/sha256.c"), "-o", str(binary)],
+                check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True, capture_output=True, timeout=10)
+
+    def test_shared_transport_preparation_progress_and_refusal(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("A C compiler is required")
+        source = (ROOT / "src/psp_app/psp_app_network.c").read_text()
+        helper = source[source.index("void psp_app_prepare_transport("):source.rindex("\n#endif")]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define PSP_UI_SCREEN_HOME 1
+#define PSP_NETWORK_FAILED 20
+#define PSP_NETWORK_CANCELLED 21
+#define PSP_NETWORK_READY 10
+#define FRAME_PUMP_TRANSPORT_PREPARE 9
+typedef enum { PSP_ENTROPY_PREPARE_PENDING, PSP_ENTROPY_PREPARE_READY, PSP_ENTROPY_PREPARE_REFUSED } PspEntropyPreparation;
+typedef struct { bool transport_prepare_pending;unsigned transport_prepare_phase; } PspInteractiveState;
+typedef struct { int status;bool inet_initialized; } PspNetwork;
+typedef struct { struct { struct { int screen; } ui; } presentation; } Process;
+typedef struct { struct { struct { const char *document_url; } page; } *navigation; } Views;
+typedef struct { void *budget; } Browser;
+typedef struct { PspInteractiveState *interactive;PspNetwork *network;void *network_lifecycle;Process *process;Views *views;Browser *browser; } PspApp;
+static bool started=true, native=true, allow=true, ca_complete=true, ok=true;
+static PspEntropyPreparation entropy=PSP_ENTROPY_PREPARE_READY;
+static unsigned calls[4], cancels, admissions;
+static bool psp_network_lifecycle_started(void *p){(void)p;return started;}
+static bool site_adapter_handles_navigation(const char *m,const char *u){(void)m;(void)u;return native;}
+static bool psp_app_frame_pump_admit(PspApp *a,int p,uint32_t facts){(void)a;(void)p;admissions++;return allow && !facts;}
+static void psp_app_frame_pump_ran(PspApp *a,int p){(void)a;(void)p;}
+static PspEntropyPreparation psp_entropy_prepare_step(void){calls[0]++;return entropy;}
+static bool fetch_prepare_tls_session_store(void){calls[1]++;return ok;}
+static bool fetch_prepare_ca_bundle_step(bool *done){calls[2]++;*done=ca_complete;return ok;}
+static bool fetch_background_transport_initialize(void *b){(void)b;calls[3]++;return ok;}
+static void fetch_cancel_ca_bundle_preparation(void){cancels++;}
+'''
+        fixture += helper
+        fixture += r'''
+#define CHECK(x) do { if(!(x)){fprintf(stderr,"prepare line %d: %s\n",__LINE__,#x);return 1;} } while(0)
+int main(void){
+    PspInteractiveState owner={true,0};PspNetwork network={0,true};
+    Process process={{{PSP_UI_SCREEN_HOME}}};Views views={0};Browser browser={0};
+    PspApp app={&owner,&network,NULL,&process,&views,&browser};
+    psp_app_prepare_transport(&app,1,false);CHECK(!calls[0] && owner.transport_prepare_phase==0);
+    entropy=PSP_ENTROPY_PREPARE_PENDING;psp_app_prepare_transport(&app,0,false);
+    CHECK(calls[0]==1 && owner.transport_prepare_phase==0);
+    entropy=PSP_ENTROPY_PREPARE_READY;allow=false;
+    psp_app_prepare_transport(&app,0,false);CHECK(calls[0]==1);
+    /* A connection wait has already checked controls and owns its cadence. */
+    psp_app_prepare_transport(&app,0,true);CHECK(calls[0]==2 && owner.transport_prepare_phase==1);
+    psp_app_prepare_transport(&app,0,true);CHECK(calls[1]==1 && owner.transport_prepare_phase==2);
+    ca_complete=false;psp_app_prepare_transport(&app,0,true);
+    CHECK(calls[2]==1 && owner.transport_prepare_phase==2);
+    ca_complete=true;psp_app_prepare_transport(&app,0,true);
+    CHECK(calls[2]==2 && owner.transport_prepare_phase==3);
+    network.inet_initialized=false;psp_app_prepare_transport(&app,0,true);
+    CHECK(!calls[3] && owner.transport_prepare_pending);
+    network.inet_initialized=true;psp_app_prepare_transport(&app,0,true);
+    CHECK(calls[3]==1 && owner.transport_prepare_pending && owner.transport_prepare_phase==4);
+    unsigned admitted=admissions;
+    psp_app_prepare_transport(&app,0,false);
+    CHECK(owner.transport_prepare_pending && calls[3]==1 && admissions==admitted);
+    network.status=PSP_NETWORK_READY;psp_app_prepare_transport(&app,0,true);
+    CHECK(!owner.transport_prepare_pending && calls[3]==1);
+    psp_app_prepare_transport(&app,0,true);CHECK(calls[3]==1);
+    for(unsigned kind=0;kind<3;kind++){
+        owner=(PspInteractiveState){true,kind};ok=false;entropy=PSP_ENTROPY_PREPARE_REFUSED;
+        unsigned before=cancels;psp_app_prepare_transport(&app,0,true);
+        CHECK(!owner.transport_prepare_pending && cancels==before+1);
+    }
+    owner=(PspInteractiveState){true,0};network.status=PSP_NETWORK_CANCELLED;
+    unsigned before=calls[0];psp_app_prepare_transport(&app,0,true);
+    CHECK(!owner.transport_prepare_pending && calls[0]==before);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tilefinch-transport-prepare-") as directory:
+            path, binary = Path(directory) / "test.c", Path(directory) / "test"
+            path.write_text(fixture)
+            subprocess.run([compiler, "-std=c11", str(path), "-o", str(binary)],
+                           check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True, capture_output=True, timeout=10)
+
+    def test_failed_cached_module_start_forgets_the_copy_before_fallback(self):
+        source = (ROOT / "src/update_launcher_psp.c").read_text()
+        start = source.index("        psp_boot_module_start(cache,")
+        discard = source.index("psp_boot_cache_discard(paths->data_dir)", start)
+        fallback = source.index("sctrlKernelLoadExecVSHMs2(eboot,", start)
+        self.assertLess(discard, fallback)
+
+    def test_boot_cache_reads_use_caller_owned_blocks_on_psp(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("A C compiler is required")
+        # Execute the complete cache/format/refusal suite against the actual
+        # PSP branch. The adapter refuses reads before unbuffered setup, so
+        # restoring the old buffered open makes the existing suite fail.
+        fixture = r'''
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static FILE *streams[8];
+static unsigned ready[8], setups, closes, fail_setup, large_reads, write_opens;
+static FILE *traced_open(const char *path, const char *mode) {
+    if (strchr(mode, 'w')) write_opens++;
+    FILE *file = fopen(path, mode);
+    if (file && !strcmp(mode, "rb")) {
+        unsigned i;
+        for (i = 0; i < 8 && streams[i]; i++) {}
+        if (i == 8) abort();
+        streams[i] = file; ready[i] = 0;
+    }
+    return file;
+}
+static int traced_close(FILE *file) {
+    for (unsigned i = 0; i < 8; i++) if (streams[i] == file) {
+        streams[i] = NULL; ready[i] = 0; closes++; break;
+    }
+    return fclose(file);
+}
+static int traced_setup(FILE *file, char *buffer, int mode, size_t size) {
+    if (buffer || mode != _IONBF || size) abort();
+    setups++;
+    if (fail_setup) { fail_setup = 0; return -1; }
+    for (unsigned i = 0; i < 8; i++) if (streams[i] == file) ready[i] = 1;
+    return setvbuf(file, buffer, mode, size);
+}
+static size_t traced_read(void *buffer, size_t size, size_t count, FILE *file) {
+    if (size && count > 1024 / size) large_reads++;
+    for (unsigned i = 0; i < 8; i++)
+        if (streams[i] == file && !ready[i]) return 0;
+    return fread(buffer, size, count, file);
+}
+#define TILEFINCH_BOOT_CACHE_TEST_STDIO
+#define main cache_suite_main
+#include "tests/test_psp_boot_handoff.c"
+#undef main
+int main(void) {
+    if (cache_suite_main() || setups == 0) return 1;
+    for (unsigned i = 0; i < 8; i++) if (streams[i]) return 2;
+    char dir[] = "/tmp/tilefinch-cache-reuse-XXXXXX";
+    if (!mkdtemp(dir)) return 6;
+    char source[160], cache[160], temp[160], receipt[180];
+    snprintf(source, sizeof(source), "%s/EBOOT.PBP", dir);
+    snprintf(cache, sizeof(cache), "%s/module.prx", dir);
+    snprintf(temp, sizeof(temp), "%s/module.tmp", dir);
+    snprintf(receipt, sizeof(receipt), "%s.receipt", cache);
+    unsigned char image[8500] = {0, 'P', 'B', 'P', 0, 0, 1, 0};
+    for (unsigned at = 8; at < 36; at += 4) put32(image + at, 40);
+    put32(image + 36, sizeof(image));
+    const unsigned char header[20] = {0x7f,'E','L','F',1,1,1,0,0,0,0,0,0,0,0,0,0xa0,0xff,8,0};
+    memcpy(image + 40, header, sizeof(header));
+    FILE *output = fopen(source, "wb");
+    if (!output || fwrite(image, 1, sizeof(image), output) != sizeof(image)
+        || fclose(output) || cache_with_space(source, cache, temp, UINT64_MAX) != PSP_BOOT_CACHE_CREATED) return 7;
+    unsigned reads_before = large_reads;
+    unsigned writes_before = write_opens;
+    if (cache_with_space(source, cache, temp, 0) != PSP_BOOT_CACHE_REUSED
+        || large_reads != reads_before || write_opens != writes_before) return 8;
+    if (remove(receipt) || remove(cache) || remove(source) || rmdir(dir)) return 9;
+    char path[] = "/tmp/tilefinch-cache-setup-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || close(fd) != 0) return 3;
+    unsigned previous = closes;
+    fail_setup = 1;
+    PspBootCacheResult result = cache_with_space(path, "unused-cache", "unused-temp", UINT64_MAX);
+    if (result != PSP_BOOT_CACHE_UNAVAILABLE || closes != previous + 1 || fail_setup) return 4;
+    if (unlink(path) != 0) return 5;
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="tilefinch-cache-io-") as work:
+            source = Path(work) / "cache.c"
+            executable = Path(work) / "cache"
+            source.write_text(fixture)
+            built = subprocess.run([
+                compiler, "-std=c11", "-O2", "-D__PSP__",
+                "-I", str(ROOT), "-I", str(ROOT / "include"), str(source),
+                str(ROOT / "src/psp_boot_handoff.c"), "-o", str(executable)
+            ], capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            ran = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+
+    def test_media_fixture_resumes_reset_audio_only_after_a_new_picture(self):
+        source = without_comments((ROOT / "src/psp_media_fixture.c").read_text())
+        clip = source[source.index("static bool fixture_run_clip("):
+                      source.index("#define PSP_MEDIA_CSC_PROBE_HEAD_PIXELS")]
+        self.assertIn("bool resume_on_picture = false;", clip)
+        self.assertLess(clip.index("media_playback_take_video_frame(playback, &frame)"),
+                        clip.index("media_playback_set_playing(playback, true)"))
+        self.assertLess(clip.index("previous_signature = signature;"),
+                        clip.index("media_playback_set_playing(playback, true)"))
+        self.assertLess(clip.index("media_playback_seek("),
+                        clip.index("resume_on_picture = true;"))
+        self.assertIn("UINT64_C(8000000)", clip)
+
+    def test_launcher_deletes_callback_before_retiring_its_thread(self):
+        source = (ROOT / "src/update_launcher_psp.c").read_text()
+        start = source.index("static bool launcher_retire_callbacks(")
+        body = source[start:source.index("\n}\n", start) + 3]
+        fixture = r'''
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stddef.h>
+static int launcher_callback_thread_id = 7;
+static atomic_int launcher_callback_id = 8, launcher_callback_status = 0;
+static int alive, calls, fail_at;
+static int step(void) { return calls++ == fail_at ? -1 : 0; }
+static int sceKernelDeleteCallback(int id) {
+    int r = step(); if (id != 8 || !alive || r < 0) return -1; alive = 0; return 0;
+}
+static int sceKernelWakeupThread(int id) { return id == 7 ? step() : -1; }
+static int psp_thread_wait_end_bounded(int id, uint32_t timeout) {
+    int r = step(); alive = 0; return id == 7 && timeout == 1000000u ? r : -1;
+}
+static int sceKernelDeleteThread(int id) { return id == 7 ? step() : -1; }
+''' + body + r'''
+int main(void) {
+    alive = 1; calls = 0; fail_at = -1;
+    if (!launcher_retire_callbacks(NULL) || calls != 4) return 1;
+    for (int fail = 0; fail < 4; fail++) {
+        alive = 1; calls = 0; fail_at = fail;
+        if (launcher_retire_callbacks(NULL) || calls != fail + 1) return 2;
+    }
+    return 0;
+}
+'''
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "callback.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", str(path / "callback.c"),
+                                       "-o", str(path / "callback")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "callback")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_signin_diagnostic_qr_excludes_general_logs_and_flushes(self):
         actions = without_comments(
             (ROOT / "src/psp_app/psp_app_actions.c").read_text())
@@ -974,10 +2244,10 @@ int main(void) {
                 encoding="utf-8"))
 
         self.assertIn("TF_DEPLOY_CHUNK_BYTES (1024u * 1024u)", source)
-        self.assertIn("TF_DEPLOY_MAX_BYTES (8u * 1024u * 1024u)", source)
+        self.assertIn("TF_DEPLOY_MAX_BYTES (16u * 1024u * 1024u)", source)
         self.assertIn("TfDeployWriteBound", source)
         self.assertIn('"ms0:/PSP/GAME/TILEFINCH/slot-a/EBOOT.PBP"', source)
-        self.assertIn("write_calls > 8u", source)
+        self.assertIn("write_calls > 16u", source)
         self.assertEqual(1, source.count("sceIoWrite(file, data, size)"))
         self.assertIn("read_unit(source_file, transfer_buffer, request)",
                       source)
@@ -1100,7 +2370,8 @@ int main(void) {
             host.mkdir()
             config = build / "CMakeCache.txt"
             config.write_text("PSP_BROWSER_ENABLE_PSP_VOICE:BOOL=ON\n")
-            (build / "EBOOT.PBP").write_bytes(b"\0PBPbrowser")
+            browser = b"\0PBPbrowser"
+            (build / "tilefinch-browser.PBP").write_bytes(browser)
             (build / "tilefinch-wasm.prx").write_bytes(b"\x7fELFwasm-abi7")
             (host / "EBOOT-device-latest.PBP").write_bytes(b"old-stage")
             result = subprocess.run(["sh", str(stage), str(build), str(host)], capture_output=True)
@@ -1110,6 +2381,7 @@ int main(void) {
             result = subprocess.run(["sh", str(stage), str(build), str(host)], capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.split(), [b"wasm", b"voice", b"eboot"])
+            self.assertEqual((host / "EBOOT-device-latest.PBP").read_bytes(), browser)
             self.assertEqual((host / "tilefinch-wasm-device-latest.prx").read_bytes(), b"\x7fELFwasm-abi7")
             self.assertEqual((host / "tilefinch-voice-device-latest.prx").read_bytes(), b"\x7fELFvoice")
             # A stale voice artifact in a validation tree is not enabled by
@@ -1180,6 +2452,37 @@ int main(void) {
                     " host0:/frame.bmp" if " " in command else "")
                 self.assertEqual(expected, result.stdout.strip())
 
+    def test_psplink_timeout_reaps_a_console_ignoring_term(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pspsh = root / "pspsh"
+            pid = root / "console-pid"
+            pspsh.write_text(
+                '#!/bin/sh\nif [ "$2" = ver ]; then echo "PSPLink v3.2.1"; exit 0; fi\n'
+                'trap "" TERM\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
+                'while :; do sleep 0.05; done\n')
+            pspsh.chmod(0o755)
+            (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
+            (root / ".tilefinch-usbhostfs.root").write_text(str(root))
+            environment = dict(os.environ, HOST_ROOT=str(root),
+                               PSPLINK_STATE_DIR=str(root), PSPSH=str(pspsh),
+                               USBHOSTFS="/usr/bin/true", MOCK_PID=str(pid),
+                               LINK_TIMEOUT_SECONDS="1", PSPLINK_POLLS_PER_SECOND="10")
+            try:
+                result = subprocess.run(
+                    [str(ROOT / "scripts/psplink-shell.sh"), "exec", "wait"],
+                    env=environment, capture_output=True, text=True, timeout=4)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertIn("command timed out", result.stderr)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid.read_text()), 0)
+            finally:
+                if pid.exists():
+                    try:
+                        os.kill(int(pid.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
+
     def test_psplink_device_loop_establishes_the_host_bridge(self):
         shell = (ROOT / "scripts/psplink-shell.sh").read_text(
             encoding="utf-8")
@@ -1189,7 +2492,7 @@ int main(void) {
             encoding="utf-8")
         self.assertIn('nohup "$USBHOSTFS" "$HOST_ROOT"', shell)
         self.assertIn("BRIDGE_START_TIMEOUT_SECONDS", shell)
-        self.assertIn('run_pspsh ver "$LINK_TIMEOUT_SECONDS"', shell)
+        self.assertIn('run_pspsh ver "$probe_timeout"', shell)
         self.assertIn('scripts/psplink-shell.sh" ready', deploy)
         self.assertIn('scripts/psplink-shell.sh" ready', youtube)
 
@@ -2047,6 +3350,24 @@ int main(void) {
             main.index("if (native_home_boot) {"):
             main.index("psp_validation_cancel_after_ms = 0;")]
         self.assertIn("psp_offline_store_handle_url(", initial_load)
+
+    def test_native_home_backing_document_does_not_start_transport(self):
+        source = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        home = source[source.index("if (native_home_boot) {"):]
+        home = home[:home.index("} else if (")]
+        self.assertIn("browser_engine_commit_empty_document(", home)
+        self.assertNotIn("browser_engine_commit_html(", home)
+        self.assertLess(home.index("psp_present("), home.index(
+            'PSP_BOOT_TIMING_MARK("native-home-presented")'))
+        run = source[source.index("PSP_BOOT_TIMING_MARK(\"native-home-presented\")"):]
+        self.assertIn("psp_app_run_interactive(", run)
+        warmup = source[source.index("if (background_network_allowed"):
+                        source.index("tilefinch-network-warmup: status=started")]
+        self.assertIn("psp_network_begin(", warmup)
+        self.assertIn("native_home_boot", warmup)
+        ready = source[source.index("tilefinch-network-warmup: status=ready"):]
+        ready = ready[:ready.index("retry=on-navigation")]
+        self.assertIn("fetch_preconnect(url, browser->budget)", ready)
 
     def test_update_check_arms_only_through_its_state_machine(self):
         # The background update check's state lives in PspUpdateCheck
@@ -3203,6 +4524,183 @@ int main(void) {
             1, source.count("void psp_media_finish_synchronous_quiesce("))
         self.assertEqual(1, source.count("static void psp_media_dispatch_one("))
 
+    def test_wide_frame_preparation_keeps_the_publication_audio_deadline(self):
+        session = (ROOT / "src/psp_media_session.c").read_text()
+        start = session.index("    uint64_t take_clock_us = media->clock_us;")
+        take = session[start:session.index("    bool startup_claim_allowed", start)]
+        start = session.index("    if (!media->presentation_deferred) {",
+                              session.index("bool psp_media_advance("))
+        retire = session[start:session.index("    bool changed =", start)]
+        self.assertIn("if (!media->presentation_deferred\n"
+                      "        && (!psp_media_startup_active", session)
+        present = (ROOT / "src/psp_media_present_session.c").read_text()
+        start = present.index("uint64_t psp_media_present_delay_us(")
+        due = present[start:present.index("\n}\n", start) + 3]
+        runtime = (ROOT / "src/psp_app/psp_app_runtime.c").read_text()
+        start = runtime.index("static bool psp_media_wait_video_due(")
+        wait = runtime[start:runtime.index("\n}\n", start) + 3]
+        self.assertIn("bool published = psp_media_wait_video_due(psp_active_media)", runtime)
+        self.assertIn("bool published = (!media_replaces_page\n"
+                      "        || psp_media_wait_video_due(psp_active_media))", runtime)
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include "tilefinch/media_backend.h"
+#include "tilefinch/psp_media_presentation_gate.h"
+#include "media_backend_psp_policy.h"
+#include <stdio.h>
+typedef struct {
+    MediaPlayback *playback;
+    struct {bool playing;} ui;
+    bool have_frame, presentation_deferred;
+    PspMediaAudioHold audio_hold;
+    PspMediaStartupPreroll startup;
+    PspMediaSeekFloor seek_floor;
+    MediaVideoFrame frame;
+    uint64_t clock_us;
+} PspMediaSession;
+static uint64_t audio_us, captured, now_us;
+static unsigned waits, feeds, releases, emits;
+static bool audio_valid=true, stall, refuse;
+bool media_playback_audio_cursor_us(const MediaPlayback *p,uint64_t *out) {
+    (void)p;*out=audio_us;return audio_valid;
+}
+bool media_playback_ready_video_start_us(const MediaPlayback *p,uint64_t *out) {
+    (void)p;*out=140000;return true;
+}
+size_t media_playback_discard_video_before(MediaPlayback *p,uint64_t t) {
+    (void)p;(void)t;return 0;
+}
+void media_playback_set_presentation_clock_us(MediaPlayback *p,uint64_t t) {
+    (void)p;captured=t;
+}
+static uint64_t sceKernelGetSystemTimeWide(void) {return now_us;}
+static int sceKernelDelayThread(unsigned us) {
+    waits++;if(refuse)return -1;
+    now_us+=us;if(!stall)audio_us+=us;return 0;
+}
+static void psp_media_service_scanout_wait(void *p) {(void)p;feeds++;}
+static void psp_media_present_release_claimed_surface(void *p) {(void)p;releases++;}
+static void psp_media_present_emit_after_release(void *p) {(void)p;emits++;}
+static void retire(PspMediaSession *media) {
+''' + retire + r'''
+}
+static void prepare(PspMediaSession *media) {bool frame_progress=false;
+''' + take + '\n(void)frame_progress;\n}\n' + due + wait + r'''
+#define CHECK(x) do{if(!(x)){fprintf(stderr,"deadline line %d: %s\n",__LINE__,#x);return 1;}}while(0)
+int main(void) {
+    PspMediaSession m={.playback=(MediaPlayback *)&m,.ui={true},.have_frame=true,
+        .clock_us=100000,.frame={.width=640,.pts_us=133333,.duration_us=33333}};
+    audio_us=100000;prepare(&m);
+    CHECK(captured==116666 && m.clock_us==100000);
+    CHECK(psp_media_present_delay_us(&m)==16667);
+    CHECK(psp_media_wait_video_due(&m) && media_video_frame_is_due(&m.frame,audio_us));
+    CHECK(waits<=18 && feeds==waits && now_us<=16667 && m.clock_us==100000);
+    CHECK(m.presentation_deferred);retire(&m);CHECK(!releases && !emits);
+    m.presentation_deferred=false;retire(&m);CHECK(releases==1 && emits==1);
+    m.frame.width=426;prepare(&m);CHECK(captured==100000);
+    m.frame.width=640;audio_valid=false;prepare(&m);CHECK(captured==100000);
+    audio_valid=true;m.audio_hold.applied=true;prepare(&m);CHECK(captured==100000);
+    CHECK(psp_media_wait_video_due(&m));m.audio_hold.applied=false;
+    m.startup.phase=PSP_MEDIA_STARTUP_CLAIMED;prepare(&m);CHECK(captured==100000);
+    m.startup.phase=PSP_MEDIA_STARTUP_NONE;
+    m.seek_floor.armed=true;prepare(&m);CHECK(captured==140000);m.seek_floor.armed=false;
+    for(unsigned failure=0;failure<3;failure++) {
+        audio_us=100000;now_us=0;waits=feeds=0;stall=failure==0;refuse=failure==1;
+        m.frame.pts_us=failure==2?300000:133333;
+        CHECK(!psp_media_wait_video_due(&m) && waits<=18 && feeds==waits && now_us<=16667);
+    }
+    m.ui.playing=false;CHECK(psp_media_present_delay_us(&m)==0);
+    CHECK(psp_media_wait_video_due(NULL));
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "deadline.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                "-I", str(ROOT / "include"), "-I", str(ROOT / "src"),
+                str(path / "deadline.c"), "-o", str(path / "deadline")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "deadline")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_resume_clock_does_not_bill_the_held_interval(self):
+        source = (ROOT / "src/psp_media_session.c").read_text()
+        start = source.index("static void psp_media_apply_audio_hold(PspMediaSession *media)\n{")
+        apply = source[start:source.index("\n}\n", start) + 3]
+        start = source.index("    if (media->machine.state == PSP_MEDIA_SESSION_PLAYING\n"
+                             "        && !media->machine.preview_active\n"
+                             "        && !media->audio_hold.applied) {")
+        step = source[start:source.index("    char error[256] = {0};", start)]
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include "tilefinch/psp_media_presentation_gate.h"
+#include "media_backend_psp_policy.h"
+#include <stdio.h>
+#define PSP_MEDIA_SESSION_PLAYING 1
+typedef struct {
+    void *playback;
+    struct { int state; bool preview_active; } machine;
+    PspMediaAudioHold audio_hold;
+    bool clock_resume_pending, have_frame;
+    uint64_t clock_us;
+    struct { uint64_t duration_us, pts_us; } frame;
+} PspMediaSession;
+static bool accept_hold=true, audio_valid, has_audio=true;
+static uint64_t audio_us;
+static bool media_playback_set_audio_submission_blocked(void *p,bool b) {
+    (void)p;(void)b;return accept_hold;
+}
+static bool media_playback_audio_cursor_us(void *p,uint64_t *c) {
+    (void)p;*c=audio_us;return audio_valid;
+}
+static bool media_playback_has_audio(void *p) {(void)p;return has_audio;}
+''' + apply + '\nstatic void step(PspMediaSession *media,unsigned elapsed_ms) {\n' + step + r'''
+}
+#define CHECK(x) do {if(!(x)){fprintf(stderr,"clock line %d: %s\n",__LINE__,#x);return 1;}}while(0)
+int main(void) {
+    PspMediaSession m={.playback=&m,.machine={PSP_MEDIA_SESSION_PLAYING,false},
+        .audio_hold={.wanted=true,.applied=true},.have_frame=true,
+        .frame={33333,0}};
+    psp_media_apply_audio_hold(NULL);
+    step(&m,500);CHECK(m.clock_us==0);
+    m.audio_hold.wanted=false;accept_hold=false;
+    psp_media_apply_audio_hold(&m);
+    CHECK(m.audio_hold.applied && !m.clock_resume_pending);
+    accept_hold=true;psp_media_apply_audio_hold(&m);
+    step(&m,500);CHECK(m.clock_us==0 && !m.clock_resume_pending);
+    psp_media_apply_audio_hold(&m);step(&m,5);CHECK(m.clock_us==5000);
+    for(unsigned round=0;round<100;round++) {
+        m.audio_hold.wanted=true;psp_media_apply_audio_hold(&m);
+        uint64_t before=m.clock_us;step(&m,1000);CHECK(m.clock_us==before);
+        m.audio_hold.wanted=false;psp_media_apply_audio_hold(&m);
+        audio_valid=true;audio_us=before+1000;
+        step(&m,1000);CHECK(m.clock_us==audio_us && !m.clock_resume_pending);
+        audio_valid=false;has_audio=false;
+        step(&m,7);CHECK(m.clock_us==audio_us+7000);
+        has_audio=true;
+    }
+    has_audio=false;m.audio_hold.wanted=true;psp_media_apply_audio_hold(&m);
+    m.audio_hold.wanted=false;psp_media_apply_audio_hold(&m);
+    uint64_t before=m.clock_us;step(&m,900);CHECK(m.clock_us==before);
+    step(&m,10);CHECK(m.clock_us==before+10000);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "clock.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                "-I", str(ROOT / "include"), "-I", str(ROOT / "src"),
+                str(path / "clock.c"), "-o", str(path / "clock")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "clock")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_audio_clock_does_not_count_firmware_queue_as_heard(self):
         """The PSP accepts a deep startup queue. Audible time follows elapsed
         wall time, capped by successful submissions, and freezes with the
@@ -4011,6 +5509,74 @@ int main(void) {
         self.assertIn(
             "have_download_proof ? &download_proof : NULL", session)
 
+    def test_video_latch_spends_poll_wait_credit_once(self):
+        source = (ROOT / "src/psp_script_main.c").read_text()
+        start = source.index("static TILEFINCH_OUT_OF_LINE void psp_wait_before_interactive_input(")
+        body = source[start:source.index("\n\nstatic TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen", start)]
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#define TILEFINCH_OUT_OF_LINE
+#define WORK_LEDGER_SLEEP 0
+#define PSP_MEDIA_FULLSCREEN_POLL_YIELD_US 2000u
+#define PSP_PAGE_TASK_YIELD_US 4000u
+static struct { unsigned presents; bool video; } psp_display;
+static unsigned delays,vblanks,wait_us,enters,leaves;
+static bool psp_display_video_active(const void *display) {
+    (void)display;return psp_display.video;
+}
+static unsigned work_ledger_enter(unsigned kind) { (void)kind;return ++enters; }
+static void work_ledger_leave(unsigned token) { if(token==enters)leaves++; }
+static int sceKernelDelayThread(unsigned us) { delays++;wait_us=us;return 0; }
+static int sceDisplayWaitVblankStart(void) { vblanks++;return 0; }
+''' + body + r'''
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"wait line %d: %s\n",__LINE__,#x);return 1; } } while(0)
+static void reset(void) { delays=vblanks=wait_us=0; }
+int main(void) {
+    psp_wait_before_interactive_input(false,false,false,0);
+    CHECK(vblanks==1 && !delays);
+    psp_display.video=true;reset();
+    psp_wait_before_interactive_input(true,false,false,0);
+    CHECK(delays==1 && wait_us==2000 && !vblanks);
+    for(unsigned at=0;at<256;at++) {
+        ++psp_display.presents;reset(); /* successful, fenced publication */
+        psp_wait_before_interactive_input(true,false,false,0);
+        CHECK(!delays && !vblanks);
+        reset(); /* early/empty turn, or rejected publication: no credit */
+        psp_wait_before_interactive_input(true,false,false,0);
+        CHECK(delays==1 && wait_us==2000 && !vblanks);
+        ++psp_display.presents;reset();
+        psp_wait_before_interactive_input(false,false,false,0); /* pause */
+        CHECK(vblanks==1 && !delays);
+        reset();psp_wait_before_interactive_input(true,false,false,0);
+        CHECK(delays==1 && wait_us==2000 && !vblanks); /* no stale pause credit */
+    }
+    psp_display.video=false;++psp_display.presents;reset();
+    psp_wait_before_interactive_input(true,false,false,0);
+    CHECK(delays==1 && wait_us==2000 && !vblanks); /* page publication is not video */
+    reset();psp_wait_before_interactive_input(false,true,false,0);
+    CHECK(!delays && !vblanks);
+    reset();psp_wait_before_interactive_input(false,true,false,777);
+    CHECK(delays==1 && wait_us==777 && !vblanks);
+    reset();psp_wait_before_interactive_input(false,false,true,0);
+    CHECK(delays==1 && wait_us==4000 && !vblanks);
+    CHECK(enters==leaves);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "wait.c").write_text(fixture)
+            compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                str(path / "wait.c"), "-o", str(path / "wait")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "wait")], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_the_worker_is_given_work_before_the_thread_stops(self):
         """The codec worker completion is collected through a bounded wait, so
         work offered before a hardware wait can finish inside that wait rather
@@ -4043,7 +5609,7 @@ int main(void) {
         loop = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         feed_at = loop.index(
-            "psp_media_feed_before_blocking(&browser->media)")
+            "psp_media_feed_before_blocking(&browser->media, false)")
         blank_at = loop.index("psp_wait_before_interactive_input(", feed_at)
         self.assertLess(feed_at, blank_at)
         self.assertNotIn(
@@ -4725,8 +6291,8 @@ int main(void) {
             (ROOT / "src/media_backend.c").read_text(encoding="utf-8"))
         pump = scheduler[
             scheduler.index(
-                "MediaPlaybackAdvanceResult "
-                "media_playback_advance_bounded_cancelable("):
+                "static MediaPlaybackAdvanceResult "
+                "playback_advance_bounded("):
             scheduler.index("void media_playback_job_stats(")]
         self.assertIn("processed >= maximum_packets + paired_credit", pump)
         self.assertIn("MEDIA_PLAYBACK_MAXIMUM_PAIRED_SUBMITS", pump)
@@ -7830,6 +9396,38 @@ int main(void) {
             targets.index("target_link_libraries(psp-browser-script PRIVATE")]
         self.assertIn("src/psp_app/psp_app_exit_handoff.c", browser_sources)
 
+    def test_boot_clock_refusal_clears_partial_output(self):
+        compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("A host C compiler is required for the clock refusal probe")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "psprtc.h").write_text(
+                '#include <stdint.h>\nunsigned sceRtcGetTickResolution(void);\n'
+                'int sceRtcGetCurrentTick(uint64_t *output);\n', encoding="utf-8")
+            (directory / "psp_boot_timing.h").write_text(
+                (ROOT / "src/psp_boot_timing.h").read_text(encoding="utf-8"), encoding="utf-8")
+            source = directory / "clock.c"
+            source.write_text('''
+#include "psp_boot_timing.h"
+static int mode;
+unsigned sceRtcGetTickResolution(void) { return mode == 2 ? 1u : 1000000u; }
+int sceRtcGetCurrentTick(uint64_t *output) { *output = mode == 3 ? 0 : 123; return mode == 1 ? -1 : 0; }
+int main(void) {
+    uint64_t tick = 999;
+    if (!psp_boot_timing_clock(&tick) || tick != 123) return 1;
+    for (mode = 1; mode <= 3; mode++) {
+        tick = 999;
+        if (psp_boot_timing_clock(&tick) || tick != 0) return 2 + mode;
+    }
+    return psp_boot_timing_clock(NULL) ? 9 : 0;
+}
+''', encoding="utf-8")
+            binary = directory / "clock"
+            subprocess.run([compiler, "-std=c11", "-D__PSP__", "-I", str(directory),
+                            str(source), "-o", str(binary)], check=True, capture_output=True, text=True)
+            subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
     def test_launcher_fast_path_keeps_safe_start_and_symbols(self):
         launcher = without_comments(
             (ROOT / "src/update_launcher_psp.c").read_text(encoding="utf-8"))
@@ -7849,7 +9447,7 @@ int main(void) {
                 "recovery_button = launcher_finish_safe_start_window("),
             "The bounded journal read should overlap the safe-start window.")
         missing_state = launcher[
-            launcher.index("if (!tilefinch_update_journal_load("):
+            launcher.index("if (fresh_install) {"):
             launcher.index('LAUNCHER_TIMING_MARK("journal-ready")')]
         self.assertNotIn(
             "tilefinch_update_journal_store(", missing_state,
@@ -7862,6 +9460,25 @@ int main(void) {
             targets.index("add_executable(tilefinch-launcher"):
             targets.index("add_executable(psp-browser-fixture")]
         self.assertIn("TILEFINCH_PSP_LAUNCHER_TIMING=1", launcher_target)
+        self.assertIn("cfw_parameters.argp = arguments", launcher)
+        self.assertIn("fallback_parameters.argp = arguments", launcher)
+        self.assertEqual(launcher.count("psp_boot_timing_encode("), 2)
+        self.assertIn("psp_boot_timing_clock(&handoff_tick)", launcher)
+        self.assertIn("psp_boot_timing_clock(&launcher_process_entered_us)", launcher)
+        clock = (ROOT / "src/psp_boot_timing.h").read_text(encoding="utf-8")
+        self.assertIn("sceRtcGetCurrentTick(output)", clock)
+        self.assertIn("sceRtcGetTickResolution() == 1000000u", clock)
+        self.assertNotIn("sceKernelGetSystemTimeWide", clock)
+        browser = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        main = browser[browser.index("int main(int argc, char *argv[])"):]
+        self.assertLess(main.index("validation_main_entered_us"),
+                        main.index("psp_fpu_mask_exceptions()"))
+        self.assertIn("psp_boot_report_handoff(", main)
+        self.assertIn("psp_boot_timing_clock(&validation_entry_tick)", main)
+        self.assertIn("psp_boot_timing_clock(&validation_surface_tick)", main)
+        self.assertIn("psp_boot_timing_decode(", browser)
+        self.assertIn("handoff-to-scanout-us=%lluus", browser)
         self.assertIn("$<TARGET_FILE:tilefinch-launcher>.unstripped",
                       launcher_target)
         self.assertIn('"${PSPDEV}/bin/psp-strip"', launcher_target)
@@ -8703,9 +10320,14 @@ int main(void) {
         loader = loader[:loader.index("#endif /* TILEFINCH_FETCH_CA_BLOB */")]
         psp_branch = loader[loader.index("#if defined(__PSP__)"):
                             loader.index("#else")]
-        self.assertIn("sceIoGetstat(", psp_branch)
-        self.assertIn("sceIoOpen(", psp_branch)
-        self.assertIn("sceIoRead(", psp_branch)
+        self.assertIn("fetch_prepare_ca_bundle_step(", psp_branch)
+        reader = fetch[fetch.index("bool fetch_prepare_ca_bundle_step("):]
+        reader = reader[:reader.index("#else")]
+        self.assertIn("sceIoGetstat(", reader)
+        self.assertIn("sceIoOpen(", reader)
+        self.assertIn("sceIoRead(", reader)
+        self.assertNotIn("fseek(", reader)
+        self.assertNotIn("ftell(", reader)
         self.assertNotIn("fseek(", psp_branch)
         self.assertNotIn("ftell(", psp_branch)
 

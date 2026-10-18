@@ -73,6 +73,8 @@ bool psp_app_frame_pump_admit(PspApp *app, FramePumpId id,
                         == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE);
     YIELD_IF_ACTIVE(FRAME_PUMP_BASELINE_FONTS,
                     !browser_engine_baseline_fonts_ready(browser->engine));
+    YIELD_IF_ACTIVE(FRAME_PUMP_TRANSPORT_PREPARE,
+                    app->interactive->transport_prepare_pending);
     return frame_pumps_admit(pumps, id, 0, 0);
 }
 

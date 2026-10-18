@@ -1341,12 +1341,43 @@ static bool test_menu_metadata_equivalence(void)
     return true;
 }
 
+static bool test_opaque_panel_row_copy(void)
+{
+    static uint16_t actual[128 * 52 + 4], expected[128 * 52 + 4];
+    uint32_t random = 1729;
+    for (unsigned sample = 0; sample < 2048; sample++) {
+        int width = 16 + sample % 97, height = 8 + sample % 41;
+        int stride = width + sample % 10;
+        unsigned offset = sample % 2;
+        for (size_t at = 0; at < sizeof(actual) / sizeof(actual[0]); at++) {
+            random = random * UINT32_C(1664525) + UINT32_C(1013904223);
+            actual[at] = expected[at] = (uint16_t) (random >> 16);
+        }
+        UiRect rect = {(int) (sample % 31) - 10, (int) (sample % 19) - 6,
+                      30 + (int) (sample % 101), 2 + (int) (sample % 55)};
+        uint16_t color = (uint16_t) random;
+        unsigned opacity = sample % 6;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (x < rect.x || x >= rect.x + rect.width
+                    || y < rect.y || y >= rect.y + rect.height) continue;
+                size_t at = offset + (size_t) y * stride + x;
+                expected[at] = opacity >= 4 ? color
+                    : blend565(color, expected[at], opacity * 2);
+            }
+        }
+        fill_rect(actual + offset, width, height, stride, rect, color, opacity);
+        CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) capture_directory = argv[1];
     if (argc > 2 && argv[2][0]) real_hindi_pack = argv[2];
     if (argc > 3 && argv[3][0]) real_arabic_pack = argv[3];
     if (argc > 4 && argv[4][0]) real_bengali_pack = argv[4];
-    return test_menu_metadata_equivalence()
+    return test_opaque_panel_row_copy() && test_menu_metadata_equivalence()
         && test_square_button_symbol() && test_all_languages() ? 0 : 1;
 }

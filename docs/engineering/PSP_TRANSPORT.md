@@ -377,8 +377,18 @@ waiting for credit (the first lookup precedes the first handshake), plus one
 timing sample per call. That is enough for an off-path guess; it is never used
 for keys.
 
-**Cost.** Boot pays nothing. The first seeding runs inside curl's global
-initialization on the browser thread: at least 4 work and 3 sleep batches
+**Cost.** The first Home paint and input sample do not wait for seeding.
+After paint, association wait frames optionally mix the existing seed,
+gather one complete estimator batch per admitted slice, and perform the
+ordinary credited release in its own slice. An immediate navigation's
+foreground connection wait uses the same preparation owner after checking
+controls. Optional warm-up never releases uncredited output, even with the
+validation policy; if it refuses, ordinary demand retains its original
+bounded attempt and configured policy. It adds no network requests and
+moves, rather than duplicates, the existing seed-file read and write.
+
+Without completed preparation, the remaining first seeding runs inside
+curl's global initialization on the browser thread: at least 4 work and 3 sleep batches
 (1,216 samples) when every batch earns the maximum, which should take tens of
 milliseconds, plus one small Memory Stick read and a 48-byte write. After
 release, each mbed TLS entropy poll costs about ten SHA-256 compressions for

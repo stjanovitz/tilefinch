@@ -1157,6 +1157,55 @@ static bool test_allocation_failure(void)
     return ok && budget.current == 0;
 }
 
+static bool test_deferred_transport_startup(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    BudgetReservation ballast = {0};
+    bool ok = budget_reservation_acquire(&ballast, &budget,
+        BUDGET_CATEGORY_RESOURCE, budget.limit - 65536u);
+    FetchSchedulerDomain *domain = fetch_scheduler_domain_create(&budget, 1);
+    FetchScheduler *scheduler = fetch_scheduler_create_deferred_in_domain(domain, 1, 4096);
+    size_t idle_bytes = budget.current;
+    FetchSchedulerDomainMetrics metrics = {0};
+    ok = ok && domain != NULL && scheduler != NULL
+        && fetch_scheduler_domain_metrics(domain, &metrics)
+        && metrics.active_views == 1 && metrics.active_slots == 0
+        && idle_bytes - (budget.limit - 65536u) < 4096u
+        && fetch_scheduler_pump(scheduler, 1, 1) == 0
+        && budget.current == idle_bytes;
+    FetchRequest shape = request();
+    uint64_t id = fetch_scheduler_enqueue(scheduler,
+        "https://stream.test/document", &shape, 4096, 1000);
+    ok = ok && id == 0 && budget.current == idle_bytes
+        && fetch_scheduler_domain_metrics(domain, &metrics)
+        && metrics.active_slots == 0
+        && strstr(fetch_scheduler_last_error(scheduler), "reservation") != NULL;
+    budget_reservation_release(&ballast);
+    /* A refused first setup must not poison the later request or its cancel. */
+    bool replay = replay_begin();
+    ok = replay && ok;
+    id = replay ? fetch_scheduler_enqueue(scheduler,
+        "https://stream.test/document", &shape, 4096, 1000) : 0;
+    ok = ok && id != 0 && fetch_scheduler_cancel(scheduler, id, "test cancellation");
+    bool success = true;
+    FetchResult result = {0};
+    ok = ok && fetch_scheduler_take(scheduler, id, &success, &result)
+        && !success && fetch_scheduler_domain_metrics(domain, &metrics)
+        && metrics.active_slots == 0;
+    fetch_result_destroy(&result);
+    fetch_trace_end();
+    fetch_scheduler_destroy(scheduler);
+    fetch_scheduler_domain_release(domain);
+    /* Empty deferred schedulers also tear down without transport ownership. */
+    domain = fetch_scheduler_domain_create(&budget, 1);
+    scheduler = fetch_scheduler_create_deferred_in_domain(domain, 1, 4096);
+    ok = ok && scheduler != NULL;
+    fetch_scheduler_destroy(scheduler);
+    fetch_scheduler_domain_release(domain);
+    return ok && budget.current == 0;
+}
+
 static bool test_lazy_shared_scheduler_domain(void)
 {
     Budget budget;
@@ -1833,6 +1882,7 @@ int main(void)
         {"cancel-truncate", test_cancel_and_truncate},
         {"buffered-pump-quota", test_buffered_fetch_respects_pump_quota},
         {"allocation-failure", test_allocation_failure},
+        {"deferred-transport", test_deferred_transport_startup},
         {"shared-scheduler-domain", test_lazy_shared_scheduler_domain},
         {"reservation-headroom", test_reservation_headroom_gate},
         {"stall-abort", test_stall_abort_window},

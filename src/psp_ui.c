@@ -180,6 +180,7 @@ typedef struct {
 } UiChromeFontCache;
 
 static UiChromeFontCache chrome_font_cache;
+static uint32_t chrome_font_epoch = 1u;
 
 typedef struct {
     uint8_t hour;
@@ -785,6 +786,17 @@ static void fill_rect(uint16_t *pixels, int width, int height, int stride,
        of a per-pixel blend branch on Allegrex; translucent fills retain
        exactly the existing rounding and read/modify/write behavior. */
     if (opacity >= 4u) {
+        /* Large opaque panels repeat an identical row. Seed it once and use
+           the platform's word-copy path rather than a halfword loop for every
+           pixel. Keep short rules/highlights on the cheaper scalar path. */
+        if (right - left >= 32 && bottom - top >= 4) {
+            uint16_t *seed = pixels + (size_t) top * (size_t) stride + left;
+            for (int x = 0; x < right - left; x++) seed[x] = color;
+            size_t bytes = (size_t) (right - left) * sizeof(*seed);
+            for (int y = top + 1; y < bottom; y++)
+                memcpy(pixels + (size_t) y * (size_t) stride + left, seed, bytes);
+            return;
+        }
         for (int y = top; y < bottom; y++) {
             uint16_t *row = pixels + (size_t) y * (size_t) stride;
             for (int x = left; x < right; x++) row[x] = color;
@@ -1133,6 +1145,7 @@ PspUiChromeGlyphPreload psp_ui_chrome_glyph_preload(void)
 
 void psp_ui_clear_chrome_font(void)
 {
+    if (++chrome_font_epoch == 0) chrome_font_epoch = 1u;
     for (size_t weight = 0; weight < 2u; weight++) {
         for (size_t size = 0; size < 2u; size++) {
             for (size_t at = 0; at < UI_CHROME_GLYPH_COUNT; at++) {
@@ -1156,17 +1169,20 @@ static const FontGlyph *chrome_font_glyph(
     unsigned codepoint, int scale, bool bold, bool *known_missing);
 static bool chrome_glyph_load_allowed(void);
 static bool chrome_glyph_slot_retryable(uint8_t state);
+static size_t ui_text_next_glyph(const char *text, size_t bytes,
+                                 unsigned *codepoint, size_t *characters);
+static const char *const media_menu_tabs[] = {"Chapters", "Audio", "Subtitles", "Queue"};
 
 /* Rasterize every printable ASCII glyph at one chrome scale, both weights,
    on the calling thread. Idempotent: cached glyphs are not reloaded. */
-static void chrome_preload_scale(int scale)
+static void chrome_preload_scale_weights(int scale, size_t weights)
 {
     if (chrome_font_cache.faces[0] == NULL) return;
 #if defined(__PSP__)
     uint64_t started = sceKernelGetSystemTimeWide();
 #endif
     unsigned loaded = 0;
-    for (size_t weight = 0; weight < 2u; weight++) {
+    for (size_t weight = 0; weight < weights; weight++) {
         for (unsigned codepoint = UI_CHROME_GLYPH_FIRST;
              codepoint <= UI_CHROME_GLYPH_LAST; codepoint++) {
             size_t at = codepoint - UI_CHROME_GLYPH_FIRST;
@@ -1190,7 +1206,41 @@ static void chrome_preload_scale(int scale)
 void psp_ui_preload_chrome_scale(unsigned scale)
 {
     if (!chrome_glyph_load_allowed()) return;
-    chrome_preload_scale(scale >= 2u ? 2 : 1);
+    chrome_preload_scale_weights(scale >= 2u ? 2 : 1, 2u);
+}
+
+void psp_ui_preload_media_chrome(void)
+{
+    if (!chrome_glyph_load_allowed()) return;
+    /* General chrome and percentages need the small set. Playback's title,
+       timeline and hints use regular large glyphs, not an entire bold set.
+       Error buttons need only the small explicit set below. */
+    chrome_preload_scale_weights(1, 2u);
+    chrome_preload_scale_weights(2, 1u);
+    /* The supervisor can also paint a failed open or a track chooser. Warm
+       their actual bold labels, not all 95 glyphs. A first chooser must not
+       allocate/rasterize its headers while audible playback is running. */
+    const char *buttons[] = {"X Retry.", tilefinch_ui_text("O Back"),
+                            tilefinch_ui_text("O Cancel"), "< >"};
+    size_t button_count = sizeof(buttons) / sizeof(buttons[0]);
+    size_t tab_count = sizeof(media_menu_tabs) / sizeof(media_menu_tabs[0]);
+    for (size_t label = 0; label < button_count + tab_count; label++) {
+        const char *text = label < button_count ? buttons[label]
+            : tilefinch_ui_text(media_menu_tabs[label - button_count]);
+        size_t at = 0, length = strlen(text);
+        while (at < length) {
+            unsigned codepoint = 0;
+            size_t used = ui_text_next_glyph(text + at,
+                length - at, &codepoint, NULL);
+            if (used == 0) break;
+            (void) chrome_font_glyph(codepoint, 2, true, NULL);
+            /* Translated tabs can fall back to compact text. Use exactly the
+               painter's cluster decoder for optional shaped glyph packs. */
+            if (label >= button_count)
+                (void) chrome_font_glyph(codepoint, 1, true, NULL);
+            at += used;
+        }
+    }
 }
 
 void psp_ui_set_chrome_fonts(
@@ -1212,7 +1262,7 @@ void psp_ui_set_chrome_fonts(
        it changes on this thread, and its handler preloads the other size
        before the next frame draws at it. Non-ASCII
        stays lazy (bounded LRU) and is owner-only. */
-    chrome_preload_scale(scale >= 2u ? 2 : 1);
+    chrome_preload_scale_weights(scale >= 2u ? 2 : 1, 2u);
 }
 
 void psp_ui_set_device_status(
@@ -7913,25 +7963,25 @@ static void draw_loading(const PspUiState *ui, uint16_t *pixels, int width,
                          int height, int stride, uint16_t accent)
 {
     if (!ui->loading && !ui->page_activation_busy) return;
-    /* The upper activity line always moves, so a stalled/unknown-length
-       request never looks frozen. The lower line is monotonic overall
-       completion; both occupy the original three-pixel loading strip. */
+    /* One strip: determinate progress when known, otherwise a moving segment.
+       Stacking activity and completion in adjacent rows read as two bars. */
     UiSurfaceAccent ramp = ui_surface_accent(
         (BrowserChromeTheme) ui->chrome_theme);
     (void) accent;
-    int segment = width / 4;
-    int range = width + segment;
-    int position = (int) (ui->loading_phase * 4u % (unsigned) range);
     int y = ui->chrome_visible ? UI_TOP_HEIGHT : 0;
-    fill_accent_ramp(pixels, width, height, stride,
-                     (UiRect) { position - segment, y, segment, 2 },
-                     ramp.accent, ramp.accent_high);
     if (ui->loading && ui->progress_per_mille >= 0) {
         int filled = width * ui->progress_per_mille / 1000;
         fill_rect(pixels, width, height, stride,
-                  (UiRect) { 0, y + 2, width, 1 }, PSP_THEME_LINE, 4);
+                  (UiRect) { 0, y, width, 3 }, PSP_THEME_LINE, 4);
         fill_accent_ramp(pixels, width, height, stride,
-                         (UiRect) { 0, y + 2, filled, 1 },
+                         (UiRect) { 0, y, filled, 3 },
+                         ramp.accent, ramp.accent_high);
+    } else {
+        int segment = width / 4;
+        int range = width + segment;
+        int position = (int) (ui->loading_phase * 4u % (unsigned) range);
+        fill_accent_ramp(pixels, width, height, stride,
+                         (UiRect) { position - segment, y, segment, 3 },
                          ramp.accent, ramp.accent_high);
     }
 }
@@ -9800,7 +9850,6 @@ static bool ui_rect_contains(UiRect rect, int x, int y)
 }
 
 static UiRect media_track_menu_rect(const PspUiMediaState *media, int width, int height);
-static const char *const media_menu_tabs[] = {"Chapters", "Audio", "Subtitles", "Queue"};
 
 /* Equal columns needlessly clip long translated category names in portrait.
    Reserve their compact measured widths, then share the remaining space. The
@@ -10244,7 +10293,7 @@ static void draw_media_buffering(uint16_t *pixels, int width, int height,
 
 /* The overlay's geometry, named once so the composite below and the band
    report above it cannot describe different rectangles. */
-#define UI_MEDIA_TITLE_BAR_HEIGHT 42
+#define UI_MEDIA_TITLE_BAR_HEIGHT PSP_UI_MEDIA_TITLE_BAR_HEIGHT
 #define UI_MEDIA_CONTROL_BAR_HEIGHT 78
 #define UI_MEDIA_PREVIEW_TOP 48
 #define UI_MEDIA_PREVIEW_HEIGHT 72
@@ -10578,13 +10627,15 @@ static void draw_media_control_bar_ground(
     const PspUiMediaState *media, uint16_t *pixels, int width, int height, int stride)
 {
     int bar_top = height - media_control_bar_height(media);
+    int hint_top = height - 38 + media_control_offset(media);
     fill_rect(pixels, width, height, stride,
-              (UiRect) {0, bar_top, width, height - bar_top},
+              (UiRect) {0, bar_top, width, hint_top - bar_top},
               PSP_THEME_CHROME_BAR, 4);
-    /* Control legend sits on the darker hint ground, like the page chrome. */
+    /* The hint backdrop is the opaque bar above, never video. Blend the two
+       uniform colors once, not once per pixel after an overlapping fill. */
     fill_rect(pixels, width, height, stride,
-              (UiRect) {0, height - 38 + media_control_offset(media),
-                        width, 38 - media_control_offset(media)}, PSP_THEME_HINT_BAR, 3);
+              (UiRect) {0, hint_top, width, height - hint_top},
+              blend565(PSP_THEME_HINT_BAR, PSP_THEME_CHROME_BAR, 6u), 4);
 }
 
 static void draw_media_control_bar(
@@ -10822,6 +10873,11 @@ static bool media_chrome_ink_complete(void)
         if (chrome_font_cache.unicode[at].loaded >= UI_CHROME_GLYPH_REFUSED_FIRST)
             return false;
     return true;
+}
+
+uint32_t psp_ui_media_raster_generation(void)
+{
+    return media_chrome_ink_complete() ? chrome_font_epoch : 0;
 }
 
 bool psp_ui_media_raster_queue_update(const PspUiMediaState *media,
@@ -11126,7 +11182,7 @@ bool psp_ui_media_overlay_paints(const PspUiMediaState *media)
 void psp_ui_media_composite_layers(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride,
-    bool include_track_menu)
+    bool include_track_menu, bool include_title)
 {
     if (!psp_ui_media_overlay_paints(media) || pixels == NULL
         || width <= 0 || height <= 0 || stride < width) return;
@@ -11153,14 +11209,16 @@ void psp_ui_media_composite_layers(
     uint16_t text = PSP_THEME_TEXT;
     uint16_t muted = PSP_THEME_TEXT_MUTED;
     uint16_t accent = PSP_THEME_ACCENT_EMBER;
-    fill_rect(pixels, width, height, stride,
-              (UiRect) {0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT}, bar, 4);
-    draw_text_with_font(
-        pixels, width, height, stride, 14, 12, media->title, 34,
-        width - 46, text, 2,
-        media->presentation == NULL
-            ? NULL : media->presentation->title_font,
-        false);
+    if (include_title) {
+        fill_rect(pixels, width, height, stride,
+                  (UiRect) {0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT}, bar, 4);
+        draw_text_with_font(
+            pixels, width, height, stride, 14, 12, media->title, 34,
+            width - 46, text, 2,
+            media->presentation == NULL
+                ? NULL : media->presentation->title_font,
+            false);
+    }
 
     if (media->resolving || media->failed) {
         if (media->resolving) {
@@ -11348,7 +11406,7 @@ void psp_ui_media_composite_with_preview(
     uint16_t *pixels, int width, int height, int stride)
 {
     psp_ui_media_composite_layers(
-        media, preview, pixels, width, height, stride, true);
+        media, preview, pixels, width, height, stride, true, true);
 }
 
 void psp_ui_media_composite_without_track_menu(
@@ -11356,7 +11414,7 @@ void psp_ui_media_composite_without_track_menu(
     uint16_t *pixels, int width, int height, int stride)
 {
     psp_ui_media_composite_layers(
-        media, preview, pixels, width, height, stride, false);
+        media, preview, pixels, width, height, stride, false, true);
 }
 
 void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,

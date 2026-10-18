@@ -1096,6 +1096,12 @@ const char *fetch_ca_bundle_path(void);
    Ordinary browsing remains lazy; validation may call this before creating
    a background transport worker whose filesystem context is more limited. */
 bool fetch_prepare_ca_bundle(void);
+/* Owner-thread preparation only; does not contact a server. Each PSP call
+   opens, reads at most 4 KiB, or validates/publishes the fixed-size bundle.
+   A demand load may finish an in-progress preparation synchronously. */
+bool fetch_prepare_ca_bundle_step(bool *complete);
+void fetch_cancel_ca_bundle_preparation(void);
+bool fetch_prepare_tls_session_store(void);
 /* Available after the first HTTPS request has loaded the configured blob.
    Computing the digest piggybacks on that one read; diagnostics never reopen
    roots.pem. */
@@ -1143,6 +1149,12 @@ bool fetch_scheduler_domain_metrics(
     const FetchSchedulerDomain *domain,
     FetchSchedulerDomainMetrics *metrics);
 FetchScheduler *fetch_scheduler_create_in_domain(
+    FetchSchedulerDomain *domain, size_t maximum_concurrent,
+    size_t maximum_reserved_bytes);
+/* Page-resource views may be empty. Retain their bounded scheduling state
+   now, but acquire curl/worker state only for the first accepted request.
+   A refused transport setup leaves the view reusable for a later retry. */
+FetchScheduler *fetch_scheduler_create_deferred_in_domain(
     FetchSchedulerDomain *domain, size_t maximum_concurrent,
     size_t maximum_reserved_bytes);
 /* PSP native-service transport is opt-in per scheduler. Replay/host builds

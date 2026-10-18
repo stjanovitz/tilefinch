@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Wide-frame preparation may borrow at most one nominal display interval;
+   actual publication still uses the ordinary audio-clock due test. */
+#define PSP_MEDIA_PREPARATION_WINDOW_US UINT64_C(16667)
+
 /*
  * What holds back the first picture and the sound after an open or a seek
  * (psp_media_session.c). Three small pieces, each replacing flags whose
@@ -12,8 +16,9 @@
  *
  * The startup preroll gates initial playback. FILLING waits for the decoder's
  * ready-frame target before the head is taken; CLAIMED has taken the head and
- * waits for it to reach the LCD (the display count passing the baseline
- * recorded at begin) before Priming completes and audio starts. A claimed head
+ * waits for a successful scanout-publication receipt before Priming completes
+ * and audio starts. The decoder's displayed count alone is insufficient: it
+ * advances after drawing, before overlays and the display latch. A claimed head
  * without a preroll could be written with the old pair of flags; it cannot be
  * here.
  *
@@ -32,13 +37,14 @@
 typedef enum {
     PSP_MEDIA_STARTUP_NONE = 0,
     PSP_MEDIA_STARTUP_FILLING,
-    PSP_MEDIA_STARTUP_CLAIMED
+    PSP_MEDIA_STARTUP_CLAIMED,
+    PSP_MEDIA_STARTUP_PUBLISHED
 } PspMediaStartupPhase;
 
 typedef struct {
     PspMediaStartupPhase phase;
-    /* Displayed-frame count when the preroll began; the claimed head has
-       reached the LCD once the count passes it. */
+    /* Draw count when preroll began; a publication receipt must also confirm
+       that the complete picture, not only its draw, reached scanout. */
     size_t displayed_baseline;
 } PspMediaStartupPreroll;
 
@@ -74,11 +80,19 @@ static inline void psp_media_startup_claim(PspMediaStartupPreroll *s)
     if (psp_media_startup_filling(s)) s->phase = PSP_MEDIA_STARTUP_CLAIMED;
 }
 
-/* The claimed head has been shown. */
+/* Only the presenter calls this, after a successful display latch. Repeated
+   receipts and receipts before a head is claimed cannot advance the gate. */
+static inline void psp_media_startup_publish(PspMediaStartupPreroll *s)
+{
+    if (psp_media_startup_claimed(s)) s->phase = PSP_MEDIA_STARTUP_PUBLISHED;
+}
+
+/* The claimed head has been drawn and its complete scanout published. */
 static inline bool psp_media_startup_presented(
     const PspMediaStartupPreroll *s, size_t displayed)
 {
-    return psp_media_startup_claimed(s) && displayed > s->displayed_baseline;
+    return s->phase == PSP_MEDIA_STARTUP_PUBLISHED
+        && displayed > s->displayed_baseline;
 }
 
 static inline void psp_media_startup_end(PspMediaStartupPreroll *s)

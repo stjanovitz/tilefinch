@@ -5,6 +5,21 @@ independently-added control flags. The state machine is the shipping lifecycle
 authority. Decoder, demux, transport, DMA, presentation, and buffer ownership
 remain separate backend responsibilities.
 
+Audio supply does not introduce another playback state machine. The backend's
+read-only admission policy uses the lifecycle machine's existing play/buffering
+intent and the bounded PCM/compressed queues. Reset, refusal recovery, and a
+full compressed queue forbid both supply exceptions. A low PCM reserve permits
+lookahead only during audible playback; the separate future-picture clock
+escape also works during priming/buffering, before audible playback can start.
+Neither decision releases a picture or starts a firmware job itself.
+
+The audio output worker retains its in-flight ownership fence through the
+firmware call, optional hardware observations, and queue-position commit.
+Seek/reset cannot acquire that queue between output completion and bookkeeping.
+Output failure releases the fence without consuming the queued block. Host
+tests execute this worker with deterministic firmware-boundary probes in both
+shipping and diagnostic configurations, alongside the pure lifecycle reducer.
+
 The host-compilable model lives in `psp_media_state.c`. Its transition
 function is pure: it receives one pre-sampled event and returns the next state
 plus non-blocking commands. Blocking or fallible work is an invoked service

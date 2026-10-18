@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 from pathlib import Path
+import re
 import struct
 import subprocess
 
@@ -134,6 +135,25 @@ def command_root(args: argparse.Namespace) -> None:
 def command_pack(args: argparse.Namespace) -> None:
     root = Path(args.directory).resolve()
     files = sorted(path for path in root.rglob("*") if path.is_file())
+    # First-install ZIPs carry a second, content-addressed executable. Never
+    # introduce it into protocol-1 packages (older clients reject new paths).
+    # Skip only an exact matching bundle, not arbitrary unknown files.
+    bundled = [file for file in files if re.fullmatch(
+        r"startup-[0-9a-f]{64}\.prx", file.relative_to(root).as_posix())]
+    for file in bundled:
+        if args.component or len(bundled) != 1:
+            raise ValueError("unexpected first-install startup module")
+        body = file.read_bytes()
+        package = (root / "EBOOT.PBP").read_bytes()
+        digest = hashlib.sha256(body).digest()
+        if (len(package) < 40 or package[:8] != b"\0PBP\0\0\1\0"
+                or file.name != "startup-" + digest.hex() + ".prx"):
+            raise ValueError("first-install startup module does not match its package")
+        begin, end = struct.unpack_from("<2I", package, 32)
+        if (begin < 40 or end < begin or package[begin:end] != body
+                or package[end:] != b"TFBOOT01" + digest):
+            raise ValueError("first-install startup module does not match its package")
+        files.remove(file)
     if not files or len(files) > MAX_FILES:
         raise ValueError("TFUP requires between 1 and 64 files")
     records: list[tuple[bytes, bytes, bytes]] = []

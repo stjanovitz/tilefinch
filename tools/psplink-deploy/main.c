@@ -3,7 +3,7 @@
  * PSPLink's built-in `cp` copies through a 2 KiB shell buffer. For the
  * roughly 6 MiB Tilefinch EBOOT that means thousands of USB round trips.
  * This PRX instead reads from host0 in 1 MiB units and writes a temporary
- * file in at most eight payload writes before atomically promoting it.
+ * file in at most sixteen payload writes before atomically promoting it.
  *
  * The ordinary Tilefinch edit loop should still load the browser PRX from
  * host0 and perform zero Memory Stick writes. This helper exists only when
@@ -24,12 +24,12 @@ PSP_HEAP_SIZE_KB(64);
 extern void __libcglue_deinit(void);
 
 #define TF_DEPLOY_CHUNK_BYTES (1024u * 1024u)
-#define TF_DEPLOY_MAX_BYTES (8u * 1024u * 1024u)
+#define TF_DEPLOY_MAX_BYTES (16u * 1024u * 1024u)
 #define TF_DEPLOY_PATH_BYTES 256u
 
 typedef char TfDeployWriteBound[
     ((TF_DEPLOY_MAX_BYTES + TF_DEPLOY_CHUNK_BYTES - 1u) /
-     TF_DEPLOY_CHUNK_BYTES) <= 8u ? 1 : -1];
+     TF_DEPLOY_CHUNK_BYTES) <= 16u ? 1 : -1];
 
 static const char default_source[] = "host0:/EBOOT-device-latest.PBP";
 static const char default_destination[] =
@@ -106,7 +106,7 @@ static int write_unit(SceUID file,
     *write_calls += 1u;
     if (written < 0) return written;
     /* A short write fails the transaction instead of issuing more writes.
-       This makes the <=8 Memory Stick payload-write bound unconditional. */
+       This makes the <=16 Memory Stick payload-write bound unconditional. */
     return (unsigned int) written == size ? 0 : -1;
 }
 
@@ -237,7 +237,7 @@ int main(int argc, char *argv[])
     memset(&temporary_stat, 0, sizeof(temporary_stat));
     native_result = sceIoGetstat(temporary, &temporary_stat);
     if (native_result < 0 || temporary_stat.st_size != source_stat.st_size ||
-        copied != (unsigned int) source_stat.st_size || write_calls > 8u) {
+        copied != (unsigned int) source_stat.st_size || write_calls > 16u) {
         if (native_result >= 0) native_result = -1;
         goto fail;
     }

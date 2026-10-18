@@ -119,12 +119,33 @@ static void psp_validation_display_wait_vblank(void)
     psp_validation_display_timing.vblank_calls++;
 }
 
+static void psp_validation_display_wait_vblank_serviced(
+    void *buffer, int stride, int format,
+    PspDisplayWaitService service, void *context)
+{
+    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    /* This interval includes useful decoder work, not only sleep. Do not
+       charge the complete serviced wait to WORK_LEDGER_SLEEP. */
+    if (psp_validation_display_inner->wait_vblank_serviced != NULL)
+        psp_validation_display_inner->wait_vblank_serviced(
+            buffer, stride, format, service, context);
+    else
+        psp_validation_display_inner->wait_vblank();
+    psp_validation_display_latched_us =
+        (uint64_t) sceKernelGetSystemTimeWide();
+    psp_validation_display_latched_vcount = (uint32_t) sceDisplayGetVcount();
+    psp_validation_display_timing.vblank_us +=
+        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
+    psp_validation_display_timing.vblank_calls++;
+}
+
 static const PspDisplayBackend psp_validation_display_backend = {
     .compose_base = psp_validation_display_compose_base,
     .flush_range = psp_validation_display_flush,
     .set_mode = psp_validation_display_set_mode,
     .set_frame_buffer = psp_validation_display_set_framebuffer,
-    .wait_vblank = psp_validation_display_wait_vblank
+    .wait_vblank = psp_validation_display_wait_vblank,
+    .wait_vblank_serviced = psp_validation_display_wait_vblank_serviced
 };
 
 static const PspDisplayBackend *psp_validation_display_wrap(
@@ -3631,6 +3652,8 @@ static void psp_webgl_measurement_reset(const NavigationSession *navigation)
 }
 
 static bool psp_validation_video_timing_window;
+static unsigned psp_validation_video_suppressed_loops;
+static unsigned psp_validation_video_suppressed_publications;
 static atomic_int psp_validation_video_window_requested;
 static atomic_int psp_validation_video_copy_requested;
 
@@ -3645,14 +3668,21 @@ void psp_webgl_measurement_main_frame(void)
     if (copy != 0) psp_media_present_ge_stage_rows_enabled(copy == 2);
     int window = atomic_exchange(&psp_validation_video_window_requested, 0);
     if (window == 1) {
-        psp_validation_video_timing_window = true;
-        psp_log_begin_timing_window();
+        psp_validation_video_timing_window = psp_log_begin_timing_window();
+        psp_validation_video_suppressed_loops = 0;
+        psp_validation_video_suppressed_publications = 0;
+        printf("tilefinch-video-timing: buffered=%d\n",
+               psp_validation_video_timing_window ? 1 : 0);
         psp_video_scanout_measurement(true);
     } else if (window == 2) {
         psp_validation_video_timing_window = false;
         /* Snapshots end at the last presentation. Flush before reporting so
            a full diagnostic buffer cannot silently drop the summary. */
         psp_log_end_timing_window();
+        printf("tilefinch-video-timing: suppressed-loops=%u "
+               "suppressed-publications=%u\n",
+               psp_validation_video_suppressed_loops,
+               psp_validation_video_suppressed_publications);
         psp_video_scanout_measurement(false);
         psp_report_presentation_cadence("video-window");
     }
@@ -4413,9 +4443,20 @@ static TILEFINCH_OUT_OF_LINE void psp_wait_before_interactive_input(
     bool fullscreen_media_poll, bool fast_page_followup,
     bool page_work_waiting, uint32_t canvas_wait_us)
 {
+    /* A successful video publication already waited for the actual scanout
+       latch. Spend that pacing credit once, not another poll sleep before
+       preparing its successor. No new publication (including a refused one)
+       keeps the ordinary yield, so an early/empty decoder cannot busy-spin.
+       Observe page/paused turns too: they must not leave stale video credit. */
+    static unsigned previous_presents;
+    bool video_followup = fullscreen_media_poll
+        && psp_display_video_active(&psp_display)
+        && psp_display.presents != previous_presents;
+    previous_presents = psp_display.presents;
     unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
     if (fullscreen_media_poll) {
-        (void) sceKernelDelayThread(PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
+        if (!video_followup)
+            (void) sceKernelDelayThread(PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
     } else if (page_work_waiting) {
         (void) sceKernelDelayThread(PSP_PAGE_TASK_YIELD_US);
     } else if (canvas_wait_us != 0) {
@@ -5116,6 +5157,15 @@ static void psp_loop_timing_end(void)
 {
     if (!psp_loop_timing.active) return;
     psp_loop_timing_phase(LOOP_TAIL);
+    /* Video cadence has its own bounded presentation records. Formatting
+       every owner turn adds CPU cost and fills the small RAM log, which then
+       loses diagnostics. Count deliberately suppressed routine rows; retain
+       all errors, checkpoints, media summaries and presentation measurements. */
+    if (psp_validation_video_timing_window) {
+        psp_validation_video_suppressed_loops++;
+        psp_loop_timing.active = false;
+        return;
+    }
     /* Live USB log flushes can cost several milliseconds after publication
        and steal the next frame's deadline. Retain causal-window loop rows
        alongside their canvas sample; format them only in the final report. */
@@ -5482,6 +5532,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             PSP_NETWORK_SUPERVISOR_STARTING, "warmup");
         printf("tilefinch-network-warmup: status=started "
                "after-homepage=yes\n");
+        interactive->transport_prepare_pending = true;
     }
 #endif
 
@@ -5531,9 +5582,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #endif
         .interactive = interactive
     };
-    PspApp *const app = &loop->app;
-    psp_app_refresh_network_profile_label(
-        app, (int) process->config.network_profile);
+    /* The saved profile number is already in UI state. Its name is only
+       visible in Options; the normal lazy Options refresh below owns that
+       firmware lookup, never Home's first input sample. */
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_loop_timing_browser = browser;
     bool input_script_loaded = psp_input_script_begin(
@@ -5726,7 +5777,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     if (lifecycle_recovered) return;
     /* The last thing the frame does before it stops is give the codec
        worker something to do while it is stopped. */
-    (void) psp_media_feed_before_blocking(&browser->media);
+    (void) psp_media_feed_before_blocking(&browser->media, false);
     /*
      * The fullscreen presenter itself waits for vblank before it
      * latches a complete frame. Waiting another vblank here samples a
@@ -5734,10 +5785,11 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
      * lands almost a whole frame late, producing the fast/slow cadence
      * visible on hardware and forcing the late-frame catch-up path.
      *
-     * Poll only while a real playing picture owns the panel. The 2ms
-     * sleep is still a blocking yield for the lower-priority codec
-     * worker -- no busy spin -- and the eventual publish remains the
-     * sole tear-free display clock. Pages, loading/error panels,
+     * Poll only while a real playing picture owns the panel. Empty turns
+     * still yield for 2ms; a completed video latch supplies pacing for one
+     * immediate follow-up. Audio and codec workers retain their higher
+     * priorities, and publication remains the sole tear-free display clock.
+     * Pages, loading/error panels,
      * paused media and seek transactions keep the established vblank
      * throttle.
      */
@@ -6358,6 +6410,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         || (intent.visual_changed
             && !(predispatch_presented && predispatch_complete))
         || media_visual_changed
+        || psp_media_menu_feedback_pending()
         || (navigation_visual_changed
             && !cursor_feedback_presented)
         || update_visual_changed || screenshot_visual_changed) {
@@ -6387,6 +6440,10 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
                 canvas_present_started_us,
                 canvas_present_finished_us);
             if (psp_input_script_running()
+                && psp_validation_video_timing_window)
+                psp_validation_video_suppressed_publications++;
+            if (psp_input_script_running()
+                && !psp_validation_video_timing_window
                 && (!psp_canvas_cadence.causal_window
                     || psp_validation_canvas_live_trace))
                 printf("tilefinch-page-publication: at-us=%llu success=%d "
@@ -6449,6 +6506,10 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     if (network_was_warming)
         psp_loop_report_network_warmup(
             loop, network_was_warming, previous_network_status);
+    psp_app_prepare_transport(app,
+        (page_input_active ? FRAME_FACT_INPUT_BUTTONS : 0u)
+        | (frame.page_dirty ? FRAME_FACT_PAGE_DIRTY : 0u)
+        | (loop->render_job_pending ? FRAME_FACT_RENDER_JOB : 0u), false);
     /* Spend association wait frames on one font file at a time. On the
        transition-to-Ready frame, start the selected-site preconnect first;
        any remaining font work yields while that handshake is active. */
@@ -8265,6 +8326,7 @@ static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
         psp_app_dispatch_deferred_media_intent(
             &browser->media, interactive)
         || media_visual_changed;
+    uint32_t menu_before = psp_ui_media_menu_feedback_key(&browser->media.ui);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool menu_was_open = browser->media.ui.presentation != NULL
         && browser->media.ui.presentation->track_menu_open;
@@ -8275,6 +8337,16 @@ static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
 #endif
     PspUiMediaIntent media_intent =
         psp_ui_media_update(&browser->media.ui, input);
+    /* A paused chooser already has its final UI state. Publish it before
+       unrelated work. During playback, combine it with the next video frame:
+       a separate old-picture swap consumes a vblank and hitches playback. The
+       coverage key excludes closing/shrinking, rotation, seek and loading;
+       those need fresh pixels or their existing semantic action handling. */
+    bool menu_feedback = media_intent.visual_changed
+        && !browser->media.ui.playing
+        && media_intent.action == PSP_UI_MEDIA_ACTION_NONE
+        && psp_ui_media_menu_feedback_reuse(menu_before,
+            psp_ui_media_menu_feedback_key(&browser->media.ui));
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_media_menu_feedback_input(&browser->media.ui,
         menu_was_open, menu_old_tab, menu_pressed_us);
@@ -8287,14 +8359,15 @@ static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
         media_operation =
             psp_log_operation_begin(media_action);
     }
-    if (psp_ui_media_intent_has_predispatch_visual(&media_intent)
+    bool menu_presented = false;
+    if ((menu_feedback || psp_ui_media_intent_has_predispatch_visual(&media_intent))
         && !psp_navigation_cooperate_supervised()) {
         /* Publish UI state which already changed before a close,
            seek, or retry can enter a slower backend operation.
            Play/Pause is deliberately excluded: its visible state is
            committed by execute_intent below, so this would publish a
            stale legend and then its replacement one vblank later. */
-        psp_present(engine_views->frame, &process->presentation.ui);
+        menu_presented = psp_present(engine_views->frame, &process->presentation.ui);
     }
     psp_media_execute_intent(&browser->media, media_intent);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -8306,7 +8379,11 @@ static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
         psp_log_operation_end(
             media_operation, media_action, "returned");
     }
-    media_visual_changed = media_intent.visual_changed;
+    /* A refused publication must retry. Successful chooser feedback needs
+       no duplicate UI-only presentation; newly decoded frames still publish
+       through the ordinary media advance below. */
+    media_visual_changed |= media_intent.visual_changed
+        && !(menu_feedback && menu_presented);
     return media_visual_changed;
 }
 
@@ -9112,10 +9189,34 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+#include "psp_boot_timing.h"
+#include "psp_boot_module.h"
 typedef struct {
     uint64_t entered_us;
     uint64_t previous_us;
 } PspBootTiming;
+
+static TILEFINCH_COLD_PATH void psp_boot_report_handoff(
+    int argc, char *argv[], uint64_t entered_us, uint64_t surface_us)
+{
+    PspBootHandoffTiming timing;
+    if (argc != 2 || argv == NULL || surface_us < entered_us
+        || !psp_boot_timing_decode(argv[1], entered_us, &timing)) {
+        printf("tilefinch-boot-handoff: valid=0 clock=rtc-us\n");
+        return;
+    }
+    const char *source = argv[0] != NULL && strncmp(argv[0], "ms0:", 4) == 0
+        ? "memory-stick" : argv[0] != NULL && strncmp(argv[0], "host0:", 6) == 0
+        ? "usb" : "other";
+    printf("tilefinch-boot-handoff: valid=1 clock=rtc-us source=%s "
+           "launcher-us=%lluus loadexec-us=%lluus "
+           "entry-to-scanout-us=%lluus handoff-to-scanout-us=%lluus\n",
+           source,
+           (unsigned long long) (timing.handoff_us - timing.launcher_us),
+           (unsigned long long) (entered_us - timing.handoff_us),
+           (unsigned long long) (surface_us - entered_us),
+           (unsigned long long) (surface_us - timing.handoff_us));
+}
 
 static TILEFINCH_COLD_PATH void psp_boot_timing_mark(
     PspBootTiming *timing, const char *stage)
@@ -9397,6 +9498,12 @@ static TILEFINCH_COLD_PATH void psp_boot_resume_download(
 
 int main(int argc, char *argv[])
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t validation_main_entered_us =
+        (uint64_t) sceKernelGetSystemTimeWide();
+    uint64_t validation_entry_tick = 0;
+    (void) psp_boot_timing_clock(&validation_entry_tick);
+#endif
     psp_fpu_mask_exceptions();
     PspProcessResources process = {0};
     PspBrowserResources browser = {0};
@@ -9419,8 +9526,8 @@ int main(int argc, char *argv[])
     uint64_t main_entered_us = (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     PspBootTiming boot_timing = {
-        .entered_us = main_entered_us,
-        .previous_us = main_entered_us
+        .entered_us = validation_main_entered_us,
+        .previous_us = validation_main_entered_us
     };
 #endif
     atomic_init(&psp_home_exit_requested, false);
@@ -9447,6 +9554,10 @@ int main(int argc, char *argv[])
     psp_present_boot_entrance(0u, "STARTING TILEFINCH", false, NULL);
     uint64_t boot_surface_presented_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t validation_surface_tick = 0;
+    (void) psp_boot_timing_clock(&validation_surface_tick);
+#endif
     PSP_BOOT_TIMING_MARK("first-scanout");
     int callback_result = -1;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -9466,6 +9577,9 @@ int main(int argc, char *argv[])
         fflush(stdout);
     }
     psp_display_set_validation_logger(psp_log_printf);
+    if (psp_boot_module_report != NULL) psp_boot_module_report();
+    psp_boot_report_handoff(
+        argc, argv, validation_entry_tick, validation_surface_tick);
 #else
     bool persistent_log_started = false;
 #endif
@@ -10666,14 +10780,8 @@ int main(int argc, char *argv[])
         /* Native HOME does not wait on a document. The empty committed page
            gives shell, tab, and history code a valid engine shape while HOME
            owns the first visible frame. Nothing here touches the network. */
-        static const char blank_html[] =
-            "<!doctype html><meta name=viewport "
-            "content=\"width=device-width,initial-scale=1\">"
-            "<title>Tilefinch</title>"
-            "<style>html,body{margin:0;background:#100e0d}</style>";
-        loaded = browser_engine_commit_html(
-            browser.engine, TILEFINCH_HOMEPAGE_URL,
-            blank_html, sizeof(blank_html) - 1u, true)
+        loaded = browser_engine_commit_empty_document(
+            browser.engine, TILEFINCH_HOMEPAGE_URL, true)
             && browser_engine_refresh_shell(browser.engine);
         if (loaded) {
             psp_home_sync_ui(&process.presentation.ui, &process.presentation.home_surface, browser.profile, NULL, false);
@@ -11124,7 +11232,11 @@ report:
            than the bare engine raster: native HOME and all browser chrome
            are composed only in VRAM, and a page-only dump cannot validate
            what the PSP actually displayed. */
-        psp_present(engine_views.frame, &process.presentation.ui);
+        /* Home is already visible. Its next ordinary frame publishes tab
+           changes together with input instead of waiting another vblank
+           before the very first sample. Explicit captures still publish. */
+        if (!native_home_boot || PSP_VALIDATION_KNOB(process.config.dump_frame != 0))
+            psp_present(engine_views.frame, &process.presentation.ui);
         if (PSP_VALIDATION_KNOB(process.config.dump_frame != 0)) {
             uint32_t dump_operation =
                 psp_log_operation_begin("frame-dump");

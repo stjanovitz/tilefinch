@@ -73,6 +73,22 @@ static int test_admission(void)
                             FRAME_FACT_NETWORK_WARMING, 0));
     CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_SITE_RESTORE_CACHE,
                              FRAME_FACT_NETWORK_WARMING, 0));
+    /* An immediately opened native provider must not spend every frame on
+       optional page idle and starve the worker it will need for its API. */
+    frame_pumps_begin(&frame);
+    CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_PROVIDER_PRERESOLVE, 0,
+                             FRAME_PUMP_BIT(FRAME_PUMP_TRANSPORT_PREPARE)));
+    CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_PAGE_IDLE, 0,
+                             FRAME_PUMP_BIT(FRAME_PUMP_TRANSPORT_PREPARE)));
+    CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_DEFERRED_IMAGE, 0,
+                             FRAME_PUMP_BIT(FRAME_PUMP_TRANSPORT_PREPARE)));
+    CHECK(frame_pumps_admit(&frame, FRAME_PUMP_TRANSPORT_PREPARE,
+                            FRAME_FACT_NETWORK_WARMING, 0));
+    frame_pumps_mark_ran(&frame, FRAME_PUMP_TRANSPORT_PREPARE);
+    CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_BASELINE_FONTS, 0, 0));
+    frame_pumps_begin(&frame);
+    CHECK(!frame_pumps_admit(&frame, FRAME_PUMP_TRANSPORT_PREPARE,
+                             FRAME_FACT_INPUT_BUTTONS, 0));
 
     /* Yielding to pending work does not need that work to have run. */
     frame_pumps_begin(&frame);

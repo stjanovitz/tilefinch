@@ -393,6 +393,31 @@ It is unnecessary wear and timing noise for media iteration.
 
 ### Installed-EBOOT remote cycle
 
+Validation launchers pass a bounded, timestamp-only argv receipt to the browser.
+The `tilefinch-boot-handoff` record reports launcher entry to handoff,
+handoff to browser `main`, browser entry to first scanout, and handoff to first
+scanout. No timestamp file or additional Memory Stick write is used. A missing,
+malformed, stale, or non-monotonic receipt reports `valid=0`, never a fabricated
+duration. The standard-loader fallback refreshes its handoff timestamp after
+a failed CFW call.
+
+Cross-process stamps use `sceRtcGetCurrentTick`, with its 1 MHz resolution
+verified, and report `clock=rtc-us`. Kernel uptime resets during LoadExec:
+subtracting kernel timestamps from separate processes can produce plausible
+but wrong durations, or become negative for a small executable. Older handoff
+records without `clock=rtc-us` are invalid. Within-process phase stamps still
+use the kernel clock. A clock adjustment during measurement invalidates the
+comparison; keep the RTC unchanged across matched runs.
+
+Use `source=memory-stick` runs to assess installed-EBOOT loading. USB runs are
+labelled separately and are not equivalent. The handoff interval includes
+process replacement, loader I/O and C runtime startup, not just storage reads.
+It does not measure XMB selection to launcher entry; that needs an external
+observation or instrumentation before the launcher. Keep boot configuration,
+storage, clock policy and update-trial state matched across comparisons, and
+report repeated runs rather than calling an emulator/USB timing a hardware
+Memory Stick result.
+
 Questions about the launcher, slotted data paths, `PARAM.SFO`, or update trials
 must use the installed EBOOT. Build `tfexec.prx`, serve it as an additional
 host directory, and use it to LoadExec the browser:

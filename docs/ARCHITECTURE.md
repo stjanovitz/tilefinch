@@ -1564,8 +1564,26 @@ machines decide when release is safe.
 HOME and Collections are native chrome, not hidden HTML documents. They can
 render immediately from bounded profile snapshots while network warm-up and
 page machinery progress in the background. The native HOME placeholder is
-committed with JavaScript disabled, so it owns no unused QuickJS realm; the
-configured global and per-site policy applies from the first real navigation.
+committed through the initial empty-document path, so it owns neither an
+unused QuickJS realm nor a resource scheduler/HTTP worker. Its temporary
+resource and script policy is restored on success or refusal; the configured
+global and per-site policy applies from the first real navigation. Wi-Fi
+warm-up still starts after HOME's first paint, and the highlighted built-in
+provider can preconnect once association completes. These are background
+preparations, not prerequisites for showing HOME or taking its first input.
+Secure entropy, the bounded TLS-session store, the trust bundle (4 KiB reads),
+and the shared HTTP worker are prepared in separate post-paint units during
+association. The same owner continues those units if an immediate first
+navigation adopts the foreground connection wait, including a native provider
+open. Optional provider work yields until this preparation completes or
+refuses; ordinary demand remains the fallback. No extra host is contacted.
+The provider's local YouTube search screen can open before association finishes;
+explicit searches, topic requests, and sign-in handoffs still require networking.
+Local adapter entry surfaces retain a deferred resource-scheduler view: creating
+or pumping an empty view does not acquire curl or start its worker. The first
+accepted resource request initializes that view, with ordinary retryable refusal
+and teardown. Ordinary document admission keeps its existing network reservation
+so font/resource pressure decisions do not change.
 Profile settings, bookmarks, and HOME destinations are still loaded before the
 first frame, because they define that native UI.
 
@@ -1577,7 +1595,10 @@ still reserves its addressable memory before the browser heap grows; that is
 an ownership requirement, not deferrable page work. Synthetic clock
 benchmarking runs only in the explicit `validation_power_test_auto` mode, not
 in ordinary validation boots. HOME's first input sample skips the redundant
-post-presentation vblank wait, while later frames keep their usual cadence.
+post-presentation vblank wait and duplicate Home publication, while later
+frames keep their usual cadence. The saved Wi-Fi profile name is queried
+only when Options needs it; the already-loaded profile number remains usable
+for navigation before that query.
 Activating a HOME tile publishes `OPENING...` through the shared
 acknowledgement path before any network or page preparation, so navigation
 never has to hide input receipt while background warm-up finishes. The

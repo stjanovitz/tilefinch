@@ -134,6 +134,7 @@ typedef struct {
  * account actions never require executing the full service page.
  */
 YoutubeLiteRoute youtube_lite_route(const char *url);
+bool youtube_lite_navigation_requires_network(const char *url);
 /* Only the service's HTTPS session handoff, never an executable feed page. */
 bool youtube_lite_signin_handoff_url(const char *url);
 

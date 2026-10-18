@@ -29,7 +29,7 @@ typedef void (*SiteAdapterDestroyCallback)(void *implementation);
 
 struct SiteAdapterDefinition {
     const char *name;
-    bool requires_network;
+    bool (*requires_network)(const char *url);
     bool (*matches)(const char *url);
     bool (*requires_stable_typography)(const char *url);
     SiteAdapterBeginCallback begin;
@@ -456,7 +456,7 @@ static void google_search_destroy(void *implementation)
 static const SiteAdapterDefinition adapters[] = {
     {
         .name = "google-search-compat",
-        .requires_network = false,
+        .requires_network = NULL,
         .matches = google_search_matches,
         .requires_stable_typography = NULL,
         .begin = google_search_begin,
@@ -470,7 +470,7 @@ static const SiteAdapterDefinition adapters[] = {
     },
     {
         .name = "youtube-lite",
-        .requires_network = true,
+        .requires_network = youtube_lite_navigation_requires_network,
         .matches = youtube_matches,
         .requires_stable_typography = youtube_requires_stable_typography,
         .begin = youtube_begin,
@@ -505,7 +505,8 @@ bool site_adapter_navigation_requires_network(
 {
     const SiteAdapterDefinition *definition =
         site_adapter_find(method, url);
-    return definition == NULL || definition->requires_network;
+    return definition == NULL || (definition->requires_network != NULL
+        && definition->requires_network(url));
 }
 
 bool site_adapter_navigation_requires_stable_typography(

@@ -429,6 +429,7 @@ TilefinchDateFormat psp_preferred_date_format(void *context);
 void psp_log_message(void *context, const char *message);
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
+bool psp_media_menu_feedback_pending(void);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
 void psp_media_menu_feedback_input(const PspUiMediaState *media,
@@ -1085,6 +1086,8 @@ typedef struct {
     PspSiteDataRestore site_data_restore;
     /* Declared admission state for this frame's optional pumps. */
     FramePumpFrame frame_pumps;
+    bool transport_prepare_pending;
+    unsigned transport_prepare_phase;
     PspReaderNavigation reader_navigation;
     PspCaptivePortal *captive_portal;
     bool blank_reader_recovery_pending;
@@ -1457,6 +1460,9 @@ bool psp_ensure_network_for_navigation(
     PspNetwork *network, PspNetworkLifecycle *lifecycle, int profile_index,
     const char *method, const char *url, bool present_destination,
     const uint16_t *frame, PspUiState *ui);
+bool psp_app_ensure_network_for_navigation(PspApp *app, const char *method,
+    const char *url, const uint16_t *frame);
+void psp_app_prepare_transport(PspApp *app, uint32_t facts, bool connection_wait);
 #endif
 
 /* User-initiated optional-model work is deliberately cold. Keeping its

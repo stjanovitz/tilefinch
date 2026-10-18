@@ -448,7 +448,9 @@ static PspMediaPresentRecord
 static PspUiMediaTrackMenuCache psp_media_track_menu_cache;
 static uint32_t psp_media_front_menu_key, psp_media_front_menu_epoch;
 static uint64_t psp_media_front_frame_epoch;
+static uint64_t psp_media_front_frame_identity;
 static uint64_t psp_media_front_menu_generation;
+static uint64_t psp_media_menu_deferred_us;
 _Static_assert(
     PSP_DISPLAY_VIDEO_AUX_BYTES
         >= (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
@@ -469,8 +471,35 @@ static bool psp_media_present_last_skipped;
 void psp_media_present_forget_buffers(void)
 {
     psp_media_front_menu_key = 0;
+    psp_media_menu_deferred_us = 0;
     psp_media_present_records_reset(
         psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
+}
+
+bool psp_media_menu_feedback_pending(void)
+{
+    if (psp_active_media == NULL || !psp_active_media->ui.visible
+        || !psp_active_media->ui.playing
+        || psp_active_media->generation != psp_media_front_menu_generation)
+        psp_media_menu_deferred_us = 0;
+    return psp_media_menu_deferred_us != 0;
+}
+
+static bool psp_media_menu_feedback_wait(bool same_picture_feedback)
+{
+    if (!psp_active_media->ui.playing) {
+        psp_media_menu_deferred_us = 0;
+        return false;
+    }
+    /* A fresh picture ends the wait, not the publication obligation. Keep a
+       pending request until a successful swap, including after refusal. */
+    if (!same_picture_feedback) return false;
+    /* Do not spend a display interval on an old picture just for UI feedback.
+       The ordinary owner pump keeps decoding while this request remains due.
+       Bound the wait to one 30-Hz picture so stalled streams still get UI. */
+    uint64_t now = (uint64_t) sceKernelGetSystemTimeWide();
+    if (psp_media_menu_deferred_us == 0) psp_media_menu_deferred_us = now;
+    return now - psp_media_menu_deferred_us < UINT64_C(33334);
 }
 
 /*
@@ -617,6 +646,39 @@ static PspMenuPhaseClock psp_menu_phase_clock(void)
     return clock;
 }
 
+/* First-picture attribution is bounded, numeric-only, and flushed after the
+   measured window. Include surface entry: timing only the overlay missed the
+   initial format switch. The presentation fence serializes both painters. */
+static struct {
+    uint64_t generation;
+    unsigned count, loading_count, playing_count;
+    PspMenuPhaseClock clocks[8][5];
+    bool published[8], resolving[8];
+} psp_player_start;
+static PspMenuPhaseClock *psp_player_start_clocks;
+
+static void psp_player_start_report(void)
+{
+    static const char *const names[] = {"surface", "video", "overlay", "publish"};
+    for (unsigned row = 0; row < psp_player_start.count; row++) {
+        const PspMenuPhaseClock *clocks = psp_player_start.clocks[row];
+        uint64_t query_us = 0;
+        for (unsigned at = 0; at < 5; at++)
+            query_us += clocks[at].after - clocks[at].before;
+        for (unsigned at = 0; at < 4; at++) {
+            bool valid = clocks[at].valid && clocks[at + 1].valid
+                && clocks[at + 1].cpu >= clocks[at].cpu
+                && clocks[at + 1].before >= clocks[at].after;
+            printf("tilefinch-player-start: frame=%u resolving=%u phase=%s published=%u wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u clock-query=%lluus\n",
+                row, psp_player_start.resolving[row], names[at], psp_player_start.published[row],
+                (unsigned long long) (valid ? clocks[at + 1].before - clocks[at].after : 0),
+                (unsigned long long) (valid ? clocks[at + 1].after - clocks[at].before : 0),
+                (unsigned long long) (valid ? clocks[at + 1].cpu - clocks[at].cpu : 0),
+                valid, (unsigned long long) query_us);
+        }
+    }
+}
+
 static void psp_menu_phase_report(unsigned key, uint32_t input_us,
     const PspMenuPhaseClock clocks[4])
 {
@@ -646,6 +708,7 @@ bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing)
 
 void psp_report_presentation_cadence(const char *phase)
 {
+    psp_player_start_report();
     const PspPresentationCadence *metrics = &psp_presentation_cadence;
     printf(
         "tilefinch-ui-cadence: phase=%s presents=%lu native=%lu "
@@ -1558,10 +1621,36 @@ static bool psp_media_track_menu_blit(
 
 /* One video frame plus its chrome, published. Out of line: the 16-bit
    compositor is what every non-video frame walks. */
+static void psp_media_service_scanout_wait(void *context)
+{
+    (void) psp_media_feed_before_blocking(context, true);
+}
+
+static bool psp_media_wait_video_due(PspMediaSession *media)
+{
+    uint64_t started_us = sceKernelGetSystemTimeWide();
+    for (unsigned poll = 0; poll < 18u; poll++) {
+        uint64_t delay_us = psp_media_present_delay_us(media);
+        if (delay_us == 0) return true;
+        media->presentation_deferred = true;
+        uint64_t now_us = sceKernelGetSystemTimeWide();
+        if (delay_us > PSP_MEDIA_PREPARATION_WINDOW_US || now_us < started_us
+            || now_us - started_us >= PSP_MEDIA_PREPARATION_WINDOW_US) return false;
+        uint64_t remaining_us = PSP_MEDIA_PREPARATION_WINDOW_US - (now_us - started_us);
+        if (delay_us > remaining_us) delay_us = remaining_us;
+        if (delay_us > 1000u) delay_us = 1000u;
+        psp_media_service_scanout_wait(media);
+        if (sceKernelDelayThread((unsigned) delay_us) < 0) return false;
+    }
+    return psp_media_present_delay_us(media) == 0;
+}
+
 __attribute__((noinline))
 static bool psp_present_video_surface(void)
 {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_player_start_clocks != NULL)
+        psp_player_start_clocks[1] = psp_menu_phase_clock();
     uint64_t presentation_started_us =
         (uint64_t) sceKernelGetSystemTimeWide();
     unsigned menu_key = psp_active_media->ui_presentation.track_menu_open
@@ -1581,12 +1670,22 @@ static bool psp_present_video_surface(void)
     /* The front is read-only; the hidden back is exclusively ours. Copy the
        completed scanout and replace only the opaque chooser. Never redraw a
        blended control on these already-composited pixels. A smaller chooser,
-       dismissal, seek, rotation or stream/EDRAM transition takes fresh video. */
-    bool menu_feedback = psp_media_front_menu_generation == psp_active_media->generation
+       dismissal, seek, rotation or stream/EDRAM transition takes fresh video.
+       A newer decoded picture also takes priority: epoch equality alone says
+       nothing about which picture the front buffer actually contains. */
+    bool current_picture = psp_media_front_menu_generation == psp_active_media->generation
         && psp_media_front_menu_epoch == feedback_epoch
         && psp_media_front_frame_epoch == psp_active_media->frame.epoch
-        && psp_ui_media_menu_feedback_reuse(psp_media_front_menu_key, feedback_key)
-        && psp_media_present_ge_stage_rows(vram,
+        && psp_media_front_frame_identity == psp_active_media->frame.identity;
+    bool menu_feedback = current_picture
+        && psp_ui_media_menu_feedback_reuse(psp_media_front_menu_key, feedback_key);
+    /* Decoder/status changes can request a refresh between source pictures
+       too. Coalesce those without spending a vblank on a duplicate; actual
+       buffering/end state and seek/rotation previews must remain immediate. */
+    if (psp_media_menu_feedback_wait(current_picture && feedback_key != 0
+            && !psp_active_media->ui.buffering && !psp_active_media->ui.ended))
+        return false;
+    menu_feedback = menu_feedback && psp_media_present_ge_stage_rows(vram,
             psp_display_video_front_buffer(&psp_display),
             PSP_VRAM_STRIDE, PSP_VRAM_STRIDE, PSP_SCREEN_HEIGHT);
     if (menu_feedback)
@@ -1597,10 +1696,19 @@ static bool psp_present_video_surface(void)
     psp_media_present_last_skipped = false;
     if (menu_feedback) psp_media_present_last_skipped = true;
 #endif
+    /* Only this owner changes priority. Audio/codec keep their higher band;
+       transport keeps running during DMA/GE/vblank waits, but cannot delay
+       the owner once a draw finishes. Restore on both exit paths below. */
+    int previous_priority = psp_thread_priority_raise(
+        TILEFINCH_PSP_THREAD_PRIORITY_PRESENT);
     if (vram == NULL
         || (!menu_feedback && !psp_present_media_frame_video(
                vram, &psp_active_media->frame,
                overlay_paints, &cost))) {
+        int restored = psp_thread_priority_restore(previous_priority);
+        if (restored < 0)
+            printf("tilefinch-media-present: priority-restore=0x%08X\n",
+                   (unsigned) restored);
         /* The engine refused after the surface was entered. Hand the panel
            back and let the next present run the software scaler; publishing a
            buffer nothing drew into would be a frame of noise. */
@@ -1609,8 +1717,14 @@ static bool psp_present_video_surface(void)
         return false;
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_player_start_clocks != NULL)
+        psp_player_start_clocks[2] = psp_menu_phase_clock();
     if (measure_menu) menu_clocks[1] = psp_menu_phase_clock();
 #endif
+    /* A firmware batch can end with several access units which produce no
+       picture. Collect/feed after drawing, not only at the next loop head:
+       otherwise overlay work and scanout leave the decoder idle at each GOP. */
+    (void) psp_media_feed_before_blocking(psp_active_media, false);
     PspUiMediaPreview preview = {
         .pixels = psp_active_media->seek_preview_pixels,
         .width = PSP_MEDIA_PREVIEW_WIDTH,
@@ -1627,18 +1741,42 @@ static bool psp_present_video_surface(void)
         psp_display_edram_content_epoch(), &psp_media_track_menu_cache,
         psp_media_track_menu_blit, NULL);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_player_start_clocks != NULL)
+        psp_player_start_clocks[3] = psp_menu_phase_clock();
     if (measure_menu) menu_clocks[2] = psp_menu_phase_clock();
     psp_cadence_composed(presentation_started_us, false);
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     unsigned published_index = psp_display.back_buffer;
 #endif
-    bool published = psp_display_publish(&psp_display);
+    /* The preceding feed may finish during overlay composition. Give its
+       successor the impending vblank wait without claiming another picture
+       or changing either display buffer's ownership. */
+    (void) psp_media_feed_before_blocking(psp_active_media, false);
+    bool published = psp_media_wait_video_due(psp_active_media)
+        && psp_display_publish_serviced(
+        &psp_display, psp_media_service_scanout_wait, psp_active_media);
+    int restored = psp_thread_priority_restore(previous_priority);
+    if (restored < 0)
+        printf("tilefinch-media-present: priority-restore=0x%08X\n",
+               (unsigned) restored);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_player_start_clocks != NULL) {
+        psp_player_start_clocks[4] = psp_menu_phase_clock();
+        psp_player_start.published[psp_player_start.count++] = published;
+        psp_player_start_clocks = NULL;
+    }
+#endif
     if (published) {
+        psp_media_presented(psp_active_media);
+        psp_media_menu_deferred_us = 0;
         psp_media_front_menu_key = feedback_key;
         psp_media_front_menu_epoch = feedback_epoch;
         psp_media_front_menu_generation = psp_active_media->generation;
-        if (!menu_feedback) psp_media_front_frame_epoch = psp_active_media->frame.epoch;
+        if (!menu_feedback) {
+            psp_media_front_frame_epoch = psp_active_media->frame.epoch;
+            psp_media_front_frame_identity = psp_active_media->frame.identity;
+        }
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (measure_menu && published) {
@@ -1853,6 +1991,24 @@ bool psp_present_internal(
         return false;
     bool media_replaces_page = media_visible && psp_active_media->have_frame
         && psp_media_frame_presentable(&psp_active_media->frame);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_player_start_clocks = NULL;
+    if (media_replaces_page) {
+        if (psp_player_start.generation != psp_active_media->generation) {
+            memset(&psp_player_start, 0, sizeof(psp_player_start));
+            psp_player_start.generation = psp_active_media->generation;
+        }
+        bool resolving = psp_active_media->ui.resolving;
+        unsigned *samples = resolving ? &psp_player_start.loading_count
+                                      : &psp_player_start.playing_count;
+        if (*samples < 4u && psp_player_start.count < 8u) {
+            psp_player_start_clocks = psp_player_start.clocks[psp_player_start.count];
+            psp_player_start.resolving[psp_player_start.count] = resolving;
+            (*samples)++;
+            psp_player_start_clocks[0] = psp_menu_phase_clock();
+        }
+    }
+#endif
     if (psp_media_video_surface_follow(media_replaces_page)) {
         bool published = psp_present_video_surface();
         /* Still on the video surface means it owned this frame, published or
@@ -1861,6 +2017,11 @@ bool psp_present_internal(
            draw the same frame into the 16-bit surface. */
         if (psp_display_video_active(&psp_display)) return published;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Surface refusal takes the ordinary fallback; do not label its absent
+       video/overlay boundaries as valid first-picture samples. */
+    psp_player_start_clocks = NULL;
+#endif
     uint16_t *vram = psp_display_back_buffer(&psp_display);
     if (vram == NULL) return false;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1993,7 +2154,9 @@ bool psp_present_internal(
         psp_present_pre_publish_hook(next == 0u ? 1u : next);
     }
 #endif
-    bool published = psp_display_publish(&psp_display);
+    bool published = (!media_replaces_page
+        || psp_media_wait_video_due(psp_active_media))
+        && psp_display_publish(&psp_display);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t published_us = (uint64_t) sceKernelGetSystemTimeWide();
     PspDisplayBackendTiming display_timing_after = {0};
@@ -2048,6 +2211,8 @@ bool psp_present_internal(
             psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
     }
 #endif
+    if (published && media_replaces_page)
+        psp_media_presented(psp_active_media);
     return published;
 }
 
@@ -3019,11 +3184,27 @@ void psp_work_cooperate_begin_media_open(
     const PspUiMediaState *media_ui)
 {
     if (ui == NULL || media_ui == NULL) return;
-    /* Player labels use both chrome sizes regardless of the menu-scale
-       preference. Populate them on the owner before the loading supervisor
-       draws percentages or the first track chooser. */
-    psp_presentation_preload_chrome_scale(1u);
-    psp_presentation_preload_chrome_scale(2u);
+    /* Populate playback's actual weights/buttons before the supervisor draws,
+       without preparing an unused large bold alphabet on every first open. */
+    bool held = psp_presentation_fence_acquire();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspMenuPhaseClock fonts_before = psp_menu_phase_clock();
+#endif
+    psp_ui_preload_media_chrome();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspMenuPhaseClock fonts_after = psp_menu_phase_clock();
+    PspUiChromeGlyphPreload preload = psp_ui_chrome_glyph_preload();
+    if (preload.glyphs != 0u) {
+        bool valid = fonts_before.valid && fonts_after.valid
+            && fonts_after.cpu >= fonts_before.cpu;
+        printf("tilefinch-player-fonts: regular-large-glyphs=%u wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u\n",
+            preload.glyphs,
+            (unsigned long long) (fonts_after.before - fonts_before.after),
+            (unsigned long long) (fonts_after.after - fonts_before.before),
+            (unsigned long long) (valid ? fonts_after.cpu - fonts_before.cpu : 0), valid);
+    }
+#endif
+    psp_presentation_fence_release(held);
     psp_ui_set_loading(ui, true, -1);
     psp_ui_show_status(ui, PSP_MEDIA_OPEN_STATUS, 600);
     psp_work_cooperate_begin(

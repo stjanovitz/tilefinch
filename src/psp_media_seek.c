@@ -428,6 +428,7 @@ bool psp_media_seek_decode_pump(
                 error[0] == '\0' ? "media seek failed" : error);
             return true;
         }
+        media->present_error[0] = '\0'; /* successful reset owns a new epoch */
         /*
          * The decode leg, retired for every seek that owes nobody a picture at
          * an exact timestamp.

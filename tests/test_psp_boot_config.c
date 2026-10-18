@@ -4,6 +4,7 @@
    and so is the table the in-app picker may write from. Both have to
    agree. */
 #include "../src/media_backend_psp_policy.h"
+#include "../src/psp_boot_timing.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -298,6 +299,39 @@ static int test_defaults_match_shared_app_profile(void)
 
 int main(void)
 {
+    char timing_argument[PSP_BOOT_TIMING_ARGUMENT_BYTES + 1u];
+    PspBootHandoffTiming timing = {100u, 200u}, decoded = {0};
+    psp_boot_timing_encode(timing_argument, timing);
+    CHECK(strlen(timing_argument) + 1u == PSP_BOOT_TIMING_ARGUMENT_BYTES);
+    CHECK(psp_boot_timing_decode(timing_argument, 300u, &decoded));
+    CHECK(decoded.launcher_us == 100u && decoded.handoff_us == 200u);
+    CHECK(!psp_boot_timing_decode(timing_argument, 199u, &decoded));
+    CHECK(!psp_boot_timing_decode(timing_argument, UINT64_C(600000101), &decoded));
+    for (size_t length = 0; length < PSP_BOOT_TIMING_ARGUMENT_BYTES - 1u; length++) {
+        char *short_argument = malloc(length + 1u);
+        CHECK(short_argument != NULL);
+        memcpy(short_argument, timing_argument, length);
+        short_argument[length] = '\0';
+        CHECK(!psp_boot_timing_decode(short_argument, 300u, &decoded));
+        free(short_argument);
+    }
+    for (size_t at = 0; at < PSP_BOOT_TIMING_ARGUMENT_BYTES - 1u; at++) {
+        char saved = timing_argument[at];
+        timing_argument[at] = '!';
+        CHECK(!psp_boot_timing_decode(timing_argument, 300u, &decoded));
+        timing_argument[at] = saved;
+    }
+    timing_argument[PSP_BOOT_TIMING_ARGUMENT_BYTES - 1u] = '0';
+    timing_argument[PSP_BOOT_TIMING_ARGUMENT_BYTES] = '\0';
+    CHECK(!psp_boot_timing_decode(timing_argument, 300u, &decoded));
+    psp_boot_timing_encode(timing_argument, (PspBootHandoffTiming) {201u, 200u});
+    CHECK(!psp_boot_timing_decode(timing_argument, 300u, &decoded));
+    psp_boot_timing_encode(timing_argument,
+        (PspBootHandoffTiming) {UINT64_MAX - 2u, UINT64_MAX - 1u});
+    CHECK(psp_boot_timing_decode(timing_argument, UINT64_MAX, &decoded));
+    psp_boot_timing_encode(timing_argument, (PspBootHandoffTiming) {0, 0});
+    CHECK(!psp_boot_timing_decode(timing_argument, 0, &decoded));
+    CHECK(!psp_boot_timing_decode(timing_argument, 300u, &decoded));
     CHECK(test_defaults_match_shared_app_profile() == 0);
     CHECK(test_game_audio_reference_selector() == 0);
     CHECK(test_app_heap_key() == 0);

@@ -196,7 +196,7 @@ case "$MODE" in
         mkdir -p "$HOST_ROOT"
         "$ROOT/scripts/stage-psp-game.sh" \
             --refresh-managed "$BUILD_DIR/boot.cfg"
-        cmake --build "$BUILD_DIR" --target psp-browser-script -j"$JOBS"
+        cmake --build "$BUILD_DIR" --target psp-browser-script-module -j"$JOBS"
         make -C "$ROOT/tools/psplink-deploy"
         artifacts=$(sh "$ROOT/scripts/stage-psplink-slot.sh" "$BUILD_DIR" "$HOST_ROOT")
         cp "$ROOT/tools/psplink-deploy/tfdeploy.prx" "$HOST_ROOT/tfdeploy.prx"

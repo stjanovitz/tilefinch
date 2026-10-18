@@ -276,7 +276,8 @@ static size_t psp_media_pump_present(
         || !media->ui.playing
         || media->machine.state == PSP_MEDIA_SESSION_OPENING
         || media->job_phase != PSP_MEDIA_JOB_NONE
-        || media->pause_boundary_pending) return 0;
+        || media->pause_boundary_pending || media->present_error[0] != '\0')
+        return 0;
     /* The whole difference between here and the frame's own advance: this
        thread is waiting on hardware, so a unit may block for the codec worker
        at no cost to the frame -- and, while the copy is the hardware being
@@ -305,6 +306,8 @@ static size_t psp_media_pump_present(
                 media->playback, decode_clock_us,
                 PSP_MEDIA_JOB_MAXIMUM_PACKETS, NULL,
                 error, sizeof(error));
+        if (advance == MEDIA_PLAYBACK_ADVANCE_ERROR)
+            psp_media_defer_present_error(media, error);
         units++;
         /* An error here is the ordinary advance's to diagnose: it has the
            retry ladder, the panel and the stats. Stop and let the next frame
@@ -436,7 +439,26 @@ void psp_media_present_texture_finish(PspMediaSession *media)
 #endif
 }
 
-size_t psp_media_feed_before_blocking(PspMediaSession *media)
+void psp_media_defer_present_error(PspMediaSession *media, const char *message)
+{
+    if (media->present_error[0] == '\0')
+        snprintf(media->present_error, sizeof(media->present_error), "%s",
+                 message[0] != '\0' ? message : "Media presentation feed failed");
+}
+
+uint64_t psp_media_present_delay_us(const PspMediaSession *media)
+{
+    if (media == NULL || media->playback == NULL || !media->have_frame
+        || !media->ui.playing || media->audio_hold.applied
+        || media->frame.width <= PSP_MEDIA_MPEG_DECODE_WIDTH
+        || media->frame.duration_us == 0) return 0;
+    uint64_t audio_us = 0;
+    if (!media_playback_audio_cursor_us(media->playback, &audio_us)
+        || media_video_frame_is_due(&media->frame, audio_us)) return 0;
+    return media->frame.pts_us - audio_us - media->frame.duration_us / 2u;
+}
+
+size_t psp_media_feed_before_blocking(PspMediaSession *media, bool prepared_only)
 {
     /* The frame stops here whether or not this feed does anything, so the
        phase is published before the guard rather than after it: a conversion
@@ -452,22 +474,29 @@ size_t psp_media_feed_before_blocking(PspMediaSession *media)
      * memcpy and an event flag, takes no wait of any kind, and hands the
      * worker several milliseconds of work it would otherwise have spent idle.
      *
-     * Bounded to one unit. This is not a pump; it is the last thing the frame
-     * does before it stops, and its whole job is that the worker does not.
+     * Bounded to one unit. Also used between video drawing and overlay work:
+     * a zero-picture access unit can finish during composition, leaving its
+     * successor ready for the final pre-scanout feed. No frame is claimed,
+     * released or presented here.
      */
     if (media == NULL || media->playback == NULL || !media->ui.visible
         || !media->ui.playing
         || media->machine.state == PSP_MEDIA_SESSION_OPENING
         || media->job_phase != PSP_MEDIA_JOB_NONE
-        || media->pause_boundary_pending) return 0;
+        || media->pause_boundary_pending || media->present_error[0] != '\0')
+        return 0;
     MediaPlaybackJobStats before = {0};
     MediaPlaybackJobStats after = {0};
     media_playback_job_stats(media->playback, &before);
     char error[256] = {0};
-    (void) media_playback_advance_bounded_cancelable(
-        media->playback,
-        psp_media_session_decode_clock_us(media, false),
-        PSP_MEDIA_JOB_MAXIMUM_PACKETS, NULL, error, sizeof(error));
+    uint64_t clock_us = psp_media_session_decode_clock_us(media, false);
+    MediaPlaybackAdvanceResult advance = prepared_only
+        ? media_playback_advance_prepared(media->playback, clock_us,
+            PSP_MEDIA_JOB_MAXIMUM_PACKETS, error, sizeof(error))
+        : media_playback_advance_bounded_cancelable(media->playback, clock_us,
+            PSP_MEDIA_JOB_MAXIMUM_PACKETS, NULL, error, sizeof(error));
+    if (advance == MEDIA_PLAYBACK_ADVANCE_ERROR)
+        psp_media_defer_present_error(media, error);
     media_playback_job_stats(media->playback, &after);
     size_t submitted =
         after.packets_submitted - before.packets_submitted;

@@ -4661,6 +4661,7 @@ bool fetch_background_transport_quiesce(unsigned timeout_ms)
 
 bool fetch_background_transport_shutdown(unsigned timeout_ms)
 {
+    fetch_cancel_ca_bundle_preparation();
     if (!fetch_background.initialized) return true;
     if (!fetch_background_transport_quiesce(timeout_ms)) return false;
     atomic_store_explicit(

@@ -370,8 +370,29 @@ static int test_search_video_journey(void)
     CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_FORM_SUBMIT);
     static const char results[] = TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-video-journey";
     static const char watch[] = TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-site-adapter-youtube";
-    CHECK(fetch_trace_replay_begin_response_keyed(results, error, sizeof(error))
-        && browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000)
+    CHECK(fetch_trace_replay_begin_response_keyed(results, error, sizeof(error)));
+    lxb_html_document_t *home_document = nav->page.document.html;
+    size_t home_history = nav->history_count;
+    CHECK(browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000));
+    browser_engine_cancel_navigation(engine, "cancel first search");
+    CHECK(browser_engine_navigation_status(engine) == BROWSER_NAVIGATION_JOB_CANCELLED
+        && nav->page.document.html == home_document && nav->history_count == home_history
+        && controller_focused_node(browser_engine_controller(engine)) == search
+        && browser_engine_render_frame(engine, NULL));
+    fetch_inject_failure_once(FETCH_INJECT_TIMEOUT);
+    CHECK(browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000));
+    BrowserNavigationJobStatus first_search = BROWSER_NAVIGATION_JOB_PENDING;
+    for (unsigned i = 0; i < 512 && first_search == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        first_search = browser_engine_pump_navigation(engine, NULL);
+    size_t typed_length = 0;
+    const char *typed = document_control_value(search, &typed_length);
+    CHECK(first_search == BROWSER_NAVIGATION_JOB_FAILED
+        && browser_engine_last_error(engine)[0] != '\0'
+        && nav->page.loaded && nav->page.document.html == home_document
+        && nav->history_count == home_history && typed != NULL
+        && typed_length == 7 && !memcmp(typed, "journey", 7)
+        && controller_focused_node(browser_engine_controller(engine)) == search);
+    CHECK(browser_engine_begin_navigation_action(engine, &action, 1u * MIB, 1000)
         && test_journey_complete(engine) == 0);
     search = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-search");
     CHECK(search != NULL && browser_engine_focus_node(engine, search)
@@ -920,8 +941,70 @@ static int test_fixed_image_publication(void)
     return 0;
 }
 
+static int test_provider_scan_turns(void)
+{
+    char fixture[128], error[256] = {0};
+    size_t source_length = 0, turns[2] = {0};
+    CHECK(write_large_youtube_replay(fixture, &source_length));
+    char path[256];
+    snprintf(path, sizeof(path), "%s/0000.body", fixture);
+    char *source = read_test_file(path, &source_length);
+    CHECK(source != NULL);
+    for (unsigned lane = 0; lane < 3; lane++) {
+        Budget budget; budget_init(&budget, 16u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 512u * 1024u)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        static const char url[] = "https://www.youtube.com/results?search_query=ratchet";
+        YoutubeLiteLoadJob *job = youtube_lite_load_begin(&budget, &session,
+            url, 1u * MIB, 2000, error, sizeof(error));
+        CHECK(job != NULL);
+        ReadyPhaseProbe clock = {.ns = tilefinch_platform_monotonic_time_ns()};
+        TilefinchPlatformServices services = {.context = &clock,
+            .monotonic_time_ns = test_ready_phase_clock};
+        if (lane == 2) services.cooperate = test_ready_phase_cancel;
+        tilefinch_platform_set_services(&services);
+        FetchPumpQuota quota = {.maximum_time_us = 10000u};
+        YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+        for (size_t pump = 0; pump < 4096 && status == YOUTUBE_LITE_LOAD_PENDING; pump++) {
+            YoutubeLiteLoadMetrics progress = {0};
+            CHECK(youtube_lite_load_metrics(job, &progress));
+            quota.maximum_time_us = lane == 0 && progress.requests_completed != 0 ? 1u : 10000u;
+            status = youtube_lite_load_pump(job, &quota);
+        }
+        tilefinch_platform_set_services(NULL);
+        YoutubeLiteLoadMetrics metrics = {0};
+        CHECK(youtube_lite_load_metrics(job, &metrics)
+            && metrics.maximum_transform_slice_bytes <= TEST_PROVIDER_SLICE_BYTES);
+        if (lane == 2) {
+            CHECK(status == YOUTUBE_LITE_LOAD_CANCELLED && clock.checkpoints == 1);
+        } else {
+            YoutubeLiteDocument actual = {0}, expected = {0};
+            if (status != YOUTUBE_LITE_LOAD_SUCCEEDED)
+                fprintf(stderr, "scan lane=%u status=%d error=%s\n", lane, status, youtube_lite_load_error(job));
+            CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+                && youtube_lite_load_take_document(job, &actual)
+                && youtube_lite_build_document(&budget, url, source, source_length,
+                    &expected, error, sizeof(error)));
+            CHECK(actual.html_length == expected.html_length
+                && !memcmp(actual.html, expected.html, actual.html_length));
+            turns[lane] = metrics.pump_calls - metrics.network_pumps;
+            youtube_lite_document_destroy(&actual);
+            youtube_lite_document_destroy(&expected);
+        }
+        youtube_lite_load_destroy(job);
+        fetch_trace_end(); browser_session_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    free(source); remove_large_youtube_replay(fixture);
+    printf("provider-scan-turns single=%zu coalesced=%zu\n", turns[0], turns[1]);
+    CHECK(turns[1] * 4u <= turns[0] * 3u);
+    return 0;
+}
+
 static int test_cooperative_site_adapter_navigation(void)
 {
+    CHECK(test_provider_scan_turns() == 0);
     CHECK(test_cooperative_lockup_cards() == 0);
     CHECK(test_watch_metadata_reuse() == 0);
     /* A large watch response may put a useful description header before a
@@ -5831,6 +5914,13 @@ static int test_youtube_cooperative_build_convergence(void)
 
 static int test_youtube_home_topics_are_lazy(void)
 {
+    CHECK(!site_adapter_navigation_requires_network("GET", "https://m.youtube.com/")
+          && !site_adapter_navigation_requires_network("GET", "https://www.youtube.com/feed/subscriptions")
+          && site_adapter_navigation_requires_network("POST", "https://www.youtube.com/")
+          && site_adapter_navigation_requires_network("GET", "https://www.youtube.com/?tilefinch_topics=1")
+          && site_adapter_navigation_requires_network("GET", "https://www.youtube.com/signin?token=synthetic")
+          && site_adapter_navigation_requires_network("GET", "https://www.youtube.com/results?search_query=fixture")
+          && site_adapter_navigation_requires_network("GET", "https://www.youtube.com/watch?v=TFTEST00001"));
     static const char fixture[] = TILEFINCH_TEST_SOURCE_DIR
         "/tests/fixtures/http-youtube-home-topics";
     char body_path[1024], pure_error[128] = {0};
@@ -6455,6 +6545,64 @@ static int test_youtube_rating_status_confirmation(void)
 static uint64_t test_youtube_account_clock(void *context)
 {
     return *(uint64_t *) context;
+}
+
+static int test_youtube_initial_tiles_are_coalesced(void)
+{
+    static const char html[] = "<!doctype html><style>body{margin:0}"
+        "a{display:block;height:80px}</style><a href='/a'>First</a>"
+        "<a href='/b'>Second</a><div style='height:1200px'>Body</div>";
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.resources.web_fonts_enabled = false;
+    config.progressive_first_paint = false;
+    for (unsigned lane = 0; lane < 6; lane++) {
+        uint64_t clock = 1000000u;
+        TilefinchPlatformServices services = {.context = &clock,
+            .monotonic_time_us = test_youtube_account_clock};
+        tilefinch_platform_set_services(&services);
+        char error[256] = {0};
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL && browser_engine_commit_html(engine,
+            lane == 4 ? "https://example.test/" : "https://www.youtube.com/",
+            html, sizeof(html) - 1, true));
+        CHECK(browser_engine_render_frame_bounded(engine, 0, 0) == BROWSER_RENDER_JOB_PENDING);
+        const TileCache *cache = browser_engine_render_metrics_view(engine);
+        size_t prepared = cache->frame_job_units;
+        size_t placeholders = 99;
+        if (lane != 4) {
+            CHECK(!browser_engine_render_placeholder_frame(engine, &placeholders)
+                && placeholders == 0 && cache->frame_job_units == prepared);
+            clock += 999999u;
+            CHECK(!browser_engine_render_placeholder_frame(engine, &placeholders));
+        }
+        if (lane == 0) clock++;
+        else if (lane == 1) CHECK(browser_engine_focus_move(engine, true));
+        else if (lane == 2) CHECK(browser_engine_scroll_by(engine, 40));
+        else if (lane == 5) clock = 999999u;
+        if (lane != 3) {
+            CHECK(browser_engine_render_placeholder_frame(engine, &placeholders)
+                && placeholders != 0);
+        }
+        BrowserRenderJobStatus status = BROWSER_RENDER_JOB_PENDING;
+        for (unsigned pump = 0; pump < 256 && status == BROWSER_RENDER_JOB_PENDING; pump++)
+            status = browser_engine_render_frame_bounded(engine, 10000, 2);
+        CHECK(status == BROWSER_RENDER_JOB_COMPLETE && cache->placeholder_tiles == 0);
+        uint64_t hash = frame_checksum(browser_engine_framebuffer(engine, NULL),
+            (size_t) device.framebuffer_width * device.framebuffer_height);
+        CHECK(browser_engine_render_frame(engine, NULL)
+            && hash == frame_checksum(browser_engine_framebuffer(engine, NULL),
+                (size_t) device.framebuffer_width * device.framebuffer_height));
+        CHECK(browser_engine_shutdown(engine));
+        BrowserEngineMetrics memory;
+        CHECK(browser_engine_metrics(engine, &memory) && memory.budget_current == 0);
+        browser_engine_destroy(engine);
+        tilefinch_platform_set_services(NULL);
+    }
+    return 0;
 }
 
 static int test_youtube_library_actions(void)

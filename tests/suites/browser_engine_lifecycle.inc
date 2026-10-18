@@ -1,3 +1,80 @@
+static int test_empty_native_document(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = true;
+    char error[256] = {0};
+    uint64_t empty_pixels = 0;
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+        CHECK(engine != NULL);
+        const NavigationSession *navigation = browser_engine_navigation_view(engine);
+        CHECK(navigation != NULL && navigation->document_scripts_enabled
+              && navigation->external_resources_enabled && navigation->web_fonts_enabled);
+        if (attempt == 1) {
+            browser_engine_test_refuse_next_render_shell_init();
+            CHECK(!browser_engine_commit_empty_document(engine, TILEFINCH_HOMEPAGE_URL, true));
+        } else if (attempt == 2) {
+            budget_inject_failure_after(browser_engine_budget(engine), 0);
+            CHECK(!browser_engine_commit_empty_document(engine, TILEFINCH_HOMEPAGE_URL, true));
+            budget_clear_failure_injection(browser_engine_budget(engine));
+        }
+        CHECK(navigation->document_scripts_enabled
+              && navigation->external_resources_enabled && navigation->web_fonts_enabled);
+        CHECK(browser_engine_commit_empty_document(engine, TILEFINCH_HOMEPAGE_URL, true));
+        CHECK(navigation->page.loaded && navigation->page.runtime == NULL
+              && navigation->page.resource_scheduler == NULL
+              && navigation->document_scripts_enabled
+              && navigation->external_resources_enabled && navigation->web_fonts_enabled);
+        CHECK(browser_engine_refresh_shell(engine) && browser_engine_render_frame(engine, NULL));
+        size_t count = 0;
+        const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+        CHECK(pixels != NULL && count == 480u * 272u);
+        uint64_t checksum = frame_checksum(pixels, count);
+        if (attempt == 0) empty_pixels = checksum;
+        CHECK(checksum == empty_pixels);
+        /* This startup-only API must never replace an incumbent page. */
+        CHECK(!browser_engine_commit_empty_document(engine, "https://empty.test/", false)
+              && navigation->page.loaded && navigation->page.runtime == NULL);
+        static const char page[] = "<!doctype html><title>Next page</title>"
+            "<a href='/next'>Continue</a><script>globalThis.pocSummary='running'</script>";
+        CHECK(browser_engine_commit_html(engine, "https://empty.test/", page,
+                                        sizeof(page) - 1u, true));
+        CHECK(navigation->page.runtime != NULL && navigation->page.resource_scheduler != NULL
+              && strcmp(navigation->page.script_result.summary, "running") == 0
+              && browser_engine_focus_move(engine, true));
+        CHECK(browser_engine_shutdown(engine));
+        BrowserEngineMetrics metrics = {0};
+        CHECK(browser_engine_metrics(engine, &metrics) && metrics.budget_current == 0
+              && metrics.budget_active_allocations == 0);
+        browser_engine_destroy(engine);
+    }
+    /* Compare the exact old backing markup through the ordinary commit path. */
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    config.resources.enabled = false;
+    config.resources.web_fonts_enabled = false;
+    BrowserEngine *control = browser_engine_create(&config, error, sizeof(error));
+    static const char old_html[] = "<!doctype html><meta name=viewport "
+        "content=\"width=device-width,initial-scale=1\"><title>Tilefinch</title>"
+        "<style>html,body{margin:0;background:#100e0d}</style>";
+    CHECK(control != NULL);
+    CHECK(browser_engine_commit_html(control, TILEFINCH_HOMEPAGE_URL,
+          old_html, sizeof(old_html) - 1u, true));
+    CHECK(browser_engine_render_frame(control, NULL));
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(control, &count);
+    CHECK(pixels != NULL && frame_checksum(pixels, count) == empty_pixels);
+    CHECK(browser_engine_shutdown(control));
+    browser_engine_destroy(control);
+    return 0;
+}
+
 static int test_engine_lifecycle(void)
 {
     BrowserDeviceProfile profile;

@@ -33,6 +33,7 @@ _Static_assert(sizeof(PSP_UI_STATUS_RELOAD_OFFER) - 1u
 #define PSP_UI_MULTILINE_TOAST_CHARACTER_LIMIT 64u
 #define PSP_UI_MENU_ITEM_COUNT 7
 #define PSP_UI_MEDIA_TITLE_CAPACITY 128
+#define PSP_UI_MEDIA_TITLE_BAR_HEIGHT 42
 #define PSP_UI_TAB_LIMIT 5
 #define PSP_UI_TAB_TITLE_CAPACITY 40
 #define PSP_UI_TAB_DOMAIN_CAPACITY 48
@@ -1175,6 +1176,9 @@ void psp_ui_set_chrome_fonts(
    the scale setting's handler calls this before the next frame draws. A
    call from any other thread is ignored. */
 void psp_ui_preload_chrome_scale(unsigned scale);
+/* Owner-only playback warmup: small chrome, regular large controls, and the
+   actual bold failure/chooser labels, not an entire unused bold alphabet. */
+void psp_ui_preload_media_chrome(void);
 /* What the last preload rasterized, for the validation log. */
 typedef struct {
     unsigned glyphs;
@@ -1509,19 +1513,22 @@ void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,
 void psp_ui_media_composite_with_preview(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride);
-/* Shared implementation behind the full and menu-cache layer views. Kept as
+/* Shared implementation behind the full and retained layer views. Kept as
    a named symbol so the PSP gate ratchets the real per-frame compositor rather
-   than either tiny public dispatcher. */
+   than either tiny public dispatcher. Omit the title only when the 8888
+   bridge supplies its exact retained opaque raster. */
 void psp_ui_media_composite_layers(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride,
-    bool include_track_menu);
+    bool include_track_menu, bool include_title);
 /* Internal layer seams used by the 8888 bridge's retained, opaque track-menu
    raster. Ordinary callers should use the complete compositor above. */
 void psp_ui_media_composite_without_track_menu(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride);
 unsigned psp_ui_media_track_menu_height(const PspUiMediaState *media);
+/* Zero while refused/off-owner glyphs still require an ordinary repaint. */
+uint32_t psp_ui_media_raster_generation(void);
 void psp_ui_media_raster_track_menu(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride);
@@ -1588,9 +1595,9 @@ void psp_ui_media_composite_8888(
     uint32_t *pixels, int width, int height, int stride,
     uint16_t *scratch);
 
-/* Optional device accelerator for the retained opaque track-menu raster.
- * `source_changed` is true only when the compact 565 cache was rebuilt, so a
- * physical-memory consumer can write it back once rather than every frame.
+/* Optional device accelerator for opaque UI rasters. Retained menus set
+ * `source_changed` only when their cache was rebuilt; moving full-width bars
+ * set it every time. A physical-memory consumer must honor that writeback.
  * The callback must finish writing `destination` before returning true. */
 typedef bool (*PspUiMediaTrackMenuBlit)(
     void *context, const uint16_t *source, int source_width,

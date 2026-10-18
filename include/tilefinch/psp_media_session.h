@@ -132,6 +132,13 @@ typedef struct {
        fill before audio establishes the clock. */
     PspMediaSeekFloor seek_floor;
     PspMediaAudioHold audio_hold;
+    /* The next elapsed interval can straddle a held/playing boundary. An
+       accepted DAC cursor remains authoritative; wall-clock fallback must
+       not bill the preceding paused or preroll work as playback. */
+    bool clock_resume_pending;
+    /* A prepared picture awaiting its audio deadline still owns its source
+       claim. Retry publication before retiring/replacing that picture. */
+    bool presentation_deferred;
     PspMediaStartupPreroll startup;
     bool have_frame;
     /* Physical open service has been requested but has not entered its first
@@ -405,6 +412,9 @@ typedef struct {
     char offline_video_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     char offline_audio_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     PspMediaJobPhase job_phase;
+    /* Opportunistic present/wait feeds must not consume a one-shot codec
+       failure. The ordinary advance owns recovery and drains this message. */
+    char present_error[192];
     uint64_t job_target_us;
     uint64_t job_actual_us;
     uint64_t job_prime_audio_us;
@@ -569,6 +579,10 @@ void psp_media_execute_intent(
 bool psp_media_advance(
     PspMediaSession *media, unsigned elapsed_ms,
     const TilefinchCancellation *cancellation);
+/* Owner-thread receipt after a complete video picture is successfully latched.
+   Ends startup preroll at that boundary, not one loop later. Never call for
+   a loading surface, a refused publication, or a supervisor's old-frame copy. */
+void psp_media_presented(PspMediaSession *media);
 
 /*
  * Feed the decoder while the caller is blocked on something that touches no
@@ -624,13 +638,17 @@ void psp_media_present_texture_release(PspMediaSession *media);
 /*
  * Hand the codec worker something to do while this thread is stopped.
  *
- * Call immediately before the frame's wait for the vertical blank. The worker
- * runs one priority below the browser thread, so it decodes only while this
- * thread is blocked, and only what it already holds -- an idle worker stays
- * idle through the whole wait. One bounded submission attempt, no waiting of
- * any kind, and nothing at all unless an ordinary playing session owns the
- * pipeline. Returns what it managed to submit.
+ * Call after drawing, before overlay composition, and immediately before the
+ * frame's wait for vertical blank. An idle worker cannot use those windows
+ * without a submitted unit. One bounded submission attempt, no codec wait,
+ * and nothing unless an ordinary playing session owns the pipeline. Never
+ * claims or releases a picture. Returns what it managed to submit.
  */
-size_t psp_media_feed_before_blocking(PspMediaSession *media);
+/* prepared_only is required while a queued scanout is waiting to latch:
+   service already-staged bytes, without storage/network reads or growth. */
+size_t psp_media_feed_before_blocking(PspMediaSession *media, bool prepared_only);
+/* Recheck a prepared wide picture against the actual DAC clock. Zero means
+   publication is permitted under the ordinary half-frame due rule. */
+uint64_t psp_media_present_delay_us(const PspMediaSession *media);
 
 #endif

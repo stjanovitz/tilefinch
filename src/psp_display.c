@@ -452,7 +452,8 @@ static void latch_probe(const PspDisplay *display, const void *buffer,
    band through otherwise opaque chrome.  Shared by publish, rearm, and the
    return from the video surface so the three cannot disagree about ordering,
    format, or the sync flag. */
-static int latch_buffer(PspDisplay *display, unsigned index)
+static int latch_buffer(PspDisplay *display, unsigned index,
+    PspDisplayWaitService service, void *context)
 {
     void *buffer = compose_buffer(display, index);
     if (buffer == NULL) return -1;
@@ -464,7 +465,12 @@ static int latch_buffer(PspDisplay *display, unsigned index)
     int result = display->backend->set_frame_buffer(
         buffer, PSP_DISPLAY_STRIDE, surface_format(display),
         PSP_DISPLAY_SYNC_NEXT_FRAME);
-    if (result >= 0 && display->backend->wait_vblank != NULL) {
+    if (result >= 0 && service != NULL
+        && display->backend->wait_vblank_serviced != NULL) {
+        display->backend->wait_vblank_serviced(
+            buffer, PSP_DISPLAY_STRIDE, surface_format(display),
+            service, context);
+    } else if (result >= 0 && display->backend->wait_vblank != NULL) {
         display->backend->wait_vblank();
     }
     return result;
@@ -508,7 +514,7 @@ bool psp_display_video_begin(PspDisplay *display)
     psp_display_content_epoch++;
     if (psp_display_content_epoch == 0u) psp_display_content_epoch = 1u;
     display->surface = PSP_DISPLAY_SURFACE_RGBA8888;
-    int result = latch_buffer(display, video_bridge);
+    int result = latch_buffer(display, video_bridge, NULL, NULL);
     display->presents++;
     if (result < 0) {
         display->rejections++;
@@ -548,7 +554,7 @@ bool psp_display_video_end(PspDisplay *display)
     uint16_t *front = buffer_at(display, front_index);
     if (front != NULL)
         memset(front, 0, PSP_DISPLAY_BUFFER_PIXELS * sizeof(*front));
-    int result = latch_buffer(display, front_index);
+    int result = latch_buffer(display, front_index, NULL, NULL);
     if (result < 0) {
         display->surface_failures++;
         display->last_surface_error = result;
@@ -559,6 +565,12 @@ bool psp_display_video_end(PspDisplay *display)
 
 bool psp_display_publish(PspDisplay *display)
 {
+    return psp_display_publish_serviced(display, NULL, NULL);
+}
+
+bool psp_display_publish_serviced(PspDisplay *display,
+    PspDisplayWaitService service, void *context)
+{
     if (display == NULL || display->backend == NULL
         || display->base == NULL) return false;
 
@@ -568,7 +580,7 @@ bool psp_display_publish(PspDisplay *display)
        look necessary. Publish only a completely composed buffer: waiting for
        the address for the next vblank and waiting until that latch completes
        is what keeps a half-drawn title bar off the panel. */
-    int result = latch_buffer(display, display->back_buffer);
+    int result = latch_buffer(display, display->back_buffer, service, context);
 
     display->presents++;
     if (result < 0) {
@@ -598,7 +610,7 @@ bool psp_display_rearm(PspDisplay *display)
     unsigned front_index = psp_display_video_active(display)
         ? display->back_buffer ^ 1u
         : page_previous_buffer(display->back_buffer);
-    if (result >= 0) result = latch_buffer(display, front_index);
+    if (result >= 0) result = latch_buffer(display, front_index, NULL, NULL);
     if (result < 0) {
         display->rearm_failures++;
         display->last_rearm_error = result;
@@ -678,12 +690,35 @@ static void system_wait_vblank(void)
     sceDisplayWaitVblankStart();
 }
 
+static void system_wait_vblank_serviced(void *buffer, int stride, int format,
+    PspDisplayWaitService service, void *context)
+{
+    /* Observe the actual front, not a guessed vcount deadline: the boundary
+       may pass between queuing and entering this wait. Cached/uncached VRAM
+       aliases describe the same physical scanout address. Never rotate early
+       on a failed query, unsupported address, or exhausted polling bound. */
+    for (unsigned poll = 0; poll < 32u; poll++) {
+        void *front = NULL;
+        int front_stride = 0, front_format = 0;
+        int result = sceDisplayGetFrameBuf(
+            &front, &front_stride, &front_format, 0);
+        if (result < 0) break;
+        if (((uintptr_t) front & UINT32_C(0x1fffffff))
+                == ((uintptr_t) buffer & UINT32_C(0x1fffffff))
+            && front_stride == stride && front_format == format) return;
+        if (service != NULL && (poll & 1u) == 0u) service(context);
+        if (sceKernelDelayThread(500u) < 0) break;
+    }
+    system_wait_vblank();
+}
+
 static const PspDisplayBackend system_backend = {
     .compose_base = system_compose_base,
     .flush_range = system_flush_range,
     .set_mode = system_set_mode,
     .set_frame_buffer = system_set_frame_buffer,
-    .wait_vblank = system_wait_vblank
+    .wait_vblank = system_wait_vblank,
+    .wait_vblank_serviced = system_wait_vblank_serviced
 };
 
 const PspDisplayBackend *psp_display_system_backend(void)

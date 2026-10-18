@@ -48,6 +48,19 @@ typedef struct {
 } FakeDisplay;
 
 static FakeDisplay fake;
+static PspDisplay *serviced_display;
+static unsigned serviced_back, service_calls;
+static bool service_fence_valid;
+
+static void fake_service(void *context)
+{
+    service_calls++;
+    service_fence_valid = service_fence_valid
+        && context == serviced_display
+        && serviced_display->back_buffer == serviced_back
+        && fake.present_event > fake.flush_event
+        && fake.last_sync == PSP_DISPLAY_SYNC_NEXT_FRAME;
+}
 
 static void *fake_compose_base(void)
 {
@@ -99,6 +112,16 @@ static const PspDisplayBackend fake_backend = {
     .wait_vblank = fake_wait_vblank
 };
 
+static void fake_wait_serviced(void *buffer, int stride, int format,
+    PspDisplayWaitService service, void *context)
+{
+    service_fence_valid = service_fence_valid
+        && buffer == fake.last_address && stride == fake.last_stride
+        && format == fake.last_format;
+    for (unsigned at = 0; at < 8u; at++) service(context);
+    fake_wait_vblank();
+}
+
 static bool fake_reset(void)
 {
     free(fake.memory);
@@ -148,6 +171,38 @@ static bool test_publish_uses_next_frame_and_claims_the_mode(void)
 }
 
 /* The defect that hid everything else: a refused present reported success. */
+static bool test_serviced_publication_keeps_rotation_behind_the_latch(void)
+{
+    CHECK(fake_reset());
+    PspDisplayBackend backend = fake_backend;
+    backend.wait_vblank_serviced = fake_wait_serviced;
+    PspDisplay display;
+    CHECK(psp_display_begin(&display, &backend));
+    serviced_display = &display;
+    for (unsigned video = 0; video < 2u; video++) {
+        if (video) CHECK(psp_display_video_begin(&display));
+        service_calls = 0;
+        service_fence_valid = true;
+        serviced_back = display.back_buffer;
+        CHECK(psp_display_publish_serviced(&display, fake_service, &display));
+        CHECK(service_calls == 8u && service_fence_valid);
+        CHECK(display.back_buffer != serviced_back);
+        serviced_back = display.back_buffer;
+        service_calls = 0;
+        fake.present_result = -5;
+        CHECK(!psp_display_publish_serviced(&display, fake_service, &display));
+        CHECK(service_calls == 0 && display.back_buffer == serviced_back);
+        fake.present_result = 0;
+        CHECK(psp_display_publish_serviced(&display, NULL, NULL));
+        CHECK(service_calls == 0);
+        backend.wait_vblank_serviced = NULL;
+        CHECK(psp_display_publish_serviced(&display, fake_service, &display));
+        CHECK(service_calls == 0); /* optional seam: ordinary wait remains */
+        backend.wait_vblank_serviced = fake_wait_serviced;
+    }
+    return true;
+}
+
 static bool test_rejected_present_is_a_failure_not_a_frame(void)
 {
     CHECK(fake_reset());
@@ -652,6 +707,7 @@ static bool test_row_copy_refuses_invalid_or_overlapping_bands(void)
 int main(void)
 {
     bool ok = test_row_copy_preserves_pixels_padding_and_display_state()
+        && test_serviced_publication_keeps_rotation_behind_the_latch()
         && test_row_copy_refuses_invalid_or_overlapping_bands()
         && test_cursor_cadence_excludes_idle_but_not_slow_motion()
         && test_publish_uses_next_frame_and_claims_the_mode()

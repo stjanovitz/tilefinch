@@ -228,6 +228,8 @@ struct BrowserEngine {
     bool autofocus_pending;
     size_t render_relayout_generation;
     uint64_t render_shell_serial;
+    uint64_t initial_tile_hold_started_us;
+    bool initial_tile_hold;
     size_t render_focus_paint_generation;
     size_t unchanged_runtime_frames_suppressed;
     PageFindIndex find;
@@ -1242,6 +1244,19 @@ static void browser_engine_reset_provisional_viewport(BrowserEngine *engine)
     engine->navigation.provisional_reader_y = 0;
 }
 
+static void browser_engine_begin_initial_tile_hold(BrowserEngine *engine)
+{
+    /* Give the native provider up to one second to finish its cold screen,
+       retaining the previous pixels instead of flashing an initial
+       checkerboard. This never delays raster work or input. */
+    engine->initial_tile_hold = engine->render_ready
+        && engine->render.frames_rendered == 0
+        && youtube_lite_route(engine->navigation.page.document_url)
+               == YOUTUBE_LITE_ROUTE_HOME;
+    engine->initial_tile_hold_started_us = engine->initial_tile_hold
+        ? tilefinch_platform_monotonic_time_us() : 0;
+}
+
 static bool browser_engine_initialize_render_shell(
     BrowserEngine *engine, const char *diagnostic_name,
     const char *failure_message)
@@ -1273,6 +1288,7 @@ static bool browser_engine_initialize_render_shell(
     }
     engine->render_ready = true;
     engine->render_shell_serial++;
+    browser_engine_begin_initial_tile_hold(engine);
     engine->render_relayout_generation =
         engine->navigation.incremental_relayouts;
     engine->render_focus_paint_generation =
@@ -1493,6 +1509,7 @@ static void browser_engine_commit_candidate_shell(void *opaque)
     }
     engine->render_ready = engine->candidate_render_ready;
     engine->render_shell_serial++;
+    browser_engine_begin_initial_tile_hold(engine);
     engine->render_relayout_generation =
         engine->navigation.incremental_relayouts;
     engine->render_focus_paint_generation =
@@ -4910,12 +4927,19 @@ typedef struct {
     const char *html;
     size_t html_length;
     bool record_history;
+    bool static_local;
 } BrowserEngineHtmlLoad;
 
 static bool browser_engine_do_commit(BrowserEngine *engine,
                                      uint64_t generation, void *opaque)
 {
     const BrowserEngineHtmlLoad *load = opaque;
+    if (load->static_local)
+        return navigation_commit_static_html(
+            &engine->navigation, generation, load->url, load->html,
+            load->html_length, engine->config.device.navigation_viewport_width,
+            engine->fonts_ready ? &engine->fonts : NULL, NULL,
+            load->record_history);
     return navigation_commit_html(
         &engine->navigation, generation, load->url, load->html,
         load->html_length, engine->config.device.navigation_viewport_width,
@@ -4943,6 +4967,42 @@ bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
     return browser_engine_run_load(
         engine, browser_engine_do_commit, &load, TILEFINCH_SUBSYSTEM_PARSER,
         TILEFINCH_DIAGNOSTIC_PARSE_FAILED);
+}
+
+bool browser_engine_commit_empty_document(BrowserEngine *engine,
+                                          const char *url, bool record_history)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || engine->navigation.page.loaded
+        || url == NULL || url[0] == '\0') return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+            "empty-document", "an empty document requires a fresh engine");
+    static const char html[] =
+        "<!doctype html><meta name=viewport "
+        "content=\"width=device-width,initial-scale=1\">"
+        "<title>Tilefinch</title>"
+        "<style>html,body{margin:0;background:#100e0d}</style>";
+    BrowserEngineHtmlLoad load = {
+        .url = url, .html = html, .html_length = sizeof(html) - 1u,
+        .record_history = record_history, .static_local = true
+    };
+    NavigationSession *navigation = &engine->navigation;
+    bool scripts = navigation->document_scripts_enabled;
+    bool resources = navigation->external_resources_enabled;
+    bool fonts = navigation->web_fonts_enabled;
+    /* The native surface owns all visible content. Its empty backing graph
+       needs no curl pool/worker/CA setup. Restore all three policies even on
+       refusal, so this optimization never disables the first real page. */
+    navigation->document_scripts_enabled = false;
+    navigation->external_resources_enabled = false;
+    navigation->web_fonts_enabled = false;
+    bool loaded = browser_engine_run_load(
+        engine, browser_engine_do_commit, &load, TILEFINCH_SUBSYSTEM_PARSER,
+        TILEFINCH_DIAGNOSTIC_PARSE_FAILED);
+    navigation->document_scripts_enabled = scripts;
+    navigation->external_resources_enabled = resources;
+    navigation->web_fonts_enabled = fonts;
+    return loaded;
 }
 
 bool browser_engine_commit_history_html(BrowserEngine *engine, const char *url,
@@ -5278,6 +5338,9 @@ static bool browser_engine_finish_input(BrowserEngine *engine,
     if (!succeeded) {
         return false;
     }
+    /* Explicit focus/scroll/pointer actions retain immediate feedback, even
+       during the provider's short automatic first-paint coalescing window. */
+    engine->initial_tile_hold = false;
     if (engine->render_ready
         && engine->render_relayout_generation
                != engine->navigation.incremental_relayouts
@@ -6461,6 +6524,16 @@ bool browser_engine_render_placeholder_frame(BrowserEngine *engine,
     if (placeholders != NULL) *placeholders = 0;
     if (engine == NULL || !engine->render_ready
         || !engine->navigation.page.loaded) return false;
+    if (engine->initial_tile_hold) {
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        const NavigationEntry *entry = navigation_current(&engine->navigation);
+        if (entry != NULL && entry->scroll_y == 0
+            && !engine->render.presented_scroll_valid
+            && now >= engine->initial_tile_hold_started_us
+            && now - engine->initial_tile_hold_started_us < UINT64_C(1000000))
+            return false;
+        engine->initial_tile_hold = false;
+    }
     engine->render.placeholder_missing = true;
     bool rendered = browser_engine_render_frame(engine, NULL);
     engine->render.placeholder_missing = false;

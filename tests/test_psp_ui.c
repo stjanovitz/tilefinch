@@ -73,9 +73,9 @@ static bool test_page_activation_activity(void)
           && !ui.loading && ui.page_activation_busy);
     psp_ui_composite(&ui, busy, WIDTH, HEIGHT, WIDTH);
     CHECK(memcmp(normal, busy, sizeof(normal)) != 0);
-    /* Activity changes only the top two rows, never page pixels beneath it. */
-    CHECK(memcmp(normal + 2 * WIDTH, busy + 2 * WIDTH,
-                 sizeof(normal) - 2 * WIDTH * sizeof(uint16_t)) == 0);
+    /* Activity uses the same three-row strip, never page pixels beneath it. */
+    CHECK(memcmp(normal + 3 * WIDTH, busy + 3 * WIDTH,
+                 sizeof(normal) - 3 * WIDTH * sizeof(uint16_t)) == 0);
     CHECK(psp_ui_set_page_activation(&ui, false));
     memset(busy, 0, sizeof(busy));
     psp_ui_composite(&ui, busy, WIDTH, HEIGHT, WIDTH);
@@ -160,16 +160,24 @@ static bool test_every_interface_language_fits_the_ui_state(void)
     return true;
 }
 
-/* The completion line is a dithered accent ramp: pixel x carries weight
+/* The single loading strip is a dithered accent ramp: pixel x carries weight
    x*16/width between the two accent ends, offset by the ordered matrix. */
 static bool test_loading_progress_ramp_pixels(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
     static uint16_t pixels[WIDTH * HEIGHT];
-    static const unsigned bayer_row0[4] = {0u, 8u, 2u, 10u};
+    static const unsigned bayer_row2[4] = {3u, 11u, 1u, 9u};
     PspUiState ui;
     psp_ui_init(&ui);
     ui.toast_frames = 0;
+    static uint16_t other[WIDTH * HEIGHT];
+    psp_ui_set_loading(&ui, true, 650);
+    ui.chrome_visible = false;
+    ui.loading_phase = 30;
+    psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+    ui.loading_phase = 100;
+    psp_ui_composite(&ui, other, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(pixels, other, 3u * WIDTH * sizeof(*pixels)) == 0);
     psp_ui_set_loading(&ui, true, 1000);
     ui.chrome_visible = false;
     psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
@@ -184,7 +192,7 @@ static bool test_loading_progress_ramp_pixels(void)
     unsigned tb = tilefinch_rgb565_blue_code(to);
     for (unsigned x = 0; x < WIDTH; x++) {
         unsigned weight = x * 16u / WIDTH;
-        unsigned threshold = bayer_row0[x & 3u];
+        unsigned threshold = bayer_row2[x & 3u];
         unsigned red = (tr * weight + fr * (16u - weight) + threshold) / 16u;
         unsigned green =
             (tg * weight + fg * (16u - weight) + threshold) / 16u;
@@ -194,6 +202,31 @@ static bool test_loading_progress_ramp_pixels(void)
         if (blue > 31u) blue = 31u;
         uint16_t expected = tilefinch_rgb565_pack_codes(red, green, blue);
         CHECK(pixels[2 * WIDTH + x] == expected);
+    }
+    for (unsigned chrome = 0; chrome < 2; chrome++) {
+        unsigned top = chrome ? 39u : 0u;
+        psp_ui_set_loading(&ui, false, 1000);
+        psp_ui_set_loading(&ui, true, 650);
+        ui.chrome_visible = chrome != 0;
+        ui.loading_phase = 30;
+        memset(pixels, 0, sizeof(pixels));
+        psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+        ui.loading_phase = 100;
+        memset(other, 0, sizeof(other));
+        psp_ui_composite(&ui, other, WIDTH, HEIGHT, WIDTH);
+        CHECK(memcmp(pixels + top * WIDTH, other + top * WIDTH,
+                     3u * WIDTH * sizeof(*pixels)) == 0);
+        psp_ui_set_loading(&ui, false, 1000);
+        psp_ui_set_loading(&ui, true, -1);
+        ui.chrome_visible = chrome != 0;
+        ui.loading_phase = 30;
+        memset(pixels, 0, sizeof(pixels));
+        psp_ui_composite(&ui, pixels, WIDTH, HEIGHT, WIDTH);
+        ui.loading_phase = 100;
+        memset(other, 0, sizeof(other));
+        psp_ui_composite(&ui, other, WIDTH, HEIGHT, WIDTH);
+        CHECK(memcmp(pixels + top * WIDTH, other + top * WIDTH,
+                     3u * WIDTH * sizeof(*pixels)) != 0);
     }
     return true;
 }
@@ -6429,6 +6462,124 @@ static bool test_chrome_font_cache_binding_and_refusals(void)
     return true;
 }
 
+static bool test_media_chrome_warmup_avoids_unused_weight(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t control[5][W * H], candidate[W * H];
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    size_t counts[2] = {0};
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_set(&media, true, true, false, 10000000u, 60000000u,
+                     "Video playback fixture");
+    for (unsigned lane = 0; lane < 2; lane++) {
+        psp_ui_clear_chrome_font();
+        psp_ui_set_chrome_fonts(face, NULL, 1u);
+        size_t before = budget.allocation_count;
+        if (lane == 0) psp_ui_preload_chrome_scale(2u);
+        else psp_ui_preload_media_chrome();
+        counts[lane] = budget.allocation_count - before;
+        size_t warmed = budget.allocation_count;
+        for (unsigned scene = 0; scene < 5; scene++) {
+            PspUiMediaState shown = media;
+            PspUiMediaPresentation presentation;
+            if (scene == 1) {
+                psp_ui_media_set_resolving(&shown, "Video playback fixture");
+                psp_ui_media_set_resolving_progress(&shown, "Loading...", 100u);
+            } else if (scene == 2) {
+                psp_ui_media_set_error(&shown, "Video unavailable");
+            } else if (scene >= 3) {
+                psp_ui_media_bind_presentation(&shown, &presentation);
+                presentation.track_menu_open = true;
+                presentation.track_menu_tab = scene - 3;
+                presentation.audio_track_count = presentation.subtitle_track_count = 6;
+                for (unsigned at = 0; at < 6; at++) {
+                    snprintf(presentation.audio_tracks[at].label,
+                        sizeof(presentation.audio_tracks[at].label), "Audio track %u", at);
+                    snprintf(presentation.subtitle_tracks[at].label,
+                        sizeof(presentation.subtitle_tracks[at].label), "Subtitle track %u", at);
+                }
+            }
+            uint16_t *pixels = lane == 0 ? control[scene] : candidate;
+            memset(pixels, 0, sizeof(candidate));
+            psp_ui_media_composite(&shown, pixels, W, H, W);
+            CHECK(budget.allocation_count == warmed);
+            if (lane != 0)
+                CHECK(memcmp(control[scene], candidate, sizeof(candidate)) == 0);
+        }
+        /* Repeated opening must not add work, and retaining the regular
+           glyphs must not silently change the title/timeline/hint pixels. */
+        if (lane != 0) {
+            psp_ui_preload_media_chrome();
+            CHECK(budget.allocation_count == warmed);
+        }
+    }
+    CHECK(counts[1] * 3u < counts[0] * 2u);
+    /* Refusal is normal and retryable; teardown returns every cached byte. */
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(face, NULL, 1u);
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    psp_ui_preload_media_chrome();
+    budget.limit = limit;
+    psp_ui_preload_media_chrome();
+    memset(candidate, 0, sizeof(candidate));
+    psp_ui_media_composite(&media, candidate, W, H, W);
+    CHECK(memcmp(control[0], candidate, sizeof(candidate)) == 0);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    return true;
+}
+
+static bool test_media_control_ground_exact_colors(void)
+{
+    enum { W = 480, H = 272, S = 512 };
+    static uint16_t pixels[S * H];
+    PspUiMediaState media;
+    PspUiMediaPresentation p;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &p);
+    psp_ui_media_set_resolving(&media, "Video");
+    for (unsigned theme = 0; theme < BROWSER_CHROME_THEME_CUSTOM; theme++) {
+        psp_ui_theme_select((BrowserChromeTheme) theme);
+        const PspUiThemePalette *palette = psp_ui_theme_active_palette;
+        unsigned r = (tilefinch_rgb565_red_code(palette->hint_bar) * 6u
+            + tilefinch_rgb565_red_code(palette->chrome_bar) * 2u) / 8u;
+        unsigned g = (tilefinch_rgb565_green_code(palette->hint_bar) * 6u
+            + tilefinch_rgb565_green_code(palette->chrome_bar) * 2u) / 8u;
+        unsigned b = (tilefinch_rgb565_blue_code(palette->hint_bar) * 6u
+            + tilefinch_rgb565_blue_code(palette->chrome_bar) * 2u) / 8u;
+        uint16_t hint = tilefinch_rgb565_pack_codes(r, g, b);
+        for (unsigned rotate = 0; rotate < 2; rotate++) {
+            p.rotation_available = p.rotation_suggested = rotate != 0;
+            for (unsigned chapters = 0; chapters < 2; chapters++) {
+                p.chapter_count = chapters;
+                media.duration_us = chapters ? 60000000u : 0;
+                for (unsigned i = 0; i < S * H; i++) pixels[i] = 0x1234;
+                psp_ui_media_composite_controls(&media, pixels, W, H, S);
+                int offset = rotate ? 0 : 16;
+                int top = H - (78 + (chapters ? 12 : 0) - offset);
+                int hint_top = H - 38 + offset;
+                for (int y = 0; y < H; y++) {
+                    for (int x = 0; x < S; x++) {
+                        uint16_t expected = x >= W || y < top ? 0x1234
+                            : y < hint_top ? palette->chrome_bar : hint;
+                        CHECK(pixels[y * S + x] == expected);
+                    }
+                }
+            }
+        }
+    }
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
+    return true;
+}
+
 static bool test_media_clockwise_controls_and_pixels(void)
 {
     enum { WIDTH = 480, HEIGHT = 272, STRIDE = 512 };
@@ -6852,6 +7003,111 @@ static bool test_menu_cache_only_tracks_visible_catalogs(void)
     return true;
 }
 
+typedef struct { unsigned calls, refusal; bool valid; } OpaqueBarProbe;
+
+static bool test_opaque_bar_blit(void *context, const uint16_t *source,
+    int source_width, int source_height, int source_stride, bool source_changed,
+    uint32_t *destination, int destination_stride, int left, int top)
+{
+    OpaqueBarProbe *probe = context;
+    probe->calls++;
+    probe->valid &= source_width == 480 && left == 0 && source_changed
+        && source_height > 0 && source_height <= 272 && top >= 0
+        && source_height <= 272 - top;
+    if (probe->refusal == 1 || (probe->refusal == 2 && probe->calls % 2)) {
+        /* A failed device draw may have touched its rows. Scalar fallback
+           must replace the entire requested rectangle, not leave a tear. */
+        for (int y = 0; y < source_height; y++)
+            memset(destination + (size_t) (top + y) * destination_stride + left,
+                   0x91, (size_t) source_width * sizeof(*destination));
+        return false;
+    }
+    return test_menu_blit(NULL, source, source_width, source_height,
+        source_stride, source_changed, destination, destination_stride, left, top);
+}
+
+static bool test_opaque_video_bars_match_scalar(void)
+{
+    enum { W = 480, H = 272, S = 512, GUARD = 16, N = S * H + 2 * GUARD };
+    static uint32_t reference[N], accelerated[N];
+    static uint16_t scratch_a[S * H], scratch_b[S * H];
+    for (unsigned flags = 0; flags < 64; flags++) {
+        PspUiMediaState media; PspUiMediaPresentation p = {0};
+        psp_ui_media_init(&media); media.presentation = &p;
+        psp_ui_media_set(&media, true, true, false, 12345000, 60000000, "Playback controls");
+        media.controls_visible = !(flags & 1);
+        p.clockwise = !!(flags & 2); media.buffering = !!(flags & 4);
+        media.failed = !!(flags & 8); media.resolving = !!(flags & 16);
+        if (flags & 32) psp_ui_media_set_subtitle(&media, "A caption over moving video");
+        for (unsigned refusal = 0; refusal < 3; refusal++) {
+            OpaqueBarProbe probe = {0, refusal, true};
+            uint32_t rng = flags + 7u;
+            for (size_t at = 0; at < N; at++) {
+                rng = rng * UINT32_C(1664525) + UINT32_C(1013904223);
+                reference[at] = accelerated[at] = rng;
+            }
+            memset(scratch_a, 0x5a, sizeof(scratch_a));
+            memset(scratch_b, 0xa5, sizeof(scratch_b));
+            psp_ui_media_composite_8888(&media, NULL, reference + GUARD,
+                W, H, S, scratch_a);
+            psp_ui_media_composite_8888_cached(&media, NULL, accelerated + GUARD,
+                W, H, S, scratch_b, NULL, 0, 0, NULL, test_opaque_bar_blit, &probe);
+            CHECK(probe.valid && memcmp(reference, accelerated, sizeof(reference)) == 0);
+            if (media.controls_visible && !p.clockwise) CHECK(probe.calls > 0);
+            else CHECK(probe.calls == 0);
+        }
+    }
+    return true;
+}
+
+static bool test_title_reuses_the_opaque_menu_storage(void)
+{
+    enum { W = 480, H = 272, S = 512, GUARD = 16, N = S * H + 2 * GUARD };
+    static uint32_t reference[N], accelerated[N];
+    static uint16_t scratch_a[S * H], scratch_b[S * H];
+    static uint16_t retained[PSP_UI_MEDIA_TRACK_MENU_WIDTH * PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT];
+    PspUiMediaState media; PspUiMediaPresentation p = {0};
+    psp_ui_media_init(&media); media.presentation = &p;
+    psp_ui_media_set(&media, true, true, false, 12345000, 60000000, "Retained playback title");
+    PspUiMediaTrackMenuCache cache = {0};
+    uint32_t signature = 0;
+    for (unsigned pass = 0; pass < 14; pass++) {
+        uint32_t epoch = pass >= 3 ? 2 : 1;
+        if (pass == 2) strcpy(media.title, "A changed playback title");
+        if (pass == 4) { p.track_menu_open = true; p.audio_track_count = 1; }
+        if (pass == 5) p.track_menu_open = false;
+        if (pass == 6) p.clockwise = true;
+        if (pass == 7) p.clockwise = false;
+        if (pass == 8) media.controls_visible = false;
+        if (pass == 9) media.controls_visible = true;
+        if (pass == 10) psp_ui_media_set_seek_preview(&media, 14000000);
+        if (pass == 11) psp_ui_media_cancel_seek_preview(&media);
+        if (pass == 12) psp_ui_clear_chrome_font();
+        for (unsigned refusal = 0; refusal < 3; refusal++) {
+            OpaqueBarProbe probe = {0, refusal, true};
+            uint32_t rng = pass + refusal + 7;
+            for (size_t at = 0; at < N; at++) {
+                rng = rng * UINT32_C(1664525) + UINT32_C(1013904223);
+                reference[at] = accelerated[at] = rng;
+            }
+            memset(scratch_a, 0x5a, sizeof(scratch_a));
+            memset(scratch_b, 0xa5, sizeof(scratch_b));
+            psp_ui_media_composite_8888(&media, NULL, reference + GUARD,
+                W, H, S, scratch_a);
+            psp_ui_media_composite_8888_cached(&media, NULL, accelerated + GUARD,
+                W, H, S, scratch_b, retained, sizeof(retained) / sizeof(*retained),
+                epoch, &cache, test_opaque_bar_blit, &probe);
+            CHECK(memcmp(reference, accelerated, sizeof(reference)) == 0);
+            if (pass < 4 || pass == 5 || pass == 7 || pass == 9 || pass >= 11)
+                CHECK(cache.valid && cache.selection == UINT8_MAX);
+            if (pass == 1) CHECK(cache.signature == signature);
+            if (pass == 12) CHECK(cache.signature != signature);
+        }
+        signature = cache.signature;
+    }
+    return true;
+}
+
 static bool test_menu_feedback_reuses_only_covered_pixels(void)
 {
     PspUiMediaState media; PspUiMediaPresentation p = {0};
@@ -7018,8 +7274,12 @@ static bool test_queue_taller_cache_and_selection(void)
 
 int main(void)
 {
+    if (!test_media_chrome_warmup_avoids_unused_weight()
+        || !test_media_control_ground_exact_colors()) return 1;
     if (!test_queue_square_is_modal()) return 1;
-    if (!test_menu_feedback_reuses_only_covered_pixels()) return 1;
+    if (!test_opaque_video_bars_match_scalar()
+        || !test_title_reuses_the_opaque_menu_storage()
+        || !test_menu_feedback_reuses_only_covered_pixels()) return 1;
     if (!test_track_focus_retains_header_ink()) return 1;
     if (!test_queue_taller_cache_and_selection()) return 1;
     if (!test_menu_cache_only_tracks_visible_catalogs()) return 1;

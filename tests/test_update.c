@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "tilefinch/sha256.h"
+#include "tilefinch/psp_boot_cache.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -769,7 +770,7 @@ static bool file_matches(
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return false;
-    uint8_t buffer[64];
+    uint8_t buffer[512];
     bool ok = expected_length <= sizeof(buffer)
         && fread(buffer, 1, expected_length, file) == expected_length
         && fgetc(file) == EOF
@@ -799,6 +800,13 @@ static bool prepare_inactive_test_slot(const char *root)
         && fclose(file) == 0;
 }
 
+static bool refuse_startup_space(void *context, uint64_t *available)
+{
+    (void)available;
+    (*(unsigned *)context)++;
+    return false;
+}
+
 static int test_installer(void)
 {
     char root[] = "/tmp/tilefinch-update-install.XXXXXX";
@@ -819,7 +827,14 @@ static int test_installer(void)
                  == sizeof(old_eboot) - 1u
           && fclose(file) == 0);
 
-    static const uint8_t eboot[] = "new-eboot";
+    /* A relocatable PBP is still the only executable in the wire package. */
+    static const uint8_t eboot[129] = {
+        0, 'P', 'B', 'P', 0, 0, 1, 0,
+        [8]=40, [12]=40, [16]=40, [20]=40, [24]=40, [28]=40,
+        [32]=40, [36]=128,
+        [40]=0x7f, [41]='E', [42]='L', [43]='F', [44]=1, [45]=1, [46]=1,
+        [56]=0xa0, [57]=0xff, [58]=8
+    };
     static const uint8_t font[] = "new-font";
     uint8_t eboot_hash[32], font_hash[32];
     CHECK(tilefinch_sha256_digest(
@@ -933,11 +948,16 @@ static int test_installer(void)
         .data_dir = data,
         .inactive_slot = TILEFINCH_UPDATE_SLOT_B,
         .current_state = state,
-        .allow_downgrade = true
+        .allow_downgrade = true,
+        .prepare_startup = true
     };
 
     size_t exercised_faults = 0;
-    for (size_t fail_at = 0; fail_at < 64; fail_at++) {
+    for (size_t fail_at = 0; fail_at < 256; fail_at++) {
+        /* A refused optional preparation still completes and deletes its part. */
+        file = fopen(package_path, "wb");
+        CHECK(file != NULL && fwrite(package.bytes, 1, package.length, file) == package.length
+              && fclose(file) == 0);
         cleanup_test_slot(root, "slot-b");
         cleanup_test_slot(root, "slot-b.tmp");
         cleanup_test_slot(root, "slot-b.old");
@@ -963,7 +983,8 @@ static int test_installer(void)
             tilefinch_update_install_create(&fault_budget, &options);
         CHECK(fault_job != NULL);
         TilefinchUpdateInstallSnapshot fault_snapshot = {0};
-        for (size_t pump = 0; pump < 100; pump++) {
+        /* Four-byte units intentionally stress suspension at every boundary. */
+        for (size_t pump = 0; pump < 512; pump++) {
             CHECK(tilefinch_update_install_pump(fault_job, 4));
             CHECK(tilefinch_update_install_snapshot(
                 fault_job, &fault_snapshot));
@@ -974,7 +995,8 @@ static int test_installer(void)
             exercised_faults = fault.operation;
             tilefinch_update_install_destroy(fault_job);
             CHECK(fault_budget.current == 0);
-            break;
+            if (!fault.fired) break;
+            continue; /* Optional cache refusal does not fail the signed update. */
         }
         CHECK(fault.fired
               && fault_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
@@ -1057,7 +1079,7 @@ static int test_installer(void)
     CHECK(tilefinch_update_install_snapshot(
               corrupt_job, &corrupt_snapshot)
           && corrupt_snapshot.phase == TILEFINCH_UPDATE_INSTALL_PREPARING);
-    for (size_t pump = 0; pump < 100; pump++) {
+    for (size_t pump = 0; pump < 512; pump++) {
         CHECK(tilefinch_update_install_pump(corrupt_job, 4));
         CHECK(tilefinch_update_install_snapshot(
             corrupt_job, &corrupt_snapshot));
@@ -1083,13 +1105,25 @@ static int test_installer(void)
     TilefinchUpdateInstallSnapshot snapshot;
     CHECK(tilefinch_update_install_snapshot(job, &snapshot)
           && snapshot.phase == TILEFINCH_UPDATE_INSTALL_PREPARING);
-    for (size_t pump = 0; pump < 100; pump++) {
+    for (size_t pump = 0; pump < 512; pump++) {
         CHECK(tilefinch_update_install_pump(job, 4));
         CHECK(tilefinch_update_install_snapshot(job, &snapshot));
         if (snapshot.phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE) break;
     }
     CHECK(snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE
           && snapshot.files_completed == 2);
+    char startup_cache[256], startup_temporary[256], startup_source[256];
+    snprintf(startup_cache, sizeof(startup_cache), "%s/startup-module.prx", data);
+    snprintf(startup_temporary, sizeof(startup_temporary), "%s/startup-module.tmp", data);
+    snprintf(startup_source, sizeof(startup_source), "%s/slot-b/EBOOT.PBP", root);
+    CHECK(file_matches(startup_cache, eboot + 40, sizeof(eboot) - 41));
+    uint8_t startup_scratch[8192];
+    unsigned startup_space_queries = 0;
+    /* The first launcher use needs no copy, comparison or free-space query. */
+    CHECK(psp_boot_cache_prepare(startup_source, startup_cache, startup_temporary,
+        startup_scratch, sizeof(startup_scratch), refuse_startup_space, NULL,
+        &startup_space_queries) == PSP_BOOT_CACHE_REUSED);
+    CHECK(startup_space_queries == 0);
     /* A completed install reclaims its own download instead of stranding up
        to 32 MB on the stick until the next one. */
     file = fopen(package_path, "rb");
@@ -1177,7 +1211,7 @@ static int test_installer(void)
     budget_init(&budget, 1024 * 1024);
     job = tilefinch_update_install_create(&budget, &options);
     CHECK(job != NULL);
-    for (size_t pump = 0; pump < 100; pump++) {
+    for (size_t pump = 0; pump < 512; pump++) {
         CHECK(tilefinch_update_install_pump(job, 4));
         CHECK(tilefinch_update_install_snapshot(job, &snapshot));
         if (snapshot.phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE) break;
@@ -1221,6 +1255,7 @@ static int test_installer(void)
     rmdir(cleanup);
     remove(active_eboot);
     rmdir(active_slot);
+    psp_boot_cache_discard(data);
     rmdir(data);
     CHECK(rmdir(root) == 0);
     return 0;

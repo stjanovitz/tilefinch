@@ -514,9 +514,12 @@ static void psp_media_present_continuation(PspMediaSession *media)
 
 static void psp_media_apply_active_projection(PspMediaSession *media)
 {
-    if (media == NULL
-        || !psp_media_projection_managed_state(media->machine.state))
-        return;
+    if (media == NULL) return;
+    if ((media->machine.state != PSP_MEDIA_SESSION_PLAYING
+         && media->machine.state != PSP_MEDIA_SESSION_PAUSED)
+        || media->machine.preview_active)
+        media->presentation_deferred = false;
+    if (!psp_media_projection_managed_state(media->machine.state)) return;
     PspMediaUiProjection projection =
         psp_media_machine_project_ui(&media->machine);
     psp_ui_media_apply_projection(&media->ui, &projection);
@@ -740,6 +743,24 @@ static void psp_media_complete_priming_if_ready(
         psp_media_release_presentation_preroll(media);
 }
 
+void psp_media_presented(PspMediaSession *media)
+{
+    if (media == NULL || media->playback == NULL || !media->ui.visible
+        || !media->have_frame) return;
+    media->presentation_deferred = false;
+    if (!psp_media_startup_claimed(&media->startup)) return;
+    psp_media_startup_publish(&media->startup);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (!media->startup_trace_presented_seen
+        && media->startup_trace_opened_us != 0) {
+        media->startup_trace_presented_seen = true;
+        media->startup_trace_presented_elapsed_us =
+            psp_media_now_us(media) - media->startup_trace_opened_us;
+    }
+#endif
+    psp_media_complete_priming_if_ready(media, "startup-published");
+}
+
 /*
  * Lifecycle service completion may be synchronous (for example, a module
  * preparation refusal) even though the controller itself is single-flight.
@@ -810,6 +831,7 @@ static void psp_media_apply_audio_hold(PspMediaSession *media)
             media->playback, blocked))
         return;
     media->audio_hold.applied = blocked;
+    media->clock_resume_pending = !blocked;
 }
 
 bool psp_media_begin_startup_preroll(PspMediaSession *media)
@@ -1040,6 +1062,7 @@ bool psp_media_backend_stats_snapshot(
 void psp_media_pipeline_destroy(PspMediaSession *media)
 {
     if (media == NULL) return;
+    media->presentation_deferred = false;
     psp_media_buffering_end(media, psp_media_now_us(media));
     youtube_resolve_job_destroy(media->resolver_job);
     media->resolver_job = NULL;
@@ -1178,6 +1201,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media_file_range_close(media->file_range);
     media_file_range_close(media->audio_file_range);
     media->playback = NULL;
+    media->present_error[0] = '\0';
     media->hls = NULL;
     media->hls_source = (MediaSampleSource) {0};
     media->hls_audio_source = (MediaSampleSource) {0};
@@ -2938,17 +2962,22 @@ bool psp_media_advance(
        machine describes reality. */
     if (psp_media_pump_dma_quarantine(media)) return true;
     /*
-     * No claim on the decoded surface outlives the present that made it. A
+     * An audio-deadline deferral keeps its claim until publication and asks
+     * for another present without replacing the pending picture. Otherwise a
+     * claim on the decoded surface ends after the present that made it. A
      * present that failed after the engine had the rows -- the list refused,
      * the sync refused -- leaves its claim standing on purpose: the software
      * scaler the caller falls back to reads the same surface. This is where
      * that ends, one frame later, so a lost release can cost a frame of
      * decoder latency and never the session.
      */
-    psp_media_present_release_claimed_surface(media);
-    psp_media_present_emit_after_release(media);
-    bool changed = !tilefinch_cancellation_requested(cancellation)
-        && psp_media_playlist_tick(media);
+    if (!media->presentation_deferred) {
+        psp_media_present_release_claimed_surface(media);
+        psp_media_present_emit_after_release(media);
+    }
+    bool changed = media->presentation_deferred
+        || (!tilefinch_cancellation_requested(cancellation)
+            && psp_media_playlist_tick(media));
     uint64_t advance_started_us = psp_media_now_us(media);
     /* A closed player may retain a complete paused pipeline for an immediate
        replay, and an internal provider view may temporarily hide one. Neither
@@ -3083,6 +3112,10 @@ bool psp_media_advance(
         && !media->machine.preview_active
         && !media->audio_hold.applied) {
         uint64_t elapsed_us = (uint64_t) elapsed_ms * 1000u;
+        if (media->clock_resume_pending) {
+            elapsed_us = 0;
+            media->clock_resume_pending = false;
+        }
         /* The DAC is the stable clock for an A/V stream. Its cursor is based
            on blocks actually accepted by the output worker, not on decode
            head or queued PCM. Before its first accepted block there is no
@@ -3135,11 +3168,17 @@ bool psp_media_advance(
     /* Telemetry only: which part of the frame a conversion completing on the
        codec worker landed in. See media_psp_backend_set_loop_phase. */
     media_psp_backend_set_loop_phase(PSP_MEDIA_LOOP_PHASE_PUMP);
-    MediaPlaybackAdvanceResult advance =
-        media_playback_advance_bounded_cancelable(
-        media->playback, decode_clock_us,
-        PSP_MEDIA_JOB_MAXIMUM_PACKETS, cancellation,
-        error, sizeof(error));
+    MediaPlaybackAdvanceResult advance;
+    if (media->present_error[0] != '\0') {
+        snprintf(error, sizeof(error), "%s", media->present_error);
+        media->present_error[0] = '\0';
+        advance = MEDIA_PLAYBACK_ADVANCE_ERROR;
+    } else {
+        advance = media_playback_advance_bounded_cancelable(
+            media->playback, decode_clock_us,
+            PSP_MEDIA_JOB_MAXIMUM_PACKETS, cancellation,
+            error, sizeof(error));
+    }
     /*
      * Keep draining the ladder while the slice lasts. The budget is checked
      * before every unit and never inside one, so at most one costly operation
@@ -3329,6 +3368,23 @@ bool psp_media_advance(
        frozen public clock. Decoder admission uses that lead; early/late frame
        decisions below must not. */
     uint64_t take_clock_us = media->clock_us;
+    /* Wide firmware pictures need two synchronous GE strips before scanout.
+       Prepare within one extra display interval, but leave the public/DAC
+       clock untouched. The final publication fence rechecks the ordinary
+       half-frame due rule after this work, including the software fallback. */
+    uint64_t audio_prepare_us = 0;
+    if (media->have_frame && media->ui.playing
+        && media->frame.width > PSP_MEDIA_MPEG_DECODE_WIDTH
+        && !media->audio_hold.applied
+        && !psp_media_startup_active(&media->startup)
+        && !media->seek_floor.armed
+        && media_playback_audio_cursor_us(media->playback, &audio_prepare_us)) {
+        uint64_t lead_us = media->frame.duration_us / 2u;
+        if (lead_us > PSP_MEDIA_PREPARATION_WINDOW_US)
+            lead_us = PSP_MEDIA_PREPARATION_WINDOW_US;
+        take_clock_us = lead_us > UINT64_MAX - take_clock_us
+            ? UINT64_MAX : take_clock_us + lead_us;
+    }
     if (psp_media_startup_filling(&media->startup)) {
         uint64_t first_ready_us = 0;
         if (media_playback_ready_video_start_us(
@@ -3387,7 +3443,8 @@ bool psp_media_advance(
             startup_claim_allowed = true;
         }
     }
-    if (!psp_media_startup_active(&media->startup) || startup_claim_allowed)
+    if (!media->presentation_deferred
+        && (!psp_media_startup_active(&media->startup) || startup_claim_allowed))
         received_frame =
             media_playback_take_video_frame(media->playback, &frame);
     frame_progress = frame_progress || received_frame;

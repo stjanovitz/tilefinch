@@ -21,6 +21,70 @@ reach its health checkpoint. Holding L during startup selects the previous
 version. The user's profile, bookmarks, downloads, and other shared data live
 outside both browser slots.
 
+### Startup compatibility
+
+Browser slots remain ordinary `EBOOT.PBP` packages with the 64 MB memory-mode
+metadata and the existing protocol-1 file list. Older installed launchers can
+therefore continue receiving the same signed updates; a separate legacy feed
+is not required. The in-app updater never overwrites the stable root launcher.
+Getting a newer launcher's startup improvements requires copying the root
+`EBOOT.PBP` from a verified install archive once, preserving both slots and
+`data/`. Updating only the browser does not silently upgrade the launcher.
+
+A newer launcher can start the packaged relocatable browser without a second
+firmware restart. Fresh-install archives also include a content-addressed
+`slot-a/startup-<sha256>.prx`, paired at build time with a small identity marker
+in the PBP's auxiliary data. The matching launcher checks the marker, sizes,
+and module headers and loads this installed executable directly, without a
+first-boot extraction or full comparison. Like the root launcher and initial
+EBOOT, this is trusted executable content from the manually installed archive,
+not a new signature authority. The marker prevents accidental build mixing;
+it is not a per-boot content-integrity check. This shortcut is used only before
+a valid update journal exists, for default slot A, never for recovery or trials.
+Missing, mismatched, or safely refused bundled modules retain normal startup.
+A returned bundled-module start failure removes that optional copy before
+ordinary startup, avoiding repeated failed attempts on subsequent boots.
+
+The signed update file list and launcher protocol remain unchanged. Newer
+browser updaters prepare the derived module after slot promotion, before
+reporting ready to restart, using bounded copy/read-back steps and their
+existing I/O buffer. They save the reuse receipt against the final slot path.
+Failure or interruption loses only this optimization; the pending signed
+trial, per-file verification, health period and rollback remain authoritative.
+Older updaters still install exactly the same EBOOT and assets; their next
+launcher boot prepares the module as before. The stable root launcher is never
+silently replaced, and older launchers continue to use ordinary PBP startup.
+
+For journalled slots the launcher derives `data/startup-module.prx` from `DATA.PSP` and
+compares every cached byte against the selected package when creating or
+adopting the copy. A bounded reuse receipt binds the verified copy to the
+selected slot path and both files' sizes and modification/change metadata.
+Normal boots with matching metadata do not reread or hash either executable.
+The cache is not a signed authority or an alternative update slot. Missing,
+static legacy, malformed, read-only, full-card, and failed module-start cases
+retain ordinary package startup. Pre-held L and recovery bypass this cache.
+Signed installation, trial-health, anti-rollback, and candidate per-file
+verification remain unchanged. The receipt is not authenticated: post-check
+corruption or modification preserving metadata is deliberately not detected
+at every boot. A resulting failed launch may require pre-held L recovery.
+
+The cache costs at most 16 MiB on card, plus one equally bounded temporary
+while replacing it, plus a receipt smaller than 1 KiB. A successful reuse
+makes no cache writes; missing/mismatched receipts cause full comparison,
+and detectable changes cause rebuilding and read-back before use. An interrupted temporary
+is never executed. Deleting these derived files is safe; startup recreates
+them if possible or uses the authoritative package. Removing only the receipt
+forces full verification on the next ordinary launch. Slot switches change
+the receipt identity; explicit update downloads remove the copy and receipt.
+Manual replacement preserving size and timestamps can evade this hint;
+delete the derived cache/receipt when installing such a replacement.
+The first start after an older updater changes the browser, or after optional
+preparation fails, can take longer while this copy is prepared; subsequent
+starts reuse it. Older launchers do not prepare it.
+An explicitly approved app download first removes the derived cache so its
+disk usage cannot prevent the ordinary update free-space check from succeeding.
+Background version checks do not remove it.
+
 Stable is the default channel. Stable and Beta accept only releases authorized
 by Tilefinch's embedded public key; the private signing key is never shipped to
 the PSP or stored in this repository. The Developer channel is a separate,

@@ -75,12 +75,18 @@ typedef enum {
  * at a time with no burst, which is slow enough to feel on the d-pad. One
  * writeback per frame costs far less than losing the cache for all of it.
  */
+typedef void (*PspDisplayWaitService)(void *context);
+
 typedef struct {
     void *(*compose_base)(void);
     void (*flush_range)(void *address, size_t bytes);
     int (*set_mode)(int mode, int width, int height);
     int (*set_frame_buffer)(void *address, int stride, int format, int sync);
     void (*wait_vblank)(void);
+    /* Optional owner-only service while waiting for this queued buffer to
+       latch. Must not return until it is safe to reuse the previous front. */
+    void (*wait_vblank_serviced)(void *buffer, int stride, int format,
+                                PspDisplayWaitService service, void *context);
 } PspDisplayBackend;
 
 typedef struct {
@@ -278,6 +284,10 @@ size_t psp_display_video_aux_pixels(const PspDisplay *display);
  * for a successful frame.
  */
 bool psp_display_publish(PspDisplay *display);
+/* Service must be bounded and must not access either scanout buffer or draw
+   with the GE. A backend without the seam keeps the ordinary firmware wait. */
+bool psp_display_publish_serviced(PspDisplay *display,
+    PspDisplayWaitService service, void *context);
 
 /*
  * Reassert the mode and last accepted front buffer after system resume.

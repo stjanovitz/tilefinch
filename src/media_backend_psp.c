@@ -399,6 +399,10 @@ typedef struct {
      */
     _Atomic uint32_t audio_output_blocks;
     _Atomic uint32_t audio_output_starves;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspMediaAudioDelivery audio_delivery;
+    atomic_bool audio_delivery_discontinuity;
+#endif
     atomic_int audio_output_first_status;
     atomic_bool audio_output_reported;
     atomic_int audio_worker_error;
@@ -2693,12 +2697,9 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
         if (!atomic_load(&backend->playing)
             || atomic_load(&backend->buffering)) continue;
         /*
-         * A wake-up with nothing to output is the audible failure mode of a
-         * decoder that cannot keep 43 AAC blocks a second in front of the
-         * hardware: the queue empties, every later block plays alone, and the
-         * user hears silence with clicks in it. Count it here -- the browser
-         * thread cannot see an empty queue it never sampled -- and never log
-         * from this thread.
+         * Count empty READY wake-ups, but do not mistake them for hardware
+         * underruns: queued DAC samples can still cover an empty software
+         * queue. Validation separately measures actual delivery coverage.
          */
         if (atomic_load(&backend->audio_queue_read)
             == atomic_load(&backend->audio_queue_write)) {
@@ -2728,6 +2729,15 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
                     0, memory_order_release);
                 break;
             }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            bool measure_delivery = backend->audio_channel >= 0
+                && backend->audio_delivery.blocks < PSP_MEDIA_AUDIO_DELIVERY_BLOCK_LIMIT;
+            uint32_t delivery_begin = measure_delivery ? psp_media_stamp_us() : 0;
+            int delivery_before = measure_delivery
+                ? sceAudioGetChannelRestLen(backend->audio_channel) : -1;
+            bool delivery_reset = measure_delivery && atomic_exchange_explicit(
+                &backend->audio_delivery_discontinuity, false, memory_order_relaxed);
+#endif
             int status = backend->audio_channel == -2
                 ? sceAudioSRCOutputBlocking(
                     PSP_AUDIO_VOLUME_MAX,
@@ -2735,9 +2745,6 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
                 : sceAudioOutputBlocking(
                     backend->audio_channel, PSP_AUDIO_VOLUME_MAX,
                     psp_media_audio_queue_slot(backend, slot));
-            atomic_store_explicit(
-                &backend->audio_output_in_flight_slot,
-                0, memory_order_release);
             /* Publish the first verdict either way: a refusal is the one
                result the decode-side counters can never express. */
             int expected_first = PSP_MEDIA_AUDIO_OUTPUT_PENDING;
@@ -2749,8 +2756,20 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
                     PSP_MEDIA_AUDIO_WORKER_OUTPUT);
                 backend->audio_worker_error = status;
                 backend->audio_stop = true;
+                atomic_store_explicit(
+                    &backend->audio_output_in_flight_slot,
+                    0, memory_order_release);
                 break;
             }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (measure_delivery) {
+                uint32_t delivery_end = psp_media_stamp_us();
+                int delivery_after = sceAudioGetChannelRestLen(backend->audio_channel);
+                psp_media_audio_delivery_observe(&backend->audio_delivery, generation,
+                    delivery_begin, delivery_end, delivery_before, delivery_after,
+                    backend->audio.sample_rate, delivery_reset);
+            }
+#endif
             atomic_fetch_add(&backend->audio_output_blocks, 1u);
             uint32_t first_output = 0u;
             uint32_t output_us = psp_media_stamp_us();
@@ -2761,6 +2780,12 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
             if (generation
                 == atomic_load(&backend->audio_queue_generation))
                 backend->audio_queue_read++;
+            /* Reset owns the queue after this release. Keep the hardware
+               observation and read-index commit inside the same ownership
+               fence as output, not racing a seek's generation/reset. */
+            atomic_store_explicit(
+                &backend->audio_output_in_flight_slot,
+                0, memory_order_release);
         }
     }
     return 0;
@@ -5343,7 +5368,28 @@ static bool psp_media_allow_submit_bypass(const void *opaque, int track_kind)
     const PspMediaBackend *backend = opaque;
     if (backend == NULL || track_kind != MEDIA_MP4_TRACK_VIDEO
         || !backend->have_audio) return false;
+    /* Both exceptions only offer work that audio submit can accept. Recovery
+       and reset must not speculatively read another source's packet. */
+    if (backend->admissions_closed
+        || atomic_load_explicit(&psp_media_video_refusal_hold, memory_order_acquire)
+        || atomic_load_explicit(&backend->video_refusal_dirty, memory_order_acquire)
+        || psp_media_audio_pending_count(backend) >= PSP_MEDIA_AUDIO_PENDING_SLOTS)
+        return false;
+    /* The usual future-picture exception below prevents a clock/surface
+       deadlock. A second, narrower supply exception protects audible output:
+       a due picture or running video job must not prevent bounded AAC staging
+       while the PCM reserve is low. The normal submit path still owns the
+       shared firmware job, refusal gates, packet limits and cancellation. */
+    if (psp_media_audio_reserve_needs_supply(
+            atomic_load_explicit(&backend->audio_queue_write, memory_order_acquire)
+                - atomic_load_explicit(&backend->audio_queue_read, memory_order_acquire),
+            psp_media_audio_pending_count(backend),
+            atomic_load_explicit(&backend->playing, memory_order_acquire)
+                && !atomic_load_explicit(&backend->buffering, memory_order_acquire)))
+        return true;
     /* Only a future ready picture can hold the surface/clock dependency.
+       Unlike reserve replenishment, this escape must also work while priming
+       or buffering, before the lifecycle machine enables audible output.
        A due picture needs presentation, and an in-flight job needs to finish,
        not to be overtaken by AAC jobs. Inspect, but never release, the slots.
        The browser already samples this queue-capped cursor each pump; do not
@@ -7156,6 +7202,10 @@ static void psp_media_set_playing(void *opaque, bool playing)
     if (backend != NULL) {
         uint64_t ignored = 0;
         (void) psp_media_audio_cursor_us(backend, &ignored);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (!playing) atomic_store_explicit(
+            &backend->audio_delivery_discontinuity, true, memory_order_relaxed);
+#endif
         atomic_store(&backend->playing, playing);
         if (backend->audio_event >= 0) {
             int status = sceKernelSetEventFlag(
@@ -7175,6 +7225,10 @@ static void psp_media_set_buffering(void *opaque, bool buffering)
     if (backend == NULL) return;
     uint64_t ignored = 0;
     (void) psp_media_audio_cursor_us(backend, &ignored);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (buffering) atomic_store_explicit(
+        &backend->audio_delivery_discontinuity, true, memory_order_relaxed);
+#endif
     atomic_store(&backend->buffering, buffering);
     if (backend->audio_event >= 0) {
         int status = sceKernelSetEventFlag(
@@ -7378,6 +7432,12 @@ static void psp_media_destroy(void *opaque)
             worker_gone = thread_release_wait >= 0;
         }
         if (worker_gone) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            const PspMediaAudioDelivery *delivery = &backend->audio_delivery;
+            psp_media_log("tilefinch-media-decoder: event=audio-delivery blocks=%u gaps=%u gap-total=%uus gap-max=%uus read-errors=%u supported=%u",
+                delivery->blocks, delivery->gaps, delivery->gap_total_us,
+                delivery->gap_max_us, delivery->errors, backend->audio_channel >= 0);
+#endif
             thread_delete = sceKernelDeleteThread(backend->audio_thread);
         } else {
             thread_terminate = sceKernelTerminateDeleteThread(
@@ -7787,6 +7847,9 @@ static bool psp_media_backend_create_track_info(
     backend->audio_cursor_elapsed_us = 0u;
     atomic_init(&backend->audio_output_blocks, 0);
     atomic_init(&backend->audio_output_starves, 0);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    atomic_init(&backend->audio_delivery_discontinuity, true);
+#endif
     atomic_init(
         &backend->audio_output_first_status,
         PSP_MEDIA_AUDIO_OUTPUT_PENDING);

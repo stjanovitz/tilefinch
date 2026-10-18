@@ -833,6 +833,11 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
     MediaPlayback *playback, uint64_t clock_us, size_t maximum_packets,
     const TilefinchCancellation *cancellation,
     char *error, size_t error_size);
+/* Hardware-wait service: no demux advancement, source reads, packet growth or
+   drain. Only already-staged packets and the backend completion are visited. */
+MediaPlaybackAdvanceResult media_playback_advance_prepared(
+    MediaPlayback *playback, uint64_t clock_us, size_t maximum_packets,
+    char *error, size_t error_size);
 void media_playback_job_stats(const MediaPlayback *playback,
                               MediaPlaybackJobStats *stats);
 bool media_playback_backend_stats(const MediaPlayback *playback,

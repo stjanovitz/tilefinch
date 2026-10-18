@@ -20,6 +20,7 @@ bool psp_media_offline_route(
 bool psp_media_resolved_stream_reusable(const PspMediaSession *media);
 void psp_media_raise_error(
     PspMediaSession *media, const char *message, const char *reason);
+void psp_media_defer_present_error(PspMediaSession *media, const char *message);
 void psp_media_retire_first_frame(PspMediaSession *media);
 PspMediaEvent psp_media_service_completion(
     const PspMediaSession *media, PspMediaEventType type);

@@ -61,6 +61,26 @@ smaller. "Writer" names the owning source file.
 
 ### `data/` — settings and session
 
+Fresh-install slot A includes one build-paired `startup-<sha256>.prx` (at most
+16 MiB). It is an installed executable, not page data; only the matching
+launcher's journal-free default boot uses it. Updates do not ship additional
+wire-package files and never depend on this first-install shortcut.
+An approved app download reclaims matching bundled duplicates in both slots;
+the slot PBPs and unrelated files remain untouched. A bundled module whose
+startup returns a failure is also removed so the next boot does not retry it.
+
+The launcher or a newer updater may also keep `startup-module.prx` (at most 16 MiB) and an
+equally bounded `startup-module.tmp` during replacement. These are derived
+executable cache files, not user data. Creation/adoption compares all bytes
+with the selected slot's packaged module, then writes `startup-module.prx.receipt`
+(less than 1 KiB). Subsequent boots trust matching slot/path and file metadata
+without rescanning either executable. This intentionally does not detect
+same-metadata corruption; pre-held L recovery bypasses the cache. Cache hits write nothing. Failed
+preparation uses the ordinary package, and recovery bypasses the cache.
+All three files may be deleted safely; none is restored as an update authority.
+An explicitly requested app download reclaims them before checking free space;
+background version checks leave them alone.
+
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
 | `profile.cfg` (+`.bak`) | `browser_profile.c` | ~0.5 MB per generation (100 history + 32 bookmarks + 16 resume points, every field length-capped); typically a few KB | replaced on every save | backup rotation; the loader falls back to `.bak` when the primary is missing or unparsable |

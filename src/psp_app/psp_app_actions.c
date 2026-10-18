@@ -73,10 +73,7 @@ static bool psp_action_network_ready(PspApp *app, const char *method,
                                      const uint16_t *engine_frame)
 {
     if (strcmp(app->process->config.trace, "none") != 0) return true;
-    if (psp_ensure_network_for_navigation(
-            app->network, app->network_lifecycle,
-            (int) app->process->config.network_profile, method, url, true,
-            engine_frame, &app->process->presentation.ui)) return true;
+    if (psp_app_ensure_network_for_navigation(app, method, url, engine_frame)) return true;
     app->interactive->previous_buttons =
         psp_ui_buttons(psp_navigation_observed_buttons());
     return false;

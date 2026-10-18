@@ -131,6 +131,10 @@ add_library(tilefinch_psp_ui STATIC
 target_include_directories(tilefinch_psp_ui PUBLIC include)
 target_link_libraries(tilefinch_psp_ui PUBLIC tilefinch_core)
 
+add_library(tilefinch_boot_handoff STATIC src/psp_boot_handoff.c src/psp_boot_cache.c)
+target_include_directories(tilefinch_boot_handoff PUBLIC include)
+target_link_libraries(tilefinch_core PRIVATE tilefinch_boot_handoff)
+
 add_library(tilefinch_psp_app_support STATIC
     src/psp_boot_config.c
     src/psp_boot_order.c
@@ -140,6 +144,7 @@ add_library(tilefinch_psp_app_support STATIC
     src/psp_voice_component_session.c
     src/psp_update_session.c)
 target_include_directories(tilefinch_psp_app_support PUBLIC include)
+target_link_libraries(tilefinch_psp_app_support PUBLIC tilefinch_boot_handoff)
 target_link_libraries(tilefinch_psp_app_support PUBLIC
     tilefinch_core tilefinch_psp_ui)
 target_compile_definitions(tilefinch_psp_app_support PRIVATE
@@ -266,6 +271,7 @@ if(PSP)
     # Developer slot, then LoadExecs the selected browser.
     add_executable(tilefinch-launcher
         src/update_launcher_psp.c
+        src/psp_boot_module.c
         src/install_paths.c
         src/sha256.c
         src/update_manifest.c
@@ -273,6 +279,7 @@ if(PSP)
         src/update_state.c
         src/update_journal.c
         src/update_slot.c
+        src/update_storage.c
         src/update_root_embedded.c
         src/update_crypto_mbedtls.c
         src/psp_time.c
@@ -288,7 +295,7 @@ if(PSP)
     target_compile_options(tilefinch-launcher PRIVATE -flto)
     target_link_options(tilefinch-launcher PRIVATE -flto)
     target_link_libraries(tilefinch-launcher PRIVATE
-        tilefinch_psp_display tilefinch_psp_systemctrl_imports
+        tilefinch_psp_display tilefinch_psp_systemctrl_imports tilefinch_boot_handoff
         ${TILEFINCH_PSP_CRYPTO_LIBRARIES}
         tilefinch_psp_entropy
         pspdisplay pspge pspctrl psprtc)
@@ -1003,23 +1010,23 @@ if(PSP)
             endif()
         endif()
 
-        # Relocatable PRX of the same browser, for PSPLink's `ld host0:/...`
-        # (docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop").
-        #
-        # PSPLink refuses a static PSP ELF with 0x80020148 (unsupported type),
-        # so the USB developer loop needs a relocatable module. This is a
-        # second LINK of the objects psp-browser-script already compiled --
-        # $<TARGET_OBJECTS:> reuses them verbatim, so the PRX cannot drift
-        # from the EBOOT and costs no second compile. Nothing about the EBOOT
-        # target changes: no ratchet, no PBP, no install-tree entry, and the
-        # PRX remains a developer artifact in every PSP build. In particular,
-        # producing it from release objects lets a no-telemetry hardware soak
-        # use host0: and perform zero Memory Stick writes. It is never
-        # packaged or copied into the install tree.
+        # Relocatable browser, sharing the static diagnostic EBOOT's objects.
+        # Keep the historical dev target/artifact names for PSPLink scripts;
+        # the shipping module target packages these bytes with MEMSIZE=1.
+        # Old launchers keep LoadExec; a newer launcher derives and verifies
+        # a raw-module cache without changing the protocol-1 slot contents.
         add_executable(psp-browser-script-dev-prx
-                $<TARGET_OBJECTS:psp-browser-script>)
+                $<TARGET_OBJECTS:psp-browser-script>
+                src/psp_boot_module.c src/psp_boot_module_client.c)
+        target_include_directories(psp-browser-script-dev-prx PRIVATE src include)
+        target_compile_definitions(psp-browser-script-dev-prx PRIVATE
+            $<TARGET_PROPERTY:psp-browser-script,COMPILE_DEFINITIONS>)
+        target_link_options(psp-browser-script-dev-prx PRIVATE
+            "LINKER:--wrap=__libcglue_init" "LINKER:--wrap=main")
         if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
             target_link_options(psp-browser-script-dev-prx PRIVATE ${_transport_probe_link_options})
+            target_compile_definitions(psp-browser-script-dev-prx PRIVATE
+                TILEFINCH_PSP_BOOT_UNWRAPPED_SEMAPHORE=1)
         endif()
         # The EBOOT's newlib printf aliases (see psp-browser-script above),
         # so a host0: hardware run executes the same printf cores it does.
@@ -1081,7 +1088,7 @@ if(PSP)
                 tilefinch_core tilefinch_psp_ui tilefinch_psp_display
                 tilefinch_psp_media_scale
                 tilefinch_psp_media_present
-                tilefinch_psp_app_support tilefinch_diagnostic_qr)
+                tilefinch_psp_app_support tilefinch_diagnostic_qr tilefinch_boot_handoff)
             if(PSP_BROWSER_ENABLE_PSP_VOICE)
                 target_link_libraries(psp-browser-script-dev-prx PRIVATE
                     tilefinch_voice_frontend pspaudio)
@@ -1136,12 +1143,50 @@ if(PSP)
                     "LINKER:-Map,${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.map")
             endif()
             add_custom_command(TARGET psp-browser-script-dev-prx POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    -DPSP_OBJDUMP=${TILEFINCH_PSP_OBJDUMP}
+                    -DPSP_ELF=$<TARGET_FILE:psp-browser-script-dev-prx>
+                    -DPSP_TEXT_LIMIT=${TILEFINCH_PSP_TEXT_LIMIT}
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckPspTextSize.cmake"
+                COMMAND ${CMAKE_COMMAND}
+                    -DPSP_NM=${CMAKE_NM}
+                    -DPSP_ELF=$<TARGET_FILE:psp-browser-script-dev-prx>
+                    -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,17408,10752>
+                    -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
+                    -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
+                    -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>
+                    -DPSP_SHARED_FONT_ZLIB=$<AND:$<BOOL:${PSP_BROWSER_FREETYPE_AVAILABLE}>,$<NOT:$<BOOL:${PSP_BROWSER_SYSTEM_FREETYPE}>>>
+                    -DPSP_LOOP_FRAME_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,6144,5120>
+                    -DPSP_FRAME_SET_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,19456,14336>
+                    -DTILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckPspHotSymbolSizes.cmake"
                 COMMAND "${PSPDEV}/bin/psp-fixup-imports"
                     $<TARGET_FILE:psp-browser-script-dev-prx>
                 COMMAND "${PSPDEV}/bin/psp-prxgen"
                     $<TARGET_FILE:psp-browser-script-dev-prx>
                     "${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.prx"
                 COMMENT "Generating psp-browser-script-dev.prx for PSPLink")
+            add_custom_target(psp-browser-script-module
+                COMMAND "${PSPDEV}/bin/mksfoex" -d MEMSIZE=1
+                    "Tilefinch" "${CMAKE_CURRENT_BINARY_DIR}/browser-module.sfo"
+                COMMAND "${PSPDEV}/bin/pack-pbp"
+                    "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.PBP"
+                    "${CMAKE_CURRENT_BINARY_DIR}/browser-module.sfo"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/tilefinch-icon0-144x82.png"
+                    NULL NULL NULL NULL
+                    "${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.prx" NULL
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.prx"
+                    "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.prx"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_psp_startup.py"
+                    --pbp "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.PBP"
+                    --module "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.prx"
+                    --header "${CMAKE_CURRENT_BINARY_DIR}/generated/psp_startup_bundle.h"
+                DEPENDS psp-browser-script-dev-prx
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_psp_startup.py"
+                COMMENT "Staging the compatible relocatable browser entry")
+        add_dependencies(tilefinch-launcher psp-browser-script-module)
 
         # Exact first-install tree. The stable launcher is the only root
         # EBOOT; browser assets belong to slot-a, while mutable state is kept
@@ -1152,7 +1197,8 @@ if(PSP)
         add_custom_target(tilefinch-psp-install-tree
             COMMAND ${CMAKE_COMMAND}
                 "-DLAUNCHER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/launcher/EBOOT.PBP"
-                "-DBROWSER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/EBOOT.PBP"
+                "-DBROWSER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.PBP"
+                "-DBROWSER_MODULE=${CMAKE_CURRENT_BINARY_DIR}/tilefinch-browser.prx"
                 "-DWASM_COMPONENT_PRX=${TILEFINCH_WASM_COMPONENT_PRX}"
                 "-DVOICE_COMPONENT_PRX=${TILEFINCH_VOICE_COMPONENT_PRX}"
                 "-DXMB_REDIRECT_PRX=${CMAKE_CURRENT_BINARY_DIR}/xmb-redirect/tilefinch_xmb.prx"
@@ -1160,7 +1206,7 @@ if(PSP)
                 "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                 "-DOUTPUT=${TILEFINCH_PSP_INSTALL_TREE}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StagePspInstall.cmake"
-            DEPENDS tilefinch-launcher psp-browser-script
+            DEPENDS tilefinch-launcher psp-browser-script-module
                 tilefinch-wasm-component tilefinch-xmb-redirect
             COMMENT
                 "Staging launcher + slot-a + optional XMB redirect"

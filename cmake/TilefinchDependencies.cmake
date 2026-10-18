@@ -238,6 +238,8 @@ set(PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-fragment-clone-storage.patch")
 set(PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-parser-init-refusal.patch")
+set(PSP_BROWSER_LEXBOR_STATIC_TABLES_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-compact-static-tables.patch")
 set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
 set(PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH
@@ -395,7 +397,8 @@ foreach(lexbor_patch IN ITEMS
         "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
         "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
         "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
-        "${PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH}")
+        "${PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH}"
+        "${PSP_BROWSER_LEXBOR_STATIC_TABLES_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
@@ -407,11 +410,28 @@ foreach(lexbor_patch IN ITEMS
         message(FATAL_ERROR "Could not prepare the Lexbor source")
     endif()
 endforeach()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(TILEFINCH_LEXBOR_TABLE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/lexbor-tables")
+file(GLOB lexbor_interface_table_inputs CONFIGURE_DEPENDS
+    "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor/html/interfaces/*_element.c"
+    "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor/html/interfaces/*_element.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${lexbor_interface_table_inputs}
+    "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor/html/interfaces/element.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/compact_lexbor_tables.py"
+    "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor/html/tokenizer/res.h"
+    "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor/html/interface_res.h")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/compact_lexbor_tables.py"
+    --source "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor"
+    --output "${TILEFINCH_LEXBOR_TABLE_DIR}"
+    COMMAND_ERROR_IS_FATAL ANY)
 if(PSP_BROWSER_LEXBOR_NEEDS_ADD_SUBDIRECTORY)
     add_subdirectory("${PSP_BROWSER_LEXBOR_SOURCE_DIR}"
                      "${CMAKE_BINARY_DIR}/_deps/lexbor-build"
                      EXCLUDE_FROM_ALL)
 endif()
+target_include_directories(lexbor_static PRIVATE "${TILEFINCH_LEXBOR_TABLE_DIR}")
 
 if(PSP AND TARGET lexbor_static)
     # The lexbor posix port config hard-codes -fPIC, which psp-gcc rejects

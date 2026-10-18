@@ -324,6 +324,8 @@ static bool backing_node_write(
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--empty-document-only") == 0)
+        return test_empty_native_document();
     if (argc == 2 && strcmp(argv[1], "--fixed-images-only") == 0)
         return test_fixed_image_publication();
     if (argc == 2 && strcmp(argv[1], "--fixed-image-repaint-only") == 0)
@@ -380,7 +382,8 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
         return test_native_text_sync_does_not_relayout_twice();
     if (argc == 2 && strcmp(argv[1], "--youtube-home-only") == 0)
-        return test_youtube_home_topics_are_lazy()
+        return test_youtube_initial_tiles_are_coalesced()
+            || test_youtube_home_topics_are_lazy()
             || test_youtube_personalized_home();
     if (argc == 2 && strcmp(argv[1], "--youtube-account-actions-only") == 0)
         return test_youtube_resume_metadata() || test_youtube_recent_history()
@@ -458,6 +461,7 @@ int main(int argc, char **argv)
     CHECK(test_smart_font_pressure_preempts_startup() == 0);
     CHECK(test_sibling_focus_retains_unrelated_matches() == 0);
     CHECK(test_required_rebuild_pressure_keeps_static_document() == 0);
+    CHECK(test_empty_native_document() == 0);
     CHECK(test_engine_lifecycle() == 0);
     CHECK(profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
@@ -533,6 +537,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
+    CHECK(test_youtube_initial_tiles_are_coalesced() == 0);
     CHECK(test_youtube_home_topics_are_lazy() == 0);
     CHECK(test_youtube_personalized_home() == 0);
     CHECK(test_youtube_resume_metadata() == 0);

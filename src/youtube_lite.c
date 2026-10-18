@@ -1918,6 +1918,14 @@ static bool lite_topics_requested(const char *url)
         && strcmp(value, "1") == 0;
 }
 
+bool youtube_lite_navigation_requires_network(const char *url)
+{
+    /* Exactly the local entry-surface condition used by the loader below.
+       Explicit discovery and authentication handoffs still perform I/O. */
+    return youtube_lite_route(url) != YOUTUBE_LITE_ROUTE_HOME
+        || lite_topics_requested(url) || youtube_lite_signin_handoff_url(url);
+}
+
 static bool lite_feed_requested(const char *url)
 {
     char value[24] = {0};
@@ -4132,6 +4140,11 @@ static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
         if (stop > length) stop = length;
         size_t marker = SIZE_MAX;
         for (size_t at = job->decode_search_offset; at < stop; at++) {
+            /* Exact marker comparison is needed only at its first byte.
+               Keep the original overlap and order across bounded windows. */
+            const char *candidate = memchr(source + at, 'y', stop - at);
+            if (candidate == NULL) break;
+            at = (size_t) (candidate - source);
             static const char spaced[] = "ytInitialData = ";
             static const char compact[] = "ytInitialData=";
             if ((sizeof(spaced) - 1u <= length - at
@@ -4603,8 +4616,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
     snprintf(job->url, sizeof(job->url), "%s", url);
     snprintf(job->language, sizeof(job->language), "%s",
              lite_preferred_language());
-    if (route == YOUTUBE_LITE_ROUTE_HOME && !lite_topics_requested(url)
-        && !job->signin_handoff) {
+    if (!youtube_lite_navigation_requires_network(url)) {
         /* The search form is local. Optional discovery gets a separate idle
            job after first paint; it must not delay entering a query. */
         if (!lite_build_document_with_comments_decoded(
@@ -5118,7 +5130,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
     job->metrics.pump_calls++;
     /* Keep the existing largest transform-unit envelope: a 48 KiB renderer
        window, a 16 KiB comments scan, and one bounded HTML emission. Coalesce
-       small ready steps only; never scan another full window or pump a
+       small ready steps, including bounded fact/decode scans; never pump a
        second transport turn merely because the host happens to be fast. */
     const size_t maximum_work = 80u * 1024u;
     uint64_t maximum_time = quota != NULL && quota->maximum_time_us != 0
@@ -5139,6 +5151,15 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         size_t next_bound;
         if (job->phase == YOUTUBE_LITE_JOB_PREPARE) {
             next_bound = 0;
+        } else if (job->phase == YOUTUBE_LITE_JOB_IDENTITY_API_KEY
+                   || (job->phase >= YOUTUBE_LITE_JOB_COMMENTS_PANEL
+                       && job->phase <= YOUTUBE_LITE_JOB_COMMENTS_TOKEN)) {
+            next_bound = 16u * 1024u;
+        } else if (job->phase == YOUTUBE_LITE_JOB_DECODE) {
+            /* A marker-search step can also start decoding 16 KiB. An
+               escape crossing its boundary consumes up to twelve more
+               source bytes; reserve that before admitting another step. */
+            next_bound = 32u * 1024u + 16u;
         } else if (job->phase == YOUTUBE_LITE_JOB_BUILD && job->build != NULL
                    && job->build->phase >= YOUTUBE_LITE_BUILD_EMIT_HEADER
                    && job->build->phase < YOUTUBE_LITE_BUILD_DONE) {

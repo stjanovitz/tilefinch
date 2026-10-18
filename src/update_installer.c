@@ -12,6 +12,7 @@
 #endif
 
 #include "tilefinch/sha256.h"
+#include "tilefinch/psp_boot_cache.h"
 
 #define INSTALL_IO_CHUNK (16u * 1024u)
 #define INSTALL_REMOVE_ENTRY_LIMIT 256u
@@ -50,6 +51,10 @@ struct TilefinchUpdateInstallJob {
     uint64_t current_file_bytes;
     size_t file_index;
     bool cancel_requested;
+    bool prepare_startup;
+    bool startup_begun;
+    PspBootCacheCopy startup;
+    char startup_source[768], startup_cache[768], startup_temporary[768];
     char message[96];
 };
 
@@ -160,6 +165,11 @@ static bool install_has_free_space(
         && available >= required;
 }
 
+static bool install_startup_space(void *directory, uint64_t *available)
+{
+    return tilefinch_update_query_free_space(directory, available);
+}
+
 TilefinchUpdateInstallJob *tilefinch_update_install_create(
     Budget *budget, const TilefinchUpdateInstallOptions *options)
 {
@@ -215,6 +225,7 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
     job->inactive_slot = options->inactive_slot;
     job->trust = options->trust;
     job->allow_downgrade = options->allow_downgrade;
+    job->prepare_startup = options->prepare_startup;
     job->state = options->current_state;
     job->fault = options->fault;
     job->fault_opaque = options->fault_opaque;
@@ -280,6 +291,7 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
 void tilefinch_update_install_destroy(TilefinchUpdateInstallJob *job)
 {
     if (job == NULL) return;
+    psp_boot_cache_copy_close(&job->startup);
     if (job->output_file != NULL) fclose(job->output_file);
     if (job->package_file != NULL) fclose(job->package_file);
     Budget *budget = job->budget;
@@ -599,18 +611,47 @@ bool tilefinch_update_install_pump(
                           "UPDATE COULD NOT BE ACTIVATED");
             return true;
         }
-        job->phase = TILEFINCH_UPDATE_INSTALL_COMPLETE;
-        job->status = TILEFINCH_UPDATE_OK;
-        /*
-         * The package is now staged and journalled; the downloaded part file
-         * (up to 32 MB) has no further reader. Close and reclaim it here
-         * rather than leaving it on the stick until the next download.
-         */
+        /* No readers remain after durable promotion. Reclaim the download
+           before admitting the optional startup copy on a nearly full card. */
         if (job->package_file != NULL) {
             fclose(job->package_file);
             job->package_file = NULL;
         }
-        (void) remove(job->package_path);
+        (void)remove(job->package_path);
+        job->phase = TILEFINCH_UPDATE_INSTALL_PREPARING_STARTUP;
+    }
+    if (job->phase == TILEFINCH_UPDATE_INSTALL_PREPARING_STARTUP) {
+        /* The signed slot and pending journal are already durable. This cache
+           is optional: interruption/refusal keeps the ordinary trial/recovery
+           boot, never a half-prepared executable or a failed authentication. */
+        if (job->prepare_startup) {
+            if (!job->startup_begun) {
+                job->startup_begun = true;
+                if (install_path(job->startup_source, sizeof(job->startup_source),
+                                 job->target_path, "EBOOT.PBP")
+                    && install_path(job->startup_cache, sizeof(job->startup_cache),
+                                    job->data_dir, "startup-module.prx")
+                    && install_path(job->startup_temporary, sizeof(job->startup_temporary),
+                                    job->data_dir, "startup-module.tmp")
+                    && !install_fault(job, "before-prepare-startup"))
+                    (void)psp_boot_cache_copy_begin(&job->startup,
+                        job->startup_source, job->startup_cache, job->startup_temporary,
+                        install_startup_space, job->data_dir);
+                return true;
+            }
+            if (job->startup.result == PSP_BOOT_CACHE_PENDING) {
+                if (install_fault(job, "during-prepare-startup"))
+                    psp_boot_cache_copy_close(&job->startup);
+                else if (psp_boot_cache_copy_step(&job->startup, job->buffer,
+                                                 INSTALL_IO_CHUNK, quota) == PSP_BOOT_CACHE_PENDING)
+                    return true;
+            }
+            if (job->startup.result == PSP_BOOT_CACHE_CREATED
+                && !install_sync_device())
+                psp_boot_cache_discard(job->data_dir);
+        }
+        job->phase = TILEFINCH_UPDATE_INSTALL_COMPLETE;
+        job->status = TILEFINCH_UPDATE_OK;
         snprintf(job->message, sizeof(job->message), "READY TO RESTART");
     }
     return true;

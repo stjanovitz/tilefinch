@@ -167,6 +167,7 @@ static bool fixture_run_clip(
     uint64_t previous_signature = 0;
     unsigned observed = 0, distinct = 0;
     bool sought = !exercise_seek;
+    bool resume_on_picture = false;
     bool failed = false;
     while (!media_playback_ended(playback)) {
         uint64_t now = (uint64_t) sceKernelGetSystemTimeWide();
@@ -205,6 +206,13 @@ static bool fixture_run_clip(
             if (previous_signature == 0 || signature != previous_signature)
                 distinct++;
             previous_signature = signature;
+            if (resume_on_picture) {
+                /* Reset intentionally pauses native audio. Like the player,
+                   resume only after observing the first valid new picture;
+                   otherwise the bounded audio queue fills after the seek. */
+                media_playback_set_playing(playback, true);
+                resume_on_picture = false;
+            }
         }
         if (!sought && observed >= 5u) {
             uint64_t actual_us = 0;
@@ -215,6 +223,7 @@ static bool fixture_run_clip(
                 break;
             }
             sought = true;
+            resume_on_picture = true;
             report->seek_completions++;
             started = (uint64_t) sceKernelGetSystemTimeWide() - actual_us;
         }

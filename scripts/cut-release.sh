@@ -315,6 +315,7 @@ step "Checking staged binaries for local build paths"
 for binary in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
+    "$tree"/slot-a/startup-*.prx \
     "$tree/slot-a/tilefinch-wasm.prx" \
     "$tree/slot-a/tilefinch-voice.prx" \
     "$tree/OPTIONAL/tilefinch_xmb.prx"

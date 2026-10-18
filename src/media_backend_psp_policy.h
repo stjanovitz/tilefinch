@@ -654,6 +654,63 @@ static inline bool psp_media_refusal_resume_has_room(
 #define PSP_MEDIA_AUDIO_PENDING_HOLD_US 30000u
 #define PSP_MEDIA_AUDIO_PENDING_LOW_WATER 4u
 
+/* A blocked video head must not drain the DAC's reserve. This only admits
+   compressed AAC into the existing bounded pending ring; it never interrupts
+   a native job, releases a picture, or increases the decode horizon. */
+static inline bool psp_media_audio_reserve_needs_supply(
+    unsigned queued, unsigned pending, bool playing)
+{
+    return playing && queued < PSP_MEDIA_AUDIO_PENDING_LOW_WATER
+        && pending < PSP_MEDIA_AUDIO_PENDING_SLOTS;
+}
+
+/* Output-thread-only validation state; read only after that worker retires.
+   Hardware drains in sample quanta, so allow 2 ms of observation uncertainty.
+   Empty software wake-ups alone are not audible underruns. */
+#define PSP_MEDIA_AUDIO_DELIVERY_BLOCK_LIMIT 256u
+typedef struct {
+    uint32_t blocks, gaps, gap_total_us, gap_max_us, errors;
+    uint32_t previous_end_us, generation, previous_rate;
+    int previous_remaining;
+    bool previous_valid;
+} PspMediaAudioDelivery;
+
+static inline void psp_media_audio_delivery_observe(
+    PspMediaAudioDelivery *state, uint32_t generation,
+    uint32_t begin_us, uint32_t end_us, int before, int after,
+    unsigned rate, bool discontinuity)
+{
+    if (state == NULL || state->blocks >= PSP_MEDIA_AUDIO_DELIVERY_BLOCK_LIMIT)
+        return;
+    state->blocks++;
+    if (before < 0 || after < 0 || rate < 8000u || rate > PSP_MEDIA_AUDIO_MAXIMUM_RATE
+        || end_us - begin_us >= UINT32_C(0x80000000)) {
+        state->errors++;
+        state->previous_valid = false;
+        return;
+    }
+    if (state->previous_valid && !discontinuity
+        && state->generation == generation && state->previous_rate == rate
+        && before == 0) {
+        uint32_t elapsed = begin_us - state->previous_end_us;
+        uint64_t covered = (uint64_t) (unsigned) state->previous_remaining
+            * 1000000u / rate;
+        if (elapsed < UINT32_C(0x80000000) && elapsed > covered
+            && elapsed - covered > 2000u) {
+            uint32_t gap = (uint32_t) (elapsed - covered);
+            state->gaps++;
+            state->gap_total_us = gap > UINT32_MAX - state->gap_total_us
+                ? UINT32_MAX : state->gap_total_us + gap;
+            if (gap > state->gap_max_us) state->gap_max_us = gap;
+        }
+    }
+    state->previous_end_us = end_us;
+    state->previous_remaining = after;
+    state->previous_rate = rate;
+    state->generation = generation;
+    state->previous_valid = true;
+}
+
 /*
  * The worker's own bound on a batched job.
  *

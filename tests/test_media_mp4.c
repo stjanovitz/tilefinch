@@ -79,6 +79,7 @@ typedef struct {
     bool drain_emit_once;
     bool drain_tail_pending;
     bool queue_once;
+    bool hold_submit;
     size_t presentation_borrows;
     size_t presentation_releases;
     size_t presentation_staged;
@@ -135,6 +136,7 @@ static MediaBackendResult backend_submit(
     BackendFixture *fixture = opaque;
     if (fixture == NULL || sample == NULL || bytes == NULL
         || length != sample->size) return MEDIA_BACKEND_ERROR;
+    if (fixture->hold_submit) return MEDIA_BACKEND_WOULD_BLOCK;
     fixture->submitted++;
     if (fixture->queue_once) {
         fixture->queue_once = false;
@@ -382,7 +384,9 @@ static bool fixture_set_first_box_payload_u32(
     return false;
 }
 
-static size_t make_fixture(Fixture *fixture)
+static size_t make_fixture_with_origin(
+    Fixture *fixture, int edit_version, uint64_t origin,
+    uint32_t composition)
 {
     memset(fixture, 0, sizeof(*fixture));
     size_t ftyp = begin_box(
@@ -395,6 +399,22 @@ static size_t make_fixture(Fixture *fixture)
         fixture, MEDIA_MP4_FOURCC('m','o','o','v'));
     size_t trak = begin_box(
         fixture, MEDIA_MP4_FOURCC('t','r','a','k'));
+    if (edit_version >= 0) {
+        size_t edts = begin_box(
+            fixture, MEDIA_MP4_FOURCC('e','d','t','s'));
+        size_t elst = begin_box(
+            fixture, MEDIA_MP4_FOURCC('e','l','s','t'));
+        append_u32(fixture, (uint32_t) edit_version << 24);
+        append_u32(fixture, 1u);
+        if (edit_version == 1) append_u32(fixture, 0u);
+        append_u32(fixture, 2000u);
+        if (edit_version == 1)
+            append_u32(fixture, (uint32_t) (origin >> 32));
+        append_u32(fixture, (uint32_t) origin);
+        append_u32(fixture, 0x10000u);
+        end_box(fixture, elst);
+        end_box(fixture, edts);
+    }
     size_t mdia = begin_box(
         fixture, MEDIA_MP4_FOURCC('m','d','i','a'));
     size_t mdhd = begin_box(
@@ -438,6 +458,16 @@ static size_t make_fixture(Fixture *fixture)
     end_box(fixture, avcc);
     end_box(fixture, avc1);
     end_box(fixture, stsd);
+
+    if (composition != 0) {
+        size_t ctts = begin_box(
+            fixture, MEDIA_MP4_FOURCC('c','t','t','s'));
+        append_u32(fixture, 0u);
+        append_u32(fixture, 1u);
+        append_u32(fixture, 2u);
+        append_u32(fixture, composition);
+        end_box(fixture, ctts);
+    }
 
     size_t stts = begin_box(
         fixture, MEDIA_MP4_FOURCC('s','t','t','s'));
@@ -494,6 +524,39 @@ static size_t make_fixture(Fixture *fixture)
     fixture->length += sizeof(payload);
     end_box(fixture, mdat);
     return mdat + 8;
+}
+
+static size_t make_fixture(Fixture *fixture)
+{
+    return make_fixture_with_origin(fixture, -1, 0, 0);
+}
+
+static bool fixture_add_fragment_origin(Fixture *fixture, uint32_t origin)
+{
+    Fixture edited;
+    make_fixture_with_origin(&edited, 0, origin, 0);
+    size_t moov = 0, trak = 0, edit = 0;
+    for (size_t at = 4; at + 4 <= fixture->length; at++) {
+        if (!moov && !memcmp(fixture->bytes + at, "moov", 4)) moov = at - 4;
+        if (!trak && !memcmp(fixture->bytes + at, "trak", 4)) trak = at - 4;
+    }
+    for (size_t at = 4; at + 4 <= edited.length; at++) {
+        if (!memcmp(edited.bytes + at, "edts", 4)) { edit = at - 4; break; }
+    }
+    if (!moov || !trak || !edit || fixture->length > sizeof(fixture->bytes) - 36u)
+        return false;
+    uint32_t moov_size = 0, trak_size = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        moov_size = (moov_size << 8) | fixture->bytes[moov + i];
+        trak_size = (trak_size << 8) | fixture->bytes[trak + i];
+    }
+    memmove(fixture->bytes + trak + 8u + 36u,
+            fixture->bytes + trak + 8u, fixture->length - trak - 8u);
+    memcpy(fixture->bytes + trak + 8u, edited.bytes + edit, 36u);
+    fixture->length += 36u;
+    put_u32(fixture->bytes + moov, moov_size + 36u);
+    put_u32(fixture->bytes + trak, trak_size + 36u);
+    return true;
 }
 
 static size_t make_fragmented_fixture_with_duration(
@@ -1677,6 +1740,82 @@ int main(void)
     CHECK(fixture_reader.bytes_read < fixture.length + 16);
     media_mp4_close(demux);
 
+    puts("test: single unit-rate edits align video presentation, not decode order");
+    for (int version = 0; version <= 1; version++) {
+        Fixture edited;
+        size_t edited_payload = make_fixture_with_origin(
+            &edited, version, 250u, 250u);
+        FixtureReader edited_reader = {
+            .bytes = edited.bytes, .length = edited.length
+        };
+        MediaRangeReader edited_source = {
+            .opaque = &edited_reader, .length = edited.length,
+            .read = fixture_read
+        };
+        demux = media_mp4_open(
+            &budget, &edited_source, NULL, error, sizeof(error));
+        CHECK(demux != NULL
+              && media_mp4_next_sample(demux, &first)
+              && first.dts == 0 && first.pts == 0
+              && first.offset == edited_payload
+              && media_mp4_next_sample(demux, &second)
+              && second.dts == 1000 && second.pts == 1000);
+        CHECK(media_mp4_seek_us(demux, 1500000u, &seek_time)
+              && seek_time == 0
+              && media_mp4_next_sample(demux, &first) && first.pts == 0);
+        media_mp4_close(demux);
+        CHECK(budget.current == 0);
+
+        /* Nonzero first PTS and a later sync sample expose seeks accidentally
+           comparing/reporting unedited DTS instead of presentation time. */
+        make_fixture_with_origin(&edited, version, 100u, 250u);
+        CHECK(fixture_set_first_box_payload_u32(
+            &edited, MEDIA_MP4_FOURCC('s','t','s','s'), 8u, 2u));
+        demux = media_mp4_open(
+            &budget, &edited_source, NULL, error, sizeof(error));
+        CHECK(demux != NULL
+              && media_mp4_seek_us(demux, 1100000u, &seek_time)
+              && seek_time == 150000u
+              && media_mp4_seek_after_us(demux, 150000u, &seek_time)
+              && seek_time == 1150000u
+              && media_mp4_next_sample(demux, &second)
+              && second.dts == 1000 && second.pts == 1150);
+        media_mp4_close(demux);
+
+        CHECK(fixture_set_first_box_payload_u32(
+            &edited, MEDIA_MP4_FOURCC('e','l','s','t'), 4u, UINT32_MAX));
+        CHECK(media_mp4_open(
+                  &budget, &edited_source, NULL, error, sizeof(error)) == NULL
+              && budget.current == 0);
+    }
+
+    puts("test: unsupported edits stay unchanged and malformed edits fail cleanly");
+    for (unsigned variant = 0; variant < 4; variant++) {
+        Fixture edited;
+        make_fixture_with_origin(&edited, 0, 250u, 250u);
+        if (variant == 0) {
+            CHECK(fixture_set_first_box_payload_u32(
+                &edited, MEDIA_MP4_FOURCC('e','l','s','t'), 16u, 0x18000u));
+        } else if (variant == 1) {
+            CHECK(fixture_set_first_box_payload_u32(
+                &edited, MEDIA_MP4_FOURCC('e','l','s','t'), 12u, UINT32_MAX));
+        } else {
+            CHECK(fixture_set_first_box_payload_u32(
+                &edited, MEDIA_MP4_FOURCC('e','l','s','t'),
+                variant == 2 ? 0u : 4u, variant == 2 ? 0x02000000u : 2u));
+        }
+        FixtureReader edited_reader = {.bytes = edited.bytes, .length = edited.length};
+        MediaRangeReader edited_source = {.opaque = &edited_reader,
+            .length = edited.length, .read = fixture_read};
+        demux = media_mp4_open(&budget, &edited_source, NULL, error, sizeof(error));
+        if (variant < 2) {
+            CHECK(demux != NULL && media_mp4_next_sample(demux, &first)
+                  && first.pts == 250);
+            media_mp4_close(demux);
+        } else CHECK(demux == NULL);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: MP4 timescale admission bounds cross-track arithmetic");
     Fixture boundary_fixture = fixture;
     CHECK(fixture_set_first_mdhd_timescale(
@@ -1714,6 +1853,38 @@ int main(void)
               &budget, &hostile_timescale_source, NULL,
               error, sizeof(error)) == NULL
           && budget.current == 0);
+
+    puts("test: fragmented edits survive normalized tfdt, window changes and seeks");
+    for (unsigned lazy = 0; lazy < 2; lazy++) {
+        Fixture edited;
+        if (lazy) {
+            CHECK(make_sidx_fragmented_fixture(&edited, NULL, NULL, NULL, NULL));
+        } else {
+            make_fragmented_fixture(&edited, 5000u, NULL, NULL);
+        }
+        CHECK(fixture_add_fragment_origin(&edited, lazy ? 250u : 5250u));
+        FixtureReader edited_reader = {.bytes = edited.bytes, .length = edited.length};
+        MediaRangeReader edited_source = {.opaque = &edited_reader,
+            .length = edited.length, .read = fixture_read};
+        demux = media_mp4_open(&budget, &edited_source, NULL, error, sizeof(error));
+        CHECK(demux != NULL
+              && media_mp4_next_sample(demux, &first)
+              && first.dts == 0 && first.pts == -250
+              && media_mp4_next_sample(demux, &second)
+              && second.dts == 1000 && second.pts == 750);
+        if (lazy) {
+            CHECK(media_mp4_seek_us(demux, 1800000u, &seek_time)
+                  && seek_time == 1750000u
+                  && media_mp4_next_sample(demux, &first)
+                  && first.pts == 1750 && first.keyframe);
+            CHECK(media_mp4_seek_after_us(demux, 0, &seek_time)
+                  && seek_time == 1750000u);
+        }
+        media_mp4_rewind(demux);
+        CHECK(media_mp4_next_sample(demux, &first) && first.pts == -250);
+        media_mp4_close(demux);
+        CHECK(budget.current == 0);
+    }
 
     puts("test: fragmented MP4 synthesizes bounded sample tables");
     Fixture fragmented_fixture;
@@ -2292,6 +2463,41 @@ int main(void)
           && job_stats.drain_calls == 3);
     media_playback_destroy(playback);
     CHECK(backend_fixture.destroyed == 1);
+    media_mp4_close(demux);
+
+    puts("test: scanout service submits staged packets without source I/O or growth");
+    demux = media_mp4_open(&budget, &reader, NULL, error, sizeof(error));
+    CHECK(demux != NULL);
+    backend_fixture = (BackendFixture) {.hold_submit = true};
+    playback = media_playback_create(&budget, demux, &backend, &playback_options,
+                                     error, sizeof(error));
+    CHECK(playback != NULL);
+    size_t prepared_reads = fixture_reader.reads;
+    size_t prepared_owned = budget.current;
+    size_t prepared_failures = budget.injected_failure_count;
+    budget_inject_failure_after(&budget, 0);
+    CHECK(media_playback_advance_prepared(playback, 0, 2, error, sizeof(error))
+          == MEDIA_PLAYBACK_ADVANCE_PENDING);
+    budget_clear_failure_injection(&budget);
+    CHECK(fixture_reader.reads == prepared_reads
+          && budget.current == prepared_owned
+          && budget.injected_failure_count == prepared_failures
+          && backend_fixture.submitted == 0 && backend_fixture.drains == 0
+          && backend_fixture.advanced == 1 && !media_playback_ended(playback));
+    CHECK(media_playback_advance_bounded(playback, 0, 1, error, sizeof(error))
+          == MEDIA_PLAYBACK_ADVANCE_PENDING);
+    CHECK(fixture_reader.reads > prepared_reads);
+    prepared_reads = fixture_reader.reads;
+    backend_fixture.hold_submit = false;
+    CHECK(media_playback_advance_prepared(playback, 0, 2, error, sizeof(error))
+          == MEDIA_PLAYBACK_ADVANCE_PENDING);
+    CHECK(backend_fixture.submitted == 1 && backend_fixture.drains == 0
+          && fixture_reader.reads == prepared_reads && !media_playback_ended(playback));
+    CHECK(media_playback_advance_prepared(playback, 0, 2, error, sizeof(error))
+          == MEDIA_PLAYBACK_ADVANCE_PENDING);
+    CHECK(backend_fixture.submitted == 1 && backend_fixture.drains == 0
+          && fixture_reader.reads == prepared_reads);
+    media_playback_destroy(playback);
     media_mp4_close(demux);
 
     /*
@@ -4447,6 +4653,92 @@ int main(void)
             psp_media_slot_dwell_charge(
                 &wrapped, PSP_MEDIA_SLOT_READY, 150u);
             CHECK(wrapped.state_us[PSP_MEDIA_SLOT_READY] == 251u);
+        }
+
+        {
+            /* Distinguish DAC underruns from software queue wake-ups. Count
+               only uncovered time beyond the hardware observation tolerance,
+               not pauses, seeks, failed queries or clock wrap artifacts. */
+            PspMediaAudioDelivery delivery = {0};
+            psp_media_audio_delivery_observe(&delivery, 0, 1000, 1100,
+                0, 1024, 32000, false);
+            CHECK(delivery.blocks == 1 && delivery.gaps == 0);
+            psp_media_audio_delivery_observe(&delivery, 0, 35100, 35110,
+                0, 1024, 32000, false); /* exactly 2 ms uncertainty */
+            CHECK(delivery.gaps == 0);
+            psp_media_audio_delivery_observe(&delivery, 0, 77110, 77120,
+                0, 1024, 32000, false);
+            CHECK(delivery.gaps == 1 && delivery.gap_total_us == 10000
+                && delivery.gap_max_us == 10000);
+            psp_media_audio_delivery_observe(&delivery, 0, 900000, 900010,
+                0, 1024, 32000, true); /* intentional pause */
+            psp_media_audio_delivery_observe(&delivery, 1, 2000000, 2000010,
+                0, 1024, 32000, false); /* seek generation */
+            CHECK(delivery.gaps == 1);
+            psp_media_audio_delivery_observe(&delivery, 1, 3000000, 3000010,
+                64, 1024, 32000, false); /* hardware still has samples */
+            CHECK(delivery.gaps == 1);
+            psp_media_audio_delivery_observe(&delivery, 1, 4000000, 4000010,
+                -1, 1024, 32000, false);
+            psp_media_audio_delivery_observe(&delivery, 1, 5000000, 5000010,
+                0, 1024, 32000, false);
+            CHECK(delivery.errors == 1 && delivery.gaps == 1);
+            psp_media_audio_delivery_observe(&delivery, 1, 6000000, 6000010,
+                0, 1024, 0, false);
+            CHECK(delivery.errors == 2 && !delivery.previous_valid);
+            PspMediaAudioDelivery wrap = {0};
+            psp_media_audio_delivery_observe(&wrap, 0,
+                UINT32_MAX - 11000u, UINT32_MAX - 10000u, 0, 1024, 32000, false);
+            psp_media_audio_delivery_observe(&wrap, 0, 35000u, 35010u,
+                0, 1024, 32000, false);
+            CHECK(wrap.gaps == 1 && wrap.gap_total_us == 13001u);
+            delivery.blocks = PSP_MEDIA_AUDIO_DELIVERY_BLOCK_LIMIT;
+            PspMediaAudioDelivery full = delivery;
+            psp_media_audio_delivery_observe(&delivery, 1, 7000000, 7000010,
+                0, 0, 32000, false);
+            CHECK(memcmp(&full, &delivery, sizeof(full)) == 0);
+            psp_media_audio_delivery_observe(NULL, 0, 0, 0, 0, 0, 0, false);
+            /* Never price old hardware samples at a different channel rate.
+               The next interval uses the new rate normally. */
+            PspMediaAudioDelivery changed = {0};
+            psp_media_audio_delivery_observe(&changed, 0, 0, 10,
+                0, 1024, 8000, false);
+            psp_media_audio_delivery_observe(&changed, 0, 100010, 100020,
+                0, 1024, 48000, false);
+            CHECK(changed.gaps == 0);
+            psp_media_audio_delivery_observe(&changed, 0, 131353, 131363,
+                0, 1024, 48000, false);
+            CHECK(changed.gaps == 1 && changed.gap_total_us == 10000);
+            /* A reversed output bracket invalidates continuity. A later valid
+               output re-arms without charging the missing/invalid interval. */
+            psp_media_audio_delivery_observe(&changed, 0, 200000, 199999,
+                0, 1024, 48000, false);
+            CHECK(changed.errors == 1 && !changed.previous_valid);
+            psp_media_audio_delivery_observe(&changed, 0, 500000, 500010,
+                0, 1024, 48000, false);
+            CHECK(changed.gaps == 1 && changed.previous_valid);
+            psp_media_audio_delivery_observe(&changed, 0, 600000, 600010,
+                0, -1, 48000, false);
+            CHECK(changed.errors == 2 && !changed.previous_valid);
+            /* Exercise rounding at every admitted rate, and repeated gaps
+               without overflowing the aggregate diagnostic. */
+            const unsigned rates[] = {8000, 32000, 44100, 48000};
+            for (unsigned r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+                PspMediaAudioDelivery rounded = {0};
+                uint32_t covered = (uint32_t) ((uint64_t) 1024 * 1000000 / rates[r]);
+                psp_media_audio_delivery_observe(&rounded, 0, 10, 20,
+                    0, 1024, rates[r], false);
+                psp_media_audio_delivery_observe(&rounded, 0,
+                    20 + covered + 2000, 30 + covered + 2000,
+                    0, 1024, rates[r], false);
+                CHECK(rounded.gaps == 0);
+                rounded.gap_total_us = UINT32_MAX - 1000;
+                uint32_t next = rounded.previous_end_us + covered + 2001;
+                psp_media_audio_delivery_observe(&rounded, 0, next, next + 10,
+                    0, 1024, rates[r], false);
+                CHECK(rounded.gaps == 1 && rounded.gap_max_us == 2001
+                    && rounded.gap_total_us == UINT32_MAX);
+            }
         }
 
         {

@@ -76,6 +76,11 @@ run_pspsh() {
     while kill -0 "$process" 2>/dev/null; do
         if [ "$elapsed" -ge $((timeout * POLLS_PER_SECOND)) ]; then
             kill "$process" 2>/dev/null || true
+            # pspsh can catch TERM while waiting for a USB reconnect. Do not
+            # let reaping that local console defeat the advertised timeout.
+            # This never resets, unloads or kills anything on the PSP.
+            sleep 0.1
+            kill -KILL "$process" 2>/dev/null || true
             wait "$process" 2>/dev/null || true
             cat "$output" >&2
             rm -f "$output"
@@ -93,7 +98,8 @@ run_pspsh() {
 }
 
 probe_ready() {
-    probe=$(run_pspsh ver "$LINK_TIMEOUT_SECONDS" 2>&1) || return 1
+    probe_timeout=${1:-$LINK_TIMEOUT_SECONDS}
+    probe=$(run_pspsh ver "$probe_timeout" 2>&1) || return 1
     printf '%s\n' "$probe" | grep -q 'PSPLink v'
 }
 
@@ -161,9 +167,13 @@ ensure_ready() {
         printf '%s\n' "$HOST_ROOT" >"$BRIDGE_ROOT"
     fi
 
-    elapsed=0
-    while [ "$elapsed" -lt $((BRIDGE_START_TIMEOUT_SECONDS * POLLS_PER_SECOND)) ]; do
-        if probe_ready; then return 0; fi
+    deadline=$(($(date +%s) + BRIDGE_START_TIMEOUT_SECONDS))
+    while :; do
+        remaining=$((deadline - $(date +%s)))
+        [ "$remaining" -gt 0 ] || break
+        probe_timeout=$LINK_TIMEOUT_SECONDS
+        if [ "$remaining" -lt "$probe_timeout" ]; then probe_timeout=$remaining; fi
+        if probe_ready "$probe_timeout"; then return 0; fi
         if grep -q '^bind: Operation not permitted' "$BRIDGE_LOG" \
                 2>/dev/null; then
             stop_recorded_bridge || true
@@ -174,7 +184,6 @@ ensure_ready() {
             return 1
         fi
         sleep "$POLL_SLEEP"
-        elapsed=$((elapsed + 1))
     done
 
     echo "PSPLink is not reachable after ${BRIDGE_START_TIMEOUT_SECONDS}s." >&2

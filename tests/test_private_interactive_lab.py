@@ -265,6 +265,45 @@ class PrivateConsoleTests(unittest.TestCase):
                 thread.join(timeout=5)
 
     @unittest.skipUnless(LAB, "requires the host lab executable")
+    def test_private_text_checks_live_document_after_private_open(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                body = b"<input autocomplete=username>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory) / "trusted.html"
+                fixture.write_text("<input autocomplete=username>")
+                session = PRIVATE.PrivateLab(LAB, directory, fixture=fixture)
+                try:
+                    session.status(timeout=30)
+                    self.assertEqual(session.send(b"private-focus username\n")[8], 1)
+                    self.assertEqual(session.send(PRIVATE.secret_command("mock-control"))[8], 1)
+                    destination = f"http://127.0.0.1:{server.server_port}/"
+                    self.assertEqual(session.send(
+                        f"private-open {destination}\n".encode())[8], 1)
+                    self.assertEqual(session.send(b"private-focus username\n")[8], 1)
+                    self.assertEqual(session.send(
+                        PRIVATE.secret_command("mock-secret"))[8], 0)
+                finally:
+                    session.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @unittest.skipUnless(LAB, "requires the host lab executable")
     def test_private_navigation_starts_at_top_without_recording_history(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):

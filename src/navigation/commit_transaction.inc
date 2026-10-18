@@ -1343,8 +1343,15 @@ static bool navigation_commit_document(
         size_t reserved = maximum_file <= SIZE_MAX / 4u
                           ? maximum_file * 4u : maximum_file;
         if (session->page.resource_scheduler == NULL) {
+            /* Native local entry surfaces have no initial network resources.
+               Ordinary documents retain eager admission, including the curl
+               reservation used by their font/resource pressure decisions. */
+            bool local_entry = site_adapter_handles_navigation("GET", url)
+                && !site_adapter_navigation_requires_network("GET", url);
             session->page.resource_scheduler =
-                fetch_scheduler_create_in_domain(
+                local_entry ? fetch_scheduler_create_deferred_in_domain(
+                    session->page.fetch_domain, 12, reserved)
+                : fetch_scheduler_create_in_domain(
                     session->page.fetch_domain, 12, reserved);
             if (session->page.resource_scheduler != NULL) {
                 (void) fetch_scheduler_enable_background_transport(

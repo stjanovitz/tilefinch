@@ -47,4 +47,17 @@ bool psp_entropy_fill(void *output, size_t length);
    never for key material. */
 void psp_entropy_fill_best_effort(void *output, size_t length);
 
+typedef enum {
+    PSP_ENTROPY_PREPARE_PENDING,
+    PSP_ENTROPY_PREPARE_READY,
+    PSP_ENTROPY_PREPARE_REFUSED
+} PspEntropyPreparation;
+
+/* Optional owner-thread warm-up: mix the existing seed, gather one complete
+   estimator batch per call, then perform the ordinary credited release.
+   Never waits for another owner, lowers credit, or emits uncredited output.
+   After 128 batches an unproductive warm-up refuses; normal fill retains
+   its existing bounded foreground attempt and policy. */
+PspEntropyPreparation psp_entropy_prepare_step(void);
+
 #endif

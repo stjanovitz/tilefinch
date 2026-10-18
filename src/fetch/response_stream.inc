@@ -236,6 +236,13 @@ static void fetch_tls_sessions_import(void)
     }
 }
 
+bool fetch_prepare_tls_session_store(void)
+{
+    return !fetch_tls_session_persistence_enabled()
+        || fetch_tls_session_store_file[0] == '\0'
+        || fetch_tls_session_memory_ensure() != NULL;
+}
+
 static size_t fetch_tls_sessions_export(void)
 {
     if (!fetch_tls_session_persistence_enabled()
@@ -338,6 +345,7 @@ bool fetch_tls_session_store_clear(void)
 #endif /* TILEFINCH_PSP_OWNED_TRANSPORT */
 
 #if !defined(TILEFINCH_PSP_OWNED_TRANSPORT)
+bool fetch_prepare_tls_session_store(void) { return true; }
 bool fetch_tls_session_store_flush(void) { return true; }
 bool fetch_tls_session_store_clear(void) { return true; }
 void fetch_tls_session_census(void) {}

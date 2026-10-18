@@ -14,7 +14,9 @@ runtime assets or immutable engine data.
 
 - **Lexbor 3.0.0** (tag `v3.0.0`): Apache License 2.0. The checkout contains
   the complete `LICENSE` and `NOTICE` files; both must accompany binary
-  distributions.
+  distributions. Local patches use bounded entity-table records and share
+  equivalent internal element dispatch; original entity values and public
+  interface functions are preserved.
 - **Bellard QuickJS**, commit `04be246001599f5995fa2f2d8c91a0f198d3f34c`
   (upstream VERSION 2026-06-04): MIT License. This is the backend used by
   every checked-in preset, including the PSP build. The engine is vendored

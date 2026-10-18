@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.41 — 2026-10-18
+
+- Faster startup, including the first launch after installation. The full startup improvement requires the updated launcher from the install ZIP; in-app updates remain compatible.
+- Smoother video playback and faster YouTube loading and search processing, with fewer startup audio interruptions, fewer player-menu hitches, and cleaner loading feedback.
+
 ## 0.1.40 — 2026-10-16
 
 - Download files directly to the Memory Stick with pause, resume, retry, and cancellation; preview and install compatible homebrew ZIPs, and manage downloads and installed apps separately.

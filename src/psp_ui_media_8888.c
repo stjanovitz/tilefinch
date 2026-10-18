@@ -27,6 +27,7 @@
  */
 
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/font.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -67,7 +68,9 @@ static uint32_t ui_media_widen(uint16_t pixel)
 static void ui_media_composite_8888(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
-    uint16_t *scratch, bool controls_only, bool without_track_menu)
+    uint16_t *scratch, bool controls_only, bool without_track_menu,
+    PspUiMediaTrackMenuBlit opaque_blit, void *blit_context,
+    uint16_t *retained_title, bool title_changed)
 {
     if (media == NULL || pixels == NULL || scratch == NULL
         || width <= 0 || height <= 0 || stride < width) return;
@@ -103,6 +106,10 @@ static void ui_media_composite_8888(
     if (count == 0u) return;
     for (size_t region = 0; region < count; region++) {
         const PspUiOverlayRegion *bounds = &regions[region];
+        if (retained_title != NULL && !title_changed && bounds->top == 0
+            && bounds->bottom == PSP_UI_MEDIA_TITLE_BAR_HEIGHT
+            && bounds->left == 0 && bounds->right == width
+            && !bounds->needs_backdrop) continue;
         for (int y = bounds->top; y < bounds->bottom; y++) {
             const uint32_t *source = clockwise
                 ? pixels + (size_t) bounds->left * physical_stride
@@ -134,14 +141,40 @@ static void ui_media_composite_8888(
     } else if (without_track_menu) {
         psp_ui_media_composite_without_track_menu(
             media, preview, scratch, width, height, stride);
+    } else if (retained_title != NULL && !title_changed) {
+        psp_ui_media_composite_layers(
+            media, preview, scratch, width, height, stride, true, false);
     } else {
         psp_ui_media_composite_with_preview(
             media, preview, scratch, width, height, stride);
     }
     for (size_t region = 0; region < count; region++) {
         const PspUiOverlayRegion *bounds = &regions[region];
+        bool title = retained_title != NULL && bounds->top == 0
+            && bounds->bottom == PSP_UI_MEDIA_TITLE_BAR_HEIGHT
+            && bounds->left == 0 && bounds->right == width
+            && !bounds->needs_backdrop;
+        if (title && title_changed) {
+            for (unsigned y = 0; y < PSP_UI_MEDIA_TITLE_BAR_HEIGHT; y++)
+                memcpy(retained_title + (size_t) y * width,
+                       scratch + (size_t) y * stride,
+                       (size_t) width * sizeof(*retained_title));
+        }
+        const uint16_t *raster = title ? retained_title : scratch;
+        int raster_stride = title ? width : stride;
+        /* Full-width opaque bars need no video backdrop. Their finished 565
+           pixels can use the same synchronous GE expansion as the chooser,
+           avoiding a CPU widening pass over most of the visible controls.
+           Keep rotated/translucent regions and any refusal on the exact
+           scalar path. Full rows also preserve texture alignment/padding. */
+        if (!clockwise && !bounds->needs_backdrop
+            && bounds->left == 0 && bounds->right == width
+            && opaque_blit != NULL && opaque_blit(blit_context,
+                raster + (size_t) bounds->top * raster_stride,
+                width, bounds->bottom - bounds->top, raster_stride, true,
+                pixels, stride, 0, bounds->top)) continue;
         for (int y = bounds->top; y < bounds->bottom; y++) {
-            const uint16_t *source = scratch + (size_t) y * (size_t) stride;
+            const uint16_t *source = raster + (size_t) y * (size_t) raster_stride;
             uint32_t *destination = clockwise
                 ? pixels + (size_t) bounds->left * physical_stride
                     + physical_width - 1 - y
@@ -161,7 +194,8 @@ void psp_ui_media_composite_8888(
     uint16_t *scratch)
 {
     ui_media_composite_8888(
-        media, preview, pixels, width, height, stride, scratch, false, false);
+        media, preview, pixels, width, height, stride, scratch, false, false,
+        NULL, NULL, NULL, false);
 }
 
 void psp_ui_media_composite_controls_8888(
@@ -169,7 +203,8 @@ void psp_ui_media_composite_controls_8888(
     int width, int height, int stride, uint16_t *scratch)
 {
     ui_media_composite_8888(
-        media, NULL, pixels, width, height, stride, scratch, true, false);
+        media, NULL, pixels, width, height, stride, scratch, true, false,
+        NULL, NULL, NULL, false);
 }
 
 static uint32_t ui_media_menu_hash_byte(uint32_t hash, unsigned char value)
@@ -265,6 +300,28 @@ static uint32_t ui_media_menu_signature(
     return hash;
 }
 
+static uint32_t ui_media_title_signature(
+    const PspUiMediaState *media, int width, uint32_t raster_generation)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    const unsigned char *palette =
+        (const unsigned char *) psp_ui_theme_active_palette;
+    for (size_t at = 0; at < sizeof(*psp_ui_theme_active_palette); at++)
+        hash = ui_media_menu_hash_byte(hash, palette[at]);
+    uintptr_t face = media->presentation == NULL
+        ? 0 : (uintptr_t) media->presentation->title_font;
+    for (unsigned byte = 0; byte < sizeof(face); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (face >> (byte * 8u)));
+    uint64_t generation = font_generation();
+    for (unsigned byte = 0; byte < sizeof(generation); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (generation >> (byte * 8u)));
+    for (unsigned byte = 0; byte < sizeof(width); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) ((unsigned) width >> (byte * 8u)));
+    for (unsigned byte = 0; byte < sizeof(raster_generation); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (raster_generation >> (byte * 8u)));
+    return ui_media_menu_hash_string(hash, media->title, sizeof(media->title));
+}
+
 uint32_t psp_ui_media_menu_feedback_key(const PspUiMediaState *media)
 {
     const PspUiMediaPresentation *p = media == NULL ? NULL : media->presentation;
@@ -294,6 +351,34 @@ void psp_ui_media_composite_8888_cached(
 {
     const PspUiMediaPresentation *presentation = media == NULL
         ? NULL : media->presentation;
+    /* The menu and normal title never coexist. Reuse the reserved opaque
+       menu raster for the title, without allocating another surface. The
+       impossible menu selection UINT8_MAX tags this use of the shared bytes. */
+    if (media != NULL && media->visible && media->controls_visible
+        && (presentation == NULL
+            || (!presentation->clockwise && !presentation->track_menu_open))
+        && !media->failed && !media->resolving && !media->seek_in_progress
+        && !media->seek_preview_active && pixels != NULL && scratch != NULL
+        && width > 0 && height >= 272 && stride >= width
+        && menu_pixels != NULL && menu_cache != NULL
+        && menu_pixel_capacity / (size_t) width >= PSP_UI_MEDIA_TITLE_BAR_HEIGHT) {
+        uint32_t raster_generation = psp_ui_media_raster_generation();
+        uint32_t signature = ui_media_title_signature(media, width, raster_generation);
+        bool changed = raster_generation == 0 || !menu_cache->valid
+            || menu_cache->selection != UINT8_MAX
+            || menu_cache->signature != signature
+            || menu_cache->edram_epoch != edram_epoch;
+        ui_media_composite_8888(
+            media, preview, pixels, width, height, stride, scratch, false, false,
+            menu_blit, menu_blit_context, menu_pixels, changed);
+        if (changed) {
+            menu_cache->valid = psp_ui_media_raster_generation() != 0;
+            menu_cache->signature = signature;
+            menu_cache->edram_epoch = edram_epoch;
+            menu_cache->selection = UINT8_MAX;
+        }
+        return;
+    }
     int menu_height = (int) psp_ui_media_track_menu_height(media);
     int top = 48 - (menu_height - (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) / 2;
     size_t required = (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH * (size_t) menu_height;
@@ -303,8 +388,9 @@ void psp_ui_media_composite_8888_cached(
         || menu_cache == NULL
         || width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
         || height < top + menu_height) {
-        psp_ui_media_composite_8888(
-            media, preview, pixels, width, height, stride, scratch);
+        ui_media_composite_8888(
+            media, preview, pixels, width, height, stride, scratch, false, false,
+            menu_blit, menu_blit_context, NULL, false);
         return;
     }
 
@@ -312,9 +398,10 @@ void psp_ui_media_composite_8888_cached(
        The retained menu is copied last, preserving the ordinary draw order. */
     ui_media_composite_8888(
         media, preview, pixels, width, height, stride,
-        scratch, false, true);
+        scratch, false, true, menu_blit, menu_blit_context, NULL, false);
     uint32_t signature = ui_media_menu_signature(media);
     bool content_changed = !menu_cache->valid
+        || menu_cache->selection == UINT8_MAX
         || menu_cache->signature != signature
         || menu_cache->edram_epoch != edram_epoch;
     bool source_changed = content_changed

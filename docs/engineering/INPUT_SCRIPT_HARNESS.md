@@ -131,6 +131,13 @@ only that copy, not decoding, rotation or framebuffer ownership. Quiet
 scanout cadence and report stage/draw averages plus successful GE copies.
 Per-loop detailed timing is disabled inside these video windows; per-picture
 cadence and the existing copy/draw counters remain active.
+Routine per-frame publication text is suppressed too, with explicit
+`suppressed-loops` / `suppressed-publications` totals. Require
+`tilefinch-video-timing: buffered=1` and the final timing-log verdict
+`dropped=0 forced-flushes=0`; an incomplete or overflowing window is not a
+qualified cadence capture. End the window after stopping playback, so draining
+its log cannot create a measured hold. Keep startup and steady-play results
+separate, and avoid full diagnostic marks during the measured interval.
 These control marks do not consume image capture slots. Session counters are
 sampled during presentation, not through a retained session pointer in the
 input handler. Do not combine seeks, pauses, initialization or diagnostic
@@ -312,8 +319,9 @@ clock brackets are adjacent, not identical, and include bounded clock-query
 cost. Neither number measures a PSP button press to its first visible feedback;
 the device supervisor can acknowledge input before owner work completes.
 
-Scripted validation runs emit `tilefinch-loop-timing` for every owner-loop
-invocation, including short frames and early returns. Its ordered phase
+Outside quiet video/canvas measurement windows, scripted validation runs emit
+`tilefinch-loop-timing` for every owner-loop invocation, including short frames
+and early returns. Its ordered phase
 durations sum exactly to `end-us - begin-us`: wait/setup, input (including
 pointer dispatch), action, diagnostic probe, navigation, runtime/recovery,
 idle resources/UI sync, raster, presentation, deferred images, and tail

@@ -27,7 +27,7 @@
  * Batches alternate so a regime that silences one source (an idle bus, an
  * empty ready queue) still leaves the other. The attempt bounds keep a
  * source that has gone quiet from stalling the caller: the browser thread
- * performs the first seeding inside curl's global initialization.
+ * finishes any seeding not already prepared in post-paint idle slices.
  */
 #define PSP_ENTROPY_WORK_BATCH 256u
 #define PSP_ENTROPY_SLEEP_BATCH 64u
@@ -36,7 +36,11 @@
 #define PSP_ENTROPY_SLEEP_US 1u
 #define PSP_ENTROPY_ATTEMPT_US UINT64_C(750000)
 #define PSP_ENTROPY_ATTEMPT_BATCHES 128u
+#if defined(__PSP__)
 #define PSP_ENTROPY_UNCACHED UINT32_C(0x40000000)
+#else
+#define PSP_ENTROPY_UNCACHED UINT32_C(0)
+#endif
 #define PSP_ENTROPY_REPORT_BYTES 320u
 #define PSP_ENTROPY_PATH_BYTES 768u
 
@@ -63,6 +67,7 @@ typedef struct {
     bool released;
     bool released_credited;
     uint32_t attempts;
+    uint32_t preparation_batches;
     uint64_t gather_us;
     PspEntropySourceStats work;
     PspEntropySourceStats sleep;
@@ -205,6 +210,26 @@ static void psp_entropy_mix_seed_file(void)
     psp_entropy_zeroize(file, sizeof(file));
 }
 
+static void psp_entropy_gather_batch_locked(bool sleep, uint32_t *salt)
+{
+    uint64_t batch_started = (uint64_t) sceKernelGetSystemTimeWide();
+    uint32_t count = sleep ? PSP_ENTROPY_SLEEP_BATCH : PSP_ENTROPY_WORK_BATCH;
+    for (uint32_t index = 0; index < count; index++) {
+        uint32_t sample = sleep ? psp_entropy_sample_sleep()
+                                : psp_entropy_sample_work(*salt);
+        psp_entropy_samples[index] = sample;
+        *salt = *salt * UINT32_C(2654435761) + sample;
+    }
+    uint64_t batch_us = (uint64_t) sceKernelGetSystemTimeWide() - batch_started;
+    uint32_t credited = 0;
+    uint32_t millibits = psp_entropy_pool_add_batch(
+        &psp_entropy.pool,
+        sleep ? PSP_ENTROPY_DOMAIN_SLEEP_TIMING : PSP_ENTROPY_DOMAIN_WORK_TIMING,
+        psp_entropy_samples, count, &credited);
+    psp_entropy_note(sleep ? &psp_entropy.sleep : &psp_entropy.work,
+                     count, millibits, batch_us);
+}
+
 static void psp_entropy_gather_locked(void)
 {
     uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
@@ -215,25 +240,7 @@ static void psp_entropy_gather_locked(void)
          batch++) {
         uint64_t batch_started = (uint64_t) sceKernelGetSystemTimeWide();
         if (batch_started - started >= PSP_ENTROPY_ATTEMPT_US) break;
-        bool sleep = (batch & 1u) != 0u;
-        uint32_t count = sleep ? PSP_ENTROPY_SLEEP_BATCH
-                               : PSP_ENTROPY_WORK_BATCH;
-        for (uint32_t index = 0; index < count; index++) {
-            uint32_t sample = sleep ? psp_entropy_sample_sleep()
-                                    : psp_entropy_sample_work(salt);
-            psp_entropy_samples[index] = sample;
-            salt = salt * UINT32_C(2654435761) + sample;
-        }
-        uint64_t batch_us =
-            (uint64_t) sceKernelGetSystemTimeWide() - batch_started;
-        uint32_t credited = 0;
-        uint32_t millibits = psp_entropy_pool_add_batch(
-            &psp_entropy.pool,
-            sleep ? PSP_ENTROPY_DOMAIN_SLEEP_TIMING
-                  : PSP_ENTROPY_DOMAIN_WORK_TIMING,
-            psp_entropy_samples, count, &credited);
-        psp_entropy_note(sleep ? &psp_entropy.sleep : &psp_entropy.work,
-                         count, millibits, batch_us);
+        psp_entropy_gather_batch_locked((batch & 1u) != 0u, &salt);
     }
     psp_entropy_zeroize(psp_entropy_samples, sizeof(psp_entropy_samples));
     psp_entropy.attempts++;
@@ -329,6 +336,41 @@ bool psp_entropy_fill(void *output, size_t length)
         psp_entropy_zeroize(next_seed, sizeof(next_seed));
     }
     return true;
+}
+
+PspEntropyPreparation psp_entropy_prepare_step(void)
+{
+    if (psp_entropy.lock < 0) return PSP_ENTROPY_PREPARE_REFUSED;
+    if (sceKernelPollSema(psp_entropy.lock, 1) < 0)
+        return PSP_ENTROPY_PREPARE_PENDING;
+    if (psp_entropy.released) {
+        psp_entropy_unlock();
+        return PSP_ENTROPY_PREPARE_READY;
+    }
+    if (!psp_entropy.boot_mixed) {
+        psp_entropy_mix_boot_context();
+        psp_entropy_mix_seed_file();
+        psp_entropy.boot_mixed = true;
+    } else if (psp_entropy_pool_ready(&psp_entropy.pool)) {
+        psp_entropy_unlock();
+        /* No entropy attempt runs: the ordinary fill observes a credited
+           pool and owns the existing once-only release and seed write. */
+        return psp_entropy_fill(NULL, 0u)
+            ? PSP_ENTROPY_PREPARE_READY : PSP_ENTROPY_PREPARE_REFUSED;
+    } else if (psp_entropy.preparation_batches < PSP_ENTROPY_ATTEMPT_BATCHES) {
+        uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
+        uint32_t salt = (uint32_t) started;
+        psp_entropy_gather_batch_locked(
+            (psp_entropy.preparation_batches & 1u) != 0u, &salt);
+        psp_entropy.preparation_batches++;
+        psp_entropy.gather_us += (uint64_t) sceKernelGetSystemTimeWide() - started;
+        psp_entropy_zeroize(psp_entropy_samples, sizeof(psp_entropy_samples));
+    } else {
+        psp_entropy_unlock();
+        return PSP_ENTROPY_PREPARE_REFUSED;
+    }
+    psp_entropy_unlock();
+    return PSP_ENTROPY_PREPARE_PENDING;
 }
 
 void psp_entropy_fill_best_effort(void *output, size_t length)

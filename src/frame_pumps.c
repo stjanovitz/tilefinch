@@ -87,7 +87,7 @@ static const FramePumpPolicy frame_pump_policies[FRAME_PUMP_COUNT] = {
             | FRAME_FACT_PAGE_DIRTY | FRAME_FACT_RENDER_JOB
             | FRAME_FACT_NAVIGATION_PENDING | FRAME_FACT_MEDIA_VISIBLE
             | FACTS_MEDIA_PIPELINE | FRAME_FACT_COOPERATE_ACTIVE,
-        .yields_to_active = PUMP(OFFLINE_DOWNLOAD),
+        .yields_to_active = PUMP(OFFLINE_DOWNLOAD) | PUMP(TRANSPORT_PREPARE),
         .yields_to_ran = PUMPS_SITE_RESTORE | PUMP(OFFLINE_DOWNLOAD),
         .resources = FRAME_RESOURCE_IDLE_SLICE,
     },
@@ -99,6 +99,7 @@ static const FramePumpPolicy frame_pump_policies[FRAME_PUMP_COUNT] = {
             | FRAME_FACT_MEDIA_OPEN | FRAME_FACT_MEDIA_DECODE,
         /* One long slice per frame: a download's supervised slice has
            already spent this frame's idle allowance. */
+        .yields_to_active = PUMP(TRANSPORT_PREPARE),
         .yields_to_ran = PUMPS_SITE_RESTORE | PUMP(OFFLINE_DOWNLOAD),
         .resources = FRAME_RESOURCE_IDLE_SLICE,
     },
@@ -111,10 +112,21 @@ static const FramePumpPolicy frame_pump_policies[FRAME_PUMP_COUNT] = {
             | FRAME_FACT_PAGE_WORK_PAUSED | FRAME_FACT_RENDER_JOB
             | FRAME_FACT_NAVIGATION_PENDING | FRAME_FACT_MEDIA_VISIBLE
             | FACTS_MEDIA_PIPELINE | FRAME_FACT_COOPERATE_ACTIVE,
-        .yields_to_active = PUMP(OFFLINE_DOWNLOAD),
+        .yields_to_active = PUMP(OFFLINE_DOWNLOAD) | PUMP(TRANSPORT_PREPARE),
         .yields_to_ran = PUMPS_SITE_RESTORE | PUMP(OFFLINE_DOWNLOAD)
             | PUMP(PAGE_IDLE),
         .resources = FRAME_RESOURCE_IDLE_SLICE,
+    },
+    [FRAME_PUMP_TRANSPORT_PREPARE] = {
+        .name = "transport-prepare",
+        .blocked_by = FRAME_FACT_INPUT_BUTTONS | FRAME_FACT_INPUT_INTENT
+            | FACTS_PAGE_BUSY | FRAME_FACT_NAVIGATION_PENDING
+            | FRAME_FACT_MEDIA_VISIBLE | FACTS_MEDIA_PIPELINE
+            | FRAME_FACT_COOPERATE_ACTIVE,
+        .yields_to_active = PUMPS_FOREGROUND_STORAGE,
+        .yields_to_ran = PUMPS_FOREGROUND_STORAGE | PUMPS_SITE_RESTORE
+            | PUMP(PROVIDER_PRERESOLVE) | PUMP(PAGE_IDLE) | PUMP(DEFERRED_IMAGE),
+        .resources = FRAME_RESOURCE_MEMORY_STICK | FRAME_RESOURCE_IDLE_SLICE,
     },
     /* The metric face loads during association wait frames; afterwards the
        selected-site handshake takes precedence over a font read. A frame
@@ -124,7 +136,8 @@ static const FramePumpPolicy frame_pump_policies[FRAME_PUMP_COUNT] = {
     [FRAME_PUMP_BASELINE_FONTS] = {
         .name = "baseline-fonts",
         .blocked_by = FRAME_FACT_PRECONNECT_CONTENDS,
-        .yields_to_ran = PUMPS_FOREGROUND_STORAGE | PUMPS_SITE_RESTORE,
+        .yields_to_ran = PUMPS_FOREGROUND_STORAGE | PUMPS_SITE_RESTORE
+            | PUMP(TRANSPORT_PREPARE),
         .resources = FRAME_RESOURCE_MEMORY_STICK,
     },
 };

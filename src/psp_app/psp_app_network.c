@@ -3,6 +3,7 @@
  * compile it away and link an empty object.
  */
 #include "psp_app_internal.h"
+#include "tilefinch/psp_entropy.h"
 
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 static PspNetworkLifecycle *psp_bound_network_lifecycle;
@@ -644,8 +645,8 @@ void psp_report_network_result(PspNetwork *network)
 #endif
 }
 
-bool psp_connect_network(PspNetwork *network, int profile_index,
-                                const uint16_t *frame, PspUiState *ui)
+static bool psp_connect_network_prepared(PspNetwork *network, int profile_index,
+    const uint16_t *frame, PspUiState *ui, PspApp *preparation_app)
 {
     if (network == NULL) {
         printf("tilefinch-network: begin refused reason=no-state "
@@ -791,6 +792,12 @@ bool psp_connect_network(PspNetwork *network, int profile_index,
             }
             previous = network->status;
         }
+        /* Opening a provider immediately adopts this foreground wait rather
+           than returning through the Home loop. Use the same preparation
+           owner here, once after controls/presentation, not a second worker.
+           Held input and terminal association states never spend a slice. */
+        if (!terminal && preparation_app != NULL && pad.Buttons == 0)
+            psp_app_prepare_transport(preparation_app, 0u, true);
         if (terminal) break;
     }
     psp_report_network_result(network);
@@ -817,6 +824,12 @@ bool psp_connect_network(PspNetwork *network, int profile_index,
     if (ready) psp_ui_show_status(ui, "OPENING PAGE", 30);
     if (frame != NULL) psp_present(frame, ui);
     return ready;
+}
+
+bool psp_connect_network(PspNetwork *network, int profile_index,
+    const uint16_t *frame, PspUiState *ui)
+{
+    return psp_connect_network_prepared(network, profile_index, frame, ui, NULL);
 }
 
 static void psp_network_shutdown_report_log(
@@ -982,10 +995,10 @@ bool psp_shutdown_network_logged(PspNetwork *network)
     return true;
 }
 
-bool psp_ensure_network_for_navigation(
+static bool psp_ensure_network_for_navigation_prepared(
     PspNetwork *network, PspNetworkLifecycle *lifecycle, int profile_index,
     const char *method, const char *url, bool present_destination,
-    const uint16_t *frame, PspUiState *ui)
+    const uint16_t *frame, PspUiState *ui, PspApp *preparation_app)
 {
     if (psp_ui_native_home_url(url)) return true;
     if (psp_profile_page_kind(url) != PSP_PROFILE_PAGE_NONE) return true;
@@ -1001,11 +1014,95 @@ bool psp_ensure_network_for_navigation(
         && !psp_network_lifecycle_needs_demand_recovery(lifecycle)) {
         if (!psp_shutdown_network_logged(network)) return false;
     }
-    bool ready = psp_connect_network(network, profile_index, frame, ui);
+    bool ready = psp_connect_network_prepared(
+        network, profile_index, frame, ui, preparation_app);
     if (!ready && psp_network_lifecycle_started(lifecycle)
         && !psp_network_lifecycle_needs_demand_recovery(lifecycle)) {
         (void) psp_shutdown_network_logged(network);
     }
     return ready;
+}
+
+bool psp_ensure_network_for_navigation(
+    PspNetwork *network, PspNetworkLifecycle *lifecycle, int profile_index,
+    const char *method, const char *url, bool present_destination,
+    const uint16_t *frame, PspUiState *ui)
+{
+    return psp_ensure_network_for_navigation_prepared(network, lifecycle,
+        profile_index, method, url, present_destination, frame, ui, NULL);
+}
+
+bool psp_app_ensure_network_for_navigation(PspApp *app, const char *method,
+    const char *url, const uint16_t *frame)
+{
+    return psp_ensure_network_for_navigation_prepared(app->network,
+        app->network_lifecycle, (int) app->process->config.network_profile,
+        method, url, true, frame, &app->process->presentation.ui, app);
+}
+
+void psp_app_prepare_transport(PspApp *app, uint32_t facts, bool connection_wait)
+{
+    PspInteractiveState *owner = app->interactive;
+    if (!owner->transport_prepare_pending) return;
+    PspNetwork *network = app->network;
+    if (network->status == PSP_NETWORK_FAILED
+        || network->status == PSP_NETWORK_CANCELLED
+        || !psp_network_lifecycle_started(app->network_lifecycle)) {
+        fetch_cancel_ca_bundle_preparation();
+        owner->transport_prepare_pending = false;
+        return;
+    }
+    if (!connection_wait) {
+        if (app->process->presentation.ui.screen != PSP_UI_SCREEN_HOME
+            && !site_adapter_handles_navigation("GET",
+                   app->views->navigation->page.document_url)) {
+            fetch_cancel_ca_bundle_preparation();
+            owner->transport_prepare_pending = false;
+            return;
+        }
+    }
+    /* A local provider may already be visible before Wi-Fi is ready.
+       Keep its optional API work gated, but spend no more preparation
+       units (or Memory Stick allowance) once the shared worker is ready. */
+    if (owner->transport_prepare_phase == 4u) {
+        if (network->status == PSP_NETWORK_READY) owner->transport_prepare_pending = false;
+        return;
+    }
+    if (!connection_wait) {
+        if (!psp_app_frame_pump_admit(app, FRAME_PUMP_TRANSPORT_PREPARE, facts)) return;
+        psp_app_frame_pump_ran(app, FRAME_PUMP_TRANSPORT_PREPARE);
+    }
+    /* Local work only; the existing selected-provider HEAD remains the
+       only speculative request. Foreground association owns its own cadence
+       and cancellation, so it does not claim an out-of-order frame pump. */
+    bool ok = true;
+    switch (owner->transport_prepare_phase) {
+        case 0: {
+            PspEntropyPreparation status = psp_entropy_prepare_step();
+            if (status == PSP_ENTROPY_PREPARE_READY) owner->transport_prepare_phase++;
+            else if (status == PSP_ENTROPY_PREPARE_REFUSED) ok = false;
+            break;
+        }
+        case 1:
+            ok = fetch_prepare_tls_session_store();
+            if (ok) owner->transport_prepare_phase++;
+            break;
+        case 2: {
+            bool complete = false;
+            ok = fetch_prepare_ca_bundle_step(&complete);
+            if (ok && complete) owner->transport_prepare_phase++;
+            break;
+        }
+        default:
+            if (!network->inet_initialized) break;
+            ok = fetch_background_transport_initialize(app->browser->budget);
+            if (ok) owner->transport_prepare_phase = 4u;
+            owner->transport_prepare_pending = ok && network->status != PSP_NETWORK_READY;
+            break;
+    }
+    if (!ok) {
+        fetch_cancel_ca_bundle_preparation();
+        owner->transport_prepare_pending = false;
+    }
 }
 #endif

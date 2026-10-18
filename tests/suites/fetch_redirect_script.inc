@@ -279,8 +279,25 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     budget_clear_failure_injection(budget);
     CHECK(script_runtime_xhr_diagnostics(runtime, false, &responses));
     CHECK(responses.count == 0);
+    static const char xhr_diagnostics_hook_probe[] =
+        "globalThis.pocSummary=typeof globalThis.__tilefinchXHRDiagnostics;"
+        "globalThis.__xhrDiagnosticsHook="
+        "globalThis.__tilefinchXHRDiagnostics;"
+        "globalThis.__tilefinchXHRDiagnostics=()=>{"
+        "globalThis.__xhrDiagnosticsHijacked=true}";
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, xhr_diagnostics_hook_probe,
+        "<xhr-diagnostics-hook-probe>", &result));
+    bool hook_was_hidden = strcmp(result.summary, "undefined") == 0;
     CHECK(script_runtime_xhr_diagnostics(runtime, true, &responses));
     CHECK(responses.count == 0 && responses.overwritten == 0);
+    static const char xhr_diagnostics_direct_call_probe[] =
+        "if(typeof globalThis.__xhrDiagnosticsHook==='function')"
+        "globalThis.__xhrDiagnosticsHook(null);"
+        "globalThis.pocSummary='attempted'";
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, xhr_diagnostics_direct_call_probe,
+        "<xhr-diagnostics-direct-call-probe>", &result));
     static const char xhr_history_probe[] =
         "(()=>{const url=URL.createObjectURL(new Blob(['mock-secret']));"
         "for(let i=0;i<40;i++){const x=new XMLHttpRequest;"
@@ -290,6 +307,11 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
                                             "<xhr-history-probe>", &result));
     CHECK(script_runtime_xhr_diagnostics(runtime, false, &responses));
     CHECK(responses.count == 32 && responses.overwritten == 8);
+    CHECK(hook_was_hidden);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.pocSummary=String(globalThis.__xhrDiagnosticsHijacked)",
+        "<xhr-diagnostics-hook-observe>", &result));
+    CHECK(strcmp(result.summary, "undefined") == 0);
     for (size_t i = 0; i < responses.count; i++) {
         const uint32_t *r = responses.rows[i];
         CHECK(r[0] == i + 9 && r[1] == 200 && r[2] == 11 && r[3] == 11);

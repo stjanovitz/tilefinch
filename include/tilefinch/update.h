@@ -377,6 +377,7 @@ typedef enum {
     TILEFINCH_UPDATE_INSTALL_EXTRACTING,
     TILEFINCH_UPDATE_INSTALL_FINALIZING,
     TILEFINCH_UPDATE_INSTALL_PROMOTING,
+    TILEFINCH_UPDATE_INSTALL_PREPARING_STARTUP,
     TILEFINCH_UPDATE_INSTALL_COMPLETE,
     TILEFINCH_UPDATE_INSTALL_ERROR,
     TILEFINCH_UPDATE_INSTALL_CANCELLED
@@ -396,6 +397,9 @@ typedef struct {
     TilefinchUpdateState current_state;
     TilefinchUpdateTrust trust;
     bool allow_downgrade;
+    /* Optional bounded derived-module preparation. Wire format is unchanged;
+       older clients still install the same authoritative EBOOT.PBP. */
+    bool prepare_startup;
     /* Optional verified download proof. Supplying it skips the redundant
        whole-package reread; omitting it retains the standalone verifier. */
     const TilefinchUpdateDownloadedPackageProof *download_proof;

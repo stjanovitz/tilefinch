@@ -18,12 +18,12 @@ fi
 # Validate the complete enabled set before even replacing host0 staging.
 for component in $components eboot; do
     case "$component" in
-        eboot) file=$build/EBOOT.PBP ;;
+        eboot) file=$build/tilefinch-browser.PBP ;;
         *) file=$build/tilefinch-$component.prx ;;
     esac
     [ -s "$file" ] || { echo "Required slot artifact missing: $file" >&2; exit 1; }
     size=$(wc -c < "$file" | tr -d ' ')
-    [ "$size" -le 8388608 ] || { echo "Slot artifact exceeds 8 MiB: $file" >&2; exit 1; }
+    [ "$size" -le 16777216 ] || { echo "Slot artifact exceeds 16 MiB: $file" >&2; exit 1; }
     magic=$(od -An -tx1 -N4 "$file" | tr -d ' \n')
     case "$component:$magic" in
         eboot:00504250|wasm:7f454c46|voice:7f454c46) ;;
@@ -33,7 +33,7 @@ done
 mkdir -p "$host"
 for component in $components eboot; do
     case "$component" in
-        eboot) cp "$build/EBOOT.PBP" "$host/EBOOT-device-latest.PBP" ;;
+        eboot) cp "$build/tilefinch-browser.PBP" "$host/EBOOT-device-latest.PBP" ;;
         *) cp "$build/tilefinch-$component.prx" "$host/tilefinch-$component-device-latest.prx" ;;
     esac
 done

@@ -54,6 +54,7 @@ typedef struct {
     uint32_t ctts_count;
     uint32_t sync_count;
     uint64_t decode_duration;
+    uint64_t presentation_origin;
     uint32_t maximum_positive_ctts;
     unsigned char *codec_config;
     size_t retained_bytes;
@@ -764,6 +765,39 @@ static bool mp4_validate_chunks(const MediaMp4Demux *demux,
     return sample == sample_count;
 }
 
+/* A single unit-rate video edit maps composition time to movie time without
+   changing decode order. Keep the offset in track ticks: no per-packet
+   rescaling or edit table is needed. More complex edits and audio trimming
+   retain the existing handling; they require segment/PCM clipping, not just
+   a timestamp shift. */
+static bool mp4_parse_presentation_origin(
+    const unsigned char *data, Mp4Box trak, Mp4Track *track)
+{
+    Mp4Box edts, elst;
+    if (track->info.kind != MEDIA_MP4_TRACK_VIDEO
+        || !mp4_box_find(data, trak.payload, trak.end,
+                         MEDIA_MP4_FOURCC('e','d','t','s'), &edts)
+        || !mp4_box_find(data, edts.payload, edts.end,
+                         MEDIA_MP4_FOURCC('e','l','s','t'), &elst))
+        return true;
+    size_t bytes = elst.end - elst.payload;
+    if (bytes < 8u) return false;
+    unsigned version = data[elst.payload];
+    if (version > 1u) return false;
+    size_t stride = version == 1u ? 20u : 12u;
+    uint32_t count = mp4_u32(data + elst.payload + 4u);
+    if (count > (bytes - 8u) / stride) return false;
+    if (count != 1u) return true;
+    const unsigned char *entry = data + elst.payload + 8u;
+    uint64_t origin = version == 1u
+        ? mp4_u64(entry + 8u) : mp4_u32(entry + 4u);
+    uint64_t maximum = version == 1u ? INT64_MAX : INT32_MAX;
+    if (origin > maximum || mp4_u32(entry + stride - 4u) != 0x10000u)
+        return true;
+    track->presentation_origin = origin;
+    return true;
+}
+
 static bool mp4_parse_track(MediaMp4Demux *demux,
                             const unsigned char *data,
                             Mp4Box trak, Mp4Track *track)
@@ -828,6 +862,7 @@ static bool mp4_parse_track(MediaMp4Demux *demux,
         ? MEDIA_MP4_TRACK_VIDEO
         : handler == MEDIA_MP4_FOURCC('s','o','u','n')
             ? MEDIA_MP4_TRACK_AUDIO : MEDIA_MP4_TRACK_OTHER;
+    if (!mp4_parse_presentation_origin(data, trak, track)) return false;
     uint32_t stsz_count = stsz.end - stsz.payload >= 12u
         ? mp4_u32(data + stsz.payload + 8u) : UINT32_MAX;
     uint32_t stsc_count = stsc.end - stsc.payload >= 8u
@@ -1565,6 +1600,12 @@ static bool mp4_load_sidx_window(
             track->fragment_decode_origin =
                 plans[at].decode_time_origin;
             track->have_fragment_decode_origin = true;
+            /* Lazy fragments already normalize their first tfdt to zero.
+               Express the edit in that same coordinate system once. */
+            track->presentation_origin = track->presentation_origin
+                    > track->fragment_decode_origin
+                ? track->presentation_origin - track->fragment_decode_origin
+                : 0;
         }
         track->window_dts_base =
             plans[at].decode_time_origin
@@ -2093,6 +2134,9 @@ static bool mp4_prepare_fragmented_tracks(
             goto done;
         }
         track->info.sample_count = plan->samples;
+        track->presentation_origin = track->presentation_origin
+                > plan->decode_time_origin
+            ? track->presentation_origin - plan->decode_time_origin : 0;
         track->info.duration = plan->duration;
         track->chunk_count = plan->samples;
         track->stsc_count = 1;
@@ -2398,9 +2442,10 @@ static bool mp4_track_peek(const Mp4Track *track, size_t track_index,
         .offset = track->byte_offset,
         .size = track->sizes[track->sample],
         .dts = track->dts,
-        .pts = composition < 0
+        .pts = (composition < 0
             && (uint64_t) -composition > track->dts
-              ? 0 : (int64_t) track->dts + composition,
+              ? 0 : (int64_t) track->dts + composition)
+            - (int64_t) track->presentation_origin,
         .duration = duration,
         .timescale = track->info.timescale,
         .keyframe = keyframe
@@ -2617,6 +2662,10 @@ static TILEFINCH_OUT_OF_LINE size_t mp4_seek_fragment_index(
 {
     uint64_t units = mp4_time_units_from_us(
         target_us, demux->fragment_index_timescale);
+    uint64_t origin = mp4_rescale_time(
+        demux->tracks[0].presentation_origin,
+        demux->tracks[0].info.timescale, demux->fragment_index_timescale);
+    units = origin > UINT64_MAX - units ? UINT64_MAX : units + origin;
     uint64_t first = demux->fragment_index[0].start_time;
     units = units > UINT64_MAX - first ? UINT64_MAX : units + first;
     size_t selected = 0;
@@ -2625,6 +2674,13 @@ static TILEFINCH_OUT_OF_LINE size_t mp4_seek_fragment_index(
         selected = i;
     }
     return selected;
+}
+
+static uint64_t mp4_seek_sample_ticks(
+    const Mp4Track *track, const MediaMp4Sample *sample)
+{
+    return track->presentation_origin == 0 ? sample->dts
+        : sample->pts < 0 ? 0 : (uint64_t) sample->pts;
 }
 
 bool media_mp4_prepare_seek_us(MediaMp4Demux *demux, uint64_t target_us)
@@ -2684,8 +2740,9 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
             Mp4Track *video = &demux->tracks[video_index];
             MediaMp4Sample sample;
             while (mp4_track_peek(video, video_index, &sample)) {
-                if (sample.keyframe && sample.dts > target_dts) {
-                    selected_dts = sample.dts;
+                uint64_t ticks = mp4_seek_sample_ticks(video, &sample);
+                if (sample.keyframe && ticks > target_dts) {
+                    selected_dts = ticks;
                     found_keyframe = true;
                     break;
                 }
@@ -2721,13 +2778,18 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
             MediaMp4Sample sample;
             uint64_t target_dts = mp4_time_units_from_us(
                 target_us, video->info.timescale);
-            selected_dts = beginning.dts;
+            MediaMp4Sample initial;
+            selected_dts = mp4_track_peek(video, video_index, &initial)
+                ? mp4_seek_sample_ticks(video, &initial) : beginning.dts;
             bool found_keyframe = false;
             while (mp4_track_peek(video, video_index, &sample)) {
-                if (sample.dts > target_dts) break;
+                uint64_t ticks = mp4_seek_sample_ticks(video, &sample);
+                if (ticks > target_dts
+                    && (video->presentation_origin == 0 || sample.keyframe))
+                    break;
                 if (sample.keyframe) {
                     selected = *video;
-                    selected_dts = sample.dts;
+                    selected_dts = ticks;
                     found_keyframe = true;
                 }
                 mp4_track_advance(video);

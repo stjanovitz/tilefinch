@@ -465,6 +465,11 @@ bool browser_engine_content_blocker_metrics(
 bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
                                 const char *html, size_t html_length,
                                 bool record_history);
+/* Initial backing document for a native frontend surface, before any page
+   is committed. Creates neither an author realm nor resource transport and
+   preserves the configured policies for the next ordinary navigation. */
+bool browser_engine_commit_empty_document(BrowserEngine *engine,
+                                          const char *url, bool record_history);
 /* Rebuild a locally supplied history target after the frontend moved the
    cursor. Restore matching-document controls before shell publication, then
    semantic focus and scroll. Same-document refreshes remain ordinary commits. */

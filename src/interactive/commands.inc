@@ -1638,9 +1638,11 @@ static bool private_console_set_text(BrowserEngine *engine,
                                      const char *hex,
                                      char *text, size_t capacity)
 {
-    const NavigationEntry *entry = navigation_current(navigation);
     TilefinchUrl url;
-    if (entry == NULL || !tilefinch_url_parse(entry->url, &url)
+    /* Private opens do not update history. Authorize against the committed
+       document receiving the text, including after redirects and handoffs. */
+    if (!navigation->page.loaded
+        || !tilefinch_url_parse(navigation->page.document_url, &url)
         || !tilefinch_url_is_secure(&url)) return false;
     if (hex == NULL) return browser_engine_replace_text(engine, "", 0);
     size_t length = strlen(hex);

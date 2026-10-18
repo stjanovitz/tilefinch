@@ -287,8 +287,9 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded(
         playback, clock_us, maximum_packets, NULL, error, error_size);
 }
 
-MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
+static MediaPlaybackAdvanceResult playback_advance_bounded(
     MediaPlayback *playback, uint64_t clock_us, size_t maximum_packets,
+    bool prepared_only,
     const TilefinchCancellation *cancellation,
     char *error, size_t error_size)
 {
@@ -338,7 +339,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             break;
         }
         for (size_t source = 0; source < playback->source_count; source++) {
-            if (!playback->have_pending[source]
+            if (!prepared_only && !playback->have_pending[source]
                 && !playback->source_ended[source]) {
                 MediaSampleSource *input = &playback->source[source];
                 if (!input->ops->next_sample(
@@ -396,6 +397,10 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                 selected = source;
                 selected_time = candidate;
             }
+        }
+        if (selected == playback->source_count && prepared_only) {
+            status = MEDIA_PLAYBACK_ADVANCE_PENDING;
+            break;
         }
         if (selected == playback->source_count
             && deferred_source != playback->source_count) {
@@ -482,6 +487,13 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             continue;
         }
         MediaSampleSource *selected_source = &playback->source[selected];
+        /* Scanout service may collect a codec job and submit bytes already
+           staged by an ordinary visit, but never allocate or read a source.
+           Even a locally available file can block on storage or USB. */
+        if (prepared_only && !playback->packet_loaded[selected]) {
+            status = MEDIA_PLAYBACK_ADVANCE_PENDING;
+            break;
+        }
         if (!playback->packet_loaded[selected]) {
             PlaybackPacketStatus capacity = playback_ensure_packet_capacity(
                 playback, selected, playback->pending[selected].size,
@@ -634,6 +646,22 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
         playback->job_stats.yielded_calls++;
     }
     return status;
+}
+
+MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
+    MediaPlayback *playback, uint64_t clock_us, size_t maximum_packets,
+    const TilefinchCancellation *cancellation, char *error, size_t error_size)
+{
+    return playback_advance_bounded(playback, clock_us, maximum_packets, false,
+                                    cancellation, error, error_size);
+}
+
+MediaPlaybackAdvanceResult media_playback_advance_prepared(
+    MediaPlayback *playback, uint64_t clock_us, size_t maximum_packets,
+    char *error, size_t error_size)
+{
+    return playback_advance_bounded(playback, clock_us, maximum_packets, true,
+                                    NULL, error, error_size);
 }
 
 void media_playback_job_stats(const MediaPlayback *playback,

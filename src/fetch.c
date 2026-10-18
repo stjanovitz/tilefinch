@@ -435,6 +435,8 @@ static char fetch_ca_blob_source[sizeof(fetch_ca_bundle)];
    a component-format change, not an invitation to allocate opportunistically
    on the transport worker. */
 static unsigned char fetch_ca_blob_psp_storage[64u * 1024u];
+static SceUID fetch_ca_read_file = -1;
+static size_t fetch_ca_read_size, fetch_ca_read_offset;
 #endif
 #endif
 /* Cross-boot TLS session resumption store. Empty disables it. */
@@ -450,6 +452,11 @@ static void fetch_tls_session_memory_reset(void);
 static void fetch_ca_blob_reset(void)
 {
 #ifdef TILEFINCH_FETCH_CA_BLOB
+#if defined(__PSP__)
+    if (fetch_ca_read_file >= 0) (void) sceIoClose(fetch_ca_read_file);
+    fetch_ca_read_file = -1;
+    fetch_ca_read_size = fetch_ca_read_offset = 0;
+#endif
 #if !defined(__PSP__)
     free(fetch_ca_blob_data);
 #endif
@@ -498,6 +505,66 @@ bool fetch_prepare_ca_bundle(void)
 #endif
 }
 
+void fetch_cancel_ca_bundle_preparation(void)
+{
+#if defined(TILEFINCH_FETCH_CA_BLOB) && defined(__PSP__)
+    if (fetch_ca_read_file >= 0) fetch_ca_blob_reset();
+#endif
+}
+
+bool fetch_prepare_ca_bundle_step(bool *complete)
+{
+    if (complete == NULL) return false;
+    *complete = false;
+#if defined(TILEFINCH_FETCH_CA_BLOB) && defined(__PSP__)
+    if (fetch_ca_bundle[0] == '\0') return false;
+    if (fetch_ca_blob_data != NULL && fetch_ca_blob_digest_valid) {
+        *complete = true;
+        return true;
+    }
+    if (fetch_ca_read_file < 0) {
+        SceIoStat info = {0};
+        if (sceIoGetstat(fetch_ca_bundle, &info) < 0 || info.st_size <= 0
+            || (uint64_t) info.st_size > sizeof(fetch_ca_blob_psp_storage)) return false;
+        fetch_ca_read_file = sceIoOpen(fetch_ca_bundle, PSP_O_RDONLY, 0);
+        if (fetch_ca_read_file < 0) return false;
+        fetch_ca_read_size = (size_t) info.st_size;
+        fetch_ca_read_offset = 0;
+        return true;
+    }
+    if (fetch_ca_read_offset < fetch_ca_read_size) {
+        size_t amount = fetch_ca_read_size - fetch_ca_read_offset;
+        if (amount > 4096u) amount = 4096u;
+        int received = sceIoRead(fetch_ca_read_file,
+            fetch_ca_blob_psp_storage + fetch_ca_read_offset, amount);
+        if (received <= 0 || (size_t) received > amount) {
+            fetch_ca_blob_reset();
+            return false;
+        }
+        fetch_ca_read_offset += (size_t) received;
+        return true;
+    }
+    unsigned char excess;
+    int tail = sceIoRead(fetch_ca_read_file, &excess, 1u);
+    int closed = sceIoClose(fetch_ca_read_file);
+    fetch_ca_read_file = -1;
+    if (tail != 0 || closed < 0 || !tilefinch_sha256_digest(
+            fetch_ca_blob_psp_storage, fetch_ca_read_size, fetch_ca_blob_digest)) {
+        fetch_ca_blob_reset();
+        return false;
+    }
+    fetch_ca_blob_data = fetch_ca_blob_psp_storage;
+    fetch_ca_blob_length = fetch_ca_read_size;
+    fetch_ca_blob_digest_valid = true;
+    snprintf(fetch_ca_blob_source, sizeof(fetch_ca_blob_source), "%s", fetch_ca_bundle);
+    *complete = true;
+    return true;
+#else
+    *complete = fetch_prepare_ca_bundle();
+    return *complete;
+#endif
+}
+
 bool fetch_ca_bundle_identity(
     uint32_t *version, size_t *length,
     uint8_t digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES])
@@ -528,38 +595,19 @@ static bool fetch_ca_blob_ensure(void)
         && strcmp(fetch_ca_blob_source, fetch_ca_bundle) == 0) {
         return true;
     }
-    fetch_ca_blob_reset();
 #if defined(__PSP__)
-    /* Memory Stick and USBHostFS paths implement sceIo reliably, but their
-       newlib stdio adapters do not consistently implement seek/tell. Read
-       the stat-bounded file through the native PSP interface so both an
-       installed EBOOT and the memory-only PSPLink build use the same trust
-       path. */
-    SceIoStat file_stat;
-    memset(&file_stat, 0, sizeof(file_stat));
-    if (sceIoGetstat(fetch_ca_bundle, &file_stat) < 0
-        || file_stat.st_size <= 0
-        || (uint64_t) file_stat.st_size
-            > (uint64_t) sizeof(fetch_ca_blob_psp_storage)) return false;
-    size_t size = (size_t) file_stat.st_size;
-    unsigned char *data = fetch_ca_blob_psp_storage;
-    SceUID file = sceIoOpen(fetch_ca_bundle, PSP_O_RDONLY, 0);
-    if (file < 0) return false;
-    size_t offset = 0;
-    bool ok = true;
-    while (offset < size) {
-        int received = sceIoRead(file, data + offset, size - offset);
-        if (received <= 0) {
-            ok = false;
-            break;
-        }
-        offset += (size_t) received;
+    /* Foreground demand finishes exactly the same bounded reader, including
+       a partial idle read. Even a backend returning one byte per call has
+       at most the fixed bundle ceiling plus open/publication steps. */
+    for (size_t step = 0; step < sizeof(fetch_ca_blob_psp_storage) + 3u; step++) {
+        bool complete = false;
+        if (!fetch_prepare_ca_bundle_step(&complete)) return false;
+        if (complete) return true;
     }
-    unsigned char excess = 0;
-    if (ok && sceIoRead(file, &excess, 1u) != 0) ok = false;
-    if (sceIoClose(file) < 0) ok = false;
-    if (!ok) return false;
+    fetch_ca_blob_reset();
+    return false;
 #else
+    fetch_ca_blob_reset();
     FILE *file = fopen(fetch_ca_bundle, "rb");
     if (file == NULL) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
@@ -573,7 +621,6 @@ static bool fetch_ca_blob_ensure(void)
     bool ok = fread(data, 1, (size_t) size, file) == (size_t) size;
     fclose(file);
     if (!ok) { free(data); return false; }
-#endif
     fetch_ca_blob_data = data;
     fetch_ca_blob_length = size;
     fetch_ca_blob_digest_valid = tilefinch_sha256_digest(
@@ -585,6 +632,7 @@ static bool fetch_ca_blob_ensure(void)
     snprintf(fetch_ca_blob_source, sizeof(fetch_ca_blob_source), "%s",
              fetch_ca_bundle);
     return true;
+#endif
 }
 #endif /* TILEFINCH_FETCH_CA_BLOB */
 

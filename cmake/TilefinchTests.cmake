@@ -16,6 +16,17 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
     find_package(Threads REQUIRED)
+    tilefinch_add_test_binary(tilefinch-lexbor-table-tests tests/test_lexbor_tables.c)
+    target_link_libraries(tilefinch-lexbor-table-tests PRIVATE lexbor_static)
+    target_include_directories(tilefinch-lexbor-table-tests PRIVATE "${TILEFINCH_LEXBOR_TABLE_DIR}")
+    add_test(NAME tilefinch-lexbor-table-tests COMMAND tilefinch-lexbor-table-tests)
+    set_tests_properties(tilefinch-lexbor-table-tests PROPERTIES
+        LABELS "tilefinch;unit;parser" TIMEOUT 30)
+    add_test(NAME tilefinch-lexbor-table-generator-tests COMMAND ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lexbor_table_generator.py"
+        "${PSP_BROWSER_LEXBOR_SOURCE_DIR}/source/lexbor")
+    set_tests_properties(tilefinch-lexbor-table-generator-tests PROPERTIES
+        LABELS "tilefinch;unit;parser;tooling" TIMEOUT 30)
     tilefinch_add_test_binary(tilefinch-youtube-playlist-tests tests/test_youtube_playlist.c)
     target_link_libraries(tilefinch-youtube-playlist-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-youtube-playlist-tests COMMAND tilefinch-youtube-playlist-tests)
@@ -1060,6 +1071,13 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;config"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-psp-boot-handoff-tests
+        tests/test_psp_boot_handoff.c)
+    target_link_libraries(tilefinch-psp-boot-handoff-tests PRIVATE tilefinch_boot_handoff)
+    add_test(NAME tilefinch-psp-boot-handoff-tests COMMAND tilefinch-psp-boot-handoff-tests)
+    set_tests_properties(tilefinch-psp-boot-handoff-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;lifecycle;update" TIMEOUT 10)
+
     tilefinch_add_test_binary(tilefinch-psp-boot-order-tests
         tests/test_psp_boot_order.c)
     target_link_libraries(tilefinch-psp-boot-order-tests
@@ -1891,6 +1909,11 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     # Python is required above for host test registration.
     if(NOT PSP)
+        add_test(NAME tilefinch-psp-startup-bundle-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psp_startup_bundle.py)
+        set_tests_properties(tilefinch-psp-startup-bundle-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;update;tooling" TIMEOUT 15)
         add_test(NAME tilefinch-allocator-pgo-tool-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_allocator_pgo_tool.py)

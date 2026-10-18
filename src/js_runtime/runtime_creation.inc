@@ -3350,13 +3350,15 @@ static ScriptRuntime *script_runtime_create_internal(
             evaluated = runtime_take_host_channel(
                 host, "networkQueueStats", &host->host_network_queue_stats);
         }
-        /* platform.js retained private media-state helpers in bootstrap
-           closures. Remove the temporary bridges before author code; native
-           code has already captured their callable values. Worker installs
-           and removes its compiler bridge inside the first-use loader. */
+        /* Remove temporary bootstrap bridges before author code; native code
+           has already captured their callable values. The XHR diagnostics
+           setter must not remain callable by the page after opt-in. Worker
+           installs and removes its compiler bridge inside the first-use loader. */
         if (evaluated) {
             JSAtom media_state_atom = JS_NewAtom(
                 host->context, "__tilefinchMediaStateFor");
+            JSAtom xhr_diagnostics_atom = JS_NewAtom(
+                host->context, "__tilefinchXHRDiagnostics");
             JSAtom fullscreen_exit_atom = JS_NewAtom(
                 host->context, "__tilefinchExitFullscreenFromHost");
             JSAtom visibility_apply_atom = JS_NewAtom(
@@ -3366,12 +3368,15 @@ static ScriptRuntime *script_runtime_create_internal(
             JSAtom user_activation_atom = JS_NewAtom(
                 host->context, "__tilefinchUserActivationState");
             if (media_state_atom == JS_ATOM_NULL
+                || xhr_diagnostics_atom == JS_ATOM_NULL
                 || fullscreen_exit_atom == JS_ATOM_NULL
                 || visibility_apply_atom == JS_ATOM_NULL
                 || visibility_query_atom == JS_ATOM_NULL
                 || user_activation_atom == JS_ATOM_NULL
                 || JS_DeleteProperty(
                        host->context, global, media_state_atom, 0) < 0
+                || JS_DeleteProperty(
+                       host->context, global, xhr_diagnostics_atom, 0) <= 0
                 || JS_DeleteProperty(
                        host->context, global, fullscreen_exit_atom, 0) < 0
                 || JS_DeleteProperty(
@@ -3383,6 +3388,7 @@ static ScriptRuntime *script_runtime_create_internal(
                 evaluated = false;
             }
             JS_FreeAtom(host->context, media_state_atom);
+            JS_FreeAtom(host->context, xhr_diagnostics_atom);
             JS_FreeAtom(host->context, fullscreen_exit_atom);
             JS_FreeAtom(host->context, visibility_apply_atom);
             JS_FreeAtom(host->context, visibility_query_atom);

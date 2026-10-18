@@ -13,6 +13,8 @@
  */
 #include "psp_ui_theme.h"
 #include "psp_boot_mark.h"
+#include "psp_boot_module.h"
+#include "psp_thread_contract.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,13 +22,16 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include "tilefinch/build_version.h"
+#include "tilefinch/psp_boot_cache.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/psp_display.h"
 #include "tilefinch/psp_entropy.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/update.h"
+#include "psp_startup_bundle.h"
 
 PSP_MODULE_INFO("Tilefinch Launcher", 0, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
@@ -49,8 +54,16 @@ static int launcher_text_x;
 static int launcher_text_y;
 static bool launcher_frame_visible;
 static bool launcher_frame_prepared;
+static int launcher_callback_thread_id = -1;
+static atomic_int launcher_callback_id = ATOMIC_VAR_INIT(-1);
+static atomic_int launcher_callback_status = ATOMIC_VAR_INIT(-1);
+/* Startup-only scratch, returned with the launcher before browser libc
+   initialization. Large sequential I/O avoids thousands of FAT operations. */
+static uint8_t launcher_boot_scratch[128u * 1024u];
 
 #ifdef TILEFINCH_PSP_LAUNCHER_TIMING
+#include "psp_boot_timing.h"
+static uint64_t launcher_process_entered_us;
 typedef struct {
     uint64_t entered_us;
     uint64_t previous_us;
@@ -343,8 +356,13 @@ static int launcher_callback_thread(SceSize args, void *argp)
         "tilefinch-launcher-exit", launcher_exit_callback, NULL);
     if (callback < 0) return callback;
     int registered = sceKernelRegisterExitCallback(callback);
+    atomic_store(&launcher_callback_id, callback);
+    atomic_store(&launcher_callback_status, registered);
     if (registered < 0) return registered;
     sceKernelSleepThreadCB();
+    /* The owner joins this UID before deleting it. Do not depend on the
+       firmware's return-from-thread trampoline to preserve a dormant UID. */
+    sceKernelExitThread(0);
     return 0;
 }
 
@@ -353,7 +371,27 @@ static void launcher_setup_callbacks(void)
     int thread = sceKernelCreateThread(
         "tilefinch-launcher-callback", launcher_callback_thread,
         TILEFINCH_PSP_THREAD_PRIORITY_CALLBACK, 4096, 0, NULL);
-    if (thread >= 0) sceKernelStartThread(thread, 0, NULL);
+    launcher_callback_thread_id = thread;
+    if (thread >= 0) (void) sceKernelStartThread(thread, 0, NULL);
+}
+
+static bool launcher_retire_callbacks(void *context)
+{
+    (void) context;
+    int callback = atomic_load(&launcher_callback_id);
+    if (launcher_callback_thread_id < 0 || callback < 0
+        || atomic_load(&launcher_callback_status) < 0) return false;
+    /* Firmware retires a thread's callbacks on exit. Delete this owned
+       callback while its thread is parked, then wake and join that thread. */
+    return sceKernelDeleteCallback(callback) >= 0
+        && sceKernelWakeupThread(launcher_callback_thread_id) >= 0
+        && psp_thread_wait_end_bounded(launcher_callback_thread_id, 1000000u) >= 0
+        && sceKernelDeleteThread(launcher_callback_thread_id) >= 0;
+}
+
+static bool launcher_cache_space(void *context, uint64_t *available)
+{
+    return tilefinch_update_query_free_space(context, available);
 }
 
 static bool launcher_slot_path(
@@ -372,8 +410,23 @@ static bool launcher_slot_path(
     return true;
 }
 
+static void launcher_cache_work_started(void *context)
+{
+    (void) context;
+    /* Preserve the normal mark and safe-start hint. Only add status below
+       the mark; a cache miss is not a separate error/recovery screen. */
+    launcher_draw_text_at(165, 174, "PREPARING FASTER STARTUP...",
+                          PSP_THEME_TEXT, 1);
+    launcher_draw_text_at(162, 192, "FIRST START AFTER AN UPDATE",
+                          PSP_THEME_TEXT_MUTED, 1);
+    launcher_draw_text_at(189, 204, "MAY TAKE A MOMENT.",
+                          PSP_THEME_TEXT_MUTED, 1);
+    launcher_publish_prepared();
+}
+
 static bool launcher_boot_slot(
-    const TilefinchInstallPaths *paths, TilefinchUpdateSlot slot)
+    const TilefinchInstallPaths *paths, TilefinchUpdateSlot slot, bool allow_module,
+    bool fresh_install)
 {
     char slot_dir[TILEFINCH_INSTALL_PATH_LIMIT];
     char eboot[TILEFINCH_INSTALL_PATH_LIMIT];
@@ -399,6 +452,53 @@ static bool launcher_boot_slot(
      * A successful call does not return. Keep the ordinary call afterward
      * for PPSSPP and environments which implement only the standard API.
      */
+#ifdef TILEFINCH_PSP_LAUNCHER_TIMING
+    char arguments[TILEFINCH_INSTALL_PATH_LIMIT + PSP_BOOT_TIMING_ARGUMENT_BYTES];
+    size_t path_bytes = strlen(eboot) + 1u;
+    memcpy(arguments, eboot, path_bytes);
+    cfw_parameters.args = path_bytes + PSP_BOOT_TIMING_ARGUMENT_BYTES;
+    cfw_parameters.argp = arguments;
+    uint64_t handoff_tick = 0;
+    (void) psp_boot_timing_clock(&handoff_tick);
+    psp_boot_timing_encode(arguments + path_bytes, (PspBootHandoffTiming) {
+        launcher_process_entered_us, handoff_tick
+    });
+#endif
+    if (allow_module && fresh_install && slot == TILEFINCH_UPDATE_SLOT_A) {
+        char bundled[TILEFINCH_INSTALL_PATH_LIMIT];
+        static const uint8_t digest[32] = TILEFINCH_PREPACKAGED_DIGEST;
+        int n = snprintf(bundled, sizeof(bundled), "%s/%s", slot_dir,
+                         TILEFINCH_PREPACKAGED_MODULE);
+        if (n > 0 && (size_t)n < sizeof(bundled)
+            && psp_boot_prepackaged_module(eboot, bundled,
+                TILEFINCH_PREPACKAGED_PBP_BYTES, TILEFINCH_PREPACKAGED_MODULE_BYTES, digest)) {
+            psp_boot_module_start(bundled, cfw_parameters.argp,
+                cfw_parameters.args, launcher_retire_callbacks, NULL);
+            /* A returned failure must not retry this optional copy next boot.
+               The authoritative PBP remains available for ordinary startup. */
+            (void)remove(bundled);
+            /* A returned start can leave a parked consumer. Replace process;
+               never attempt a second module or force-unload uncertain code. */
+            goto ordinary_startup;
+        }
+    }
+    char cache[TILEFINCH_INSTALL_PATH_LIMIT];
+    char temporary[TILEFINCH_INSTALL_PATH_LIMIT];
+    int cache_length = snprintf(cache, sizeof(cache), "%s/startup-module.prx", paths->data_dir);
+    int temporary_length = snprintf(temporary, sizeof(temporary), "%s/startup-module.tmp", paths->data_dir);
+    if (allow_module && cache_length > 0 && (size_t)cache_length < sizeof(cache)
+        && temporary_length > 0 && (size_t)temporary_length < sizeof(temporary)
+        && psp_boot_cache_prepare(eboot, cache, temporary,
+            launcher_boot_scratch, sizeof(launcher_boot_scratch),
+            launcher_cache_space, launcher_cache_work_started,
+            (void *)paths->data_dir) != PSP_BOOT_CACHE_UNAVAILABLE) {
+        psp_boot_module_start(cache, cfw_parameters.argp,
+            cfw_parameters.args, launcher_retire_callbacks, NULL);
+        /* A returned start failed before heap retirement. Forget the optional
+           copy so a recoverable load failure cannot persist on every boot. */
+        psp_boot_cache_discard(paths->data_dir);
+    }
+ordinary_startup:;
     int cfw_result =
         sctrlKernelLoadExecVSHMs2(eboot, &cfw_parameters);
     struct SceKernelLoadExecParam fallback_parameters = {
@@ -407,6 +507,15 @@ static bool launcher_boot_slot(
         .argp = eboot,
         .key = "game"
     };
+#ifdef TILEFINCH_PSP_LAUNCHER_TIMING
+    fallback_parameters.args = cfw_parameters.args;
+    fallback_parameters.argp = arguments;
+    /* A failed CFW call is not part of the standard loader's interval. */
+    (void) psp_boot_timing_clock(&handoff_tick);
+    psp_boot_timing_encode(arguments + path_bytes, (PspBootHandoffTiming) {
+        launcher_process_entered_us, handoff_tick
+    });
+#endif
     int fallback_result =
         sceKernelLoadExec(eboot, &fallback_parameters);
     char diagnostic[80];
@@ -575,6 +684,7 @@ int main(int argc, char **argv)
 #ifdef TILEFINCH_PSP_LAUNCHER_TIMING
     uint64_t launcher_entered_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    (void) psp_boot_timing_clock(&launcher_process_entered_us);
     LauncherTiming launcher_timing = {
         .entered_us = launcher_entered_us,
         .previous_us = launcher_entered_us
@@ -610,7 +720,8 @@ int main(int argc, char **argv)
     psp_entropy_configure(NULL, PSP_ENTROPY_PERMIT_UNCREDITED, NULL);
 
     TilefinchUpdateState state;
-    if (!tilefinch_update_journal_load(paths.data_dir, &state, NULL)) {
+    bool fresh_install = !tilefinch_update_journal_load(paths.data_dir, &state, NULL);
+    if (fresh_install) {
         memset(&state, 0, sizeof(state));
         state.generation = 1;
         state.active_slot = TILEFINCH_UPDATE_SLOT_A;
@@ -712,7 +823,11 @@ int main(int argc, char **argv)
         }
     }
     LAUNCHER_TIMING_MARK("handoff");
-    if (!launcher_boot_slot(&paths, slot)) {
+    /* Recovery and pre-held L always use the authoritative PBP directly.
+       A full/read-only card or a broken derived cache cannot block rollback. */
+    if (!launcher_boot_slot(&paths, slot,
+            !recovery_button && action != TILEFINCH_UPDATE_BOOT_RECOVERY,
+            fresh_install)) {
         launcher_puts(
             "\nCould not start this slot.\n"
             "Hold L during startup to try the previous version.\n"

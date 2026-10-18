@@ -249,9 +249,40 @@ static void fetch_scheduler_copy_error(char *error, size_t error_size,
     snprintf(error, error_size, "%s", message == NULL ? "" : message);
 }
 
+static bool fetch_scheduler_prepare_transport(FetchScheduler *scheduler)
+{
+    if (scheduler->global_acquired) return true;
+    if (!curl_global_acquire(scheduler->budget)) {
+        fetch_scheduler_set_error(scheduler,
+            curl_global_error[0] == '\0'
+                ? "network runtime or curl memory reservation unavailable"
+                : curl_global_error);
+        return false;
+    }
+    CURLM *multi = curl_multi_init();
+    if (multi == NULL) {
+        fetch_scheduler_set_error(scheduler,
+                                  "curl multi handle exceeded network memory");
+        curl_global_release();
+        return false;
+    }
+#if defined(TILEFINCH_PSP_HTTP2)
+    if (curl_multi_setopt(
+            multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX) != CURLM_OK) {
+        fetch_scheduler_set_error(scheduler, "curl HTTP/2 multiplex setup failed");
+        curl_multi_cleanup(multi);
+        curl_global_release();
+        return false;
+    }
+#endif
+    scheduler->multi = multi;
+    scheduler->global_acquired = true;
+    return true;
+}
+
 static FetchScheduler *fetch_scheduler_create_in_domain_ex(
     FetchSchedulerDomain *domain, size_t maximum_concurrent,
-    size_t maximum_reserved_bytes, char *error, size_t error_size)
+    size_t maximum_reserved_bytes, bool deferred, char *error, size_t error_size)
 {
     fetch_scheduler_copy_error(error, error_size, "");
     if (domain == NULL || domain->budget == NULL
@@ -259,53 +290,31 @@ static FetchScheduler *fetch_scheduler_create_in_domain_ex(
         || maximum_concurrent > FETCH_SCHEDULER_LIMIT
         || maximum_reserved_bytes == 0
         || maximum_reserved_bytes == SIZE_MAX) {
-        fetch_scheduler_copy_error(
-            error, error_size, "invalid scheduler limits");
+        fetch_scheduler_copy_error(error, error_size, "invalid scheduler limits");
         return NULL;
     }
-    if (!curl_global_acquire(domain->budget)) {
-        fetch_scheduler_copy_error(
-            error, error_size,
-            curl_global_error[0] == '\0'
-                ? "network runtime or curl memory reservation unavailable"
-                : curl_global_error);
+    FetchScheduler *scheduler = budget_calloc(domain->budget, 1, sizeof(*scheduler));
+    if (scheduler == NULL) {
+        fetch_scheduler_copy_error(error, error_size, "scheduler state exceeded page memory");
         return NULL;
     }
-    Budget *budget = domain->budget;
-    FetchScheduler *scheduler = budget_calloc(budget, 1,
-                                              sizeof(*scheduler));
-    CURLM *multi = curl_multi_init();
-    if (scheduler == NULL || multi == NULL
-        || fetch_scheduler_domain_retain(domain) == NULL) {
-        fetch_scheduler_copy_error(
-            error, error_size,
-            scheduler == NULL ? "scheduler state exceeded page memory"
-            : (multi == NULL ? "curl multi handle exceeded network memory"
-                             : "scheduler domain retain failed"));
-        if (multi != NULL) curl_multi_cleanup(multi);
-        budget_free(budget, scheduler);
-        curl_global_release();
+    scheduler->budget = domain->budget;
+    if (!deferred && !fetch_scheduler_prepare_transport(scheduler)) {
+        fetch_scheduler_copy_error(error, error_size, scheduler->last_error);
+        budget_free(domain->budget, scheduler);
         return NULL;
     }
-#if defined(TILEFINCH_PSP_HTTP2)
-    if (curl_multi_setopt(
-            multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX) != CURLM_OK) {
-        fetch_scheduler_copy_error(
-            error, error_size, "curl HTTP/2 multiplex setup failed");
-        fetch_scheduler_domain_release(domain);
-        curl_multi_cleanup(multi);
-        budget_free(budget, scheduler);
-        curl_global_release();
+    if (fetch_scheduler_domain_retain(domain) == NULL) {
+        fetch_scheduler_copy_error(error, error_size, "scheduler domain retain failed");
+        if (scheduler->multi != NULL) curl_multi_cleanup(scheduler->multi);
+        if (scheduler->global_acquired) curl_global_release();
+        budget_free(domain->budget, scheduler);
         return NULL;
     }
-#endif
-    scheduler->budget = budget;
-    scheduler->multi = multi;
     scheduler->domain = domain;
     scheduler->capacity = maximum_concurrent;
     scheduler->maximum_reserved_bytes = maximum_reserved_bytes;
     scheduler->next_id = 1;
-    scheduler->global_acquired = true;
     domain->active_views++;
     if (domain->active_views > domain->peak_active_views) {
         domain->peak_active_views = domain->active_views;
@@ -318,7 +327,15 @@ FetchScheduler *fetch_scheduler_create_in_domain(
     size_t maximum_reserved_bytes)
 {
     return fetch_scheduler_create_in_domain_ex(
-        domain, maximum_concurrent, maximum_reserved_bytes, NULL, 0);
+        domain, maximum_concurrent, maximum_reserved_bytes, false, NULL, 0);
+}
+
+FetchScheduler *fetch_scheduler_create_deferred_in_domain(
+    FetchSchedulerDomain *domain, size_t maximum_concurrent,
+    size_t maximum_reserved_bytes)
+{
+    return fetch_scheduler_create_in_domain_ex(
+        domain, maximum_concurrent, maximum_reserved_bytes, true, NULL, 0);
 }
 
 FetchScheduler *fetch_scheduler_create(Budget *budget,
@@ -351,7 +368,7 @@ FetchScheduler *fetch_scheduler_create_ex(
     }
     FetchScheduler *scheduler = fetch_scheduler_create_in_domain_ex(
         domain, maximum_concurrent, maximum_reserved_bytes,
-        error, error_size);
+        false, error, error_size);
     fetch_scheduler_domain_release(domain);
     return scheduler;
 }
@@ -361,6 +378,11 @@ bool fetch_scheduler_enable_background_transport(
 {
     if (scheduler == NULL || scheduler->pending != 0
         || scheduler->reserved_bytes != 0) return false;
+    if (!scheduler->global_acquired) {
+        if (enabled && !fetch_background_transport_available()) return false;
+        scheduler->background_transport_enabled = enabled;
+        return true;
+    }
     if (enabled
         && (!fetch_background_transport_available()
             || !fetch_background_transport_initialize(
@@ -957,6 +979,15 @@ static uint64_t fetch_scheduler_enqueue_internal(
         fetch_scheduler_set_error(
             scheduler, "shared page request slots are full");
         return 0;
+    }
+    /* Local page construction must not initialize the network. Only an
+       admitted request may do so; failure owns no request slot/reservation. */
+    if (!fetch_scheduler_prepare_transport(scheduler)) return 0;
+    if (scheduler->background_transport_enabled
+        && scheduler->background_chunk == NULL) {
+        /* Match eager callers' optional-worker fallback on refusal. */
+        scheduler->background_transport_enabled = false;
+        (void) fetch_scheduler_enable_background_transport(scheduler, true);
     }
     ScheduledFetch *item = budget_calloc(
         scheduler->budget, 1, sizeof(*item));
@@ -1889,7 +1920,8 @@ size_t fetch_scheduler_pump_bounded(
     FetchPumpMetrics *metrics)
 {
     if (metrics != NULL) memset(metrics, 0, sizeof(*metrics));
-    if (scheduler == NULL || maximum_completions == 0) return 0;
+    if (scheduler == NULL || maximum_completions == 0
+        || scheduler->multi == NULL) return 0;
     FetchPumpMetrics local = {0};
     FetchPumpMetrics *pump = metrics == NULL ? &local : metrics;
     size_t bytes_remaining = quota == NULL
@@ -2556,7 +2588,7 @@ void fetch_scheduler_destroy(FetchScheduler *scheduler)
     for (size_t i = 0; i < scheduler->capacity; i++) {
         scheduled_fetch_clear(scheduler, &scheduler->items[i]);
     }
-    curl_multi_cleanup(scheduler->multi);
+    if (scheduler->multi != NULL) curl_multi_cleanup(scheduler->multi);
     bool acquired = scheduler->global_acquired;
     budget_free(budget, scheduler->background_chunk);
     budget_free(budget, scheduler);

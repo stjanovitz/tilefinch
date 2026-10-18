@@ -21,8 +21,12 @@ int main(void)
        claimed head outside any preroll. */
     psp_media_startup_claim(&startup);
     CHECK(!psp_media_startup_active(&startup));
+    psp_media_startup_publish(&startup);
+    CHECK(!psp_media_startup_active(&startup));
 
     CHECK(psp_media_startup_begin(&startup, 7));
+    CHECK(psp_media_startup_filling(&startup));
+    psp_media_startup_publish(&startup);
     CHECK(psp_media_startup_filling(&startup));
     CHECK(!psp_media_startup_presented(&startup, 8));
     /* A second begin keeps the running preroll and its baseline. */
@@ -33,10 +37,17 @@ int main(void)
     CHECK(psp_media_startup_claimed(&startup));
     CHECK(!psp_media_startup_filling(&startup));
     CHECK(!psp_media_startup_presented(&startup, 7));
-    CHECK(psp_media_startup_presented(&startup, 8));
+    CHECK(!psp_media_startup_presented(&startup, 8)); /* draw is not a latch */
     /* Claiming again (a later frame) stays claimed. */
     psp_media_startup_claim(&startup);
     CHECK(psp_media_startup_claimed(&startup));
+    psp_media_startup_publish(&startup);
+    CHECK(psp_media_startup_active(&startup));
+    CHECK(!psp_media_startup_presented(&startup, 7));
+    CHECK(psp_media_startup_presented(&startup, 8));
+    psp_media_startup_claim(&startup);
+    psp_media_startup_publish(&startup);
+    CHECK(psp_media_startup_presented(&startup, 8));
 
     psp_media_startup_end(&startup);
     CHECK(!psp_media_startup_active(&startup));

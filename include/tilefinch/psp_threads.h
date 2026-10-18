@@ -16,6 +16,10 @@
  * Owner checkpoints donate bounded CPU windows during setup and polling so
  * browser work cannot starve the worker or firmware network service.
  * The browser outranks best-effort clock changes for the same reason.
+ * While composing a decoded video picture, the browser temporarily outranks
+ * transport so ready graphics work cannot wait behind another body burst.
+ * Hardware waits still let transport run; normal priority resumes immediately
+ * after scanout publication, before input or the next owner turn.
  *
  * Module loading and voice share the short real-time service band, but do not
  * run concurrently with active playback in the supported flow.
@@ -27,6 +31,7 @@
 #define TILEFINCH_PSP_THREAD_PRIORITY_AUDIO         0x18
 #define TILEFINCH_PSP_THREAD_PRIORITY_VOICE         0x18
 #define TILEFINCH_PSP_THREAD_PRIORITY_CODEC         0x19
+#define TILEFINCH_PSP_THREAD_PRIORITY_PRESENT       0x1e
 #define TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT     0x1f
 #define TILEFINCH_PSP_THREAD_PRIORITY_BROWSER       0x20
 #define TILEFINCH_PSP_THREAD_PRIORITY_SWDEC         0x21
@@ -46,6 +51,12 @@ _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_DMA
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_AUDIO
                    < TILEFINCH_PSP_THREAD_PRIORITY_CODEC,
                "audio output must not queue behind firmware decode");
+_Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_CODEC
+                   < TILEFINCH_PSP_THREAD_PRIORITY_PRESENT,
+               "audio/codec dispatch must outrank video composition");
+_Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_PRESENT
+                   < TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT,
+               "ready video publication must outrank transport bursts");
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_CODEC
                    < TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT,
                "codec dispatch must keep the Media Engine fed");

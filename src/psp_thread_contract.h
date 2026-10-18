@@ -53,4 +53,23 @@ static inline int psp_thread_wait_end_bounded(
     return sceKernelWaitThreadEnd(thread, &timeout_us);
 }
 
+/* Owner-only, lexical scope. A caller already at a higher priority is left
+   alone, as is a refused raise. Return the exact previous priority only when
+   firmware accepted the change; -1 means there is nothing to restore. */
+static inline int psp_thread_priority_raise(int priority)
+{
+    SceUID thread = sceKernelGetThreadId();
+    SceKernelThreadInfo info;
+    if (psp_thread_snapshot(thread, &info) < 0
+        || info.currentPriority <= priority) return -1;
+    if (sceKernelChangeThreadPriority(thread, priority) < 0) return -1;
+    return info.currentPriority;
+}
+
+static inline int psp_thread_priority_restore(int previous)
+{
+    if (previous < 0) return 0;
+    return sceKernelChangeThreadPriority(sceKernelGetThreadId(), previous);
+}
+
 #endif
