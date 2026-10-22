@@ -163,8 +163,8 @@ All committed fidelity rows are expected to pass. Exact floors live only in
 
 ## PSP engineering constraints
 
-The engine runs inside a 16 MiB (`strict`) or 24 MiB (`realistic`) shared
-ceiling on a 32-bit in-order MIPS core with no virtual memory. In engine code:
+The engine runs inside a 16 MiB (`strict`) or 32 MiB (`realistic`, the PSP
+app's own, shared with voice) ceiling on a 32-bit in-order MIPS core with no virtual memory. In engine code:
 
 - **Allocate through the `Budget` allocator** (`include/tilefinch/budget.h`).
   Every byte the page owns — DOM, JavaScript heap, styles, resources, layout,
@@ -184,6 +184,17 @@ ceiling on a 32-bit in-order MIPS core with no virtual memory. In engine code:
 - Prefer the `BrowserEngine` facade (`include/tilefinch/browser_engine.h`) for new
   frontend work; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership
   and lifecycle boundaries.
+
+## The PSP source-text contract test is frozen
+
+`tests/test_psp_sdk_contracts.py` pins C source text (needles, orderings,
+slices of PSP-only files) rather than behaviour, so it breaks on harmless
+renames and passes when behaviour is wrong but spelled the same. Do not add
+checks to it. Put a new PSP invariant in a host-compiled behavioural test,
+behind a seam such as `PspDisplayBackend` if needed. When a refactor breaks
+one of its checks, update only that check, minimally, or replace it with a
+behavioural test; deleting a check that a named behavioural test covers is
+welcome.
 
 ## Verification discipline
 

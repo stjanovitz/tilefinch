@@ -141,6 +141,38 @@ typedef int32_t StyleLength;
 #define GRID_TRACK_MAX_CONTENT_VALUE UINT16_C(2)
 #define GRID_TRACK_FIT_CONTENT_FLAG UINT16_C(0x8000)
 #define GRID_TRACK_FIT_CONTENT_MASK UINT16_C(0x7fff)
+/*
+ * The second grid-auto-columns/rows track, packed into 16 bits: the track
+ * type in the top two bits and a 14-bit value. Zero means "no second
+ * track", so an AUTO track stores its keyword value plus one (auto is 1,
+ * min-content 2, max-content 3); every other type has a non-zero type
+ * field. A fit-content() track or a value over 14 bits does not fit and
+ * is not packed.
+ */
+#define GRID_AUTO_SECOND_VALUE_MASK UINT16_C(0x3fff)
+static inline bool grid_auto_second_pack(uint8_t type, unsigned value,
+                                         uint16_t *packed)
+{
+    if (type == GRID_TRACK_AUTO) {
+        if (value > GRID_TRACK_MAX_CONTENT_VALUE) return false;
+        value++;
+    } else if (type > GRID_TRACK_PERCENT
+               || value > GRID_AUTO_SECOND_VALUE_MASK) {
+        return false;
+    }
+    *packed = (uint16_t) (((unsigned) type << 14) | value);
+    return true;
+}
+static inline uint8_t grid_auto_second_type(uint16_t packed)
+{
+    return (uint8_t) (packed >> 14);
+}
+static inline unsigned grid_auto_second_value(uint16_t packed)
+{
+    unsigned value = packed & GRID_AUTO_SECOND_VALUE_MASK;
+    return grid_auto_second_type(packed) == GRID_TRACK_AUTO && value != 0
+        ? value - 1u : value;
+}
 /* Explicit tracks per axis. Realistic page grids (12-column mobile
    layouts, 14- and 16-column editorial grids, 24-column frameworks) must
    keep every track; the stylesheet track-template tables and the transient
@@ -809,6 +841,8 @@ typedef struct {
     bool min_width_auto;
     bool min_width_percent;
     bool max_width_percent;
+    /* Uses padding before width; needed by column-flex automatic minima. */
+    bool min_height_auto;
     int width;
     int width_offset;
     bool has_height;
@@ -850,7 +884,12 @@ typedef struct {
     /* CSS content:url() replaces an element; shares generated_text storage
        and the alignment byte before generated_attr, not a new URL pointer. */
     bool generated_image;
-    const char *generated_attr;
+    union {
+        const char *generated_attr;
+        /* A short UTF-8 scalar in an unmaterialized declaration. The
+           generated_attr_length sentinel distinguishes it from attr(). */
+        char generated_scalar[4];
+    };
     bool has_top;
     bool has_right;
     bool has_bottom;
@@ -879,9 +918,11 @@ typedef struct {
     uint16_t shadow_host : 1;
     /* Preserve the hidden keyword for CSSOM without enlarging the style. */
     uint16_t overflow_y_hidden : 1;
-    /* A single bounded implicit-track size covers the common Level 1 form.
-       Lists retain their first value deterministically until cyclic implicit
-       track lists can justify additional per-style storage. */
+    /* grid-auto-columns/rows keep at most two implicit track sizes: the
+       first here and the second, packed by grid_auto_second_pack(), below.
+       A longer list, or a second track the packing cannot hold, is
+       rejected until cyclic implicit track lists justify more per-style
+       storage. */
     uint16_t grid_auto_column_value;
     uint16_t grid_auto_row_value;
     /* A second bounded implicit sizing function is independent of the
@@ -909,8 +950,8 @@ typedef struct {
     uint8_t resize_mode : 2;
     uint8_t touch_action : 2;
     uint8_t content_visibility : 2;
-    /* Uniform CSS scale in Q2.6. */
-    uint8_t transform_scale_q6;
+    /* Uniform CSS scale in Q2.14, reusing alignment padding before x/y. */
+    uint16_t transform_scale_q14;
     bool transform_x_percent;
     bool transform_y_percent;
     int transform_x;
@@ -1831,11 +1872,13 @@ typedef struct {
     uint8_t name_length;
     /* False: an element sees only its own declarations, never an
        ancestor's. */
-    bool inherits;
+    bool inherits : 1;
+    bool length_syntax : 1;
+    bool registered_by_api : 1;
 } StyleRegisteredProperty;
 
-/* Registrations kept per sheet; later ones are ignored (Tailwind v4
-   registers about a hundred). */
+/* Unique registrations kept per sheet; excess names are ignored for
+   @property and refused by the API (Tailwind v4 registers about a hundred). */
 #define STYLE_REGISTERED_PROPERTY_LIMIT 256u
 
 /* Text limits of a StyleCustomRule, each including the terminating NUL. A
@@ -1849,7 +1892,8 @@ typedef struct {
 #define STYLE_CUSTOM_SELECTOR_CAPACITY STYLE_SELECTOR_TEXT_CAPACITY
 #define STYLE_CUSTOM_NAME_CAPACITY 128u
 #define STYLE_CUSTOM_VALUE_CAPACITY 1024u
-/* Custom-property values at least this long are "long": together they may
+/* Custom-property values at least this long are "long": together with
+   long transition values (STYLE_TRANSITION_SHORT_VALUE_CAPACITY) they may
    take at most STYLE_CUSTOM_LONG_VALUE_BYTES of one sheet's arena (the
    census maximum is about 14 KiB per page), and a long declaration past
    that total is dropped like an oversized one. */
@@ -1928,10 +1972,32 @@ typedef struct {
 } StyleTransitionRule;
 
 #define STYLE_TRANSITION_LIST_LIMIT 8u
+/* The longest serialized <easing-function>, with its NUL, that one timing
+   item takes: a linear() of about 80 stops, which covers the generated
+   spring and bounce curves pages use (tens of stops). A longer one is
+   rejected rather than truncated, alike by transition-timing-function, CSS
+   animations and Element.animate() (__tilefinchTimingFunction). */
+#define STYLE_TIMING_FUNCTION_CAPACITY 1024u
+/* The bytes all the serialized easings of one timing list share: room for
+   two maximal linear() items, or eight of a quarter of that, beside the
+   initial "ease" every list keeps at offset 0 (transition_initial). A list
+   whose easings need more is rejected like an invalid one. */
+#define STYLE_TIMING_LIST_TEXT_CAPACITY \
+    (2u * STYLE_TIMING_FUNCTION_CAPACITY + (unsigned) sizeof("ease"))
+/* The longest transition declaration value retained (longer ones are
+   dropped as invalid); a value of STYLE_TRANSITION_SHORT_VALUE_CAPACITY
+   bytes or more also draws on the sheet's long-value allowance
+   (STYLE_CUSTOM_LONG_VALUE_BYTES). */
+#define STYLE_TRANSITION_VALUE_CAPACITY 2048u
+#define STYLE_TRANSITION_SHORT_VALUE_CAPACITY 256u
 
 /* The computed transition longhands of one element. Lists keep their
    authored length up to STYLE_TRANSITION_LIST_LIMIT items; an element with
-   nothing authored has the initial single item (all 0s ease 0s). */
+   nothing authored has the initial single item (all 0s ease 0s). Built on
+   demand (getComputedStyle, the transition watcher), never stored per
+   element: ComputedStyle holds no transition state. Timing item i is the
+   string at timing_text + timing_offsets[i] (style_transition_timing), so a
+   list of keywords takes a few bytes and only a long linear() takes more. */
 typedef struct {
     uint8_t property_count;
     uint8_t duration_count;
@@ -1940,8 +2006,18 @@ typedef struct {
     char properties[STYLE_TRANSITION_LIST_LIMIT][40];
     double duration_ms[STYLE_TRANSITION_LIST_LIMIT];
     double delay_ms[STYLE_TRANSITION_LIST_LIMIT];
-    char timings[STYLE_TRANSITION_LIST_LIMIT][48];
+    uint16_t timing_offsets[STYLE_TRANSITION_LIST_LIMIT];
+    /* Bytes of timing_text in use; the rest is never read. */
+    uint16_t timing_text_used;
+    char timing_text[STYLE_TIMING_LIST_TEXT_CAPACITY];
 } StyleTransitionComputed;
+
+/* Timing item `index` of `transition`, serialized. */
+static inline const char *style_transition_timing(
+    const StyleTransitionComputed *transition, size_t index)
+{
+    return transition->timing_text + transition->timing_offsets[index];
+}
 
 typedef struct {
     char name[STYLE_DIAGNOSTIC_PROPERTY_NAME_CAPACITY];
@@ -2136,7 +2212,8 @@ typedef struct {
     size_t custom_rule_capacity;
     /* Arena bytes of custom-property values (custom rules, :root
        variables and registered initial values) at least
-       STYLE_CUSTOM_SHORT_VALUE_CAPACITY long, bounded by
+       STYLE_CUSTOM_SHORT_VALUE_CAPACITY long, and of transition values at
+       least STYLE_TRANSITION_SHORT_VALUE_CAPACITY long, bounded by
        STYLE_CUSTOM_LONG_VALUE_BYTES. */
     size_t custom_value_long_bytes;
     StyleRegisteredProperty *registered_properties;
@@ -2183,6 +2260,7 @@ typedef struct {
        page font state behind a stable pointer makes transactional page moves
        safe without growing every Stylesheet or retained ComputedStyle. */
     StyleWebFonts *web_fonts;
+    uint64_t font_text_pages;
     /* Transient per-resolution scratch (the node being resolved, its
        font-relative bases, and image-source provenance for the declarations
        being parsed).  Allocated once per sheet in stylesheet_build_context;
@@ -2193,9 +2271,10 @@ typedef struct {
        (style_subject_has_class), allocated on first use. */
     struct StyleClassTokenCache *class_tokens;
     bool class_tokens_refused;
-    /* Sticky demand from font-relative geometry, including empty boxes.
-       Text-command admission alone must not omit these web families. */
-    uint8_t metric_web_font_families;
+    /* Sticky demand from font-relative geometry, including empty boxes:
+       the web-font faces (TILEFINCH_WEB_FONT_WEIGHT_LIMIT bits per family
+       slot) such geometry may use, and each one's primary face at its
+       weight. Text-command admission alone must not omit these faces. */
     uint64_t metric_web_font_faces;
     uint64_t metric_web_font_primary_faces;
     /* Transient layout-owned cooperation state. Unlike resolve_scratch this
@@ -2332,6 +2411,8 @@ typedef struct {
        class-token cache, and linear scans outside it. */
     uint64_t selector_class_token_builds;
     uint64_t selector_class_linear_scans;
+    /* Lab and test diagnostics: what the cascade dropped or rejected. Only
+       trace-enabled builds count them (always zero on the shipping PSP). */
     uint64_t diagnostic_declarations;
     uint64_t diagnostic_supported_declarations;
     uint64_t diagnostic_rejected_declarations;
@@ -2380,6 +2461,7 @@ typedef struct {
     bool selector_attribute_names_ready;
     bool selector_attribute_names_opaque;
     bool document_rules_deferred;
+    const DocumentRegisteredProperty *api_registrations;
     bool rule_batch_active;
     bool rule_batch_dirty;
     bool has_multicolumn_rules;
@@ -2414,7 +2496,8 @@ typedef struct {
        first rule, so navigation can insert a later-added source without a
        rebuild. A link whose fetch failed or whose rules were deduplicated
        away may be absent: it contributes no rule. Bounded-out means
-       "unknown": every later insertion rebuilds. */
+       "unknown": every later insertion rebuilds, and until then adopted
+       rules apply by document scope alone (confined ones fail closed). */
 #define STYLE_SOURCE_NODE_LIMIT 48u
     const lxb_dom_node_t *style_source_nodes[STYLE_SOURCE_NODE_LIMIT];
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
@@ -2425,6 +2508,9 @@ typedef struct {
        style_source_nodes: how many, and the document_adopted_tier_hash fold
        of each with the text revision it was parsed at. */
     uint8_t adopted_source_count;
+    /* Exclusive end of the adopted tail. Later native/user declarations
+       have no source node and must not inherit the last source's scope. */
+    unsigned adopted_rule_order_end;
     uint64_t adopted_sources_signature;
     /* Where those sources' rules apply (stylesheet_set_adopted_scopes);
        bit i is the i-th adopted source. One the document adopts applies to
@@ -2437,7 +2523,9 @@ typedef struct {
     uint64_t adopted_document_mask;
     uint8_t adopted_document_order[64];
     struct StyleAdoptedScopeRoot *adopted_scope_roots;
-    uint8_t adopted_scope_root_count;
+    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (256) roots: a byte would wrap
+       a full table to zero (asserted in style_sheet.c). */
+    uint16_t adopted_scope_root_count;
     /* A refused scope update must never turn confined rules global. */
     bool adopted_scopes_failed;
     bool adopted_order_varies;
@@ -2458,6 +2546,8 @@ typedef struct {
 
 bool stylesheet_build(Stylesheet *sheet, Budget *budget,
                       const PocDocument *document, int viewport_width);
+bool stylesheet_register_api_property(Stylesheet *sheet,
+                                      const DocumentRegisteredProperty *property);
 /* Returns active, non-pseudo selectors whose declaration makes the matched
    element a flex/grid/table layout container. Pointers remain owned by sheet. */
 size_t stylesheet_layout_island_selectors(const Stylesheet *sheet,
@@ -2722,6 +2812,10 @@ bool stylesheet_resolve_named_grid_lines(
 bool stylesheet_serialize_grid_template_tracks(
     const Stylesheet *sheet, const ComputedStyle *container, bool rows,
     char *output, size_t capacity);
+bool stylesheet_serialize_used_grid_columns(
+    const Stylesheet *sheet, const ComputedStyle *container,
+    const int *widths, unsigned count, unsigned origin,
+    char *output, size_t capacity);
 uint32_t stylesheet_border_color(
     const Stylesheet *sheet, const ComputedStyle *style,
     StyleBorderSide side, uint8_t *alpha);
@@ -2875,6 +2969,13 @@ bool style_retained_presentation_value(
 bool style_transition_computed(
     const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
     StyleTransitionComputed *output);
+/* The same cascade for callers that read only the property, duration and
+   delay lists (the transition watcher's snapshot and discovery): easings
+   the stylesheet already validated are recognized but not validated again
+   or serialized, and the timing list stays the initial `ease`. */
+bool style_transition_computed_untimed(
+    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    StyleTransitionComputed *output);
 /* Resolves any declaration deliberately retained outside ComputedStyle.
    This includes the sparse scroll-container and pointer properties as well
    as SVG presentation values. Callers must use a property collected by the
@@ -2931,6 +3032,18 @@ bool style_container_layout_state_add(Stylesheet *sheet,
                                       int content_height,
                                       int padding_horizontal,
                                       int padding_vertical);
+/* The same, for a box whose block size layout found auto: a `size`
+   container is size-contained (CSS Containment 3), so its queries and cqh
+   units answer against `size_contained_height` (its content height laid
+   out without its children: min-height, or 0), not the measured content.
+   < 0: the block size was definite; the measured height stands. */
+bool style_container_layout_state_add_contained(Stylesheet *sheet,
+                                                lxb_dom_node_t *node,
+                                                int content_width,
+                                                int content_height,
+                                                int padding_horizontal,
+                                                int padding_vertical,
+                                                int size_contained_height);
 void style_container_layout_state_clear(Stylesheet *sheet);
 uint64_t style_container_layout_state_signature(const Stylesheet *sheet);
 /* The last layout collected container geometry: the page has container
@@ -2956,7 +3069,10 @@ bool style_container_log_verified(const Stylesheet *sheet);
 void style_container_log_release(Stylesheet *sheet);
 bool style_container_log_active(const Stylesheet *sheet);
 /* Record the content box of `node` if it establishes a size container.
-   content_height < 0: unknown (a size container keeps its prior height). */
+   Its height stays the one the last measured pass recorded; without one,
+   content_height (the size-contained height of a `size` container whose
+   block size is auto, see style_container_layout_state_add_contained) is
+   the first guess, and < 0 or any other container type answers 0. */
 void style_container_live_update(Stylesheet *sheet, lxb_dom_node_t *node,
                                  int content_width, int content_height);
 /* Monotonic count of container-query consultations (dependency probe). */

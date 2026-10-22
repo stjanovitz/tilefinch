@@ -19,8 +19,10 @@ bool psp_media_present_portrait_probe_due(
 bool psp_media_present_has_portrait_content(
     const uint32_t *pixels, int width, int height, int stride_pixels)
 {
-    if (pixels == NULL || width <= height || height < 32 || width > 640
-        || height > 512 || stride_pixels < width || stride_pixels > 2048)
+    if (pixels == NULL || width <= height || height < 32
+        || width > PSP_MEDIA_PRESENT_ROTATION_MAX_WIDTH
+        || height > PSP_MEDIA_PRESENT_ROTATION_MAX_HEIGHT
+        || stride_pixels < width || stride_pixels > 2048)
         return false;
     int crop = height * 9 / 16;
     int margin = (width - crop) / 2;
@@ -247,22 +249,15 @@ bool psp_media_present_plan_clockwise(
     return true;
 }
 
-void psp_media_present_quad_vertices(
+void psp_media_present_clockwise_vertices(
     const PspMediaPresentQuad *quad, PspMediaPresentVertex vertices[4])
 {
     /* Clockwise positions of the source's TL, TR, BR, BL corners. A sprite
        cannot exchange texture axes; a four-vertex fan can, without a copy. */
-    if (quad->clockwise) {
-        vertices[0] = (PspMediaPresentVertex) {quad->u0, quad->v0, quad->x1, quad->y0, 0};
-        vertices[1] = (PspMediaPresentVertex) {quad->u1, quad->v0, quad->x1, quad->y1, 0};
-        vertices[2] = (PspMediaPresentVertex) {quad->u1, quad->v1, quad->x0, quad->y1, 0};
-        vertices[3] = (PspMediaPresentVertex) {quad->u0, quad->v1, quad->x0, quad->y0, 0};
-    } else {
-        vertices[0] = (PspMediaPresentVertex) {quad->u0, quad->v0, quad->x0, quad->y0, 0};
-        vertices[1] = (PspMediaPresentVertex) {quad->u1, quad->v0, quad->x1, quad->y0, 0};
-        vertices[2] = (PspMediaPresentVertex) {quad->u1, quad->v1, quad->x1, quad->y1, 0};
-        vertices[3] = (PspMediaPresentVertex) {quad->u0, quad->v1, quad->x0, quad->y1, 0};
-    }
+    vertices[0] = (PspMediaPresentVertex) {quad->u0, quad->v0, quad->x1, quad->y0, 0};
+    vertices[1] = (PspMediaPresentVertex) {quad->u1, quad->v0, quad->x1, quad->y1, 0};
+    vertices[2] = (PspMediaPresentVertex) {quad->u1, quad->v1, quad->x0, quad->y1, 0};
+    vertices[3] = (PspMediaPresentVertex) {quad->u0, quad->v1, quad->x0, quad->y0, 0};
 }
 
 bool psp_media_present_plan_portrait_crop(
@@ -270,7 +265,7 @@ bool psp_media_present_plan_portrait_crop(
     int source_width, int source_height, int source_stride_pixels,
     int screen_width, int screen_height)
 {
-    if (source_width <= 0 || source_width > 640
+    if (source_width <= 0 || source_width > PSP_MEDIA_PRESENT_ROTATION_MAX_WIDTH
         || source_height <= 0 || source_height > PSP_MEDIA_PRESENT_TEXTURE_MAX
         || source_stride_pixels < source_width) return false;
     int width = source_height * 9 / 16;

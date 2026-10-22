@@ -8,6 +8,40 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.42 — 2026-10-22
+
+- When memory runs out, pages no longer lose click handlers and other event listeners on removed or re-inserted elements.
+- Site information, Site data & storage, Help details and the video error panel now appear in your interface language.
+- Many more messages appear in your interface language: setting changes, site storage, themes, video errors and progress, the Update and Previous versions screens, and the font-pack install box.
+- Interface language downloads are smaller and use less memory; installing one removes its older versions from the Memory Stick.
+- After an update, if your interface language or its font pack needs a new download, a notice offers to take you to Interface language.
+- Faster D-pad focus on revisited pages and pages with many style tags, faster container queries, and cheaper DOM updates while images load.
+- Fixed a possible crash with `::before`/`::after` items in baseline-aligned flex rows; grids using `minmax(min(100%, 20rem), 1fr)` and similar keep their columns; pages with many repeated `@container` rules apply all of them.
+- Re-downloading an interface language now works when an older copy is on the Memory Stick, and an unusable saved YouTube login is removed instead of warning on every start.
+- `element.animate()` now eases linearly by default, long `linear()` easings work in transitions, section-paged documents keep listeners on more than 128 elements, and an undecodable JPEG now fires `error`.
+- Pages with more than 128 elements that have event listeners no longer lose some listeners over time; images that fail to load now fire `error`, including `src=""`.
+- Malformed CSS is now ignored as in other browsers: five-value `margin`, invalid transition and animation timing functions, bad `minmax()` and over-long `grid-auto-rows` lists; `env()` fallbacks now apply in more properties.
+- `outline` and `border-radius` values containing functions such as `rgb(0 0 0 / 50%)` or `calc()` now apply, as do `outline: thick` and border keywords in any letter case.
+- Container queries on `orientation` and `aspect-ratio` now apply, and `@media` accepts range syntax for `aspect-ratio`.
+- Pages no longer leak removed elements whose event handlers refer to themselves, and `img.complete` is correct for images that failed to load.
+- A signed-in YouTube session with many cookies no longer appears signed out: oversized cookie headers now keep the sign-in cookies instead of sending none.
+- Pages that preload many images no longer hang waiting for them, and a new image can no longer show a freed image's size.
+- `@container not (...)` rules and long `var()` values now apply; component styles stay inside their component; flex baselines line up with relatively positioned text.
+
+- CSS transitions between named colours now animate; `@container` queries accept `calc()` and all length units; flex baseline alignment honours line-height.
+- Pages with very many web components, long `calc()` letter-spacing, or `:has(a:any-link)` rules now style correctly, and an extreme `hsl()` hue no longer hangs the page.
+- Clearer download errors, no false 4 GB/s speeds after a server restart, and a translatable Downloads page.
+- A `boot.cfg` naming a retired experimental video decoder now starts normally.
+- Debug and experiment code removed from the shipped build, which is about 12 KB smaller.
+
+- Variable web fonts, uppercase CSS selectors and web-component styles now render correctly, and SVG artwork past its clip limits appears instead of vanishing.
+- Image-heavy pages and canvas games load images reliably: `load` events fire for every image, and drawing an image that is still loading no longer stalls it.
+- YouTube links with a start time such as `t=1m30s` open at that time; playlists keep auto-advancing and report a video that can't open.
+- Downloads that finished but were interrupted now complete on Retry, and the saved compiled-script cache survives Memory Stick errors.
+- Translated interface messages display in full, accented capitals look right, and interface and page language packs load together.
+- "YouTube login: Always" in Settings now works.
+- Faster styling, SVG drawing, sprite icons and Basic view on complex pages, with less memory per request.
+
 ## 0.1.41 — 2026-10-18
 
 - Faster startup, including the first launch after installation. The full startup improvement requires the updated launcher from the install ZIP; in-app updates remain compatible.

@@ -64,12 +64,12 @@ static void grid_defined_row_track(
     bool use_second = auto_sized && second_auto_row != 0
                       && (auto_index & 1u) != 0;
     *type = use_second
-        ? (uint8_t) (second_auto_row >> 14)
+        ? grid_auto_second_type(second_auto_row)
         : (auto_sized
            ? style->grid_auto_row_type
            : stylesheet_grid_track_type(sheet, style, true, row));
     *value = use_second
-        ? second_auto_row & 0x3fffu
+        ? grid_auto_second_value(second_auto_row)
         : (auto_sized
            ? style->grid_auto_row_value
            : stylesheet_grid_track_value(sheet, style, true, row));
@@ -379,8 +379,8 @@ static void grid_laid_items_release(LayoutContext *context,
    move exactly those items' output down. Each translation runs to the end
    of the output arrays, so walk the items in layout order and apply the
    change in the required cumulative offset at each item's start. Returns
-   false when the record is incomplete (the caller keeps later rows fixed,
-   as before). */
+   false when the record is incomplete (the caller then leaves later rows
+   where they were laid out). */
 static bool grid_shift_later_rows(LayoutContext *context,
                                   const GridLaidItems *laid,
                                   int grown_row, int grown)
@@ -456,9 +456,9 @@ static void grid_resolve_final_rows(
             int implicit = explicit_row < 0
                 ? explicit_row : explicit_row - explicit_grid_rows;
             bool second = second_implicit_row != 0 && (implicit & 1) != 0;
-            type = second ? (uint8_t) (second_implicit_row >> 14)
+            type = second ? grid_auto_second_type(second_implicit_row)
                           : style->grid_auto_row_type;
-            value = second ? second_implicit_row & 0x3fffu
+            value = second ? grid_auto_second_value(second_implicit_row)
                            : style->grid_auto_row_value;
         }
         automatic[row] = type == GRID_TRACK_AUTO;
@@ -626,6 +626,18 @@ bool layout_block_grid_section(LayoutContext *context,
     int grid_max_column = explicit_grid_columns;
     int grid_min_row = 0;
     int grid_max_row = explicit_grid_rows;
+    /* A single row of identical fixed implicit columns needs no occupancy
+       or sizing storage beyond the existing table: further auto items can
+       repeat its last track arithmetically. Other grids keep their bounded
+       general-placement fallback. */
+    bool repeat_fixed_columns = computed_style_grid_auto_flow_column(style)
+        && explicit_grid_columns == 0 && explicit_grid_rows == 0
+        && !inherited_grid_columns && !inherited_grid_rows
+        && style->grid_auto_column_type == GRID_TRACK_FIXED
+        && style->grid_auto_column_value > 0
+        && style->grid_auto_column_second == 0
+        && (style->justify_content == JUSTIFY_START
+            || style->justify_content == JUSTIFY_STRETCH);
     if (grid && !replaced_content) {
         FlatItemIterator *iterator = &scratch->traversal.flat.iterator;
         FlatItem *item = &scratch->traversal.flat.item;
@@ -641,6 +653,15 @@ bool layout_block_grid_section(LayoutContext *context,
                 continue;
             }
             grid_children++;
+            if (repeat_fixed_columns
+                && (computed_style_grid_column_start(&item->style) != 0
+                || computed_style_grid_column_end(&item->style) != 0
+                || computed_style_grid_row_start(&item->style) != 0
+                || computed_style_grid_row_end(&item->style) != 0
+                || computed_style_grid_column_span(&item->style) > 1
+                || computed_style_grid_row_span(&item->style) > 1)) {
+                repeat_fixed_columns = false;
+            }
             if (grid_item_locked_to_major_axis(&item->style, style)) {
                 grid_locked_children++;
             }
@@ -741,7 +762,7 @@ bool layout_block_grid_section(LayoutContext *context,
             uint8_t type = adaptive_columns
                 ? GRID_TRACK_FLEX
                 : (use_second_implicit_column
-                   ? (uint8_t) (implicit_column_second >> 14)
+                   ? grid_auto_second_type(implicit_column_second)
                    : (auto_sized_column
                    ? style->grid_auto_column_type
                    : stylesheet_grid_track_type(
@@ -749,7 +770,7 @@ bool layout_block_grid_section(LayoutContext *context,
                        (unsigned) explicit_column)));
             unsigned value = adaptive_columns ? 1000u
                 : (use_second_implicit_column
-                   ? implicit_column_second & 0x3fffu
+                   ? grid_auto_second_value(implicit_column_second)
                    : (auto_sized_column
                       ? style->grid_auto_column_value
                       : stylesheet_grid_track_value(
@@ -1176,6 +1197,9 @@ bool layout_block_grid_section(LayoutContext *context,
             track_starts[column] = track_cursor;
             track_cursor += track_widths[column] + distributed_gap;
         }
+        layout_record_grid_columns(context->layout, node, track_widths,
+                                   (unsigned) columns,
+                                   (unsigned) grid_column_origin);
         int row_track_heights[GRID_PLACEMENT_ROW_LIMIT] = {0};
         unsigned explicit_rows = (unsigned) explicit_grid_rows;
         int uniform_row_height = 0;
@@ -1378,10 +1402,10 @@ bool layout_block_grid_section(LayoutContext *context,
             bool second = second_implicit_row != 0
                 && (implicit & 1) != 0;
             uint8_t type = second
-                ? (uint8_t) (second_implicit_row >> 14)
+                ? grid_auto_second_type(second_implicit_row)
                 : style->grid_auto_row_type;
             unsigned value = second
-                ? second_implicit_row & 0x3fffu
+                ? grid_auto_second_value(second_implicit_row)
                 : style->grid_auto_row_value;
             if (type == GRID_TRACK_FIXED) {
                 row_track_heights[row] = (int) value;
@@ -1521,6 +1545,10 @@ bool layout_block_grid_section(LayoutContext *context,
             }
         }
         GridPlacementState placement_state = placement_template;
+        size_t in_flow_commands = context->layout->count;
+        size_t in_flow_links = context->layout->link_count;
+        size_t in_flow_controls = context->layout->control_count;
+        size_t in_flow_boxes = context->layout->node_box_count;
         FlexItemIterator *iterator = &scratch->traversal.flex.iterator;
         FlatItem *item = &scratch->traversal.flex.item;
         /* Latest row that already holds a laid-out item: rows after it can
@@ -1545,6 +1573,7 @@ bool layout_block_grid_section(LayoutContext *context,
         size_t span_align_count = 0;
         bool reshare_possible = !inherited_grid_rows
             && flex_track_space_definite;
+        size_t repeated_columns = 0;
         flex_iterator_init(iterator, context, node, style, grid_order);
         while (flex_iterator_next(iterator, item)) {
             grid_resolve_item_placement(
@@ -1553,8 +1582,13 @@ bool layout_block_grid_section(LayoutContext *context,
                 continue;
             }
             GridItemPlacement item_placement;
-            (void) grid_place_item(
+            bool placed = grid_place_item(
                 &placement_state, &item->style, &item_placement);
+            bool repeat_column = !placed && repeat_fixed_columns;
+            if (repeat_column) {
+                item_placement.row = 0;
+                repeated_columns++;
+            }
             int grid_row = item_placement.row;
             while (initialized_rows <= grid_row) {
                 int previous = initialized_rows - 1;
@@ -1588,6 +1622,11 @@ bool layout_block_grid_section(LayoutContext *context,
                 assigned_cell_width += track_widths[column + offset];
             }
             int child_x = track_starts[column];
+            if (repeat_column) {
+                child_x = layout_clamp_coordinate((int64_t) child_x
+                    + (int64_t) repeated_columns
+                        * ((int64_t) track_widths[column] + distributed_gap));
+            }
             int child_bottom = row_top;
             if (item->anonymous_text) {
                 reshare_possible = false;
@@ -1669,10 +1708,10 @@ bool layout_block_grid_section(LayoutContext *context,
                             bool second = second_implicit_row != 0
                                 && (implicit & 1) != 0;
                             row_type = second
-                                ? (uint8_t) (second_implicit_row >> 14)
+                                ? grid_auto_second_type(second_implicit_row)
                                 : style->grid_auto_row_type;
                             row_value = second
-                                ? second_implicit_row & 0x3fffu
+                                ? grid_auto_second_value(second_implicit_row)
                                 : style->grid_auto_row_value;
                         }
                         collapsed_flex_track = row_type == GRID_TRACK_FLEX
@@ -1870,7 +1909,8 @@ bool layout_block_grid_section(LayoutContext *context,
                             &stretch_row_value);
                     }
                     context->assigned_grid_minimum =
-                        stretch_row_type == GRID_TRACK_FLEX
+                        !definite_height
+                        && stretch_row_type == GRID_TRACK_FLEX
                         && stretch_row_value != 0
                         && item_placement.row_span == 1
                         && laid_out_row <= grid_row;
@@ -2055,7 +2095,10 @@ bool layout_block_grid_section(LayoutContext *context,
             grid_resolve_item_placement(context, node, style, &item->style);
             if (item->style.out_of_flow || item->style.fixed_position) continue;
             GridItemPlacement final_placement;
-            if (!grid_place_item(&placement_state, &item->style, &final_placement)) continue;
+            if (!grid_place_item(&placement_state, &item->style, &final_placement)) {
+                if (!repeat_fixed_columns) continue;
+                final_placement.row = 0;
+            }
             int row = final_placement.row;
             int last = row + final_placement.row_span - 1;
             if (row < 0 || last >= initialized_rows || item->anonymous_text
@@ -2087,6 +2130,29 @@ bool layout_block_grid_section(LayoutContext *context,
             if (shift != 0) {
                 translate_node_subtree(context->layout, span->node, 0,
                                        shift);
+            }
+        }
+        /* Auto rows acquire their height while laying out their contents.
+           The provisional free space above used zero for those rows; align
+           the completed group, not that empty placeholder. Positioned grid
+           children precede these ranges and retain their own containing box. */
+        if (flex_track_space_definite && initialized_rows > 0
+            && (style->align_content == JUSTIFY_CENTER
+                || style->align_content == JUSTIFY_END)) {
+            int occupied = row_extents[initialized_rows - 1] - row_starts[0];
+            int free_space = declared_content_height - occupied;
+            if (free_space < 0) free_space = 0;
+            int leading = style->align_content == JUSTIFY_CENTER
+                ? free_space / 2 : free_space;
+            int shift = leading - row_leading_space;
+            if (shift != 0) {
+                layout_translate_range(context->layout, in_flow_commands,
+                    in_flow_links, in_flow_controls, in_flow_boxes,
+                    0, shift, "grid-content-align", node);
+                for (int row = 0; row < initialized_rows; row++) {
+                    row_starts[row] = layout_add_coordinate(row_starts[row], shift);
+                    row_extents[row] = layout_add_coordinate(row_extents[row], shift);
+                }
             }
         }
         int grid_bottom = line->y;

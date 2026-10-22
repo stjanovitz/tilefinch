@@ -2999,7 +2999,7 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     task->request_id = valid ? fetch_scheduler_enqueue(
         bridge->fetch_scheduler, task->request_url, &request,
         response_limit, timeout_ms) : 0;
-#if !defined(__PSP__)
+#ifdef JS_RT_XHR_DIAGNOSTICS
     _Static_assert(BUDGET_CATEGORY_COUNT <= 9,
                    "private staging census must cover every Budget category");
     if (task->request_id != 0 && bridge->host != NULL

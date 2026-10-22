@@ -53,7 +53,7 @@ from inline samples and repository fixtures by `make_seeds.py`; they are not
 checked in.
 
 Allocation limits: `run.sh` passes `-malloc_limit_mb=64` and
-`-rss_limit_mb=2048`. The PSP has about 24 MB for everything, so a single
+`-rss_limit_mb=2048`. The PSP app's page envelope is 32 MiB, so a single
 allocation above 64 MB that scales with input is a finding.
 
 Suggested `-max_len`: url 4096, css 8192, html 16384, http 4096,

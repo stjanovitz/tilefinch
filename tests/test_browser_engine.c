@@ -324,12 +324,27 @@ static bool backing_node_write(
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
+        return test_computed_grid_columns();
+    if (argc == 2 && strcmp(argv[1], "--basic-recovery-only") == 0) {
+        CHECK(test_basic_view_admission_and_presentation() == 0);
+        CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
+        CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--history-form-only") == 0) {
+        CHECK(test_history_restores_bounded_form_state() == 0);
+        CHECK(test_history_disclosures_leave_room_for_form_state() == 0);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--empty-document-only") == 0)
         return test_empty_native_document();
     if (argc == 2 && strcmp(argv[1], "--fixed-images-only") == 0)
         return test_fixed_image_publication();
     if (argc == 2 && strcmp(argv[1], "--fixed-image-repaint-only") == 0)
         return test_deferred_image_relayout_requests_repaint();
+    if (argc == 2 && strcmp(argv[1], "--deferred-image-events-only") == 0)
+        return test_deferred_image_retry_fires_load();
     if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
         return test_youtube_login_journey() || test_youtube_personalized_home()
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
@@ -408,9 +423,13 @@ int main(int argc, char **argv)
         failed |= test_transition_timer_exhaustion();
         failed |= test_transition_handler_replacement();
         failed |= test_transition_negative_delay();
+        failed |= test_transition_named_colors();
         failed |= test_transition_watch_scopes();
         failed |= test_transition_listener_discovery_reuse();
         failed |= test_transition_discovery_uses_changed_subtree();
+        failed |= test_easing_validation_agreement();
+        failed |= test_animate_default_easing();
+        failed |= test_long_linear_easing();
         return failed != 0;
     }
     if (argc == 2 && strcmp(argv[1], "--transition-watch-profile") == 0)
@@ -493,6 +512,7 @@ int main(int argc, char **argv)
     CHECK(test_contenteditable_relayout_refusal_retires_shell() == 0);
     CHECK(test_author_relayout_refusal_retires_shell() == 0);
     CHECK(test_history_restores_bounded_form_state() == 0);
+    CHECK(test_history_disclosures_leave_room_for_form_state() == 0);
     CHECK(test_post_mutation_document_refresh_refusal_retires_shell() == 0);
     CHECK(test_page_video_activation() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
@@ -505,6 +525,7 @@ int main(int argc, char **argv)
     CHECK(test_geometry_only_callback_skips_style_only_flow() == 0);
     CHECK(test_focus_paint_geometry_reuse() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
+    CHECK(test_computed_grid_columns() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
     CHECK(test_opacity_geometry_snapshot_reuse() == 0);
@@ -516,13 +537,18 @@ int main(int argc, char **argv)
     CHECK(test_transition_timer_exhaustion() == 0);
     CHECK(test_transition_handler_replacement() == 0);
     CHECK(test_transition_negative_delay() == 0);
+    CHECK(test_transition_named_colors() == 0);
     CHECK(test_transition_watch_scopes() == 0);
     CHECK(test_transition_listener_discovery_reuse() == 0);
     CHECK(test_transition_discovery_uses_changed_subtree() == 0);
+    CHECK(test_easing_validation_agreement() == 0);
+    CHECK(test_animate_default_easing() == 0);
+    CHECK(test_long_linear_easing() == 0);
     CHECK(test_author_error_text_is_not_fatal() == 0);
     CHECK(test_emergency_break_uses_pair_kerning() == 0);
     CHECK(test_managed_challenge_script_heap() == 0);
     CHECK(test_deferred_image_relayout_requests_repaint() == 0);
+    CHECK(test_deferred_image_retry_fires_load() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
@@ -556,6 +582,7 @@ int main(int argc, char **argv)
     CHECK(test_blank_reader_frontend_recovery() == 0);
     CHECK(test_declared_media_card_recovery() == 0);
     CHECK(test_basic_view_admission_and_presentation() == 0);
+    CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
     CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);
@@ -575,6 +602,17 @@ int main(int argc, char **argv)
     CHECK(test_late_candidate_failure_transaction() == 0);
     CHECK(test_allocator_owner_conflict_does_not_poison_engine() == 0);
     CHECK(test_incumbent_teardown_cannot_run_author_javascript() == 0);
+
+    BrowserConfig font_profile;
+    browser_config_init(&font_profile, NULL);
+    CHECK(browser_config_apply_psp_memory_profile(&font_profile, BROWSER_PSP_MEMORY_REALISTIC)
+          && font_profile.resources.maximum_font_bytes == 256u * 1024u
+          && font_profile.resources.maximum_font_file_bytes == 256u * 1024u
+          && font_profile.resources.maximum_font_face_backend_bytes == 256u * 1024u);
+    CHECK(browser_config_apply_psp_memory_profile(&font_profile, BROWSER_PSP_MEMORY_STRICT)
+          && font_profile.resources.maximum_font_file_bytes == 128u * 1024u
+          && font_profile.resources.maximum_font_bytes == 256u * 1024u
+          && font_profile.resources.maximum_font_face_backend_bytes == 256u * 1024u);
 
     BrowserConfig policy_config;
     browser_config_init(&policy_config, NULL);

@@ -33,10 +33,10 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-youtube-playlist-tests PROPERTIES
         LABELS "tilefinch;unit;provider;media;journey" TIMEOUT 30)
     if(NOT PSP)
-        tilefinch_add_test_binary(tilefinch-youtube-feed-probe-tests tests/test_youtube_feed_probe.c)
-        target_link_libraries(tilefinch-youtube-feed-probe-tests PRIVATE tilefinch_core)
-        add_test(NAME tilefinch-youtube-feed-probe-tests COMMAND tilefinch-youtube-feed-probe-tests)
-        set_tests_properties(tilefinch-youtube-feed-probe-tests PROPERTIES
+        tilefinch_add_test_binary(tilefinch-youtube-feed-auth-tests tests/test_youtube_feed_auth.c)
+        target_link_libraries(tilefinch-youtube-feed-auth-tests PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-youtube-feed-auth-tests COMMAND tilefinch-youtube-feed-auth-tests)
+        set_tests_properties(tilefinch-youtube-feed-auth-tests PROPERTIES
             LABELS "tilefinch;unit;provider" TIMEOUT 20)
     endif()
     tilefinch_add_test_binary(tilefinch-linked-video-preview-tests tests/test_linked_video_preview.c)
@@ -70,6 +70,12 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-ui-language-tests COMMAND tilefinch-ui-language-tests)
     set_tests_properties(tilefinch-ui-language-tests PROPERTIES
         LABELS "tilefinch;unit;ui;storage" TIMEOUT 20)
+    # The catalog format's structural checks below the SHA-256 pin.
+    tilefinch_add_test_binary(tilefinch-ui-language-format-tests tests/test_ui_language_format.c)
+    target_link_libraries(tilefinch-ui-language-format-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-ui-language-format-tests COMMAND tilefinch-ui-language-format-tests)
+    set_tests_properties(tilefinch-ui-language-format-tests PROPERTIES
+        LABELS "tilefinch;unit;ui" TIMEOUT 20)
     if(NOT PSP)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         add_test(NAME tilefinch-psp-hot-symbol-tests
@@ -95,6 +101,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         add_test(NAME tilefinch-indic-sequence-tests
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_indic_sequences.py")
         set_tests_properties(tilefinch-indic-sequence-tests PROPERTIES LABELS "tilefinch" TIMEOUT 30)
+        # Every shipped literal status toast has an active-catalog key, and
+        # the catalog keeps no key the browser no longer looks up.
+        add_test(NAME tilefinch-ui-toast-catalog-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_toast_catalog.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tilefinch-ui-toast-catalog-tests PROPERTIES
+            LABELS "tilefinch;unit;ui;tooling" TIMEOUT 60)
         add_test(NAME tilefinch-ui-translation-resources-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_translation_resources.py)
@@ -145,16 +159,6 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_buffered_reply_harness.py)
         set_tests_properties(tilefinch-buffered-reply-harness-tests PROPERTIES
             LABELS "tilefinch;unit;performance;tooling" TIMEOUT 10)
-        add_test(NAME tilefinch-native-tier-sample-report-tests
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_tier_sample_report.py)
-        set_tests_properties(tilefinch-native-tier-sample-report-tests PROPERTIES
-            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
-        add_test(NAME tilefinch-native-tier-admission-report-tests
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_tier_admission_report.py)
-        set_tests_properties(tilefinch-native-tier-admission-report-tests PROPERTIES
-            LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 10)
         if(TARGET psp-browser-interactive-lab)
             if(TARGET PkgConfig::TILEFINCH_FFMPEG)
                 add_test(NAME tilefinch-host-player-cleanup-tests
@@ -186,6 +190,12 @@ if(PSP_BROWSER_BUILD_TESTS)
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_site_census.py
                     $<TARGET_FILE:psp-browser-interactive-lab>)
+            add_test(NAME tilefinch-host-shipping-font-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_shipping_fonts.py
+                    $<TARGET_FILE:psp-browser-interactive-lab>)
+            set_tests_properties(tilefinch-host-shipping-font-tests PROPERTIES
+                LABELS "tilefinch;unit;memory;tooling" TIMEOUT 60)
             set_tests_properties(tilefinch-site-census-tests PROPERTIES
                 LABELS "tilefinch;unit;tooling" TIMEOUT 120)
             add_test(NAME tilefinch-declarative-refresh-lab-tests
@@ -1116,6 +1126,22 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;profile"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-psp-ui-language-repair-tests
+        tests/test_psp_ui_language_repair.c)
+    target_link_libraries(tilefinch-psp-ui-language-repair-tests
+        PRIVATE tilefinch_psp_app_support)
+    target_compile_definitions(tilefinch-psp-ui-language-repair-tests PRIVATE
+        TILEFINCH_UI_RESOURCE_ROOT="${TILEFINCH_UI_RESOURCE_ROOT}")
+    if(NOT PSP)
+        add_dependencies(tilefinch-psp-ui-language-repair-tests
+            tilefinch-ui-resources)
+    endif()
+    add_test(NAME tilefinch-psp-ui-language-repair-tests
+        COMMAND tilefinch-psp-ui-language-repair-tests)
+    set_tests_properties(tilefinch-psp-ui-language-repair-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;ui;storage"
+        TIMEOUT 20)
+
     tilefinch_add_test_binary(tilefinch-psp-lifecycle-tests
         tests/test_psp_lifecycle.c)
     target_link_libraries(tilefinch-psp-lifecycle-tests
@@ -2007,6 +2033,13 @@ if(PSP_BROWSER_BUILD_TESTS)
             SKIP_RETURN_CODE 77
             TIMEOUT 300)
         endif()
+        add_test(NAME tilefinch-lab-layout-dump-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lab_layout_dump.py
+                $<TARGET_FILE:psp-browser-lab>)
+        set_tests_properties(tilefinch-lab-layout-dump-tests PROPERTIES
+            LABELS "tilefinch;unit;tooling;layout;font"
+            TIMEOUT 30)
         add_test(NAME tilefinch-counter-baseline-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_counter_baselines.py
@@ -2058,10 +2091,39 @@ if(PSP_BROWSER_BUILD_TESTS)
             TIMEOUT 10)
         add_test(NAME tilefinch-reference-capture-browser-tests
             COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py)
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                CaptureReceiptTests BrowserCaptureTests)
         set_tests_properties(tilefinch-reference-capture-browser-tests PROPERTIES
             LABELS "tilefinch;acceptance;tooling;network;visual"
             TIMEOUT 120)
+        add_test(NAME tilefinch-reference-query-browser-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                QueryBrowserCaptureTests)
+        set_tests_properties(tilefinch-reference-query-browser-tests PROPERTIES
+            LABELS "tilefinch;acceptance;tooling;network;visual"
+            TIMEOUT 120)
+        add_test(NAME tilefinch-reference-scroll-browser-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                ScrollSurfaceCaptureTests)
+        add_test(NAME tilefinch-reference-worker-browser-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                WorkerCaptureTests)
+        add_test(NAME tilefinch-reference-long-document-browser-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                LongDocumentCaptureTests)
+        set_tests_properties(tilefinch-reference-scroll-browser-tests
+            tilefinch-reference-worker-browser-tests tilefinch-reference-long-document-browser-tests PROPERTIES
+            LABELS "tilefinch;acceptance;tooling;network;visual"
+            TIMEOUT 120)
+        # Browser fixtures use bounded host-operation clocks. Do not run native
+        # load generators beside them and turn contention into false timeouts.
+        set_tests_properties(tilefinch-reference-capture-browser-tests
+            tilefinch-reference-query-browser-tests tilefinch-reference-scroll-browser-tests
+            tilefinch-reference-worker-browser-tests tilefinch-reference-long-document-browser-tests PROPERTIES RUN_SERIAL TRUE)
         add_test(NAME tilefinch-native-capture-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_capture.py
@@ -2785,6 +2847,9 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "ROOT-TEXT-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
+    # Each bounded section-retention table overflows except the stable-key
+    # event-target maps, which grow within the heap's execution reserve:
+    # their 140 listener and handler targets drop nothing.
     add_test(NAME experimental-section-retention-caps
         COMMAND psp-browser-interactive-lab
             --url https://section-retention-cap.test/page
@@ -2797,7 +2862,7 @@ if(PSP_BROWSER_BUILD_TESTS)
             --no-loop-capture
             --output ${CMAKE_CURRENT_BINARY_DIR}/section-retention-cap-final.ppm)
     set_tests_properties(experimental-section-retention-caps PROPERTIES
-        PASS_REGULAR_EXPRESSION "javascript-section-retention wrapper-evictions=[1-9][0-9]* listener-drops=[1-9][0-9]* handler-drops=[1-9][0-9]* observer-drops=[1-9][0-9]* record-drops=[1-9][0-9]* dirty-drops=[1-9][0-9]* state-evictions=[1-9][0-9]* control-drops=[1-9][0-9]*"
+        PASS_REGULAR_EXPRESSION "javascript-section-retention wrapper-evictions=[1-9][0-9]* listener-drops=0 handler-drops=0 observer-drops=[1-9][0-9]* record-drops=[1-9][0-9]* dirty-drops=[1-9][0-9]* state-evictions=[1-9][0-9]* control-drops=[1-9][0-9]*"
         FAIL_REGULAR_EXPRESSION "loop command-failed;status=FAIL"
         TIMEOUT 30)
 
@@ -2857,19 +2922,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     list(REMOVE_ITEM _tilefinch_lab_scenarios ${_tilefinch_tests_before_lab})
     set_tests_properties(${_tilefinch_lab_scenarios} PROPERTIES
         LABELS "tilefinch;lab;scenario")
-
-    if(PSP_BROWSER_QUICKJS_NATIVE_TRACE)
-        tilefinch_add_test_binary(native-trace-tests
-            tests/test_native_trace.c
-        )
-        list(APPEND TILEFINCH_TEST_BINARY_TARGETS native-trace-tests)
-        target_include_directories(native-trace-tests PRIVATE
-            include
-            "${quickjs_SOURCE_DIR}")
-        target_link_libraries(native-trace-tests PRIVATE qjs)
-        set_target_properties(native-trace-tests PROPERTIES C_EXTENSIONS ON)
-        add_test(NAME native-trace-tests COMMAND native-trace-tests)
-    endif()
 
     # Load-tolerant timeouts for CPU-bound tests. A TIMEOUT bounds a hang,
     # not speed, but the suite shares the host with other builds and test

@@ -13,13 +13,17 @@
 
 #include <lexbor/dom/interfaces/element.h>
 
+#ifndef __PSP__
+#include "tilefinch_test_faults.h"
+#endif
+
 /* The classifier keeps one scratch record per element, for at most 8,192
    elements. Its walk may visit eight times as many nodes: text and comment
    nodes cost no record, and article pages carry about one text node per
    element (en.wikipedia.org's PlayStation Portable article: 6,130 elements,
    about 13,000 nodes). */
 #define READER_NODE_LIMIT 8192u
-#define READER_ANALYZE_VISIT_LIMIT 65536u
+#define READER_ANALYZE_VISIT_LIMIT (READER_NODE_LIMIT * 8u)
 #define READER_DEPTH_LIMIT 128u
 #define READER_ENTRY_LIMIT 64u
 #define READER_PART_SCAN_LIMIT 256u
@@ -36,9 +40,12 @@
    its size (restyling the raw page and laying out the view before the
    page's scripts are retired: about 2 MiB on en.wikipedia.org, up to
    3.3 MiB on the census) plus a margin, so the extra nodes never take the
-   room that step needs. The byte bound follows the node bound at 256 bytes per node
-   (census pages average about 120), between 256 KiB and 1 MiB. The markup
-   buffer grows on demand, so a small page never holds the whole byte bound.
+   room that step needs. The byte bound follows the node bound at 256 bytes
+   per node (census pages average about 120) from 256 KiB up to its 1 MiB
+   ceiling, which it reaches at 4,096 nodes. The node ceiling was raised to
+   8,192 without raising that markup ceiling (deliberately, cd30f7b7), so
+   above 4,096 nodes the bytes bound a view first. The markup buffer grows
+   on demand, so a small page never holds the whole byte bound.
    Both bounds are fixed when a preparation starts, so the same budget state
    always yields the same view. */
 #define READER_EXTRACT_NODE_CEILING 8192u
@@ -114,10 +121,25 @@ typedef struct {
     bool dry_run;
 } ReaderMutationJournal;
 
+/* Computed styles of the last filtered image's element ancestors, top-down.
+   The extraction walks the document top-down, so consecutive images share
+   most of their chain and only the unshared tail is cascaded again. */
+typedef struct {
+    lxb_dom_node_t *nodes[READER_EXTRACT_DEPTH_LIMIT];
+    bool hidden[READER_EXTRACT_DEPTH_LIMIT];
+    ComputedStyle styles[READER_EXTRACT_DEPTH_LIMIT];
+    size_t count;
+} ReaderImageStyleChain;
+
 typedef struct {
     const PocDocument *document;
     const LayoutDocument *source_layout;
     const Stylesheet *source_stylesheet;
+    /* Lazily allocated beside the extraction, only with the extraction
+       reserve still free; without it every image cascades its whole
+       chain as before. */
+    ReaderImageStyleChain *image_styles;
+    bool image_styles_refused;
     Budget *budget;
     char *data;
     size_t length;
@@ -584,6 +606,77 @@ static bool reader_header_is_link_masthead(lxb_dom_node_t *node)
         }
     }
     return linked_masthead && part == NULL && links >= 2u;
+}
+
+static bool reader_basic_navigation_header(lxb_dom_node_t *node)
+{
+    if (!reader_name_is(node, "header")) return false;
+    /* A page-level navigation shell may be inside main. Keep article and
+       section headers expanded, and never classify a title/prose header by
+       its link count alone. No site names or author class names are used. */
+    lxb_dom_node_t *ancestor = node->parent;
+    size_t depth = 0;
+    for (; ancestor != NULL && depth < READER_EXTRACT_DEPTH_LIMIT;
+         ancestor = ancestor->parent, depth++) {
+        if (reader_name_is(ancestor, "article")
+            || reader_name_is(ancestor, "section")) return false;
+    }
+    if (ancestor != NULL) return false;
+    size_t links = 0, visited = 0;
+    bool navigation_control = false;
+    lxb_dom_node_t *part = node->first_child;
+    for (; part != NULL && visited < READER_PART_SCAN_LIMIT; visited++) {
+        bool skip = part->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (reader_hidden_element(part) || reader_name_is(part, "svg")
+                || reader_name_is(part, "nav"));
+        if (reader_name_is(part, "nav")) {
+            links += 2u;
+            navigation_control = true;
+        }
+        if (!skip) {
+            if (reader_name_is(part, "a")) links++;
+            if (reader_name_is(part, "button") || reader_name_is(part, "input")
+                || reader_name_is(part, "select")) navigation_control = true;
+            if (reader_name_is(part, "h1") || reader_name_is(part, "h2")
+                || reader_name_is(part, "h3") || reader_name_is(part, "h4")
+                || reader_name_is(part, "h5") || reader_name_is(part, "h6")
+                || reader_name_is(part, "p") || reader_name_is(part, "article")
+                || reader_name_is(part, "section") || reader_name_is(part, "main")
+                || reader_name_is(part, "blockquote")
+                || reader_name_is(part, "table")
+                || reader_name_is(part, "figure")) return false;
+            if (part->type == LXB_DOM_NODE_TYPE_TEXT) {
+                size_t length = 0;
+                const char *text = document_text_data(part, &length);
+                if (reader_visible_text_bytes(text, length) != 0u) {
+                    bool label = false;
+                    lxb_dom_node_t *parent = part->parent;
+                    for (size_t at = 0; parent != node && parent != NULL
+                         && at < READER_EXTRACT_DEPTH_LIMIT;
+                         parent = parent->parent, at++) {
+                        if (reader_name_is(parent, "a")
+                            || reader_name_is(parent, "button")
+                            || reader_name_is(parent, "label")
+                            || reader_name_is(parent, "option")) {
+                            label = true;
+                            break;
+                        }
+                    }
+                    if (!label) return false;
+                }
+            }
+        }
+        if (!skip) {
+            part = reader_next_within(part, node);
+        } else {
+            size_t at = 0;
+            while (part != node && part->next == NULL
+                   && at++ < READER_EXTRACT_DEPTH_LIMIT) part = part->parent;
+            if (at > READER_EXTRACT_DEPTH_LIMIT) return false;
+            part = part == node ? NULL : part->next;
+        }
+    }
+    return part == NULL && links >= 2u && navigation_control;
 }
 
 static bool reader_header_is_page_chrome(lxb_dom_node_t *node)
@@ -1427,7 +1520,40 @@ static bool reader_previous_ends_link(lxb_dom_node_t *node)
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
-static bool reader_image_style_hidden(const ReaderExtractBuffer *output,
+static ReaderImageStyleChain *reader_image_style_chain(
+    ReaderExtractBuffer *output)
+{
+    if (output->image_styles != NULL || output->image_styles_refused)
+        return output->image_styles;
+    size_t remaining = budget_remaining(output->budget);
+    if (remaining >= READER_EXTRACT_RESERVE_BYTES
+        && remaining - READER_EXTRACT_RESERVE_BYTES
+               >= sizeof(ReaderImageStyleChain))
+        output->image_styles = budget_malloc_category(
+            output->budget, BUDGET_CATEGORY_DOM,
+            sizeof(ReaderImageStyleChain));
+    if (output->image_styles == NULL) output->image_styles_refused = true;
+    else output->image_styles->count = 0u;
+    return output->image_styles;
+}
+
+static void reader_image_style_chain_release(ReaderExtractBuffer *output)
+{
+    budget_free(output->budget, output->image_styles);
+    output->image_styles = NULL;
+}
+
+static ComputedStyle reader_image_ancestor_style(
+    const ReaderExtractBuffer *output, lxb_dom_node_t *node,
+    const ComputedStyle *parent)
+{
+#ifndef __PSP__
+    tilefinch_test_faults()->reader_image_style_resolutions++;
+#endif
+    return style_for_node(output->source_stylesheet, node, parent);
+}
+
+static bool reader_image_style_hidden(ReaderExtractBuffer *output,
                                       lxb_dom_node_t *node, bool *cancelled)
 {
     *cancelled = false;
@@ -1443,6 +1569,33 @@ static bool reader_image_style_hidden(const ReaderExtractBuffer *output,
         if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         ancestors[depth++] = at;
     }
+    ReaderImageStyleChain *chain = reader_image_style_chain(output);
+    if (chain != NULL) {
+        size_t shared = 0;
+        while (shared < chain->count && shared < depth
+               && chain->nodes[shared] == ancestors[depth - 1u - shared])
+            shared++;
+        chain->count = shared;
+        for (size_t level = shared; level < depth; level++) {
+            if (level != shared && ((level - shared) & 15u) == 0u
+                && !tilefinch_platform_cooperate("reader-image-styles",
+                                                 depth - level)) {
+                *cancelled = true;
+                return false;
+            }
+            lxb_dom_node_t *at = ancestors[depth - 1u - level];
+            chain->styles[level] = reader_image_ancestor_style(
+                output, at, level == 0u ? NULL : &chain->styles[level - 1u]);
+            chain->hidden[level] = (level != 0u && chain->hidden[level - 1u])
+                || chain->styles[level].display == DISPLAY_NONE
+                || chain->styles[level].opacity == 0;
+            chain->nodes[level] = at;
+            chain->count = level + 1u;
+        }
+        /* As below: visibility is the image's own final inherited value. */
+        return depth != 0u && (chain->hidden[depth - 1u]
+                               || chain->styles[depth - 1u].visibility_hidden);
+    }
     bool hidden = false, has_parent = false;
     ComputedStyle style = {0};
     while (depth != 0) {
@@ -1451,7 +1604,7 @@ static bool reader_image_style_hidden(const ReaderExtractBuffer *output,
             *cancelled = true;
             return false;
         }
-        style = style_for_node(output->source_stylesheet,
+        style = reader_image_ancestor_style(output,
             ancestors[--depth], has_parent ? &style : NULL);
         has_parent = true;
         hidden = hidden || style.display == DISPLAY_NONE
@@ -1599,6 +1752,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     bool folded_navigation = output->basic_mode && !in_admitted_form
         && (reader_name_is(node, "nav")
             || reader_header_is_link_masthead(node)
+            || reader_basic_navigation_header(node)
             || reader_attribute_equals_ci_trimmed(node, "role", "navigation")
             || reader_attribute_equals_ci_trimmed(node, "role", "banner"));
     if (folded_navigation) tag = "nav";
@@ -3179,14 +3333,6 @@ static bool reader_document_prepare_internal(
     return true;
 }
 
-bool reader_document_prepare_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis)
-{
-    return reader_document_prepare_internal(
-        document, stylesheet, NULL, analysis, true, false, true, NULL);
-}
-
 bool reader_document_prepare_with_layout(
     PocDocument *document, const Stylesheet *stylesheet,
     const LayoutDocument *source_layout, ReaderDocumentAnalysis *analysis)
@@ -3315,6 +3461,7 @@ static bool reader_document_prepare_basic_internal(
             &output, child, 0u, false, false, &child_meaningful);
         meaningful = meaningful || child_meaningful;
     }
+    reader_image_style_chain_release(&output);
     /* Complete admission refuses any omitted action (form, control,
        select option or anchor: bounded_out), but a view shortened by its
        emitted node or byte bound is a balanced, honestly labeled prefix and
@@ -3394,29 +3541,13 @@ static bool reader_document_prepare_basic_internal(
     return okay;
 }
 
-bool reader_document_prepare_basic_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis)
-{
-    return reader_document_prepare_basic_internal(
-        document, stylesheet, NULL, analysis, true, false);
-}
-
-bool reader_document_prepare_basic_complete_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis)
-{
-    /* Extraction already builds into bounded temporary markup before any DOM
-       mutation. Complete admission can therefore validate and commit that
-       same buffer once, rather than repeating the entire source traversal. */
-    return reader_document_prepare_basic_internal(
-        document, stylesheet, NULL, analysis, true, true);
-}
-
 bool reader_document_prepare_basic_complete_with_layout(
     PocDocument *document, const Stylesheet *stylesheet,
     const LayoutDocument *layout, ReaderDocumentAnalysis *analysis)
 {
+    /* Extraction already builds into bounded temporary markup before any DOM
+       mutation. Complete admission can therefore validate and commit that
+       same buffer once, rather than repeating the entire source traversal. */
     return reader_document_prepare_basic_internal(
         document, stylesheet, layout, analysis, true, true);
 }
@@ -3448,11 +3579,37 @@ bool reader_document_discard_prepared_view(
     return document_refresh(document);
 }
 
+#ifndef __PSP__
 bool reader_document_prepare(PocDocument *document,
                              ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_with_stylesheet(document, NULL, analysis);
 }
+
+bool reader_document_prepare_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_with_layout(
+        document, stylesheet, NULL, analysis);
+}
+
+bool reader_document_prepare_basic_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_basic_internal(
+        document, stylesheet, NULL, analysis, true, false);
+}
+
+bool reader_document_prepare_basic_complete_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis)
+{
+    return reader_document_prepare_basic_complete_with_layout(
+        document, stylesheet, NULL, analysis);
+}
+#endif
 
 const char *reader_page_kind_name(ReaderPageKind kind)
 {

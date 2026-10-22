@@ -15,7 +15,7 @@
  * the October 2026 site census and the m.vk.com capture) once each on a
  * fresh page-configured QuickJS runtime (tilefinch-js-bench --only
  * compile_peak), on the host and, for 25 of them, in the PSP build under
- * PPSSPP at 111 MHz. See docs/engineering/MEMORY_EXPERIMENTS.md, "Script
+ * PPSSPP at 111 MHz. See .private-investigations/MEMORY_EXPERIMENTS.md, "Script
  * admission by compile working set".
  *
  * - The QuickJS heap peak while one unit compiles is 1.0-11.8 times its
@@ -39,7 +39,7 @@
  *   is not in these figures (xe.com: another 25.6 s, an engine pacing
  *   problem rather than a cost of the script), nor is the layout and image
  *   work of the page the scripts build. See
- *   docs/engineering/PERFORMANCE_LEDGER.md, "Device check of the heavy-page
+ *   .private-investigations/PERFORMANCE_LEDGER.md, "Device check of the heavy-page
  *   estimate".
  */
 
@@ -121,7 +121,7 @@ uint32_t script_admission_restore_ms(size_t bytes);
 /* PSP milliseconds to read the bytecode of `bytes` of source from the
    Memory Stick tier (Keep compiled scripts), on top of the restore: about
    1 MB/s, the card's documented rate, with bytecode about the size of its
-   source (docs/engineering/MEMORY_EXPERIMENTS.md, "Keep compiled
+   source (.private-investigations/MEMORY_EXPERIMENTS.md, "Keep compiled
    scripts"). */
 uint32_t script_admission_disk_read_ms(size_t bytes);
 

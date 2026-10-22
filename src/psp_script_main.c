@@ -4365,10 +4365,13 @@ psp_advance_page_runtime_with_reader_recovery(
                 browser_profile_basic_fallback_mode(app->browser->profile),
                 ui->basic_mode || ui->reader_mode,
                 app->interactive->blank_reader_recovery_pending, runtime_ok,
-                /* A realm retired after a script failure, not a page that
-                   never ran scripts (JavaScript off for the site). */
-                navigation->page.runtime == NULL
-                    && navigation->page.script_degradation_observed,
+                /* Current-page memory refusal or retirement, not ordinary
+                   widget errors or JavaScript disabled for the site. */
+                navigation->page.script_memory_limited
+                    || navigation->page.script_result.host_compile_memory_refusals
+                           != 0u
+                    || (navigation->page.runtime == NULL
+                        && navigation->page.script_degradation_observed),
                 app->interactive->basic_failure_examined_generation
                     == navigation->generation)) {
             app->interactive->basic_failure_examined_generation =
@@ -4637,7 +4640,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
             &process->presentation.ui,
             status == BROWSER_SESSION_PERSISTENCE_OK
                 ? "HTTP CACHES CLEARED"
-                : "CACHE FILE COULD NOT BE CLEARED",
+                : "CACHE FILE COULD NOT BE REMOVED",
             240);
         return;
     }
@@ -4679,7 +4682,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
             !cleared ? "SOME DATA COULD NOT BE CLEARED"
                 : status == BROWSER_SESSION_PERSISTENCE_OK
                     ? "LOCAL STORAGE CLEARED"
-                    : "LOCAL FILE COULD NOT BE CLEARED",
+                    : "LOCAL FILE COULD NOT BE REMOVED",
             240);
         return;
     }
@@ -4700,9 +4703,9 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
         bool cleared = browser_session_clear_site_data(
             browser->session, site_url);
         char site[CONTENT_BLOCKER_HOST_LIMIT];
+        /* The registrable site: every YouTube host is "youtube.com". */
         if (cleared && content_blocker_site_from_url(site_url, site)
-            && (strcmp(site, "youtube.com") == 0
-                || (strlen(site) > 12u && strcmp(site + strlen(site) - 12u, ".youtube.com") == 0)))
+            && strcmp(site, "youtube.com") == 0)
             cleared = psp_app_youtube_login_clear(&login_app);
         if (cleared) {
             /* Persisted snapshots are rewritten from the now-cleared
@@ -5666,7 +5669,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
    opportunity. Publication still waits for vblank, so scanout stays
    synchronized; only the idle wait between two slices of work goes.
    Opt-in (boot key page_task_yield=1): the shorter waits starve
-   lower-priority I/O threads on the device (PERFORMANCE_LEDGER.md,
+   lower-priority I/O threads on the device
+   (.private-investigations/PERFORMANCE_LEDGER.md,
    2026-09-29), so ordinary frames keep the vblank wait. */
 static TILEFINCH_OUT_OF_LINE bool psp_loop_page_work_waiting(PspLoop *loop)
 {
@@ -6560,7 +6564,7 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_start_boot_navigation(
             (uint64_t) sceKernelGetSystemTimeWide();
         psp_ui_show_status(
             &process->presentation.ui, loop->restoring_last_page ? "RESTORING LAST PAGE"
-                                     : "OPENING MY HOMEPAGE",
+                                     : "OPENING MY HOMEPAGE...",
             180);
     } else {
         psp_ui_show_home(&process->presentation.ui);
@@ -9820,7 +9824,7 @@ int main(int argc, char *argv[])
            process.config.validation_latch_probe != 0
                ? "enabled" : "disabled");
 #endif
-    /* Publish the experimental decoder knob before anything can open a video.
+    /* Publish the decoder-program knob before anything can open a video.
        The backend owns the parse so this boot path stays a single call. */
     media_psp_backend_set_wide_program(process.config.experimental_wide_video);
     media_psp_backend_set_au_dump(
@@ -10238,6 +10242,7 @@ int main(int argc, char *argv[])
     if (!psp_glyph_component_session_attach_selected(
             browser.glyph_component_session, browser.budget,
             &process.install_paths,
+            browser_profile_glyph_language(browser.profile),
             psp_ui_language_glyphs(browser.profile),
             browser_profile_color_emoji(browser.profile))) {
         printf("tilefinch-glyph-component: selected packs unavailable\n");
@@ -10982,27 +10987,12 @@ report:
            engine_views.navigation->page.layout.link_count,
            (unsigned) browser_engine_glyph_script_mask(browser.engine),
            browser.budget->current, browser.budget->peak);
-    /* The four diagnostic counters are uint64_t, not size_t. Printing them
-       with %zu read four bytes of an eight-byte vararg slot, and the o32 ABI's
-       8-byte alignment for the first of them left a padding hole where
-       declarations= read uninitialized stack -- 0xDEADBEEF on device -- and
-       every later specifier on the line consumed the wrong slot. Match the
-       host report in src/main.c, which has always used %llu. */
     printf("tilefinch-psp-script: css-rules=%zu important=%zu layers=%zu "
-           "vars=%zu declarations=%llu supported=%llu rejected=%llu "
-           "deferred=%llu\n",
+           "vars=%zu\n",
            engine_views.navigation->page.stylesheet.count,
            engine_views.navigation->page.stylesheet.important_rule_count,
            engine_views.navigation->page.stylesheet.layer_count,
-           engine_views.navigation->page.stylesheet.variable_count,
-           (unsigned long long)
-               engine_views.navigation->page.stylesheet.diagnostic_declarations,
-           (unsigned long long)
-               engine_views.navigation->page.stylesheet.diagnostic_supported_declarations,
-           (unsigned long long)
-               engine_views.navigation->page.stylesheet.diagnostic_rejected_declarations,
-           (unsigned long long)
-               engine_views.navigation->page.stylesheet.diagnostic_deferred_declarations);
+           engine_views.navigation->page.stylesheet.variable_count);
     printf("tilefinch-psp-script: css-cache-hits=%zu retained-hits=%zu "
            "retries=%zu transient=%zu pressure-serializations=%zu\n",
            engine_views.navigation->page.external_stylesheets.cache_hits,

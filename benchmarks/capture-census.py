@@ -13,14 +13,16 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from urllib.parse import urljoin, urlsplit
 
-from visual_scenario import load_manifest, trace_digest
+from visual_scenario import load_manifest, trace_digest, inline_tracker_evidence_ready, cosmetic_evidence_ready
 
 HERE = Path(__file__).resolve().parent
 CAPTURE = HERE / "capture-reference.js"
@@ -47,7 +49,10 @@ def toolchain_preflight(node: Path, executable: Path | None) -> tuple[Path, dict
       const browser = await p.chromium.launch({headless:true, executablePath:executable,
         args:['--disable-background-networking','--host-resolver-rules=MAP * ~NOTFOUND']});
       try { console.log(JSON.stringify({executable, version:browser.version(),
-        package:require.resolve('playwright/package.json')})); }
+        package:require.resolve('playwright/package.json'),
+        drivers:['utilsBundle.js','coreBundle.js'].map(name=>require('path').join(
+          require('path').dirname(require.resolve('playwright-core/package.json')),'lib',name))
+          .filter(file=>require('fs').existsSync(file))})); }
       finally { await browser.close(); }
     })().catch(e => { console.error(e.message); process.exitCode=1; });'''
     result = subprocess.run([str(node), "-e", program, str(executable or "")],
@@ -65,11 +70,17 @@ def toolchain_preflight(node: Path, executable: Path | None) -> tuple[Path, dict
         raise ValueError("capture PNG normalizer preflight failed")
     return actual, {"browser_version": info["version"],
                     "playwright_package_sha256": file_digest(package),
+                    "playwright_drivers_sha256": {Path(p).name:file_digest(Path(p).resolve(strict=True)) for p in info["drivers"]},
                     "python_executable_sha256": file_digest(Path(sys.executable).resolve())}
 
 
 def source_identity(manifest: Path, node: Path, executable: Path) -> dict:
     files = [manifest, CAPTURE, HERE / "reference-capture-audit.js",
+             HERE / "reference-scroll-surface.js",
+             HERE / "reference-worker-capture.js",
+             HERE / "retained-query-posts.js",
+             HERE / "inline-tracker-policy.js", HERE.parent / "src/inline_tracker_rules.inc",
+             HERE / "cosmetic-blocker-policy.js", HERE.parent / "src/cosmetic_blocker_css.inc",
              HERE / "normalize-reference-frame.py", HERE / "reference_frame.py",
              HERE / "visual_scenario.py", Path(__file__), node, executable]
     return {str(path.resolve()): file_digest(path.resolve()) for path in files}
@@ -78,6 +89,11 @@ def source_identity(manifest: Path, node: Path, executable: Path) -> dict:
 def complete_state(state) -> bool:
     """Validate the completion evidence, not only its aggregate success flag."""
     if not isinstance(state, dict) or state.get("capture_ready") is not True:
+        return False
+    policy = state.get('offline_capability_policy', {})
+    if isinstance(policy, dict) and 'cosmetic_blocking' in policy and not cosmetic_evidence_ready(policy['cosmetic_blocking']):
+        return False
+    if isinstance(policy, dict) and 'inline_trackers' in policy and not inline_tracker_evidence_ready(policy['inline_trackers']):
         return False
     audit, targets, full = (state.get(name) for name in
                             ("browser_request_audit", "target_interception", "full_document"))
@@ -235,6 +251,48 @@ def save(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def source_response_barrier(trace: Path, url: str) -> str | None:
+    """Diagnose explicit access barriers before attempting page geometry.
+
+    This only refuses captures; absence of a recognized barrier proves nothing
+    about eligibility. The unchanged browser, resource and receipt gates remain
+    responsible for qualification. Never return a redirect URL or cookie.
+    """
+    target = url.split('#', 1)[0]
+    records = sorted(trace.glob('[0-9][0-9][0-9][0-9].meta'))
+    if len(records) > 4096:
+        raise ValueError('source response inventory exceeds its bound')
+    for path in records:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise ValueError('source response metadata is not a bounded regular file')
+        fields = {}
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line or line.startswith('#'):
+                continue
+            key, separator, value = line.partition('=')
+            if not separator or not key or key in fields:
+                raise ValueError('invalid source response metadata')
+            fields[key] = value
+        if fields.get('url') != target or fields.get('method') != 'GET':
+            continue
+        headers = {}
+        for key, value in fields.items():
+            if re.fullmatch(r'response-header-[0-9]+', key):
+                name, separator, content = value.partition(':')
+                if separator:
+                    headers.setdefault(name.strip().lower(), []).append(content.strip())
+        if (any(v.lower() == 'challenge' for v in headers.get('x-amzn-waf-action', []))
+                or any(v.lower() == 'challenge' for v in headers.get('cf-mitigated', []))):
+            return 'source-access-challenge'
+        if fields.get('status') in ('301', '302', '303', '307', '308'):
+            for location in headers.get('location', []):
+                redirect = urlsplit(urljoin(target, location))
+                if re.search(r'/(?:login|signin|sign-in)(?:/|$)', redirect.path, re.I):
+                    return 'source-signin-required'
+        return None
+    return None
+
+
 def capture_one(scenario, options, sources) -> dict:
     root = options.output_root / scenario.scenario
     root.mkdir(parents=True, exist_ok=True)
@@ -247,6 +305,9 @@ def capture_one(scenario, options, sources) -> dict:
             raise ValueError("trace escapes capture root")
         if trace_digest(trace) != scenario.trace_sha256:
             raise ValueError("manifest trace pin differs from retained input")
+        barrier = source_response_barrier(trace, scenario.url)
+        if barrier:
+            raise ValueError(barrier)
         latest = root / "latest.json"
         if options.resume and latest.exists():
             try:
@@ -266,6 +327,10 @@ def capture_one(scenario, options, sources) -> dict:
             command.extend(["--executable", str(options.executable)])
         if getattr(options, "retained_preflights", False):
             command.append("--retained-preflights")
+        if getattr(options, "inline_trackers", False):
+            command.append("--inline-trackers")
+        if getattr(options, "cosmetic_blocking", False):
+            command.append("--cosmetic-blocking")
         with (attempt / "stdout.log").open("w") as stdout, (attempt / "stderr.log").open("w") as stderr:
             # Browser operations close normally first; this outer bound also
             # contains startup/helper hangs and owns child cleanup.
@@ -317,6 +382,10 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retained-preflights", action="store_true",
                         help="replay exact retained read-only CORS preflights; unknown checks fail closed")
+    parser.add_argument("--cosmetic-blocking", action="store_true",
+                        help="apply the native shared cosmetic stylesheet in the reference")
+    parser.add_argument("--inline-trackers", action="store_true",
+                        help="apply shared Basic inline tracker rules; native comparison must use Basic blocking too")
     options = parser.parse_args()
     if not 1000 <= options.timeout_ms <= 120000 or not 0 <= options.settle_ms <= 10000:
         parser.error("invalid bounded browser timeout or settle interval")
@@ -339,6 +408,8 @@ def main() -> int:
         options.executable, toolchain = toolchain_preflight(options.node, options.executable)
         sources = {"files": source_identity(options.manifest, options.node, options.executable),
                    "retained_preflights": options.retained_preflights,
+                   "inline_trackers": options.inline_trackers,
+                   "cosmetic_blocking": options.cosmetic_blocking,
                    "toolchain": toolchain}
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
         parser.error(str(error))

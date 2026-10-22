@@ -70,9 +70,44 @@
 /* Navigation remains one private translation unit so candidate/page state is
    never exported.  The ordered implementation seams mirror its lifecycle. */
 static void navigation_bind_node_retirement(NavigationSession *session);
+
+/* last_error stays a plain status: the frontends show it. The numbers go to
+   the diagnostic record beside it. */
+static void navigation_note_layout_failure(
+    NavigationSession *session, unsigned phase, bool cancelled,
+    size_t refusals)
+{
+    snprintf(session->last_error, sizeof(session->last_error), "%s",
+             NAVIGATION_LAYOUT_FAILED_ERROR);
+    session->last_layout_failure = (NavigationLayoutFailure) {
+        .phase = phase,
+        .cancelled = cancelled,
+        .refusals = refusals,
+        .current = session->budget->current,
+        .limit = session->budget->limit
+    };
+}
+
 #include "navigation/page_lifecycle.inc"
 #include "navigation/declarative_refresh.inc"
 #include "navigation/configuration.inc"
 #include "navigation/document_stream.inc"
 #include "navigation/load_state.inc"
 #include "navigation/history_runtime.inc"
+
+#ifndef __PSP__
+/* Exercise the transfer/retirement ordering without a site fixture or an
+   allocator-dependent OOM threshold. The production teardown is the oracle. */
+void navigation_test_retired_stream_teardown(NavigationSession *session);
+void navigation_test_retired_stream_teardown(NavigationSession *session)
+{
+    NavigationDocumentStream stream = {
+        .session = session,
+        .runtime = session->page.runtime,
+        .runtime_transferred = true,
+        .scheduler_transferred = true
+    };
+    navigation_retire_current_page_scripts(session);
+    navigation_stream_destroy_staging(&stream);
+}
+#endif

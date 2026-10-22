@@ -350,6 +350,9 @@ static bool navigation_compiled_stylesheet_cache_take(
         return false;
     }
     *sheet = session->compiled_stylesheet_cache;
+    /* API registrations are document-owned and never reusable across a
+       navigation, even when the external source bytes are identical. */
+    sheet->api_registrations = NULL;
     *external_stats = session->compiled_stylesheet_cache_external_stats;
     memset(&session->compiled_stylesheet_cache, 0,
            sizeof(session->compiled_stylesheet_cache));
@@ -375,6 +378,7 @@ static void navigation_compiled_stylesheet_cache_store(
 #endif
     if (!page->compiled_stylesheet_cacheable
         || page->stylesheet.budget == NULL
+        || page->stylesheet.api_registrations != NULL
         || page->external_stylesheets.skipped_pressure != 0) {
         session->performance.compiled_stylesheet_cache_unmarked_skips++;
         return;
@@ -477,6 +481,12 @@ static bool navigation_install_minimal_stylesheet_fallback(
     NavigationSession *session)
 {
     if (session == NULL) return false;
+#if !defined(__PSP__)
+    if (tilefinch_test_faults()->refuse_next_minimal_stylesheet) {
+        tilefinch_test_faults()->refuse_next_minimal_stylesheet = false;
+        return false;
+    }
+#endif
     stylesheet_destroy(&session->page.stylesheet);
     if (!stylesheet_build_context_deferred(
             &session->page.stylesheet, session->budget,
@@ -814,6 +824,8 @@ static void navigation_prepare_layout_reuse(
     bool full_rebuild, const bool *local_focus);
 static bool navigation_focus_geometry_unchanged(
     NavigationSession *session, const ScriptMutationJournal *mutations);
+static void navigation_evict_layout_reuse_under_pressure(
+    NavigationSession *session);
 
 static LayoutReuseCache *navigation_prepare_geometry_reuse(
     void *opaque, const ScriptMutationJournal *mutations,
@@ -831,6 +843,7 @@ static LayoutReuseCache *navigation_prepare_geometry_reuse(
        cascade. Its generation guards invalidate the cache when replacement
        rules actually arrive; the journal still invalidates changed DOM now. */
     navigation_prepare_layout_reuse(session, mutations, false, NULL);
+    navigation_evict_layout_reuse_under_pressure(session);
     return session->page.layout_reuse;
 }
 
@@ -948,7 +961,8 @@ static const char *const resource_fingerprint_attributes[] = {
 /* `parts`, when present, also hashes the stylesheet sources (style, link,
    base and style text) into parts[0] and the image-bearing elements (img,
    video, source, use) into parts[1], so a changed fingerprint can say which
-   kind of resource moved. */
+   kind of resource moved. parts[2] additionally identifies exact stylesheet
+   sources and revisions, excluding which roots adopt those same sources. */
 static bool resource_fingerprint_node(lxb_dom_node_t *node,
                                       uint64_t *hash, uint64_t *parts)
 {
@@ -979,6 +993,36 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
             *hash = fingerprint_bytes(*hash, name, name_length);
             if (part != NULL)
                 *part = fingerprint_bytes(*part, name, name_length);
+            if (style || link || base) {
+                if (parts != NULL) {
+                    parts[2] = fingerprint_bytes(parts[2],
+                        (const char *) &node, sizeof(node));
+                    parts[2] = fingerprint_bytes(parts[2], name, name_length);
+                }
+                static const char *const policy[] = {
+                    "nonce", "integrity", "crossorigin", "referrerpolicy",
+                    "disabled", "title"
+                };
+                for (size_t i = 0; i < sizeof(policy) / sizeof(policy[0]); i++) {
+                    size_t length = 0;
+                    const char *value = document_attribute(node, policy[i], &length);
+                    /* Distinguish an absent boolean attribute from empty. */
+                    bool present = value != NULL;
+                    *hash = fingerprint_bytes(*hash, (const char *) &present, sizeof(present));
+                    *hash = fingerprint_bytes(*hash, (const char *) &length, sizeof(length));
+                    *hash = fingerprint_bytes(*hash, value, length);
+                    if (parts != NULL) {
+                        parts[2] = fingerprint_bytes(parts[2],
+                            (const char *) &present, sizeof(present));
+                        parts[2] = fingerprint_bytes(parts[2],
+                            (const char *) &length, sizeof(length));
+                        parts[2] = fingerprint_bytes(parts[2], value, length);
+                        parts[0] = fingerprint_bytes(parts[0], (const char *) &present, sizeof(present));
+                        parts[0] = fingerprint_bytes(parts[0], (const char *) &length, sizeof(length));
+                        parts[0] = fingerprint_bytes(parts[0], value, length);
+                    }
+                }
+            }
             for (size_t i = 0;
                  i < sizeof(resource_fingerprint_attributes)
                          / sizeof(resource_fingerprint_attributes[0]);
@@ -989,6 +1033,14 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
                 *hash = fingerprint_bytes(*hash, value, length);
                 if (part != NULL)
                     *part = fingerprint_bytes(*part, value, length);
+                if (parts != NULL && (style || link || base)) {
+                    bool present = value != NULL;
+                    parts[2] = fingerprint_bytes(parts[2],
+                        (const char *) &present, sizeof(present));
+                    parts[2] = fingerprint_bytes(parts[2],
+                        (const char *) &length, sizeof(length));
+                    parts[2] = fingerprint_bytes(parts[2], value, length);
+                }
             }
         }
         if (style) style_depth++;
@@ -1002,6 +1054,8 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
                 if (parts != NULL) {
                     parts[0] = fingerprint_bytes(parts[0], marker, sizeof(marker));
                     parts[0] = fingerprint_bytes(parts[0], override, length);
+                    parts[2] = fingerprint_bytes(parts[2], marker, sizeof(marker));
+                    parts[2] = fingerprint_bytes(parts[2], override, length);
                 }
             }
         }
@@ -1011,6 +1065,8 @@ static bool resource_fingerprint_node(lxb_dom_node_t *node,
             *hash = fingerprint_bytes(*hash, text, length);
             if (parts != NULL)
                 parts[0] = fingerprint_bytes(parts[0], text, length);
+            if (parts != NULL)
+                parts[2] = fingerprint_bytes(parts[2], text, length);
         }
         if (node->first_child != NULL) {
             node = node->first_child;
@@ -1038,14 +1094,23 @@ static bool page_resource_fingerprint_split(const PocDocument *document,
 {
     if (hash == NULL) return false;
     *hash = 0;
-    if (parts != NULL) parts[0] = parts[1] = 0;
+    if (parts != NULL) parts[0] = parts[1] = parts[2] = 0;
     if (document == NULL || document->html == NULL) return true;
     /* Adopted constructed sheets are stylesheet sources outside the tree. */
     uint64_t adopted = document_adopted_sheets_signature(document);
+    adopted ^= (uint64_t) document->registered_property_count << 32;
     *hash = UINT64_C(1469598103934665603) ^ adopted;
     if (parts != NULL) {
         parts[0] = UINT64_C(1469598103934665603) ^ adopted;
         parts[1] = UINT64_C(1469598103934665603);
+        lxb_dom_node_t *sources[DOCUMENT_ADOPTED_TIER_LIMIT];
+        uint32_t revisions[DOCUMENT_ADOPTED_TIER_LIMIT];
+        size_t count = document_adopted_sheets_active(
+            document, sources, revisions, DOCUMENT_ADOPTED_TIER_LIMIT);
+        if (count == SIZE_MAX) return false;
+        parts[2] = UINT64_C(1469598103934665603);
+        for (size_t i = 0; i < count; i++)
+            parts[2] = document_adopted_tier_hash(parts[2], sources[i], revisions[i]);
     }
     return resource_fingerprint_node(
         lxb_dom_interface_node(document->html), hash, parts);
@@ -1066,6 +1131,8 @@ static void navigation_note_committed_fingerprint(NavigationSession *session)
             session->resource_fingerprint_parts_last[0];
         session->resource_fingerprint_parts[1] =
             session->resource_fingerprint_parts_last[1];
+        session->resource_fingerprint_parts[2] =
+            session->resource_fingerprint_parts_last[2];
         session->resource_fingerprint_parts_owner =
             session->resource_fingerprint;
         session->resource_fingerprint_parts_valid = true;
@@ -1076,7 +1143,8 @@ static void navigation_note_committed_fingerprint(NavigationSession *session)
 }
 
 /* Whether the last traversal differs from the committed fingerprint in
-   `part` (0 stylesheet sources, 1 image elements). Unknown counts as
+   `part` (0 stylesheet sources/scopes, 1 image elements, 2 exact stylesheet
+   source identity/content excluding adopting roots). Unknown counts as
    changed. */
 static bool navigation_fingerprint_part_changed(
     const NavigationSession *session, unsigned part)
@@ -1092,12 +1160,13 @@ static bool navigation_resource_fingerprint(
     NavigationSession *session, const PocDocument *document, uint64_t *hash)
 {
     if (session != NULL) session->performance.resource_fingerprint_scans++;
-    uint64_t parts[2] = {0};
+    uint64_t parts[3] = {0};
     if (page_resource_fingerprint_split(document, hash, parts)) {
         if (session != NULL) {
             session->resource_fingerprint_last = *hash;
             session->resource_fingerprint_parts_last[0] = parts[0];
             session->resource_fingerprint_parts_last[1] = parts[1];
+            session->resource_fingerprint_parts_last[2] = parts[2];
         }
         return true;
     }
@@ -1830,8 +1899,9 @@ void navigation_retire_large_incumbent_realm(NavigationSession *session)
         navigation_retire_current_page_scripts(session);
 }
 
-static bool navigation_retire_exhausted_script_realms(
-    NavigationSession *session, bool allocator_rejection_observed)
+static bool navigation_retire_exhausted_script_realms_mode(
+    NavigationSession *session, bool allocator_rejection_observed,
+    bool static_fallback)
 {
     if (session == NULL || session->page.runtime == NULL) {
         return false;
@@ -1892,12 +1962,21 @@ static bool navigation_retire_exhausted_script_realms(
     navigation_retire_current_page_scripts(session);
     session->page.script_result.success = false;
     session->page.script_degradation_observed = true;
+    session->page.script_memory_limited = true;
     snprintf(session->page.script_result.summary,
              sizeof(session->page.script_result.summary),
              "JavaScript stopped at its memory limit");
-    stylesheet_enable_static_custom_element_fallback(
-        &session->page.stylesheet);
+    if (static_fallback)
+        stylesheet_enable_static_custom_element_fallback(
+            &session->page.stylesheet);
     return true;
+}
+
+static bool navigation_retire_exhausted_script_realms(
+    NavigationSession *session, bool allocator_rejection_observed)
+{
+    return navigation_retire_exhausted_script_realms_mode(
+        session, allocator_rejection_observed, true);
 }
 
 static bool navigation_queue_frame_message(void *opaque,
@@ -2945,6 +3024,7 @@ static bool stack_function_name(const char *stack,
     return true;
 }
 
+#if NAVIGATION_CAPABILITY_TRACES_COMPILED
 static bool stack_generated_function_name(const char *stack,
                                           char *output,
                                           size_t output_size)
@@ -2983,6 +3063,7 @@ static bool stack_generated_location(const char *stack,
     *column = strtoul(column_start, &end, 10);
     return end != column_start && *column != 0;
 }
+#endif
 
 static bool collect_iframes(ScriptRuntime *runtime, lxb_dom_node_t *node,
                             long *frames, size_t capacity,

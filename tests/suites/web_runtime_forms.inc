@@ -201,6 +201,106 @@
     navigation_destroy(&wpt_compatibility_navigation);
     CHECK(budget.current == 0);
 
+    puts("test: document-owned registered CSS lengths");
+    static const char registered_property_page[] =
+        "<!doctype html><style>"
+        "@property --unit{syntax:'<length>';inherits:false;initial-value:3px}"
+        "#parent{font-size:16px;--unit:calc(1em / 16)}"
+        "#child{font-size:10px;width:calc(40 * var(--unit))}"
+        "</style><div id=parent><span id=child>x</span></div><script>"
+        "let duplicate=false,invalid=0,order='';"
+        "CSS.registerProperty({get inherits(){order+='i';return true},"
+        "get initialValue(){order+='v';return '1px'},"
+        "get name(){order+='n';return '--unit'},"
+        "get syntax(){order+='s';return '<length>'}});"
+        "try{CSS.registerProperty({name:'--unit',inherits:true,"
+        "syntax:'<length>',initialValue:'1px'})}catch(e){"
+        "duplicate=e.name==='InvalidModificationError'}"
+        "for(const value of ['1em','10%','auto','var(--x)','1']){"
+        "try{CSS.registerProperty({name:'--bad',inherits:false,"
+        "syntax:'<length>',initialValue:value})}catch(e){"
+        "if(e.name==='SyntaxError')invalid++}}"
+        "CSS.registerProperty({name:'--bad',inherits:false,"
+        "syntax:'<length>',initialValue:'calc(2px + 3px)'});"
+        "globalThis.pocSummary=duplicate&&invalid===5&&order==='ivns'"
+        "&&CSS.registerProperty.name==='registerProperty'"
+        "&&CSS.registerProperty.length===1"
+        "&&Object.getOwnPropertyDescriptor(CSS,'registerProperty').enumerable"
+        "&&typeof globalThis.__tilefinchRegisterProperty==='undefined'"
+        "?'register:ok':'register:bad:'+duplicate+':'+invalid+':'+order;</script>";
+    static NavigationSession registered_navigation;
+    CHECK(navigation_init(&registered_navigation, &budget, 2));
+    navigation_enable_scripts(&registered_navigation, 4 * MIB, 1000);
+    uint64_t registered_generation = navigation_begin(&registered_navigation);
+    CHECK(navigation_commit_html(&registered_navigation, registered_generation,
+        "https://registered.test/", registered_property_page,
+        sizeof(registered_property_page) - 1u, 480, NULL, NULL, true));
+    CHECK(strcmp(registered_navigation.page.script_result.summary,
+                 "register:ok") == 0);
+    CHECK(registered_navigation.page.document.registered_property_count == 2);
+    Stylesheet *registered_sheet = &registered_navigation.page.stylesheet;
+    CHECK(registered_sheet->registered_property_count == 2);
+    CHECK(stylesheet_reset_document_rules(registered_sheet));
+    CHECK(registered_sheet->registered_property_count == 2);
+    stylesheet_destroy(registered_sheet);
+    CHECK(stylesheet_build(registered_sheet, &budget,
+        &registered_navigation.page.document, 480));
+    CHECK(registered_sheet->registered_property_count == 2);
+    ScriptResult registered_probe = {0};
+    CHECK(script_runtime_evaluate_diagnostic(registered_navigation.page.runtime,
+        "pocSummary=getComputedStyle(document.getElementById('child'))"
+        ".getPropertyValue('--unit')", "<registered-rebuild>", &registered_probe));
+    CHECK(strcmp(registered_probe.summary, "1px") == 0);
+    navigation_destroy(&registered_navigation);
+    CHECK(budget.current == 0);
+
+    /* @property and CSS.registerProperty() apply one set of rules. They
+       used to disagree: @property accepted any syntax string and relative
+       <length> initial values, while the API refused every syntax but "*"
+       and <length>. Each pair registers the same definition both ways. */
+    puts("test: @property and CSS.registerProperty share registration rules");
+    static const char registration_rules_page[] =
+        "<!doctype html><style>"
+        "@property --rule-rel{syntax:'<length>';inherits:false;"
+        "initial-value:1em}"
+        "@property --rule-color{syntax:'<color>';inherits:false;"
+        "initial-value:red}"
+        "@property --rule-list{syntax:'<length>+ | auto';inherits:false;"
+        "initial-value:1px 2px}"
+        "@property --rule-typo{syntax:'<lenght>';inherits:false;"
+        "initial-value:1px}"
+        "@property --rule.dot{syntax:'*';inherits:false;initial-value:x}"
+        "</style><body><script>"
+        "const api=(name,syntax,initialValue)=>{try{CSS.registerProperty("
+        "{name,syntax,inherits:false,initialValue});return 1}catch(e){"
+        "return e.name==='SyntaxError'?0:'?'+e.name}};"
+        "const rule=name=>getComputedStyle(document.body)"
+        ".getPropertyValue(name)!==''?1:0;"
+        "globalThis.pocSummary=["
+        "rule('--rule-rel'),api('--api-rel','<length>','1em'),"
+        "rule('--rule-color'),api('--api-color','<color>','red'),"
+        "rule('--rule-list'),api('--api-list','<length>+ | auto','1px 2px'),"
+        "rule('--rule-typo'),api('--api-typo','<lenght>','1px'),"
+        "rule('--rule.dot'),api('--api.dot','*','x')].join('')</script>";
+    static NavigationSession registration_rules_navigation;
+    CHECK(navigation_init(&registration_rules_navigation, &budget, 2));
+    navigation_enable_scripts(&registration_rules_navigation, 4 * MIB, 1000);
+    uint64_t registration_rules_generation =
+        navigation_begin(&registration_rules_navigation);
+    CHECK(navigation_commit_html(&registration_rules_navigation,
+        registration_rules_generation, "https://registered.test/",
+        registration_rules_page, sizeof(registration_rules_page) - 1u, 480,
+        NULL, NULL, true));
+    if (strcmp(registration_rules_navigation.page.script_result.summary,
+               "0011110000") != 0)
+        fprintf(stderr, "registration rules: %s %s\n",
+                registration_rules_navigation.page.script_result.summary,
+                registration_rules_navigation.page.script_result.error);
+    CHECK(strcmp(registration_rules_navigation.page.script_result.summary,
+                 "0011110000") == 0);
+    navigation_destroy(&registration_rules_navigation);
+    CHECK(budget.current == 0);
+
     puts("test: bounded file, body, beacon, and stream APIs");
     static const char browser_io_page[] =
         "<!doctype html><body><script>"
@@ -362,10 +462,16 @@
     navigation_enable_scripts(&browser_io_navigation, 5 * MIB, 1000);
     uint64_t browser_io_generation =
         navigation_begin(&browser_io_navigation);
-    CHECK(navigation_commit_html(
+    bool browser_io_committed = navigation_commit_html(
         &browser_io_navigation, browser_io_generation,
         "https://browser-io.test/", browser_io_page,
-        strlen(browser_io_page), 480, NULL, NULL, true));
+        strlen(browser_io_page), 480, NULL, NULL, true);
+    if (!browser_io_committed)
+        fprintf(stderr, "browser IO commit failed: %.470s; script=%.470s watchdog-ms=%lu\n",
+                browser_io_navigation.last_error,
+                browser_io_navigation.page.script_result.error,
+                browser_io_navigation.page.script_result.watchdog_elapsed_ms);
+    CHECK(browser_io_committed);
     for (size_t tick = 0;
          tick < 16
          && strcmp(browser_io_navigation.page.script_result.summary,
@@ -2792,17 +2898,17 @@
     if (!(transformed_body_style.display == DISPLAY_NONE
           && transformed_body_style.hidden
           && transformed_body_style.has_transform
-          && transformed_body_style.transform_scale_q6 == 0)) {
+          && transformed_body_style.transform_scale_q14 == 0)) {
         fprintf(stderr,
                 "staged geometry display=%d hidden=%d transform=%d scale=%u\n",
                 transformed_body_style.display, transformed_body_style.hidden,
                 transformed_body_style.has_transform,
-                transformed_body_style.transform_scale_q6);
+                transformed_body_style.transform_scale_q14);
     }
     CHECK(transformed_body_style.display == DISPLAY_NONE
           && transformed_body_style.hidden
           && transformed_body_style.has_transform
-          && transformed_body_style.transform_scale_q6 == 0);
+          && transformed_body_style.transform_scale_q14 == 0);
     stylesheet_destroy(&transformed_body_sheet);
     document_destroy(&transformed_body_document);
     CHECK(budget.current == 0);
@@ -2973,7 +3079,7 @@
         "const mutationShapeObserver=new MutationObserver(()=>{}),mutationShapeOk=Object.getOwnPropertyNames(mutationShapeObserver).length===0&&Object.prototype.toString.call(mutationShapeObserver)==='[object MutationObserver]'&&Object.prototype.toString.call(new PerformanceObserver(()=>{}))==='[object PerformanceObserver]';const xhrProbe=new XMLHttpRequest,xhrPrototypeNames=Object.getOwnPropertyNames(XMLHttpRequest.prototype),xhrUpload=xhrProbe.upload,xhrReadonlyNames=['readyState','status','statusText','response','responseURL','responseXML','upload'],xhrReadonlyDescriptors=xhrReadonlyNames.every(name=>{const descriptor=Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,name);return typeof descriptor?.get==='function'&&descriptor.set===undefined});let xhrBrandChecks=0,xhrBrandRejects=0;for(const name of [...xhrReadonlyNames,'timeout','withCredentials','onreadystatechange']){const descriptor=Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,name);for(const kind of ['get','set'])if(typeof descriptor?.[kind]==='function'){xhrBrandChecks++;try{descriptor[kind].call(xhrUpload,kind==='set'?0:undefined)}catch(error){if(error instanceof TypeError)xhrBrandRejects++}}}const xhrBrandOk=xhrBrandChecks===13&&xhrBrandRejects===xhrBrandChecks;xhrProbe.status=299;xhrProbe.readyState=4;xhrProbe.upload={};let xhrStrictReadonly='';try{(()=>{'use strict';xhrProbe.status=299})()}catch(error){xhrStrictReadonly=error.name}const xhrShapeOk=XMLHttpRequest.name==='XMLHttpRequest'&&Object.prototype.toString.call(xhrProbe)==='[object XMLHttpRequest]'&&xhrProbe instanceof EventTarget&&Object.getPrototypeOf(XMLHttpRequest.prototype)===XMLHttpRequestEventTarget.prototype&&xhrProbe.upload===xhrUpload&&xhrProbe.upload instanceof XMLHttpRequestUpload&&xhrProbe.upload instanceof EventTarget&&xhrProbe.status===0&&xhrProbe.readyState===0&&xhrReadonlyDescriptors&&xhrBrandOk&&xhrStrictReadonly==='TypeError'&&['readyState','response','responseText','responseType','responseURL','responseXML','status','statusText','timeout','upload','withCredentials','onreadystatechange'].every(name=>xhrPrototypeNames.includes(name))&&!xhrPrototypeNames.some(name=>name[0]==='_'||name==='emit')&&Function.prototype.toString.call(XMLHttpRequest).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequest.prototype.open).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequestEventTarget.prototype.addEventListener).includes('[native code]');"
         "let navigatorConstructed=false,uaDataConstructed=false,gpuConstructed=false,wgslConstructed=false,pluginsConstructed=false,mimeTypesConstructed=false,clipboardConstructed=false,storageManagerConstructed=false,keyboardConstructed=false,keyboardMapConstructed=false;try{new Navigator}catch(_){navigatorConstructed=true}try{new NavigatorUAData}catch(_){uaDataConstructed=true}try{new GPU}catch(_){gpuConstructed=true}try{new WGSLLanguageFeatures}catch(_){wgslConstructed=true}try{new PluginArray}catch(_){pluginsConstructed=true}try{new MimeTypeArray}catch(_){mimeTypesConstructed=true}try{new Clipboard}catch(_){clipboardConstructed=true}try{new StorageManager}catch(_){storageManagerConstructed=true}try{new Keyboard}catch(_){keyboardConstructed=true}try{new KeyboardLayoutMap}catch(_){keyboardMapConstructed=true}const navigatorIdentityOwn=Object.getOwnPropertyNames(navigator).some(name=>['userAgent','appCodeName','appName','appVersion','language','languages','platform','product','productSub','vendor','vendorSub','maxTouchPoints','cookieEnabled','onLine','hardwareConcurrency','deviceMemory','userAgentData','gpu','plugins','mimeTypes','pdfViewerEnabled','webdriver','javaEnabled','getGamepads','clipboard','storage','keyboard','connection','getBattery','permissions','sendBeacon'].includes(name)),navigatorShapeOk=navigator instanceof Navigator&&Object.prototype.toString.call(navigator)==='[object Navigator]'&&!navigatorIdentityOwn&&Object.getPrototypeOf(navigator)===Navigator.prototype&&clientInformation===navigator&&navigator.appCodeName==='Mozilla'&&navigator.appName==='Netscape'&&navigator.product==='Gecko'&&navigator.vendor===''&&navigator.webdriver===false&&navigator.pdfViewerEnabled===false&&navigator.javaEnabled()===false&&navigator.plugins instanceof PluginArray&&navigator.mimeTypes instanceof MimeTypeArray&&navigator.plugins.length===0&&navigator.mimeTypes.length===0&&navigator.plugins.item(0)===null&&navigator.mimeTypes.namedItem('application/pdf')===null&&Object.prototype.toString.call(navigator.plugins)==='[object PluginArray]'&&Object.prototype.toString.call(navigator.mimeTypes)==='[object MimeTypeArray]'&&navigator.clipboard instanceof Clipboard&&Object.prototype.toString.call(navigator.clipboard)==='[object Clipboard]'&&navigator.storage instanceof StorageManager&&navigator.storage===navigator.storage&&Object.prototype.toString.call(navigator.storage)==='[object StorageManager]'&&navigator.keyboard instanceof Keyboard&&navigator.keyboard===navigator.keyboard&&Object.prototype.toString.call(navigator.keyboard)==='[object Keyboard]'&&navigator.userAgentData instanceof NavigatorUAData&&Object.prototype.toString.call(navigator.userAgentData)==='[object NavigatorUAData]'&&navigatorConstructed&&uaDataConstructed&&pluginsConstructed&&mimeTypesConstructed&&clipboardConstructed&&storageManagerConstructed&&keyboardConstructed&&keyboardMapConstructed;const platformStatusShapeOk=navigator.connection===navigator.connection&&navigator.connection instanceof NetworkInformation&&Object.prototype.toString.call(navigator.connection)==='[object NetworkInformation]'&&navigator.permissions===navigator.permissions&&navigator.permissions instanceof Permissions&&Object.prototype.toString.call(navigator.permissions)==='[object Permissions]'&&typeof navigator.getBattery==='function';const gpuEntryOk=!isSecureContext?navigator.gpu===undefined:navigator.gpu===navigator.gpu&&navigator.gpu instanceof GPU&&Object.prototype.toString.call(navigator.gpu)==='[object GPU]'&&Object.getOwnPropertyNames(navigator.gpu).length===0&&navigator.gpu.wgslLanguageFeatures instanceof WGSLLanguageFeatures&&Object.prototype.toString.call(navigator.gpu.wgslLanguageFeatures)==='[object WGSLLanguageFeatures]'&&navigator.gpu.wgslLanguageFeatures.size===0&&[...navigator.gpu.wgslLanguageFeatures].length===0&&navigator.gpu.getPreferredCanvasFormat()==='bgra8unorm'&&gpuConstructed&&wgslConstructed;const capabilitiesOk=navigatorShapeOk&&platformStatusShapeOk&&gpuEntryOk&&typeof RTCPeerConnection==='undefined'&&typeof RTCDataChannel==='undefined';"
         "const encoder=new TextEncoder,encodedReplacement=encoder.encode(String.fromCharCode(0xd800)),largeEncoded=encoder.encode('x'.repeat(240*1024)),intoTarget=new Uint8Array(4),intoResult=encoder.encodeInto('A€B',intoTarget);const streamingDecoder=new TextDecoder,streamFirst=streamingDecoder.decode(new Uint8Array([0xe2,0x82]),{stream:true}),streamSecond=streamingDecoder.decode(new Uint8Array([0xac]));let fatalEncoding='',nbspEncoding='',verticalTabEncoding='',boundedEncoding='';try{new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array([0xc0]));}catch(error){fatalEncoding=error.name;}try{new TextDecoder(String.fromCharCode(0xa0)+'windows-1252')}catch(error){nbspEncoding=error.name;}try{new TextDecoder(String.fromCharCode(0x0b)+'windows-1252')}catch(error){verticalTabEncoding=error.name;}try{new TextDecoder('windows-1252').decode(new Uint8Array(1024*1024+1))}catch(error){boundedEncoding=error.name;}const latinDecoder=new TextDecoder('iso-8859-1'),latinText=latinDecoder.decode(new Uint8Array([0x41,0x80,0x81,0xa3])),fatalLatin=new TextDecoder('windows-1252',{fatal:true}).decode(new Uint8Array([0x8d,0x9d]));const encodingOk=encodedReplacement.join(',')==='239,191,189'&&largeEncoded.length===240*1024&&largeEncoded[0]===120&&largeEncoded[largeEncoded.length-1]===120&&globalThis.__tilefinchEncodeUtf8===undefined&&intoResult.read===2&&intoResult.written===4&&intoTarget.join(',')==='65,226,130,172'&&streamFirst===''&&streamSecond==='€'&&new TextDecoder().decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='A'&&new TextDecoder('utf8',{ignoreBOM:true}).decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='﻿A'&&new TextDecoder().decode(new Uint8Array([0xc0,0xaf])).length===2&&fatalEncoding==='TypeError'&&nbspEncoding==='RangeError'&&verticalTabEncoding==='RangeError'&&boundedEncoding==='RangeError'&&new TextDecoder(String.fromCharCode(0x20,0x09)+'iso-8859-1'+String.fromCharCode(0x0d,0x0a)).encoding==='windows-1252'&&latinDecoder.encoding==='windows-1252'&&latinText.length===4&&latinText.charCodeAt(0)===65&&latinText.charCodeAt(1)===0x20ac&&latinText.charCodeAt(2)===0x81&&latinText.charCodeAt(3)===0xa3&&fatalLatin.charCodeAt(0)===0x8d&&fatalLatin.charCodeAt(1)===0x9d&&new TextDecoder('us-ascii').decode(new Uint8Array([0x80]))==='€';"
-        "const successfulBase64=atob(btoa('PSP\\0'))==='PSP\\0'&&atob('UFM')==='PS'&&atob('UFM=')==='PS',successfulBase64Diagnostic=globalThis.__tilefinchBase64Error;let invalidBase64Name='';try{atob('!');}catch(error){invalidBase64Name=error.name;}const base64Ok=successfulBase64&&successfulBase64Diagnostic===''&&invalidBase64Name==='InvalidCharacterError'&&globalThis.__tilefinchBase64Error.includes('bad-index=0');"
+        "const successfulBase64=atob(btoa('PSP\\0'))==='PSP\\0'&&atob('UFM')==='PS'&&atob('UFM=')==='PS';let invalidBase64Name='',latin1Name='';try{atob('!');}catch(error){invalidBase64Name=error.name;}try{btoa('\\u0100');}catch(error){latin1Name=error.name;}const base64Ok=successfulBase64&&invalidBase64Name==='InvalidCharacterError'&&latin1Name==='InvalidCharacterError';"
         "const abortController=new AbortController,abortSignal=abortController.signal;let abortSeen=false;abortSignal.addEventListener('abort',()=>abortSeen=true,{once:true});abortController.abort();const recursiveSignal=new AbortController().signal,recursiveCalls=[],onceAbort=()=>{recursiveCalls.push('once');recursiveSignal.dispatchEvent(new Event('abort'))};recursiveSignal.addEventListener('abort',onceAbort,{once:true});recursiveSignal.addEventListener('abort',{handleEvent(){recursiveCalls.push('object')}});recursiveSignal.dispatchEvent(new Event('abort'));const removalSignal=new AbortController().signal,removalCalls=[],removedAbort=()=>removalCalls.push('removed');removalSignal.addEventListener('abort',()=>{removalCalls.push('first');removalSignal.removeEventListener('abort',removedAbort)});removalSignal.addEventListener('abort',removedAbort);removalSignal.dispatchEvent(new Event('abort'));const falsySignal=AbortSignal.any([AbortSignal.abort(0)]),privateController=new AbortController,privateSignal=privateController.signal,fakeSignalTarget=new EventTarget;let falsyThrown='none',badTimeout='',signalConstructor='',borrowedSignal='',borrowedController='',fakeSignalError='',fakeSignalTouched=0;try{falsySignal.throwIfAborted()}catch(error){falsyThrown=error}try{AbortSignal.timeout(-1)}catch(error){badTimeout=error.name}try{new AbortSignal}catch(error){signalConstructor=error.name}try{AbortSignal.prototype.throwIfAborted.call({})}catch(error){borrowedSignal=error.name}try{AbortController.prototype.abort.call({})}catch(error){borrowedController=error.name}try{fakeSignalTarget.addEventListener('fake',()=>{},{signal:{get aborted(){fakeSignalTouched++;return false},addEventListener(){}}})}catch(error){fakeSignalError=error.name}privateController.signal='forged';privateSignal.aborted=true;privateSignal.reason='forged';const abortOk=abortSignal instanceof EventTarget&&abortSignal.aborted&&abortSeen&&abortSignal.reason instanceof DOMException&&abortSignal.reason.name==='AbortError'&&recursiveCalls.join(',')==='once,object,object'&&removalCalls.join(',')==='first'&&falsySignal.aborted&&falsySignal.reason===0&&falsyThrown===0&&badTimeout==='RangeError'&&signalConstructor==='TypeError'&&borrowedSignal==='TypeError'&&borrowedController==='TypeError'&&fakeSignalError==='TypeError'&&fakeSignalTouched===0&&privateController.signal===privateSignal&&!privateSignal.aborted&&privateSignal.reason===undefined&&!Object.prototype.hasOwnProperty.call(privateController,'signal')&&!Object.prototype.hasOwnProperty.call(privateSignal,'aborted');"
         "const headerProbe=new Headers(new Map([['z-last','1'],['a-first','2'],['z-last','3']])),headerOrder=[...headerProbe.keys()].join(','),headerValues=[...headerProbe.values()].join(','),generatedHeaders=new Headers((function*(){yield ['x-one','1'];yield ['x-two','2']})()),tabHeaders=new Headers({'x-tab':'\\talpha\\t beta\\t'});let illegalHeader='',badHeaderPair='';try{Headers.prototype.get.call({},{toString(){return 'a-first'}})}catch(error){illegalHeader=error.name}try{new Headers((function*(){yield ['one']})())}catch(error){badHeaderPair=error.name}const headersOk=!Object.prototype.hasOwnProperty.call(headerProbe,'map')&&headerOrder==='a-first,z-last'&&headerValues==='2,3'&&[...headerProbe][0][0]==='a-first'&&headerProbe.get('Z-LAST')==='3'&&generatedHeaders.get('x-one')==='1'&&generatedHeaders.get('x-two')==='2'&&tabHeaders.get('x-tab')==='alpha\\t beta'&&illegalHeader==='TypeError'&&badHeaderPair==='TypeError';"
         "const template=document.createElement('template');template.innerHTML='<template for=target><b>update</b></template><template data-assistant-presentation-flush></template>';const templateClone=template.cloneNode(true),clonedTarget=templateClone.content.querySelector('template[for=target]'),flushTemplate=template.content.querySelector('template[data-assistant-presentation-flush]'),fragmentProbe=document.createDocumentFragment(),fragmentText=document.createTextNode('fragment');fragmentProbe.appendChild(fragmentText);const fragmentHost=document.createElement('div');fragmentHost.appendChild(fragmentProbe);const equalProbe=document.createElement('p');equalProbe.textContent='equal';const templateOk=template.children.length===0&&template.content.querySelector('template[for=target]')!==null&&template.content.querySelectorAll('template[for],template[data-assistant-presentation-flush]').length===2&&flushTemplate.matches('template[data-assistant-presentation-flush]')&&clonedTarget.content.querySelector('b').textContent==='update'&&equalProbe.isEqualNode(equalProbe.cloneNode(true))&&fragmentProbe.childNodes.length===0&&fragmentHost.textContent==='fragment';"
@@ -3050,9 +3156,9 @@
           && mutation_scripts.dom_mutations >= 4
           && mutation_scripts.events_dispatched >= 2
           && mutation_scripts.performance_now_calls >= 1
-          /* Canvas, Worker and DOM traversal (its createNodeIterator
-             probe) are each admitted on first use. */
-          && mutation_scripts.bootstrap_lazy_module_loads == 3
+          /* Canvas, Worker, DOM traversal and shadow ownership are each
+             admitted on first use by this interface probe. */
+          && mutation_scripts.bootstrap_lazy_module_loads == 4
           && mutation_scripts.bootstrap_lazy_module_failures == 0
           && mutated.body_text == NULL
           && strcmp(mutation_scripts.summary,
@@ -5695,98 +5801,8 @@
     browser_session_destroy(&storage_manager_session);
     CHECK(budget.current == 0);
 
-    puts("test: dedicated Worker exposes a bounded OPFS sync access handle");
-    CHECK(document_parse(
-        &worker_performance_document, &budget, worker_lifecycle_page,
-        strlen(worker_lifecycle_page), 8));
-    CHECK(browser_session_init(&storage_manager_session, &budget, 64 * 1024));
-    memset(&worker_performance_result, 0,
-           sizeof(worker_performance_result));
-    worker_performance_runtime = script_runtime_create_deferred(
-        &worker_performance_document, &budget, 5 * MIB, 1000,
-        "https://opfs-sync.test/", &storage_manager_session,
-        &worker_performance_result);
-    CHECK(worker_performance_runtime != NULL
-          && script_runtime_evaluate_diagnostic(
-              worker_performance_runtime,
-              "(()=>{pocSummary='pending';const source=\"(async()=>{const root="
-              "await navigator.storage.getDirectory(),file=await root."
-              "getFileHandle('sync.bin',{create:true}),handle=await file."
-              "createSyncAccessHandle();let invalidPromise,invalidSync=false;try{"
-              "invalidPromise=FileSystemFileHandle.prototype.createSyncAccessHandle."
-              "call({})}catch(error){invalidSync=true}const invalidRejected=!invalidSync"
-              "&&invalidPromise instanceof Promise&&await invalidPromise.then(()=>false,"
-              "error=>error&&error.name==='TypeError'),input=new Uint8Array([7,8,9]),options="
-              "Object.create({at:1});options.unused=()=>0;let locked="
-              "false;try{await file.createWritable()}catch(error){locked=error.name"
-              "==='NoModificationAllowedError'}const first=handle.write(input."
-              "subarray(0,1)),written=first+handle.write(input.subarray(1)),size="
-              "handle.getSize(),output=new Uint8Array(2),read=handle.read(output,"
-              "options),wide=new Uint8Array(1024*1024),wideRead=handle.read(wide,"
-              "{at:0}),eofRead=handle.read(wide,{at:99});handle.truncate(2);handle."
-              "truncate(4);const zeroes=new Uint8Array(2),zeroRead=handle.read(zeroes,"
-              "{at:2});handle.truncate(2);handle.flush();handle.close();handle.close();"
-              "const unit=new Uint8Array([1]),chunk=new Uint8Array(64),block=new "
-              "Uint8Array(4096),oneFile=await root.getFileHandle('one.bin',{create:true}),"
-              "one=await oneFile.createSyncAccessHandle();for(let i=0;i<4096;i++)one."
-              "write(unit);one.close();const chunkFile=await root.getFileHandle('chunk."
-              "bin',{create:true}),chunked=await chunkFile.createSyncAccessHandle();for("
-              "let i=0;i<64;i++)chunked.write(chunk);chunked.close();const blockFile=await"
-              " root.getFileHandle('block.bin',{create:true}),blocked=await blockFile."
-              "createSyncAccessHandle();blocked.write(block);blocked.close();const saved="
-              "Uint8Array.prototype.set;Uint8Array.prototype.set=()=>{throw Error('poison')};"
-              "const encoded=new TextEncoder().encode('worker-copy');Uint8Array.prototype."
-              "set=saved;"
-              "postMessage({written,size,read,bytes:Array.from(output),locked,tag:"
-              "Object.prototype.toString.call(handle),ctor:handle instanceof "
-              "FileSystemSyncAccessHandle,invalidRejected,wideRead,eofRead,wide:Array."
-              "from(wide.subarray(0,3)),zeroRead,zeroes:Array.from(zeroes),encoded:Array."
-              "from(encoded)})})().catch(error=>postMessage"
-              "({error:error.name+':'+error.message}))\",url=URL.createObjectURL(new Blob(["
-              "source])),worker=new Worker(url);worker.onmessage=async event=>{try{"
-              "const root=await navigator.storage.getDirectory(),file=await root."
-              "getFileHandle('sync.bin'),bytes=new Uint8Array(await(await file."
-              "getFile()).arrayBuffer()),writer=await file.createWritable();await "
-              "writer.close();const data=event.data;pocSummary=!data.error&&data."
-              "written===3&&data.size===3&&data.read===2&&data.bytes.join(',')==='8,9'"
-              "&&data.wideRead===3&&data.eofRead===0&&data.wide.join(',')==='7,8,9'"
-              "&&data.zeroRead===2&&data.zeroes.join(',')==='0,0'&&data.encoded.join(',')"
-              "==='119,111,114,107,101,114,45,99,111,112,121'"
-              "&&data.locked&&data.ctor&&data.invalidRejected&&data.tag==='[object "
-              "FileSystemSyncAccessHandle]'&&bytes.length===2&&bytes[0]===7&&bytes[1]"
-              "===8&&__tilefinchRootCensus.opfsBufferGrowths<=17&&"
-              "__tilefinchRootCensus.opfsBufferCopiedBytes<=8192&&"
-              "__tilefinchRootCensus.workerOpfsReadScratchBytes===7&&"
-              "__tilefinchRootCensus.workerOpfsReadCloneBytes===7?"
-              "'OPFS-SYNC-OK':'OPFS-SYNC-BAD:'+JSON.stringify({data,bytes:Array."
-              "from(bytes)});worker.terminate();URL.revokeObjectURL(url)}catch(error){"
-              "pocSummary='OPFS-SYNC-ERROR:'+error.name+':'+error.message}}})()",
-              "<opfs-worker-sync-access>", &worker_performance_result));
-    for (size_t worker_turn = 0; worker_turn < 64; worker_turn++) {
-        bool advanced = script_runtime_advance(
-            worker_performance_runtime, worker_turn, 32,
-            &worker_performance_result);
-        if (!advanced) {
-            fprintf(stderr, "OPFS advance turn=%zu interrupted=%d "
-                "watchdog-ms=%lu error=%s\n", worker_turn,
-                (int) worker_performance_result.interrupted,
-                worker_performance_result.watchdog_elapsed_ms,
-                worker_performance_result.error);
-        }
-        CHECK(advanced);
-    }
-    if (strcmp(worker_performance_result.summary,
-               "OPFS-SYNC-OK") != 0) {
-        fprintf(stderr, "OPFS sync summary=%s error=%s\n",
-                worker_performance_result.summary,
-                worker_performance_result.error);
-    }
-    CHECK(strcmp(worker_performance_result.summary,
-                 "OPFS-SYNC-OK") == 0);
-    script_runtime_destroy(worker_performance_runtime);
-    document_destroy(&worker_performance_document);
-    browser_session_destroy(&storage_manager_session);
-    CHECK(budget.current == 0);
+    CHECK(test_opfs_sync_access() == 0);
+    budget_install_lexbor(&budget);
 
     puts("test: terminating a Worker releases its active OPFS writer");
     CHECK(document_parse(

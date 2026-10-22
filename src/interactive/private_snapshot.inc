@@ -255,6 +255,7 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         "Cookie admission diagnostics: enabled=%u http=%zu script=%zu refused=%zu "
         "byte-refusals=%zu slot-refusals=%zu allocation-refusals=%zu "
         "policy-ignored=%zu evictions=%zu peak-values=%zu limit=%zu "
+        "header-omissions=%zu "
         "google-count=%zu google-bytes=%zu youtube-count=%zu youtube-bytes=%zu\n",
         cookie_diagnostics.enabled, cookie_diagnostics.http_attempts,
         cookie_diagnostics.script_attempts, cookie_diagnostics.refused,
@@ -262,23 +263,9 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         cookie_diagnostics.allocation_refusals, cookie_diagnostics.policy_ignored,
         cookie_diagnostics.evictions, cookie_diagnostics.peak_value_bytes,
         navigation->browser_session == NULL ? 0 : navigation->browser_session->maximum_cookie_bytes,
+        cookie_diagnostics.header_omissions,
         google_usage.cookie_count, google_usage.cookie_bytes,
         youtube_usage.cookie_count, youtube_usage.cookie_bytes) > 0;
-    ok = ok && fprintf(text,
-        "YouTube feed diagnostics: attempted=%u complete=%u bootstrap-status=%ld "
-        "bootstrap-bytes=%zu same-origin=%u destination=%u login-known=%u logged-in=%u "
-        "authorization-present=%u api-status=%ld api-bytes=%zu json=%u error=%u "
-        "api-login-known=%u api-logged-out=%u results=%zu message=%u signin-required=%u\n",
-        private_youtube_feed_attempted, private_youtube_feed_okay,
-        private_youtube_feed.bootstrap_status, private_youtube_feed.bootstrap_bytes,
-        private_youtube_feed.bootstrap_same_origin, private_youtube_feed.bootstrap_destination,
-        private_youtube_feed.login_known,
-        private_youtube_feed.logged_in, private_youtube_feed.authorization_present,
-        private_youtube_feed.api_status,
-        private_youtube_feed.api_bytes, private_youtube_feed.api_json,
-        private_youtube_feed.api_error, private_youtube_feed.api_login_known,
-        private_youtube_feed.api_logged_out, private_youtube_feed.result_count,
-        private_youtube_feed.api_message, private_youtube_feed.api_signin_required) > 0;
     ok = ok && fprintf(text,
         "Page memory diagnostics: current=%zu peak=%zu limit=%zu refusals=%zu\n",
         budget_current, budget_peak, navigation->budget->limit,
@@ -348,19 +335,17 @@ static bool private_snapshot_page(BrowserEngine *engine, NavigationSession *navi
         navigation->last_transport_timed_out,
         navigation->last_error[0] != '\0', navigation->loads_committed,
         private_snapshot_navigation_error_kind(navigation->last_error)) > 0;
-    unsigned layout_phase = 0, layout_cancelled = 0;
-    size_t layout_refusals = 0, layout_current = 0, layout_limit = 0;
-    bool layout_diagnostic = sscanf(navigation->last_error,
-        "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
-        &layout_phase, &layout_cancelled, &layout_refusals,
-        &layout_current, &layout_limit) == 5;
+    bool layout_diagnostic = strcmp(navigation->last_error,
+                                    NAVIGATION_LAYOUT_FAILED_ERROR) == 0;
+    const NavigationLayoutFailure *layout_failure =
+        &navigation->last_layout_failure;
     ok = ok && fprintf(text,
         "Layout failure diagnostics: available=%u phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu\n",
-        layout_diagnostic, layout_diagnostic ? layout_phase : 0,
-        layout_diagnostic ? layout_cancelled : 0,
-        layout_diagnostic ? layout_refusals : 0,
-        layout_diagnostic ? layout_current : 0,
-        layout_diagnostic ? layout_limit : 0) > 0;
+        layout_diagnostic, layout_diagnostic ? layout_failure->phase : 0,
+        layout_diagnostic ? (unsigned) layout_failure->cancelled : 0,
+        layout_diagnostic ? layout_failure->refusals : 0,
+        layout_diagnostic ? layout_failure->current : 0,
+        layout_diagnostic ? layout_failure->limit : 0) > 0;
     ok = ok && fprintf(text, "Response diagnostics: available=%u count=%zu "
                        "overwritten=%zu json-observer-installed=%u json-parse-calls=%zu "
                        "json-parse-failures=%zu\n", responses_ok, responses.count,

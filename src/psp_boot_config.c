@@ -1,7 +1,6 @@
 #include "tilefinch/psp_boot_config.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +8,7 @@
 #include "media_backend_psp_policy.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/install_paths.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/update.h"
 
@@ -364,18 +364,7 @@ bool psp_boot_config_load(
 static bool boot_config_publish(const char *temporary, const char *path,
                                 const char *backup)
 {
-    bool had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) {
-            remove(temporary);
-            return false;
-        }
-    }
-    if (rename(temporary, path) == 0) return true;
-    if (had_previous) (void) rename(backup, path);
+    if (tilefinch_platform_replace_file(temporary, path, backup)) return true;
     remove(temporary);
     return false;
 }

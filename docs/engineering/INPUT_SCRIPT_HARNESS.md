@@ -1432,6 +1432,18 @@ and the `tilefinch-site-data-fixture-tests` host test reloads it with the
 shipping readers, so a persistence-format change fails on the host instead of
 turning the emulator run into a restore with nothing to read.
 
+Validation builds print both frame-pump violation counts at exit and, for
+each pump, how many admissions and slices the run saw and how often it was
+refused because of another pump rather than a frame fact
+(`tilefinch-frame-pump: name=baseline-fonts admissions=1 slices=1 yields=1`).
+Admissions and slices show that a site is live, not merely present in the
+source; a yield shows that a declared relation arbitrated something. Two
+relations rest on the host table test (`tests/test_frame_pumps.c`) alone,
+with no emulator evidence: cache restoration waiting for the baseline fonts
+(on this boot path, the network-warming fact holds cache restoration back
+until long after the single font slice) and page-idle yielding to a download
+slice (which needs a live media download).
+
 `runtime-input-live` and `runtime-cancel-live` use the bounded cooperative
 runtime fixture. Their goldens preserve action order/counts and captures but
 omit asynchronous cursor positions; the raw trace remains available. Separate

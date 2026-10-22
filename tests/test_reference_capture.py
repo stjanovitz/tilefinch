@@ -93,6 +93,203 @@ def reference_environment_state() -> dict[str, object]:
 
 @unittest.skipIf(NODE is None, "Node.js is unavailable")
 class ReferenceCaptureIndexTests(unittest.TestCase):
+    def test_caught_worker_quota_refusal_still_invalidates_capture(self):
+        script = r'''const c=require(process.argv[1]),vm=require('node:vm'),assert=require('node:assert/strict');
+const context=vm.createContext({denials:[]});
+vm.runInContext(`
+globalThis.__tilefinchBlockedCapability=kind=>denials.push(kind);
+globalThis.Worker=class Worker{terminate(){}};
+(${c.installOfflineCapabilityPolicy})({version:'offline-capabilities-v2',surfaceVersion:'realm-entrypoints-unavailable-v1',dedicatedWorkers:true});
+for(let i=0;i<16;i++)new Worker('https://fixture.test/worker.js');
+try{new Worker('https://fixture.test/worker.js')}catch(_){}
+`,context);
+assert.deepEqual(Array.from(context.denials),['WORKER-QUOTA']);'''
+        result = subprocess.run((NODE, '-e', script, str(CAPTURE)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_mobile_auto_fit_requires_independent_device_and_visual_geometry(self):
+        script = r'''const c=require(process.argv[1]);
+const scenario={cssWidth:480,cssHeight:272,scaleNumerator:1,scaleDenominator:1};
+const good={coarse:true,touch:1,width:494,height:280,layoutWidth:480,screenWidth:480,screenHeight:272,
+ dpr:1,visual:{width:494,height:272*494/480,scale:480/494},animations:0,editableFocus:false};
+if(!c.mobileAutoFitProfileReady(good,scenario))throw Error('valid auto-fit rejected');
+for(const change of [{coarse:false},{touch:0},{dpr:2},{width:480},{height:279},
+ {layoutWidth:494},{screenWidth:800},{screenHeight:600},{animations:1},{editableFocus:true},
+ {visual:{width:494,height:279,scale:480/494}},{visual:null}]){
+ if(c.mobileAutoFitProfileReady({...good,...change},scenario))throw Error('invalid profile accepted');
+}
+for(const args of [['--mobile-auto-fit'],['--mobile-auto-fit','--scroll-window-px','1024','--browser','firefox'],
+ ['--scroll-selector','#panel'],['--dedicated-workers'],
+ ['--dedicated-workers','--scroll-window-px','1024','--script-free-diagnostic']]){
+ let refused=false;try{c.parseArguments(args)}catch(_){refused=true}if(!refused)throw Error('mode not bounded');
+}'''
+        result = subprocess.run((NODE, '-e', script, str(CAPTURE)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_control_actions_require_a_plain_bounded_diagnostic(self) -> None:
+        script=r'''
+const c=require(process.argv[1]);
+const refuse=args=>{try{c.parseArguments(args);return false;}catch(_){return true;}};
+console.log(JSON.stringify([refuse(['--click-text','Keep blocking']),
+ refuse(['--scroll-window-px','4096','--click-text','']),
+ refuse(['--scroll-window-px','4096','--click-text','x'.repeat(257)]),
+ refuse(['--scroll-window-px','4096','--click-text','a\nb']),
+ refuse(['--scroll-window-px','4096','--retained-query-posts','--click-text','Keep blocking']),
+ c.parseArguments(['--scroll-window-px','4096','--click-text','Keep blocking']).clickText]));
+'''
+        result=subprocess.run((NODE,'-e',script,str(CAPTURE)),capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),[True]*5+['Keep blocking'])
+
+    def test_retained_query_posts_refuse_mutations_and_ambiguous_bodies(self) -> None:
+        script=r'''
+const path=require('path'),q=require(path.join(path.dirname(process.argv[1]),'retained-query-posts.js'));
+const queries=['query Public($path: ID!){project(fullPath:$path){id}}',
+ '# comment\nquery Public {x {...Fields}} fragment Fields on T {id}',
+ '{ public { id } }'];
+const denied=['mutation { deleteEverything }','subscription { changes }',
+ 'query Q {x} mutation M {deleteEverything}','query Q {x} query R {y}',
+ 'query Q {x','query Q {x} !'];
+const accepts=body=>{try{q.readQueryBody(Buffer.from(body));return true;}catch(_){return false;}};
+console.log(JSON.stringify({ok:queries.map(query=>accepts(JSON.stringify({query,variables:{}}))),
+ no:denied.map(query=>accepts(JSON.stringify({query}))),
+ extra:[accepts('[{"query":"{x}"}]'),accepts('{"query":"mutation{x}","query":"{x}"}'),
+ accepts(JSON.stringify({query:'{x}',extensions:{}})),accepts(JSON.stringify({query:'{x}',variables:[]})),
+ accepts(JSON.stringify({query:'{x}',variables:{padding:'x'.repeat(16384)}}))],
+ explicit:q.queryDocumentOnly('query Q { field(input:"mutation {x}") }'),
+ flag:captureFlag() }));
+function captureFlag(){const c=require(process.argv[1]);let refused=false;
+ try{c.parseArguments(['--retained-query-posts']);}catch(_){refused=true;}
+ return [refused,c.parseArguments(['--scroll-window-px','4096','--retained-query-posts']).retainedQueryPosts];}
+'''
+        result=subprocess.run((NODE,'-e',script,str(CAPTURE)),capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        value=json.loads(result.stdout)
+        self.assertEqual(value['ok'],[True]*3)
+        self.assertEqual(value['no'],[False]*6)
+        self.assertEqual(value['extra'],[False]*5)
+        self.assertTrue(value['explicit'])
+        self.assertEqual(value['flag'],[True,True])
+
+    def test_cdp_query_body_is_bounded_and_missing_data_is_not_guessed(self) -> None:
+        script=r'''
+const a=require(process.argv[1]);
+const read=postData=>a.cdpRoute({}, {request:{headers:{},postData}}).request().postDataBuffer();
+console.log(JSON.stringify([read('query')?.toString(),read(undefined),read('x'.repeat(16385)),
+ read('é'.repeat(8193)),read('é'.repeat(8192))?.length]));
+'''
+        result=subprocess.run((NODE,'-e',script,str(ROOT/'benchmarks/reference-capture-audit.js')),
+            capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),['query',None,None,None,16384])
+
+    def test_retained_query_admission_is_pinned_and_anonymous(self) -> None:
+        script=r'''
+const fs=require('fs'),path=require('path'),os=require('os');
+const q=require(path.join(path.dirname(process.argv[1]),'retained-query-posts.js'));
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'query-admission-'));
+const body=Buffer.from(JSON.stringify({query:'query Q { public { id } }'}));
+let h=0xcbf29ce484222325n;for(const b of body)h=BigInt.asUintN(64,(h^BigInt(b))*0x100000001b3n);
+const hash=h.toString(16).padStart(16,'0');
+const record={id:'0000',method:'POST',url:'https://public.test/api/query',
+ requestBodyLength:body.length,requestBodyHash:hash,requestCookieBytes:0,requestCredentials:0};
+const run=records=>q.loadRetainedQueryPosts({root,records},'https://public.test/',()=>hash);
+const denied=records=>{try{run(records);return false;}catch(_){return true;}};
+try{
+ fs.writeFileSync(path.join(root,'0000.request'),body);
+ fs.writeFileSync(path.join(root,'0001.request'),body);
+ const ok=run([record]);
+ const failures=[denied([{...record,url:'https://other.test/api/query'}]),
+ denied([{...record,requestBodyHash:'0000000000000000'}]),
+ denied([{...record,requestBodyLength:body.length+1}]),denied([{...record,requestCookieBytes:1}]),
+ denied([{...record,requestCredentials:1}]),denied([record,{...record,id:'0001'}]),denied([])];
+ fs.unlinkSync(path.join(root,'0000.request'));
+ fs.symlinkSync(path.join(root,'0001.request'),path.join(root,'0000.request'));
+ failures.push(denied([record]));
+ console.log(JSON.stringify({count:ok.length,sha:ok[0].sha256.length,failures}));
+}finally{fs.rmSync(root,{recursive:true,force:true});}
+'''
+        result=subprocess.run((NODE,'-e',script,str(CAPTURE)),capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        value=json.loads(result.stdout)
+        self.assertEqual([value['count'],value['sha']],[1,64])
+        self.assertEqual(value['failures'],[True]*8)
+
+    def test_number_parts_preserve_grouping_and_formatted_text(self) -> None:
+        script = r'''
+const fs=require('fs'),vm=require('vm'),path=require('path');
+const source=fs.readFileSync(path.join(path.dirname(process.argv[1]),'../src/bootstrap/intl.js'),'utf8');
+const engine=vm.createContext({});vm.runInContext('Intl=undefined;'+source,engine);
+const native=Intl.NumberFormat;
+const capture=require(process.argv[1]);
+globalThis.location={href:'https://parts.test/'};globalThis.top=globalThis;
+capture.installReplayEnvironment({version:'deterministic-hermetic-v3',clockVersion:'playwright-clock-paused-v2',
+ clockContract:'dual-domain-ms-call-v2',clockScope:'top-level-realm-v1',rngVersion:'splitmix64-url-scope-v1',
+ seedSource:'trace-origin-ms-v1',intlContract:'bounded-en-us-utc-v1',seedSha256:'0'.repeat(64),
+ seedU64:'1000',originMs:1000});
+const cases=[[{},12345.6],[{},-1234567.89],[{useGrouping:false},12345.6],
+ [{minimumFractionDigits:3},1.2],[{style:'percent'},.125],
+ [{style:'currency',currency:'USD'},-1234.5],[{},NaN]];
+const check=C=>cases.map(([options,value])=>{
+ const f=new C('en-US',options),parts=f.formatToParts(value);
+ return {parts,joined:parts.map(p=>p.value).join(''),formatted:f.format(value)};
+});
+console.log(JSON.stringify({engine:check(engine.Intl.NumberFormat),replay:check(Intl.NumberFormat),
+ decimal:cases.slice(0,4).map(([options,value])=>new native('en-US',options).formatToParts(value))}));
+'''
+        result=subprocess.run((NODE,'-e',script,str(CAPTURE)),capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        value=json.loads(result.stdout)
+        self.assertEqual(value['engine'],value['replay'])
+        self.assertEqual([r['parts'] for r in value['engine'][:4]],value['decimal'])
+        self.assertEqual(value['engine'][4]['parts'],[
+            {'type':'integer','value':'12'},{'type':'decimal','value':'.'},
+            {'type':'fraction','value':'5'},{'type':'percentSign','value':'%'}])
+        self.assertEqual(value['engine'][5]['parts'][0],{'type':'currency','value':'USD'})
+        self.assertEqual(value['engine'][6]['parts'],[{'type':'nan','value':'NaN'}])
+        for row in value['engine']:
+            self.assertEqual(row['joined'],row['formatted'])
+
+    def test_response_selection_preserves_request_origin_variants(self) -> None:
+        script = r'''
+const c=require(process.argv[1]);
+const record=(id,origin,status)=>({id,requestOrigin:origin,success:true,status,signature:id});
+const route=c.selectRoute([record('1','',200),record('2','https://page.test',200),
+ record('3','https://other.test',403)]);
+const pick=origin=>c.selectRequestOriginRoute(route,origin)?.candidates.map(r=>r.id)||null;
+const mixed=c.selectRoute([record('5',undefined,200),record('6','https://page.test',200)]);
+const old=c.selectRoute([record('7',undefined,200),record('8',undefined,200)]),counts=new Map();
+const legacy=['','https://page.test'].map(origin=>{
+ const selected=c.selectRequestOriginRoute(old,origin);
+ return c.claimRouteRecord(selected,counts,selected.requestOrigin===null?'legacy':origin).record.id;
+});
+console.log(JSON.stringify([pick(''),pick('https://page.test'),pick('https://other.test'),
+ pick('https://unknown.test'),c.selectRequestOriginRoute(c.selectRoute([record('4',undefined,200)]),
+ 'https://page.test').candidates.map(r=>r.id),
+ c.selectRequestOriginRoute(mixed,'https://page.test').candidates.map(r=>r.id),legacy]));
+'''
+        result=subprocess.run((NODE,'-e',script,str(CAPTURE)),capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),[['1'],['2'],['3'],None,['4'],['6'],['7','8']])
+
+    def test_scroll_windows_are_explicit_and_bounded(self) -> None:
+        script = r'''
+const c=require(process.argv[1]);
+const selected=c.parseArguments(['--scroll-window-px','4096']);
+const refused=['0','-1','16385','1.5','NaN'].map(value=>{
+ try { c.parseArguments(['--scroll-window-px',value]); return false; }
+ catch (_) { return true; }
+});
+console.log(JSON.stringify({selected,refused,ordinary:c.parseArguments([]).scrollWindow}));
+'''
+        result = subprocess.run((NODE, "-e", script, str(CAPTURE)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value['selected']['scrollWindow'], 4096)
+        self.assertTrue(value['selected']['fullDocument'])
+        self.assertEqual(value['refused'], [True] * 5)
+        self.assertEqual(value['ordinary'], 0)
+
     def test_retained_preflight_shapes_are_exact_read_only_requests(self) -> None:
         script = r'''
 const shape=require(process.argv[1]).preflightShape;
@@ -136,6 +333,33 @@ console.log(JSON.stringify({first,conflict,denied}));
         self.assertEqual(value["first"]["requests"][0]["request_origin"], "https://page.test")
         self.assertFalse(value["conflict"]["complete"])
         self.assertFalse(value["denied"]["complete"])
+
+    def test_origin_variant_plan_preserves_types_and_occurrences(self):
+        script = r'''
+const capture=require(process.argv[1]), audit=require(process.argv[2]);
+const d=capture.createRequestDiagnostics(), o=audit.createOriginEvidence({variants:true});
+for(const [origin,type] of [['','script'],['https://page.test','fetch'],['','script']]) {
+ d.record('unmatched','GET',type,'https://asset.test/shared.js');
+ o.record('GET','https://asset.test/shared.js',origin,type);
+}
+const first=capture.buildReadOnlyAcquisitionPlan(d.summary(),o.summary());
+const missing=o.summary();missing.entries.pop();
+const overflow=o.summary();overflow.overflow=true;
+console.log(JSON.stringify({first,
+ missing:capture.buildReadOnlyAcquisitionPlan(d.summary(),missing),
+ overflow:capture.buildReadOnlyAcquisitionPlan(d.summary(),overflow)}));
+'''
+        result = subprocess.run((NODE, '-e', script, str(CAPTURE),
+            str(ROOT / 'benchmarks/reference-capture-audit.js')), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value['first']['mode'], 'exact-get-head-plan-v3')
+        self.assertTrue(value['first']['complete'])
+        rows = value['first']['requests']
+        self.assertEqual([(r['request_origin'], r['resource_types'], r['occurrences']) for r in rows],
+            [('', ['script'], 2), ('https://page.test', ['fetch'], 1)])
+        self.assertFalse(value['missing']['complete'])
+        self.assertFalse(value['overflow']['complete'])
 
     def test_browser_request_audit_detects_unintercepted_redirects(self) -> None:
         script = r'''
@@ -187,6 +411,24 @@ console.log(JSON.stringify([audit.summary(4),unknown.summary(1),transport.summar
         self.assertEqual(audit["failures"][0]["reason"], "canceled-replayed-response")
         self.assertFalse(unknown["ready"])
         self.assertFalse(transport["ready"])
+
+    def test_pending_protocol_request_keeps_diagnostics_and_fails_readiness(self) -> None:
+        script = r'''
+const audit=require(process.argv[1]).createRequestAudit(), session={};
+audit.networkBegin(session,{requestId:'pending',request:{url:'https://asset.test/pending',method:'GET'},type:'Image'});
+audit.networkIntercepted(session,{networkId:'pending'});
+audit.networkFulfilled(session,{networkId:'pending'});
+console.log(JSON.stringify(audit.summary(1)));
+'''
+        result = subprocess.run((NODE, "-e", script,
+            str(ROOT / "benchmarks/reference-capture-audit.js")), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertFalse(value['ready'])
+        self.assertEqual(value['pending'], 1)
+        self.assertEqual(value['pending_requests'][0]['url'], 'https://asset.test/pending')
+        self.assertTrue(value['pending_requests'][0]['fulfilled'])
+        self.assertTrue(value['pending_requests'][0]['intercepted'])
 
     def test_blocked_preflight_covers_only_its_linked_parent(self) -> None:
         script = r'''
@@ -1418,7 +1660,7 @@ capture.installReplayEnvironment({
 const instant = 1700000000042;
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
 const engine = vm.createContext({});
-vm.runInContext('Intl = undefined;' + fs.readFileSync(
+vm.runInContext('__tilefinchDefaultTimeZone=Intl.DateTimeFormat().resolvedOptions().timeZone; Intl = undefined;' + fs.readFileSync(
   path.join(path.dirname(process.argv[1]), '../src/bootstrap/intl.js'), 'utf8'), engine);
 function segmentState(Constructor) {
   return ['grapheme', 'word', 'sentence'].flatMap(granularity =>
@@ -1428,6 +1670,13 @@ function segmentState(Constructor) {
       return [segmenter.resolvedOptions(), Array.from(result),
         Array.from({length:text.length + 2}, (_,i) => result.containing(i - 1))];
     }));
+}
+function dateState(Constructor) {
+ return [{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',
+   second:'2-digit',hour12:false,timeZoneName:'longOffset',timeZone:'UTC'},
+   {weekday:'long'},{hour:'numeric'},{dateStyle:'full',timeStyle:'short',timeZone:'+05:30'}]
+   .map(options=>{const f=new Constructor('en-US',{timeZone:'UTC',...options});return [f.format(instant),
+     f.formatToParts(instant),f.resolvedOptions()];});
 }
 const date = new Intl.DateTimeFormat("en-US", { timeZone: "UTC" });
 const time = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", hour: "numeric" });
@@ -1469,6 +1718,8 @@ process.stdout.write(JSON.stringify({
   dateConstructor: Date.prototype.constructor === Date,
   segmenterMatchesBootstrap: JSON.stringify(segmentState(Intl.Segmenter)) ===
     JSON.stringify(segmentState(engine.Intl.Segmenter)),
+  dateMatchesBootstrap: JSON.stringify(dateState(Intl.DateTimeFormat)) ===
+    JSON.stringify(dateState(engine.Intl.DateTimeFormat)),
 }));
 """
         completed = subprocess.run(
@@ -1513,7 +1764,7 @@ process.stdout.write(JSON.stringify({
                 "year": "numeric", "month": "numeric", "day": "numeric",
             },
         )
-        self.assertEqual(state["time"], "10:13:20 PM")
+        self.assertEqual(state["time"], "10 PM")
         self.assertEqual(
             (state["number"], state["percent"], state["currency"]),
             ("1,234.5", "25%", "USD 1,234.5"),
@@ -1529,6 +1780,7 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(state["methodsNative"])
         self.assertTrue(state["dateConstructor"])
         self.assertTrue(state["segmenterMatchesBootstrap"])
+        self.assertTrue(state["dateMatchesBootstrap"])
 
     def test_read_only_policy_denies_mutations_before_native_network_apis(self) -> None:
         script = r"""

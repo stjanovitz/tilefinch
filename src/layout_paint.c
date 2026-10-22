@@ -58,31 +58,34 @@ _Static_assert((int) STYLE_MIX_BLEND_DARKEN == (int) LAYOUT_MIX_BLEND_DARKEN,
 #include <math.h>
 
 static int scale_around_center(int value, int origin_twice,
-                               uint8_t scale_q6)
+                               uint16_t scale_q14)
 {
     int64_t delta_twice = (int64_t) value * 2 - origin_twice;
     int64_t scaled_twice = origin_twice
-        + delta_twice * scale_q6 / 64;
+        + delta_twice * scale_q14 / 16384;
     if (scaled_twice > (int64_t) INT_MAX * 2) return INT_MAX;
     if (scaled_twice < (int64_t) INT_MIN * 2) return INT_MIN;
     return (int) (scaled_twice < 0
                   ? (scaled_twice - 1) / 2 : (scaled_twice + 1) / 2);
 }
 
-static int scale_dimension(int value, uint8_t scale_q6)
+static int scale_dimension(int value, uint16_t scale_q14)
 {
-    if (value <= 0 || scale_q6 == 0) return 0;
-    int64_t scaled = ((int64_t) value * scale_q6 + 32) / 64;
+    if (value <= 0 || scale_q14 == 0) return 0;
+    int64_t scaled = ((int64_t) value * scale_q14 + 8192) / 16384;
     if (scaled > INT_MAX) return INT_MAX;
     return scaled < 1 ? 1 : (int) scaled;
 }
 
-static int scale_fixed_around_center(int value_fixed, int origin_twice,
-                                     uint8_t scale_q6)
+/* Scales a 26.6 coordinate about an origin given in doubled pixels.
+   Glyph positions (layout_bidi.c) and command geometry share it so a
+   scaled run's glyphs stay on its commands. */
+int scale_fixed_around_center(int value_fixed, int origin_twice,
+                              uint16_t scale_q14)
 {
     int64_t origin_fixed = (int64_t) origin_twice * 32;
     int64_t scaled = origin_fixed
-        + ((int64_t) value_fixed - origin_fixed) * scale_q6 / 64;
+        + ((int64_t) value_fixed - origin_fixed) * scale_q14 / 16384;
     return scaled > INT_MAX ? INT_MAX
            : (scaled < INT_MIN ? INT_MIN : (int) scaled);
 }
@@ -130,27 +133,27 @@ void layout_transform_origin_twice(
 void layout_scale_range(LayoutDocument *layout, size_t command_start,
                         size_t link_start, size_t control_start,
                         size_t node_box_start, int origin_x_twice,
-                        int origin_y_twice, uint8_t scale_q6,
+                        int origin_y_twice, uint16_t scale_q14,
                         lxb_dom_node_t *source)
 {
-    if (scale_q6 == 64) return;
+    if (scale_q14 == 16384) return;
     layout_bidi_scale_commands(
-        layout, command_start, origin_x_twice, scale_q6);
+        layout, command_start, origin_x_twice, scale_q14);
     for (size_t i = command_start; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
         if (command->type == DRAW_TEXT) {
             int x_fixed = scale_fixed_around_center(
                 draw_command_text_x_fixed(command), origin_x_twice,
-                scale_q6);
+                scale_q14);
             draw_command_set_text_x_fixed(command, x_fixed);
         } else {
             command->x = scale_around_center(command->x, origin_x_twice,
-                                             scale_q6);
+                                             scale_q14);
         }
         command->y = scale_around_center(command->y, origin_y_twice,
-                                         scale_q6);
-        command->width = scale_dimension(command->width, scale_q6);
-        command->height = scale_dimension(command->height, scale_q6);
+                                         scale_q14);
+        command->width = scale_dimension(command->width, scale_q14);
+        command->height = scale_dimension(command->height, scale_q14);
         if (command->type == DRAW_IMAGE
             && command->image_fit >= LAYOUT_IMAGE_FIT_SPRITE
             && command->image_fit <= LAYOUT_IMAGE_FIT_SPRITE_TILE_XY) {
@@ -167,26 +170,26 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                 command->image);
             if (width > 0 && height > 0) {
                 draw_command_set_image_sprite_size(
-                    command, scale_dimension(width, scale_q6),
-                    scale_dimension(height, scale_q6));
+                    command, scale_dimension(width, scale_q14),
+                    scale_dimension(height, scale_q14));
             }
             draw_command_set_image_offset(
                 command, scale_around_center(
-                    draw_command_image_offset_x(command), 0, scale_q6),
+                    draw_command_image_offset_x(command), 0, scale_q14),
                 scale_around_center(
-                    draw_command_image_offset_y(command), 0, scale_q6));
+                    draw_command_image_offset_y(command), 0, scale_q14));
         }
         if (command->type != DRAW_TEXT && command->type != DRAW_IMAGE
             && command->type != DRAW_SHEARED_FILL
             && command->type != DRAW_ROTATED_FILL) {
             command->radius = layout_scale_radius_code(
-                command->radius, scale_q6, 64);
+                command->radius, scale_q14, 16384);
         }
         if (command->type == DRAW_TEXT) {
             int64_t size_fixed =
                 (int64_t) draw_command_text_font_size_fixed(command)
-                * scale_q6 + 32;
-            size_fixed /= 64;
+                * scale_q14 + 8192;
+            size_fixed /= 16384;
             if (size_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
                 size_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
             }
@@ -195,46 +198,46 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
             if (draw_command_is_text_shadow(command)) {
                 draw_command_set_text_shadow_blur(
                     command, scale_dimension(
-                        draw_command_text_shadow_blur(command), scale_q6));
+                        draw_command_text_shadow_blur(command), scale_q14));
             }
             draw_command_set_text_letter_spacing_fixed(command,
                 scale_around_center(draw_command_text_letter_spacing_fixed(command),
-                    0, scale_q6));
+                    0, scale_q14));
             int underline_offset = 0;
             if (draw_command_text_underline_offset(
                     command, &underline_offset)) {
                 draw_command_set_text_underline_offset(
                     command, scale_around_center(
-                        underline_offset, 0, scale_q6));
+                        underline_offset, 0, scale_q14));
             }
         }
         if (command->type == DRAW_SHEARED_FILL) {
             command->text_length = (uint32_t) scale_dimension(
-                (int) command->text_length, scale_q6);
-            command->font_size = scale_dimension(command->font_size, scale_q6);
-            command->radius = scale_dimension(command->radius, scale_q6);
+                (int) command->text_length, scale_q14);
+            command->font_size = scale_dimension(command->font_size, scale_q14);
+            command->radius = scale_dimension(command->radius, scale_q14);
         }
         if (command->type == DRAW_ROTATED_FILL) {
             unsigned w = (unsigned) scale_dimension(
-                command->text_length & 65535u, scale_q6);
+                draw_command_rotated_width(command), scale_q14);
             unsigned h = (unsigned) scale_dimension(
-                command->text_length >> 16, scale_q6);
+                draw_command_rotated_height(command), scale_q14);
             if (w > 65535u) w = 65535u;
             if (h > 65535u) h = 65535u;
-            command->text_length = w | (h << 16);
-            command->radius = scale_fixed_around_center(command->radius, 0, scale_q6);
-            command->scale = scale_fixed_around_center(command->scale, 0, scale_q6);
+            draw_command_set_rotated_extent(command, w, h);
+            command->radius = scale_fixed_around_center(command->radius, 0, scale_q14);
+            command->scale = scale_fixed_around_center(command->scale, 0, scale_q14);
         }
         if (command->type == DRAW_BORDER_TRIANGLE) {
             command->text_length = (uint32_t) scale_dimension(
-                (int) command->text_length, scale_q6);
-            command->font_size = scale_dimension(command->font_size, scale_q6);
+                (int) command->text_length, scale_q14);
+            command->font_size = scale_dimension(command->font_size, scale_q14);
         }
         if (command->type == DRAW_STROKE_RECT
             && command->image_fit == LAYOUT_STROKE_SIDES) {
             unsigned sides[4];
             for (unsigned side = 0; side < 4; side++) {
-                int width = scale_dimension(draw_command_stroke_side(command, side), scale_q6);
+                int width = scale_dimension(draw_command_stroke_side(command, side), scale_q14);
                 sides[side] = width > 65535 ? 65535u : (unsigned) width;
             }
             draw_command_set_stroke_sides(command, sides);
@@ -244,57 +247,57 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
             || command->type == DRAW_SHADOW_RECT
             || command->type == DRAW_IMAGE) {
             if (command->type == DRAW_TEXT) {
-                int scale = scale_dimension(draw_command_text_scale(command), scale_q6);
+                int scale = scale_dimension(draw_command_text_scale(command), scale_q14);
                 if (scale > TILEFINCH_BITMAP_FONT_SCALE_LIMIT)
                     scale = TILEFINCH_BITMAP_FONT_SCALE_LIMIT;
                 draw_command_set_text_scale(command, scale);
             } else command->scale = command->type == DRAW_IMAGE
-                ? layout_scale_radius_code(command->scale, scale_q6, 64)
-                : scale_dimension(command->scale, scale_q6);
+                ? layout_scale_radius_code(command->scale, scale_q14, 16384)
+                : scale_dimension(command->scale, scale_q14);
         }
         if (command->type == DRAW_SHADOW_RECT
             && command->image_fit == LAYOUT_SHADOW_OUTSIDE_BOX)
             draw_command_set_shadow_offset(command,
-                scale_around_center((int16_t) command->text_length, 0, scale_q6),
-                scale_around_center((int16_t) (command->text_length >> 16), 0, scale_q6));
+                scale_around_center((int16_t) command->text_length, 0, scale_q14),
+                scale_around_center((int16_t) (command->text_length >> 16), 0, scale_q14));
     }
     for (size_t i = link_start; i < layout->link_count; i++) {
         LinkRegion *link = &layout->links[i];
-        link->x = scale_around_center(link->x, origin_x_twice, scale_q6);
-        link->y = scale_around_center(link->y, origin_y_twice, scale_q6);
-        link->width = scale_dimension(link->width, scale_q6);
-        link->height = scale_dimension(link->height, scale_q6);
+        link->x = scale_around_center(link->x, origin_x_twice, scale_q14);
+        link->y = scale_around_center(link->y, origin_y_twice, scale_q14);
+        link->width = scale_dimension(link->width, scale_q14);
+        link->height = scale_dimension(link->height, scale_q14);
     }
     for (size_t i = control_start; i < layout->control_count; i++) {
         ControlRegion *control = &layout->controls[i];
         control->x = scale_around_center(control->x, origin_x_twice,
-                                         scale_q6);
+                                         scale_q14);
         control->y = scale_around_center(control->y, origin_y_twice,
-                                         scale_q6);
-        control->width = scale_dimension(control->width, scale_q6);
-        control->height = scale_dimension(control->height, scale_q6);
+                                         scale_q14);
+        control->width = scale_dimension(control->width, scale_q14);
+        control->height = scale_dimension(control->height, scale_q14);
     }
     for (size_t i = node_box_start; i < layout->node_box_count; i++) {
         LayoutNodeBox *box = &layout->node_boxes[i];
         if (source != NULL && !layout_node_within(box->node, source)) continue;
         if (box->command_start < command_start
             || box->command_end > layout->count) continue;
-        box->x = scale_around_center(box->x, origin_x_twice, scale_q6);
-        box->y = scale_around_center(box->y, origin_y_twice, scale_q6);
-        box->width = scale_dimension(box->width, scale_q6);
-        box->height = scale_dimension(box->height, scale_q6);
-        box->client_width = scale_dimension(box->client_width, scale_q6);
-        box->client_height = scale_dimension(box->client_height, scale_q6);
-        box->content_width = scale_dimension(box->content_width, scale_q6);
-        box->content_height = scale_dimension(box->content_height, scale_q6);
-        box->scroll_x = scale_dimension(box->scroll_x, scale_q6);
-        box->scroll_y = scale_dimension(box->scroll_y, scale_q6);
+        box->x = scale_around_center(box->x, origin_x_twice, scale_q14);
+        box->y = scale_around_center(box->y, origin_y_twice, scale_q14);
+        box->width = scale_dimension(box->width, scale_q14);
+        box->height = scale_dimension(box->height, scale_q14);
+        box->client_width = scale_dimension(box->client_width, scale_q14);
+        box->client_height = scale_dimension(box->client_height, scale_q14);
+        box->content_width = scale_dimension(box->content_width, scale_q14);
+        box->content_height = scale_dimension(box->content_height, scale_q14);
+        box->scroll_x = scale_dimension(box->scroll_x, scale_q14);
+        box->scroll_y = scale_dimension(box->scroll_y, scale_q14);
         int clip_radius_code = layout_node_box_clip_radius_code(layout, box);
         clip_radius_code = layout_scale_radius_code(
-            clip_radius_code, scale_q6, 64);
+            clip_radius_code, scale_q14, 16384);
         int clip_radius = style_border_radius_maximum(clip_radius_code);
         int clip_margin = scale_dimension(
-            (int) layout_node_box_clip_margin(box), scale_q6);
+            (int) layout_node_box_clip_margin(box), scale_q14);
         layout_node_box_set_clip_geometry(
             box, (unsigned) clip_radius, (unsigned) clip_margin,
             layout_node_box_clip_box(box));
@@ -778,6 +781,14 @@ void layout_positioned_clip_index_prepare(
         if (index->count == LAYOUT_POSITIONED_CLIP_INDEX_LIMIT
             || i > UINT32_MAX) {
             index->complete = false;
+            index->bitmap_prefix = true;
+            memset(index->boxes, 0, sizeof(index->boxes));
+            size_t prefix = LAYOUT_POSITIONED_CLIP_INDEX_LIMIT * 32u;
+            if (prefix > layout->node_box_count) prefix = layout->node_box_count;
+            for (size_t at = 0; at < prefix; at++) {
+                if (layout->node_boxes[at].positioned_ancestor_distance != 0)
+                    index->boxes[at / 32u] |= UINT32_C(1) << (at % 32u);
+            }
             return;
         }
         index->boxes[index->count++] = (uint32_t) i;
@@ -800,17 +811,41 @@ bool layout_positioned_command_escapes_clip_indexed(
        deferred subtree that made the numeric intervals overlap. */
     const LayoutNodeBox *positioned_owner = NULL;
     size_t positioned_span = SIZE_MAX;
-    bool indexed = index != NULL && index->complete
-        && index->count <= LAYOUT_POSITIONED_CLIP_INDEX_LIMIT
-        && index->layout == layout
+    bool snapshot = index != NULL && index->layout == layout
         && index->node_box_count == layout->node_box_count;
-    size_t count = indexed ? index->count : layout->node_box_count;
-    for (size_t i = 0; i < count; i++) {
+    bool indexed = snapshot && index->complete
+        && index->count <= LAYOUT_POSITIONED_CLIP_INDEX_LIMIT;
+    bool owner_cached = snapshot && index->owner_ready
+        && index->owner_command == command_index;
+    if (index != NULL && !snapshot) index->owner_ready = false;
+    if (owner_cached) positioned_owner = index->command_owner;
+    size_t cursor = 0, word = 0;
+    uint32_t pending = 0;
+    bool bitmap = snapshot && !indexed && index->bitmap_prefix;
+    for (size_t visit = 0; !owner_cached && visit < layout->node_box_count; visit++) {
+        size_t at;
+        if (indexed) {
+            if (cursor == index->count) break;
+            at = index->boxes[cursor++];
+        } else if (bitmap) {
+            while (pending == 0 && word < LAYOUT_POSITIONED_CLIP_INDEX_LIMIT)
+                pending = index->boxes[word++];
+            if (pending != 0) {
+                at = (word - 1u) * 32u + (unsigned) __builtin_ctz(pending);
+                pending &= pending - 1u;
+            } else {
+                if (cursor < LAYOUT_POSITIONED_CLIP_INDEX_LIMIT * 32u)
+                    cursor = LAYOUT_POSITIONED_CLIP_INDEX_LIMIT * 32u;
+                if (cursor >= layout->node_box_count) break;
+                at = cursor++;
+            }
+        } else {
+            at = cursor++;
+        }
 #ifndef TILEFINCH_NO_TRACE
         if (index != NULL) index->candidates_visited++;
 #endif
-        const LayoutNodeBox *candidate = &layout->node_boxes[
-            indexed ? index->boxes[i] : i];
+        const LayoutNodeBox *candidate = &layout->node_boxes[at];
         if (candidate->positioned_ancestor_distance == 0
             || command_index < candidate->command_start
             || command_index >= candidate->command_end) continue;
@@ -819,6 +854,11 @@ bool layout_positioned_command_escapes_clip_indexed(
             positioned_owner = candidate;
             positioned_span = span;
         }
+    }
+    if (snapshot && !owner_cached) {
+        index->command_owner = positioned_owner;
+        index->owner_command = command_index;
+        index->owner_ready = true;
     }
     if (positioned_owner != NULL
         && !layout_node_within(positioned_owner->node, clip_box->node)) {
@@ -1391,9 +1431,7 @@ static void draw_command_vertical_ink_bounds(const LayoutDocument *layout,
         || (command->image_fit & LAYOUT_TEXT_DECORATION_UNDERLINE) == 0
         || !draw_command_text_underline_offset(
                command, &underline_offset)) return;
-    const FontFace *face = font_context_face_at_weight(
-        layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), draw_uses_bold_face(command), draw_command_font_weight(command));
+    const FontFace *face = draw_command_face(layout, command);
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
@@ -2143,9 +2181,9 @@ static bool rotated_solid_command(const DrawCommand *source,
         || right - left > 65535 || bottom - top > 65535) return false;
     *result = *source;
     result->type = DRAW_ROTATED_FILL;
-    result->text_length = (uint32_t) source->width | ((uint32_t) source->height << 16);
-    result->font_size = (int32_t) ((uint32_t) (uint16_t) cosine
-        | ((uint32_t) (uint16_t) sine << 16));
+    draw_command_set_rotated_extent(result, (unsigned) source->width,
+                                    (unsigned) source->height);
+    draw_command_set_rotated_basis(result, cosine, sine);
     result->radius = (int) (x - left * 1024);
     result->scale = (int) (y - top * 1024);
     result->x = (int) left;
@@ -2175,51 +2213,56 @@ bool layout_rotate_solid_command_span(LayoutDocument *layout, size_t start,
     return true;
 }
 
+/* The sheared form of an unrounded solid fill, or false when the fill
+   cannot be represented. Shared by validation and application so a span is
+   only ever rewritten with the geometry it was validated with. */
+static bool sheared_solid_command(const DrawCommand *source,
+                                  int origin_y_twice, int shear_q10,
+                                  DrawCommand *result)
+{
+    if (source->type != DRAW_FILL_RECT || source->radius != 0
+        || source->font_size != 0
+        || draw_command_backdrop_blur(source) != 0) return false;
+    int64_t top = (int64_t) source->x * 1024
+        + ((int64_t) source->y * 2 - origin_y_twice) * shear_q10 / 2;
+    int64_t bottom = top + (int64_t) source->height * shear_q10;
+    int64_t left = top < bottom ? top : bottom;
+    int64_t right = (top > bottom ? top : bottom)
+        + (int64_t) source->width * 1024;
+    int64_t pixel_left = left >= 0 ? left / 1024
+        : -((-left + 1023) / 1024);
+    int64_t pixel_right = right >= 0 ? (right + 1023) / 1024
+        : -((-right) / 1024);
+    if (source->width < 0 || source->height < 0
+        || pixel_left < INT_MIN || pixel_right > INT_MAX
+        || pixel_right - pixel_left > INT_MAX
+        || top - pixel_left * 1024 > INT_MAX) return false;
+    *result = *source;
+    result->type = DRAW_SHEARED_FILL;
+    result->text_length = (uint32_t) source->width;
+    result->font_size = source->height;
+    result->scale = shear_q10;
+    result->radius = (int) (top - pixel_left * 1024);
+    result->x = (int) pixel_left;
+    result->width = (int) (pixel_right - pixel_left);
+    return true;
+}
+
 bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
                                      size_t end, int origin_y_twice,
                                      int16_t shear_q10)
 {
     if (layout == NULL || start > end || end > layout->count) return false;
     if (shear_q10 == 0) return true;
+    DrawCommand sheared;
+    /* Validate first: unsupported content leaves the whole span untouched. */
+    for (size_t i = start; i < end; i++)
+        if (!sheared_solid_command(&layout->commands[i], origin_y_twice,
+                                   shear_q10, &sheared)) return false;
     for (size_t i = start; i < end; i++) {
-        const DrawCommand *command = &layout->commands[i];
-        if (command->type != DRAW_FILL_RECT || command->radius != 0
-            || command->font_size != 0
-            || draw_command_backdrop_blur(command) != 0) return false;
-        int64_t top = (int64_t) command->x * 1024
-            + ((int64_t) command->y * 2 - origin_y_twice) * shear_q10 / 2;
-        int64_t bottom = top + (int64_t) command->height * shear_q10;
-        int64_t left = top < bottom ? top : bottom;
-        int64_t right = (top > bottom ? top : bottom)
-            + (int64_t) command->width * 1024;
-        int64_t pixel_left = left >= 0 ? left / 1024
-            : -((-left + 1023) / 1024);
-        int64_t pixel_right = right >= 0 ? (right + 1023) / 1024
-            : -((-right) / 1024);
-        if (command->width < 0 || command->height < 0
-            || pixel_left < INT_MIN || pixel_right > INT_MAX
-            || pixel_right - pixel_left > INT_MAX
-            || top - pixel_left * 1024 > INT_MAX) return false;
-    }
-    for (size_t i = start; i < end; i++) {
-        DrawCommand *command = &layout->commands[i];
-        int64_t top = (int64_t) command->x * 1024
-            + ((int64_t) command->y * 2 - origin_y_twice) * shear_q10 / 2;
-        int64_t bottom = top + (int64_t) command->height * shear_q10;
-        int64_t left = top < bottom ? top : bottom;
-        int64_t right = (top > bottom ? top : bottom)
-            + (int64_t) command->width * 1024;
-        int64_t pixel_left = left >= 0 ? left / 1024
-            : -((-left + 1023) / 1024);
-        int64_t pixel_right = right >= 0 ? (right + 1023) / 1024
-            : -((-right) / 1024);
-        command->type = DRAW_SHEARED_FILL;
-        command->text_length = (uint32_t) command->width;
-        command->font_size = command->height;
-        command->scale = shear_q10;
-        command->radius = (int) (top - pixel_left * 1024);
-        command->x = (int) pixel_left;
-        command->width = (int) (pixel_right - pixel_left);
+        (void) sheared_solid_command(&layout->commands[i], origin_y_twice,
+                                     shear_q10, &sheared);
+        layout->commands[i] = sheared;
     }
     return true;
 }
@@ -2231,7 +2274,7 @@ bool layout_skew_solid_command_span(LayoutDocument *layout, size_t start,
    touching links, controls, or node boxes owned by the originating element. */
 void layout_transform_command_span(
     LayoutDocument *layout, size_t command_start, size_t command_end,
-    int origin_x_twice, int origin_y_twice, uint8_t scale_q6,
+    int origin_x_twice, int origin_y_twice, uint16_t scale_q14,
     uint8_t rotate_quadrants, int dx, int dy)
 {
     if (layout == NULL || command_start >= command_end
@@ -2241,7 +2284,7 @@ void layout_transform_command_span(
     span.commands = layout->commands + command_start;
     span.count = command_end - command_start;
     layout_scale_range(&span, 0, 0, 0, 0, origin_x_twice,
-                       origin_y_twice, scale_q6, NULL);
+                       origin_y_twice, scale_q14, NULL);
     layout_rotate_range_quadrants(&span, 0, 0, 0, 0, origin_x_twice,
                                   origin_y_twice, rotate_quadrants, NULL);
     layout_translate_range(&span, 0, 0, 0, 0, dx, dy,

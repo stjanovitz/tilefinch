@@ -1062,11 +1062,10 @@ bool media_psp_backend_wide_program_rejected(void);
 /*
  * The decoder-program override, published once from the historically named
  * `experimental_wide_video=` boot key before the first video opens. An absent
- * value selects the hardware-qualified "wide" default. Explicit "off" keeps
- * the 240p compatibility program; "wide-annexb" and "boot4" remain diagnostic
- * alternatives. Unknown persisted values fail the boot-config gate, while a
- * direct unknown call fails closed to off. The returned value is a
- * PspMediaWideProgram from src/media_backend_psp_policy.h.
+ * value selects the hardware-qualified "wide" default; explicit "off" keeps
+ * the 240p compatibility program. Unknown persisted values fail the
+ * boot-config gate, while a direct unknown call fails closed to off. The
+ * returned value is a PspMediaWideProgram from src/media_backend_psp_policy.h.
  */
 void media_psp_backend_set_wide_program(const char *name);
 int media_psp_backend_wide_program(void);

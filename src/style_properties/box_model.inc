@@ -505,28 +505,21 @@ static bool style_property_padding_block_end(const StylePropertyParse *parse)
     return true;
 }
 
+/* outline-style takes the border <line-style> keywords, which share their
+   codes with the outline's, plus auto, drawn solid. */
+_Static_assert((unsigned) STYLE_OUTLINE_NONE == (unsigned) STYLE_BORDER_NONE
+               && (unsigned) STYLE_OUTLINE_SOLID
+                  == (unsigned) STYLE_BORDER_SOLID
+               && (unsigned) STYLE_OUTLINE_DASHED
+                  == (unsigned) STYLE_BORDER_DASHED
+               && (unsigned) STYLE_OUTLINE_DOTTED
+                  == (unsigned) STYLE_BORDER_DOTTED,
+               "outline styles reuse the border line-style codes");
+
 static unsigned outline_style_code(const char *text, size_t length)
 {
-    if (span_case_equal(text, length, "none")
-        || span_case_equal(text, length, "hidden")) {
-        return STYLE_OUTLINE_NONE;
-    }
-    if (span_case_equal(text, length, "dashed")) {
-        return STYLE_OUTLINE_DASHED;
-    }
-    if (span_case_equal(text, length, "dotted")) {
-        return STYLE_OUTLINE_DOTTED;
-    }
-    if (span_case_equal(text, length, "solid")
-        || span_case_equal(text, length, "double")
-        || span_case_equal(text, length, "groove")
-        || span_case_equal(text, length, "ridge")
-        || span_case_equal(text, length, "inset")
-        || span_case_equal(text, length, "outset")
-        || span_case_equal(text, length, "auto")) {
-        return STYLE_OUTLINE_SOLID;
-    }
-    return UINT_MAX;
+    if (span_case_equal(text, length, "auto")) return STYLE_OUTLINE_SOLID;
+    return style_border_line_style(text, length);
 }
 
 static void outline_set_width_style(ComputedStyle *style,
@@ -545,7 +538,7 @@ static void outline_set_width_style(ComputedStyle *style,
 
 static bool style_property_outline(const StylePropertyParse *parse)
 {
-    char resolved[128];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -557,11 +550,11 @@ static bool style_property_outline(const StylePropertyParse *parse)
     bool color_set = false;
     uint32_t color = 0;
     uint8_t alpha = 255;
-    for (size_t at = 0, length = strlen(resolved); at < length;) {
-        while (at < length && isspace((unsigned char) resolved[at])) at++;
-        size_t end = at;
-        while (end < length && !isspace((unsigned char) resolved[end])) end++;
-        if (end == at) break;
+    /* Components split at the top level only: `rgb(0 0 0 / 50%)`,
+       `calc(1px + 1px)` and `color-mix(in srgb, red 50%, blue)` are one
+       token each. */
+    size_t cursor = 0, at = 0, end = 0, length = strlen(resolved);
+    while (style_next_top_level_token(resolved, length, &cursor, &at, &end)) {
         unsigned candidate_style =
             outline_style_code(resolved + at, end - at);
         if (candidate_style != UINT_MAX) {
@@ -581,12 +574,12 @@ static bool style_property_outline(const StylePropertyParse *parse)
         } else {
             int parsed = style_parse_length(
                 parse->sheet, resolved + at, end - at, -1, NULL);
-            if (parsed >= 0) {
+            if (parsed >= 0 || style_line_width_keyword(
+                    resolved + at, end - at, &parsed)) {
                 width = (unsigned) parsed;
                 recognized = true;
             }
         }
-        at = end;
     }
     if (!recognized) return true;
     outline_set_width_style(parse->style, width, line_style);
@@ -605,7 +598,7 @@ static bool style_property_outline(const StylePropertyParse *parse)
 
 static bool style_property_outline_component(const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -657,12 +650,8 @@ static bool style_property_outline_component(const StylePropertyParse *parse)
     if (span_equal(parse->name, parse->name_length, "outline-width")) {
         int width = style_parse_length(
             parse->sheet, resolved, strlen(resolved), -1, NULL);
-        if (width < 0) {
-            width = strcasecmp(resolved, "thin") == 0 ? 1
-                : (strcasecmp(resolved, "medium") == 0 ? 3
-                   : (strcasecmp(resolved, "thick") == 0 ? 5 : -1));
-        }
-        if (width >= 0) {
+        if (width >= 0 || style_line_width_keyword(
+                resolved, strlen(resolved), &width)) {
             outline_set_width_style(
                 parse->style, (unsigned) width,
                 computed_style_outline_style(parse->style));
@@ -928,26 +917,17 @@ static bool style_property_border_color(const StylePropertyParse *parse)
                                  sizeof(resolved), 0)) return true;
         uint32_t colors[4];
         uint8_t alphas[4];
-        size_t count = 0, at = 0, length = strlen(resolved);
-        while (at < length && count < 4) {
-            while (at < length && isspace((unsigned char) resolved[at])) at++;
-            if (at == length) break;
-            size_t end = at;
-            unsigned depth = 0;
-            while (end < length) {
-                if (resolved[end] == '(') depth++;
-                else if (resolved[end] == ')' && depth != 0) depth--;
-                if (depth == 0 && isspace((unsigned char) resolved[end])) break;
-                end++;
-            }
+        size_t count = 0, cursor = 0, at = 0, end = 0;
+        size_t length = strlen(resolved);
+        while (count < 4 && style_next_top_level_token(
+                   resolved, length, &cursor, &at, &end)) {
             if (!style_parse_color_with_alpha(sheet, resolved + at, end - at,
                                               &colors[count], &alphas[count]))
                 return true;
             count++;
-            at = end;
         }
-        while (at < length && isspace((unsigned char) resolved[at])) at++;
-        if (count == 0 || at != length) return true;
+        if (count == 0 || style_next_top_level_token(
+                resolved, length, &cursor, &at, &end)) return true;
         if (count == 1) {
             style->border_color = colors[0];
             style->border_alpha = alphas[0];
@@ -1043,35 +1023,10 @@ static bool style_property_border_color(const StylePropertyParse *parse)
     return true;
 }
 
-static unsigned border_line_style(const char *text, size_t length)
-{
-    if (span_case_equal(text, length, "none")
-        || span_case_equal(text, length, "hidden")) {
-        return STYLE_BORDER_NONE;
-    }
-    if (span_case_equal(text, length, "dotted")) {
-        return STYLE_BORDER_DOTTED;
-    }
-    if (span_case_equal(text, length, "dashed")) {
-        return STYLE_BORDER_DASHED;
-    }
-    if (span_case_equal(text, length, "solid")
-        || span_case_equal(text, length, "double")
-        || span_case_equal(text, length, "groove")
-        || span_case_equal(text, length, "ridge")
-        || span_case_equal(text, length, "inset")
-        || span_case_equal(text, length, "outset")) {
-        return STYLE_BORDER_SOLID;
-    }
-    return UINT_MAX;
-}
-
 static bool parse_border_width_value(Stylesheet *sheet, const char *text,
                                      size_t length, int *width)
 {
-    if (span_case_equal(text, length, "thin")) { *width = 1; return true; }
-    if (span_case_equal(text, length, "medium")) { *width = 3; return true; }
-    if (span_case_equal(text, length, "thick")) { *width = 5; return true; }
+    if (style_line_width_keyword(text, length, width)) return true;
     StyleLength parsed = 0;
     bool percent = false;
     if (!parse_style_length(sheet, text, length, &parsed, &percent)
@@ -1081,31 +1036,30 @@ static bool parse_border_width_value(Stylesheet *sheet, const char *text,
     return true;
 }
 
+/* One to `capacity` <line-width> components; *count receives how many. */
+static bool parse_border_width_list(Stylesheet *sheet, const char *text,
+                                    size_t length, int *values,
+                                    size_t capacity, size_t *count)
+{
+    size_t cursor = 0, at = 0, end = 0;
+    *count = 0;
+    while (*count < capacity && style_next_top_level_token(
+               text, length, &cursor, &at, &end)) {
+        if (!parse_border_width_value(
+                sheet, text + at, end - at, &values[*count])) return false;
+        (*count)++;
+    }
+    return *count != 0 && !style_next_top_level_token(
+        text, length, &cursor, &at, &end);
+}
+
 static bool parse_border_width_box(Stylesheet *sheet, const char *text,
                                    size_t length, StyleEdges *edges)
 {
     int values[4] = {0};
     size_t count = 0;
-    size_t at = 0;
-    while (at < length && count < 4) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        unsigned parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses != 0) parentheses--;
-            if (parentheses == 0
-                && isspace((unsigned char) text[end])) break;
-            end++;
-        }
-        if (end == at
-            || !parse_border_width_value(
-                   sheet, text + at, end - at, &values[count])) return false;
-        count++;
-        at = end;
-    }
-    while (at < length && isspace((unsigned char) text[at])) at++;
-    if (count == 0 || at != length) return false;
+    if (!parse_border_width_list(sheet, text, length, values, 4, &count))
+        return false;
     edges->top = values[0];
     edges->right = count > 1 ? values[1] : values[0];
     edges->bottom = count > 2 ? values[2] : values[0];
@@ -1115,7 +1069,7 @@ static bool parse_border_width_box(Stylesheet *sheet, const char *text,
 
 static bool style_property_border_style(const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
@@ -1129,7 +1083,7 @@ static bool style_property_border_style(const StylePropertyParse *parse)
         while (end < length
                && !isspace((unsigned char) resolved[end])) end++;
         if (end == at) break;
-        unsigned line = border_line_style(resolved + at, end - at);
+        unsigned line = style_border_line_style(resolved + at, end - at);
         if (line == UINT_MAX) return true;
         values[count++] = line;
         at = end;
@@ -1248,11 +1202,12 @@ static bool style_property_border_inline_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        int first = 0, second = 0;
-        if (style_parse_pair(sheet, value, value_length, &first, &second)
-            && first >= 0 && second >= 0) {
-            style->border.left = first;
-            style->border.right = second;
+        int values[2] = {0, 0};
+        size_t count = 0;
+        if (parse_border_width_list(sheet, value, value_length, values, 2,
+                                    &count)) {
+            style->border.left = values[0];
+            style->border.right = values[count - 1];
             *mask |= S_BORDER_LEFT | S_BORDER_RIGHT;
         }
     
@@ -1266,11 +1221,12 @@ static bool style_property_border_block_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        int first = 0, second = 0;
-        if (style_parse_pair(sheet, value, value_length, &first, &second)
-            && first >= 0 && second >= 0) {
-            style->border.top = first;
-            style->border.bottom = second;
+        int values[2] = {0, 0};
+        size_t count = 0;
+        if (parse_border_width_list(sheet, value, value_length, values, 2,
+                                    &count)) {
+            style->border.top = values[0];
+            style->border.bottom = values[count - 1];
             *mask |= S_BORDER_TOP | S_BORDER_BOTTOM;
         }
     
@@ -1363,29 +1319,16 @@ static bool style_property_gap(const StylePropertyParse *parse)
         } else {
             StyleLength values[2] = {0, 0};
             bool percents[2] = {false, false};
-            size_t count = 0, at = 0;
-            while (at < value_length && count < 2u) {
-                while (at < value_length
-                       && isspace((unsigned char) value[at])) at++;
-                size_t end = at;
-                unsigned parentheses = 0;
-                while (end < value_length) {
-                    if (value[end] == '(') parentheses++;
-                    else if (value[end] == ')' && parentheses != 0)
-                        parentheses--;
-                    if (parentheses == 0
-                        && isspace((unsigned char) value[end])) break;
-                    end++;
-                }
-                if (end == at || !parse_dimension_length(
-                        sheet, value + at, end - at,
-                        &values[count], &percents[count])) break;
+            size_t count = 0, cursor = 0, at = 0, end = 0;
+            bool valid = true;
+            while (valid && style_next_top_level_token(
+                       value, value_length, &cursor, &at, &end)) {
+                valid = count < 2u && parse_dimension_length(
+                    sheet, value + at, end - at,
+                    &values[count], &percents[count]);
                 count++;
-                at = end;
             }
-            while (at < value_length
-                   && isspace((unsigned char) value[at])) at++;
-            if (count != 0 && at == value_length
+            if (valid && count != 0
                 && values[0] >= 0
                 && values[0] < STYLE_LENGTH_PERCENT_TAG
                 && (count == 1u || (values[1] >= 0

@@ -1586,10 +1586,14 @@
     }
   }
 
+  const imageDataArrayName = Function.call.bind(
+    Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8ClampedArray.prototype),
+      Symbol.toStringTag).get);
   class ImageData {
     constructor(dataOrWidth, widthOrHeight, heightOrSettings) {
       let data, width, height;
-      if (dataOrWidth instanceof Uint8ClampedArray) {
+      if (imageDataArrayName(dataOrWidth) === "Uint8ClampedArray") {
         data = dataOrWidth;
         width = Math.trunc(Number(widthOrHeight));
         if (!Number.isFinite(width) || width <= 0)
@@ -3095,12 +3099,14 @@
     node.setAttribute(name, String(Number(value) >>> 0));
   globalThis.__tilefinchFlushCanvasSurfaces = flushCanvasSurfaces;
   globalThis.__tilefinchCanvasReadbackState = canvasReadbackState;
-  Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
-    configurable: false,
-    enumerable: false,
-    value: canvasDiagnostics,
-    writable: false,
-  });
+  /* Batching counters for host tests (test-probe realms only). */
+  if (globalThis.__tilefinchTestProbes)
+    Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
+      configurable: false,
+      enumerable: false,
+      value: canvasDiagnostics,
+      writable: false,
+    });
   globalThis.__tilefinchCanvasConnected = (root) => {
     /* DOMParser, createHTMLDocument, and ordinary detached construction use
        the same Node wrappers as the live page.  They must remain inert: even

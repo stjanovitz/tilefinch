@@ -1110,6 +1110,128 @@ static bool append_order_matches_rebuild(NavigationSession *navigation,
     return ok;
 }
 
+typedef struct {
+    Budget *budget;
+    void *optional;
+    unsigned calls;
+} RelayoutReclaimProbe;
+
+static void relayout_reclaim_probe(void *opaque)
+{
+    RelayoutReclaimProbe *probe=opaque;
+    probe->calls++;
+    budget_free(probe->budget,probe->optional);
+    probe->optional=NULL;
+}
+
+static bool test_full_relayout_reclaims_owner_caches(void)
+{
+    static const char html[]="<!doctype html><style>body{margin:0}"
+        "p{height:1000px}</style><a href=/next>Keep</a><p>Readable</p>";
+    Budget budget;
+    budget_init(&budget,16*MIB);
+    bool installed=budget_install_lexbor(&budget);
+    NavigationSession navigation={0};
+    bool ready=installed && navigation_init(&navigation,&budget,4);
+    bool ok=ready && navigation_commit_html(&navigation,navigation_begin(&navigation),
+        "https://relayout-cache.test/",html,sizeof(html)-1,480,NULL,NULL,true);
+    RelayoutReclaimProbe probe={.budget=&budget};
+    uint64_t before=ok?append_order_layout_digest(&navigation.page.layout):0;
+    size_t limit=budget.limit;
+    if(ok) {
+        navigation.reclaim_optional=relayout_reclaim_probe;
+        navigation.reclaim_optional_opaque=&probe;
+        navigation_set_scroll(&navigation,100);
+        /* A roomy rebuild must preserve warm accelerators. */
+        navigation.style_rebuild_required=true;
+        ok=navigation_relayout(&navigation) && probe.calls==0;
+        probe.optional=budget_malloc(&budget,MIB);
+        ok=ok && probe.optional!=NULL;
+        budget.limit=budget.current+64u*1024u;
+        navigation.style_rebuild_required=true;
+        ok=ok && navigation_relayout(&navigation) && probe.calls==1
+            && probe.optional==NULL && navigation.page.loaded
+            && navigation_current(&navigation)->scroll_y==100
+            && append_order_layout_digest(&navigation.page.layout)==before;
+    }
+    budget.limit=limit;
+    budget_free(&budget,probe.optional);
+    navigation_destroy(&navigation);
+    if(!ok) fprintf(stderr,"owner cache reclaim calls=%u failed\n",probe.calls);
+    return ok && budget.current==0;
+}
+
+static bool test_overflow_preserves_admitted_stylesheet(void)
+{
+    char html[16384];
+    int used = snprintf(html, sizeof(html), "<!doctype html><style>"
+        "p{color:#112233}</style><p>Outside</p><div id=ha></div><div id=hb></div>");
+    for (unsigned i = 0; i < SCRIPT_MUTATION_JOURNAL_LIMIT + 32; i++)
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<div class=row>Row%u</div>", i);
+    used += snprintf(html + used, sizeof(html) - (size_t) used,
+        "<script>globalThis.a=new CSSStyleSheet();"
+        "a.replaceSync('.sample{color:#446688}');"
+        "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
+        "globalThis.rb=document.getElementById('hb').attachShadow({mode:'open'});"
+        "ra.innerHTML='<span class=sample>InsideA</span>';"
+        "rb.innerHTML='<span class=sample>InsideB</span>';"
+        "ra.adoptedStyleSheets=[a];</script>");
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(&navigation,
+            16, 64 * 1024, 16 * 1024, 16, 64 * 1024, 64 * 1024, 256 * 1024, 1000);
+    }
+    bool ok = ready && used > 0 && (size_t) used < sizeof(html)
+        && navigation_commit_html(&navigation, navigation_begin(&navigation),
+            "https://retained-scope.test/", html, (size_t) used, 480, NULL, NULL, true);
+    size_t full = navigation.performance.full_relayouts;
+    ScriptResult result = {0};
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "document.querySelectorAll('.row').forEach((p,i)=>p.setAttribute('data-n',String(i)));"
+        "ra.adoptedStyleSheets=[];rb.adoptedStyleSheets=[a]",
+        "<overflow-scope-transfer>", &result)
+        && script_runtime_consume_relayout(navigation.page.runtime);
+    size_t limit = budget.limit;
+    /* Enough for the required small layout, less than the independent
+       stylesheet reparse reserve. Keeping CSS must not depend on a reparse. */
+    budget.limit = budget.current + 1536u * 1024u;
+    ok = ok && navigation_relayout(&navigation)
+        && navigation.performance.mutation_journal_overflows != 0
+        && navigation.performance.full_relayouts == full
+        && navigation.page.external_stylesheets.skipped_pressure == 0
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x112233
+        && append_order_text_color(&navigation.page.layout, "InsideB") == 0x446688
+        && append_order_text_color(&navigation.page.layout, "InsideA") != 0x446688;
+    budget.limit = limit;
+    ok = ok && append_order_matches_rebuild(&navigation, "overflow scope transfer");
+    full = navigation.performance.full_relayouts;
+    ok = ok && append_order_mutate(&navigation,
+        "document.querySelectorAll('.row').forEach((p,i)=>p.setAttribute('data-x',String(i)));"
+        "a.replaceSync('.sample{color:#778899}')", "<overflow-source-edit>")
+        && navigation.performance.full_relayouts == full + 1
+        && append_order_text_color(&navigation.page.layout, "InsideB") == 0x778899;
+    full = navigation.performance.full_relayouts;
+    ok = ok && append_order_mutate(&navigation,
+        "document.querySelectorAll('.row').forEach((p,i)=>p.setAttribute('data-y',String(i)));"
+        "document.querySelector('style').setAttribute('nonce','changed')",
+        "<overflow-policy-edit>")
+        && navigation.performance.full_relayouts == full + 1;
+    if (!ok) fprintf(stderr, "overflow preserved sheet: full=%zu/%zu skipped=%zu %s\n",
+        navigation.performance.full_relayouts, full,
+        navigation.page.external_stylesheets.skipped_pressure, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_adopted_sources_insert_between_existing(void)
 {
     static const char html[] =
@@ -1226,6 +1348,225 @@ static bool test_confined_style_append_keeps_selector_cache(void)
     bool clean = budget.current == 0;
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* The style-source table bounds the sources whose adopted rules can be
+   confined. An in-place append that fills it past the bound must not lose
+   the confinement of a component sheet already held: past the bound no
+   source bit is known, which would apply every shadow-only rule to the
+   whole document. */
+static bool test_style_append_past_source_bound_keeps_confinement(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.sample{color:#010203}</style>"
+        "<p class=sample>Outside</p><div id=ha></div><script>"
+        "for(let i=0;i<46;i++){let s=document.createElement('style');"
+        "s.textContent='.unused'+i+'{color:red}';document.head.appendChild(s);}"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('.sample{color:#112233}');"
+        "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
+        "ra.innerHTML='<span class=sample>InsideA</span>';"
+        "ra.adoptedStyleSheets=[a];</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://source-bound.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    const Stylesheet *sheet = &navigation.page.stylesheet;
+    /* 47 document sources and the shadow-only constructed sheet. */
+    ok = ok && sheet->style_source_count == STYLE_SOURCE_NODE_LIMIT
+        && !sheet->style_sources_bounded_out
+        && sheet->adopted_source_count == 1
+        && sheet->adopted_shadow_only_mask == 1
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233;
+    ok = ok && append_order_mutate(&navigation,
+        "let s=document.createElement('style');s.textContent='.extra{color:red}';"
+        "document.head.appendChild(s)", "<source-bound-append>")
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_matches_rebuild(&navigation, "source bound append");
+    if (!ok) fprintf(stderr, "source bound append failed: sources=%zu "
+        "bounded=%d adopted=%zu mask=%llx outside=%06x error=%s\n",
+        (size_t) sheet->style_source_count,
+        (int) sheet->style_sources_bounded_out,
+        (size_t) sheet->adopted_source_count,
+        (unsigned long long) sheet->adopted_shadow_only_mask,
+        (unsigned) append_order_text_color(&navigation.page.layout, "Outside"),
+        navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A freed style source bounds the sheet's sources out until the next
+   rebuild (navigation_retire_subtree: the page runtime reclaimed a recorded
+   <style>, or a constructed sheet's backing node, while the sheet still
+   held its address). In that window the sheet no longer vouches for its
+   sources or the carriers its adopted scopes came from, so a shadow-only
+   adopted sheet must not reach the document: neither through a
+   getComputedStyle read in the same task nor through the next relayout,
+   which rebuilds instead of reusing the unvouched sheet. The rule index
+   keeps shadow-scoped rules from outside elements' candidates; without
+   it (refused under memory pressure, or disabled here) the plain rule
+   scan depends on admission alone. */
+static bool retired_style_source_case(bool indexed)
+{
+    static const char html[] =
+        "<!doctype html><style>.sample{color:#010203}</style>"
+        "<p class=sample id=out>Outside</p><div id=ha></div><script>"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('.sample{color:#112233}');"
+        "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
+        "ra.innerHTML='<span class=sample>InsideA</span>';"
+        "ra.adoptedStyleSheets=[a];</script>";
+    if (!indexed) (void) setenv("TILEFINCH_DISABLE_STYLE_INDEX", "1", 1);
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://retired-source.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    Stylesheet *sheet = &navigation.page.stylesheet;
+    ok = ok && !sheet->style_sources_bounded_out
+        && sheet->adopted_source_count == 1
+        && sheet->adopted_shadow_only_mask == 1
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233;
+    /* What the retirement observer does when a recorded source dies. This
+       harness keeps removed nodes' wrappers alive, so the observer itself
+       cannot be driven to that point here. */
+    if (ok) sheet->style_sources_bounded_out = true;
+    ScriptResult result = {0};
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "pocSummary=getComputedStyle(document.getElementById('out')).color",
+        "<retired-source-read>", &result)
+        && strcmp(result.summary, "rgb(1, 2, 3)") == 0;
+    size_t full = navigation.performance.full_relayouts;
+    ok = ok && navigation_relayout(&navigation)
+        && navigation.performance.full_relayouts == full + 1
+        && !sheet->style_sources_bounded_out
+        && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
+        && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233;
+    if (!indexed) (void) unsetenv("TILEFINCH_DISABLE_STYLE_INDEX");
+    if (!ok) fprintf(stderr, "retired source confinement failed: indexed=%d "
+        "read=%s full=%zu/%zu bounded=%d outside=%06x inside=%06x "
+        "error=%s/%s\n", (int) indexed, result.summary, full,
+        navigation.performance.full_relayouts,
+        (int) sheet->style_sources_bounded_out,
+        (unsigned) append_order_text_color(&navigation.page.layout, "Outside"),
+        (unsigned) append_order_text_color(&navigation.page.layout, "InsideA"),
+        result.error, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_retired_style_source_keeps_adopted_confinement(void)
+{
+    return retired_style_source_case(false)
+        && retired_style_source_case(true);
+}
+
+/* The rebuild a bounded-out confining sheet requires is not skipped by a
+   semantic-only (aria-*) or paint-only focus relayout: skipping it left
+   the flag set, so every such relayout paused (requeued) the
+   detached-image preload job again without ever rebuilding. */
+static bool required_style_rebuild_case(bool focus_first)
+{
+    static const char html[] =
+        "<!doctype html><style>.sample{color:#010203}</style>"
+        "<p class=sample id=out>Outside</p><a id=link href=/x>Link</a>"
+        "<div id=ha></div><script>"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('.sample{color:#112233}');"
+        "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
+        "ra.innerHTML='<span class=sample>InsideA</span>';"
+        "ra.adoptedStyleSheets=[a];</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(&navigation, generation,
+        "https://retired-semantic.test/", html, sizeof(html) - 1,
+        480, NULL, NULL, true);
+    Stylesheet *sheet = &navigation.page.stylesheet;
+    ok = ok && sheet->adopted_shadow_only_mask == 1;
+    /* What the retirement observer does when a recorded source dies. */
+    if (ok) sheet->style_sources_bounded_out = true;
+    ScriptResult result = {0};
+    size_t full = navigation.performance.full_relayouts;
+    size_t semantic = navigation.performance.semantic_relayout_skips;
+    size_t focus = navigation.performance.focus_outline_relayout_skips
+        + navigation.performance.focus_paint_relayout_skips;
+    /* A D-pad focus move (the native focus marker) or an aria-* write. */
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        focus_first
+            ? "document.getElementById('link')"
+              ".setAttribute('data-tilefinch-focus','')"
+            : "document.getElementById('out').setAttribute('aria-label','one')",
+        "<retired-semantic-first>", &result)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation);
+    bool rebuilt = navigation.performance.full_relayouts == full + 1
+        && navigation.performance.semantic_relayout_skips == semantic
+        && navigation.performance.focus_outline_relayout_skips
+             + navigation.performance.focus_paint_relayout_skips == focus
+        && !navigation.style_rebuild_required
+        && !sheet->style_sources_bounded_out
+        && append_order_text_color(&navigation.page.layout, "InsideA")
+               == 0x112233;
+    /* With the sheet rebuilt, the next semantic write skips as before. */
+    ok = ok && rebuilt
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "document.getElementById('out').setAttribute('aria-label','two')",
+            "<retired-semantic-second>", &result)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation)
+        && navigation.performance.full_relayouts == full + 1
+        && navigation.performance.semantic_relayout_skips == semantic + 1;
+    if (!ok) fprintf(stderr, "required rebuild vs skip: focus-first=%d "
+        "full=%zu/%zu semantic=%zu/%zu focus=%zu/%zu required=%d bounded=%d "
+        "error=%s/%s\n", (int) focus_first, full,
+        navigation.performance.full_relayouts, semantic,
+        navigation.performance.semantic_relayout_skips, focus,
+        navigation.performance.focus_outline_relayout_skips
+            + navigation.performance.focus_paint_relayout_skips,
+        (int) navigation.style_rebuild_required,
+        (int) sheet->style_sources_bounded_out, result.error,
+        navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_required_style_rebuild_outranks_semantic_skip(void)
+{
+    return required_style_rebuild_case(false)
+        && required_style_rebuild_case(true);
 }
 
 static bool test_stylesheet_completion_waits_for_checkpoint(void)

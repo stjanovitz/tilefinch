@@ -1,16 +1,17 @@
-/* FinalizationRegistry cleanup under the hosts' own advance cadence.
+/* Native wrapper maintenance under the hosts' own advance cadence.
 
-   Wrapper cleanup runs as low-priority engine tasks inside
-   script_runtime_advance (at most sixteen per advance, within the caller's
-   task budget). No host gates its advance on pending author work: the PSP
+   Cleared wrapper WeakRefs are swept in bounded slices between tasks,
+   without allocating a FinalizationRegistry job for every DOM wrapper.
+   Author cleanup jobs keep their independent low-priority task queue.
+   No host gates its advance on pending author work: the PSP
    frame loop calls psp_advance_page_runtime every frame with a budget of
    two (pausing only for native menus and transient handoffs), and the lab
    and scripted boot loops tick with a budget of eight. An idle page with
-   queued cleanups therefore drains without counting as pending author work,
+   pending maintenance therefore drains without counting as pending author work,
    which would otherwise delay startup settle, boot-window return, and the
    degraded-page recovery clocks. A page whose due tasks fill every turn is
-   different: two frame-rate intervals took both PSP slots forever and no
-   cleanup ever ran, holding every collected wrapper's handle slot. These
+   different: two frame-rate intervals formerly took both PSP slots forever
+   and no cleanup ran, holding every collected wrapper's handle slot. These
    fixtures drive BrowserEngine as the PSP frame loop does and require the
    queue, and the handle slots it holds, to drain in both cases. */
 #include "browser_engine_test_support.h"
@@ -22,6 +23,13 @@ static size_t cleanup_live_handle_slots(const ScriptRuntime *runtime)
     for (size_t slot = 0; slot < runtime->bridge.node_count; slot++)
         if (runtime->bridge.nodes[slot] != NULL) live++;
     return live;
+}
+
+static bool cleanup_pending(ScriptRuntime *runtime)
+{
+    ScriptRunnableState state = {0};
+    return script_runtime_runnable_state(runtime, &state)
+        && state.cleanup_pending;
 }
 
 static int cleanup_drain_journey(const char *page, size_t page_length,
@@ -64,12 +72,12 @@ static int cleanup_drain_journey(const char *page, size_t page_length,
     size_t garbage = cleanup_live_handle_slots(runtime);
     CHECK(garbage >= baseline + garbage_nodes);
     (void) script_runtime_collect_and_trim(runtime);
-    CHECK(JS_IsCleanupJobPending(runtime->runtime));
+    CHECK(cleanup_pending(runtime));
     /* Queued cleanup is not author work: it must not look like an
        unsettled startup to the recovery and boot-window heuristics. */
     CHECK(script_runtime_has_pending_author_work(runtime) == !idle);
     unsigned ticks = 0;
-    for (; ticks < 4096u && JS_IsCleanupJobPending(runtime->runtime);
+    for (; ticks < 4096u && cleanup_pending(runtime);
          ticks++)
         CHECK(browser_engine_advance_runtime(engine, 16u, 2u, NULL));
     size_t drained = cleanup_live_handle_slots(runtime);
@@ -80,9 +88,9 @@ static int cleanup_drain_journey(const char *page, size_t page_length,
         "<cleanup-count>", &navigation->page.script_result));
     printf("cleanup-drain %s ticks=%u pending=%d slots=%zu->%zu->%zu "
            "finalized,tasks=%s\n", idle ? "idle" : "busy", ticks,
-           JS_IsCleanupJobPending(runtime->runtime), baseline, garbage,
+           cleanup_pending(runtime), baseline, garbage,
            drained, navigation->page.script_result.summary);
-    CHECK(!JS_IsCleanupJobPending(runtime->runtime));
+    CHECK(!cleanup_pending(runtime));
     unsigned finalized = 0, tasks = 0;
     CHECK(sscanf(navigation->page.script_result.summary, "%u %u",
                  &finalized, &tasks) == 2);

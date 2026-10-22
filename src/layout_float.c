@@ -136,8 +136,21 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
     for (size_t i = 0; may_share_preceding_line && i < line->float_count; i++) {
         if (line->floats[i].top > preceding_line_y) may_share_preceding_line = false;
     }
-    if (line->line_height != 0 || line->line_height_fixed != 0
-        || line->x != line->start_x) {
+    /* Keep a fitting right float out of an open left-aligned line's
+       baseline accounting, rather than flushing its preceding inline and
+       incorrectly starting the following inline on the next line. Reuse
+       the existing bounded atomic stack; unsupported alignment/bidi or a
+       full stack retains the conservative finalized-line path. */
+    bool continue_line = may_share_preceding_line
+        && line->text_align == TEXT_ALIGN_LEFT && !line->direction_rtl
+        && !line->bidi_pipeline_expected && line->bidi_flow == NULL
+        && !line->inline_overflow_ellipsis && line->clamp_limit == 0
+        && line->atomics != NULL && line->atomics->count < LINE_ATOMIC_LIMIT;
+    int saved_cursor = line->x;
+    int saved_cursor_fixed = line->x_fixed;
+    bool saved_cursor_valid = line->x_fixed_valid;
+    if (!continue_line && (line->line_height != 0 || line->line_height_fixed != 0
+        || line->x != line->start_x)) {
         layout_flush_line(line);
     }
     /* CSS 2.1 9.5.1: a later float may not be placed above an earlier
@@ -202,6 +215,11 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
             desired_width - margins, NULL);
         desired_width = border_box + margins;
     }
+    if (continue_line && desired_width > preceding_line_space) {
+        layout_flush_line(line);
+        normal_flow_y = line->y;
+        continue_line = false;
+    }
     /* A right float that fits beside content already on the line belongs
        at that line's top (CSS 2.1 9.5.1), not below it. Finalize the inline
        commands first so their alignment cannot move the float's subtree;
@@ -245,6 +263,12 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
     context->percentage_basis_node = saved_basis_node;
     context->percentage_basis_width = saved_basis_width;
     if (!placed) return false;
+    if (continue_line) {
+        line->atomics->entries[line->atomics->count++] = (LineAtomic) {
+            .node = node, .mode = LINE_ATOMIC_FLOAT,
+            .top = float_top, .height = float_bottom - float_top
+        };
+    }
     if (float_bottom <= float_top) float_bottom = float_top + 1;
     line->floats[line->float_count++] = (FloatExclusion) {
         .x = float_x,
@@ -255,5 +279,10 @@ bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
     };
     line->y = normal_flow_y;
     update_float_band(line);
+    if (continue_line) {
+        line->x = saved_cursor;
+        line->x_fixed = saved_cursor_fixed;
+        line->x_fixed_valid = saved_cursor_valid;
+    }
     return true;
 }

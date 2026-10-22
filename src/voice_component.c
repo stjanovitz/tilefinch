@@ -7,10 +7,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(__PSP__)
-#include <pspiofilemgr.h>
-#endif
-
 #include "tilefinch/sha256.h"
 
 #define VOICE_COMPONENT_IO_CHUNK (16u * 1024u)
@@ -496,9 +492,9 @@ static bool write_file_bytes(
     if (ok) ok = fsync(fileno(file)) == 0;
 #endif
     if (file != NULL && fclose(file) != 0) ok = false;
-#if defined(__PSP__)
-    if (ok) ok = sceIoSync("ms0:", 0) >= 0;
-#endif
+    /* A durability hint: the checked write already succeeded, and some real
+       firmware rejects every sync (tilefinch_memory_stick_sync). */
+    if (ok) (void) tilefinch_memory_stick_sync();
     return ok;
 }
 
@@ -526,19 +522,21 @@ static bool promote_install(TilefinchVoiceComponentInstall *job)
         if (had_active) (void) rename(job->previous, job->active);
         return false;
     }
-#if defined(__PSP__)
     /* UNINSTALLED is the durable authority that suppresses every otherwise
-       valid generation.  Commit the newly promoted directory before removing
+       valid generation.  Flush the newly promoted directory before removing
        that authority: if power fails here, the marker remains and the model
        stays disabled; if it fails after this sync, active is recoverable even
-       when the later marker deletion reaches FAT first. */
-    if (sceIoSync("ms0:", 0) < 0) return false;
-#endif
+       when the later marker deletion reaches FAT first.
+
+       Both syncs follow a completed rename or unlink, so they are hints:
+       on firmware that rejects them the work is still done, and reporting
+       "could not be activated" would contradict the promoted directory. The
+       ordering then rests on the driver; the worst a power cut can leave is
+       a disabled model or the previous verified generation, because the
+       resolver only accepts a directory with READY and every payload file. */
+    (void) tilefinch_memory_stick_sync();
     if (unlink(job->removed_marker) != 0 && errno != ENOENT) return false;
-#if defined(__PSP__)
-    /* Publish the now-enabled state as a second, separately durable step. */
-    if (sceIoSync("ms0:", 0) < 0) return false;
-#endif
+    (void) tilefinch_memory_stick_sync();
     return true;
 }
 

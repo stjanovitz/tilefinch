@@ -96,7 +96,7 @@
         &collapsed_sheet, border_none, NULL);
     CHECK(max_content_style.has_width && max_content_style.width_max_content
           && empty_clip_style.clip_rect_empty && empty_clip_style.hidden
-          && zero_scale_style.transform_scale_q6 == 0
+          && zero_scale_style.transform_scale_q14 == 0
           && zero_scale_style.hidden
           && border_none_style.border.bottom == 0);
     CHECK(layout_build(&collapsed_layout, &budget, &collapsed_document,
@@ -972,11 +972,13 @@
     ComputedStyle fallback_framed_style = style_for_node(
         &invalid_fallback_sheet,
         find_id(invalid_fallback_root, "fallback-framed"), NULL);
-    CHECK(fallback_framed_style.border.top == 2
-          && fallback_framed_style.border.left == 2
-          && stylesheet_border_color(
-                 &invalid_fallback_sheet, &fallback_framed_style,
-                 STYLE_BORDER_TOP, NULL) == 0x112233);
+    /* A missing variable is invalid at computed-value time, not an
+       unsupported parse-time function: the winning shorthand resets every
+       border component instead of reviving the older frame. */
+    CHECK(fallback_framed_style.border.top == 0
+          && fallback_framed_style.border.left == 0
+          && computed_style_border_line(
+                 &fallback_framed_style, STYLE_BORDER_TOP) == STYLE_BORDER_NONE);
     ComputedStyle fallback_edged_style = style_for_node(
         &invalid_fallback_sheet,
         find_id(invalid_fallback_root, "fallback-edged"), NULL);
@@ -1678,8 +1680,7 @@
     ComputedStyle auto_dir_style =
         style_for_node(&text_flow_sheet, auto_dir_node, NULL);
     int resolved_indent = 0;
-    const FontFace *sans_face = font_context_face_variant(
-        &fonts, NULL, FONT_SANS, false, false);
+    const FontFace *sans_face = font_context_face(&fonts, NULL, FONT_SANS);
     int zero_advance_fixed = font_text_width_for_family_at_size_fixed(
         sans_face, FONT_SANS, "0", 1, 20 * 64, false, false);
     int expected_ch_width = zero_advance_fixed > 0

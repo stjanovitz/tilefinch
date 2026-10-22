@@ -141,14 +141,34 @@ typedef void (*NavigationScriptFrontierCallback)(
 
 typedef struct {
     uint16_t control_index;
-    /* 0x8000 tags bounded option-selectedness; 0x4000 tags a disclosure's
-       open state, addressed by bounded DOM disclosure ordinal, not a visible
-       control index. Neither record contains a DOM pointer. */
+    /* The value's length, or a tag: NAVIGATION_HISTORY_CONTROL_OPTIONS on
+       bounded option-selectedness (the length is under the mask), or
+       exactly NAVIGATION_HISTORY_CONTROL_DISCLOSURES for the one record of
+       disclosure open states: bit n of value is DOM disclosure ordinal n,
+       and control_index is how many were recorded. Neither record contains
+       a DOM pointer. */
     uint16_t value_length;
     char value[128];
 } NavigationHistoryControl;
 
+#define NAVIGATION_HISTORY_CONTROL_OPTIONS 0x8000u
+#define NAVIGATION_HISTORY_CONTROL_DISCLOSURES 0x4000u
+#define NAVIGATION_HISTORY_CONTROL_LENGTH_MASK 0x7fffu
+
 #define NAVIGATION_HISTORY_CONTROL_LIMIT 8u
+
+/* last_error after a failed layout construction; its details are in
+   NavigationSession.last_layout_failure: the LayoutPerformance.failed_phase,
+   whether it was cancelled, and the Budget's refusals during it and its use
+   and limit at the time. */
+#define NAVIGATION_LAYOUT_FAILED_ERROR "layout construction failed"
+typedef struct {
+    unsigned phase;
+    bool cancelled;
+    size_t refusals;
+    size_t current;
+    size_t limit;
+} NavigationLayoutFailure;
 
 typedef struct {
     char *url;
@@ -287,6 +307,9 @@ typedef struct {
     /* Current-document fact. Session script counters are diagnostic totals
        and can outlive a page; frontend recovery must never consult them. */
     bool script_degradation_observed;
+    /* Current-page memory admission/retirement failure. Header links do not
+       prove an application initialized after this measured refusal. */
+    bool script_memory_limited;
     /* Script-heap rejections already attributed by the realm-retirement
        check, so a later check needs a new rejection, not just text. */
     size_t script_heap_rejections_seen;
@@ -431,6 +454,10 @@ typedef void (*NavigationDeferredImageReadyCallback)(
 typedef void (*NavigationImageTableMovedCallback)(
     void *opaque, NavigationSession *session, uintptr_t previous_base,
     size_t previous_count);
+
+/* Owner-only boundary before a destructive full relayout. Unlike an
+   allocator callback, no raster or HTTP response is currently borrowed. */
+typedef void (*NavigationReclaimOptionalCallback)(void *opaque);
 
 typedef struct {
     size_t ordinal;
@@ -793,14 +820,15 @@ struct NavigationSession {
     FetchStreamOptions stream_delivery;
     unsigned progressive_preview_lookahead_percent;
     uint64_t resource_fingerprint;
-    /* resource_fingerprint's stylesheet-source [0] and image-element [1]
+    /* resource_fingerprint's stylesheet/source-scope [0], image-element [1]
+       and exact stylesheet-source (excluding adoption scopes) [2]
        parts (see navigation_note_committed_fingerprint): valid while
        `owner` still equals the committed fingerprint. `last` is the latest
        traversal. */
-    uint64_t resource_fingerprint_parts[2];
+    uint64_t resource_fingerprint_parts[3];
     uint64_t resource_fingerprint_parts_owner;
     uint64_t resource_fingerprint_last;
-    uint64_t resource_fingerprint_parts_last[2];
+    uint64_t resource_fingerprint_parts_last[3];
     bool resource_fingerprint_parts_valid;
     bool style_rebuild_required;
     bool relayout_damage_valid;
@@ -918,6 +946,9 @@ struct NavigationSession {
        identify (tilefinch_bot_wall_header_vendor), or empty. */
     char last_bot_wall_vendor[TILEFINCH_BOT_WALL_VENDOR_LIMIT];
     char last_error[512];
+    /* Details of the failure when last_error is
+       NAVIGATION_LAYOUT_FAILED_ERROR. Diagnostics only; never shown. */
+    NavigationLayoutFailure last_layout_failure;
     char last_script_error_context[2048];
     char last_page_trace[2048];
     char previous_page_trace[2048];
@@ -1031,6 +1062,8 @@ struct NavigationSession {
     void *deferred_image_ready_opaque;
     NavigationImageTableMovedCallback image_table_moved;
     void *image_table_moved_opaque;
+    NavigationReclaimOptionalCallback reclaim_optional;
+    void *reclaim_optional_opaque;
     /* Prepare content-shape Reader markers on a completed candidate DOM
        before its first authoritative stylesheet/layout pass. */
     bool prepare_reader_candidates;

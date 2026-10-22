@@ -86,7 +86,7 @@ and a measured physical-device soak.
 ## Target and budgets
 
 The target display is 480×272. The shipping PSP memory profile gives the whole
-page 24 MiB and QuickJS 5 MiB; the engineering pressure profile lowers those
+page 32 MiB, shared with voice recognition, and QuickJS 5 MiB; the engineering pressure profile lowers those
 ceilings to 16 MiB and 4 MiB. DOM, script, styles, decoded images, Canvas,
 WebGL resources, layout, render data, and session state share the page budget.
 Reaching one subsystem's local limit does not imply that the remaining page
@@ -119,7 +119,7 @@ from what the game leaves and separately requires at least 2.5 MiB of the
 floor to stay free, so the game cannot quietly grow into it.
 
 The default comes from Treadline's qualification soak opened through the
-offline route on the host (64-bit pointers, realistic 24 MiB profile,
+offline route on the host (64-bit pointers, a 24 MiB embedder-default budget,
 1,800 frames): the QuickJS heap peaked at 5.09 MB (5.95 MB of arenas in the
 Budget) and everything else at 5.60 MB (layout 2.11, resources 1.92, render
 1.03, session 0.67 with script sources left on the Memory Stick, DOM 0.35),
@@ -128,7 +128,7 @@ Budget) and everything else at 5.60 MB (layout 2.11, resources 1.92, render
 1.1 MB more heap than Treadline's. At 9 MiB the steady worst case is about
 5.6 MB + 9 MiB of heap with arena overhead (~10.9 MB), 16.5 MB, and about
 20.7 MB while the 4 MiB startup window is open,
-leaving more than the eighth of 24 MiB the page reserve keeps. The strict
+leaving more than the eighth of the 32 MiB envelope the page reserve keeps. The strict
 6 MiB floor gives a steady worst case of about 13 MB of its 16 MiB, again
 above that profile's eighth. The PSP-1000
 (32 MB) is unsupported; every supported model (PSP-2000, PSP-3000, PSP Go,
@@ -187,12 +187,20 @@ small games:
   `strokeText()`, and `measureText()`;
 - canvas, decoded image, and `ImageBitmap` sources for `drawImage()`;
 - `ImageData`, pixel readback/writeback, PNG export, `Path2D` SVG strings, and
-  `Path2D.addPath()`.
+  `Path2D.addPath()`; a blank buffer from another `ImageData`'s dimensions,
+  `putImageData()` of a clipped dirty rectangle, and a context reset without
+  replacing the canvas;
+- pointer capture and layout-derived canvas-relative coordinates, so canvas
+  controls stay stable through hover, drag, and release.
 
 One JavaScript RGBA backing is limited to 512 KiB: at most 131,072 pixels, with
-authored dimensions proportionally bounded to 480×272. The renderer retains at
+authored dimensions proportionally bounded to 480×272 (a zero-sized axis
+stays zero while the other is still capped). The renderer retains at
 most four native presentation snapshots and 1 MiB across them. Eight
-`ImageBitmap` objects may retain at most 1 MiB in aggregate. Paths retain at
+`ImageBitmap` objects may retain at most 1 MiB in aggregate; their pixels
+stay in the QuickJS budget, preserve the canvas origin-clean state, and add
+no canvas backing store, and closing or collecting one returns its
+allowance. `HTMLImageElement.decode()` exposes bounded decode readiness. Paths retain at
 most 256 commands. Native batches admit 64 rectangles, 16 images, or 16
 path/text paint operations at once; excess work is flushed or refused without
 unbounded growth.
@@ -332,7 +340,8 @@ The Fullscreen API is supported for one connected top-level element after a
 trusted user activation. Start+Select remains the browser-owned page-control
 escape chord, and HOME remains firmware-owned. `document.hidden`,
 `document.visibilityState`, and `visibilitychange`
-track inactive pages, native media, suspend, and resume. Stop simulation and
+track inactive pages, native media, suspend, and resume; ordinary timers stay
+eligible while visual callbacks wait. Stop simulation and
 mute or suspend game audio while hidden; do not accumulate elapsed animation
 steps to replay later.
 
@@ -771,7 +780,7 @@ fails.
 
 Before describing a game as Game Profile v1 compatible:
 
-- test at 480×272 with the shipping 24 MiB / 5 MiB memory profile;
+- test at 480×272 with the shipping 32 MiB / 5 MiB memory profile;
 - run the strict 16 MiB / 4 MiB pressure profile and confirm clean degradation;
 - record displayed present intervals as well as callback, WebGL, raster, and
   publication phases after warm-up. Target 16.67 ms and require both steady

@@ -205,10 +205,6 @@ notice in this file.
 
 ## Optional components
 
-- **GNU lightning** (LGPL-3.0-or-later): linked only when the experimental
-  `PSP_BROWSER_QUICKJS_NATIVE_TRACE=ON` diagnostic is enabled; OFF by default
-  and in every preset. Enabling it in a distributed binary would add LGPL
-  relinking obligations.
 - **FFmpeg** n8.1.2 (LGPL-2.1-or-later in Tilefinch's configuration): used by
   the host media laboratory and by the replaceable PSP software-decoder PRX.
   The PSP build enables only H.264, `aac_fixed`, and the H.264 parser; it does
@@ -217,7 +213,7 @@ notice in this file.
   `scripts/prepare-swdec-ffmpeg.sh` reconstructs the linkable component input
   from the upstream tag. The license is checked in at
   `third_party/notices/ffmpeg/COPYING.LGPLv2.1`.
-- **Apple JavaScriptCore**: macOS-only diagnostic spike, disabled in presets.
+- **Apple JavaScriptCore**: macOS-only diagnostic spike, off by default.
 
 ## Distributing binaries
 

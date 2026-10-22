@@ -18,21 +18,21 @@ class ResourceTests(unittest.TestCase):
         resources = ROOT / "_resource_identity_probe"
         historical = hashlib.sha256()
         for path, data in sorted(generator.outputs(resources).items()):
-            if path.is_relative_to(resources) and int(path.parent.name[1:]) <= 10:
+            if path.is_relative_to(resources) and int(path.parent.name[1:]) <= 11:
                 historical.update(path.relative_to(resources).as_posix().encode() + b"\0" + data)
-        # Fixed before v11: every previously published resource remains exact.
+        # Fixed before v12: every previously published resource remains exact.
         self.assertEqual(historical.hexdigest(),
-            "43644306dca44836cd686c6556e914169eea13723bcdec28d755e3d33f503b7f")
+            "0fbf0634d2a69b5672c4aee19f9436e14065b075ae54eccd8d361a03ca036a18")
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v11/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v11/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v12/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v12/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v11/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v11/as.tful"', manifest)
+        self.assertIn('"translations/ui/v12/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v12/as.tful"', manifest)
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
@@ -88,6 +88,29 @@ class ResourceTests(unittest.TestCase):
         self.assertLessEqual({"Subscribe", "Unsubscribe", "Add to this playlist", "Remove", "Load more", "Remove from Watch Later",
             "Updating...", "Added to playlist.", "Removed from playlist.", "Subscribed.", "Unsubscribed.",
             "Not confirmed. Select again to retry.", "Sign in to use this action.", "Select an action."}, keys)
+
+    def test_hashed_catalog_refuses_colliding_keys(self):
+        # FNV-1a of the lowercased key, as style_fnv1a(..., true) computes.
+        self.assertEqual(generator.key_hash("queued"), 0x58300254)
+        self.assertEqual(generator.key_hash("QUEUED"), 0x58300254)
+        self.assertEqual(generator.key_hash("Untranslated probe 3466157"), 0x58300254)
+        rows = [["queued", "a"], ["Untranslated probe 3466157", "b"]]
+        with self.assertRaisesRegex(ValueError, "collision"):
+            generator.hashed_catalog("es", rows, 1)
+        with self.assertRaisesRegex(ValueError, "too long"):
+            generator.hashed_catalog("es", [["x" * 256, "a"]], 1)
+        data = generator.hashed_catalog("es", [["Back", "Volver"], ["Settings", "Ajustes"]], 1)
+        header = b"TFUI2\tes\n"
+        self.assertTrue(data.startswith(header + b"\x00\x02"))
+        hashes = [int.from_bytes(data[len(header) + 2 + 4 * i:][:4], "big") for i in range(2)]
+        self.assertEqual(hashes, sorted(generator.key_hash(k) for k in ("Back", "Settings")))
+        self.assertNotIn(b"Settings", data)
+
+    def test_active_catalog_has_no_english_keys(self):
+        rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
+        data = generator.hashed_catalog("es", rows, 1)
+        self.assertTrue(data.startswith(b"TFUI2\tes\n"))
+        self.assertNotIn(b"Manage apps installed by Tilefinch", data)
 
     def test_source_tree_contains_no_downloads(self):
         self.assertEqual(list((ROOT / "translations").rglob("*.tful")), [])

@@ -327,7 +327,7 @@ void psp_app_heavy_action(PspApp *app, PspAppFrameState *frame,
             (void) browser_engine_answer_heavy_page(engine, true);
             psp_ui_show_status(ui,
                                remembered ? "THIS SITE'S APP ALWAYS STARTS"
-                                          : "SITE LIST FULL - THIS SESSION",
+                                          : "SITE LIST FULL - THIS SESSION ONLY",
                                180);
             break;
         }

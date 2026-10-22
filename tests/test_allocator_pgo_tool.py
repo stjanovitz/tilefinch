@@ -77,6 +77,8 @@ class AllocatorPgoToolTests(unittest.TestCase):
             self.assertEqual(len(configurations), 1 if fail else 2)
             for args in configurations:
                 self.assertIn("-DTEST_FORWARDED=ON", args)
+                # The bench target exists only for the QuickJS-NG engine.
+                self.assertIn("-DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF", args)
                 Path(args[args.index("-B") + 1]).relative_to(scratch)
             if not fail:
                 self.assertIn("ratio=1.000x", result.stdout)

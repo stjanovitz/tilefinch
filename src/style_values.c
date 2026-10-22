@@ -14,7 +14,7 @@ static bool style_parse_background_size_values(
     const Stylesheet *sheet, const char *text, size_t length,
     uint16_t *width, uint16_t *height, uint8_t *fit, uint8_t *size_flags)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (width == NULL || height == NULL || fit == NULL || size_flags == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                           sizeof(resolved), 0)) return false;
@@ -157,7 +157,7 @@ bool style_parse_background_position(const Stylesheet *sheet,
                                       const char *text, size_t length,
                                       ComputedStyle *style)
 {
-    char resolved[64];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                           sizeof(resolved), 0)) return false;
@@ -284,22 +284,54 @@ static bool transform_scale_number(const char *text, size_t length,
     return *end == '\0';
 }
 
-static bool transform_angle_degrees(const char *text, size_t length,
-                                     double *degrees)
+bool style_angle_unit_degrees(const char *unit, size_t length, double *scale)
 {
-    char buffer[40];
+    static const struct {
+        const char *name;
+        double degrees;
+    } units[] = {
+        {"deg", 1.0}, {"grad", 0.9}, {"rad", 57.29577951308232},
+        {"turn", 360.0}
+    };
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        if (span_case_equal(unit, length, units[i].name)) {
+            *scale = units[i].degrees;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool style_parse_angle_degrees(const char *text, size_t length,
+                               bool unitless_zero, double *degrees)
+{
+    char buffer[64];
+    if (text == NULL || degrees == NULL) return false;
+    trim(&text, &length);
     if (length == 0 || length >= sizeof(buffer)) return false;
     memcpy(buffer, text, length);
     buffer[length] = '\0';
     char *end = NULL;
     double angle = strtod(buffer, &end);
     if (end == buffer || !isfinite(angle)) return false;
-    if (strcasecmp(end, "turn") == 0) angle *= 360.0;
-    else if (strcasecmp(end, "grad") == 0) angle *= 0.9;
-    else if (strcasecmp(end, "rad") == 0) angle *= 57.29577951308232;
-    else if (*end != '\0' && strcasecmp(end, "deg") != 0) return false;
-    else if (*end == '\0' && angle != 0.0) return false;
+    size_t unit_length = length - (size_t) (end - buffer);
+    double scale = 1.0;
+    if (unit_length == 0) {
+        if (!unitless_zero || angle != 0.0) return false;
+    } else if (!style_angle_unit_degrees(end, unit_length, &scale)) {
+        return false;
+    }
+    angle *= scale;
     if (!isfinite(angle)) return false;
+    *degrees = angle;
+    return true;
+}
+
+static bool transform_angle_degrees(const char *text, size_t length,
+                                     double *degrees)
+{
+    double angle = 0.0;
+    if (!style_parse_angle_degrees(text, length, true, &angle)) return false;
     *degrees = fmod(angle, 360.0);
     return true;
 }
@@ -307,21 +339,28 @@ static bool transform_angle_degrees(const char *text, size_t length,
 static bool transform_skew_number(const char *text, size_t length,
                                   double *shear)
 {
-    char buffer[40];
-    if (length == 0 || length >= sizeof(buffer)) return false;
-    memcpy(buffer, text, length);
-    buffer[length] = '\0';
-    char *end = NULL;
-    double angle = strtod(buffer, &end);
-    if (end == buffer || !isfinite(angle)) return false;
-    if (strcasecmp(end, "turn") == 0) angle *= 360.0;
-    else if (strcasecmp(end, "grad") == 0) angle *= 0.9;
-    else if (strcasecmp(end, "rad") == 0) angle *= 57.29577951308232;
-    else if (*end != '\0' && strcasecmp(end, "deg") != 0) return false;
-    else if (*end == '\0' && angle != 0.0) return false;
-    if (fabs(angle) > 75.0) return false;
+    double angle = 0.0;
+    if (!style_parse_angle_degrees(text, length, true, &angle)
+        || fabs(angle) > 75.0) return false;
     *shear = tan(angle * 0.017453292519943295);
     return true;
+}
+
+static int transform_translation_length(Stylesheet *sheet, const char *text,
+    size_t length, bool *percent)
+{
+    int pixels = style_parse_length(sheet, text, length, INT_MIN, percent);
+    /* Keep the common sparse parser, but do not truncate virtualized page
+       positions at its legacy 16-bit ceiling. The cascade's tagged parser
+       already enforces layout's wider coordinate bound. */
+    if (!*percent && (pixels == 32767 || pixels == -32767)) {
+        StyleLength value;
+        bool relative = false;
+        if (!parse_style_length(sheet, text, length, &value, &relative)
+            || relative || !style_length_resolve(sheet, value, 0, &pixels))
+            return INT_MIN;
+    }
+    return pixels;
 }
 
 /* Compose the practical 2D subset into one uniform-scale/quarter-turn/
@@ -334,9 +373,9 @@ void style_parse_transform_translation(Stylesheet *sheet,
                                         const char *text, size_t length,
                                         ComputedStyle *style)
 {
-    char value[256];
+    char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
     style->has_transform = false;
-    style->transform_scale_q6 = 64;
+    style->transform_scale_q14 = 16384;
     style->individual_rotate_quadrants = 0;
     style->transform_x = style->transform_y = 0;
     style->transform_x_percent = style->transform_y_percent = false;
@@ -418,14 +457,14 @@ void style_parse_transform_translation(Stylesheet *sheet,
             int x = 0, y = 0;
             bool xp = false, yp = false;
             if (!translate_y
-                && (x = style_parse_length(sheet, parts[0], part_lengths[0],
-                                           INT_MIN, &xp)) == INT_MIN) return;
+                && (x = transform_translation_length(
+                        sheet, parts[0], part_lengths[0], &xp)) == INT_MIN) return;
             if (translate_y) {
-                if ((y = style_parse_length(sheet, parts[0], part_lengths[0],
-                                            INT_MIN, &yp)) == INT_MIN) return;
+                if ((y = transform_translation_length(
+                        sheet, parts[0], part_lengths[0], &yp)) == INT_MIN) return;
             } else if (translate && count >= 2
-                       && (y = style_parse_length(
-                               sheet, parts[1], part_lengths[1], INT_MIN,
+                       && (y = transform_translation_length(
+                               sheet, parts[1], part_lengths[1],
                                &yp)) == INT_MIN) return;
             if (translate && count == 3) {
                 bool zp = false;
@@ -555,20 +594,26 @@ void style_parse_transform_translation(Stylesheet *sheet,
     } else if (fabs(c) > 0.000001 || fabs(d) > 0.000001) return;
     if ((fabs(tx) > 0.000001 && fabs(pxw) > 0.000001)
         || (fabs(ty) > 0.000001 && fabs(pyh) > 0.000001)) return;
-    if (scale > 255.0 / 64.0) scale = 255.0 / 64.0;
-    style->transform_scale_q6 = (uint8_t) (scale * 64.0 + 0.5);
+    double fixed = scale * (double) STYLE_TRANSFORM_SCALE_Q14_ONE;
+    if (fixed > (double) STYLE_TRANSFORM_SCALE_Q14_MAX)
+        fixed = (double) STYLE_TRANSFORM_SCALE_Q14_MAX;
+    style->transform_scale_q14 = (uint16_t) (fixed + 0.5);
     style->individual_rotate_quadrants = (uint8_t) quadrants;
     style->transform_x_percent = fabs(pxw) > 0.000001;
     style->transform_y_percent = fabs(pyh) > 0.000001;
     double final_x = style->transform_x_percent ? pxw : tx;
     double final_y = style->transform_y_percent ? pyh : ty;
-    if (final_x < -32767.0) final_x = -32767.0;
-    if (final_x > 32767.0) final_x = 32767.0;
-    if (final_y < -32767.0) final_y = -32767.0;
-    if (final_y > 32767.0) final_y = 32767.0;
+    double x_limit = style->transform_x_percent ? 32767.0
+        : STYLE_LENGTH_DIRECT_LIMIT;
+    double y_limit = style->transform_y_percent ? 32767.0
+        : STYLE_LENGTH_DIRECT_LIMIT;
+    if (final_x < -x_limit) final_x = -x_limit;
+    if (final_x > x_limit) final_x = x_limit;
+    if (final_y < -y_limit) final_y = -y_limit;
+    if (final_y > y_limit) final_y = y_limit;
     style->transform_x = (int) (final_x < 0 ? final_x - 0.5 : final_x + 0.5);
     style->transform_y = (int) (final_y < 0 ? final_y - 0.5 : final_y + 0.5);
-    style->has_transform = style->transform_scale_q6 != 64
+    style->has_transform = style->transform_scale_q14 != 16384
         || quadrants != 0 || style->transform_x != 0 || style->transform_y != 0
         || shear != 0.0 || rotation_q6 != 0;
     if (shear != 0.0 || rotation_q6 != 0) {
@@ -641,23 +686,22 @@ static unsigned color_byte(double value)
     return (unsigned) (value * 255.0 + 0.5);
 }
 
+/* A hue at *cursor's optional angle unit (a bare number is degrees),
+   normalized to [0, 360). */
 static double hue_degrees(const char **cursor, double hue)
 {
-    if (strncmp(*cursor, "turn", 4) == 0) {
-        *cursor += 4;
-        hue *= 360.0;
-    } else if (strncmp(*cursor, "grad", 4) == 0) {
-        *cursor += 4;
-        hue *= 0.9;
-    } else if (strncmp(*cursor, "rad", 3) == 0) {
-        *cursor += 3;
-        hue *= 57.29577951308232;
-    } else if (strncmp(*cursor, "deg", 3) == 0) {
-        *cursor += 3;
+    size_t unit_length = 0;
+    while (isalpha((unsigned char) (*cursor)[unit_length])) unit_length++;
+    double scale = 1.0;
+    if (unit_length != 0
+        && style_angle_unit_degrees(*cursor, unit_length, &scale)) {
+        *cursor += unit_length;
+        hue *= scale;
     }
-    while (hue < 0.0) hue += 360.0;
-    while (hue >= 360.0) hue -= 360.0;
-    return hue;
+    if (!isfinite(hue)) return 0.0;
+    hue = fmod(hue, 360.0);
+    if (hue < 0.0) hue += 360.0;
+    return hue >= 360.0 ? 0.0 : hue;
 }
 
 static double hsl_channel(double p, double q, double hue)
@@ -1076,7 +1120,7 @@ static bool style_parse_color_with_alpha_depth(const Stylesheet *sheet,
                                                 uint8_t *alpha,
                                                 unsigned depth)
 {
-    char value[256];
+    char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)) return false;
     text = value;
     length = strlen(value);
@@ -1569,35 +1613,23 @@ bool style_parse_background_shorthand_color(const Stylesheet *sheet,
     bool found = false;
     *transparent = false;
     *current_color = false;
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) resolved[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (resolved[end] == '(') parentheses++;
-            else if (resolved[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0
-                && isspace((unsigned char) resolved[end])) break;
-            end++;
+    size_t cursor = 0, at = 0, end = 0;
+    while (style_next_top_level_token(resolved, length, &cursor, &at, &end)) {
+        uint32_t candidate = 0;
+        uint8_t candidate_alpha = 255;
+        if (span_case_equal(resolved + at, end - at, "currentcolor")) {
+            *current_color = true;
+            *transparent = false;
+            *alpha = 255;
+            found = true;
+        } else if (style_parse_color_with_alpha(sheet, resolved + at, end - at,
+                                   &candidate, &candidate_alpha)) {
+            *current_color = false;
+            *color = candidate;
+            *alpha = candidate_alpha;
+            *transparent = candidate_alpha == 0;
+            found = true;
         }
-        if (end > at) {
-            uint32_t candidate = 0;
-            uint8_t candidate_alpha = 255;
-            if (span_case_equal(resolved + at, end - at, "currentcolor")) {
-                *current_color = true;
-                *transparent = false;
-                *alpha = 255;
-                found = true;
-            } else if (style_parse_color_with_alpha(sheet, resolved + at, end - at,
-                                       &candidate, &candidate_alpha)) {
-                *current_color = false;
-                *color = candidate;
-                *alpha = candidate_alpha;
-                *transparent = candidate_alpha == 0;
-                found = true;
-            }
-        }
-        at = end;
     }
     return found;
 }
@@ -1633,31 +1665,10 @@ bool style_parse_background_shorthand_position(
     char position[96];
     size_t position_length = 0;
     bool after_slash = false;
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t start = at;
-        int parentheses = 0;
-        char quote = 0;
-        while (at < length) {
-            char c = text[at];
-            if (quote != 0) {
-                if (c == quote) quote = 0;
-                at++;
-                continue;
-            }
-            if (c == '\'' || c == '"') {
-                quote = c;
-                at++;
-                continue;
-            }
-            if (c == '(') parentheses++;
-            else if (c == ')' && parentheses > 0) parentheses--;
-            else if (parentheses == 0 && isspace((unsigned char) c)) break;
-            at++;
-        }
+    size_t cursor = 0, start = 0, end = 0;
+    while (style_next_top_level_token(text, length, &cursor, &start, &end)) {
         const char *token = text + start;
-        size_t token_length = at - start;
-        if (token_length == 0) continue;
+        size_t token_length = end - start;
         if (token_length == 1 && token[0] == '/') {
             after_slash = true;
             continue;
@@ -1685,6 +1696,35 @@ bool style_parse_background_shorthand_position(
         sheet, position, position_length, style);
 }
 
+/* Where the top-level segment starting at `at` ends: at `separator`, or at
+   any whitespace when `separator` is zero, outside parentheses, quoted
+   strings and backslash escapes (an escaped quote neither opens nor closes
+   a string, as in layer_component_next).  The one CSS component scanner
+   behind both iterators below. */
+static size_t top_level_segment_end(const char *text, size_t length,
+                                    size_t at, char separator)
+{
+    int depth = 0;
+    char quote = 0;
+    while (at < length) {
+        char c = text[at];
+        if (c == '\\' && at + 1u < length) { at += 2u; continue; }
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            at++;
+            continue;
+        }
+        if (c == '\'' || c == '"') { quote = c; at++; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') { if (depth > 0) depth--; }
+        else if (depth == 0
+                 && (separator == 0 ? isspace((unsigned char) c) != 0
+                                    : c == separator)) break;
+        at++;
+    }
+    return at;
+}
+
 /* Paren/quote-aware top-level list iterator, shared by the multi-layer
    background shorthand and by gradient argument parsing so the engine keeps
    exactly one CSS list splitter.  *cursor starts at zero; each call writes
@@ -1698,31 +1738,34 @@ bool style_next_top_level(const char *text, size_t length, char separator,
         return false;
     }
     if (*cursor > length) return false;
-    size_t at = *cursor;
-    size_t segment_start = at;
-    int depth = 0;
-    char quote = 0;
-    while (at < length) {
-        char c = text[at];
-        if (quote != 0) {
-            if (c == quote) quote = 0;
-            at++;
-            continue;
-        }
-        if (c == '\'' || c == '"') { quote = c; at++; continue; }
-        if (c == '(') depth++;
-        else if (c == ')') { if (depth > 0) depth--; }
-        else if (c == separator && depth == 0) break;
-        at++;
-    }
-    size_t segment_end = at;
-    *cursor = at + 1;
+    size_t segment_start = *cursor;
+    size_t segment_end = top_level_segment_end(
+        text, length, segment_start, separator);
+    *cursor = segment_end + 1;
     while (segment_start < segment_end
            && isspace((unsigned char) text[segment_start])) segment_start++;
     while (segment_end > segment_start
            && isspace((unsigned char) text[segment_end - 1])) segment_end--;
     *start = segment_start;
     *end = segment_end;
+    return true;
+}
+
+bool style_next_top_level_token(const char *text, size_t length,
+                                size_t *cursor, size_t *start, size_t *end)
+{
+    if (text == NULL || cursor == NULL || start == NULL || end == NULL) {
+        return false;
+    }
+    size_t at = *cursor;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (at >= length) {
+        *cursor = length;
+        return false;
+    }
+    *start = at;
+    *end = top_level_segment_end(text, length, at, 0);
+    *cursor = *end;
     return true;
 }
 
@@ -1766,19 +1809,8 @@ static bool gradient_side_angle(const char *text, size_t length,
 static bool gradient_angle_value(const char *text, size_t length,
                                  uint16_t *angle)
 {
-    char buffer[32];
-    if (length == 0 || length >= sizeof(buffer)) return false;
-    memcpy(buffer, text, length);
-    buffer[length] = '\0';
-    char *end = NULL;
-    double parsed = strtod(buffer, &end);
-    if (end == buffer || !isfinite(parsed)) return false;
-    while (isspace((unsigned char) *end)) end++;
-    if (strcasecmp(end, "turn") == 0) parsed *= 360.0;
-    else if (strcasecmp(end, "grad") == 0) parsed *= 0.9;
-    else if (strcasecmp(end, "rad") == 0) parsed *= 57.29577951308232;
-    else if (*end != '\0' && strcasecmp(end, "deg") != 0) return false;
-    if (*end == '\0' && parsed != 0.0) return false;
+    double parsed = 0.0;
+    if (!style_parse_angle_degrees(text, length, true, &parsed)) return false;
     double normalized = fmod(parsed, 360.0);
     if (normalized < 0.0) normalized += 360.0;
     *angle = (uint16_t) (normalized + 0.5);
@@ -2178,9 +2210,8 @@ bool style_parse_box_shadow(const Stylesheet *sheet, const char *text,
         uint32_t color = 0;
         uint8_t alpha = 255;
         size_t token_cursor = 0, token_start = 0, token_end = 0;
-        while (style_next_top_level(layer, layer_length, ' ', &token_cursor,
-                                    &token_start, &token_end)) {
-            if (token_end == token_start) continue;
+        while (style_next_top_level_token(layer, layer_length, &token_cursor,
+                                          &token_start, &token_end)) {
             const char *token = layer + token_start;
             size_t token_length = token_end - token_start;
             if (token_length == 5
@@ -2509,7 +2540,7 @@ bool style_parse_background_box(Stylesheet *sheet, const char *text,
                                 size_t length, ComputedStyle *style,
                                 bool set_origin, bool set_clip)
 {
-    char resolved[128];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (sheet == NULL || style == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                                 sizeof(resolved), 0)) {
@@ -2594,6 +2625,44 @@ bool style_parse_mask_image_layers(Stylesheet *sheet, const char *text,
     return true;
 }
 
+/* The next component of one background or mask layer in text[*at, end):
+   components are separated by whitespace and by '/', which is punctuation
+   rather than a component, outside parentheses, quoted strings and
+   backslash escapes, so a slash inside url() or a function never splits.
+   *slash becomes true once a '/' has been passed (the size follows it).
+   False once no component remains. */
+static bool layer_component_next(const char *text, size_t end, size_t *at,
+                                 size_t *start, size_t *stop, bool *slash)
+{
+    size_t i = *at;
+    for (;;) {
+        while (i < end && isspace((unsigned char) text[i])) i++;
+        if (i >= end || text[i] != '/') break;
+        *slash = true;
+        i++;
+    }
+    if (i >= end) {
+        *at = end;
+        return false;
+    }
+    *start = i;
+    unsigned depth = 0;
+    char quote = 0;
+    while (i < end) {
+        char c = text[i];
+        if (c == '\\' && i + 1u < end) { i += 2u; continue; }
+        if (quote != 0) { if (c == quote) quote = 0; i++; continue; }
+        if (c == '\'' || c == '"') { quote = c; i++; continue; }
+        if (c == '(') depth++;
+        else if (c == ')' && depth != 0) depth--;
+        else if (depth == 0 && (c == '/' || isspace((unsigned char) c))) break;
+        i++;
+    }
+    *stop = i;
+    *at = i;
+    return true;
+}
+
 static bool mask_shorthand_word(const char *word, size_t length,
                                 const char *wanted)
 {
@@ -2651,33 +2720,11 @@ bool style_parse_mask_shorthand(Stylesheet *sheet, const char *text,
         layer->clip = STYLE_PAINT_BOX_BORDER;
 
         size_t image_start = SIZE_MAX, image_end = SIZE_MAX;
-        for (size_t at = start; at < end;) {
-            while (at < end && isspace((unsigned char) resolved[at])) at++;
-            if (at < end && resolved[at] == '/') { at++; continue; }
-            size_t token_start = at;
-            unsigned depth = 0;
-            char quote = 0;
-            while (at < end) {
-                char c = resolved[at];
-                if (quote != 0) {
-                    if (c == quote) quote = 0;
-                    at++;
-                    continue;
-                }
-                if (c == '\'' || c == '"') {
-                    quote = c;
-                    at++;
-                    continue;
-                }
-                if (c == '(') depth++;
-                else if (c == ')' && depth != 0) depth--;
-                else if (depth == 0
-                         && (isspace((unsigned char) c) || c == '/')) {
-                    break;
-                }
-                at++;
-            }
-            size_t token_length = at - token_start;
+        size_t at = start, token_start = 0, token_end = 0;
+        bool slash = false;
+        while (layer_component_next(resolved, end, &at, &token_start,
+                                    &token_end, &slash)) {
+            size_t token_length = token_end - token_start;
             bool image_token = token_length == 4
                 && memcmp(resolved + token_start, "none", 4) == 0;
             if (!image_token && token_length >= 5) {
@@ -2698,7 +2745,7 @@ bool style_parse_mask_shorthand(Stylesheet *sheet, const char *text,
             if (image_token) {
                 if (image_start != SIZE_MAX) return false;
                 image_start = token_start;
-                image_end = at;
+                image_end = token_end;
             }
         }
         if (image_start == SIZE_MAX) return false;
@@ -2722,39 +2769,12 @@ bool style_parse_mask_shorthand(Stylesheet *sheet, const char *text,
         bool after_slash = false;
         const char *repeat_words[2] = {NULL, NULL};
         size_t repeat_lengths[2] = {0, 0}, repeat_count = 0;
-        for (size_t at = start; at < end;) {
-            while (at < end && isspace((unsigned char) resolved[at])) at++;
-            if (at < end && resolved[at] == '/') {
-                after_slash = true;
-                at++;
+        at = start;
+        while (layer_component_next(resolved, end, &at, &token_start,
+                                    &token_end, &after_slash)) {
+            size_t token_length = token_end - token_start;
+            if (token_start == image_start && token_end == image_end)
                 continue;
-            }
-            size_t token_start = at;
-            unsigned depth = 0;
-            char quote = 0;
-            while (at < end) {
-                char c = resolved[at];
-                if (quote != 0) {
-                    if (c == quote) quote = 0;
-                    at++;
-                    continue;
-                }
-                if (c == '\'' || c == '"') {
-                    quote = c;
-                    at++;
-                    continue;
-                }
-                if (c == '(') depth++;
-                else if (c == ')' && depth != 0) depth--;
-                else if (depth == 0
-                         && (isspace((unsigned char) c) || c == '/')) {
-                    break;
-                }
-                at++;
-            }
-            size_t token_length = at - token_start;
-            if (token_length == 0) continue;
-            if (token_start == image_start && at == image_end) continue;
             const char *token = resolved + token_start;
             bool valid_box = false;
             StylePaintBox box = style_parse_paint_box_keyword(
@@ -3229,24 +3249,10 @@ static void style_parse_background_layer_shorthand_geometry(
     char position[96] = {0}, size[96] = {0};
     size_t position_length = 0, size_length = 0;
     bool after_slash = false;
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        if (at == length) break;
-        if (text[at] == '/') { after_slash = true; at++; continue; }
-        size_t start = at;
-        unsigned depth = 0;
-        char quote = 0;
-        while (at < length) {
-            char c = text[at];
-            if (c == '\\' && at + 1u < length) { at += 2u; continue; }
-            if (quote) { if (c == quote) quote = 0; at++; continue; }
-            if (c == '\'' || c == '"') { quote = c; at++; continue; }
-            if (c == '(') depth++;
-            else if (c == ')' && depth != 0) depth--;
-            else if (depth == 0 && (c == '/' || isspace((unsigned char) c))) break;
-            at++;
-        }
-        size_t n = at - start;
+    size_t at = 0, start = 0, stop = 0;
+    while (layer_component_next(text, length, &at, &start, &stop,
+                                &after_slash)) {
+        size_t n = stop - start;
         bool dimension = background_length_token(text + start, n)
             || (n == 4 && memcmp(text + start, "auto", 4) == 0)
             || (n == 5 && memcmp(text + start, "cover", 5) == 0)
@@ -3336,32 +3342,10 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
             stack.backgrounds[layer_index] = retained;
         }
         bool layer_image_found = false;
-        for (size_t at = seg_start; at < seg_end;) {
-            while (at < seg_end
-                   && isspace((unsigned char) resolved[at])) at++;
-            if (at == seg_end) break;
-            size_t token_start = at;
-            unsigned depth = 0;
-            char quote = 0;
-            while (at < seg_end) {
-                char c = resolved[at];
-                if (quote != 0) {
-                    if (c == quote) quote = 0;
-                    at++;
-                    continue;
-                }
-                if (c == '\'' || c == '"') {
-                    quote = c;
-                    at++;
-                    continue;
-                }
-                if (c == '(') depth++;
-                else if (c == ')' && depth != 0) depth--;
-                else if (depth == 0 && isspace((unsigned char) c)) break;
-                at++;
-            }
-            size_t token_length = at - token_start;
-            if (token_length == 0) continue;
+        size_t token_cursor = seg_start, token_start = 0, token_end = 0;
+        while (style_next_top_level_token(resolved, seg_end, &token_cursor,
+                                          &token_start, &token_end)) {
+            size_t token_length = token_end - token_start;
             StyleGradient candidate = {0};
             if (style_parse_gradient(
                     sheet, resolved + token_start, token_length,
@@ -3387,7 +3371,7 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                 chosen_start = seg_start;
                 chosen_end = seg_end;
                 chosen_image_start = token_start;
-                chosen_image_end = at;
+                chosen_image_end = token_end;
                 chosen_layer = layer_index;
                 chosen_found = true;
                 if (layer_index < STYLE_PAINT_LAYER_LIMIT) {
@@ -3465,37 +3449,19 @@ static bool parse_style_length_components(Stylesheet *sheet,
 {
     if (sheet == NULL || text == NULL || values == NULL || capacity == 0
         || count == NULL) return false;
-    char resolved[STYLE_MATH_SOURCE_CAPACITY];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
     }
     size_t program_count = sheet->math_program_count;
     size_t instruction_count = sheet->math_instruction_count;
     size_t resolved_length = strlen(resolved);
-    size_t used = 0;
-    for (size_t at = 0; at < resolved_length;) {
-        while (at < resolved_length
-               && isspace((unsigned char) resolved[at])) at++;
-        if (at == resolved_length) break;
-        if (used == capacity) {
-            style_math_restore(sheet, program_count, instruction_count);
-            return false;
-        }
-        size_t end = at;
-        unsigned parentheses = 0;
-        while (end < resolved_length) {
-            if (resolved[end] == '(') {
-                parentheses++;
-                if (parentheses > STYLE_MATH_NESTING_LIMIT + 1u) break;
-            } else if (resolved[end] == ')') {
-                if (parentheses == 0) break;
-                parentheses--;
-            }
-            if (parentheses == 0
-                && isspace((unsigned char) resolved[end])) break;
-            end++;
-        }
-        if (end == at || parentheses != 0
+    size_t used = 0, cursor = 0, at = 0, end = 0;
+    /* An unbalanced or over-deep component is one token here, and the
+       length parser rejects it. */
+    while (style_next_top_level_token(resolved, resolved_length, &cursor,
+                                      &at, &end)) {
+        if (used == capacity
             || !parse_style_length(sheet, resolved + at, end - at,
                                    &values[used], NULL)
             || values[used] < 0) {
@@ -3503,7 +3469,6 @@ static bool parse_style_length_components(Stylesheet *sheet,
             return false;
         }
         used++;
-        at = end;
     }
     if (used == 0) {
         style_math_restore(sheet, program_count, instruction_count);
@@ -3550,7 +3515,7 @@ bool style_parse_padding_pair(Stylesheet *sheet, const char *text,
 bool style_length_is_auto(const Stylesheet *sheet, const char *text,
                            size_t length)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     return style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)
            && strcmp(resolved, "auto") == 0;
 }
@@ -3558,7 +3523,7 @@ bool style_length_is_auto(const Stylesheet *sheet, const char *text,
 bool style_noninherited_length_is_auto(const Stylesheet *sheet,
                                         const char *text, size_t length)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)) {
         return false;
     }
@@ -3577,7 +3542,7 @@ bool style_noninherited_length_is_auto(const Stylesheet *sheet,
 uint64_t style_parse_margin_box(const Stylesheet *sheet, const char *text,
                                  size_t length, ComputedStyle *style)
 {
-    char resolved[STYLE_MATH_SOURCE_CAPACITY];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(
             sheet, text, length, resolved, sizeof(resolved), 0)) {
         return 0;
@@ -3587,26 +3552,15 @@ uint64_t style_parse_margin_box(const Stylesheet *sheet, const char *text,
     int values[4] = {0};
     bool automatic[4] = {false};
     bool percentages[4] = {false};
-    size_t count = 0;
-    for (size_t at = 0; at < length && count < 4;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0 && isspace((unsigned char) text[end])) break;
-            end++;
-        }
-        if (end > at) {
-            automatic[count] = style_length_is_auto(sheet, text + at, end - at);
-            values[count] = automatic[count] ? 0 : style_parse_length(
-                sheet, text + at, end - at, INT_MIN,
-                &percentages[count]);
-            if (!automatic[count] && values[count] == INT_MIN) return 0;
-            count++;
-        }
-        at = end;
+    size_t count = 0, cursor = 0, at = 0, end = 0;
+    /* One to four components; a fifth makes the declaration invalid. */
+    while (style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        if (count == 4) return 0;
+        automatic[count] = style_length_is_auto(sheet, text + at, end - at);
+        values[count] = automatic[count] ? 0 : style_parse_length(
+            sheet, text + at, end - at, INT_MIN, &percentages[count]);
+        if (!automatic[count] && values[count] == INT_MIN) return 0;
+        count++;
     }
     if (count == 0) return 0;
     style->margin.top = values[0];
@@ -3735,18 +3689,62 @@ uint32_t stylesheet_border_color(
     return color;
 }
 
+bool style_line_width_keyword(const char *text, size_t length, int *width)
+{
+    if (span_case_equal(text, length, "thin")) *width = 1;
+    else if (span_case_equal(text, length, "medium")) *width = 3;
+    else if (span_case_equal(text, length, "thick")) *width = 5;
+    else return false;
+    return true;
+}
+
+unsigned style_border_line_style(const char *text, size_t length)
+{
+    if (span_case_equal(text, length, "none")
+        || span_case_equal(text, length, "hidden")) {
+        return STYLE_BORDER_NONE;
+    }
+    if (span_case_equal(text, length, "dotted")) {
+        return STYLE_BORDER_DOTTED;
+    }
+    if (span_case_equal(text, length, "dashed")) {
+        return STYLE_BORDER_DASHED;
+    }
+    if (span_case_equal(text, length, "solid")
+        || span_case_equal(text, length, "double")
+        || span_case_equal(text, length, "groove")
+        || span_case_equal(text, length, "ridge")
+        || span_case_equal(text, length, "inset")
+        || span_case_equal(text, length, "outset")) {
+        return STYLE_BORDER_SOLID;
+    }
+    return UINT_MAX;
+}
+
 uint64_t style_parse_border(
     const Stylesheet *sheet, const char *text, size_t length,
     int *width, uint32_t *color, uint8_t *alpha, unsigned *line_style,
     uint64_t edge_mask)
 {
-    char resolved[STYLE_MATH_SOURCE_CAPACITY];
-    if (!style_resolve_value(
-            sheet, text, length, resolved, sizeof(resolved), 0)) {
-        return 0;
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
+    bool resolved_ok = style_resolve_value(
+        sheet, text, length, resolved, sizeof(resolved), 0);
+    if (resolved_ok) {
+        text = resolved;
+        length = strlen(resolved);
     }
-    text = resolved;
-    length = strlen(resolved);
+    if (!resolved_ok || span_case_equal(text, length, "initial")
+        || span_case_equal(text, length, "unset")) {
+        /* Deferred variable substitution already won the cascade. Its
+           invalid-value reset must also clear a native control's UA border,
+           rather than exposing that earlier declaration again. Used width
+           is zero for the initial `none` line style. */
+        *width = 0;
+        *color = UINT32_MAX;
+        *alpha = 255;
+        if (line_style != NULL) *line_style = STYLE_BORDER_NONE;
+        return edge_mask;
+    }
     int parsed_width = -1;
     bool has_color = false;
     unsigned parsed_style = STYLE_BORDER_NONE;
@@ -3754,72 +3752,37 @@ uint64_t style_parse_border(
     /* CSS drops a declaration it cannot parse, leaving the previous cascaded
        value in force.  Track whether ANY component of this value was
        understood so a wholly unparseable `border` value (an unresolvable
-       var(), say) reports "no edges touched" instead of silently rewriting
+       unsupported function, say) reports "no edges touched" instead of silently rewriting
        the border to the 1px default. */
     bool recognized = false;
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0 && isspace((unsigned char) text[end])) break;
-            end++;
+    size_t cursor = 0, at = 0, end = 0;
+    while (style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        uint32_t candidate;
+        uint8_t candidate_alpha = 255;
+        unsigned candidate_style = style_border_line_style(
+            text + at, end - at);
+        int candidate_width = -1;
+        if (candidate_style != UINT_MAX) {
+            if (has_style) return 0;
+            parsed_style = candidate_style;
+            has_style = true;
+            recognized = true;
+        } else if (style_parse_color_with_alpha(sheet, text + at, end - at,
+                                   &candidate, &candidate_alpha)) {
+            *color = candidate;
+            *alpha = candidate_alpha;
+            has_color = true;
+            recognized = true;
+        } else if ((candidate_width = style_parse_length(
+                        sheet, text + at, end - at, -1, NULL)) >= 0
+                   || style_line_width_keyword(
+                       text + at, end - at, &candidate_width)) {
+            if (parsed_width >= 0) return 0;
+            parsed_width = candidate_width;
+            recognized = true;
+        } else {
+            return 0;
         }
-        if (end > at) {
-            uint32_t candidate;
-            uint8_t candidate_alpha = 255;
-            if (span_equal(text + at, end - at, "none")
-                || span_equal(text + at, end - at, "hidden")) {
-                if (has_style) return 0;
-                parsed_style = STYLE_BORDER_NONE;
-                has_style = true;
-                recognized = true;
-            } else if (style_parse_color_with_alpha(sheet, text + at, end - at,
-                                       &candidate, &candidate_alpha)) {
-                *color = candidate;
-                *alpha = candidate_alpha;
-                has_color = true;
-                recognized = true;
-            } else {
-                int candidate_width = style_parse_length(sheet, text + at,
-                                                   end - at, -1, NULL);
-                if (candidate_width >= 0) {
-                    if (parsed_width >= 0) return 0;
-                    parsed_width = candidate_width;
-                    recognized = true;
-                } else if (span_equal(text + at, end - at, "thin")
-                           || span_equal(text + at, end - at, "medium")
-                           || span_equal(text + at, end - at, "thick")) {
-                    if (parsed_width >= 0) return 0;
-                    parsed_width = span_equal(text + at, end - at, "thin")
-                        ? 1 : (span_equal(text + at, end - at, "medium")
-                               ? 3 : 5);
-                    recognized = true;
-                } else {
-                    unsigned candidate_style = STYLE_BORDER_NONE;
-                    bool style_token = true;
-                    if (span_equal(text + at, end - at, "dotted"))
-                        candidate_style = STYLE_BORDER_DOTTED;
-                    else if (span_equal(text + at, end - at, "dashed"))
-                        candidate_style = STYLE_BORDER_DASHED;
-                    else if (span_equal(text + at, end - at, "solid")
-                             || span_equal(text + at, end - at, "double")
-                             || span_equal(text + at, end - at, "groove")
-                             || span_equal(text + at, end - at, "ridge")
-                             || span_equal(text + at, end - at, "inset")
-                             || span_equal(text + at, end - at, "outset"))
-                        candidate_style = STYLE_BORDER_SOLID;
-                    else style_token = false;
-                    if (!style_token || has_style) return 0;
-                    parsed_style = candidate_style;
-                    has_style = true;
-                    recognized = true;
-                }
-            }
-        }
-        at = end;
     }
     if (!recognized) return 0;
     if (has_style && parsed_style == STYLE_BORDER_NONE) parsed_width = 0;
@@ -3833,66 +3796,25 @@ uint64_t style_parse_border(
     return edge_mask;
 }
 
-bool style_parse_pair(const Stylesheet *sheet, const char *text,
-                      size_t length, int *first, int *second)
-{
-    int values[2] = {0, 0};
-    size_t count = 0;
-    size_t at = 0;
-    for (; at < length && count < 2;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0 && isspace((unsigned char) text[end])) break;
-            end++;
-        }
-        if (end > at) {
-            int parsed = style_parse_length(
-                sheet, text + at, end - at, INT_MIN, NULL);
-            if (parsed == INT_MIN) return false;
-            values[count++] = parsed;
-        }
-        at = end;
-    }
-    while (at < length && isspace((unsigned char) text[at])) at++;
-    if (count == 0 || at != length) return false;
-    *first = values[0];
-    *second = count > 1 ? values[1] : values[0];
-    return true;
-}
-
 bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text,
                                  size_t length, int values[2],
                                  bool automatic[2], bool percentages[2])
 {
-    size_t count = 0;
-    size_t at = 0;
-    for (; at < length && count < 2;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (parentheses == 0 && isspace((unsigned char) text[end])) break;
-            end++;
-        }
-        if (end > at) {
-            automatic[count] = style_length_is_auto(sheet, text + at, end - at);
-            bool percent = false;
-            values[count] = automatic[count] ? 0 : style_parse_length(
-                sheet, text + at, end - at, INT_MIN, &percent);
-            if (!automatic[count] && values[count] == INT_MIN) return false;
-            if (percentages != NULL) percentages[count] = percent;
-            count++;
-        }
-        at = end;
+    size_t count = 0, cursor = 0, at = 0, end = 0;
+    while (count < 2
+           && style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        automatic[count] = style_length_is_auto(sheet, text + at, end - at);
+        bool percent = false;
+        values[count] = automatic[count] ? 0 : style_parse_length(
+            sheet, text + at, end - at, INT_MIN, &percent);
+        if (!automatic[count] && values[count] == INT_MIN) return false;
+        if (percentages != NULL) percentages[count] = percent;
+        count++;
     }
-    while (at < length && isspace((unsigned char) text[at])) at++;
-    if (count == 0 || at != length) return false;
+    if (count == 0
+        || style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        return false;
+    }
     if (count == 1) {
         values[1] = values[0];
         automatic[1] = automatic[0];
@@ -3904,7 +3826,7 @@ bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text,
 int style_parse_line_height(const Stylesheet *sheet, const char *text,
                              size_t length)
 {
-    char value[128];
+    char value[STYLE_MATH_SOURCE_CAPACITY];
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0))
         return STYLE_LINE_HEIGHT_INVALID;
     if (strcasecmp(value, "normal") == 0) return 0;
@@ -3959,7 +3881,7 @@ bool style_parse_text_decoration_underline(const Stylesheet *sheet,
                                             const char *text, size_t length,
                                             bool *underline, bool *inherit)
 {
-    char resolved[128];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (underline == NULL || inherit == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                           sizeof(resolved), 0)) return false;
@@ -4002,7 +3924,7 @@ bool style_parse_text_underline_offset(const Stylesheet *sheet,
                                         const char *text, size_t length,
                                         unsigned *offset_code)
 {
-    char resolved[128];
+    char resolved[STYLE_MATH_SOURCE_CAPACITY];
     if (offset_code == NULL
         || !style_resolve_value(sheet, text, length, resolved,
                           sizeof(resolved), 0)) return false;
@@ -4060,14 +3982,14 @@ static bool font_size_keyword(const char *text, size_t length, int *size,
         {"xx-large", 32}, {"xxx-large", 48}
     };
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
-        if (style_font_span_equal(text, length, keywords[i].name)) {
+        if (span_case_equal(text, length, keywords[i].name)) {
             *size = keywords[i].pixels;
             *unit = FONT_SIZE_UNIT_ABSOLUTE;
             return true;
         }
     }
-    bool larger = style_font_span_equal(text, length, "larger");
-    if (!larger && !style_font_span_equal(text, length, "smaller"))
+    bool larger = span_case_equal(text, length, "larger");
+    if (!larger && !span_case_equal(text, length, "smaller"))
         return false;
     *size = larger ? 1200 : 833;
     *unit = FONT_SIZE_UNIT_EM;
@@ -4078,7 +4000,7 @@ int style_parse_font_size(const Stylesheet *sheet, const char *text,
                            size_t length, uint8_t *unit,
                            uint8_t *fraction)
 {
-    char value[128];
+    char value[STYLE_MATH_SOURCE_CAPACITY];
     *unit = FONT_SIZE_UNIT_ABSOLUTE;
     *fraction = 0;
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)) return 14;
@@ -4089,11 +4011,11 @@ int style_parse_font_size(const Stylesheet *sheet, const char *text,
     if (opening != NULL && math_length != 0
         && math[math_length - 1] == ')') {
         size_t name_length = (size_t) (opening - math);
-        bool function = style_math_identifier_equal(math, name_length,
+        bool function = span_case_equal(math, name_length,
                                                     "min")
-            || style_math_identifier_equal(math, name_length, "max")
-            || style_math_identifier_equal(math, name_length, "clamp")
-            || style_math_identifier_equal(math, name_length, "calc");
+            || span_case_equal(math, name_length, "max")
+            || span_case_equal(math, name_length, "clamp")
+            || span_case_equal(math, name_length, "calc");
         if (function) {
             const StyleResolveScratch *scratch =
                 sheet != NULL ? sheet->resolve_scratch : NULL;
@@ -4144,18 +4066,6 @@ int style_parse_font_size(const Stylesheet *sheet, const char *text,
     int fixed = 0;
     if (!font_size_pixels_to_fixed(number, &fixed)) return 14;
     return style_font_size_from_fixed(fixed, fraction);
-}
-
-bool style_font_span_equal(const char *text, size_t length,
-                            const char *wanted)
-{
-    size_t wanted_length = strlen(wanted);
-    if (length != wanted_length) return false;
-    for (size_t i = 0; i < length; i++) {
-        if (tolower((unsigned char) text[i])
-            != tolower((unsigned char) wanted[i])) return false;
-    }
-    return true;
 }
 
 /* Return one whitespace-delimited font component.  A top-level slash is a
@@ -4230,7 +4140,7 @@ static bool parse_font_number(const char *text, size_t length,
 static bool font_suffix_equal(const char *suffix, const char *end,
                               const char *wanted)
 {
-    return style_font_span_equal(suffix, (size_t) (end - suffix), wanted);
+    return span_case_equal(suffix, (size_t) (end - suffix), wanted);
 }
 
 static bool parse_font_size_component(const Stylesheet *sheet,
@@ -4242,10 +4152,10 @@ static bool parse_font_size_component(const Stylesheet *sheet,
     *fraction = 0;
     if (font_size_keyword(text, length, size, unit)) return true;
     if ((length > 5 && text[length - 1] == ')')
-        && (style_font_span_equal(text, 4, "min(")
-            || style_font_span_equal(text, 4, "max(")
-            || style_font_span_equal(text, 5, "calc(")
-            || style_font_span_equal(text, 6, "clamp("))) {
+        && (span_case_equal(text, 4, "min(")
+            || span_case_equal(text, 4, "max(")
+            || span_case_equal(text, 5, "calc(")
+            || span_case_equal(text, 6, "clamp("))) {
         int parsed = style_parse_font_size(sheet, text, length, unit, fraction);
         if (parsed < 0) return false;
         *size = parsed;
@@ -4322,7 +4232,7 @@ static bool parse_font_line_height_component(const Stylesheet *sheet,
                                              const char *text, size_t length,
                                              int *line_height)
 {
-    if (style_font_span_equal(text, length, "normal")) {
+    if (span_case_equal(text, length, "normal")) {
         *line_height = 0;
         return true;
     }
@@ -4373,16 +4283,16 @@ bool style_parse_font_weight_component(const char *text, size_t length,
                                         uint16_t *weight)
 {
     if (weight == NULL) return false;
-    if (style_font_span_equal(text, length, "normal")) {
+    if (span_case_equal(text, length, "normal")) {
         *weight = 400;
         return true;
     }
-    if (style_font_span_equal(text, length, "bold")
-        || style_font_span_equal(text, length, "bolder")) {
+    if (span_case_equal(text, length, "bold")
+        || span_case_equal(text, length, "bolder")) {
         *weight = 700;
         return true;
     }
-    if (style_font_span_equal(text, length, "lighter")) {
+    if (span_case_equal(text, length, "lighter")) {
         *weight = 300;
         return true;
     }
@@ -4404,7 +4314,7 @@ static bool font_stretch_component(const char *text, size_t length)
         "extra-expanded", "ultra-expanded"
     };
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
-        if (style_font_span_equal(text, length, values[i])) return true;
+        if (span_case_equal(text, length, values[i])) return true;
     }
     return false;
 }
@@ -4426,37 +4336,37 @@ static bool select_platform_font_family(const char *text, size_t length,
 {
     if (text == NULL || family == NULL) return false;
     trim(&text, &length);
-    if (style_font_span_equal(text, length, "monospace")
-        || style_font_span_equal(text, length, "ui-monospace")) {
+    if (span_case_equal(text, length, "monospace")
+        || span_case_equal(text, length, "ui-monospace")) {
         *family = FONT_MONOSPACE;
         return true;
     }
-    if (style_font_span_equal(text, length, "serif")
-        || style_font_span_equal(text, length, "ui-serif")) {
+    if (span_case_equal(text, length, "serif")
+        || span_case_equal(text, length, "ui-serif")) {
         *family = FONT_SERIF;
         return true;
     }
-    if (style_font_span_equal(text, length, "arial")
-        || style_font_span_equal(text, length, "helvetica")
-        || style_font_span_equal(text, length, "helvetica neue")
-        || style_font_span_equal(text, length, "liberation sans")
-        || style_font_span_equal(text, length, "nimbus sans")
-        || style_font_span_equal(text, length, "nimbus sans l")) {
+    if (span_case_equal(text, length, "arial")
+        || span_case_equal(text, length, "helvetica")
+        || span_case_equal(text, length, "helvetica neue")
+        || span_case_equal(text, length, "liberation sans")
+        || span_case_equal(text, length, "nimbus sans")
+        || span_case_equal(text, length, "nimbus sans l")) {
         *family = FONT_METRIC_SANS;
         return true;
     }
-    if (style_font_span_equal(text, length, "verdana")) {
+    if (span_case_equal(text, length, "verdana")) {
         *family = FONT_HUMANIST_SANS;
         return true;
     }
-    if (style_font_span_equal(text, length, "-apple-system")
-        || style_font_span_equal(text, length, "blinkmacsystemfont")
-        || style_font_span_equal(text, length, "system-ui")) {
+    if (span_case_equal(text, length, "-apple-system")
+        || span_case_equal(text, length, "blinkmacsystemfont")
+        || span_case_equal(text, length, "system-ui")) {
         *family = FONT_SYSTEM_SANS;
         return true;
     }
-    if (style_font_span_equal(text, length, "sans-serif")
-        || style_font_span_equal(text, length, "ui-sans-serif")) {
+    if (span_case_equal(text, length, "sans-serif")
+        || span_case_equal(text, length, "ui-sans-serif")) {
         *family = FONT_SANS;
         return true;
     }
@@ -4671,11 +4581,11 @@ bool style_font_family_component(const Stylesheet *sheet,
                       || isspace(character) || character >= 0x80)) return false;
             }
             size_t family_length = end - start;
-            if (style_font_span_equal(value + start, family_length, "inherit")
-                || style_font_span_equal(value + start, family_length, "initial")
-                || style_font_span_equal(value + start, family_length, "unset")
-                || style_font_span_equal(value + start, family_length, "revert")
-                || style_font_span_equal(value + start, family_length,
+            if (span_case_equal(value + start, family_length, "inherit")
+                || span_case_equal(value + start, family_length, "initial")
+                || span_case_equal(value + start, family_length, "unset")
+                || span_case_equal(value + start, family_length, "revert")
+                || span_case_equal(value + start, family_length,
                                    "revert-layer")) return false;
             consider_font_family(
                 sheet, value + start, family_length,
@@ -4734,15 +4644,15 @@ bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text,
             parsed.font_size_unit = unit;
             break;
         }
-        if (style_font_span_equal(component, component_length, "normal")) {
+        if (span_case_equal(component, component_length, "normal")) {
             if (++normals + categories > 4) return false;
             continue;
         }
-        if (style_font_span_equal(component, component_length, "italic")
-            || style_font_span_equal(component, component_length, "oblique")) {
+        if (span_case_equal(component, component_length, "italic")
+            || span_case_equal(component, component_length, "oblique")) {
             if (style_seen) return false;
             style_seen = true;
-            oblique_style = style_font_span_equal(component, component_length,
+            oblique_style = span_case_equal(component, component_length,
                                              "oblique");
             parsed.font_italic = true;
             categories++;
@@ -4754,7 +4664,7 @@ bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text,
             oblique_angles++;
             continue;
         }
-        if (style_font_span_equal(component, component_length, "small-caps")) {
+        if (span_case_equal(component, component_length, "small-caps")) {
             if (variant_seen) return false;
             variant_seen = true;
             categories++;
@@ -4807,6 +4717,50 @@ bool style_parse_font_shorthand(const Stylesheet *sheet, const char *text,
     return true;
 }
 
+/* The content-sized minmax() floors, which leave the track minimum 0.
+   CSS keywords are ASCII case-insensitive. */
+static bool grid_track_keyword_floor(const char *text, size_t length)
+{
+    return span_case_equal(text, length, "auto")
+        || span_case_equal(text, length, "min-content")
+        || span_case_equal(text, length, "max-content");
+}
+
+/* A math floor the immediate resolver cannot fold to one unit, such as
+   calc(50% - 1rem) or min(100%, 20rem): valid when the math compiler
+   accepts it as a <length-percentage>. */
+static bool grid_track_math_floor(const Stylesheet *sheet, const char *text,
+                                  size_t length)
+{
+    char resolved[STYLE_MATH_SOURCE_CAPACITY];
+    if (!style_resolve_value(sheet, text, length, resolved,
+                             sizeof(resolved), 0)) return false;
+    const char *start = resolved;
+    size_t resolved_length = strlen(resolved);
+    trim(&start, &resolved_length);
+    StyleMathParser parser;
+    StyleMathCandidate candidate;
+    int root = -1;
+    return style_math_candidate(sheet, start, resolved_length, &parser,
+                                &candidate, &root, STYLE_DEFAULT_FONT_PX,
+                                STYLE_DEFAULT_FONT_PX,
+                                STYLE_DEFAULT_FONT_PX / 2)
+        && parser.nodes[root].type == STYLE_MATH_TYPE_LENGTH;
+}
+
+/* The floor of minmax(<floor>, <ceiling>), given the text after
+   "minmax(": the part before its top-level comma. False without one. */
+static bool grid_minmax_floor(const char *text, size_t length,
+                              const char **floor, size_t *floor_length)
+{
+    size_t cursor = 0, start = 0, end = 0;
+    if (!style_next_top_level(text, length, ',', &cursor, &start, &end)
+        || cursor > length) return false;
+    *floor = text + start;
+    *floor_length = end - start;
+    return true;
+}
+
 bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
                             size_t length, uint8_t *type,
                             unsigned *value, unsigned *minimum)
@@ -4818,40 +4772,55 @@ bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
     if (length == 0) return false;
     if (length > 8 && memcmp(text, "minmax(", 7) == 0
         && text[length - 1] == ')') {
+        /* minmax(<inflexible-breadth>, <track-breadth>): exactly two
+           arguments. A floor that is not a non-negative length or
+           percentage or an auto/min-content/max-content keyword, or a
+           ceiling that is not a track breadth (a nested minmax() or
+           fit-content() is not), makes the track invalid. */
         const char *inside = text + 7;
         size_t inside_length = length - 8;
-        size_t comma = 0;
-        int depth = 0;
-        while (comma < inside_length) {
-            if (inside[comma] == '(') depth++;
-            else if (inside[comma] == ')' && depth > 0) depth--;
-            else if (inside[comma] == ',' && depth == 0) break;
-            comma++;
-        }
-        if (comma < inside_length) {
-            const char *floor_text = inside;
-            size_t floor_length = comma;
-            trim(&floor_text, &floor_length);
+        size_t cursor = 0, floor_start = 0, floor_end = 0;
+        size_t ceiling_start = 0, ceiling_end = 0;
+        if (!style_next_top_level(inside, inside_length, ',', &cursor,
+                                  &floor_start, &floor_end)
+            || !style_next_top_level(inside, inside_length, ',', &cursor,
+                                     &ceiling_start, &ceiling_end)
+            || cursor <= inside_length) return false;
+        const char *floor_text = inside + floor_start;
+        size_t floor_length = floor_end - floor_start;
+        const char *ceiling_text = inside + ceiling_start;
+        size_t ceiling_length = ceiling_end - ceiling_start;
+        if (!grid_track_keyword_floor(floor_text, floor_length)) {
             bool percent = false;
-            int floor = style_parse_length(sheet, floor_text, floor_length, 0,
-                                     &percent);
-            if (!percent && floor > 0) *minimum = (unsigned) floor;
-            uint8_t maximum_type = GRID_TRACK_AUTO;
-            unsigned maximum_value = 0;
-            unsigned ignored_minimum = 0;
-            if (style_parse_grid_track(
-                    sheet, inside + comma + 1,
-                    inside_length - comma - 1,
-                    &maximum_type, &maximum_value,
-                    &ignored_minimum)) {
-                *type = maximum_type;
-                *value = maximum_value;
-                if (*type == GRID_TRACK_FIXED && *minimum > *value) {
-                    *minimum = *value;
-                }
-                return true;
+            int floor = style_parse_length(sheet, floor_text, floor_length,
+                                           INT_MIN, &percent);
+            if (floor_text[0] == '-') return false;
+            /* The minimum is stored in pixels, so a percentage floor and
+               one mixing a percentage with a length both leave it 0, as
+               they did before floors were validated. */
+            if (floor == INT_MIN) {
+                if (!grid_track_math_floor(sheet, floor_text, floor_length))
+                    return false;
+            } else if (!percent && floor > 0) {
+                *minimum = (unsigned) floor;
             }
         }
+        if ((ceiling_length > 7 && memcmp(ceiling_text, "minmax(", 7) == 0)
+            || (ceiling_length > 12
+                && memcmp(ceiling_text, "fit-content(", 12) == 0))
+            return false;
+        uint8_t maximum_type = GRID_TRACK_AUTO;
+        unsigned maximum_value = 0;
+        unsigned ignored_minimum = 0;
+        if (!style_parse_grid_track(sheet, ceiling_text, ceiling_length,
+                                    &maximum_type, &maximum_value,
+                                    &ignored_minimum)) return false;
+        *type = maximum_type;
+        *value = maximum_value;
+        if (*type == GRID_TRACK_FIXED && *minimum > *value) {
+            *minimum = *value;
+        }
+        return true;
     }
     char token[96];
     if (length >= sizeof(token)) return false;
@@ -4942,19 +4911,19 @@ bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
     const char *repeat = strstr(value, "repeat(");
     if (repeat == value) {
         const char *argument = repeat + 7;
+        while (isspace((unsigned char) *argument)) argument++;
         if (strncmp(argument, "auto-fit", 8) == 0
             || strncmp(argument, "auto-fill", 9) == 0) {
             const char *minimum = strstr(argument, "minmax(");
-            if (minimum != NULL) {
-                minimum += 7;
-                const char *comma = strchr(minimum, ',');
-                if (comma != NULL) {
-                    int parsed = style_parse_length(sheet, minimum,
-                                              (size_t) (comma - minimum),
-                                              0, NULL);
-                    if (parsed > 0) {
-                        candidate.grid_min_column_width = parsed;
-                    }
+            const char *floor = NULL;
+            size_t floor_length = 0;
+            if (minimum != NULL
+                && grid_minmax_floor(minimum + 7, strlen(minimum + 7),
+                                     &floor, &floor_length)) {
+                int parsed = style_parse_length(sheet, floor, floor_length,
+                                                0, NULL);
+                if (parsed > 0) {
+                    candidate.grid_min_column_width = parsed;
                 }
             }
             computed_style_set_grid_column_count(&candidate, 0);
@@ -4971,7 +4940,7 @@ bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
 bool style_parse_grid_line(const Stylesheet *sheet, const char *text,
                             size_t length, int *line, int *span)
 {
-    char value[64];
+    char value[STYLE_KEYWORD_RESOLVED_CAPACITY];
     *line = 0;
     *span = 0;
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)) {
@@ -5139,15 +5108,10 @@ static bool grid_track_automatic_minimum(const char *text, size_t length)
     /* A bare flexible track means minmax(auto, <flex>). Do not conflate
        it with minmax(0, <flex>), whose zero minimum deliberately shrinks. */
     if (length <= 7 || memcmp(text, "minmax(", 7) != 0) return true;
-    text += 7;
-    length -= 7;
-    const char *comma = memchr(text, ',', length);
-    if (comma == NULL) return false;
-    length = (size_t) (comma - text);
-    trim(&text, &length);
-    return span_equal(text, length, "auto")
-        || span_equal(text, length, "min-content")
-        || span_equal(text, length, "max-content");
+    const char *floor = NULL;
+    size_t floor_length = 0;
+    return grid_minmax_floor(text + 7, length - 7, &floor, &floor_length)
+        && grid_track_keyword_floor(floor, floor_length);
 }
 
 static bool grid_append_track(
@@ -5959,8 +5923,9 @@ static bool append_grid_track_token(
         output, capacity, used, token, strlen(token));
 }
 
-bool stylesheet_serialize_grid_template_tracks(
+static bool serialize_grid_template_tracks(
     const Stylesheet *sheet, const ComputedStyle *container, bool rows,
+    const int *widths, unsigned width_count, unsigned origin,
     char *output, size_t capacity)
 {
     if (output == NULL || capacity == 0) return false;
@@ -5974,20 +5939,22 @@ bool stylesheet_serialize_grid_template_tracks(
         if (!append_grid_area_serialization(
                 output, capacity, &used, "subgrid", 7)) return false;
     }
-    unsigned count = subgrid ? 0
+    unsigned count = widths != NULL ? width_count : subgrid ? 0
         : stylesheet_grid_track_count(sheet, container, rows);
-    unsigned lines = subgrid && template != NULL
+    unsigned lines = widths == NULL && subgrid && template != NULL
         ? GRID_TRACK_REPEAT_LIMIT + 1u : count + 1u;
     for (unsigned line = 0; line < lines; line++) {
+        unsigned named_line = line >= origin ? line - origin : UINT_MAX;
         bool has_names = false;
         for (unsigned slot = 0; slot < STYLE_GRID_LINE_NAMES_PER_LINE;
              slot++) {
             if (template != NULL
-                && template->line_names[line][slot] != 0) {
+                && named_line <= GRID_TRACK_REPEAT_LIMIT
+                && template->line_names[named_line][slot] != 0) {
                 has_names = true;
             }
         }
-        if (has_names) {
+        if (has_names || (subgrid && widths != NULL)) {
             if (used != 0 && !append_grid_area_serialization(
                     output, capacity, &used, " ", 1)) return false;
             if (!append_grid_area_serialization(
@@ -5995,7 +5962,7 @@ bool stylesheet_serialize_grid_template_tracks(
             bool first = true;
             for (unsigned slot = 0; slot < STYLE_GRID_LINE_NAMES_PER_LINE;
                  slot++) {
-                uint8_t id = template->line_names[line][slot];
+                uint8_t id = has_names ? template->line_names[named_line][slot] : 0;
                 if (id == 0 || sheet == NULL || sheet->grid_areas == NULL
                     || id > sheet->grid_areas->line_name_count) continue;
                 if (!first && !append_grid_area_serialization(
@@ -6010,10 +5977,15 @@ bool stylesheet_serialize_grid_template_tracks(
             if (!append_grid_area_serialization(
                     output, capacity, &used, "]", 1)) return false;
         }
-        if (line >= count) continue;
+        if (line >= count || subgrid) continue;
         if (used != 0 && !append_grid_area_serialization(
                 output, capacity, &used, " ", 1)) return false;
-        if (!append_grid_track_token(
+        if (widths != NULL) {
+            char token[32];
+            snprintf(token, sizeof(token), "%dpx", widths[line]);
+            if (!append_grid_area_serialization(
+                    output, capacity, &used, token, strlen(token))) return false;
+        } else if (!append_grid_track_token(
                 output, capacity, &used,
                 stylesheet_grid_track_type(sheet, container, rows, line),
                 stylesheet_grid_track_value(sheet, container, rows, line),
@@ -6027,6 +5999,24 @@ bool stylesheet_serialize_grid_template_tracks(
             output, capacity, &used, "none", 4);
     }
     return true;
+}
+
+bool stylesheet_serialize_grid_template_tracks(
+    const Stylesheet *sheet, const ComputedStyle *container, bool rows,
+    char *output, size_t capacity)
+{
+    return serialize_grid_template_tracks(sheet, container, rows,
+        NULL, 0, 0, output, capacity);
+}
+
+bool stylesheet_serialize_used_grid_columns(
+    const Stylesheet *sheet, const ComputedStyle *container,
+    const int *widths, unsigned count, unsigned origin,
+    char *output, size_t capacity)
+{
+    if (widths == NULL || count > GRID_TRACK_REPEAT_LIMIT) return false;
+    return serialize_grid_template_tracks(sheet, container, false,
+        widths, count, origin, output, capacity);
 }
 
 size_t style_append_css_codepoint(char *output, size_t length,

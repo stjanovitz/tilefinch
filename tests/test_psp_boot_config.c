@@ -135,6 +135,37 @@ static int test_app_heap_key(void)
     return 0;
 }
 
+/* A boot.cfg that still carries one of the retired decoder A/B spellings
+   must boot on the default wide program: no warning, no config-gate halt. */
+static int test_retired_decoder_spellings_boot(void)
+{
+    static const char *const retired[] = {
+        "wide-annexb", "boot4", "edram-real", "no-boot"
+    };
+    for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); i++) {
+        char path[] = "/tmp/tilefinch-boot-retired-XXXXXX";
+        int descriptor = mkstemp(path);
+        CHECK(descriptor >= 0 && close(descriptor) == 0);
+        FILE *file = fopen(path, "wb");
+        CHECK(file != NULL
+              && fprintf(file, "experimental_wide_video=%s\n", retired[i]) > 0
+              && fclose(file) == 0);
+        PspBootConfig config;
+        psp_boot_config_defaults(&config);
+        WarningCapture warning = {0};
+        const char *invalid = NULL;
+        CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+        CHECK(warning.calls == 0);
+        CHECK(psp_boot_config_validate(&config, &invalid));
+        CHECK(psp_media_wide_program_configured(config.experimental_wide_video)
+              == PSP_MEDIA_WIDE_PROGRAM_WIDE);
+        CHECK(psp_media_wide_program_choice_index(config.experimental_wide_video)
+              == (unsigned) PSP_MEDIA_WIDE_PROGRAM_WIDE);
+        CHECK(remove(path) == 0);
+    }
+    return 0;
+}
+
 static int write_text(const char *path, const char *text)
 {
     FILE *file = fopen(path, "wb");
@@ -335,6 +366,7 @@ int main(void)
     CHECK(test_defaults_match_shared_app_profile() == 0);
     CHECK(test_game_audio_reference_selector() == 0);
     CHECK(test_app_heap_key() == 0);
+    CHECK(test_retired_decoder_spellings_boot() == 0);
     CHECK(test_file_kb_migration() == 0);
     PspBootConfig config;
     psp_boot_config_defaults(&config);
@@ -836,45 +868,27 @@ int main(void)
     CHECK(!psp_boot_config_validate(&recoverable, &invalid));
     CHECK(strcmp(invalid, "limit_mb") == 0);
 
-    /* The experimental decoder knob defaults to absent, accepts exactly the
-       documented spellings, and halts the boot on anything else. */
+    /* The decoder knob defaults to absent, accepts the documented spellings
+       (and the retired A/B ones, read as the default; see
+       test_retired_decoder_spellings_boot), and halts the boot on anything
+       else. */
     CHECK(config.experimental_wide_video[0] == '\0');
-    CHECK(psp_boot_config_validate(&config, &invalid));
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "wide-annexb");
-    CHECK(psp_boot_config_validate(&config, &invalid));
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "boot4");
-    CHECK(psp_boot_config_validate(&config, &invalid));
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "edram-real");
-    CHECK(psp_boot_config_validate(&config, &invalid));
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "no-boot");
     CHECK(psp_boot_config_validate(&config, &invalid));
     snprintf(config.experimental_wide_video,
              sizeof(config.experimental_wide_video), "off");
     CHECK(psp_boot_config_validate(&config, &invalid));
     snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "annexb");
-    CHECK(!psp_boot_config_validate(&config, &invalid));
-    CHECK(strcmp(invalid, "experimental_wide_video") == 0);
-    /* A typo near the new spelling still halts rather than reading as off. */
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "boot3");
-    CHECK(!psp_boot_config_validate(&config, &invalid));
-    CHECK(strcmp(invalid, "experimental_wide_video") == 0);
-    /* Including the two the in-app picker can now write: a hand edit that
-       misses either spelling has to halt exactly as before, which is why the
-       picker is restricted to psp_media_wide_program_choice's table. */
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "edram");
-    CHECK(!psp_boot_config_validate(&config, &invalid));
-    CHECK(strcmp(invalid, "experimental_wide_video") == 0);
-    snprintf(config.experimental_wide_video,
-             sizeof(config.experimental_wide_video), "noboot");
-    CHECK(!psp_boot_config_validate(&config, &invalid));
-    CHECK(strcmp(invalid, "experimental_wide_video") == 0);
+             sizeof(config.experimental_wide_video), "wide");
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    static const char *const halting[] = {
+        "annexb", "boot3", "Boot4", "edram", "noboot", "no-boot4"
+    };
+    for (size_t i = 0; i < sizeof(halting) / sizeof(halting[0]); i++) {
+        snprintf(config.experimental_wide_video,
+                 sizeof(config.experimental_wide_video), "%s", halting[i]);
+        CHECK(!psp_boot_config_validate(&config, &invalid));
+        CHECK(strcmp(invalid, "experimental_wide_video") == 0);
+    }
     /* Every spelling the picker offers survives the gate and round-trips
        through the override writer below. */
     for (unsigned choice = 0;

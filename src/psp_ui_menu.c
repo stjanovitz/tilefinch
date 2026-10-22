@@ -418,12 +418,15 @@ static void menu_update_page_information(
     }
 }
 
+/* Bit 7 is local to this table, never a saved failure action. */
+enum { MENU_FAILURE_RETRY = 0x80u, MENU_FAILURE_SAVED = 0x7fu };
+
 static const struct {
     uint8_t flag;
     PspUiAction action;
     const char *label;
 } menu_failure_choices[] = {
-    {0x80u, PSP_UI_ACTION_RELOAD, "Retry"},
+    {MENU_FAILURE_RETRY, PSP_UI_ACTION_RELOAD, "Retry"},
     {PSP_UI_FAILURE_BASIC_VIEW, PSP_UI_ACTION_RECOVERY_BASIC, "Show Basic view"},
     {PSP_UI_FAILURE_RELOAD_BASIC, PSP_UI_ACTION_RECOVERY_RELOAD_BASIC, "Reload in Basic view"},
     {PSP_UI_FAILURE_READER, PSP_UI_ACTION_RECOVERY_READER, "Try Reader mode"},
@@ -436,10 +439,10 @@ static const struct {
 
 static unsigned menu_failure_mask(const PspUiState *ui)
 {
-    /* Bit 7 is local to this table, never a saved failure action. Heavy
-       pages omit Retry; Return is always present through its zero mask. */
-    return (ui->failure_actions & 0x7fu)
-        | (ui->failure_recovery_heavy ? 0u : 0x80u);
+    /* Heavy pages omit Retry; Return is always present through its zero
+       mask. */
+    return (ui->failure_actions & MENU_FAILURE_SAVED)
+        | (ui->failure_recovery_heavy ? 0u : MENU_FAILURE_RETRY);
 }
 
 size_t psp_ui_menu_failure_labels(
@@ -475,13 +478,8 @@ static PspUiAction menu_failure_action(
 static void menu_update_failure_recovery(
     PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
 {
-    /* Count the seven optional bits directly, rather than walking display
-       labels on every Up/Down press. Pairwise sums fit in each byte. */
-    unsigned bits = ui->failure_actions & 0x7fu;
-    bits -= (bits >> 1) & 0x55u;
-    bits = (bits & 0x33u) + ((bits >> 2) & 0x33u);
-    size_t count = ((bits + (bits >> 4)) & 0x0fu)
-        + (ui->failure_recovery_heavy ? 1u : 2u);
+    /* The rows the sheet shows: at most nine table entries per press. */
+    size_t count = psp_ui_menu_failure_labels(ui, NULL, SIZE_MAX);
     if (pressed & PSP_UI_BUTTON_UP) {
         ui->menu_selection = (uint8_t) (
             (ui->menu_selection + count - 1u) % count);

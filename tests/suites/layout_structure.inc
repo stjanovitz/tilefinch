@@ -839,6 +839,135 @@ static int test_container_queries_one_pass(Budget *budget)
     return 0;
 }
 
+/* orientation and aspect-ratio read the container's block size, which the
+   first pass cannot know while it styles the container's children: the
+   measured height must reach the final layout. */
+static int test_container_ratio_features_layout(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const struct { const char *size; int t_height, u_height; } cases[] = {
+        {"width:300px;height:200px", 30, 7},
+        {"width:200px;height:300px", 12, 0},
+        {"width:300px;height:300px", 12, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char page[512];
+        int written = snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}"
+            "#box{container-type:size;%s}"
+            "#t{height:1px}#u{height:0}"
+            "@container (orientation: landscape){#t{height:30px}}"
+            "@container (orientation: portrait){#t{height:12px}}"
+            "@container (min-aspect-ratio: 3/2){#u{height:7px}}"
+            "</style><div id=box><div id=t></div><div id=u></div></div>",
+            cases[i].size);
+        CHECK(written > 0 && (size_t) written < sizeof(page));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, page, (size_t) written, 34)
+              && stylesheet_build(&sheet, budget, &document, 480)
+              && stylesheet_has_container_queries(&sheet)
+              && layout_build(&layout, budget, &document, &sheet,
+                              NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *t = layout_box_for_node(
+            &layout, find_id(root, "t"));
+        const LayoutNodeBox *u = layout_box_for_node(
+            &layout, find_id(root, "u"));
+        if (t == NULL || u == NULL || t->height != cases[i].t_height
+            || u->height != cases[i].u_height)
+            fprintf(stderr, "container %s: #t %d #u %d, want %d %d\n",
+                    cases[i].size, t == NULL ? -1 : t->height,
+                    u == NULL ? -1 : u->height, cases[i].t_height,
+                    cases[i].u_height);
+        CHECK(t != NULL && u != NULL && t->height == cases[i].t_height
+              && u->height == cases[i].u_height);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* container-type: size applies size containment: an auto block size is
+   sized as if the container had no content (its min-height, or 0), so its
+   block-axis queries never read the content those rules may resize. An
+   explicit height, and a flex item's stretched cross size, are definite.
+   Answered the same with the one-pass log and the measured rebuild. */
+static int test_container_size_containment_layout(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const struct { const char *box; const char *wrap; int t, u; }
+    cases[] = {
+        /* Browsers: contained height 0 -> landscape, height < 1px. */
+        {"width:200px", "", 30, 7},
+        {"width:200px;height:400px", "", 1, 0},
+        {"width:200px;min-height:50px", "", 30, 0},
+        /* Stretched to the 300px sibling: portrait. */
+        {"width:200px", "display:flex", 1, 0},
+    };
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) setenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG", "1", 1);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char page[768];
+            int written = snprintf(page, sizeof(page),
+                "<!doctype html><style>body{margin:0}"
+                "#wrap{%s}#side{width:20px;height:300px}"
+                "#box{container-type:size;%s}#tall{height:300px}"
+                "#t{height:1px}#u{height:0}"
+                "@container (orientation: landscape){#t{height:30px}}"
+                "@container (height < 1px){#u{height:7px}}"
+                "</style><div id=wrap><div id=side></div><div id=box>"
+                "<div id=tall></div><div id=t></div><div id=u></div>"
+                "</div></div>", cases[i].wrap, cases[i].box);
+            CHECK(written > 0 && (size_t) written < sizeof(page));
+            PocDocument document = {0};
+            Stylesheet sheet = {0};
+            LayoutDocument layout = {0};
+            CHECK(document_parse(&document, budget, page, (size_t) written, 34)
+                  && stylesheet_build(&sheet, budget, &document, 480)
+                  && layout_build(&layout, budget, &document, &sheet,
+                                  NULL, NULL, 480));
+            lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+            const LayoutNodeBox *t = layout_box_for_node(
+                &layout, find_id(root, "t"));
+            const LayoutNodeBox *u = layout_box_for_node(
+                &layout, find_id(root, "u"));
+            if (t == NULL || u == NULL || t->height != cases[i].t
+                || u->height != cases[i].u)
+                fprintf(stderr, "size container %s / %s pass %d: #t %d #u %d, "
+                        "want %d %d\n", cases[i].box, cases[i].wrap, pass,
+                        t == NULL ? -1 : t->height,
+                        u == NULL ? -1 : u->height, cases[i].t, cases[i].u);
+            CHECK(t != NULL && u != NULL && t->height == cases[i].t
+                  && u->height == cases[i].u);
+            /* A relayout starts from the recorded geometry (a stretched
+               item's too) and needs no second pass. */
+            LayoutDocument again = {0};
+            CHECK(layout_build(&again, budget, &document, &sheet,
+                               NULL, NULL, 480));
+            t = layout_box_for_node(&again, find_id(root, "t"));
+            u = layout_box_for_node(&again, find_id(root, "u"));
+            if (again.performance.resumable_passes != 1)
+                fprintf(stderr, "size container %s / %s pass %d: relayout "
+                        "took %zu passes\n", cases[i].box, cases[i].wrap,
+                        pass, (size_t) again.performance.resumable_passes);
+            CHECK(t != NULL && u != NULL && t->height == cases[i].t
+                  && u->height == cases[i].u
+                  && again.performance.resumable_passes == 1);
+            layout_destroy(&again);
+            layout_destroy(&layout);
+            stylesheet_destroy(&sheet);
+            document_destroy(&document);
+        }
+    }
+    unsetenv("TILEFINCH_DISABLE_CONTAINER_QUERY_LOG");
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_bounded_multicolumn_blocks(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -1837,6 +1966,14 @@ static int test_has_attribute_dependency_classification(Budget *budget)
               &sheet, "aria-expanded", 13, NULL, 0, "true", 4)
           && !stylesheet_attribute_change_may_affect_has(
               &sheet, "title", 5, "before", 6, "after", 5));
+    /* Every attribute a supported pseudo-class reads: :any-link reads
+       href exactly as :link does. */
+    static const char link_css[] = "div:has(a:any-link){margin:3px}";
+    CHECK(!stylesheet_attribute_change_may_affect_has(
+              &sheet, "href", 4, NULL, 0, "#next", 5)
+          && stylesheet_add_css(&sheet, link_css, sizeof(link_css) - 1)
+          && stylesheet_attribute_change_may_affect_has(
+              &sheet, "href", 4, NULL, 0, "#next", 5));
 
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -3424,7 +3561,9 @@ static int fallback_command_baseline(const LayoutDocument *layout,
         if (command->type == DRAW_TEXT
             && command->text_length == wanted_length
             && memcmp(command->text, wanted, wanted_length) == 0) {
-            return command->y + 6 * (command->scale > 0 ? command->scale : 1);
+            /* Without fonts, inline layout puts the baseline three
+               quarters down the line box (line_text_baseline). */
+            return command->y + command->height * 3 / 4;
         }
     }
     return -1;
@@ -4049,18 +4188,18 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
           && transform.transform_y == 5
           && !transform.transform_x_percent
           && !transform.transform_y_percent
-          && transform.transform_scale_q6 == 128
+          && transform.transform_scale_q14 == 32768
           && transform.individual_rotate_quadrants == 1
           && computed_style_isolation_isolate(&transform));
     CHECK(transform_list.has_transform
           && transform_list.transform_x == 10
           && transform_list.transform_y == 5
-          && transform_list.transform_scale_q6 == 128
+          && transform_list.transform_scale_q14 == 32768
           && transform_list.individual_rotate_quadrants == 1
           && transform_matrix.has_transform
           && transform_matrix.transform_x == 7
           && transform_matrix.transform_y == 9
-          && transform_matrix.transform_scale_q6 == 128
+          && transform_matrix.transform_scale_q14 == 32768
           && transform_matrix.individual_rotate_quadrants == 1
           && transform_rejected.has_transform
           && transform_rejected.individual_rotate_quadrants == 0);
@@ -4160,5 +4299,34 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == baseline);
+    /* Mathematical width division is not a word-break solution. A balanced
+       heading must not acquire extra lines when a long word crosses the
+       ideal partition. Sweep widths rather than depending on one font's
+       exact glyph advances. */
+    for (int width = 160; width <= 440; width += 8) {
+        char headings[768];
+        int written = snprintf(headings, sizeof(headings),
+            "<style>p{width:%dpx;font-size:24px;line-height:28px}"
+            "#balance{text-wrap:balance}</style>"
+            "<p id=greedy>The Largest Reports From Our Local Town</p>"
+            "<p id=balance>The Largest Reports From Our Local Town</p>",
+            width);
+        CHECK(written > 0 && (size_t) written < sizeof(headings));
+        CHECK(document_parse(&document, budget, headings, (size_t) written, 93)
+              && stylesheet_build(&sheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &sheet,
+                              NULL, NULL, 480));
+        root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *greedy = layout_box_for_node(
+            &layout, find_id(root, "greedy"));
+        const LayoutNodeBox *balanced = layout_box_for_node(
+            &layout, find_id(root, "balance"));
+        CHECK(greedy != NULL && balanced != NULL
+              && balanced->height <= greedy->height);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget->current == baseline);
+    }
     return 0;
 }

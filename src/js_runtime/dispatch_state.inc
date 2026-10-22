@@ -189,12 +189,6 @@ void script_runtime_notify_user_activation(ScriptRuntime *runtime)
         js_rt_bridge_notify_user_activation(&runtime->bridge);
 }
 
-bool script_runtime_has_transient_user_activation(ScriptRuntime *runtime)
-{
-    return runtime != NULL
-        && js_rt_bridge_user_activation_is_active(&runtime->bridge);
-}
-
 static bool runtime_clear_page_fullscreen(ScriptRuntime *runtime,
                                           bool dispatch_event)
 {
@@ -429,9 +423,7 @@ bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
 {
     if (runtime == NULL || url == NULL || url_size == 0
         || !runtime->bridge.navigation_requested) return false;
-    if (runtime->xhr_diagnostics != NULL)
-        js_rt_saturating_add_size(
-            &runtime->xhr_diagnostics->navigation_consumed, 1);
+    JS_RT_XHR_COUNT(runtime, navigation_consumed);
     snprintf(url, url_size, "%s", runtime->bridge.navigation_url);
     if (replace != NULL) *replace = runtime->bridge.navigation_replace;
     if (user_activated != NULL)
@@ -838,7 +830,56 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
     JS_FreeValue(runtime->context, global);
 }
 
-enum { SCRIPT_IMAGE_LOAD_LIMIT = 128 };
+/* Records cover the <img> entries of one tracked image table (a delivered
+   record keeps its source so republication does not fire `load` again)
+   plus pending ones whose node has since left it. */
+enum { SCRIPT_IMAGE_LOAD_LIMIT = 2u * IMAGE_TRACKED_NODE_LIMIT };
+
+/* Room for one more record: grow within the limit, else drop the oldest
+   delivered record (a later republication may then deliver it again). */
+static bool runtime_image_load_reserve(ScriptRuntime *runtime)
+{
+    size_t count = runtime->image_load_state_count;
+    size_t capacity = runtime->image_load_state_capacity;
+    if (count < capacity) return true;
+    if (capacity < SCRIPT_IMAGE_LOAD_LIMIT) {
+        size_t grown = capacity == 0 ? 16u : capacity * 2u;
+        if (grown > SCRIPT_IMAGE_LOAD_LIMIT) grown = SCRIPT_IMAGE_LOAD_LIMIT;
+        ScriptImageLoadState *states = budget_realloc_category(
+            runtime->budget, BUDGET_CATEGORY_JAVASCRIPT,
+            runtime->image_load_states, grown * sizeof(*states));
+        if (states != NULL) {
+            runtime->image_load_states = states;
+            runtime->image_load_state_capacity = grown;
+            return true;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (runtime->image_load_states[i].pending) continue;
+        runtime->image_load_state_count--;
+        memmove(&runtime->image_load_states[i], &runtime->image_load_states[i + 1u],
+            (runtime->image_load_state_count - i) * sizeof(*runtime->image_load_states));
+        return true;
+    }
+    return false;
+}
+
+/* The record for `handle`, or the record count. Tables are republished in
+   much the same order, so the search resumes after the previous match. */
+static size_t runtime_image_load_find(const ScriptRuntime *runtime,
+                                      long handle, size_t *hint)
+{
+    size_t count = runtime->image_load_state_count;
+    if (*hint >= count) *hint = 0;
+    for (size_t probe = 0; probe < count; probe++) {
+        size_t at = *hint + probe < count ? *hint + probe : *hint + probe - count;
+        if (runtime->image_load_states[at].handle != handle) continue;
+        *hint = at + 1u < count ? at + 1u : 0u;
+        return at;
+    }
+    return count;
+}
+
 static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *images)
 {
     for (size_t i = 0; i < runtime->image_load_state_count;) {
@@ -855,32 +896,34 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
                 * sizeof(*state));
         }
     }
+    size_t hint = 0;
     for (size_t i = 0; i < images->count; i++) {
         const ImageResource *image = &images->items[i];
         if (image->is_canvas || image->is_mask || image->is_background
             || image->source_hash == 0 || !image_resource_available(image)
             || image->node == NULL || image->node->local_name != LXB_TAG_IMG)
             continue;
-        long handle = script_runtime_node_weak_handle(runtime, image->node);
-        if (handle == 0) continue;
-        size_t at = 0;
-        while (at < runtime->image_load_state_count
-            && runtime->image_load_states[at].handle != handle) at++;
+        /* Only an image that will be queued gets a handle: one without a
+           handle has no record yet, and registration can reclaim slots. */
+        long handle = (long) js_rt_bridge_find_node_handle(
+            &runtime->bridge, image->node);
+        size_t at = handle == 0 ? runtime->image_load_state_count
+            : runtime_image_load_find(runtime, handle, &hint);
+        if (at != runtime->image_load_state_count) {
+            const ScriptImageLoadState *state = &runtime->image_load_states[at];
+            if (state->source_hash == image->source_hash
+                && (state->pending || state->delivered)) continue;
+        }
+        if (!image_resource_source_current(runtime->bridge.stylesheet, image)) continue;
         if (at == runtime->image_load_state_count) {
-            if (at == SCRIPT_IMAGE_LOAD_LIMIT) continue;
-            if (runtime->image_load_states == NULL) {
-                runtime->image_load_states = budget_calloc_category(
-                    runtime->budget, BUDGET_CATEGORY_JAVASCRIPT,
-                    SCRIPT_IMAGE_LOAD_LIMIT, sizeof(*runtime->image_load_states));
-                if (runtime->image_load_states == NULL) return;
-            }
-            runtime->image_load_state_count++;
+            if (!runtime_image_load_reserve(runtime)) continue;
+            if (handle == 0)
+                handle = script_runtime_node_weak_handle(runtime, image->node);
+            if (handle == 0) continue;
+            at = runtime->image_load_state_count++;
             runtime->image_load_states[at] = (ScriptImageLoadState) {.handle = handle};
         }
         ScriptImageLoadState *state = &runtime->image_load_states[at];
-        if (state->source_hash == image->source_hash
-            && (state->pending || state->delivered)) continue;
-        if (!image_resource_source_current(runtime->bridge.stylesheet, image)) continue;
         if (!state->pending) runtime->image_load_pending++;
         ScriptImageLoadState queued = {.handle = handle,
             .source_hash = image->source_hash, .pending = true};
@@ -890,6 +933,7 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
             (runtime->image_load_state_count - at - 1u) * sizeof(*state));
         runtime->image_load_states[runtime->image_load_state_count - 1u] = queued;
     }
+    image_queue_page_failures(runtime, images);
 }
 
 void script_runtime_set_images(ScriptRuntime *runtime,
@@ -941,6 +985,8 @@ void script_runtime_set_stylesheet(ScriptRuntime *runtime,
                                    const Stylesheet *stylesheet)
 {
     if (runtime == NULL) return;
+    if (runtime->bridge.stylesheet != stylesheet)
+        image_preload_cancel_job(runtime);
     runtime->bridge.stylesheet = stylesheet;
 }
 

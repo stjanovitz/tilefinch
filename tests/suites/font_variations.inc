@@ -71,6 +71,121 @@ static bool test_variable_font_weights(void)
     return true;
 }
 
+/* Every weight instance of a variable page face must paint each glyph at the
+   pen position layout measured, even when the declared fallback is a stack
+   with compatible Latin advance tables (system-ui, Verdana). */
+static bool test_variable_font_paints_measured_advances(void)
+{
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+    static const char text[] = "AVAVA";
+    const size_t length = sizeof(text) - 1u;
+    enum { WIDTH = 320, HEIGHT = 64, SIZE = 40 };
+    static const FontFamily fallbacks[] = {FONT_SYSTEM_SANS, FONT_HUMANIST_SANS};
+    static const unsigned weights[] = {400, 700};
+    Budget budget; budget_init(&budget, 4u*MIB);
+    WebFontSet fonts = {0};
+    FontSet fallback_fonts = {0};
+    CHECK(font_face_load_encoded(&fonts.families[0].faces[0], &budget,
+        variable_font_fixture, sizeof(variable_font_fixture), 256u*KIB));
+    fonts.families[0].weights[0] = 400; fonts.families[0].weight_max[0] = 700;
+    static uint16_t pixels[WIDTH * HEIGHT];
+    for (size_t f = 0; f < sizeof(fallbacks)/sizeof(fallbacks[0]); f++) {
+        FontFamily web = FONT_SANS;
+        CHECK(font_family_web(0, fallbacks[f], &web));
+        for (size_t w = 0; w < sizeof(weights)/sizeof(weights[0]); w++) {
+            const FontFace *face = font_context_face_at_weight(
+                NULL, &fonts, web, false, weights[w] >= 650, weights[w]);
+            CHECK(face != NULL && face != &fonts.families[0].faces[0]
+                  && face->authored_weight == weights[w]);
+            FontFamily metric = font_context_metric_family(&fonts, web, face);
+            DrawCommand command = {.type = DRAW_TEXT, .text = text,
+                .text_length = length, .x = 4, .y = 4, .width = WIDTH - 8,
+                .height = HEIGHT - 8, .font_size = SIZE,
+                .font_weight = (uint8_t)(weights[w] / 10u),
+                .opacity_scale = 256};
+            draw_command_set_text_font_family(&command, web);
+            LayoutDocument layout = {.budget = &budget, .commands = &command,
+                .count = 1, .width = WIDTH, .height = HEIGHT,
+                .fonts = &fallback_fonts, .web_fonts = &fonts,
+                .page_background = 0xffffff};
+            TileCache tiles;
+            CHECK(tile_cache_init(&tiles, &budget, &layout, 1)
+                  && tile_cache_set_frame(&tiles, pixels, WIDTH * HEIGHT)
+                  && tile_cache_render_frame(&tiles, 0, WIDTH, HEIGHT, NULL));
+            /* The authored glyphs are solid boxes separated by blank
+               columns, so each inked span starts one glyph. */
+            int starts[8]; size_t count = 0; bool inked = false;
+            for (int x = 0; x < WIDTH; x++) {
+                bool column = false;
+                for (int y = 0; y < HEIGHT && !column; y++)
+                    column = pixels[(size_t) y * WIDTH + (size_t) x] != 0xffffu;
+                if (column && !inked && count < 8) starts[count++] = x;
+                inked = column;
+            }
+            tile_cache_destroy(&tiles);
+            CHECK(count == length);
+            for (size_t at = 1; at < length; at++) {
+                int measured = font_text_width_for_family_at_size_fixed_mode(
+                    face, metric, text, at, SIZE * 64, false,
+                    weights[w] >= 650, true);
+                CHECK(measured > 0);
+                int expected = starts[0] + (measured + 32) / 64;
+                if (starts[at] < expected - 1 || starts[at] > expected + 1) {
+                    fprintf(stderr, "variable paint drift fallback=%u weight=%u "
+                        "glyph=%zu painted=%d measured=%d\n",
+                        (unsigned) fallbacks[f], weights[w], at, starts[at],
+                        expected);
+                    return false;
+                }
+            }
+            CHECK(metric == FONT_SANS);
+        }
+    }
+    web_font_set_destroy(&fonts); CHECK(budget.current == 0);
+#endif
+    return true;
+}
+
+/* Mixed-weight and mixed-size prose alternates instances of one shared
+   FreeType face. Returning to an instance that was already measured must
+   reuse its ASCII advances instead of reloading every outline. */
+static bool test_variable_font_instance_advances_survive_switches(void)
+{
+#ifdef TILEFINCH_TEST_HAVE_FREETYPE
+    Budget budget; budget_init(&budget, 4u*MIB);
+    WebFontSet fonts = {0};
+    CHECK(font_face_load_encoded(&fonts.families[0].faces[0], &budget,
+        variable_font_fixture, sizeof(variable_font_fixture), 256u*KIB));
+    fonts.families[0].weights[0] = 400; fonts.families[0].weight_max[0] = 700;
+    FontFamily web = FONT_SANS; CHECK(font_family_web(0, FONT_SANS, &web));
+    const FontFace *regular = font_context_face_at_weight(NULL, &fonts, web, false, false, 400);
+    const FontFace *medium = font_context_face_at_weight(NULL, &fonts, web, false, false, 500);
+    const FontFace *bold = font_context_face_at_weight(NULL, &fonts, web, false, true, 700);
+    const FontFace *faces[] = {regular, medium, bold, regular, bold};
+    static const int sizes[] = {16 * 64, 16 * 64, 16 * 64, 14 * 64, 20 * 64};
+    int widths[5] = {0};
+    for (size_t i = 0; i < 5; i++) {
+        widths[i] = font_text_width_at_size_fixed_mode(
+            faces[i], "AV AV", 5, sizes[i], false, false);
+        CHECK(widths[i] > 0);
+    }
+    CHECK(widths[2] > widths[1] && widths[1] > widths[0]);
+    tilefinch_test_faults()->web_font_advance_loads = 0;
+    for (unsigned round = 0; round < 20; round++) {
+        for (size_t i = 0; i < 5; i++)
+            CHECK(font_text_width_at_size_fixed_mode(
+                faces[i], "AV AV", 5, sizes[i], false, false) == widths[i]);
+    }
+    unsigned loads = tilefinch_test_faults()->web_font_advance_loads;
+    if (loads != 0) {
+        fprintf(stderr, "variable instance advance reloads=%u\n", loads);
+        return false;
+    }
+    web_font_set_destroy(&fonts); CHECK(budget.current == 0);
+#endif
+    return true;
+}
+
 static bool test_variable_font_descriptors(void)
 {
     static const char html[] = "<style>"

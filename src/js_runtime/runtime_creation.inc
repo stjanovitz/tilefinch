@@ -446,6 +446,7 @@ typedef enum {
     LAZY_BOOTSTRAP_INTL,
     LAZY_BOOTSTRAP_OPFS,
     LAZY_BOOTSTRAP_TRAVERSAL,
+    LAZY_BOOTSTRAP_SHADOW,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -577,6 +578,7 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_INTL: return "Intl";
     case LAZY_BOOTSTRAP_OPFS: return "Origin-private file system";
     case LAZY_BOOTSTRAP_TRAVERSAL: return "DOM traversal";
+    case LAZY_BOOTSTRAP_SHADOW: return "Shadow DOM ownership";
     default: return "Platform feature";
     }
 }
@@ -751,7 +753,6 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         "__tilefinchCurrentDocumentURL",
         "__tilefinchSecureContext",
         "__tilefinchDocumentDomainValid",
-        "__tilefinchDiagnosticLookup",
         "__tilefinchDispatchActivationHandle",
         "__tilefinchDispatchAt",
         "__tilefinchDispatchDOMContentLoaded",
@@ -790,6 +791,8 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         "__tilefinchRegisterNativeNodeStateCleanup",
         "__tilefinchReportUncaught",
         "__tilefinchRetireNativeNodeState",
+        "__tilefinchHoldEventState",
+        "__tilefinchReleaseEventHolders",
         "__tilefinchRunTask",
         "__tilefinchSchedulerNow",
         "__tilefinchSetFocusHandle",
@@ -951,6 +954,35 @@ static bool runtime_take_host_channel(ScriptRuntime *runtime,
     return removed;
 }
 
+/* Lazy modules run after hardening.js deleted the eager test-probe flag.
+   Define it for the module's synchronous initialization only, over any
+   page-defined value, and remove it before author code resumes. Shipping
+   realms get `false`, so a page cannot switch the probes on.
+
+   Only TRUE counts as success. Without JS_PROP_THROW, QuickJS answers FALSE
+   (not -1) when a page owns a non-configurable flag (a top-level `var`, or
+   Object.defineProperty), and the page's value would then reach the module.
+   The caller fails the load instead: no module, so no probes. */
+static bool runtime_lazy_test_probes(ScriptRuntime *runtime, bool open)
+{
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    JSAtom atom = JS_NewAtom(context, "__tilefinchTestProbes");
+    bool probes = false;
+#ifdef JS_RT_TEST_INSTRUMENTS
+    probes = runtime->test_probes;
+#endif
+    bool ok = !JS_IsException(global) && atom != JS_ATOM_NULL
+        && (open
+            ? JS_DefinePropertyValue(context, global, atom,
+                                     JS_NewBool(context, probes),
+                                     JS_PROP_CONFIGURABLE) > 0
+            : JS_DeleteProperty(context, global, atom, 0) > 0);
+    if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
+    JS_FreeValue(context, global);
+    return ok;
+}
+
 static bool runtime_load_lazy_bootstrap(
     ScriptRuntime *runtime, LazyBootstrapFeature feature)
 {
@@ -964,7 +996,9 @@ static bool runtime_load_lazy_bootstrap(
     uint64_t total_us = 0;
     uint64_t compile_us = 0;
     bool evaluated = false;
-    if (feature == LAZY_BOOTSTRAP_CANVAS) {
+    if (!runtime_lazy_test_probes(runtime, true)) {
+        /* A page-defined, non-configurable flag: fail the load. */
+    } else if (feature == LAZY_BOOTSTRAP_CANVAS) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
                          browser_bootstrap_canvas,
@@ -1210,6 +1244,13 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-traversal-lazy>",
             &browser_bootstrap_traversal_bytecode, false, trace,
             &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_SHADOW) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_shadow,
+                         browser_bootstrap_shadow_bytecode),
+            "<browser-shadow-lazy>", &browser_bootstrap_shadow_bytecode,
+            false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_OPFS) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
@@ -1247,6 +1288,7 @@ static bool runtime_load_lazy_bootstrap(
         }
         JS_FreeValue(runtime->context, global);
     }
+    if (!runtime_lazy_test_probes(runtime, false)) evaluated = false;
 #ifdef TILEFINCH_GAME_AUDIO_REFERENCE
     if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO
         && !runtime->game_audio_internal_slots) {
@@ -1409,6 +1451,21 @@ static bool runtime_install_lazy_bootstrap_feature(
         if (!ok) return false;
     }
     return true;
+}
+
+static JSValue js_runtime_ensure_shadow_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_SHADOW))
+        return JS_ThrowInternalError(context,
+            "Shadow DOM ownership could not be initialized");
+    return JS_TRUE;
 }
 
 static JSValue js_runtime_ensure_canvas_bootstrap(
@@ -1990,7 +2047,10 @@ static ScriptRuntime *script_runtime_create_internal(
 #endif
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
+#ifdef JS_RT_XHR_DIAGNOSTICS
     host->private_outcome_classifier = JS_UNDEFINED;
+    host->xhr_diagnostics_install = JS_UNDEFINED;
+#endif
     for (size_t callback = 0; callback < SCRIPT_HOST_CALLBACK_COUNT;
          callback++) {
         host->host_callbacks[callback] = JS_UNDEFINED;
@@ -2000,6 +2060,8 @@ static ScriptRuntime *script_runtime_create_internal(
     host->bridge.trusted_node_wrap = JS_UNDEFINED;
     host->bridge.trusted_stable_script_wrap = JS_UNDEFINED;
     host->bridge.trusted_retire_native_node_state = JS_UNDEFINED;
+    host->bridge.trusted_hold_event_state = JS_UNDEFINED;
+    host->bridge.trusted_release_event_holders = JS_UNDEFINED;
     host->document = document;
     host->document_scope = options->document_scope;
     host->timeout_ms = timeout_ms;
@@ -2009,6 +2071,9 @@ static ScriptRuntime *script_runtime_create_internal(
     host->bridge.dynamic_code_allowed = !options->dynamic_code_disabled;
     host->bridge.allow_test_network_primitive_overrides =
         options->allow_test_network_primitive_overrides;
+#ifdef JS_RT_TEST_INSTRUMENTS
+    host->test_probes = !options->omit_test_probes;
+#endif
     host->bridge.stylesheet = options->stylesheet;
     host->bridge.maximum_scripts = options->maximum_scripts == 0
         ? SCRIPT_DYNAMIC_TASK_LIMIT : options->maximum_scripts;
@@ -2304,6 +2369,9 @@ static ScriptRuntime *script_runtime_create_internal(
     JSValue global = JS_GetGlobalObject(host->context);
     JSValue js_document = JS_NewObject(host->context);
     bool setup_ok = !JS_IsException(global) && !JS_IsException(js_document);
+    if (setup_ok) setup_ok = js_rt_install_function(
+        host->context, global, "__tilefinchEnsureShadowBootstrap",
+        js_runtime_ensure_shadow_bootstrap, 0);
     if (setup_ok) {
         JSValue ensure_canvas = JS_NewCFunction(
             host->context, js_runtime_ensure_canvas_bootstrap,
@@ -2421,13 +2489,15 @@ static ScriptRuntime *script_runtime_create_internal(
                 JS_NewString(host->context,
                              TILEFINCH_BROWSER_FULL_VERSION)) >= 0;
     }
-    if (setup_ok) {
+#if TILEFINCH_LAB_ENVIRONMENT
+    /* Lab knob; the bootstrap reads an absent flag as false. */
+    if (setup_ok
+        && tilefinch_lab_getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL) {
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchDiagnosticMobileSafari",
-            JS_NewBool(host->context,
-                tilefinch_lab_getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI")
-                    != NULL)) >= 0;
+            JS_TRUE) >= 0;
     }
+#endif
     if (setup_ok) {
         setup_ok = js_lazy_webpack_install(host, global);
     }
@@ -2471,10 +2541,11 @@ static ScriptRuntime *script_runtime_create_internal(
                               (double) device_width
                               / (double) css_viewport_width)) >= 0;
     }
-#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#ifdef JS_RT_TEST_INSTRUMENTS
     /* Host and validation realms only: the bootstrap then publishes its
-       test-only probes. hardening.js deletes this flag. */
-    if (setup_ok) {
+       test-only probes. hardening.js deletes this flag; lazy modules get it
+       back from runtime_load_lazy_bootstrap(). */
+    if (setup_ok && host->test_probes) {
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchTestProbes", JS_TRUE) >= 0;
     }
@@ -2623,7 +2694,7 @@ static ScriptRuntime *script_runtime_create_internal(
                                        js_dom_namespace_uri, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchNodeIdentity",
-                                       js_dom_node_identity, 2)
+                                       js_dom_node_identity, 3)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchParseColor",
                                        js_dom_parse_color, 1)
@@ -2732,6 +2803,12 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchReleaseNodeWrapper",
                                        js_dom_release_node_wrapper, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchNoteEventState",
+                                       js_dom_note_event_state, 3)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchGrowEventTargets",
+                                       js_dom_grow_event_targets, 2)
                    && js_rt_install_function(host->context, global, "__tilefinchGetText",
                                        js_dom_get_text, 1)
                    && js_rt_install_function(host->context, global,
@@ -2794,6 +2871,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchTransitionSnapshot",
                                        js_transition_snapshot, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchTimingFunction",
+                                       js_timing_function, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchAttributeChangeMayAffectHas",
                                        js_attribute_change_may_affect_has, 3)
@@ -3243,6 +3323,20 @@ static ScriptRuntime *script_runtime_create_internal(
         if (evaluated)
             evaluated = runtime_install_legacy_surface(host, global);
         if (evaluated) {
+            /* Publish after bootstrap reflection so QuickJS's lazy function
+               entry remains cold on pages that never register a property. */
+            static const JSCFunctionListEntry css_functions[] = {
+                { "registerProperty", JS_PROP_C_W_E, JS_DEF_CFUNC, 0,
+                  .u = { .func = { 1, JS_CFUNC_generic,
+                      { .generic = js_css_register_property } } } }
+            };
+            JSValue css = JS_GetPropertyStr(host->context, global, "CSS");
+            if (JS_IsException(css)) evaluated = false;
+            else evaluated = JS_SetPropertyFunctionList(host->context, css,
+                css_functions, sizeof(css_functions) / sizeof(css_functions[0])) == 0;
+            JS_FreeValue(host->context, css);
+        }
+        if (evaluated) {
             host->page_scroll_apply = JS_GetPropertyStr(
                 host->context, global, "__tilefinchApplyPageScroll");
             host->page_scroll_flush = JS_GetPropertyStr(
@@ -3290,6 +3384,10 @@ static ScriptRuntime *script_runtime_create_internal(
                 JS_GetPropertyStr(
                     host->context, global,
                     "__tilefinchRetireNativeNodeState");
+            host->bridge.trusted_hold_event_state = JS_GetPropertyStr(
+                host->context, global, "__tilefinchHoldEventState");
+            host->bridge.trusted_release_event_holders = JS_GetPropertyStr(
+                host->context, global, "__tilefinchReleaseEventHolders");
             evaluated = runtime_capture_host_callbacks(host, global)
                      && JS_IsFunction(host->context,
                                       host->page_scroll_apply)
@@ -3321,7 +3419,13 @@ static ScriptRuntime *script_runtime_create_internal(
                             host->bridge.trusted_stable_script_wrap)
                      && JS_IsFunction(
                             host->context,
-                            host->bridge.trusted_retire_native_node_state);
+                            host->bridge.trusted_retire_native_node_state)
+                     && JS_IsFunction(
+                            host->context,
+                            host->bridge.trusted_hold_event_state)
+                     && JS_IsFunction(
+                            host->context,
+                            host->bridge.trusted_release_event_holders);
         }
 #if !defined(TILEFINCH_BOOTSTRAP_BYTECODE_ONLY)
         if (evaluated && tilefinch_trace_eval_source()) {
@@ -3346,19 +3450,33 @@ static ScriptRuntime *script_runtime_create_internal(
                 "<eval-source-diagnostic>");
         }
 #endif
+#ifdef JS_RT_XHR_DIAGNOSTICS
+        /* Test-probe realms hand over the XHR recorder installer; it never
+           becomes a page-reachable global. */
+        if (evaluated) {
+            JSValue channel = JS_GetPropertyStr(
+                host->context, global, "__tilefinchHostChannel");
+            JSValue install = JS_IsObject(channel)
+                ? JS_GetPropertyStr(host->context, channel, "xhrDiagnostics")
+                : JS_UNDEFINED;
+            if (JS_IsFunction(host->context, install)) {
+                host->xhr_diagnostics_install = install;
+            } else {
+                JS_FreeValue(host->context, install);
+            }
+            JS_FreeValue(host->context, channel);
+        }
+#endif
         if (evaluated) {
             evaluated = runtime_take_host_channel(
                 host, "networkQueueStats", &host->host_network_queue_stats);
         }
         /* Remove temporary bootstrap bridges before author code; native code
-           has already captured their callable values. The XHR diagnostics
-           setter must not remain callable by the page after opt-in. Worker
-           installs and removes its compiler bridge inside the first-use loader. */
+           has already captured their callable values. Worker installs and
+           removes its compiler bridge inside the first-use loader. */
         if (evaluated) {
             JSAtom media_state_atom = JS_NewAtom(
                 host->context, "__tilefinchMediaStateFor");
-            JSAtom xhr_diagnostics_atom = JS_NewAtom(
-                host->context, "__tilefinchXHRDiagnostics");
             JSAtom fullscreen_exit_atom = JS_NewAtom(
                 host->context, "__tilefinchExitFullscreenFromHost");
             JSAtom visibility_apply_atom = JS_NewAtom(
@@ -3368,15 +3486,12 @@ static ScriptRuntime *script_runtime_create_internal(
             JSAtom user_activation_atom = JS_NewAtom(
                 host->context, "__tilefinchUserActivationState");
             if (media_state_atom == JS_ATOM_NULL
-                || xhr_diagnostics_atom == JS_ATOM_NULL
                 || fullscreen_exit_atom == JS_ATOM_NULL
                 || visibility_apply_atom == JS_ATOM_NULL
                 || visibility_query_atom == JS_ATOM_NULL
                 || user_activation_atom == JS_ATOM_NULL
                 || JS_DeleteProperty(
                        host->context, global, media_state_atom, 0) < 0
-                || JS_DeleteProperty(
-                       host->context, global, xhr_diagnostics_atom, 0) <= 0
                 || JS_DeleteProperty(
                        host->context, global, fullscreen_exit_atom, 0) < 0
                 || JS_DeleteProperty(
@@ -3388,7 +3503,6 @@ static ScriptRuntime *script_runtime_create_internal(
                 evaluated = false;
             }
             JS_FreeAtom(host->context, media_state_atom);
-            JS_FreeAtom(host->context, xhr_diagnostics_atom);
             JS_FreeAtom(host->context, fullscreen_exit_atom);
             JS_FreeAtom(host->context, visibility_apply_atom);
             JS_FreeAtom(host->context, visibility_query_atom);
@@ -3451,16 +3565,7 @@ static ScriptRuntime *script_runtime_create_internal(
     if (evaluated) evaluated = js_rt_runtime_refresh(host);
 
     if (evaluated) {
-        JSValue summary = JS_GetPropertyStr(host->context, global, "pocSummary");
-        if (!JS_IsUndefined(summary)) {
-            const char *text = JS_ToCString(host->context, summary);
-            if (text != NULL) {
-                snprintf(host->result.summary, sizeof(host->result.summary),
-                         "%s", text);
-                JS_FreeCString(host->context, text);
-            }
-        }
-        JS_FreeValue(host->context, summary);
+        js_rt_runtime_read_lab_summary(host, global);
         JSValue submitted = JS_GetPropertyStr(host->context, global,
                                               "__tilefinchSubmitted");
         host->result.form_submission_requested =
@@ -3536,25 +3641,6 @@ ScriptRuntime *script_runtime_create_configured(
         options, result);
 }
 
-ScriptRuntime *script_runtime_create_with_session_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    BrowserSession *session, int css_viewport_width,
-    int css_viewport_height, int device_width, int device_height,
-    ScriptResult *result)
-{
-    ViewportContext viewport;
-    if (!viewport_context_init(&viewport, css_viewport_width,
-                               css_viewport_height, device_width,
-                               device_height)) return NULL;
-    ScriptRuntimeOptions options = {
-        .session = session, .viewport = viewport
-    };
-    return script_runtime_create_configured(
-        document, budget, js_memory_limit, timeout_ms, document_url,
-        &options, result);
-}
-
 ScriptRuntime *script_runtime_create_deferred(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
     unsigned timeout_ms, const char *document_url,
@@ -3562,26 +3648,6 @@ ScriptRuntime *script_runtime_create_deferred(
 {
     ViewportContext viewport;
     if (!viewport_context_init(&viewport, 480, 272, 480, 272)) return NULL;
-    ScriptRuntimeOptions options = {
-        .session = session, .viewport = viewport,
-        .defer_document_scripts = true
-    };
-    return script_runtime_create_configured(
-        document, budget, js_memory_limit, timeout_ms, document_url,
-        &options, result);
-}
-
-ScriptRuntime *script_runtime_create_deferred_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    BrowserSession *session, int css_viewport_width,
-    int css_viewport_height, int device_width, int device_height,
-    ScriptResult *result)
-{
-    ViewportContext viewport;
-    if (!viewport_context_init(&viewport, css_viewport_width,
-                               css_viewport_height, device_width,
-                               device_height)) return NULL;
     ScriptRuntimeOptions options = {
         .session = session, .viewport = viewport,
         .defer_document_scripts = true

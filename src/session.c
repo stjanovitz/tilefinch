@@ -542,23 +542,39 @@ void browser_session_site_adapter_state_remove(
         memset(state, 0, sizeof(*state));
 }
 
+/* A request-private copy of the jar for one redirect chain. It holds only
+   the live cookies (and allowed sites) it copied, growing toward the
+   session's BROWSER_COOKIE_ENTRIES slots only when a staged Set-Cookie
+   needs a free slot, so the common request does not carry a full table. */
 struct BrowserCookieOverlay {
     Budget *budget;
     bool site_data_allowed;
-    BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
+    BrowserCookieEntry *cookies;
+    size_t cookie_capacity;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
     size_t maximum_cookie_bytes;
     size_t maximum_cookie_long_path_bytes;
     size_t cookie_clock;
-    char third_party_cookie_allowed_sites[BROWSER_SECURITY_SITE_LIMIT]
-                                         [BROWSER_ORIGIN_LIMIT];
+    char (*third_party_cookie_allowed_sites)[BROWSER_ORIGIN_LIMIT];
     size_t third_party_cookie_allowed_site_count;
+    const char *credential_cookie_site;
+    const char *const *credential_cookie_names;
+    size_t credential_cookie_name_count;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* The source session's diagnostics: the transport sends the Cookie
+       header this overlay builds, so header omissions are counted here. */
+    BrowserCookieDiagnostics *header_diagnostics;
+#endif
 };
 
 typedef struct {
     Budget *budget;
     BrowserCookieEntry *cookies;
+    /* Slots in `cookies`; an overlay may hold fewer than
+       BROWSER_COOKIE_ENTRIES and grow (never past it) through `overlay`. */
+    size_t cookie_capacity;
+    BrowserCookieOverlay *overlay;
     size_t *cookie_bytes;
     size_t *cookie_long_path_bytes;
     size_t maximum_cookie_bytes;
@@ -566,7 +582,15 @@ typedef struct {
     size_t *cookie_clock;
     const char (*third_party_cookie_allowed_sites)[BROWSER_ORIGIN_LIMIT];
     size_t third_party_cookie_allowed_site_count;
+    const char *credential_cookie_site;
+    const char *const *credential_cookie_names;
+    size_t credential_cookie_name_count;
     BrowserCookieDiagnostics *diagnostics;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* Where cookie_string counts header omissions: set only for the
+       request-private overlay, whose header is the one sent. */
+    BrowserCookieDiagnostics *header_diagnostics;
+#endif
 } BrowserCookieStore;
 
 static BrowserCookieStore browser_session_cookie_store(
@@ -575,6 +599,7 @@ static BrowserCookieStore browser_session_cookie_store(
     return (BrowserCookieStore) {
         .budget = session == NULL ? NULL : session->budget,
         .cookies = session == NULL ? NULL : session->cookies,
+        .cookie_capacity = session == NULL ? 0 : BROWSER_COOKIE_ENTRIES,
         .cookie_bytes = session == NULL ? NULL : &session->cookie_bytes,
         .cookie_long_path_bytes = session == NULL
             ? NULL : &session->cookie_long_path_bytes,
@@ -587,6 +612,12 @@ static BrowserCookieStore browser_session_cookie_store(
             : session->third_party_cookie_allowed_sites
         , .third_party_cookie_allowed_site_count = session == NULL ? 0
             : session->third_party_cookie_allowed_site_count
+        , .credential_cookie_site = session == NULL
+            ? NULL : session->credential_cookie_site
+        , .credential_cookie_names = session == NULL
+            ? NULL : session->credential_cookie_names
+        , .credential_cookie_name_count = session == NULL
+            ? 0 : session->credential_cookie_name_count
         , .diagnostics = session == NULL ? NULL : &session->cookie_diagnostics
     };
 }
@@ -597,6 +628,8 @@ static BrowserCookieStore browser_overlay_cookie_store(
     return (BrowserCookieStore) {
         .budget = overlay == NULL ? NULL : overlay->budget,
         .cookies = overlay == NULL ? NULL : overlay->cookies,
+        .cookie_capacity = overlay == NULL ? 0 : overlay->cookie_capacity,
+        .overlay = overlay,
         .cookie_bytes = overlay == NULL ? NULL : &overlay->cookie_bytes,
         .cookie_long_path_bytes = overlay == NULL
             ? NULL : &overlay->cookie_long_path_bytes,
@@ -609,6 +642,16 @@ static BrowserCookieStore browser_overlay_cookie_store(
             : overlay->third_party_cookie_allowed_sites
         , .third_party_cookie_allowed_site_count = overlay == NULL ? 0
             : overlay->third_party_cookie_allowed_site_count
+        , .credential_cookie_site = overlay == NULL
+            ? NULL : overlay->credential_cookie_site
+        , .credential_cookie_names = overlay == NULL
+            ? NULL : overlay->credential_cookie_names
+        , .credential_cookie_name_count = overlay == NULL
+            ? 0 : overlay->credential_cookie_name_count
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+        , .header_diagnostics = overlay == NULL
+            ? NULL : overlay->header_diagnostics
+#endif
     };
 }
 
@@ -839,7 +882,7 @@ static BrowserCookieEntry *find_cookie(BrowserCookieStore *store,
                                        const char *name,
                                        const char *partition_key)
 {
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    for (size_t i = 0; i < store->cookie_capacity; i++) {
         BrowserCookieEntry *entry = &store->cookies[i];
         if (entry->value != NULL && strcmp(entry->domain, domain) == 0
             && entry->path_length == path_length
@@ -870,7 +913,7 @@ static void clear_cookie_entry(BrowserCookieStore *store,
 
 static void reclaim_expired_cookies(BrowserCookieStore *store, int64_t now)
 {
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    for (size_t i = 0; i < store->cookie_capacity; i++) {
         BrowserCookieEntry *entry = &store->cookies[i];
         if (entry->value != NULL && entry->expires_at != 0
             && entry->expires_at <= now) {
@@ -926,7 +969,7 @@ static bool insecure_cookie_overlays_secure(
 {
     if (store == NULL || name == NULL || domain == NULL || path == NULL)
         return false;
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    for (size_t i = 0; i < store->cookie_capacity; i++) {
         const BrowserCookieEntry *existing = &store->cookies[i];
         if (existing->value == NULL || !existing->secure
             || strcmp(existing->name, name) != 0) {
@@ -945,18 +988,18 @@ static bool insecure_cookie_overlays_secure(
     return false;
 }
 
-static bool cookie_string(const BrowserCookieStore *store, const char *url,
-                          const TilefinchRequestContext *request,
-                          const TilefinchRequestFacts *facts,
-                          bool include_http_only, char *output,
-                          size_t output_capacity, uint64_t *fingerprint)
+/* The cookies a request may send, in RFC 6265 Cookie-header order. */
+static bool cookie_candidates(const BrowserCookieStore *store, const char *url,
+                              const TilefinchRequestContext *request,
+                              const TilefinchRequestFacts *facts,
+                              bool include_http_only, CookieURL *parsed,
+                              size_t candidates[BROWSER_COOKIE_ENTRIES],
+                              size_t *candidate_count)
 {
-    bool writing = output != NULL && output_capacity != 0;
-    if (store == NULL || store->cookies == NULL
-        || (!writing && fingerprint == NULL)) return false;
-    CookieURL parsed;
-    if (!parse_cookie_url(url, &parsed)) return false;
-    size_t used = 0;
+    *candidate_count = 0;
+    if (store == NULL
+        || (store->cookies == NULL && store->overlay == NULL)) return false;
+    if (!parse_cookie_url(url, parsed)) return false;
     int64_t now = cookie_now();
     char partition_key[BROWSER_ORIGIN_LIMIT] = {0};
     const char *top_level = request == NULL ? url
@@ -974,21 +1017,18 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
     bool lax_allowed = request == NULL
         || (facts != NULL ? facts->allows_lax_cookie
                           : tilefinch_request_allows_lax_cookie(request));
-    if (writing) output[0] = '\0';
-    uint64_t hash = UINT64_C(1469598103934665603);
-    size_t candidates[BROWSER_COOKIE_ENTRIES];
-    size_t candidate_count = 0;
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    size_t count = 0;
+    for (size_t i = 0; i < store->cookie_capacity; i++) {
         const BrowserCookieEntry *entry = &store->cookies[i];
         if (entry->value == NULL
             || (entry->expires_at != 0 && entry->expires_at <= now)
             || (!include_http_only && entry->http_only)
-            || (entry->secure && !parsed.secure)
+            || (entry->secure && !parsed->secure)
             || (entry->host_only
-                ? strcmp(parsed.host, entry->domain) != 0
-                : !domain_matches(parsed.host, entry->domain))
+                ? strcmp(parsed->host, entry->domain) != 0
+                : !domain_matches(parsed->host, entry->domain))
             || !path_matches(
-                   parsed.path, parsed.path_length,
+                   parsed->path, parsed->path_length,
                    browser_cookie_entry_path(entry), entry->path_length)
             || (entry->same_site == BROWSER_COOKIE_SAME_SITE_STRICT
                 && !same_site)
@@ -1004,7 +1044,7 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
         /* RFC 6265 serialization prefers more specific paths, then older
            creation times. This is observable for same-named cookies. */
         size_t entry_path_length = entry->path_length;
-        size_t position = candidate_count;
+        size_t position = count;
         while (position != 0) {
             const BrowserCookieEntry *previous =
                 &store->cookies[candidates[position - 1]];
@@ -1019,23 +1059,132 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
             position--;
         }
         candidates[position] = i;
-        candidate_count++;
+        count++;
     }
+    *candidate_count = count;
+    return true;
+}
+
+/* Which cookies survive when a header would exceed its bound: 0 for the
+   site's registered credential cookies, 1 for cookies the server marked
+   HttpOnly or __Host-/__Secure- (session cookies are), 2 for the rest. */
+static unsigned cookie_header_rank(const BrowserCookieStore *store,
+                                   const CookieURL *parsed,
+                                   const BrowserCookieEntry *entry)
+{
+    if (store->credential_cookie_names != NULL
+        && store->credential_cookie_site != NULL
+        && domain_matches(parsed->host, store->credential_cookie_site)) {
+        for (size_t i = 0; i < store->credential_cookie_name_count; i++) {
+            if (strcmp(entry->name, store->credential_cookie_names[i]) == 0)
+                return 0;
+        }
+    }
+    if (entry->http_only || strncmp(entry->name, "__Host-", 7) == 0
+        || strncmp(entry->name, "__Secure-", 9) == 0) return 1;
+    return 2;
+}
+
+static size_t cookie_pair_length(const BrowserCookieEntry *entry)
+{
+    return strlen(entry->name) + 1 + entry->value_length;
+}
+
+static bool cookie_string(const BrowserCookieStore *store, const char *url,
+                          const TilefinchRequestContext *request,
+                          const TilefinchRequestFacts *facts,
+                          bool include_http_only, char *output,
+                          size_t output_capacity, uint64_t *fingerprint)
+{
+    bool writing = output != NULL && output_capacity != 0;
+    if (writing) output[0] = '\0';
+    if (!writing && fingerprint == NULL) return false;
+    CookieURL parsed;
+    size_t candidates[BROWSER_COOKIE_ENTRIES];
+    size_t candidate_count = 0;
+    if (!cookie_candidates(store, url, request, facts, include_http_only,
+                           &parsed, candidates, &candidate_count))
+        return false;
+    /* A fingerprint describes what a bounded builder sends. */
+    bool bounded = !writing
+        || output_capacity >= BROWSER_COOKIE_HEADER_CAPACITY;
+    size_t limit = bounded ? BROWSER_COOKIE_HEADER_CAPACITY - 1
+                           : output_capacity - 1;
+    size_t total = 0;
+    bool fits = true;
+    for (size_t candidate = 0; candidate < candidate_count && fits;
+         candidate++) {
+        size_t needed = (candidate == 0 ? 0 : 2) + cookie_pair_length(
+            &store->cookies[candidates[candidate]]);
+        if (needed > limit - total) fits = false;
+        else total += needed;
+    }
+    bool keep[BROWSER_COOKIE_ENTRIES];
+    for (size_t candidate = 0; candidate < candidate_count; candidate++)
+        keep[candidate] = fits;
+    if (!fits) {
+        /* Callers may deliberately treat cookie construction failure as an
+           empty Cookie header. Never leave a sendable partial prefix. */
+        if (!bounded) return false;
+        /* Same-named cookies form one group, led by its first (most
+           specific) member, which is the value a server reads. The group
+           takes its leader's rank, and once a member is left out every
+           later member is too, so a shadowed value is never sent in place
+           of the one it shadows. */
+        _Static_assert(BROWSER_COOKIE_ENTRIES <= 256u,
+                       "cookie group leaders are stored in bytes");
+        uint8_t leader[BROWSER_COOKIE_ENTRIES];
+        unsigned char rank_of[BROWSER_COOKIE_ENTRIES];
+        bool omitted[BROWSER_COOKIE_ENTRIES];
+        for (size_t candidate = 0; candidate < candidate_count;
+             candidate++) {
+            const BrowserCookieEntry *entry =
+                &store->cookies[candidates[candidate]];
+            size_t first = 0;
+            while (first < candidate
+                   && strcmp(store->cookies[candidates[first]].name,
+                             entry->name) != 0) first++;
+            leader[candidate] = (uint8_t) first;
+            rank_of[candidate] = first == candidate
+                ? (unsigned char) cookie_header_rank(store, &parsed, entry)
+                : rank_of[first];
+            omitted[candidate] = false;
+        }
+        size_t used = 0, kept = 0;
+        for (unsigned rank = 0; rank < 3; rank++) {
+            for (size_t candidate = 0; candidate < candidate_count;
+                 candidate++) {
+                if (rank_of[candidate] != rank) continue;
+                const BrowserCookieEntry *entry =
+                    &store->cookies[candidates[candidate]];
+                size_t needed = (kept == 0 ? 0 : 2)
+                    + cookie_pair_length(entry);
+                if (omitted[leader[candidate]] || needed > limit - used) {
+                    omitted[leader[candidate]] = true;
+                    continue;
+                }
+                used += needed;
+                kept++;
+                keep[candidate] = true;
+            }
+        }
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+        BrowserCookieDiagnostics *d = store->header_diagnostics;
+        if (writing && d != NULL && d->enabled
+            && d->header_omissions <= SIZE_MAX - (candidate_count - kept))
+            d->header_omissions += candidate_count - kept;
+#endif
+    }
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t used = 0;
     for (size_t candidate = 0; candidate < candidate_count; candidate++) {
+        if (!keep[candidate]) continue;
         const BrowserCookieEntry *entry =
             &store->cookies[candidates[candidate]];
         size_t name_length = strlen(entry->name);
-        size_t needed = (used == 0 ? 0 : 2) + name_length + 1
-                        + entry->value_length;
-        if (writing && needed >= output_capacity - used) {
-            /* Callers may deliberately treat cookie construction failure as
-               an empty Cookie header. Never leave a sendable partial prefix. */
-            output[0] = '\0';
-            return false;
-        }
         if (fingerprint != NULL) {
             static const char separator[] = "; ";
-            if (candidate != 0)
+            if (used != 0)
                 hash = session_hash_bytes(hash, separator, 2);
             hash = session_hash_bytes(hash, entry->name, name_length);
             hash = session_hash_bytes(hash, "=", 1);
@@ -1048,6 +1197,8 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
             memcpy(output + used, entry->value, entry->value_length);
             used += entry->value_length;
             output[used] = '\0';
+        } else {
+            used = 1;
         }
     }
     if (fingerprint != NULL) *fingerprint = hash;
@@ -1148,16 +1299,58 @@ bool browser_session_cookie_header_fingerprint_context(
         NULL, 0, fingerprint);
 }
 
+bool browser_session_cookie_value_context(
+    const BrowserSession *session, const TilefinchRequestContext *context,
+    const char *name, const char **value, size_t *length)
+{
+    if (value != NULL) *value = NULL;
+    if (length != NULL) *length = 0;
+    TilefinchRequestFacts facts;
+    if (session == NULL || context == NULL || name == NULL || value == NULL
+        || length == NULL || !session->site_data_allowed
+        || !tilefinch_request_context_analyze(context, &facts)
+        || !facts.sends_credentials) return false;
+    BrowserCookieStore store = browser_session_cookie_store(
+        (BrowserSession *) session);
+    CookieURL parsed;
+    size_t candidates[BROWSER_COOKIE_ENTRIES];
+    size_t candidate_count = 0;
+    if (!cookie_candidates(&store, context->target_url, context, &facts, true,
+                           &parsed, candidates, &candidate_count))
+        return false;
+    for (size_t candidate = 0; candidate < candidate_count; candidate++) {
+        const BrowserCookieEntry *entry =
+            &session->cookies[candidates[candidate]];
+        if (strcmp(entry->name, name) != 0) continue;
+        *value = entry->value;
+        *length = entry->value_length;
+        return true;
+    }
+    return false;
+}
+
+void browser_session_set_credential_cookies(
+    BrowserSession *session, const char *site,
+    const char *const *names, size_t name_count)
+{
+    if (session == NULL) return;
+    bool valid = site != NULL && names != NULL && name_count != 0;
+    session->credential_cookie_site = valid ? site : NULL;
+    session->credential_cookie_names = valid ? names : NULL;
+    session->credential_cookie_name_count = valid ? name_count : 0;
+}
+
 /* Creation order is observable when paths have equal specificity. If a long
    session (or a replay seed near SIZE_MAX) exhausts the monotonic counter,
    compact the live order without allocating or changing serialization. */
 static void cookie_clock_make_room(BrowserCookieStore *store)
 {
+    /* Both store views keep cookie_capacity <= BROWSER_COOKIE_ENTRIES. */
     if (store == NULL || store->cookies == NULL || store->cookie_clock == NULL
         || *store->cookie_clock < SIZE_MAX - 1) return;
     size_t ordered[BROWSER_COOKIE_ENTRIES];
     size_t count = 0;
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    for (size_t i = 0; i < store->cookie_capacity; i++) {
         if (store->cookies[i].value == NULL) continue;
         size_t position = count;
         while (position != 0) {
@@ -1178,22 +1371,65 @@ static void cookie_clock_make_room(BrowserCookieStore *store)
     *store->cookie_clock = count;
 }
 
-static void cookie_diagnostic_add(BrowserCookieStore *store, unsigned kind)
+typedef enum {
+    COOKIE_DIAGNOSTIC_BYTES,
+    COOKIE_DIAGNOSTIC_SLOT,
+    COOKIE_DIAGNOSTIC_ALLOCATION,
+    COOKIE_DIAGNOSTIC_POLICY_IGNORED,
+    COOKIE_DIAGNOSTIC_EVICTION
+} CookieDiagnosticKind;
+
+static void cookie_diagnostic_add(BrowserCookieStore *store,
+                                  CookieDiagnosticKind kind)
 {
     BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
     if (d == NULL || !d->enabled) return;
-    size_t *counter = kind == 0 ? &d->byte_refusals
-        : kind == 1 ? &d->slot_refusals
-        : kind == 2 ? &d->allocation_refusals
-        : kind == 3 ? &d->policy_ignored : &d->evictions;
+    size_t *counter = &d->evictions;
+    switch (kind) {
+    case COOKIE_DIAGNOSTIC_BYTES: counter = &d->byte_refusals; break;
+    case COOKIE_DIAGNOSTIC_SLOT: counter = &d->slot_refusals; break;
+    case COOKIE_DIAGNOSTIC_ALLOCATION: counter = &d->allocation_refusals; break;
+    case COOKIE_DIAGNOSTIC_POLICY_IGNORED: counter = &d->policy_ignored; break;
+    case COOKIE_DIAGNOSTIC_EVICTION: break;
+    }
     if (*counter != SIZE_MAX) (*counter)++;
+}
+
+/* Adds free slots to an overlay's table (never past BROWSER_COOKIE_ENTRIES)
+   and points `store` at the new table. */
+static bool cookie_overlay_grow(BrowserCookieStore *store)
+{
+    BrowserCookieOverlay *overlay = store == NULL ? NULL : store->overlay;
+    if (overlay == NULL || overlay->cookies != store->cookies
+        || overlay->cookie_capacity != store->cookie_capacity
+        || overlay->cookie_capacity >= BROWSER_COOKIE_ENTRIES) return false;
+    size_t capacity = overlay->cookie_capacity;
+    size_t grown = BROWSER_COOKIE_ENTRIES - capacity < 8u
+        ? BROWSER_COOKIE_ENTRIES : capacity + 8u;
+    BrowserCookieEntry *cookies = budget_calloc_category(
+        overlay->budget, BUDGET_CATEGORY_RESOURCE, grown, sizeof(*cookies));
+    /* Under budget pressure, one more slot still stores the cookie the
+       jar would have stored. */
+    if (cookies == NULL && grown != capacity + 1u) {
+        grown = capacity + 1u;
+        cookies = budget_calloc_category(
+            overlay->budget, BUDGET_CATEGORY_RESOURCE, grown, sizeof(*cookies));
+    }
+    if (cookies == NULL) return false;
+    if (capacity != 0) memcpy(cookies, overlay->cookies,
+                              capacity * sizeof(*cookies));
+    budget_free(overlay->budget, overlay->cookies);
+    overlay->cookies = store->cookies = cookies;
+    overlay->cookie_capacity = store->cookie_capacity = grown;
+    return true;
 }
 
 static bool cookie_set_raw(BrowserCookieStore *store,
                        const TilefinchRequestContext *request,
                        const char *cookie, bool from_http)
 {
-    if (store == NULL || store->budget == NULL || store->cookies == NULL
+    if (store == NULL || store->budget == NULL
+        || (store->cookies == NULL && store->overlay == NULL)
         || store->cookie_bytes == NULL
         || store->cookie_long_path_bytes == NULL
         || store->cookie_clock == NULL
@@ -1372,7 +1608,7 @@ static bool cookie_set_raw(BrowserCookieStore *store,
        unless the top-level site has an explicit bounded grant. */
     if (!partitioned && !tilefinch_request_same_site(request)
         && !cookie_store_third_party_allowed(store, request)) {
-        cookie_diagnostic_add(store, 3);
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_POLICY_IGNORED);
         return true;
     }
     if (path_length == 0 || path_length >= BROWSER_COOKIE_LONG_PATH_LIMIT) {
@@ -1413,12 +1649,12 @@ static bool cookie_set_raw(BrowserCookieStore *store,
         clear_cookie_entry(store, entry);
         return true;
     }
-    bool evicting = false;
+    bool evicting = false, grow = false;
     if (entry == NULL) {
         BrowserCookieEntry *oldest_domain = NULL;
         BrowserCookieEntry *oldest_global = NULL;
         size_t domain_count = 0;
-        for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        for (size_t i = 0; i < store->cookie_capacity; i++) {
             BrowserCookieEntry *candidate = &store->cookies[i];
             if (candidate->value == NULL) continue;
             /* Eviction must not become a back door around the protections
@@ -1447,39 +1683,49 @@ static bool cookie_set_raw(BrowserCookieStore *store,
             entry = oldest_domain;
             evicting = entry != NULL;
         } else {
-            for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+            for (size_t i = 0; i < store->cookie_capacity; i++) {
                 if (store->cookies[i].value == NULL) {
                     entry = &store->cookies[i];
                     break;
                 }
             }
-            if (entry == NULL) {
+            /* A smaller overlay has a free slot wherever the jar would. It
+               grows only once the cookie has passed its checks and its
+               copies are allocated, so a refused cookie leaves the table
+               as it was. */
+            if (entry == NULL
+                && store->cookie_capacity < BROWSER_COOKIE_ENTRIES)
+                grow = true;
+            if (entry == NULL && !grow) {
                 entry = oldest_global;
                 evicting = entry != NULL;
             }
         }
     }
-    if (entry == NULL) {
-        cookie_diagnostic_add(store, 1);
+    if (entry == NULL && !grow) {
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_SLOT);
         return false;
     }
-    bool newly_created = entry->value == NULL;
-    size_t old_length = entry->value == NULL ? 0 : entry->value_length;
+    bool newly_created = grow || entry->value == NULL;
+    size_t old_length = newly_created ? 0 : entry->value_length;
     size_t old_long_path_length =
-        entry->long_path == NULL ? 0 : entry->path_length;
+        grow || entry->long_path == NULL ? 0 : entry->path_length;
     if (*store->cookie_bytes - old_length + value_length
         > store->maximum_cookie_bytes) {
-        cookie_diagnostic_add(store, 0);
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_BYTES);
         return false;
     }
     size_t new_long_path_length =
         path_length >= sizeof(entry->path) ? path_length : 0;
     if (*store->cookie_long_path_bytes - old_long_path_length
             + new_long_path_length
-        > store->maximum_cookie_long_path_bytes) return false;
+        > store->maximum_cookie_long_path_bytes) {
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_BYTES);
+        return false;
+    }
     char *copy = budget_malloc(store->budget, value_length + 1);
     if (copy == NULL) {
-        cookie_diagnostic_add(store, 2);
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_ALLOCATION);
         return false;
     }
     memcpy(copy, value, value_length); copy[value_length] = '\0';
@@ -1487,15 +1733,25 @@ static bool cookie_set_raw(BrowserCookieStore *store,
     if (new_long_path_length != 0) {
         long_path = budget_malloc(store->budget, path_length + 1);
         if (long_path == NULL) {
-            cookie_diagnostic_add(store, 2);
+            cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_ALLOCATION);
             budget_free(store->budget, copy);
             return false;
         }
         memcpy(long_path, path, path_length);
         long_path[path_length] = '\0';
     }
+    if (grow) {
+        size_t first_new = store->cookie_capacity;
+        if (!cookie_overlay_grow(store)) {
+            cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_ALLOCATION);
+            budget_free(store->budget, long_path);
+            budget_free(store->budget, copy);
+            return false;
+        }
+        entry = &store->cookies[first_new];
+    }
     if (evicting) {
-        cookie_diagnostic_add(store, 4);
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_EVICTION);
         clear_cookie_entry(store, entry);
         newly_created = true;
         old_length = 0;
@@ -1544,12 +1800,14 @@ static bool cookie_set(BrowserCookieStore *store,
     bool okay = cookie_set_raw(store, request, cookie, from_http);
     BrowserCookieDiagnostics *d = store == NULL ? NULL : store->diagnostics;
     if (d != NULL && d->enabled) {
+        if (!okay && d->refused != SIZE_MAX) d->refused++;
+#ifndef __PSP__
         size_t *attempts = from_http ? &d->http_attempts : &d->script_attempts;
         if (*attempts != SIZE_MAX) (*attempts)++;
-        if (!okay && d->refused != SIZE_MAX) d->refused++;
         if (store->cookie_bytes != NULL
             && *store->cookie_bytes > d->peak_value_bytes)
             d->peak_value_bytes = *store->cookie_bytes;
+#endif
     }
     return okay;
 }
@@ -1854,16 +2112,47 @@ BrowserCookieOverlay *browser_session_cookie_overlay_create(
     overlay->maximum_cookie_long_path_bytes =
         source->maximum_cookie_long_path_bytes;
     overlay->cookie_clock = source->cookie_clock;
-    overlay->third_party_cookie_allowed_site_count =
-        source->third_party_cookie_allowed_site_count;
-    memcpy(overlay->third_party_cookie_allowed_sites,
-           source->third_party_cookie_allowed_sites,
-           sizeof(overlay->third_party_cookie_allowed_sites));
+    overlay->credential_cookie_site = source->credential_cookie_site;
+    overlay->credential_cookie_names = source->credential_cookie_names;
+    overlay->credential_cookie_name_count =
+        source->credential_cookie_name_count;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    overlay->header_diagnostics =
+        (BrowserCookieDiagnostics *) &source->cookie_diagnostics;
+#endif
+    size_t sites = source->third_party_cookie_allowed_site_count;
+    if (sites > BROWSER_SECURITY_SITE_LIMIT) sites = BROWSER_SECURITY_SITE_LIMIT;
+    if (sites != 0) {
+        overlay->third_party_cookie_allowed_sites = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE,
+            sites * sizeof(overlay->third_party_cookie_allowed_sites[0]));
+        if (overlay->third_party_cookie_allowed_sites == NULL) {
+            browser_cookie_overlay_destroy(overlay);
+            return NULL;
+        }
+        memcpy(overlay->third_party_cookie_allowed_sites,
+               source->third_party_cookie_allowed_sites,
+               sites * sizeof(overlay->third_party_cookie_allowed_sites[0]));
+        overlay->third_party_cookie_allowed_site_count = sites;
+    }
     /* A blocked session still gets a valid request-private jar, but it is
        intentionally empty. This closes the transport path that otherwise
        bypasses the public cookie-header gate. */
     if (!source->site_data_allowed) return overlay;
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+    size_t live = 0;
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++)
+        if (source->cookies[i].value != NULL) live++;
+    if (live != 0) {
+        overlay->cookies = budget_calloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE, live, sizeof(*overlay->cookies));
+        if (overlay->cookies == NULL) {
+            browser_cookie_overlay_destroy(overlay);
+            return NULL;
+        }
+        overlay->cookie_capacity = live;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES && at < live; i++) {
         const BrowserCookieEntry *entry = &source->cookies[i];
         if (entry->value == NULL) continue;
         char *value = budget_malloc_category(
@@ -1874,9 +2163,10 @@ BrowserCookieOverlay *browser_session_cookie_overlay_create(
         }
         memcpy(value, entry->value, entry->value_length);
         value[entry->value_length] = '\0';
-        overlay->cookies[i] = *entry;
-        overlay->cookies[i].value = value;
-        overlay->cookies[i].long_path = NULL;
+        BrowserCookieEntry *copy = &overlay->cookies[at++];
+        *copy = *entry;
+        copy->value = value;
+        copy->long_path = NULL;
         if (entry->long_path != NULL) {
             char *path = budget_malloc_category(
                 budget, BUDGET_CATEGORY_RESOURCE,
@@ -1886,7 +2176,7 @@ BrowserCookieOverlay *browser_session_cookie_overlay_create(
                 return NULL;
             }
             memcpy(path, entry->long_path, entry->path_length + 1);
-            overlay->cookies[i].long_path = path;
+            copy->long_path = path;
             overlay->cookie_long_path_bytes += entry->path_length;
         }
         overlay->cookie_bytes += entry->value_length;
@@ -1934,10 +2224,12 @@ void browser_cookie_overlay_destroy(BrowserCookieOverlay *overlay)
     if (overlay == NULL) return;
     Budget *budget = overlay->budget;
     if (budget != NULL) {
-        for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        for (size_t i = 0; i < overlay->cookie_capacity; i++) {
             budget_free(budget, overlay->cookies[i].value);
             budget_free(budget, overlay->cookies[i].long_path);
         }
+        budget_free(budget, overlay->cookies);
+        budget_free(budget, overlay->third_party_cookie_allowed_sites);
         budget_free(budget, overlay);
     }
 }
@@ -3460,6 +3752,34 @@ void browser_session_decoded_image_forget(BrowserSession *session,
             cache_decoded_image_invalidate_entry(session, entry);
         }
     }
+}
+
+size_t browser_session_decoded_image_reclaim(BrowserSession *session,
+                                            size_t target_bytes)
+{
+    if (session == NULL || session->budget == NULL || target_bytes == 0) return 0;
+    size_t before = budget_remaining(session->budget);
+    size_t reclaimed = 0;
+    for (size_t retired = 0;
+         retired < BROWSER_CACHE_ENTRIES && reclaimed < target_bytes; retired++) {
+        BrowserCacheEntry *victim = NULL;
+        for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+            BrowserCacheEntry *entry = &session->cache[i];
+            if (entry->decoded_image_pixels != NULL
+                && entry->decoded_image_pixels->references == 1u
+                && (victim == NULL || entry->stamp < victim->stamp))
+                victim = entry;
+        }
+        if (victim == NULL) break;
+        /* Acquiring pixels retains a lease without allocating. Releasing
+           this cache-only copy cannot invalidate a caller's live pixels or
+           its borrowed response/provenance pointers, unlike whole-entry
+           eviction from an allocator hook. */
+        cache_decoded_image_invalidate_entry(session, victim);
+        size_t after = budget_remaining(session->budget);
+        reclaimed = after > before ? after - before : 0;
+    }
+    return reclaimed;
 }
 
 bool browser_session_decoded_image_put(

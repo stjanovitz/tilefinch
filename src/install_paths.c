@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(__PSP__)
+#include <pspiofilemgr.h>
+#endif
+
 static bool path_copy(char *output, size_t size, const char *value)
 {
     if (output == NULL || size == 0 || value == NULL) return false;
@@ -132,3 +136,25 @@ bool tilefinch_install_advisory_matches(
         || strcmp(data_dir, paths->data_dir) == 0;
     return slot_matches && data_matches;
 }
+
+#if defined(__PSP__)
+TilefinchMemoryStickSync tilefinch_memory_stick_sync(void)
+{
+    return sceIoSync("ms0:", 0) >= 0 || sceIoSync("msfat0:", 0) >= 0
+        ? TILEFINCH_MEMORY_STICK_SYNCED : TILEFINCH_MEMORY_STICK_SYNC_REJECTED;
+}
+#else
+static TilefinchMemoryStickSync host_sync_result =
+    TILEFINCH_MEMORY_STICK_SYNC_SKIPPED;
+
+TilefinchMemoryStickSync tilefinch_memory_stick_sync(void)
+{
+    return host_sync_result;
+}
+
+void tilefinch_memory_stick_sync_set_host_result(
+    TilefinchMemoryStickSync result)
+{
+    host_sync_result = result;
+}
+#endif

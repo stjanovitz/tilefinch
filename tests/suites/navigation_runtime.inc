@@ -520,6 +520,46 @@ static bool test_detached_canvas_publishes_when_inserted(void)
     return ok && clean;
 }
 
+static bool test_stream_teardown_after_realm_retirement(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Retained after OOM</title>"
+        "<body><script>globalThis.started=true;</script>"
+        "<main><h1>Readable content</h1><a href='/next'>Next</a></main>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    bool loaded = ready && navigation_commit_html(
+        &navigation, navigation_begin(&navigation),
+        "https://realm-retirement.test/document", html, sizeof(html)-1,
+        480, NULL, NULL, true);
+    bool had_runtime = loaded && navigation.page.runtime != NULL;
+    if (had_runtime) navigation_test_retired_stream_teardown(&navigation);
+    bool ok = loaded && navigation.page.loaded
+        && had_runtime
+        && navigation.page.runtime == NULL
+        && strcmp(navigation.page.document.title, "Retained after OOM") == 0
+        && navigation.page.layout.link_count != 0;
+    if (!ok) fprintf(stderr, "retired staging ready=%d loaded=%d runtime=%p "
+        "limited=%d scripts=%zu/%zu/%zu script-error=%s error=%s\n", ready, loaded,
+        (void *)navigation.page.runtime, navigation.page.script_memory_limited,
+        navigation.script_attempted, navigation.script_loaded, navigation.script_failed,
+        navigation.page.script_result.error,
+        navigation.last_error);
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_navigation_keeps_server_dom_after_author_script_error(void)
 {
     static const char html[] =

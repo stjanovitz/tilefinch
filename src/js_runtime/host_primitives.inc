@@ -490,18 +490,14 @@ static JSValue js_request_navigation(JSContext *context,
                  && (strncmp(url, "https://", 8) == 0
                      || strncmp(url, "http://", 7) == 0);
     if (!valid) {
-        if (bridge->host != NULL && bridge->host->xhr_diagnostics != NULL)
-            js_rt_saturating_add_size(
-                &bridge->host->xhr_diagnostics->navigation_refused, 1);
+        JS_RT_XHR_COUNT(bridge->host, navigation_refused);
         JS_FreeCString(context, url);
         return JS_ThrowTypeError(context, "invalid navigation URL");
     }
     snprintf(bridge->navigation_url, sizeof(bridge->navigation_url), "%s",
              url);
     bridge->navigation_requested = true;
-    if (bridge->host != NULL && bridge->host->xhr_diagnostics != NULL)
-        js_rt_saturating_add_size(
-            &bridge->host->xhr_diagnostics->navigation_accepted, 1);
+    JS_RT_XHR_COUNT(bridge->host, navigation_accepted);
     bridge->navigation_replace = argc > 1
                                  && JS_ToBool(context, argv[1]) > 0;
     /* Snapshot at the request boundary. The host may not consume this until
@@ -617,7 +613,7 @@ static JSValue js_request_media(JSContext *context,
     bridge->media_credentials = request.credentials;
     bridge->media_source = source_copy;
     bridge->media_requested = true;
-    bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+    bridge_pin_node_slot(bridge, slot);
     return JS_TRUE;
 }
 
@@ -856,6 +852,9 @@ static JSValue js_set_element_scroll(JSContext *context,
     return JS_NewBool(context, intent != NULL || applied);
 }
 
+#ifdef JS_RT_TEST_INSTRUMENTS
+/* Lab telemetry for frame-eval (the host lab prints it with a page failure).
+   Best effort: a refused string never fails the evaluation. */
 static const char *frame_eval_value_type(JSContext *context,
                                          JSValueConst value)
 {
@@ -869,7 +868,7 @@ static const char *frame_eval_value_type(JSContext *context,
     return "object";
 }
 
-static bool set_frame_eval_telemetry(JSContext *context, uint64_t count,
+static void set_frame_eval_telemetry(JSContext *context, uint64_t count,
                                      int64_t source_length,
                                      const char *state, uint64_t elapsed_ms)
 {
@@ -883,13 +882,16 @@ static bool set_frame_eval_telemetry(JSContext *context, uint64_t count,
                  (unsigned long long) elapsed_ms);
     }
     JSValue global = JS_GetGlobalObject(context);
-    if (JS_IsException(global)) return false;
-    int result = JS_SetPropertyStr(context, global,
-                                   "__tilefinchFrameEvalTelemetry",
-                                   JS_NewString(context, telemetry));
+    if (JS_IsException(global)
+        || JS_SetPropertyStr(context, global,
+                             "__tilefinchFrameEvalTelemetry",
+                             JS_NewString(context, telemetry)) < 0) {
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+    }
     JS_FreeValue(context, global);
-    return result >= 0;
 }
+#endif
 
 static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
                                 size_t slot)
@@ -1014,13 +1016,12 @@ static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
         return JS_ThrowRangeError(context, "frame eval exceeds bounded size");
     }
 
+#ifdef JS_RT_TEST_INSTRUMENTS
     uint64_t count = bridge == NULL ? 0 : ++bridge->frame_eval_count;
     uint64_t started = monotonic_time_ms();
-    if (!set_frame_eval_telemetry(context, count, source_length, "running",
-                                  UINT64_MAX)) {
-        JS_FreeValue(context, source);
-        return JS_EXCEPTION;
-    }
+    set_frame_eval_telemetry(context, count, source_length, "running",
+                             UINT64_MAX);
+#endif
     JSContext *realm = NULL;
     for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
         if (bridge->host->frame_realms[i].context != NULL
@@ -1051,12 +1052,11 @@ static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
     if (text != NULL) JS_FreeCString(context, text);
     JS_FreeValue(context, source);
     if (JS_IsException(value)) return value;
-    if (!set_frame_eval_telemetry(context, count, source_length,
-                                  frame_eval_value_type(context, value),
-                                  monotonic_time_ms() - started)) {
-        JS_FreeValue(context, value);
-        return JS_EXCEPTION;
-    }
+#ifdef JS_RT_TEST_INSTRUMENTS
+    set_frame_eval_telemetry(context, count, source_length,
+                             frame_eval_value_type(context, value),
+                             monotonic_time_ms() - started);
+#endif
     return value;
 }
 
@@ -1296,7 +1296,7 @@ static JSValue js_cookie_get(JSContext *context, JSValueConst this_value,
 {
     (void) this_value; (void) argc; (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    char cookies[4096];
+    char cookies[BROWSER_COOKIE_HEADER_CAPACITY];
     if (bridge->session == NULL || bridge->opaque_origin
         || !browser_session_cookie_get(bridge->session,
                                        bridge->document_url, cookies,
@@ -1717,6 +1717,14 @@ static JSValue js_utf8_encode(JSContext *context,
     (void) this_value;
     if (argc < 1 || !JS_IsString(argv[0]))
         return JS_ThrowTypeError(context, "well-formed string required");
+    /* TextEncoder keeps its public ceiling. Blob may use the remaining
+       portion of its separately bounded URL payload allowance. This hook
+       is captured privately by the bootstrap, never exposed to authors. */
+    uint32_t maximum = 256u * 1024u;
+    if (argc > 1 && JS_ToUint32(context, &maximum, argv[1]) < 0)
+        return JS_EXCEPTION;
+    if (maximum > 512u * 1024u)
+        return JS_ThrowRangeError(context, "invalid encoding allowance");
     JSValue units_value = JS_GetPropertyStr(context, argv[0], "length");
     uint32_t units = 0u;
     if (JS_IsException(units_value)
@@ -1727,7 +1735,7 @@ static JSValue js_utf8_encode(JSContext *context,
     JS_FreeValue(context, units_value);
     /* Every UTF-16 code unit contributes at least one output byte, so reject
        oversized strings before JS_ToCStringLen can allocate a UTF-8 copy. */
-    if (units > 256u * 1024u)
+    if (units > maximum)
         return JS_ThrowRangeError(context,
                                   "encoded text exceeds bounded size");
     size_t length = 0u;
@@ -1736,7 +1744,7 @@ static JSValue js_utf8_encode(JSContext *context,
     /* Keep TextEncoder bounded at its existing PSP-facing ceiling. The
        bootstrap first applies the Web IDL USVString conversion, so QuickJS's
        UTF-8 conversion never sees an unmatched surrogate here. */
-    if (length > 256u * 1024u) {
+    if (length > maximum) {
         JS_FreeCString(context, bytes);
         return JS_ThrowRangeError(context,
                                   "encoded text exceeds bounded size");

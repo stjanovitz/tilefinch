@@ -82,20 +82,9 @@ static const char *const basic_hosts[] = {
    HTML space character. Keep the '-' boundary: a blanket ad-* / substring
    rule also hides unrelated controls and content. These are ordinary CSS
    selectors, evaluated by the existing style pass, not a second DOM walk. */
-#define COSMETIC_CLASS_PREFIX(prefix) \
-    ":is([class^=\"" prefix "\"],[class*=\" " prefix "\"]," \
-    "[class*=\"\\9 " prefix "\"],[class*=\"\\a " prefix "\"]," \
-    "[class*=\"\\c " prefix "\"],[class*=\"\\d " prefix "\"]),"
-
 static const char cosmetic_css[] =
-    COSMETIC_CLASS_PREFIX("ad-slot-")
-    COSMETIC_CLASS_PREFIX("ad-banner-")
-    "ins.adsbygoogle,.advertisement,.advertising,.ad-banner,.ad-container,"
-    ".ad-slot,.ad-wrapper,.sponsored,.promoted,.promotedlink,[data-ad],[data-ad-slot],"
-    "[data-ad-client],[aria-label=\"advertisement\"],"
-    "[aria-label=\"sponsored\"]{display:none!important}";
-
-#undef COSMETIC_CLASS_PREFIX
+#include "cosmetic_blocker_css.inc"
+    ;
 
 _Static_assert(sizeof(cosmetic_css) <= CONTENT_BLOCKER_COSMETIC_CSS_LIMIT,
                "built-in cosmetic stylesheet must fit the frontend buffer");
@@ -645,6 +634,43 @@ bool content_blocker_would_block(
             third_party, &allowed, &blocked);
     }
     return blocked && !allowed;
+}
+
+static bool blocker_inline_contains(const char *source, size_t length, const char *token)
+{
+    size_t n = strlen(token);
+    if (n > length) return false;
+    for (size_t i = 0; i <= length - n; i++)
+        if (source[i] == token[0] && memcmp(source + i, token, n) == 0) return true;
+    return false;
+}
+
+const char *content_blocker_inline_rule(const ContentBlocker *blocker,
+    const char *document_url, const char *source, size_t length)
+{
+    if (blocker == NULL || blocker->mode == CONTENT_BLOCKER_OFF || source == NULL
+        || document_url == NULL || length > CONTENT_BLOCKER_INLINE_BYTES_LIMIT) return NULL;
+    while (length != 0 && (*source == ' ' || *source == '\t' || *source == '\r'
+           || *source == '\n' || *source == '\f')) { source++; length--; }
+#define INLINE_TRACKER_RULE(id, domain, property, prefix, a, b, c) \
+    if (length >= sizeof(prefix) - 1 && memcmp(source, prefix, sizeof(prefix) - 1) == 0) { \
+        char host[CONTENT_BLOCKER_HOST_LIMIT], site[CONTENT_BLOCKER_HOST_LIMIT]; \
+        if (blocker_url_host(document_url, host) && blocker_host_suffix(host, domain) \
+            && content_blocker_site_from_url(document_url, site) && !blocker_site_allowed(blocker, site) \
+            && blocker_inline_contains(source, length, a) && blocker_inline_contains(source, length, b) \
+            && blocker_inline_contains(source, length, c)) return id; \
+    }
+#include "inline_tracker_rules.inc"
+#undef INLINE_TRACKER_RULE
+    return NULL;
+}
+
+bool content_blocker_should_block_inline(ContentBlocker *blocker,
+    const char *document_url, const char *source, size_t length)
+{
+    bool blocked = content_blocker_inline_rule(blocker, document_url, source, length) != NULL;
+    if (blocked) { blocker->requests_considered++; blocker->requests_blocked++; }
+    return blocked;
 }
 
 bool content_blocker_should_block(

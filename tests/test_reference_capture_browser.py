@@ -5,6 +5,7 @@ No server or network is required. Playwright is optional in public clones;
 maintainers run this lane with their installed browser before capture changes.
 """
 import json
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks"))
@@ -29,6 +32,71 @@ spec.loader.exec_module(census)
 
 
 class CaptureReceiptTests(unittest.TestCase):
+    def test_cosmetic_receipt_requires_exact_shared_stylesheet(self):
+        state = self.complete_state()
+        proof = dict(version='shared-cosmetic-v1', ready=True, enabled=True,
+            rules_sha256=hashlib.sha256((ROOT / 'src/cosmetic_blocker_css.inc').read_bytes()).hexdigest())
+        state['offline_capability_policy'] = dict(cosmetic_blocking=proof)
+        self.assertTrue(census.complete_state(state))
+        for key, value in [('ready', False), ('enabled', 1), ('rules_sha256', '0'*64),
+                           ('version', 'unshared')]:
+            original = proof[key]
+            proof[key] = value
+            self.assertFalse(census.complete_state(state))
+            proof[key] = original
+
+    def test_inline_tracker_blocking_receipt_requires_exact_bounded_evidence(self):
+        state = self.complete_state()
+        proof = dict(version='shared-inline-trackers-v1', ready=True, blocked=1, enabled=True,
+            rules_sha256=hashlib.sha256((ROOT / 'src/inline_tracker_rules.inc').read_bytes()).hexdigest(),
+            records=[dict(rule='retail-client-metrics-v1', source_sha256='a'*64)])
+        state['offline_capability_policy'] = dict(inline_trackers=proof)
+        self.assertTrue(census.complete_state(state))
+        for key, value in [('ready', False), ('blocked', 2), ('rules_sha256', 'b'*64),
+                           ('records', [dict(rule='unknown', source_sha256='a'*64)])]:
+            original = proof[key]
+            proof[key] = value
+            self.assertFalse(census.complete_state(state))
+            proof[key] = original
+    def test_challenge_preflight_never_launches_browser_or_claims_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / 'trace'
+            trace.mkdir()
+            (trace / 'trace.meta').write_text('capture-complete=yes\nrecord-count=1\n')
+            (trace / '0000.meta').write_text('method=GET\nurl=https://page.test/\n'
+                'status=202\nresponse-header-0=x-amzn-waf-action: challenge\n')
+            (trace / '0000.body').write_bytes(b'')
+            scenario = SimpleNamespace(scenario='barrier', replay_dir='trace',
+                trace_sha256=trace_digest(trace), url='https://page.test/')
+            options = SimpleNamespace(output_root=root / 'output', trace_root=root,
+                settle_ms=0, timeout_ms=1000, attempt_timeout_seconds=30,
+                resume=False, manifest=root / 'manifest.tsv', node=Path('node'), executable=None)
+            with patch.object(census, 'run_bounded', side_effect=AssertionError('browser launched')):
+                receipt = census.capture_one(scenario, options, {'files': {}})
+            self.assertEqual(receipt['status'], 'incomplete')
+            self.assertEqual(receipt['reasons'], ['source-access-challenge'])
+            self.assertEqual(receipt['artifacts'], {})
+
+    def test_source_access_barriers_are_not_geometry_or_resource_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = root / '0000.meta'
+            prefix = 'method=GET\nurl=https://page.test/article\n'
+            for header in ('x-amzn-waf-action: challenge', 'CF-Mitigated: Challenge'):
+                meta.write_text(prefix + 'status=202\nlength=0\nresponse-header-0=' + header + '\n')
+                self.assertEqual(census.source_response_barrier(root, 'https://page.test/article'),
+                                 'source-access-challenge')
+            meta.write_text(prefix + 'status=302\nresponse-header-0=location: /login/?dest=private\n')
+            self.assertEqual(census.source_response_barrier(root, 'https://page.test/article'),
+                             'source-signin-required')
+            for response in ('status=202\n', 'status=302\nresponse-header-0=location: /news/\n',
+                             'status=200\nresponse-header-0=location: /login/\n'):
+                meta.write_text(prefix + response)
+                self.assertIsNone(census.source_response_barrier(root, 'https://page.test/article'))
+            meta.write_text(prefix + 'status=202\nresponse-header-0=x-amzn-waf-action: challenge\n')
+            self.assertIsNone(census.source_response_barrier(root, 'https://page.test/other'))
+
     @staticmethod
     def complete_state():
         return {"capture_ready": True,
@@ -187,13 +255,8 @@ def record(trace, number, url, body, content_type, status=200, headers=()):
 
 
 @unittest.skipUnless(PLAYWRIGHT, "Node/Playwright is unavailable")
-class BrowserCaptureTests(unittest.TestCase):
-    def test_environment_preflight_and_failed_image_contracts(self):
-        result = subprocess.run([NODE, str(ROOT / "tests/playwright_reference_contract.js")],
-                                capture_output=True, text=True, timeout=90)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def capture(self, directory, *, missing=False, full=True, iframe=False, viewport_units=False, corrupt_frame_image=False, hidden_frame=False, pointer_media=False, long_document=False):
+class CaptureFixtureBase(unittest.TestCase):
+    def capture(self, directory, *, missing=False, full=True, iframe=False, viewport_units=False, corrupt_frame_image=False, hidden_frame=False, pointer_media=False, long_document=False, scroll_window=0, distant_image=False, query_mode="", dismiss=False, wide_layout=False, mobile_auto_fit=False, shadow_marker=False, hidden_shadow_marker=False, shadow_image="", internal_scroll="", worker_mode="", fragment=False):
         trace = directory / "trace"
         trace.mkdir()
         # Native lazy loading requires the scroll sweep; the hidden broken
@@ -207,6 +270,23 @@ document.title='Capture fixture invalid input';</script>
 <img loading="lazy" src="/lazy.svg"><img hidden src="/hidden.svg">'''
         if long_document:
             html += b'<div style="height:65000px"></div><p>Discussion end</p>'
+        if fragment:
+            html += b"<script>if(location.hash!=='#initial-state')document.title='Wrong fragment';</script>"
+        if wide_layout:
+            html += b'''<style>body{width:494px}#edge{position:fixed;bottom:0;left:0;width:100%;height:4px;background:#00ff00;z-index:999}</style><div id=edge></div>'''
+        if shadow_marker:
+            html = html.replace(b'<h1>Fixture ready</h1>',
+                b'<div id=shadow></div><script>document.getElementById("shadow").attachShadow({mode:"open"}).innerHTML="<h1>Fixture ready</h1>"</script>')
+            if hidden_shadow_marker:
+                html += b'<style>#shadow{display:none}</style>'
+        if shadow_image:
+            html += b'''<div id=shadowimages></div><script>document.getElementById('shadowimages').attachShadow({mode:'open'}).innerHTML='<img width=32 height=32 src="/shadow-broken.svg">'</script>'''
+            if shadow_image == 'hidden':
+                html += b'<style>#shadowimages{display:none}</style>'
+        if distant_image:
+            html += b'<img loading="lazy" src="/outside-window.svg">'
+        if dismiss:
+            html+=b'''<div style="position:fixed;inset:0;background:white;z-index:9"><button onclick="document.querySelector('h1').textContent='Action completed';this.parentElement.remove()">Keep blocking</button></div>'''
         if viewport_units:
             html += (b'<div style="height:100vh;background:#00ff00"></div>'
                      b'<div style="height:16px;background:#0000ff"></div>')
@@ -214,6 +294,28 @@ document.title='Capture fixture invalid input';</script>
             html += (b'<style>#pointer{height:16px;background:#123456}'
                      b'@media(pointer:coarse){#pointer{background:#ff00ff}}</style>'
                      b'<div id="pointer"></div>')
+        if internal_scroll:
+            style = 'height:232px;overflow-y:auto'
+            if internal_scroll == 'hidden': style += ';display:none'
+            if internal_scroll == 'static': style = 'height:232px;overflow-y:visible'
+            html = html.replace(b'<h1>', ('<header style="height:40px">Fixed header</header>'
+                '<main id="scrollsurface" style="'+style+'"><h1>').encode(), 1) + b'</main>'
+            if internal_scroll == 'duplicate':
+                html += b'<main id="scrollsurface" style="height:30px;overflow-y:auto">duplicate</main>'
+        if worker_mode:
+            html += b'''<script>const w=new Worker('/worker.js');w.onmessage=e=>document.querySelector('h1').textContent=e.data;</script>'''
+        query_body=json.dumps({'query':'query Read { public { id } }','variables':{}},separators=(',',':'))
+        if query_mode:
+            sent=query_body if query_mode!='different' else query_body.replace('public','other')
+            if query_mode=='oversized':sent=json.dumps({'query':'{public{id}}','variables':{'padding':'x'*16384}})
+            script="const done=value=>{const p=document.createElement('p');p.textContent=JSON.parse(value).message;document.body.append(p);};"
+            if query_mode=='xhr':
+                script+="const x=new XMLHttpRequest();x.open('POST','/api/query');x.setRequestHeader('Content-Type','application/json');x.onload=()=>done(x.responseText);x.send("+json.dumps(sent)+");"
+            else:
+                script+="fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:"+json.dumps(sent)+"}).then(r=>r.text()).then(done).catch(()=>{});"
+            html+=('<script>'+script+'</script>').encode()
+            if query_mode.startswith('socket-'):
+                html+=b"<script>try{new WebSocket('wss://capture.test/live-updates')}catch(_){}</script>"
         svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="red"/></svg>'
         records = [("https://capture.test/", html, "text/html", 200, ()),
                    ("https://capture.test/redirect.svg", b"", "text/plain", 302,
@@ -235,21 +337,50 @@ document.title='Capture fixture invalid input';</script>
                  "image/svg+xml", 200, ())])
         if not missing:
             records.append(("https://images.test/final.svg", svg, "image/svg+xml", 200, ()))
+        if query_mode:
+            records.append(("https://capture.test/api/query",b'{"message":"Query ready"}',"application/json",200,()))
+        if shadow_image:
+            records.append(("https://capture.test/shadow-broken.svg", b'not an image', "image/svg+xml", 200, ()))
+        if worker_mode:
+            source = b"setTimeout(()=>postMessage('Worker ready'),10);"
+            if worker_mode == 'fetch': source = b"fetch('/worker-data').then(r=>r.text()).then(postMessage);"
+            if worker_mode == 'import': source = b"importScripts('/worker-extra.js');"
+            if worker_mode == 'write': source = b"fetch('/worker-data',{method:'POST',body:'write'}).catch(()=>{});postMessage('Worker ready');"
+            if worker_mode == 'socket': source = b"try{new WebSocket('wss://capture.test/socket')}catch(_){};postMessage('Worker ready');"
+            if worker_mode == 'pending': source = b"setTimeout(()=>postMessage('later'),100000);postMessage('Worker ready');"
+            if worker_mode == 'unknown': source = b"fetch('/not-retained').catch(()=>postMessage('Worker ready'));"
+            if worker_mode == 'quota': source = b"const ids=[];for(let i=0;i<256;i++)ids.push(setTimeout(()=>{},100000));try{setTimeout(()=>{},100000)}catch(_){};ids.forEach(clearTimeout);postMessage('Worker ready');"
+            source = b"if(!globalThis.__tilefinchReplayEnvironment)throw new Error('worker author code escaped initialization');" + source
+            if worker_mode == 'blob':
+                html = html.replace(b"new Worker('/worker.js')", ("new Worker(URL.createObjectURL(new Blob(["+json.dumps(source.decode())+"],{type:'text/javascript'})))").encode())
+                records[0] = ("https://capture.test/", html, "text/html", 200, ())
+            records.append(("https://capture.test/worker.js", source, "text/javascript", 200, ()))
+            records.append(("https://capture.test/worker-data", b'Worker ready', "text/plain", 200, ()))
+            if worker_mode == 'import': records.append(("https://capture.test/worker-extra.js", b"postMessage('Worker ready');", "text/javascript", 200, ()))
         for index, values in enumerate(records):
             record(trace, index, *values)
+        if query_mode:
+            stem=trace/f'{len(records)-1:04d}';body=query_body.encode();hash_value=0xcbf29ce484222325
+            for byte in body:hash_value=((hash_value^byte)*0x100000001b3)&0xffffffffffffffff
+            stem.with_suffix('.request').write_bytes(body)
+            p=stem.with_suffix('.meta');p.write_text(p.read_text().replace('method=GET','method=POST')+
+                f'request-body-length={len(body)}\nrequest-body-hash={hash_value:016x}\nrequest-cookie-bytes=0\nrequest-credentials=0\n')
         (trace / "trace.meta").write_text(
             f"psp-http-trace-clock=1\norigin-ms=1000\ncapture-complete=yes\nrecord-count={len(records)}\n")
         header = (ROOT / "benchmarks/fidelity-scenarios.tsv").read_text().splitlines()[0].split("\t")
         row = dict.fromkeys(header, "-")
         row.update(scenario="capture-fixture", url="https://capture.test/", replay_dir="trace",
                    trace_sha256=trace_digest(trace), expected_http="200", required_title="Capture fixture",
-                   required_state_marker="Fixture ready", device_width="480", device_height="272",
+                   required_state_marker="Action completed" if dismiss else "Query ready" if query_mode else "Fixture ready", device_width="480", device_height="272",
                    css_width="480", css_height="272", scale_numerator="1", scale_denominator="1",
                    checkpoints="top|selector:h1|bottom", reference_state="reference-state.json", limit_mb="32",
                    ticks="1", tick_ms="33", max_download_kb="4096", script_timeout_ms="1000",
                    script_heap_mb="8", script_total_mb="8", script_file_kb="512", script_count="16",
                    min_stylesheets_loaded="0", min_images_loaded="1", min_scripts_loaded="0",
                    min_network_completions="1", max_pending="0")
+        if query_mode=='socket-blocked':row['blocked_origins']='capture.test/live-updates'
+        if worker_mode: row['required_state_marker']='Worker ready'
+        if fragment: row['url'] += '#initial-state'
         manifest = directory / "manifest.tsv"
         manifest.write_text("\t".join(header) + "\n" + "\t".join(row[key] for key in header) + "\n")
         command = [NODE, str(ROOT / "benchmarks/capture-reference.js"), "--scenario", "capture-fixture",
@@ -257,6 +388,16 @@ document.title='Capture fixture invalid input';</script>
                    "--output-root", str(directory / "output"), "--settle-ms", "0"]
         if full:
             command.append("--full-document")
+        if scroll_window:
+            command.extend(["--scroll-window-px", str(scroll_window)])
+        if mobile_auto_fit:
+            command.append("--mobile-auto-fit")
+        if internal_scroll:
+            command.extend(['--scroll-selector', '#absent' if internal_scroll == 'missing' else '#scrollsurface'])
+        if worker_mode: command.append('--dedicated-workers')
+        if query_mode and query_mode!='default':
+            command.append('--retained-query-posts')
+        if dismiss:command.extend(['--click-text','Keep blocking'])
         if os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"):
             command.extend(["--executable", os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"]])
         completed = subprocess.run(command, capture_output=True, text=True, timeout=90)
@@ -269,6 +410,113 @@ document.title='Capture fixture invalid input';</script>
             self.assertEqual(reasons, [], str(reasons))
         audit = json.loads((output / "capture-audit.json").read_text())
         return completed, {**state, **audit}, output
+
+class BrowserCaptureTests(CaptureFixtureBase):
+    def test_shared_cosmetic_policy_preserves_content_and_detects_tampering(self):
+        script = r'''
+const {chromium}=require('playwright'),policy=require(process.argv[1]);
+(async()=>{const b=await chromium.launch({headless:true,
+ executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+ args:['--disable-background-networking','--host-resolver-rules=MAP * ~NOTFOUND']});
+try{for(const enabled of [false,true]){const c=await b.newContext();
+await c.addInitScript(policy.installPolicy,{...policy.loadRules(),enabled});
+await c.route('**/*',r=>r.fulfill({contentType:'text/html',body:'<style>body{margin:0}</style>'+
+ '<div data-csa-c-slot-id="adplacements:detail:test" style="height:50px;margin:20px">Sponsored</div>'+
+ '<div id="content" data-csa-c-slot-id="content:detail:test">Product</div>'}));
+const p=await c.newPage();await p.goto('https://example.test/');
+const result=await p.evaluate(()=>({y:document.querySelector('#content').getBoundingClientRect().y,
+ text:document.body.textContent,evidence:__tilefinchCosmeticEvidence()}));
+if(!result.evidence.ready||!result.text.includes('Sponsored')||!result.text.includes('Product')
+ ||(enabled?result.y!==0:result.y<50))throw Error(JSON.stringify(result));
+if(enabled){await p.evaluate(()=>Array.from(document.querySelectorAll('style'))
+ .find(s=>s.textContent.includes('adplacements:')).sheet.cssRules[0].style.display='block');
+if((await p.evaluate(()=>__tilefinchCosmeticEvidence())).ready)throw Error('CSSOM modification accepted');
+await p.evaluate(()=>Array.from(document.querySelectorAll('style'))
+ .find(s=>s.textContent.includes('adplacements:')).remove());
+if((await p.evaluate(()=>__tilefinchCosmeticEvidence())).ready)throw Error('removed policy accepted');}
+await c.close();}console.log('cosmetic policy passed');}finally{await b.close()}})()
+.catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result = subprocess.run([NODE, '-e', script, str(ROOT / 'benchmarks/cosmetic-blocker-policy.js')],
+            capture_output=True, text=True, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_shared_inline_tracker_policy_preserves_other_scripts_and_errors(self):
+        script = r'''
+const {chromium}=require('playwright'), policy=require(process.argv[1]);
+(async()=>{const b=await chromium.launch({headless:true,
+ executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+ args:['--disable-background-networking','--host-resolver-rules=MAP * ~NOTFOUND']});
+try{const context=await b.newContext();const config=policy.loadRules(),blocks=[];
+await context.exposeBinding('__tilefinchInlineTrackerBlocked',(_s,id,source)=>{
+ if(policy.matchRule('www.amazon.com',source,config.rules)!==id)throw Error('bad evidence');blocks.push(id);
+});
+await context.addInitScript({content:`(${policy.installPolicy})(${JSON.stringify(config)},${policy.matchRule})`});
+const tracker='window.ue_ibe = (window.ue_ibe || 0) + 1; /* n.RXVM=function rx.ex64( /rd/uedata */ window.trackerRan=true;';
+await context.route('**/*',route=>route.request().url()==='https://www.amazon.com/synthetic-inline'
+ ? route.fulfill({contentType:'text/html',body:'<script>window.before=1;</script><script>'+tracker+
+ '</script><script>window.after=1;window.ue_ibe=7;</script><script>throw Error("ordinary author error")</script>'})
+ : route.abort());
+const p=await context.newPage(),errors=[];p.on('pageerror',e=>errors.push(e.message));
+await p.goto('https://www.amazon.com/synthetic-inline');
+const state=await p.evaluate(()=>({before,after,tracker:window.trackerRan,metric:ue_ibe,
+ text:document.scripts[1].text,evidence:__tilefinchInlineTrackerEvidence()}));
+if(state.before!==1||state.after!==1||state.tracker!==undefined||state.metric!==7||state.text!==tracker
+ ||!state.evidence.ready||state.evidence.blocked!==1||blocks.length!==1
+ ||JSON.stringify(errors)!==JSON.stringify(['ordinary author error']))throw Error(JSON.stringify({state,blocks,errors}));
+await p.evaluate(()=>delete window.ue_ibe);
+if((await p.evaluate(()=>__tilefinchInlineTrackerEvidence())).ready)throw Error('tampered guard accepted');
+console.log('inline tracker policy passed');
+}finally{await b.close()}})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result = subprocess.run([NODE, '-e', script, str(ROOT / 'benchmarks/inline-tracker-policy.js')],
+            capture_output=True, text=True, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_environment_preflight_and_failed_image_contracts(self):
+        result = subprocess.run([NODE, str(ROOT / "tests/playwright_reference_contract.js")],
+                                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_mobile_auto_fit_preserves_the_entire_physical_viewport(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, state, output = self.capture(Path(temporary),
+                wide_layout=True, mobile_auto_fit=True, scroll_window=1024)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertTrue(state['capture_ready'])
+            self.assertEqual(state['capture_scope'], 'mobile-auto-fit-window-diagnostic-v1')
+            self.assertEqual(state['viewport']['auto_fit']['profile']['width'], 494)
+            for view in state['full_document']['viewports']:
+                profile = view['input_profile']['after']
+                self.assertEqual(profile, view['input_profile']['before'])
+                self.assertEqual((profile['screenWidth'], profile['screenHeight']), (480,272))
+                self.assertTrue(profile['coarse'])
+                width, height, pixels = read_png(output/view['frame'])
+                self.assertEqual((width, height), (480,272))
+                # The physical bottom row must be present, not padded/cropped.
+                self.assertEqual(pixels[((height-1)*width+width//2)*3:][:3], bytes((0,255,0)))
+
+    def test_visible_shadow_content_is_required_not_only_a_matching_title(self):
+        for hidden in (False, True):
+            with self.subTest(hidden=hidden), tempfile.TemporaryDirectory() as temporary:
+                completed, state, _ = self.capture(Path(temporary),
+                    shadow_marker=True, hidden_shadow_marker=hidden, scroll_window=1024)
+                self.assertEqual(completed.returncode, 3 if hidden else 0,
+                                 completed.stdout + completed.stderr)
+                self.assertEqual(state['capture_ready'], not hidden)
+                if hidden:
+                    self.assertIn('reference-state-marker-missing', state['eligibility_reasons'])
+
+    def test_painted_shadow_image_failure_is_not_hidden_by_the_host_boundary(self):
+        for hidden in (False, True):
+            with self.subTest(hidden=hidden), tempfile.TemporaryDirectory() as temporary:
+                completed, state, _ = self.capture(Path(temporary),
+                    shadow_image='hidden' if hidden else 'visible')
+                self.assertEqual(completed.returncode, 0 if hidden else 3,
+                                 completed.stdout + completed.stderr)
+                self.assertEqual(state['capture_ready'], hidden)
+                if not hidden:
+                    self.assertIn('reference-paintable-images-incomplete', state['eligibility_reasons'])
 
     def test_redirect_and_lazy_images_are_replayed_and_verified(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -283,14 +531,24 @@ document.title='Capture fixture invalid input';</script>
             self.assertEqual(state["full_document"]["viewports"][-1]["incomplete"], 0)
             self.assertEqual(state["replay_ledger"]["requests"], 5)
 
-    def test_long_discussion_is_swept_without_allocating_a_full_page_image(self):
+    def test_window_capture_does_not_claim_the_document_bottom(self):
         with tempfile.TemporaryDirectory() as temp:
-            result, state, output = self.capture(Path(temp), long_document=True)
+            result, state, output = self.capture(Path(temp), long_document=True,
+                scroll_window=4096, distant_image=True)
             self.assertEqual(result.returncode, 0, json.dumps(state, indent=2))
-            self.assertGreater(state['full_document']['steps'], 256)
-            self.assertGreater(state['full_document']['final_extent']['height'], 65000)
-            self.assertTrue(census.complete_state(json.loads((output / 'reference-state.json').read_text())))
-            self.assertFalse((output / 'full-page.png').exists())
+            self.assertEqual(state['capture_scope'], 'viewport-window-diagnostic-v1')
+            full = state['full_document']
+            self.assertEqual(full['version'], 'bounded-viewport-window-v1')
+            self.assertEqual(full['window_scroll_limit'], 4096)
+            self.assertEqual([v['scroll_y'] for v in full['viewports']], [0,1024,2048,3072,4096])
+            self.assertGreater(full['final_extent']['maximum'], 4096)
+            self.assertTrue(all(not view['full_document'] for view in full['viewports']))
+            self.assertTrue(all(not any('/outside-window.svg' in image['src']
+                for image in view['images']) for view in full['viewports']))
+            raw = json.loads((output/'reference-state.json').read_text())
+            self.assertEqual(raw['checkpoints'][-1]['kind'], 'offset')
+            self.assertTrue(state['capture_ready'])
+            self.assertFalse(census.complete_state(json.loads((output/'reference-state.json').read_text())))
 
     def test_corrupt_painted_child_image_refuses_complete_capture(self):
         for full in (False, True):
@@ -373,6 +631,112 @@ document.title='Capture fixture invalid input';</script>
             self.assertEqual(state["replay_ledger"]["requests"], 8)
             self.assertGreaterEqual(state["target_interception"]["targets"], 2)
             self.assertTrue(state["target_interception"]["ready"])
+
+
+class LongDocumentCaptureTests(CaptureFixtureBase):
+    def test_long_discussion_is_swept_without_allocating_a_full_page_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, state, output = self.capture(Path(temp), long_document=True)
+            self.assertEqual(result.returncode, 0, json.dumps(state, indent=2))
+            self.assertGreater(state['full_document']['steps'], 256)
+            self.assertGreater(state['full_document']['final_extent']['height'], 65000)
+            self.assertTrue(census.complete_state(json.loads((output / 'reference-state.json').read_text())))
+            self.assertFalse((output / 'full-page.png').exists())
+
+
+class ScrollSurfaceCaptureTests(CaptureFixtureBase):
+    def test_internal_scroller_captures_real_offsets_and_lazy_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, state, output = self.capture(Path(temporary), internal_scroll='normal', scroll_window=1024)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertTrue(state['capture_ready'])
+            self.assertEqual(state['capture_scope'], 'element-scroll-window-diagnostic-v1')
+            views = state['full_document']['viewports']
+            self.assertGreater(views[-1]['scroll_y'], 500)
+            for view in views:
+                surface = view['scroll_surface']
+                self.assertEqual(surface['selector'], '#scrollsurface')
+                self.assertEqual(surface['y'], view['requested'])
+                self.assertEqual((surface['outer_x'], surface['outer_y']), (0,0))
+                self.assertEqual(surface['height'], 232)
+                self.assertEqual((read_png(output/view['frame'])[:2]), (480,272))
+            self.assertNotEqual((output/views[0]['frame']).read_bytes(), (output/views[-1]['frame']).read_bytes())
+
+    def test_window_navigation_preserves_fragment_without_changing_http_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, state, _ = self.capture(Path(temporary), fragment=True, scroll_window=1024)
+            self.assertEqual(completed.returncode, 0, str(state.get('eligibility_reasons')))
+            self.assertEqual(state['url'], 'https://capture.test/')
+            self.assertEqual(state['navigation']['requested'], 'https://capture.test/#initial-state')
+            self.assertEqual(state['navigation']['observed'], state['navigation']['requested'])
+
+    def test_internal_scroller_refuses_missing_ambiguous_hidden_and_non_scrolling_targets(self):
+        for mode in ('missing', 'duplicate', 'hidden', 'static'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                completed, state, _ = self.capture(Path(temporary), internal_scroll=mode, scroll_window=1024)
+                self.assertEqual(completed.returncode, 3, completed.stdout + completed.stderr)
+                self.assertFalse(state['capture_ready'])
+                self.assertTrue(state['failure'].startswith('full-document:'), state['failure'])
+
+
+@unittest.skipUnless(os.name == "posix", "worker capture requires POSIX process ownership")
+class WorkerCaptureTests(CaptureFixtureBase):
+    def test_dedicated_worker_has_offline_routing_and_logical_timers(self):
+        for mode in ('timer', 'fetch', 'blob', 'import'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                completed, state, _ = self.capture(Path(temporary), worker_mode=mode, scroll_window=1024)
+                self.assertEqual(completed.returncode, 0, str(state.get('failure')) + str(state.get('eligibility_reasons')) + completed.stderr)
+                self.assertTrue(state['capture_ready'])
+                self.assertEqual(state['capture_scope'], 'dedicated-worker-window-diagnostic-v1')
+                self.assertTrue(state['offline_capability_policy']['worker_evidence']['ready'])
+                self.assertEqual(state['offline_capability_policy']['worker_evidence']['admitted'], 1)
+                evidence = state['offline_capability_policy']['worker_evidence']
+                self.assertGreaterEqual(evidence['transport']['held_total'], 1)
+                self.assertEqual(evidence['transport']['held'], 0)
+                self.assertTrue(evidence['transport']['profile_removed'])
+                self.assertEqual(evidence['realms'][0]['messages'], 1)
+                if mode in ('timer', 'blob'): self.assertEqual(evidence['realms'][0]['callbacks'], 1)
+
+    def test_worker_writes_are_denied_and_uncontained_work_cannot_qualify(self):
+        for mode in ('write', 'socket', 'pending', 'unknown', 'quota'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                completed, state, _ = self.capture(Path(temporary), worker_mode=mode, scroll_window=1024)
+                self.assertEqual(completed.returncode, 0 if mode == 'write' else 3,
+                    str(state.get('failure')) + str(state.get('eligibility_reasons')))
+                if mode == 'write':
+                    self.assertEqual(state['read_only_policy']['diagnostics']['by_method'].get('POST'), 1)
+                    self.assertEqual(state['replay_ledger']['unmatched'], 0)
+                else: self.assertFalse(state['capture_ready'])
+
+
+@unittest.skipUnless(PLAYWRIGHT, "Node/Playwright is unavailable")
+class QueryBrowserCaptureTests(unittest.TestCase):
+    capture = BrowserCaptureTests.capture
+
+    def test_retained_query_replay_is_body_exact_and_opt_in(self):
+        for mode in ('fetch','xhr','different','default','oversized','socket-blocked','socket-unknown'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as temp:
+                result,state,output=self.capture(Path(temp),scroll_window=4096,query_mode=mode)
+                if mode in ('fetch','xhr','socket-blocked'):
+                    self.assertEqual(result.returncode,0,json.dumps(state,indent=2))
+                    self.assertEqual(state['capture_scope'],'retained-query-window-diagnostic-v1')
+                    self.assertEqual(state['read_only_policy']['denied_before_network'],0)
+                    self.assertEqual(len(state['read_only_policy']['retained_query_sha256']),1)
+                    self.assertFalse(census.complete_state(json.loads((output/'reference-state.json').read_text())))
+                else:
+                    self.assertEqual(result.returncode,3,json.dumps(state,indent=2))
+                    if mode=='socket-unknown':
+                        self.assertGreater(state['offline_capability_policy']['diagnostics']['total'],0)
+                    else:self.assertGreater(state['read_only_policy']['denied_before_network'],0)
+                    if mode=='different':self.assertFalse(state['read_only_policy']['ready'])
+
+    def test_reviewed_control_action_is_recorded_and_not_a_default_state_oracle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result,state,output=self.capture(Path(temp),scroll_window=4096,dismiss=True)
+            self.assertEqual(result.returncode,0,json.dumps(state,indent=2))
+            self.assertEqual(state['capture_scope'],'interaction-window-diagnostic-v1')
+            self.assertEqual(state['pre_capture_action'],{'kind':'visible-control-click','text':'Keep blocking','count':1})
+            self.assertFalse(census.complete_state(json.loads((output/'reference-state.json').read_text())))
 
 
 if __name__ == "__main__":

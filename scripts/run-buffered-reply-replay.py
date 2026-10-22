@@ -191,9 +191,7 @@ def main():
     parser.add_argument("--match-region", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
                         help="explicit reference pixel region, excluding native chrome if needed")
     parser.add_argument("--build-dir", type=Path, default=Path("build-preset-release"))
-    parser.add_argument("--lab-target", choices=("psp-browser-interactive-lab",
-                        "psp-browser-native-tier-native-lab",
-                        "psp-browser-native-tier-reference-lab"),
+    parser.add_argument("--lab-target", choices=("psp-browser-interactive-lab",),
                         default="psp-browser-interactive-lab")
     args = parser.parse_args()
     page_options, page_configuration = page_replay_options(args.content_blocker, args.user_css)

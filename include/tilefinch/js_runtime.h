@@ -95,6 +95,8 @@ bool script_execution_policy_for_profile(
 #define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC 16352u
 #define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX \
     SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC
+_Static_assert(DOCUMENT_CSSOM_SHEET_LIMIT == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX,
+               "the CSSOM override registry holds one entry per DOM handle");
 
 typedef struct {
     bool success;
@@ -440,6 +442,8 @@ typedef struct {
     bool sampled_clock;
 } ScriptSchedulerSnapshot;
 
+#if !defined(__PSP__)
+/* Host lab only: the private-session XHR history. */
 enum { SCRIPT_XHR_DIAGNOSTIC_LIMIT = 32, SCRIPT_XHR_DIAGNOSTIC_COLUMNS = 10 };
 enum { SCRIPT_PRIVATE_OUTCOME_COUNT = 13 };
 typedef struct {
@@ -472,13 +476,12 @@ typedef struct {
        response reads, readystatechange events, progress events, load events.
        No request/response contents, URLs, headers or callback identities. */
     uint32_t rows[SCRIPT_XHR_DIAGNOSTIC_LIMIT][SCRIPT_XHR_DIAGNOSTIC_COLUMNS];
-#if !defined(__PSP__)
     /* Opt-in numeric staging census; never stores request or response text. */
     size_t staging_count;
     size_t staging_overwritten;
     size_t staging_rows[16][12];
-#endif
 } ScriptXHRDiagnostics;
+#endif
 
 /* Validation census for the bounded PSP WebGL translator. Shipping builds
    expose an empty snapshot without adding timing work to the frame path. */
@@ -1248,6 +1251,9 @@ typedef struct {
        callers must leave this false: native realm primitives are otherwise
        installed non-writable, non-configurable, and non-enumerable. */
     bool allow_test_network_primitive_overrides;
+    /* Host-test seam: build the realm without the bootstrap's test-only
+       probes, as the shipping PSP build always does. Ignored there. */
+    bool omit_test_probes;
     /* Trusted audio backend selection, not a page-visible capability. Browser
        configuration selects native slots; zero-initialized standalone callers
        retain the reference JavaScript implementation for differential tests.
@@ -1319,6 +1325,7 @@ bool script_runtime_scheduler_snapshot(
    The private JSON observer changes JSON.parse identity, but preserves its
    arguments, receiver, return value and exception; it does not see aliases
    captured before enablement. It is diagnostic, not ordinary browsing. */
+#if !defined(__PSP__)
 bool script_runtime_xhr_diagnostics(
     ScriptRuntime *runtime, bool enable, ScriptXHRDiagnostics *snapshot);
 /* Trusted local diagnostic source only, never called for ordinary browsing.
@@ -1329,6 +1336,7 @@ bool script_runtime_private_outcome_classifier(
     ScriptRuntime *runtime, const char *source, size_t length);
 /* Explicit local diagnostic sampling only: bounded 13-bit stage masks. */
 unsigned script_runtime_private_probe(ScriptRuntime *runtime, bool failures);
+#endif
 
 typedef struct {
     bool selected_native;
@@ -1664,25 +1672,14 @@ ScriptRuntime *script_runtime_create_configured(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
     unsigned timeout_ms, const char *document_url,
     const ScriptRuntimeOptions *options, ScriptResult *result);
-ScriptRuntime *script_runtime_create_with_session_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    BrowserSession *session, int css_viewport_width,
-    int css_viewport_height, int device_width, int device_height,
-    ScriptResult *result);
 ScriptRuntime *script_runtime_create_deferred(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
     unsigned timeout_ms, const char *document_url,
     BrowserSession *session, ScriptResult *result);
-ScriptRuntime *script_runtime_create_deferred_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    BrowserSession *session, int css_viewport_width,
-    int css_viewport_height, int device_width, int device_height,
-    ScriptResult *result);
 bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
                                     lxb_dom_node_t *script_node,
                                     bool module, ScriptResult *result);
+bool script_runtime_block_inline_tracker(ScriptRuntime *runtime, lxb_dom_node_t *node);
 typedef enum {
     SCRIPT_INLINE_DATA_FALLBACK = 0,
     SCRIPT_INLINE_DATA_APPLIED,
@@ -1805,6 +1802,10 @@ void script_runtime_media_recheck(ScriptRuntime *runtime);
    before the next parser-blocking script executes, then perform the required
    microtask checkpoint. */
 bool script_runtime_parser_mutation_checkpoint(ScriptRuntime *runtime);
+/* Run at most one due non-rendering timer task between parser deliveries.
+   Network completions and rendering tasks retain their normal owner turns. */
+bool script_runtime_parser_timer_runnable(ScriptRuntime *runtime);
+bool script_runtime_parser_timer_checkpoint(ScriptRuntime *runtime);
 bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
                                         const char *source,
                                         const char *source_url,
@@ -1988,7 +1989,6 @@ bool script_runtime_dispatch_pointer_node(
    the synchronous event callback. Embedders notify ancestor runtimes for a
    trusted child-frame input before dispatching the event. */
 void script_runtime_notify_user_activation(ScriptRuntime *runtime);
-bool script_runtime_has_transient_user_activation(ScriptRuntime *runtime);
 bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
                                         lxb_dom_node_t *node,
                                         const char *event_type,
@@ -2164,6 +2164,10 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                                  int device_height);
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images);
+/* Pause detached image work before replacing its borrowed stylesheet or
+   competing for the shared decoder. Pending sources retry in a later turn;
+   this does not dispatch author callbacks or discard completed preloads. */
+void script_runtime_pause_image_preloads(ScriptRuntime *runtime);
 /* Whether this realm has attached any shadow root (so shadow composition
    can change what renders; see document_shadow_light_child_rendered). */
 bool script_runtime_has_shadow_roots(const ScriptRuntime *runtime);

@@ -122,8 +122,8 @@ the session cache or the next app launch, and under memory pressure only the
 bytecode is released; the script stays a hit and compiles from its source,
 read on demand, instead of missing to the network.
 
-Measured on the host (`tilefinch-offline-app-limits-tests`, realistic 24 MiB
-budget), the launch's Budget peak and what it leaves resident fell from
+Measured on the host (`tilefinch-offline-app-limits-tests`, a 24 MiB
+embedder-default budget), the launch's Budget peak and what it leaves resident fell from
 1.42/0.90 MB to 0.37/0.35 MB for Treadline and from 2.07/1.66 MB to
 0.65/0.63 MB for 1 MiB of synthetic script. Those Treadline figures were for
 an older five-script model of the game; the test now installs the shipped
@@ -333,7 +333,10 @@ The host `tilefinch-file-download-tests` runs synthetic streaming, recovery,
 filename, confirmation, and allocation-refusal checks without network access.
 Its optional `--fetch-url HTTPS_URL EXPECTED_SHA256` mode performs one public
 download into a temporary host directory, checks its complete SHA-256, reports
-bytes and Budget peak, then deletes it. `--source-journey PAGE_URL FILE_URL
+bytes and Budget peak, then deletes it. `--fetch-keep HTTPS_URL
+EXPECTED_SHA256 COPY_PATH` does the same but also copies the verified file to
+COPY_PATH, which must not exist yet (for example, to qualify it with
+`tilefinch-zip-install-tests --qualify-archive`). `--source-journey PAGE_URL FILE_URL
 EXPECTED_SHA256` additionally checks actual rendered-link activation, native
 confirmation and cancellation continuity. `tilefinch-zip-install-tests` covers
 staging, publication, corrupt/unsafe archives, cancellation and allocation

@@ -18,6 +18,43 @@ patch on a patch, and a validation rewrite rejected already-patched trees),
 and every engine change was reviewable only as a patch file. Now an engine
 change is an ordinary diff.
 
+Prototype changes release their retained proposed prototype if copy-on-write
+shape preparation refuses an allocation. The original prototype remains
+unchanged; failed bootstrap setup must not leave that retained reference and
+its reachable realm alive. `test_quickjs_oom --set-prototype-only` checks
+refusal, successful replacement and zero ownership after teardown.
+
+A lazily initialized property (every `JS_DEF_CFUNC`/`JS_DEF_OBJECT` list
+entry, including the built-in prototypes' methods) keeps its autoinit record
+when the initializer or the global variable reference is refused, so a later
+access retries. Upstream cleared the record first and left a permanent
+`undefined`. `test_quickjs_oom --global-autoinit-only` checks that every
+global and ordinary-object entry is still a function after a refusal.
+
+Closures with exactly one capture and no home-object requirement store that
+capture in the otherwise unused home-object slot. Indexed capture accesses
+keep their ordinary vector path; methods needing `super` retain the separate
+vector and home object. Marking and finalization distinguish inline storage,
+including partially initialized closures. The native-call suite checks live
+storage against otherwise equivalent capture-free closures, and
+`test_quickjs_oom --capture-refusal-only` covers collection and allocation
+refusal during construction. Memory summaries include capture vectors and
+shared variable references rather than overwriting them with bytecode totals.
+
+Common function `length`/`name` pairs share immutable two-property tables
+within their realm: empty, `get`, or `set` names with arities zero through
+three, at most twelve entries. Functions borrow an existing entry at creation;
+internal name inference can switch entries directly. Author definitions,
+additions and deletions detach before obtaining writable property pointers.
+A refused detach leaves both the function and cache unchanged. Optional index
+allocation failure keeps ordinary owned storage without throwing. The cache
+owns only scalar/string values, survives through function bytecode's realm
+ownership, and is released at realm teardown; constructors and other shapes
+retain normal storage. Native-call and `--metadata-refusal-only` OOM tests
+cover descriptors, mutation isolation, methods, cross-realm lifetime, cycles
+and refusal. The optional-array patch's initializer context stops at the shape
+assignment so it does not depend on owned versus borrowed allocation spelling.
+
 `cmake/TilefinchDependencies.cmake` pins the SHA-256 of `quickjs.c` and
 `quickjs.h`, and one combined fingerprint of the other sources whose
 change can alter compiled bytecode (`quickjs-atom.h`, `quickjs-opcode.h`,
@@ -30,6 +67,13 @@ which keys the persistent compiled-script tier and lazy bundle records,
 hashes the compiled `quickjs.c` together with that combined fingerprint.
 The lab variants' pins cover only their `quickjs.c` (the other sources are
 copied unchanged), so they move only when `quickjs.c` or a patch does.
+
+Tiny function source spans (at most 256 bytes) keep their existing private
+copy instead of pinning a shared backing of at least 64 KiB. Larger and
+nested source spans retain sharing. Bytecode restoration follows the same
+policy, with shared ownership as the allocation-refusal fallback. Exact
+`toString`, eager/lazy calls, cache restoration, and source release are covered
+by `test_quickjs_oom --small-source-only`.
 
 Host and validation builds can also enable an independent execution census
 (`CONFIG_TILEFINCH_EXECUTION_CENSUS`). Its C-only API enables per-runtime
@@ -504,6 +548,16 @@ so its difference from malloc usage must not be described as reclaimable memory.
     re-arm is unchanged. Tilefinch's pacing (`js_rt_gc_pacing`) uses it to
     stop near-limit collection thrash. The lab-variant baseline and variant
     pins moved with this change.
+33. `test-refuse-allocation` (not a patch layer, host builds only) —
+    `JS_TestRefuseAllocation(n)` makes `js_malloc_rt` (or a
+    `js_realloc_rt` growth past its block) refuse the Nth allocation from
+    then on, once, and `JS_TestRefusalPending` tells whether it is still
+    to come. The engine's own arenas serve most allocations without the
+    embedding's allocator, so Budget-level refusal cannot reach them; this
+    lets a host test refuse each allocation of one operation in turn
+    (`test_js_responsiveness --event-state-oom-only`). Compiled out under
+    `__PSP__`. The lab-variant baseline and variant pins moved with this
+    change.
 
 FinalizationRegistry callbacks use a separate runtime-owned job list. The
 host drains it through `JS_ExecutePendingCleanupJob` as bounded tasks after
@@ -520,10 +574,7 @@ Turning `PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH` or
 `quickjs.h` into the binary directory, reverses the optional/default layers down to the
 shared bounded baseline (fingerprint checked), re-applies them with the
 chosen options, and checks the result against a fingerprint pinned for that
-combination. The vendored tree is never modified. The experimental VM patch
-(`vm-profile`) and the `latin1-string-vm` and `array-growth-128k-migration`
-patches are history only; configure refuses
-`PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH=ON`.
+combination. The vendored tree is never modified.
 
 ## Updating upstream
 

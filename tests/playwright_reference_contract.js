@@ -343,7 +343,7 @@ async function main() {
       locale: "en-US", calendar: "gregory", numberingSystem: "latn", timeZone: "UTC",
       year: "numeric", month: "numeric", day: "numeric",
     },
-    time: "10:13:20 PM",
+    time: "10 PM",
     number: "1,234.5",
     percent: "25%",
     currency: "USD 1,234.5",

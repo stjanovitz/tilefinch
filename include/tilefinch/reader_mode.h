@@ -43,18 +43,17 @@ typedef struct {
 /* Analyze one loaded DOM and install one hidden, bounded semantic Reader tree
    in a single operation. The raw DOM remains intact; the generic Reader
    stylesheet switches which tree is presented. The caller keeps the result
-   beside the page and does not repeat this work while scrolling. */
-bool reader_document_prepare(PocDocument *document,
-                             ReaderDocumentAnalysis *analysis);
-/* The navigation path supplies its already-built stylesheet so authored
-   display/visibility rules participate in primary-media admission. Tests and
-   reduced callers may use reader_document_prepare(), which retains the
-   markup-only fallback. */
-bool reader_document_prepare_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis);
-/* Settled source sizing is optional and checked against the source revisions.
-   It prevents small header images expanding when wrappers are flattened. */
+   beside the page and does not repeat this work while scrolling.
+
+   The browser supplies its already-built stylesheet, so authored
+   display/visibility rules participate in primary-media admission, and
+   optionally the settled source layout: it calls
+   reader_document_prepare_with_layout, _complete_with_layout,
+   _complete_with_stylesheet and _detached_with_stylesheet, and the Basic
+   view's _basic_complete_with_layout. A NULL stylesheet keeps the
+   markup-only fallback. Settled source sizing is checked against the
+   source revisions; it prevents small header images expanding when wrappers
+   are flattened. */
 struct LayoutDocument;
 bool reader_document_prepare_with_layout(
     PocDocument *document, const Stylesheet *stylesheet,
@@ -92,18 +91,30 @@ bool reader_document_prepare_complete_with_stylesheet(
    are flattened to non-actionable content. The complete variant builds the
    entire candidate in temporary storage and installs nothing when any
    structural/byte/form bound is reached. */
-bool reader_document_prepare_basic_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis);
-bool reader_document_prepare_basic_complete_with_stylesheet(
-    PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis);
 /* Optional settled source geometry keeps small CSS-sized images from
    expanding to their intrinsic size when layout wrappers are flattened.
    The caller must not supply a layout with unpublished DOM mutations. */
 bool reader_document_prepare_basic_complete_with_layout(
     PocDocument *document, const Stylesheet *stylesheet,
     const struct LayoutDocument *layout, ReaderDocumentAnalysis *analysis);
+
+#ifndef __PSP__
+/* Host test shorthands for the entry points above, without a source layout
+   (and, for the first, without a stylesheet). The browser does not use
+   them. */
+bool reader_document_prepare(PocDocument *document,
+                             ReaderDocumentAnalysis *analysis);
+bool reader_document_prepare_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis);
+/* The non-complete Basic view, which may install a shortened view. */
+bool reader_document_prepare_basic_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis);
+bool reader_document_prepare_basic_complete_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis);
+#endif
 
 /* Remove the exact native extracted root most recently appended for `kind`
    and its body marker. This is the allocation-failure rollback used when the

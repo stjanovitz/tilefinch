@@ -29,6 +29,10 @@ typedef enum {
 } ImageDecodeProbeResult;
 
 bool image_decode_busy(void);
+/* Lossless one-byte samples for sequential grayscale JPEGs, used only by
+   the renderer's pressure fallback. Not an RGBA surface. */
+ImageDecodeStatus image_resource_decode_gray_checked(
+    const ImageResource *image, Budget *budget, unsigned char **decoded);
 /* Peak bytes the last image_resource_decode_checked() held at once (its
    allocations, libwebp's, and the output). */
 size_t image_decode_last_peak_bytes(void);

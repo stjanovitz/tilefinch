@@ -1171,6 +1171,10 @@ static bool script_execute_inline_admitted(
     ExternalScriptMetrics *metrics)
 {
     script_runtime_script_mark_started(runtime, node);
+    if (!module && script_runtime_block_inline_tracker(runtime, node)) {
+        metrics->policy_refusals++;
+        return true;
+    }
     if (!module && prefer_data) {
         size_t source_length = 0;
         if (script_admit_inline_data_node(

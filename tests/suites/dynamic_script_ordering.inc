@@ -5,8 +5,11 @@ static bool test_dynamic_classic_and_error(Budget *budget)
         "globalThis.classicExecuted=true;"
         "globalThis.classicProbe=document.currentScript?.id==="
         "'dynamic-classic'?'current':'wrong';"
-        "Promise.resolve().then(()=>{globalThis.classicAfter="
-        "document.currentScript===null?'restored':'leaked';});";
+        /* Script cleanup checkpoints run before currentScript is restored.
+           Load handlers and later timer tasks must still see null. */
+        "Promise.all([Promise.resolve(),Promise.resolve()]).then(()=>{"
+        "globalThis.classicAfter=document.currentScript?.id==="
+        "'dynamic-classic'?'checkpoint-current':'checkpoint-wrong';});";
     static const char error_source[] =
         "throw new Error('intentional dynamic script failure');";
     static const char append_classic[] =
@@ -52,7 +55,7 @@ static bool test_dynamic_classic_and_error(Budget *budget)
     REQUIRE(navigation.page.script_result.network_requests == requests);
     size_t advances = 0;
     REQUIRE(advance_until(
-        &navigation, "classic:load:current:restored:load-restored",
+        &navigation, "classic:load:current:checkpoint-current:load-restored",
         8, &advances));
     REQUIRE(advances > 0 && browser.cache_hits == hits + 1u);
     REQUIRE(navigation.page.script_result.network_requests == requests + 1u);
@@ -632,7 +635,8 @@ static bool test_remove_pending_still_executes(Budget *budget)
         "pendingDynamic&&!pendingDynamic.isConnected)?"
         "'current-detached':'wrong';"
         "Promise.resolve().then(()=>{globalThis.detachedAfter="
-        "document.currentScript===null?'restored':'leaked';});";
+        "document.currentScript===pendingDynamic?"
+        "'checkpoint-current':'checkpoint-wrong';});";
     static const char later_source[] =
         "globalThis.laterDynamicExecuted=true;";
     static const char append_pending[] =
@@ -657,7 +661,7 @@ static bool test_remove_pending_still_executes(Budget *budget)
         "globalThis.pocSummary='remove:detached:' + "
         "(!pendingDynamic.isConnected?'yes':'no');";
     static const char expected[] =
-        "remove:completed:current-detached:restored:load-restored:"
+        "remove:completed:current-detached:checkpoint-current:load-restored:"
         "recovered:load";
     ScriptReplayRecord records[] = {{
         .url = "https://remove.test/pending.js",

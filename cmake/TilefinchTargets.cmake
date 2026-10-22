@@ -141,6 +141,7 @@ add_library(tilefinch_psp_app_support STATIC
     src/psp_lifecycle.c
     src/psp_profile_store.c
     src/psp_glyph_component_session.c
+    src/psp_ui_language_repair.c
     src/psp_voice_component_session.c
     src/psp_update_session.c)
 target_include_directories(tilefinch_psp_app_support PUBLIC include)
@@ -211,6 +212,8 @@ endif()
 # through both presenters and requires them to agree pixel for pixel.
 target_link_libraries(tilefinch_psp_media_present PUBLIC
     tilefinch_psp_media_scale)
+target_link_libraries(psp-browser-interactive-lab PRIVATE
+    tilefinch_psp_media_present)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_psp_media_present PRIVATE
         -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
@@ -476,8 +479,8 @@ if(PSP)
         target_link_options(psp-browser-script PRIVATE
             "LINKER:--defsym=_vfiprintf_r=_vfprintf_r"
             "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
-        # Code-layout experiments (PERFORMANCE_LEDGER.md, "Profile-ordered
-        # code layout"). Every function already has its own section
+        # Code-layout experiments (.private-investigations/PERFORMANCE_LEDGER.md,
+        # "Profile-ordered code layout"). Every function already has its own section
         # (-ffunction-sections), so a
         # GNU ld --section-ordering-file places a profiled hot set first and
         # contiguous in .text, inside as few 8 KiB I-cache ways as it needs.
@@ -670,125 +673,15 @@ if(PSP)
             # pack-pbp is a POST_BUILD step, so the packaged EBOOT keeps its
             # old ICON0 unless the link itself depends on the asset.
             "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/tilefinch-icon0-144x82.png")
+        # PSP .text ratchets; history is in git. Raising either limit
+        # needs a re-measurement and a device-cost justification (AGENTS.md).
         if(TILEFINCH_PSP_VALIDATION_LOG)
-            # Native game-audio envelopes keep attack/release progress on the
-            # mixer thread while JavaScript stalls. Keep validation probes
-            # out of the shipping ratchet while allowing measured device-only
-            # instrumentation to grow without code-golfing production paths.
-            # Raised by 200,000 bytes (user-approved) for the measurement
-            # tiers (work vector, offline replay): validation was within
-            # 1.3 KB of the old 4,500,000-byte limit.
-            # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
-            # engine (TilefinchDependencies.cmake): 4,548,332 -> 4,824,900.
-            # Native AudioParam scheduling measured 5,001,716 bytes with all
-            # validation probes retained (previous image: 4,974,340). Its
-            # device component tests reduce scheduling CPU by 59-73%; whole
-            # gameplay qualification remains opt-in. Admit a user-approved
-            # 24 KiB validation-only increase; shipping keeps its own limit.
-            # Installed-app heap, deferred script source and recompile
-            # work plus the larger game menus measured 5,029,216 bytes in
-            # validation. The user approved a validation-only ceiling of
-            # 5,500,000 bytes (2026-10-04); shipping keeps its own limit.
+            # Validation-only: 5,500,000 bytes, user-approved 2026-10-04;
+            # last recorded 5,029,216 bytes (2026-10-04).
             set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
         else()
-            # Security-boundary retirement and private lazy Worker compiler
-            # installation are native fail-closed paths.  Their measured
-            # device cost is admitted explicitly rather than code-golfing
-            # ownership checks at the browser/runtime boundary.
-            # The bounded WebAssembly JavaScript adapter adds 14,148 bytes of
-            # resident bridge code.  The 230+ KiB interpreter remains in the
-            # lazy tilefinch-wasm.prx and therefore does not affect boot.
-            # Security hardening for active-document principals and bounded
-            # WebAssembly/QuickJS execution measured 4,470,576 bytes. Keep
-            # 9,424 bytes of the user-approved 10 KiB growth allowance.
-            # Raised by 280,000 bytes (user-approved) for the -O2 JavaScript
-            # engine: first usable input -3.2 s and first answer -6.5 s on
-            # the device (chatgpt-ask); this build 4,647,460 bytes.
-            # Bounded native playlist/subscription actions and the paired
-            # non-ASCII glyph-cache lookup measured 4,764,444 bytes. The
-            # user approved an 8,000-byte increase: these actions run in
-            # cooperative navigation jobs, not the gameplay frame path,
-            # and the glyph lookup retains the existing cache allocation.
-            # The bounded chapter overlay measured 4,770,704 bytes. The
-            # user approved 4 KiB more code; its 24-entry catalog is owned
-            # by the media presentation, with no frame-path allocation or
-            # network work and no growth of the hot UI snapshot.
-            # Bounded select-history restoration and offline history routing
-            # measure 4,773,760 bytes. The user approved 2 KiB more code;
-            # snapshots reuse the existing RAM-only history records, and
-            # restoration runs before candidate publication, not per frame.
-            # Compact controls, placeholder styling and bounded generated
-            # decoration fixes measure 4,785,392 bytes after consolidation.
-            # The user approved 2 KiB more code; unequal border widths use
-            # existing command fields with no additional raster surface.
-            # Placeholder indexing adds only 8 bytes per stylesheet, and
-            # all new layout work is outside the per-frame raster loop.
-            # Final grid stretching, DOM interface brands and fitted image
-            # corner spans measure 4,795,176 bytes. The user approved 3 KiB;
-            # geometry is updated in place with no retained surface growth.
-            # Current geometry adoption and immutable raster lifetime keys
-            # measure 4,796,684 bytes. The user approved 2 KiB more code.
-            # They eliminate redundant flow/raster work without relaxing
-            # page limits, cache byte ceilings or pressure reclamation.
-            # Bounded TrueType WOFF2 decoding plus opacity-only geometry
-            # reuse measure 4,839,912 bytes. The user approved 40 KiB then
-            # 1 KiB more code. Brotli allocations share the existing capped
-            # font allocator; page, font-download and cache limits stay fixed.
-            # Exact advance caching, retained font-independent styles and
-            # demand-driven font admission add about 1.8 KiB of code. The
-            # user approved 1 KiB more ceiling; per-face scratch is bounded
-            # and no page, cache, download or font allocator limit increases.
-            # The persisted website-font menu and rollback-safe Smart
-            # fallback require about 2.2 KiB more code. The user approved
-            # 3 KiB; fixed UI bits and normal page/font limits do not grow.
-            # Prompt font-pressure relief, scoped focus reuse and fresh
-            # static recovery measure 4,845,696 bytes after consolidation.
-            # The user approved 1 KiB above the prior ratchet; page, font
-            # and cache memory/download ceilings remain unchanged.
-            # The fresh 0.1.35 release profile measures 4,859,608 bytes.
-            # The user approved a measured 14 KiB increase for this engine
-            # code-generation difference; page/font/cache limits stay fixed.
-            # Playlist recovery, RAM-only semantic focus restoration and
-            # interruptible image publication measure 4,873,968 bytes.
-            # The user approved 5 KiB more code; provider coalescing keeps
-            # its deadline and step bounds, and image retries preserve the
-            # incumbent layout. Page, download and queue limits stay fixed.
-            # Native focus names and coalesced partial-frame progress
-            # measure 4,874,700 bytes. The user approved 1 KiB more code;
-            # names share page/menu storage within the existing 1 KiB UI
-            # snapshot, and raster slices/input polling are not enlarged.
-            # Retained Queue focus/footer painting measures 4,877,312 bytes.
-            # The user approved 1 KiB more code; cache metadata reuses padding
-            # and the menu keeps its existing surface and queue ceilings.
-            # Track-row repaint and safe retained-scanout menu feedback cut
-            # measured first feedback from 35.6 ms to 15.8 ms. The approved
-            # 2 KiB increase changes no page, download or surface ceilings.
-            # Header-only sign-in handoff, one stable-entry recovery and
-            # opt-in count-only diagnostics measured 3,088 bytes over this
-            # ceiling. The approved 4 KiB changes no resource quotas.
-            # Native sign-in continuation and credential-free outcome reporting:
-            # measured 4,885,320 bytes; approved 2 KiB, with page quotas unchanged.
-            # Session-safe sign-in recovery and independent native header
-            # publication measured 4,887,568 bytes. The approved 2 KiB
-            # increase changes no memory, cookie or download quotas.
-            # Bounded focus-shadow slots and exact pseudo paint updates:
-            # measured 4,895,100 bytes; approved 7 KiB, with the 64-slot
-            # paint ceiling and all page-memory quotas unchanged.
-            # Generated-content wrapping, final containing-block geometry and
-            # bounded image-load tasks measure 4,899,748 bytes. The approved
-            # 3 KiB increase changes no page or download ceiling; positioned
-            # jobs add 384 bytes of context and image tasks allocate lazily.
-            # Fractional tracking and nested inline-block baselines measure
-            # 4,901,732 bytes. The approved 2 KiB increase preserves retained
-            # command/style sizes and all page and download ceilings.
-            # CSS replacement images, independent unknown-media dimensions
-            # and flow-button centering measure 4,903,080 bytes, 936 bytes
-            # over the preceding limit after the final sizing checks.
-            # The approved 1 KiB changes no retained record or resource quota.
-            # Generated float exclusions, indefinite flex minimums and
-            # allocation-free font sharing measure 4,908,384 bytes after
-            # preserving Smart icon fonts through full sheet rebuilds.
-            # The approved 2 + 1 KiB changes no retained record or quota.
+            # Ordinary: 5,114,112 bytes, user-approved 2026-10-15 (200 KiB
+            # headroom); last measured 5,025,356 bytes (2026-10-21, 8c0487d6).
             set(TILEFINCH_PSP_TEXT_LIMIT 5114112)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
@@ -1233,6 +1126,8 @@ endif()
 target_compile_definitions(psp-browser-interactive-lab PRIVATE
     TILEFINCH_SANS_FONT="${PSP_BROWSER_SANS_FONT}"
     TILEFINCH_SERIF_FONT="${PSP_BROWSER_SERIF_FONT}"
+    TILEFINCH_PSP_SANS_FONT="${PSP_BROWSER_PSP_SANS_FONT}"
+    TILEFINCH_PSP_SERIF_FONT="${PSP_BROWSER_PSP_SERIF_FONT}"
     TILEFINCH_SANS_ITALIC_FONT="${PSP_BROWSER_SANS_ITALIC_FONT}"
     TILEFINCH_SANS_BOLD_FONT="${PSP_BROWSER_SANS_BOLD_FONT}"
     TILEFINCH_SERIF_BOLD_FONT="${PSP_BROWSER_SERIF_BOLD_FONT}"
@@ -1246,211 +1141,6 @@ if(PSP_BROWSER_LIBCURL_TRANSPORT AND NOT PSP)
     target_link_libraries(psp-browser-trace-acquire PRIVATE tilefinch_core)
     add_executable(psp-browser-trace-inventory src/trace_inventory_main.c)
     target_link_libraries(psp-browser-trace-inventory PRIVATE tilefinch_core)
-endif()
-
-# Explicit hardware helper-ABI control. This includes the exact selected VM
-# source once, before qjs's supporting archive objects. No browser target links
-# the fixture, and no CTest entry starts a cross-build or device run.
-if(PSP AND PSP_BROWSER_USE_BELLARD_QUICKJS)
-    add_executable(psp-native-tier-helper-probe EXCLUDE_FROM_ALL
-        benchmarks/native-tier-helper-probe.c src/psp_atomic_shims.c)
-    target_include_directories(psp-native-tier-helper-probe PRIVATE include)
-    target_compile_definitions(psp-native-tier-helper-probe PRIVATE
-        PSP_BROWSER_BELLARD_QUICKJS=1
-        TILEFINCH_HELPER_QUICKJS_SOURCE="${quickjs_SOURCE_DIR}/quickjs.c"
-        "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
-    target_compile_options(psp-native-tier-helper-probe PRIVATE
-        "$<TARGET_PROPERTY:qjs,COMPILE_OPTIONS>")
-    target_link_libraries(psp-native-tier-helper-probe PRIVATE
-        tilefinch_core m psppower)
-    set_target_properties(psp-native-tier-helper-probe PROPERTIES
-        C_EXTENSIONS ON OUTPUT_NAME native-helper-probe.elf)
-    target_link_options(psp-native-tier-helper-probe PRIVATE
-        "-specs=${PSPDEV}/psp/sdk/lib/prxspecs"
-        "LINKER:-q"
-        "LINKER:-T,${PSPDEV}/psp/sdk/lib/linkfile.prx"
-        "${PSPDEV}/psp/sdk/lib/prxexports.o")
-    set_property(TARGET psp-native-tier-helper-probe APPEND PROPERTY LINK_DEPENDS
-        "${PSPDEV}/psp/sdk/lib/linkfile.prx"
-        "${PSPDEV}/psp/sdk/lib/prxexports.o"
-        "${quickjs_SOURCE_DIR}/quickjs.c")
-    add_custom_command(TARGET psp-native-tier-helper-probe POST_BUILD
-        COMMAND "${PSPDEV}/bin/psp-fixup-imports"
-            $<TARGET_FILE:psp-native-tier-helper-probe>
-        COMMAND "${PSPDEV}/bin/psp-prxgen"
-            $<TARGET_FILE:psp-native-tier-helper-probe>
-            "${CMAKE_CURRENT_BINARY_DIR}/native-helper-probe.prx"
-        COMMENT "Generating the isolated host0 helper ABI probe")
-
-    # Actual machine-code lowering remains an explicit host0-only experiment.
-    # The generated interpreter copy must never enter an ordinary browser link.
-    set(native_region_engine "${CMAKE_CURRENT_BINARY_DIR}/native-tier-region-quickjs.c")
-    add_custom_command(OUTPUT "${native_region_engine}"
-        COMMAND "${CMAKE_COMMAND}"
-            "-DINPUT=${quickjs_SOURCE_DIR}/quickjs.c"
-            "-DOUTPUT=${native_region_engine}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/native-tier-region-engine.cmake"
-        DEPENDS "${quickjs_SOURCE_DIR}/quickjs.c"
-            benchmarks/native-tier-region-engine.cmake VERBATIM)
-    set_source_files_properties("${native_region_engine}" PROPERTIES HEADER_FILE_ONLY TRUE)
-    add_executable(psp-native-tier-region-probe EXCLUDE_FROM_ALL
-        benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-        src/psp_atomic_shims.c "${native_region_engine}")
-    target_include_directories(psp-native-tier-region-probe PRIVATE include
-        "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-        "${quickjs_SOURCE_DIR}")
-    target_compile_definitions(psp-native-tier-region-probe PRIVATE
-        PSP_BROWSER_BELLARD_QUICKJS=1 TF_REGION_FRAME_LEASE=1
-        TF_REGION_TABLE_DISPATCH=1 TF_REGION_SEMANTIC_CONTINUATIONS=1
-        TF_REGION_COMPACT_PLAN=1 "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
-    target_compile_options(psp-native-tier-region-probe PRIVATE
-        "$<TARGET_PROPERTY:qjs,COMPILE_OPTIONS>")
-    target_link_libraries(psp-native-tier-region-probe PRIVATE tilefinch_core m psppower)
-    set_target_properties(psp-native-tier-region-probe PROPERTIES
-        C_EXTENSIONS ON OUTPUT_NAME native-region-probe.elf)
-    target_link_options(psp-native-tier-region-probe PRIVATE
-        "-specs=${PSPDEV}/psp/sdk/lib/prxspecs" "LINKER:-q"
-        "LINKER:-T,${PSPDEV}/psp/sdk/lib/linkfile.prx"
-        "${PSPDEV}/psp/sdk/lib/prxexports.o")
-    set_property(TARGET psp-native-tier-region-probe APPEND PROPERTY LINK_DEPENDS
-        "${PSPDEV}/psp/sdk/lib/linkfile.prx" "${PSPDEV}/psp/sdk/lib/prxexports.o")
-    add_custom_command(TARGET psp-native-tier-region-probe POST_BUILD
-        COMMAND "${PSPDEV}/bin/psp-fixup-imports" $<TARGET_FILE:psp-native-tier-region-probe>
-        COMMAND "${PSPDEV}/bin/psp-prxgen" $<TARGET_FILE:psp-native-tier-region-probe>
-            "${CMAKE_CURRENT_BINARY_DIR}/native-region-probe.prx"
-        COMMENT "Generating the isolated host0 Allegrex region probe")
-endif()
-
-# A hand-lowered, real-JSValue ABI experiment, not a browser execution tier.
-# It includes QuickJS internals in its own translation unit. The qjs archive
-# supplies only supporting objects; neither tilefinch_core nor a PSP EBOOT
-# contains this fixture. Explicitly build this target when investigating it.
-if(NOT PSP AND UNIX AND PSP_BROWSER_USE_BELLARD_QUICKJS
-   AND quickjs_SOURCE_DIR STREQUAL tilefinch_quickjs_vendor_dir)
-    function(tilefinch_add_native_tier_probe name)
-        add_executable(${name} EXCLUDE_FROM_ALL ${ARGN} src/budget.c)
-        target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_compile_definitions(${name} PRIVATE PSP_BROWSER_BELLARD_QUICKJS=1
-            "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
-        target_compile_options(${name} PRIVATE -funsigned-char -fwrapv)
-        set_target_properties(${name} PROPERTIES C_EXTENSIONS ON)
-        target_link_libraries(${name} PRIVATE qjs lexbor_static m)
-        if(TILEFINCH_OWNER_CHECKS)
-            target_compile_definitions(${name} PRIVATE TILEFINCH_OWNER_CHECKS=1)
-            target_link_libraries(${name} PRIVATE Threads::Threads)
-        endif()
-    endfunction()
-    tilefinch_add_native_tier_probe(tilefinch-native-tier-helper-probe
-        benchmarks/native-tier-helper-probe.c)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|x86_64|AMD64)$")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-code-pool-probe
-            benchmarks/native-tier-code-pool-probe.c benchmarks/native-tier-code-pool.c)
-    endif()
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-        option(TILEFINCH_NATIVE_TIER_JOB_CENSUS
-            "Compile per-opcode census hooks into the isolated native-tier lab"
-            OFF)
-        set(native_region_engine "${CMAKE_CURRENT_BINARY_DIR}/native-tier-region-quickjs.c")
-        add_custom_command(OUTPUT "${native_region_engine}"
-            COMMAND "${CMAKE_COMMAND}"
-                "-DINPUT=${quickjs_SOURCE_DIR}/quickjs.c"
-                "-DOUTPUT=${native_region_engine}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/native-tier-region-engine.cmake"
-            DEPENDS "${quickjs_SOURCE_DIR}/quickjs.c"
-                benchmarks/native-tier-region-engine.cmake VERBATIM)
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-probe
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        set_source_files_properties("${native_region_engine}" PROPERTIES HEADER_FILE_ONLY TRUE)
-        target_include_directories(tilefinch-native-tier-region-probe PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-reference
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-reference PRIVATE
-            TF_REGION_INTERPRETER_ONLY=1)
-        target_include_directories(tilefinch-native-tier-region-reference PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-frame-lease
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-frame-lease PRIVATE
-            TF_REGION_FRAME_LEASE=1)
-        target_include_directories(tilefinch-native-tier-region-frame-lease PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-table-dispatch
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-table-dispatch PRIVATE
-            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1)
-        target_include_directories(tilefinch-native-tier-region-table-dispatch PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-continuations
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-continuations PRIVATE
-            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
-            TF_REGION_SEMANTIC_CONTINUATIONS=1)
-        target_include_directories(tilefinch-native-tier-region-continuations PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        # Keep the fixed-layout target above as the timing/ownership control.
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-compact-plan
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-compact-plan PRIVATE
-            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
-            TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1)
-        target_include_directories(tilefinch-native-tier-region-compact-plan PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        tilefinch_add_native_tier_probe(tilefinch-native-tier-region-sized-plan
-            benchmarks/native-tier-region-probe.c benchmarks/native-tier-code-pool.c
-            "${native_region_engine}")
-        target_compile_definitions(tilefinch-native-tier-region-sized-plan PRIVATE
-            TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
-            TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1
-            TF_REGION_COMPACT_PLAN_U32=1)
-        target_include_directories(tilefinch-native-tier-region-sized-plan PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-            "${quickjs_SOURCE_DIR}")
-        # Whole-page A/B only. This executable links the isolated interpreter
-        # copy before qjs; the normal lab and every shipping target stay intact.
-        foreach(lane IN ITEMS native reference)
-            set(lab_target "psp-browser-native-tier-${lane}-lab")
-            add_executable(${lab_target} EXCLUDE_FROM_ALL
-                src/interactive_main.c benchmarks/native-tier-region-probe.c
-                benchmarks/native-tier-code-pool.c "${native_region_engine}")
-            target_link_libraries(${lab_target} PRIVATE tilefinch_psp_ui)
-            target_include_directories(${lab_target} PRIVATE
-                "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
-                "${quickjs_SOURCE_DIR}")
-            target_compile_definitions(${lab_target} PRIVATE
-                PSP_BROWSER_BELLARD_QUICKJS=1
-                TF_REGION_FRAME_LEASE=1 TF_REGION_TABLE_DISPATCH=1
-                TF_REGION_SEMANTIC_CONTINUATIONS=1 TF_REGION_COMPACT_PLAN=1
-                TF_REGION_LIVE_ENGINE=1 CONFIG_TILEFINCH_CALL_COUNTS=1
-                "$<TARGET_PROPERTY:qjs,COMPILE_DEFINITIONS>")
-            if(TILEFINCH_NATIVE_TIER_JOB_CENSUS)
-                target_compile_definitions(${lab_target} PRIVATE
-                    TF_REGION_JOB_CENSUS=1)
-            endif()
-            if(lane STREQUAL reference)
-                target_compile_definitions(${lab_target} PRIVATE TF_REGION_LIVE_DISABLED=1)
-            endif()
-            get_target_property(lab_fonts psp-browser-interactive-lab COMPILE_DEFINITIONS)
-            target_compile_definitions(${lab_target} PRIVATE ${lab_fonts})
-            # Keep optimized machine code while allowing independent PC samples
-            # to resolve interpreter cases to source lines in the lab only.
-            target_compile_options(${lab_target} PRIVATE -funsigned-char -fwrapv
-                -g1)
-            set_target_properties(${lab_target} PROPERTIES C_EXTENSIONS ON)
-        endforeach()
-    endif()
 endif()
 
 if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)

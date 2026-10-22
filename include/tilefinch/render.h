@@ -78,6 +78,7 @@ typedef struct {
     uint64_t last_used;
     bool valid;
     bool failed;
+    bool grayscale;
 } ScaledImageCacheEntry;
 
 typedef enum {
@@ -449,11 +450,8 @@ typedef struct {
        frame job running. placeholder_tiles counts them for the last frame. */
     bool placeholder_missing;
     size_t placeholder_tiles;
-    /* When set, a one-shot full-frame render yields to the frontend under
-       this cooperate phase whenever 8 ms of tile raster has passed (the
-       load preview's first frame is ~0.1 s on the PSP). It never aborts the
-       frame: a cancel request persists to the caller's next checkpoint. */
-    const char *raster_cooperate_phase;
+    /* Start of the current run of tile raster since the last yield to the
+       frontend (see rasterize_tile). */
     uint64_t raster_slice_started_us;
     /* Cache/tiles may yield while the incumbent frame remains immutable.
        Composition cannot: it overwrites that same authoritative buffer. */

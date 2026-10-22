@@ -56,10 +56,21 @@ ImageRetargetOutcome images_retarget_display_step(
 void images_retarget_plan_rebase(ImageResources *images, size_t generation);
 void images_retarget_plan_discard(ImageResources *images);
 
+/* At an owner rebuild boundary, release only unpinned, reproducible pixels.
+   Encoded bytes, intrinsic dimensions and aliases remain valid; painting or
+   a later retarget step can restore them. Never call during a paint. */
+size_t images_reclaim_rebuildable_rasters(ImageResources *images,
+                                         BrowserSession *session,
+                                         size_t needed_bytes);
+
 /* Page script is about to read the pixels of images->items[index]: decode it
    back to full resolution if it was reduced or released, and pin it there.
    Returns false only when the pixels could not be restored. */
 bool images_retarget_pin_full(ImageResources *images, size_t index,
                               BrowserSession *session);
+/* Whether images_retarget_pin_full(images, index, ...) would decode the
+   surface again (changing the table's pixels and decoded-byte stats) rather
+   than only mark it pinned. */
+bool images_retarget_pin_full_restores(ImageResources *images, size_t index);
 
 #endif

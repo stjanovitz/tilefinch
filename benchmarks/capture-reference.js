@@ -18,7 +18,12 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const childProcess = require("node:child_process");
+const retainedQueries = require("./retained-query-posts.js");
 const captureAudit = require("./reference-capture-audit.js");
+const inlineTrackers = require("./inline-tracker-policy.js");
+const cosmeticBlocker = require("./cosmetic-blocker-policy.js");
+const {inspectScrollSurface} = require("./reference-scroll-surface.js");
+const {createWorkerCapture, launchWorkerBrowser} = require("./reference-worker-capture.js");
 
 const TRACE_META = /^\d{4}\.meta$/;
 const SAFE_HEADER = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -158,7 +163,15 @@ function parseArguments(argv) {
     python: "python3",
     scriptFreeDiagnostic: false,
     fullDocument: false,
+    scrollWindow: 0,
+    mobileAutoFit: false,
+    scrollSelector: null,
+    dedicatedWorkers: false,
     retainedPreflights: false,
+    inlineTrackers: false,
+    cosmeticBlocking: false,
+    retainedQueryPosts: false,
+    clickText: null,
   };
   const value = (option, index) => {
     if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
@@ -171,7 +184,18 @@ function parseArguments(argv) {
     if (option === "--help" || option === "-h") result.help = true;
     else if (option === "--script-free-diagnostic") result.scriptFreeDiagnostic = true;
     else if (option === "--full-document") result.fullDocument = true;
+    else if (option === "--mobile-auto-fit") result.mobileAutoFit = true;
+    else if (option === "--scroll-selector") result.scrollSelector = value(option, i++);
+    else if (option === "--dedicated-workers") result.dedicatedWorkers = true;
+    else if (option === "--scroll-window-px") {
+      result.scrollWindow = Number(value(option, i++));
+      result.fullDocument = true;
+    }
     else if (option === "--retained-preflights") result.retainedPreflights = true;
+    else if (option === "--inline-trackers") result.inlineTrackers = true;
+    else if (option === "--cosmetic-blocking") result.cosmeticBlocking = true;
+    else if (option === "--retained-query-posts") result.retainedQueryPosts = true;
+    else if (option === "--click-text") result.clickText = value(option, i++);
     else if (option === "--inspect-trace") result.inspectTrace = value(option, i++);
     else if (option === "--manifest") result.manifest = value(option, i++);
     else if (option === "--scenario") result.scenario = value(option, i++);
@@ -195,6 +219,25 @@ function parseArguments(argv) {
       || result.settleMs > 10000) {
     throw new CaptureError("--settle-ms must be an integer in 0..10000");
   }
+  if (!Number.isInteger(result.scrollWindow) || result.scrollWindow < 0
+      || result.scrollWindow > 16384) {
+    throw new CaptureError("--scroll-window-px must be an integer in 1..16384");
+  }
+  if (argv.includes("--scroll-window-px") && result.scrollWindow === 0) {
+    throw new CaptureError("--scroll-window-px must be an integer in 1..16384");
+  }
+  if (result.retainedQueryPosts && !result.scrollWindow)
+    throw new CaptureError("--retained-query-posts requires a diagnostic scroll window");
+  if (result.mobileAutoFit && (!result.scrollWindow || result.browser !== "chromium"))
+    throw new CaptureError("--mobile-auto-fit requires a Chromium diagnostic scroll window");
+  if (result.scrollSelector !== null && (!result.scrollWindow || !result.scrollSelector.trim()
+      || result.scrollSelector.length > 512 || /[\r\n\0]/.test(result.scrollSelector)))
+    throw new CaptureError("--scroll-selector requires one bounded selector and a diagnostic scroll window");
+  if (result.dedicatedWorkers && (!result.scrollWindow || result.browser !== "chromium" || result.scriptFreeDiagnostic))
+    throw new CaptureError("--dedicated-workers requires a Chromium diagnostic scroll window");
+  if (result.clickText !== null && (!result.scrollWindow || result.retainedQueryPosts
+      || !result.clickText.trim() || result.clickText.length > 256 || /[\r\n\0]/.test(result.clickText)))
+    throw new CaptureError("--click-text requires one bounded label and a plain diagnostic scroll window");
   return result;
 }
 
@@ -206,7 +249,15 @@ function usage() {
     "       --output-root DIR [--manifest FILE] [--browser chromium]",
     "       [--text-metrics-output FILE]",
     "       [--full-document] (bounded lazy-resource sweep and five verified views)",
+    "       [--scroll-window-px N] (five diagnostic views within the first N scroll pixels)",
+    "       [--mobile-auto-fit] (audited physical viewport; window diagnostics only)",
+    "       [--scroll-selector CSS] (one visible internal scrolling element; window diagnostics only)",
+    "       [--dedicated-workers] (paused, offline, clock-controlled workers; window diagnostics only)",
     "       [--retained-preflights] (exact retained GET/HEAD CORS permission checks only)",
+    "       [--inline-trackers] (shared Basic inline-tracker policy)",
+    "       [--cosmetic-blocking] (shared native cosmetic stylesheet)",
+    "       [--retained-query-posts] (exact anonymous same-origin retained query bodies; window diagnostics only)",
+    "       [--click-text LABEL] (one recorded visible control action; plain window diagnostics only)",
     "       [--script-free-diagnostic] (resource discovery only; never a qualified reference)",
     "",
     "Capture mode requires the Playwright package and a selected browser binary.",
@@ -299,7 +350,7 @@ function installReplayEnvironment(configuration) {
   }
   const fixedWallClock = configuration.clockContract === "fixed-origin-wall-observed-monotonic-v1";
   if ((!fixedWallClock && configuration.clockContract !== "dual-domain-ms-call-v2")
-      || configuration.clockScope !== "top-level-realm-v1") {
+      || !["top-level-realm-v1", "dedicated-worker-realm-v1"].includes(configuration.clockScope)) {
     throw new Error("deterministic replay requires the dual-domain clock contract");
   }
   const MASK = (1n << 64n) - 1n;
@@ -671,7 +722,7 @@ function installReplayEnvironment(configuration) {
     value = ((value ^ (value >> 27n)) * 0x94d049bb133111ebn) & MASK;
     return (value ^ (value >> 31n)) & MASK;
   };
-  const serializedUrl = String(globalThis.location && location.href || "about:blank");
+  const serializedUrl = String(configuration.workerScope || globalThis.location?.href || "about:blank");
   const urlBytes = utf8(serializedUrl);
   let framed = 0xcbf29ce484222325n;
   for (const byte of utf8(configuration.rngVersion)) framed = feed(framed, byte);
@@ -1167,7 +1218,32 @@ function installReplayEnvironment(configuration) {
       }
       return result;
     }
-    formatToParts(value) { return [{ type: "integer", value: this.format(value) }]; }
+    formatToParts(value) {
+      const parts = [];
+      let text = this.format(value);
+      if (this.options.style === "currency") {
+        const separator = text.lastIndexOf(" ");
+        parts.push({ type: "currency", value: text.slice(0, separator) },
+          { type: "literal", value: " " });
+        text = text.slice(separator + 1);
+      }
+      const percent = text.endsWith("%");
+      if (percent) text = text.slice(0, -1);
+      if (text.startsWith("-")) {
+        parts.push({ type: "minusSign", value: "-" });
+        text = text.slice(1);
+      }
+      const pair = text.split(".");
+      const groups = pair[0].split(",");
+      for (let i = 0; i < groups.length; i++) {
+        if (i) parts.push({ type: "group", value: "," });
+        parts.push({ type: text === "NaN" ? "nan" : "integer", value: groups[i] });
+      }
+      if (pair.length > 1) parts.push({ type: "decimal", value: "." },
+        { type: "fraction", value: pair[1] });
+      if (percent) parts.push({ type: "percentSign", value: "%" });
+      return parts;
+    }
     resolvedOptions() {
       return {
         locale: this.locale, numberingSystem: "latn", style: this.options.style || "decimal",
@@ -1208,48 +1284,248 @@ function installReplayEnvironment(configuration) {
     static supportedLocalesOf(locales) { return supportedLocales(locales); }
   }
 
+  const hostZone = "UTC",
+    dateProto = Date.prototype,
+    utcTime = dateProto.getTime,
+    weekdayNames = [
+      "Sunday",
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+    ],
+    monthNames = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ],
+    utcZones = /^(?:etc\/)?(?:utc|uct|gmt|gmt[+-]?0|universal|zulu|greenwich)$/i,
+    offsetZone = /^([+-])(\d{2})(?::?(\d{2}))?$/,
+    resolveZone = (value) => {
+      if (value === undefined) return hostZone;
+      const text = String(value);
+      if (utcZones.test(text)) return "UTC";
+      const offset = offsetZone.exec(text);
+      if (offset) {
+        if (Number(offset[2]) > 23 || Number(offset[3] || 0) > 59)
+          throw new RangeError("Invalid time zone specified: " + text);
+        return offset[1] + offset[2] + ":" + (offset[3] || "00");
+      }
+      if (text.toLowerCase() === hostZone.toLowerCase()) return hostZone;
+      if (!/^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/.test(text))
+        throw new RangeError("Invalid time zone specified: " + text);
+      return text;
+    },
+    /* Minutes east of UTC for this instant in a resolved zone. A named
+       zone other than the host's has no rules here and formats as UTC. */
+    zoneOffset = (zone, time) => {
+      if (zone === hostZone) return 0;
+      const offset = offsetZone.exec(zone);
+      return offset
+        ? (offset[1] === "-" ? -1 : 1) *
+            (Number(offset[2]) * 60 + Number(offset[3]))
+        : 0;
+    },
+    dateFields = ["weekday", "year", "month", "day"],
+    timeFields = ["hour", "minute", "second"];
+  const boundFormats = new WeakMap(),
+    two = (value) => String(value).padStart(2, "0"),
+    named = (names, index, style) =>
+      style === "long"
+        ? names[index]
+        : style === "narrow"
+          ? names[index][0]
+          : names[index].slice(0, 3),
+    numeric = (value, style) => (style === "2-digit" ? two(value) : value);
   class BoundedDateTimeFormat {
     constructor(locales, options = {}) {
-      this.locale = localeOf(locales);
-      this.options = options || {};
-    }
-    _date(value) {
-      const date = value === undefined ? new Date() : new Date(value);
-      if (!Number.isFinite(date.getTime())) throw new RangeError("Invalid time value");
-      return date;
-    }
-    format(value) {
-      const date = this._date(value);
-      if (this.options.timeStyle || this.options.hour !== undefined) {
-        const pad = (part) => String(part).padStart(2, "0");
-        const hour = date.getUTCHours();
-        return `${hour % 12 || 12}:${pad(date.getUTCMinutes())}:` +
-          `${pad(date.getUTCSeconds())} ${hour < 12 ? "AM" : "PM"}`;
-      }
-      return `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()}`;
+      this.locale = localeOf(Array.isArray(locales) ? locales[0] : locales);
+      options = options || {};
+      const resolved = {};
+      for (const key of [
+        ...dateFields,
+        ...timeFields,
+        "timeZoneName",
+        "dateStyle",
+        "timeStyle",
+      ])
+        if (options[key] !== undefined) resolved[key] = String(options[key]);
+      if (
+        !resolved.dateStyle &&
+        !resolved.timeStyle &&
+        ![...dateFields, ...timeFields].some((key) => resolved[key])
+      )
+        resolved.year = resolved.month = resolved.day = "numeric";
+      this.hour12 =
+        options.hour12 !== undefined
+          ? !!options.hour12
+          : options.hourCycle === undefined ||
+            options.hourCycle === "h12" ||
+            options.hourCycle === "h11";
+      this.timeZone = resolveZone(options.timeZone);
+      this.options = resolved;
     }
     formatToParts(value) {
-      const date = this._date(value);
-      if (this.options.timeStyle || this.options.hour !== undefined) {
-        return [{ type: "literal", value: this.format(date) }];
+      const time = utcTime.call(
+        value === undefined
+          ? new Date()
+          : value instanceof Date
+            ? value
+            : new Date(Number(value)),
+      );
+      if (!Number.isFinite(time)) throw new RangeError("Invalid time value");
+      const offset = zoneOffset(this.timeZone, time),
+        shifted = new Date(time + offset * 60000),
+        o = this.options,
+        parts = [],
+        add = (type, value) => parts.push({ type, value: String(value) }),
+        list = (fields, separator) =>
+          fields.forEach((field, at) => {
+            if (at) add("literal", separator);
+            add(field[0], field[1]);
+          }),
+        month = shifted.getUTCMonth(),
+        hour = shifted.getUTCHours();
+      let { weekday, month: monthStyle, day, year, hour: hourStyle } = o,
+        { minute, second, timeZoneName } = o,
+        joiner = ", ";
+      if (o.dateStyle) {
+        const style = o.dateStyle;
+        weekday = style === "full" ? "long" : undefined;
+        monthStyle =
+          style === "short" ? "numeric" : style === "medium" ? "short" : "long";
+        day = "numeric";
+        year = style === "short" ? "2-digit" : "numeric";
+        if (style === "full" || style === "long") joiner = " at ";
       }
-      return [
-        { type: "month", value: String(date.getUTCMonth() + 1) },
-        { type: "literal", value: "/" },
-        { type: "day", value: String(date.getUTCDate()) },
-        { type: "literal", value: "/" },
-        { type: "year", value: String(date.getUTCFullYear()) },
-      ];
+      if (o.timeStyle) {
+        hourStyle = minute = "numeric";
+        second = o.timeStyle === "short" ? undefined : "numeric";
+        timeZoneName =
+          o.timeStyle === "full" || o.timeStyle === "long"
+            ? "short"
+            : undefined;
+      }
+      const weekdayField = weekday && [
+          "weekday",
+          named(weekdayNames, shifted.getUTCDay(), weekday),
+        ],
+        dayField = day && ["day", numeric(shifted.getUTCDate(), day)],
+        yearValue = shifted.getUTCFullYear(),
+        yearField = year && [
+          "year",
+          year === "2-digit" ? two(yearValue % 100) : yearValue,
+        ];
+      if (monthStyle === "numeric" || monthStyle === "2-digit") {
+        /* en-US numeric dates: "Thu, 10/1/2026". */
+        if (weekdayField) list([weekdayField], ""), add("literal", ", ");
+        list(
+          [["month", numeric(month + 1, monthStyle)], dayField, yearField].filter(
+            Boolean,
+          ),
+          "/",
+        );
+      } else if (monthStyle) {
+        /* en-US textual dates: "Thursday, October 1, 2026". */
+        if (weekdayField) list([weekdayField], ""), add("literal", ", ");
+        add("month", named(monthNames, month, monthStyle));
+        if (dayField) add("literal", " "), add(dayField[0], dayField[1]);
+        if (yearField)
+          add("literal", dayField ? ", " : " "), add(yearField[0], yearField[1]);
+      } else list([weekdayField, dayField, yearField].filter(Boolean), " ");
+      if (hourStyle || minute || second) {
+        if (parts.length) add("literal", joiner);
+        const shown = this.hour12 ? hour % 12 || 12 : hour,
+          paired = (style, other) => (other ? "2-digit" : style);
+        list(
+          [
+            hourStyle && [
+              "hour",
+              numeric(
+                shown,
+                !this.hour12 && (minute || second) ? "2-digit" : hourStyle,
+              ),
+            ],
+            minute && [
+              "minute",
+              numeric(
+                shifted.getUTCMinutes(),
+                paired(minute, hourStyle || second),
+              ),
+            ],
+            second && [
+              "second",
+              numeric(
+                shifted.getUTCSeconds(),
+                paired(second, hourStyle || minute),
+              ),
+            ],
+          ].filter(Boolean),
+          ":",
+        );
+        if (hourStyle && this.hour12)
+          add("literal", " "), add("dayPeriod", hour < 12 ? "AM" : "PM");
+      }
+      if (timeZoneName) {
+        if (parts.length) add("literal", " ");
+        const magnitude = Math.abs(offset);
+        add(
+          "timeZoneName",
+          this.timeZone === "UTC"
+            ? "UTC"
+            : "GMT" +
+                (offset === 0
+                  ? ""
+                  : (offset < 0 ? "-" : "+") +
+                    Math.floor(magnitude / 60) +
+                    (magnitude % 60 ? ":" + two(magnitude % 60) : "")),
+        );
+      }
+      return parts;
+    }
+    /* ECMA-402: format is an accessor returning a function bound to this
+       formatter, so `dates.map(formatter.format)` works. */
+    get format() {
+      let bound = boundFormats.get(this);
+      if (!bound) {
+        bound = nativeShape((value) =>
+          this.formatToParts(value)
+            .map((part) => part.value)
+            .join(""));
+        boundFormats.set(this, bound);
+      }
+      return bound;
     }
     resolvedOptions() {
-      return {
-        locale: this.locale, calendar: "gregory", numberingSystem: "latn",
-        timeZone: "UTC", year: "numeric", month: "numeric", day: "numeric",
-      };
+      const result = {
+          locale: this.locale,
+          calendar: "gregory",
+          numberingSystem: "latn",
+          timeZone: this.timeZone,
+        },
+        o = this.options;
+      if (o.hour !== undefined || o.timeStyle !== undefined) {
+        result.hourCycle = this.hour12 ? "h12" : "h23";
+        result.hour12 = this.hour12;
+      }
+      for (const key in o) result[key] = o[key];
+      return result;
     }
-    static supportedLocalesOf(locales) { return supportedLocales(locales); }
+    static supportedLocalesOf(locales) {
+      return BoundedNumberFormat.supportedLocalesOf(locales);
+    }
   }
-
   class BoundedCollator {
     constructor(locales, options = {}) {
       this.locale = localeOf(locales);
@@ -1576,7 +1852,7 @@ function installReplayEnvironment(configuration) {
         scope: configuration.clockScope,
         originMs,
         hostElapsedMs,
-        playwrightElapsedMs: Math.max(
+        playwrightElapsedMs: configuration.workerClock ? hostElapsedMs : Math.max(
           0, Math.trunc(playwrightMonotonicNow === null
             ? Reflect.apply(playwrightDateNow, NativeDate, []) - originMs
             : playwrightMonotonicNow() - playwrightMonotonicOrigin),
@@ -1627,6 +1903,30 @@ function installReadOnlyPolicy(configuration) {
   }
   const methodName = (value) => String(value || "GET").toUpperCase();
   const safe = (method) => method === "GET" || method === "HEAD";
+  const queryPosts = configuration.queryPosts || [];
+  const readQueryText = async request => {
+    const reader = request.clone().body?.getReader();
+    if (!reader) return "";
+    const decoder = new TextDecoder("utf-8",{fatal:true});
+    let bytes = 0, text = "";
+    try {
+      for (let count = 0; count < 64; count++) {
+        const chunk = await reader.read();
+        if (chunk.done) return text + decoder.decode();
+        if (chunk.value.byteLength > 16384-bytes) throw new TypeError("query body exceeds bound");
+        bytes += chunk.value.byteLength;
+        text += decoder.decode(chunk.value,{stream:true});
+      }
+      throw new TypeError("query body chunk count exceeds bound");
+    } catch (error) { reader.cancel().catch(()=>{}); throw error; }
+  };
+  const queryMatch = (method, url, body, headers) => {
+    if (method !== "POST" || typeof body !== "string" || body.length > 16384
+        || headers.has("authorization")
+        || headers.get("content-type")?.split(";",1)[0].trim().toLowerCase() !== "application/json") return false;
+    try { url = new URL(url, document.baseURI).href; } catch (_) { return false; }
+    return queryPosts.some(entry => entry.url === url && entry.body === body);
+  };
   const retainedPreflights = configuration.preflightPolicy
     === "cors-preflight-retained-only-v2";
   const descriptorOwner = (object, property) => {
@@ -1722,6 +2022,12 @@ function installReadOnlyPolicy(configuration) {
         catch (error) { return Promise.reject(error); }
         const method = methodName(request.method);
         if (!safe(method)) {
+          if (method === "POST" && queryPosts.length) return readQueryText(request).then(body => {
+            if (queryMatch(method, request.url, body, request.headers))
+              return Reflect.apply(target, thisArgument, [request]);
+            report(method, "fetch", request.url);
+            throw new TypeError("unretained query POST blocked during offline capture");
+          }, error => { report(method,"fetch",request.url); throw error; });
           report(method, "fetch", request.url);
           return Promise.reject(new TypeError(
             "non-read-only fetch blocked during offline capture",
@@ -1853,7 +2159,7 @@ function installReadOnlyPolicy(configuration) {
         const request = requests.get(thisArgument) || {
           method: "GET", url: "", headers: new Headers(), uploadListeners: new Map(),
         };
-        if (!safe(request.method)) {
+        if (!safe(request.method) && !queryMatch(request.method,request.url,argumentsList[0],request.headers)) {
           report(request.method, "xmlhttprequest", request.url);
           throw new DOMException(
             "non-read-only XMLHttpRequest blocked during offline capture", "NetworkError",
@@ -2004,6 +2310,24 @@ function installOfflineCapabilityPolicy(configuration) {
       throw new Error(`offline capability policy cannot remove ${String(property)}`);
     }
   };
+  if (configuration.dedicatedWorkers) {
+    const NativeWorker = globalThis.Worker, terminate = NativeWorker.prototype.terminate, workers = [];
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    Object.defineProperty(globalThis, "Worker", {...descriptor, value:new Proxy(NativeWorker, {
+      construct(target, args, newTarget) {
+        if (workers.length >= 16) {
+          report("WORKER-QUOTA", "");
+          throw new RangeError("capture worker constructor bound exceeded");
+        }
+        const worker = Reflect.construct(target, args, newTarget);
+        workers.push(worker); return worker;
+      },
+    })});
+    Object.defineProperty(globalThis, "__tilefinchTerminateCaptureWorkers", {value:() => {
+      for (const worker of workers) Reflect.apply(terminate, worker, []);
+      return workers.length;
+    }});
+  }
 
   /* Retain prototype backstops for worklet objects discovered before their
      getters are removed. They are not reachable by page code after a healthy
@@ -2038,6 +2362,7 @@ function installOfflineCapabilityPolicy(configuration) {
     "Worker", "SharedWorker", "ShadowRealm", "AudioWorkletNode", "Worklet",
     "SharedStorage", "SharedStorageWorklet", "SharedStorageWorkletGlobalScope",
   ]) {
+    if (name === "Worker" && configuration.dedicatedWorkers) continue;
     removeSurface(globalThis, name);
   }
   removeSurface(globalThis, "sharedStorage");
@@ -2061,7 +2386,8 @@ function installOfflineCapabilityPolicy(configuration) {
   const surfaceEvidence = Object.freeze({
     version: configuration.surfaceVersion,
     dedicated_worker_constructor:
-      !("Worker" in globalThis) ? "unavailable" : "exposed",
+      configuration.dedicatedWorkers && typeof Worker === "function" ? "controlled"
+        : !("Worker" in globalThis) ? "unavailable" : "exposed",
     shared_worker_constructor:
       !("SharedWorker" in globalThis) ? "unavailable" : "exposed",
     shadow_realm_constructor:
@@ -2118,14 +2444,15 @@ function installOfflineCapabilityPolicy(configuration) {
   });
 }
 
-function offlineCapabilityEvidenceReady(value) {
+function offlineCapabilityEvidenceReady(value, dedicatedWorkers = false) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const expectedKeys = Object.keys(OFFLINE_CAPABILITY_SURFACE_EVIDENCE).sort();
   const actualKeys = Object.keys(value).sort();
   return actualKeys.length === expectedKeys.length
     && actualKeys.every((key, index) => key === expectedKeys[index])
     && expectedKeys.every(
-      (key) => value[key] === OFFLINE_CAPABILITY_SURFACE_EVIDENCE[key],
+      (key) => value[key] === (dedicatedWorkers && key === "dedicated_worker_constructor"
+        ? "controlled" : OFFLINE_CAPABILITY_SURFACE_EVIDENCE[key]),
     );
 }
 
@@ -2266,6 +2593,43 @@ function createRequestDiagnostics(hardLimit = Number.POSITIVE_INFINITY) {
 }
 
 function buildReadOnlyAcquisitionPlan(summary, origins = null) {
+  if (origins?.version === "unmatched-request-origin-v2"
+      && (summary.total || summary.truncated || origins.total || origins.overflow || origins.entries.length)) {
+    const requests = new Map(), counts = new Map(), observed = new Map();
+    let unplannable = summary.truncated + (origins.overflow ? 1 : 0), total = 0;
+    for (const entry of summary.entries) {
+      if (entry.classification !== "unmatched" || !READ_ONLY_METHODS.has(entry.method)
+          || entry.url_truncated) { unplannable += 1; continue; }
+      const key = `${entry.method}\0${entry.url}\0${entry.resource_type}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    for (const entry of origins.entries) {
+      const origin = entry.request_origin;
+      let valid = origin === "";
+      try { valid ||= origin.startsWith("https://") && new URL(origin).origin === origin; }
+      catch (_) {}
+      const evidenceKey = `${entry.method}\0${entry.url}\0${entry.resource_type}`;
+      if (!valid || !READ_ONLY_METHODS.has(entry.method) || !counts.has(evidenceKey)
+          || !Number.isSafeInteger(entry.occurrences) || entry.occurrences < 1) {
+        unplannable += 1; continue;
+      }
+      observed.set(evidenceKey, (observed.get(evidenceKey) || 0) + entry.occurrences);
+      total += entry.occurrences;
+      const key = `${entry.method}\0${entry.url}\0${origin}`;
+      if (!requests.has(key)) requests.set(key, {method:entry.method, url:entry.url,
+        url_sha256:crypto.createHash("sha256").update(entry.url).digest("hex"),
+        request_origin:origin, resource_types:new Set(), occurrences:0});
+      const request = requests.get(key);
+      request.resource_types.add(entry.resource_type);
+      request.occurrences += entry.occurrences;
+    }
+    if (total !== origins.total || counts.size !== observed.size
+        || [...counts].some(([key, count]) => observed.get(key) !== count)) unplannable += 1;
+    const ordered = [...requests.entries()].sort(([a], [b]) => compareCodeUnitStrings(a, b))
+      .map(([, row]) => ({...row, resource_types:[...row.resource_types].sort()}));
+    return {mode:"exact-get-head-plan-v3", complete:unplannable === 0,
+      request_count:ordered.length, unplannable, requests:ordered};
+  }
   const requests = new Map();
   let unplannable = summary.truncated;
   for (const entry of summary.entries) {
@@ -3517,6 +3881,11 @@ function loadRecord(metaPath) {
     headers, body, cookies, responseDateSeconds, asyncDelayPumps,
     externalCancel, transportTimeout, cacheMode, signature,
     userAgent: metadata["request-user-agent"],
+    requestOrigin: metadata["request-origin"],
+    requestBodyLength: Number(metadata["request-body-length"]),
+    requestBodyHash: metadata["request-body-hash"],
+    requestCookieBytes: Number(metadata["request-cookie-bytes"]),
+    requestCredentials: Number(metadata["request-credentials"]),
   };
 }
 
@@ -3535,8 +3904,18 @@ function selectRoute(records) {
     mode: candidates.length === 1 ? "reusable" : "occurrence-sequence",
     selected: candidates.length === 1 ? candidates[0] : null,
     candidates,
+    records,
     ambiguous: signatures.size > 1,
   };
+}
+
+function selectRequestOriginRoute(route, origin) {
+  if (!route) return null;
+  const records = route.records || route.candidates;
+  const exact = records.filter((record) => record.requestOrigin === origin);
+  const legacy = records.filter((record) => record.requestOrigin === undefined);
+  const selected = exact.length ? exact : legacy;
+  return selected.length ? {...selectRoute(selected), requestOrigin:exact.length ? origin : null} : null;
 }
 
 function claimRouteRecord(route, occurrences, key) {
@@ -3905,6 +4284,7 @@ function loadScenario(manifestPath, wanted) {
     number("script_count", 1, 256);
     return {
       name: row.scenario, url: normalizeUrl(row.url, manifestPath),
+      navigationUrl: new URL(row.url).href,
       replayDir: safeRelative(row.replay_dir, "replay_dir"), digest: row.trace_sha256,
       expectedHttp: number("expected_http", 100, 599), requiredTitle: row.required_title,
       requiredMarker: row.required_state_marker,
@@ -4024,6 +4404,12 @@ async function settleCapture(page, milliseconds, isNetworkIdle) {
 }
 
 async function checkpointPosition(page, checkpoint) {
+  if (checkpoint.kind === "offset") {
+    return page.evaluate((y) => {
+      scrollTo({ left: 0, top: y, behavior: "instant" });
+      return scrollY;
+    }, checkpoint.target);
+  }
   if (checkpoint.kind === "top") {
     /* Checkpoints are positions, not animations: an author's
        `scroll-behavior: smooth` (MDN sets it on html) would otherwise leave
@@ -4075,6 +4461,8 @@ async function runScenarioClock(
     throw new CaptureError("offline capture requires Playwright Clock.runFor");
   }
   for (let tick = 0; tick < ticks; tick += 1) {
+    if (context.__tilefinchWorkerCapture)
+      await scheduler.driveUntilSettled(context.__tilefinchWorkerCapture.advance(tickMs), "worker-clock-advance");
     /* Match script_runtime_advance(): every existing realm receives the full
        logical tick before Playwright releases timers/rAF scheduled within it.
        A realm created during that release starts at zero, like a newly-created
@@ -4105,7 +4493,7 @@ async function runScenarioClock(
 }
 
 function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs,
-  expectedContract = REPLAY_CLOCK_CONTRACT) {
+  expectedContract = REPLAY_CLOCK_CONTRACT, expectedScope = REPLAY_CLOCK_SCOPE) {
   const fixedWallClock = expectedContract === REPLAY_FIXED_WALL_CLOCK_CONTRACT;
   if (!fixedWallClock && expectedContract !== REPLAY_CLOCK_CONTRACT) return false;
   const sources = clockEvidence && clockEvidence.clockSources;
@@ -4130,7 +4518,7 @@ function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs,
     && Number.isSafeInteger(hostElapsedMs)
     && hostElapsedMs >= 0 && hostElapsedMs <= MAX_REPLAY_HOST_ELAPSED_MS
     && clockEvidence.contract === expectedContract
-    && clockEvidence.scope === REPLAY_CLOCK_SCOPE
+    && clockEvidence.scope === expectedScope
     && clockEvidence.originMs === originMs
     && clockEvidence.hostElapsedMs === hostElapsedMs
     && clockEvidence.playwrightElapsedMs === hostElapsedMs
@@ -4158,7 +4546,7 @@ function replayClockEvidenceReady(clockEvidence, originMs, hostElapsedMs,
 }
 
 async function evaluateCaptureEvidence(page, scenario, hostOperations = null) {
-  return runTrackedHostOperation(
+  const evidence = await runTrackedHostOperation(
     hostOperations, "capture-evidence-evaluate", () => page.evaluate(
       ({ requiredMarker, fallbackMarkers, interstitialMarkers }) => {
         const bodyText = document.body ? document.body.innerText : "";
@@ -4211,6 +4599,26 @@ async function evaluateCaptureEvidence(page, scenario, hostOperations = null) {
       },
     ),
   );
+  /* innerText omits open shadow trees. A painted custom-element page still
+     needs an actual visible marker, not a relaxed title-only expectation. */
+  const visibleText = async (marker) => runTrackedHostOperation(
+    hostOperations, "capture-visible-marker", async () => {
+      const matches = page.getByText(marker, {exact: false});
+      const count = await matches.count();
+      if (count > 32) throw new CaptureError("visible marker exceeds match bound");
+      for (let i = 0; i < count; i++) if (await matches.nth(i).isVisible()) return true;
+      return false;
+    });
+  if (!evidence.requiredMarker)
+    evidence.requiredMarker = await visibleText(scenario.requiredMarker);
+  for (const [field, markers] of [["fallback", scenario.fallbackMarkers],
+                                 ["interstitial", scenario.interstitialMarkers]]) {
+    if (evidence[field]) continue;
+    for (const marker of markers) if (await visibleText(marker)) {
+      evidence[field] = true; break;
+    }
+  }
+  return evidence;
 }
 
 async function drainRouteHandlers(scheduler, lifecycle, limit = 64) {
@@ -4247,6 +4655,10 @@ async function freezeAndDrainContext(
     throw new CaptureError("offline capture must freeze exactly one context page");
   }
   const before = activity.value;
+  if (context.__tilefinchWorkerCapture && !context.__tilefinchWorkerCapture.summary().frozen) {
+    await scheduler.driveUntilSettled(context.__tilefinchWorkerCapture.freeze(), "worker-freeze");
+    await boundedDrainRouteHandlers(hostOperations, scheduler, lifecycle);
+  }
   for (let pass = 0; pass < 3; pass += 1) {
     await scheduler.closeAdmissionGeneration();
     await boundedDrainRouteHandlers(hostOperations, scheduler, lifecycle);
@@ -4256,6 +4668,73 @@ async function freezeAndDrainContext(
     throw new CaptureError("late route or capability activity survived the freeze boundary");
   }
   return pages;
+}
+
+function mobileAutoFitProfileReady(profile, scenario) {
+  const visual = profile?.visual;
+  const near = (a, b) => Number.isFinite(a) && Math.abs(a - b) <= .02;
+  return profile?.coarse === true && profile.touch === 1
+    && scenario.scaleNumerator === scenario.scaleDenominator
+    && profile.dpr === 1 && profile.screenWidth === scenario.cssWidth
+    && profile.screenHeight === scenario.cssHeight
+    && Number.isInteger(profile.width) && Number.isInteger(profile.height)
+    && profile.width >= scenario.cssWidth && profile.width <= scenario.cssWidth * 4
+    && profile.height >= scenario.cssHeight && profile.height <= scenario.cssHeight * 4
+    && visual && visual.scale >= .25 && visual.scale <= 1
+    && near(visual.width * visual.scale, scenario.cssWidth)
+    && near(visual.height * visual.scale, scenario.cssHeight)
+    && profile.layoutWidth === scenario.cssWidth
+    && profile.width >= Math.ceil(visual.width)
+    && profile.height === Math.ceil(profile.width * visual.height / visual.width)
+    && profile.animations === 0 && profile.editableFocus === false;
+}
+
+function collectMobileViewportProfile(page) {
+  return page.evaluate(() => ({
+    coarse: matchMedia("(pointer:coarse)").matches,
+    touch: navigator.maxTouchPoints, width: innerWidth, height: innerHeight,
+    layoutWidth: document.documentElement.clientWidth,
+    screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio,
+    visual: visualViewport ? {width: visualViewport.width,
+      height: visualViewport.height, scale: visualViewport.scale} : null,
+    animations: document.getAnimations().filter(a => a.playState === "running").length,
+    editableFocus: !!document.activeElement?.matches("input,textarea,[contenteditable]:not([contenteditable=false])"),
+  }));
+}
+
+async function captureMobileAutoFitViewport(page, session, raw, scenario) {
+  const before = await collectMobileViewportProfile(page);
+  if (!mobileAutoFitProfileReady(before, scenario))
+    throw new CaptureError("mobile auto-fit input/animation profile is not capturable: "
+      + JSON.stringify(before));
+  const allMetrics = await session.send("Page.getLayoutMetrics");
+  const metrics = allMetrics.cssVisualViewport;
+  if (!metrics || Math.abs(metrics.clientWidth - before.visual.width) > .02
+      || Math.abs(metrics.clientHeight - before.visual.height) > .02
+      || Math.abs(metrics.scale - before.visual.scale) > 1e-6)
+    throw new CaptureError("mobile auto-fit protocol viewport disagrees with page evidence");
+  if (allMetrics.cssLayoutViewport.clientWidth !== before.width
+      || allMetrics.cssLayoutViewport.clientHeight !== before.height)
+    throw new CaptureError("mobile auto-fit layout viewport changed");
+  /* Supplying a CSS clip can clear Chromium's device metrics; Playwright's
+     rounded clip also loses a physical row at fractional page scale. Capture
+     the actual surface without a clip or emulation writes. No animation or
+     caret state is rewritten: active ones are refused above. */
+  const result = await session.send("Page.captureScreenshot", {
+    format: "png", fromSurface: true, captureBeyondViewport: false,
+  });
+  if (typeof result.data !== "string" || result.data.length > 16 * 1024 * 1024)
+    throw new CaptureError("mobile auto-fit screenshot exceeds bounded storage");
+  const bytes = Buffer.from(result.data, "base64");
+  if (bytes.length < 24 || bytes.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a"
+      || bytes.readUInt32BE(16) !== scenario.deviceWidth
+      || bytes.readUInt32BE(20) !== scenario.deviceHeight)
+    throw new CaptureError("mobile auto-fit screenshot does not cover the physical viewport");
+  const after = await collectMobileViewportProfile(page);
+  if (!mobileAutoFitProfileReady(after, scenario)
+      || JSON.stringify(before) !== JSON.stringify(after))
+    throw new CaptureError("mobile auto-fit profile changed during screenshot");
+  fs.writeFileSync(raw, bytes, {mode: 0o600});
 }
 
 function normalizePng(raw, output, scenario, python, timeoutMs) {
@@ -4427,6 +4906,9 @@ async function captureReference(options) {
     throw new CaptureError(`trace digest mismatch: manifest=${scenario.digest} actual=${trace.digest}`);
   }
   const environment = replayEnvironment(trace);
+  const queryPosts = options.retainedQueryPosts
+    ? retainedQueries.loadRetainedQueryPosts(trace, scenario.url, fnv1a64) : [];
+  const readOnlyPolicyVersion = options.retainedQueryPosts ? "get-head-exact-query-posts-v1" : READ_ONLY_POLICY_VERSION;
   const preflightPolicy = options.retainedPreflights
     ? RETAINED_PREFLIGHT_POLICY : READ_ONLY_PREFLIGHT_POLICY;
   const documentUserAgent = captureAudit.retainedUserAgent(trace.records, scenario.url);
@@ -4485,6 +4967,8 @@ async function captureReference(options) {
     terminalFailures: 0,
   };
   let responseScheduler = null;
+  let workerCapture = null;
+  let workerBrowser = null;
   const hostOperations = createHostOperationTracker({
     timeoutMs: options.timeoutMs,
     onTerminalFailure: (error, label) => {
@@ -4498,7 +4982,14 @@ async function captureReference(options) {
   const runHost = (label, operation, settings) =>
     hostOperations.run(label, operation, settings);
   try {
-  browser = await launchBrowser(browserType, launch, hostOperations);
+  if (options.dedicatedWorkers) {
+    workerBrowser = await runHost("isolated-worker-browser-launch", async () => {
+      const result = await launchWorkerBrowser(playwright, launch);
+      if (hostOperations.isTerminal()) {await result.cleanup(); throw new CaptureError("worker browser launch expired");}
+      return result;
+    });
+    browser = workerBrowser.browser;
+  } else browser = await launchBrowser(browserType, launch, hostOperations);
   context = await runHost("browser-context-create", () => browser.newContext({
       userAgent: documentUserAgent,
       viewport: { width: scenario.cssWidth, height: scenario.cssHeight },
@@ -4557,7 +5048,7 @@ async function captureReference(options) {
   });
   const activity = { value: 0 };
   const requestAudit = captureAudit.createRequestAudit();
-  const originEvidence = captureAudit.createOriginEvidence();
+  const originEvidence = captureAudit.createOriginEvidence({variants:true});
   let interceptedHttpRequests = 0;
   /* CDP Network includes favicon requests and every redirect hop which
      Playwright's page-level events can omit. Audit each intercepted target. */
@@ -4663,6 +5154,10 @@ async function captureReference(options) {
     }
 
     const requestMethod = request.method().toUpperCase();
+    const queryPost = requestMethod === "POST" ? queryPosts.find(entry => entry.url === requestUrl
+      && request.postDataBuffer()?.equals(Buffer.from(entry.body))
+      && !request.headers().authorization
+      && request.headers()["content-type"]?.split(";",1)[0].trim().toLowerCase() === "application/json") : null;
     const preflight = options.retainedPreflights && requestMethod === "OPTIONS"
       ? captureAudit.preflightShape(request.headers()) : null;
     if (preflight) {
@@ -4719,7 +5214,7 @@ async function captureReference(options) {
         await terminalAdmission(
           "invalid", "invalid", requestUrl, "invalid-url-abort", "invalid-url",
         );
-      } else if (!READ_ONLY_METHODS.has(requestMethod) && !preflight) {
+      } else if (!READ_ONLY_METHODS.has(requestMethod) && !preflight && !queryPost) {
         const preflight = requestMethod === "OPTIONS"
           && request.headers()["access-control-request-method"] !== undefined;
         await terminalAdmission(
@@ -4729,14 +5224,19 @@ async function captureReference(options) {
           { preflight },
         );
       } else {
-        let selected = trace.routes.get(routeKey);
+        const requestOrigin = request.headers().origin || "";
+        let selected = selectRequestOriginRoute(trace.routes.get(routeKey), requestOrigin);
+        if (selected && queryPost) {
+          const candidates = (selected.records || selected.candidates).filter(record => record.id === queryPost.id);
+          selected = candidates.length ? {...selectRoute(candidates),requestOrigin:selected.requestOrigin} : null;
+        }
         if (selected && preflight) {
           const candidates = selected.candidates.filter((record) =>
             JSON.stringify(record.preflight) === JSON.stringify(preflight));
           selected = candidates.length ? selectRoute(candidates) : null;
         }
         if (!selected) {
-          originEvidence.record(requestMethod, normalized, request.headers().origin);
+          originEvidence.record(requestMethod, normalized, request.headers().origin, resourceType);
           if (options.retainedPreflights && READ_ONLY_METHODS.has(requestMethod)) {
             const checks = [...preflightRequests.values()].filter((item) =>
               item.url === requestUrl && item.method === requestMethod);
@@ -4770,7 +5270,8 @@ async function captureReference(options) {
           await responseScheduler.enqueueAdmission(identity, () => {
             /* Retained occurrences are claimed only after every HTTP terminal
                request in the Playwright-channel admission wave is sorted. */
-            const claim = claimRouteRecord(selected, routeOccurrences, routeKey);
+            const claim = claimRouteRecord(selected, routeOccurrences,
+              selected?.requestOrigin === null ? routeKey : `${routeKey}\0${requestOrigin}`);
             if (claim.record === null) {
               unexpectedDiagnostics.record(
                 claim.exhausted ? "occurrence-exhausted" : claim.reason,
@@ -4878,6 +5379,12 @@ async function captureReference(options) {
       routeLifecycle.lateBindingCallbacks += 1;
       return;
     }
+    if (options.retainedQueryPosts && kind === "WEBSOCKET"
+        && blockedUrlMatches(value,scenario.blockedOrigins)) {
+      ledger.blocked += 1;
+      blockedDiagnostics.record("blocked-origin-policy",kind,"websocket",value);
+      return;
+    }
     capabilityDiagnostics.record("capability-denied", kind, kind, value);
     recordUnexpected("unmatched", kind, String(kind).toLowerCase(), value);
   };
@@ -4888,8 +5395,7 @@ async function captureReference(options) {
     recordCapability(kind, value);
     return null;
   });
-  await context.exposeBinding(
-    "__tilefinchReadOnlyDenied", (_source, method, kind, value) => {
+  const recordReadOnlyDenied = (method, kind, value) => {
       if (routeLifecycle.phase !== "OPEN") {
         /* An unload beacon to an explicitly excluded telemetry route cannot
            change the frozen page or replay: the read-only hook denied it
@@ -4921,16 +5427,48 @@ async function captureReference(options) {
       policyDiagnostics.record("policy-denied", method, kind, value);
       if (String(kind).includes("cors-preflight")) preflightPolicyDenials += 1;
       return null;
+    };
+  await context.exposeBinding("__tilefinchReadOnlyDenied", (_source, ...values) => recordReadOnlyDenied(...values));
+  if (options.dedicatedWorkers) context.__tilefinchWorkerCapture = workerCapture = createWorkerCapture({
+    runHost, environment, scenarioUrl:scenario.url, preflightPolicy,
+    releaseTarget:target => workerBrowser.release(target),
+    terminateWorkers:async () => {
+      for (const capturedPage of context.pages()) for (const frame of capturedPage.frames())
+        await runHost("worker-owner-terminate", () => frame.evaluate(() => __tilefinchTerminateCaptureWorkers()));
     },
-  );
+    installReplayEnvironment, installReadOnlyPolicy, installOfflineCapabilityPolicy, installOfflineProtocolPolicy,
+    validateClock:replayClockEvidenceReady,
+    report:(type, method, kind, value) => {
+      if (type === "policy") recordReadOnlyDenied(method, kind, value);
+      else if (type === "capability") recordCapability(method, value);
+      else hostOperations.failTerminal(new Error("unknown worker report"), "worker policy");
+    },
+    fail:error => hostOperations.failTerminal(error, "worker capture"),
+  });
   await context.addInitScript(installReplayEnvironment, environment);
+  const cosmeticRules = {...cosmeticBlocker.loadRules(), enabled:!!options.cosmeticBlocking};
+  await context.addInitScript(cosmeticBlocker.installPolicy, cosmeticRules);
+  const inlineRules = {...inlineTrackers.loadRules(), enabled:!!options.inlineTrackers};
+  const inlineBlocks = [];
+  await context.exposeBinding("__tilefinchInlineTrackerBlocked", ({frame}, id, source) => {
+    const host = new URL(frame.url()).hostname;
+    if (!inlineRules.enabled || inlineBlocks.length >= 32 || inlineTrackers.matchRule(host, source, inlineRules.rules) !== id) {
+      const error = new CaptureError("inline tracker blocking evidence is invalid");
+      hostOperations.failTerminal(error, "inline tracker policy");
+      throw error;
+    }
+    inlineBlocks.push({rule:id, source_sha256:crypto.createHash("sha256").update(source).digest("hex")});
+  });
+  await context.addInitScript({content:`(${inlineTrackers.installPolicy.toString()})(${JSON.stringify(inlineRules)}, ${inlineTrackers.matchRule.toString()});`});
   await context.addInitScript(installReadOnlyPolicy, {
-    version: READ_ONLY_POLICY_VERSION,
+    version: readOnlyPolicyVersion,
     preflightPolicy,
+    queryPosts,
   });
   await context.addInitScript(installOfflineCapabilityPolicy, {
     version: OFFLINE_CAPABILITY_POLICY_VERSION,
     surfaceVersion: OFFLINE_CAPABILITY_SURFACE_VERSION,
+    dedicatedWorkers:options.dedicatedWorkers,
   });
   await context.addInitScript(installOfflineProtocolPolicy);
   const page = await context.newPage();
@@ -4960,7 +5498,8 @@ async function captureReference(options) {
           });
         },
         () => requestAudit.networkFulfilled(target, event)));
-    }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"), requestAudit);
+    }, runHost, trackRouteHandler, (error) => hostOperations.failTerminal(error, "frame target setup"), requestAudit,
+      options.dedicatedWorkers ? (target, info) => workerCapture.setup(target, info) : null);
   }
   /* Diagnostic evidence only: surface page-side failures (script errors,
      failed dynamic imports) in the reference state so stalled SPA
@@ -4979,7 +5518,7 @@ async function captureReference(options) {
   let failure = null;
   try {
     navigationResponse = await responseScheduler.driveUntilSettled(
-      page.goto(scenario.url, {
+      page.goto(options.scrollWindow ? scenario.navigationUrl : scenario.url, {
         waitUntil: "domcontentloaded", timeout: options.timeoutMs,
       }),
       "navigation",
@@ -5008,52 +5547,76 @@ async function captureReference(options) {
     );
   } catch (error) { failure = `navigation:${error.message}`; }
 
-  const fullDocument = { version: "bounded-viewport-sweep-v2", requested: options.fullDocument,
+  let preCaptureAction = null;
+  const performPreCaptureAction = async () => {
+    if (options.clickText) {
+      await runHost("pre-capture-control", () => responseScheduler.driveUntilSettled(
+        page.getByText(options.clickText,{exact:true}).click({timeout:5000}),"pre-capture-control"));
+      await runHost("pre-capture-control-settle", () => responseScheduler.driveUntilSettled(
+        settleCapture(page,options.settleMs,()=>ledger.active===0),"pre-capture-control-settle"));
+      preCaptureAction = {kind:"visible-control-click",text:options.clickText,count:1};
+    }
+  };
+  const scrollWindow = options.scrollWindow || 0;
+  const captureCheckpoints = scrollWindow ? [
+    { name: "top", kind: "top", target: null },
+    { name: "window-end", kind: "offset", target: scrollWindow },
+  ] : scenario.checkpoints;
+  const fullDocument = { version: options.scrollSelector ? "bounded-element-window-v1"
+      : scrollWindow ? "bounded-viewport-window-v1" : "bounded-viewport-sweep-v2", requested: options.fullDocument,
     steps: 0, clock_ticks: 0, complete: !options.fullDocument, viewports: [],
+    ...(scrollWindow ? { window_scroll_limit: scrollWindow } : {}),
+    ...(options.scrollSelector ? {scroll_selector:options.scrollSelector} : {}),
     viewport_css: { width: scenario.cssWidth, height: scenario.cssHeight },
     full_screenshot: false, full_screenshot_status: "omitted-mobile-emulation" };
-  const inputProfile = () => page.evaluate(() => ({
+  const inputProfile = () => options.mobileAutoFit ? collectMobileViewportProfile(page) : page.evaluate(() => ({
     coarse: matchMedia("(pointer:coarse)").matches, touch: navigator.maxTouchPoints,
     width: innerWidth, height: innerHeight,
   }));
+  const scrollSurface = (values = {}) => page.evaluate(inspectScrollSurface,
+    {selector:options.scrollSelector, ...values});
+  const visualEvidence = async () => {
+    if (context.__tilefinchWorkerCapture) await responseScheduler.driveUntilSettled(
+      context.__tilefinchWorkerCapture.checkpoint(), "worker-view-checkpoint");
+    const evidence = await captureAudit.collectVisualEvidence(page, visualOptions(!scrollWindow), runHost);
+    if (!options.scrollSelector) return evidence;
+    const surface = await runHost("element-scroll-evidence", () => scrollSurface());
+    return {...evidence, scroll_y:surface.y, maximum:surface.maximum, scroll_surface:surface};
+  };
   if (!failure && options.fullDocument) {
     try {
+      if (options.scrollSelector) fullDocument.scroll_candidates = await runHost(
+        "element-scroll-discovery", () => scrollSurface({discover:true}));
       let requested = 0;
       for (let step = 0; step < MAX_DOCUMENT_SWEEP_STEPS; step += 1) {
-        await runHost("document-sweep-position", () => page.evaluate((y) => {
-          scrollTo({ top: y, behavior: "instant" });
-        }, requested));
+        await runHost("document-sweep-position", () => scrollSurface({top:requested}));
         await runScenarioClock(context, responseScheduler, 1, scenario.tickMs, hostOperations);
         fullDocument.clock_ticks += 1;
         await runHost("document-sweep-settle", () => responseScheduler.driveUntilSettled(
           settleCapture(page, Math.min(options.settleMs, 100), () => ledger.active === 0),
           "document-sweep",
         ));
-        const position = await runHost("document-sweep-extent", () => page.evaluate(() => {
-          const root = document.scrollingElement || document.documentElement;
-          return { y: scrollY, maximum: Math.max(0, root.scrollHeight - innerHeight), height: innerHeight };
-        }));
+        const position = await runHost("document-sweep-extent", () => scrollSurface());
         fullDocument.steps += 1;
         if (position.maximum + position.height > MAX_DOCUMENT_HEIGHT) {
           throw new CaptureError("full-document extent exceeds bounded height");
         }
-        if (position.y >= position.maximum - 2) { fullDocument.complete = true; break; }
-        requested = Math.min(position.maximum, position.y + Math.max(1, position.height - 32));
+        const maximum = scrollWindow ? Math.min(position.maximum, scrollWindow) : position.maximum;
+        if (position.y >= maximum - 2) { fullDocument.complete = true; break; }
+        requested = Math.min(maximum, position.y + Math.max(1, position.height - 32));
       }
       if (!fullDocument.complete) throw new CaptureError("full-document scroll exceeded bounded steps");
+      await performPreCaptureAction();
       fullDocument.geometry_attempts = [];
       for (let geometryAttempt = 0; geometryAttempt < 2; geometryAttempt += 1) {
       fullDocument.viewports = [];
       for (const fraction of [0, .25, .5, .75, 1]) {
-        const requested = await runHost("document-view-position", () => page.evaluate((fraction) => {
-          const root = document.scrollingElement || document.documentElement;
-          const y = Math.floor(Math.max(0, root.scrollHeight - innerHeight) * fraction);
-          scrollTo({ top: y, behavior: "instant" }); return y;
-        }, fraction));
+        const position = await runHost("document-view-position", () => scrollSurface({fraction, limit:scrollWindow}));
+        const requested = Math.floor(Math.min(position.maximum, scrollWindow || position.maximum) * fraction);
         await runHost("document-view-settle", () => responseScheduler.driveUntilSettled(
           settleCapture(page, options.settleMs, () => ledger.active === 0), "document-view",
         ));
-        const evidence = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
+        const evidence = await visualEvidence();
         if (Math.abs(evidence.scroll_y - requested) > 2) {
           throw new CaptureError("full-document viewport shifted during settling");
         }
@@ -5061,17 +5624,19 @@ async function captureReference(options) {
         const raw = path.join(outputDirectory, `raw-${name}`);
         const profileBefore = await runHost("document-view-input-before", inputProfile);
         await runHost("document-view-screenshot", () => responseScheduler.driveUntilSettled(
-          page.screenshot({ path: raw, animations: "disabled", caret: "hide" }),
+          options.mobileAutoFit ? captureMobileAutoFitViewport(page, pageSession, raw, scenario)
+            : page.screenshot({ path: raw, animations: "disabled", caret: "hide" }),
           "document-view-screenshot",
         ));
         await runHost("document-view-normalize", () => normalizePng(
           raw, path.join(outputDirectory, name), scenario, options.python, options.timeoutMs,
         ));
-        const after = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
+        const after = await visualEvidence();
         const profileAfter = await runHost("document-view-input-after", inputProfile);
         for (const profile of [profileBefore, profileAfter]) {
-          if (!profile.coarse || profile.touch !== 1
-              || profile.width !== scenario.cssWidth || profile.height !== scenario.cssHeight) {
+          if (options.mobileAutoFit ? !mobileAutoFitProfileReady(profile, scenario)
+              : (!profile.coarse || profile.touch !== 1
+                 || profile.width !== scenario.cssWidth || profile.height !== scenario.cssHeight)) {
             throw new CaptureError("document viewport input profile changed during screenshot: "
               + JSON.stringify({ before: profileBefore, after: profileAfter }));
           }
@@ -5079,28 +5644,36 @@ async function captureReference(options) {
         if (after.scroll_y !== evidence.scroll_y || after.maximum !== evidence.maximum) {
           throw new CaptureError("full-document viewport changed during screenshot");
         }
+        if (options.scrollSelector && JSON.stringify(after.scroll_surface) !== JSON.stringify(evidence.scroll_surface))
+          throw new CaptureError("internal scroll surface changed during screenshot");
         fullDocument.viewports.push({ fraction, requested, frame: name, ...after,
           input_profile: { before: profileBefore, after: profileAfter } });
       }
       const extent = fullDocument.viewports.at(-1);
       const pixelScale = scenario.scaleNumerator / scenario.scaleDenominator;
-      if (extent.document_width * pixelScale > 2048 || extent.document_height * pixelScale > MAX_DOCUMENT_HEIGHT) {
+      if (extent.document_width * pixelScale > (scrollWindow ? MAX_DOCUMENT_HEIGHT : 2048)
+          || extent.document_height * pixelScale > MAX_DOCUMENT_HEIGHT) {
         throw new CaptureError("full-document screenshot exceeds bounded dimensions");
       }
       /* Full-page Chromium capture changes touch emulation while painting.
          Enlarging its surface instead changes viewport units or omits
          offscreen content. Keep accurate viewport screenshots; never label
          a stitched scroll sequence as a coherent full-page image. */
-      const finalExtent = await captureAudit.collectVisualEvidence(page, visualOptions(true), runHost);
+      const finalExtent = await visualEvidence();
       fullDocument.final_extent = { width: finalExtent.document_width, height: finalExtent.document_height,
-        maximum: finalExtent.maximum, incomplete: finalExtent.incomplete, ready: finalExtent.ready };
+        maximum: finalExtent.maximum, incomplete: finalExtent.incomplete, ready: finalExtent.ready,
+        ...(options.scrollSelector ? {scroll_surface:finalExtent.scroll_surface} : {}) };
       if (!finalExtent.ready) throw new CaptureError("full-document paintable images remain incomplete");
       const mixedGeometry = fullDocument.viewports.some((view) =>
         view.document_width !== extent.document_width || view.document_height !== extent.document_height
-        || view.maximum !== extent.maximum);
+        || view.maximum !== extent.maximum
+        || (options.scrollSelector && JSON.stringify({...view.scroll_surface, y:0})
+          !== JSON.stringify({...extent.scroll_surface, y:0})));
       if (mixedGeometry || finalExtent.document_width !== extent.document_width
           || finalExtent.document_height !== extent.document_height
-          || finalExtent.maximum !== extent.maximum) {
+          || finalExtent.maximum !== extent.maximum
+          || (options.scrollSelector && JSON.stringify({...finalExtent.scroll_surface, y:0})
+            !== JSON.stringify({...extent.scroll_surface, y:0}))) {
         const archived = `geometry-attempt-${geometryAttempt + 1}`;
         fs.mkdirSync(path.join(outputDirectory, archived));
         for (const name of fullDocument.viewports.map((view) => view.frame)) {
@@ -5113,17 +5686,24 @@ async function captureReference(options) {
       }
       break;
       }
-      await runHost("document-reset-scroll", () => page.evaluate(() => scrollTo({ top: 0, behavior: "instant" })));
+      await runHost("document-reset-scroll", () => scrollSurface({top:0}));
     } catch (error) { failure = `full-document:${error.message}`; }
   }
   const checkpointStates = [];
   if (!failure) {
-    for (const [index, checkpoint] of scenario.checkpoints.entries()) {
+    for (const [index, checkpoint] of captureCheckpoints.entries()) {
       try {
         const scrollY = await runHost(
           `checkpoint-${checkpoint.name}-settle-boundary`,
           () => responseScheduler.driveUntilSettled(
-            settleCheckpoint(
+            options.scrollSelector ? (async () => {
+              const position = await scrollSurface({top:checkpoint.kind === "top" ? 0 : scrollWindow});
+              await settleCapture(page, options.settleMs, () => ledger.active === 0);
+              const after = await scrollSurface();
+              if (after.y !== position.y || after.maximum !== position.maximum)
+                throw new CaptureError("internal checkpoint moved during settling");
+              return after.y;
+            })() : settleCheckpoint(
               page, checkpoint, options.settleMs, () => ledger.active === 0,
             ),
             `checkpoint-${checkpoint.name}`,
@@ -5136,7 +5716,7 @@ async function captureReference(options) {
         await runHost(
           `screenshot-${checkpoint.name}-boundary`,
           () => responseScheduler.driveUntilSettled(
-            page.screenshot({
+            options.mobileAutoFit ? captureMobileAutoFitViewport(page, pageSession, raw, scenario) : page.screenshot({
               path: raw, type: "png", animations: "disabled", caret: "hide",
             }),
             `screenshot-${checkpoint.name}`,
@@ -5152,7 +5732,8 @@ async function captureReference(options) {
           name: checkpoint.name, kind: checkpoint.kind, target: checkpoint.target,
           scroll_y: scrollY, frame: filename, format: "png-rgb8",
           width: scenario.deviceWidth, height: scenario.deviceHeight,
-          visual_evidence: await captureAudit.collectVisualEvidence(page, visualOptions(false), runHost),
+          visual_evidence: options.scrollSelector ? await visualEvidence()
+            : await captureAudit.collectVisualEvidence(page, visualOptions(false), runHost),
         });
       } catch (error) { failure = `checkpoint:${checkpoint.name}:${error.message}`; break; }
     }
@@ -5181,12 +5762,33 @@ async function captureReference(options) {
     performanceTimeOrigin: 0, clockEvidence: null,
   };
   let pageState = emptyPageState;
+  let mobileViewportEvidence = null;
   let textMetrics = null;
+  let inlineEvidence = {version:"shared-inline-trackers-v1", rules_sha256:inlineRules.sha256,
+    enabled:inlineRules.enabled, blocked:0, ready:false};
+  let cosmeticEvidence = {version:"shared-cosmetic-v1", rules_sha256:cosmeticRules.sha256,
+    enabled:cosmeticRules.enabled, ready:false};
+  try {
+    const frames = page.frames();
+    if (frames.length > 64) throw new CaptureError("inline tracker frame bound exceeded");
+    const evidence = [];
+    const cosmetic = [];
+    for (const frame of frames) cosmetic.push(await runHost("cosmetic-policy-evidence", () =>
+      frame.evaluate(() => globalThis.__tilefinchCosmeticEvidence())));
+    cosmeticEvidence.ready = cosmetic.every(row => row.ready && row.rules_sha256 === cosmeticRules.sha256
+      && row.enabled === cosmeticRules.enabled);
+    for (const frame of frames) evidence.push(await runHost("inline-tracker-policy-evidence", () =>
+      frame.evaluate(() => globalThis.__tilefinchInlineTrackerEvidence())));
+    inlineEvidence.blocked = evidence.reduce((sum, row) => sum + row.blocked, 0);
+    inlineEvidence.ready = evidence.every(row => row.ready && row.rules_sha256 === inlineRules.sha256);
+  } catch (error) { if (!failure) failure = `inline-policy:${error.message}`; }
   if (!failure) {
     try {
       pageState = await evaluateCaptureEvidence(
         page, scenario, hostOperations,
       );
+      if (options.mobileAutoFit)
+        mobileViewportEvidence = await runHost("mobile-auto-fit-evidence", inputProfile);
     } catch (error) { failure = `evidence:${error.message}`; }
   }
   if (!failure && textMetricsPath !== null) {
@@ -5270,6 +5872,9 @@ async function captureReference(options) {
     });
     browserCloseSucceeded = true;
     browser = null;
+    if (workerBrowser) await runHost("isolated-worker-browser-close", () => workerBrowser.cleanup(), {
+      allowAfterTerminal:true,
+    });
   } catch (error) {
     teardownReady = false;
     if (!failure) failure = `teardown:browser:${error.message}`;
@@ -5299,6 +5904,7 @@ async function captureReference(options) {
   }
   const fallback = pageState.fallback;
   const interstitial = pageState.interstitial;
+  inlineEvidence.ready = inlineEvidence.ready && inlineEvidence.blocked === inlineBlocks.length;
   const unexpectedSummary = unexpectedDiagnostics.summary();
   const policySummary = policyDiagnostics.summary();
   const capabilitySummary = capabilityDiagnostics.summary();
@@ -5336,13 +5942,17 @@ async function captureReference(options) {
     && replayClockEvidenceReady(
       clockEvidence, environment.originMs, expectedVirtualMs, environment.clockContract,
     );
-  const readOnlyPolicyReady = pageState.readOnlyPolicy === READ_ONLY_POLICY_VERSION
+  const readOnlyPolicyReady = pageState.readOnlyPolicy === readOnlyPolicyVersion
     && pageState.readOnlyPreflightPolicy === preflightPolicy
-    && preflightPolicyDenials === 0 && !policySummary.overflow && !preflightOverflow;
+    && preflightPolicyDenials === 0 && !policySummary.overflow && !preflightOverflow
+    && (!options.retainedQueryPosts || !policySummary.entries.some(entry =>
+      entry.method === "POST" && diagnosticOrigin(entry.url) === new URL(scenario.url).origin
+      && !blockedUrlMatches(entry.url,scenario.blockedOrigins)));
   const capabilityPolicyReady =
     pageState.capabilityPolicy === OFFLINE_CAPABILITY_POLICY_VERSION
-    && offlineCapabilityEvidenceReady(pageState.capabilityEvidence)
-    && capabilitySummary.total === 0 && !capabilitySummary.overflow;
+    && offlineCapabilityEvidenceReady(pageState.capabilityEvidence, options.dedicatedWorkers)
+    && (!options.dedicatedWorkers || (workerCapture.summary().ready && workerBrowser.evidence().held === 0))
+    && capabilitySummary.total === 0 && !capabilitySummary.overflow && inlineEvidence.ready && cosmeticEvidence.ready;
   const schedulerReady = !schedulerSummary.overflow
     && schedulerSummary.ready === true
     && schedulerSummary.failures === 0
@@ -5364,7 +5974,9 @@ async function captureReference(options) {
     && teardownReady
     && resources.pending === 0;
   const expectedScale = scenario.scaleNumerator / scenario.scaleDenominator;
-  const viewportReady = pageState.innerWidth === scenario.cssWidth
+  const viewportReady = options.mobileAutoFit
+    ? mobileAutoFitProfileReady(mobileViewportEvidence, scenario)
+    : pageState.innerWidth === scenario.cssWidth
     && pageState.innerHeight === scenario.cssHeight
     && Math.abs(pageState.devicePixelRatio - expectedScale) < 1e-6;
   const observedUrl = observedUrlBeforeTeardown;
@@ -5414,6 +6026,8 @@ async function captureReference(options) {
     ...(pageState.requiredMarker ? [] : ["reference-state-marker-missing"]),
     ...(fallback ? ["reference-fallback"] : []),
     ...(interstitial ? ["reference-interstitial"] : []),
+    ...(!inlineEvidence.ready ? ["reference-inline-tracker-policy-unhealthy"] : []),
+    ...(!cosmeticEvidence.ready ? ["reference-cosmetic-policy-unhealthy"] : []),
     ...(resources.stylesheets_loaded >= scenario.minStylesheets
       ? [] : ["reference-stylesheets-below-minimum"]),
     ...(resources.images_loaded >= scenario.minImages
@@ -5424,7 +6038,7 @@ async function captureReference(options) {
       ? [] : ["reference-network-completions-below-minimum"]),
     ...(resources.pending <= scenario.maxPending
       ? [] : ["reference-resources-pending"]),
-    ...(checkpointStates.length === scenario.checkpoints.length
+    ...(checkpointStates.length === captureCheckpoints.length
       ? [] : ["reference-checkpoints-incomplete"]),
   ];
   const ready = eligibilityReasons.length === 0;
@@ -5456,9 +6070,17 @@ async function captureReference(options) {
   const state = {
     schema: 2, scenario: scenario.name, trace_sha256: scenario.digest,
     url: scenario.url, capture_url: captureUrl,
+    ...(options.scrollWindow ? {navigation:{requested:scenario.navigationUrl, observed:observedUrl}} : {}),
     capture_transport: "cdp-response-keyed",
-    capture_scope: options.fullDocument ? "viewport-sweep-diagnostic-v2" : "manifest-checkpoints-v1",
+    capture_scope: options.dedicatedWorkers ? "dedicated-worker-window-diagnostic-v1"
+      : options.scrollSelector ? "element-scroll-window-diagnostic-v1"
+      : options.mobileAutoFit ? "mobile-auto-fit-window-diagnostic-v1"
+      : options.clickText ? "interaction-window-diagnostic-v1"
+      : options.retainedQueryPosts ? "retained-query-window-diagnostic-v1"
+      : scrollWindow ? "viewport-window-diagnostic-v1"
+      : options.fullDocument ? "viewport-sweep-diagnostic-v2" : "manifest-checkpoints-v1",
     target_interception: targetInterceptionEvidence,
+    ...(options.clickText ? {pre_capture_action:preCaptureAction} : {}),
     http_status: navigationStatus,
     title: pageState.title,
     state_markers: pageState.requiredMarker ? [scenario.requiredMarker] : [],
@@ -5471,6 +6093,10 @@ async function captureReference(options) {
         width: pageState.innerWidth, height: pageState.innerHeight,
         device_pixel_ratio: pageState.devicePixelRatio,
       },
+      ...(options.mobileAutoFit ? {auto_fit: {
+        version: "physical-mobile-viewport-v1", profile: mobileViewportEvidence,
+        screenshot: "cdp-surface-no-clip-v1",
+      }} : {}),
     },
     resources, replay_ledger: persistedLedger,
     replay_environment: {
@@ -5497,7 +6123,8 @@ async function captureReference(options) {
       animation_frame: environment.clockContract,
     },
     read_only_policy: {
-      version: READ_ONLY_POLICY_VERSION,
+      version: readOnlyPolicyVersion,
+      ...(options.retainedQueryPosts ? {retained_query_sha256:queryPosts.map(entry=>entry.sha256)} : {}),
       preflight_policy: preflightPolicy,
       ...(options.retainedPreflights ? {
         preflight_requests: [...preflightRequests.values()],
@@ -5510,9 +6137,12 @@ async function captureReference(options) {
       diagnostics: policySummary,
     },
     offline_capability_policy: {
+      inline_trackers:{...inlineEvidence, records:inlineBlocks},
+      cosmetic_blocking:cosmeticEvidence,
       version: OFFLINE_CAPABILITY_POLICY_VERSION,
       ready: capabilityPolicyReady,
-      worker_realms: "api-unavailable-before-page-script",
+      worker_realms: options.dedicatedWorkers ? "paused-offline-dedicated-v1" : "api-unavailable-before-page-script",
+      ...(options.dedicatedWorkers ? {worker_evidence:{...workerCapture.summary(), transport:workerBrowser.evidence()}} : {}),
       shared_worker_realms: "api-unavailable-before-page-script",
       worklet_realms: "api-unavailable-before-module-load",
       shadow_realms: "api-unavailable-before-page-script",
@@ -5607,6 +6237,7 @@ async function captureReference(options) {
         });
       } catch (_error) {}
     }
+    if (workerBrowser) await workerBrowser.cleanup();
   }
 }
 
@@ -5638,6 +6269,7 @@ module.exports = {
   teardownEvidenceSnapshot,
   evaluateCaptureEvidence, collectReferenceTextMetrics,
   launchBrowser, normalizePng,
+  mobileAutoFitProfileReady, collectMobileViewportProfile, captureMobileAutoFitViewport,
   installOfflineCapabilityPolicy, installOfflineProtocolPolicy,
   installReadOnlyPolicy, installReplayEnvironment,
   loadRecord, loadScenario, loadTrace, normalizeUrl,
@@ -5648,4 +6280,5 @@ module.exports = {
   retainedFailureAbortCode,
   runScenarioClock,
   selectRoute, settlePage, traceDigest, traceInfo, traceOriginMs,
+  selectRequestOriginRoute,
 };

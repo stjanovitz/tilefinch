@@ -79,6 +79,7 @@ static bool test_authoritative_layout_resumes_across_finalize_ticks(void)
         && navigation_load_metrics(load, &metrics)
         && navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED
         && navigation.page.loaded
+        && navigation.page.committed_us != 0u
         && navigation.page.document.node_count >= 300
         && navigation.page.layout.performance.resumable_phases >= 8
         && navigation.page.layout.performance.resumable_passes == 1
@@ -117,6 +118,7 @@ static bool test_resumable_layout_cancel_preserves_incumbent(void)
         && navigation_init(&navigation, &budget, 4)
         && prior_page(&navigation)
         && resumable_layout_replay_begin();
+    uint64_t incumbent_committed_us = navigation.page.committed_us;
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
     NavigationLoad *load = ready ? navigation_load_begin_url(
         &navigation, generation,
@@ -145,6 +147,7 @@ static bool test_resumable_layout_cancel_preserves_incumbent(void)
     bool ok = was_finalizing
         && navigation_load_status(load) == NAVIGATION_LOAD_CANCELLED
         && navigation.page.loaded && current != NULL
+        && navigation.page.committed_us == incumbent_committed_us
         && strcmp(current->url, "https://prior.test/#old") == 0
         && strcmp(navigation.page.document.title, "Prior") == 0;
     navigation_load_destroy(load);

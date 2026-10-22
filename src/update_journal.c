@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(__PSP__)
-#include <pspiofilemgr.h>
-#else
+#include "tilefinch/install_paths.h"
+
+#if !defined(__PSP__)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -76,18 +76,31 @@ static bool journal_sync_file(FILE *file)
 #endif
 }
 
-static bool journal_sync_directory(const char *directory)
+/* Runs after the rename has already selected the new copy, so it can only
+   make that commit durable sooner; it cannot undo it. Consistency does not
+   depend on it: the stale copy is the only one ever replaced, and a torn or
+   missing new copy fails its checksum, so after a power cut the next load
+   selects either the old or the new state, both complete. What the flush
+   buys is durability: a STARTED trial reaching the card before the trial
+   slot runs is what sends a hung trial to recovery on the next boot. Some
+   real firmware/storage-driver combinations reject every sync after the
+   checked writes succeeded; failing the store there would leave callers
+   believing the old state while the card selects the new one (a launcher
+   dropping into recovery over a journal that says TRIAL, a browser retrying
+   a confirmation whose generation is already on disk). There the store
+   reports the commit it made, and that durability rests on the driver. */
+static void journal_sync_directory(const char *directory)
 {
 #if defined(__PSP__)
     (void) directory;
-    return sceIoSync("ms0:", 0) >= 0;
 #else
     int descriptor = open(directory, O_RDONLY);
-    if (descriptor < 0) return false;
-    bool ok = fsync(descriptor) == 0;
-    close(descriptor);
-    return ok;
+    if (descriptor >= 0) {
+        (void) fsync(descriptor);
+        close(descriptor);
+    }
 #endif
+    (void) tilefinch_memory_stick_sync();
 }
 
 bool tilefinch_update_journal_store(
@@ -141,7 +154,10 @@ bool tilefinch_update_journal_store(
         remove(temporary);
         return false;
     }
-    if (journal_fault(fault, fault_opaque, "before-directory-sync")
-        || !journal_sync_directory(data_dir)) return false;
+    /* A fault here models power loss after the commit; the return value is
+       then moot, and the sweep checks only what the next load selects. */
+    if (journal_fault(fault, fault_opaque, "before-directory-sync"))
+        return false;
+    journal_sync_directory(data_dir);
     return true;
 }

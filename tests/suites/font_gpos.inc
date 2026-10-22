@@ -130,12 +130,15 @@ static bool check_gpos_face(const unsigned char *font, size_t length,
         (void) font_kerning_at_size_fixed(&face, 'A', 'V', sizes[i]);
     CHECK(tilefinch_test_faults()->web_font_kerning_cache_resets
         == size_resets + (units == -192 ? 3u : 0u));
-    (void) font_kerning_fixed(&face, 'A', 'V', 20);
+    /* Latin pairs around common-script pairs (DFLT plan) keep their cached
+       entries: plans tag entries instead of flushing the shared cache. */
+    int latin_pair = font_kerning_fixed(&face, 'A', 'V', 20);
     unsigned resets = tilefinch_test_faults()->web_font_kerning_cache_resets;
-    CHECK(font_kerning_fixed(&face, '1', '2', 20) == 0);
-    (void) font_kerning_fixed(&face, 'A', 'V', 20);
-    CHECK(tilefinch_test_faults()->web_font_kerning_cache_resets
-        == resets + (units == -64 ? 2u : 0u));
+    for (unsigned repeat = 0; repeat < 4; repeat++) {
+        CHECK(font_kerning_fixed(&face, '1', '2', 20) == 0);
+        CHECK(font_kerning_fixed(&face, 'A', 'V', 20) == latin_pair);
+    }
+    CHECK(tilefinch_test_faults()->web_font_kerning_cache_resets == resets);
     unsigned lookups = tilefinch_test_faults()->web_font_charmap_lookups;
     for (unsigned repeat = 0; repeat < 8; repeat++) {
         CHECK(font_face_has_codepoint(&face, 'A'));

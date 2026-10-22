@@ -37,11 +37,6 @@ typedef struct {
 
 const JSMallocFunctions *budget_quickjs_allocator(void);
 BudgetQuickJSPool *budget_quickjs_pool_create(Budget *budget);
-#if !defined(__PSP__)
-/* Host-only native-tier lab: recover the existing Budget owner from the
-   allocator passed to JS_NewRuntime2. Never creates a second allocation. */
-Budget *budget_quickjs_pool_owner(const BudgetQuickJSPool *pool);
-#endif
 bool budget_quickjs_pool_destroy(BudgetQuickJSPool *pool);
 size_t budget_quickjs_pool_trim(BudgetQuickJSPool *pool,
                                 size_t retain_per_class);

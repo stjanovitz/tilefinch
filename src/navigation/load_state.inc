@@ -99,6 +99,27 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
     return stream->parser_checkpoint_outcome;
 }
 
+/* Transport keys omit fragments, but parser-blocking scripts must see the
+   same inherited fragment as the eventual history entry. An explicit final
+   fragment (including an empty '#') takes precedence. Use scratch because
+   the stream updates its document URL in place. */
+static bool navigation_response_document_url(
+    const char *effective, const char *requested,
+    char output[NAVIGATION_URL_LIMIT])
+{
+    char normalized[NAVIGATION_URL_LIMIT];
+    if (!tilefinch_url_normalize(effective, normalized, sizeof(normalized)))
+        return false;
+    const char *fragment = strchr(requested, '#');
+    if (fragment != NULL && strchr(normalized, '#') == NULL) {
+        size_t used = strlen(normalized), length = strlen(fragment);
+        if (length >= sizeof(normalized) - used) return false;
+        memcpy(normalized + used, fragment, length + 1);
+    }
+    memcpy(output, normalized, strlen(normalized) + 1);
+    return true;
+}
+
 static bool navigation_stream_headers(void *opaque,
                                       const FetchResult *metadata)
 {
@@ -132,8 +153,8 @@ static bool navigation_stream_headers(void *opaque,
             tilefinch_encoding_from_content_type(metadata->content_type));
     }
     if (metadata->effective_url[0] != '\0') {
-        snprintf(stream->document_url, sizeof(stream->document_url), "%s",
-                 metadata->effective_url);
+        if (!navigation_response_document_url(metadata->effective_url,
+                stream->document_url, stream->document_url)) return false;
         snprintf(stream->resource_base_url,
                  sizeof(stream->resource_base_url), "%s",
                  metadata->effective_url);
@@ -534,6 +555,8 @@ static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
         }
         if (ok) load->staged_stall = false;
     }
+    if (ok && length != 0 && !load->sectioned)
+        ok = navigation_stream_parser_timer_checkpoint(load->document_stream);
     uint64_t elapsed = navigation_now_us() - started;
     load->metrics.parser_pump_us += elapsed;
     if (elapsed > load->metrics.maximum_parser_pump_us) {
@@ -597,7 +620,7 @@ static bool navigation_load_initialize_document_stream(
     stream->viewport_width = load->viewport_width;
     stream->isolates_remote_document = true;
     snprintf(stream->document_url, sizeof(stream->document_url), "%s",
-             load->request_url);
+             load->requested_url);
     snprintf(stream->resource_base_url,
              sizeof(stream->resource_base_url), "%s", load->request_url);
     snprintf(stream->referrer_source_url,
@@ -1459,15 +1482,8 @@ NavigationLoadStatus navigation_load_pump(
 static bool navigation_load_history_url(
     const NavigationLoad *load, char output[NAVIGATION_URL_LIMIT])
 {
-    if (!tilefinch_url_normalize(load->effective_history_url, output,
-                              NAVIGATION_URL_LIMIT)) return false;
-    const char *fragment = strchr(load->requested_url, '#');
-    if (fragment != NULL && strchr(output, '#') == NULL) {
-        size_t used = strlen(output), length = strlen(fragment);
-        if (length >= NAVIGATION_URL_LIMIT - used) return false;
-        memcpy(output + used, fragment, length + 1);
-    }
-    return true;
+    return navigation_response_document_url(load->effective_history_url,
+                                            load->requested_url, output);
 }
 
 static bool navigation_load_finalize_parse(NavigationLoad *load)
@@ -1803,13 +1819,12 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         if (layout_status != LAYOUT_BUILD_COMPLETE
             || !layout_build_job_take(
                    load->layout_job, &candidate->page.layout)) {
-            snprintf(candidate->last_error, sizeof(candidate->last_error),
-                     "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
-                     load->layout_job == NULL ? 11u
-                         : layout_build_job_failure_phase(load->layout_job),
-                     (unsigned) (layout_status == LAYOUT_BUILD_CANCELLED),
-                     session->budget->failure_count - failures_before,
-                     session->budget->current, session->budget->limit);
+            navigation_note_layout_failure(
+                candidate, load->layout_job == NULL
+                    ? LAYOUT_BUILD_FAILED_AT_STARTUP
+                    : layout_build_job_failure_phase(load->layout_job),
+                layout_status == LAYOUT_BUILD_CANCELLED,
+                session->budget->failure_count - failures_before);
             built = false;
         } else {
             layout_build_job_destroy(load->layout_job);
@@ -1831,6 +1846,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
             if (built) {
                 candidate->replacement_failure_overlay_active = false;
                 candidate->replacement_failure_message[0] = '\0';
+                candidate->page.committed_us = navigation_now_us();
                 candidate->loads_committed++;
             }
         }
@@ -1847,6 +1863,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
                  candidate->last_error[0] == '\0'
                    ? "candidate page construction failed"
                    : candidate->last_error);
+        session->last_layout_failure = candidate->last_layout_failure;
         snprintf(session->last_script_error_context,
                  sizeof(session->last_script_error_context), "%s",
                  candidate->last_script_error_context);

@@ -84,6 +84,15 @@ the exact track id and performs a close/reopen transaction at the current
 position while preserving the machine's play/pause intent; it is not a second
 decoder-control authority and is not classified as failure recovery.
 
+The audio, subtitle, and alternate-language preferences are independent
+profile settings, defaulting to the PSP's system language. The parser scans
+the bounded player inventory but keeps only the six highest-ranked distinct
+audio and caption descriptors. Exact selected IDs, exact BCP-47 tags,
+primary-language fallbacks, the alternate language, and the authored default
+are ordered without per-track allocation, and a late track can displace a
+weaker retained one, so the six-entry bound cannot hide a preferred language.
+Triangle opens the native player's track menu.
+
 Subtitles are optional presentation data rather than a media-machine state.
 They default off. An explicit selection runs a separate bounded resolver job
 which copies only the selected caption URL and six-row catalog into the
@@ -92,7 +101,10 @@ fetches one bounded credential-free WebVTT document outside the two
 media-reserved transport slots. Parsing creates one capped cue table charged
 to the session budget. Seek uses the same clock lookup, and close/reopen
 cancels the resolver/request and releases every cue. Resolve, fetch, parse, or
-unsupported-track failure never changes playback state.
+unsupported-track failure never changes playback state. The subtitle
+preference affects only ranking. Caption size, and either an opaque box or a
+text shadow, are profile settings; the opaque player furniture avoids
+importing moving 8888 video into the RGB565 chrome compositor.
 
 ## Control graph
 

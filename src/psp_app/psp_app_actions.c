@@ -63,6 +63,22 @@ __attribute__((noinline))
 static void psp_app_dispatch_heavy_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
 
+/* Offers a file download for url (NULL: nothing to offer): the "Save
+   file?" sheet when the store accepts it, otherwise the failure toast. */
+static void psp_app_offer_file(PspApp *app, PspAppFrameState *frame,
+                               const char *url, const char *failure_status)
+{
+    BrowserEngine *engine = app->browser->engine;
+    bool shown = url != NULL && psp_offline_store_offer_file(
+        &app->browser->offline_store, engine, url);
+    (void) psp_engine_views_refresh(app->views, engine);
+    psp_sync_ui(&app->process->presentation.ui, engine, app->browser->profile);
+    if (shown) psp_ui_show_file_download(&app->process->presentation.ui,
+        psp_offline_store_file_preview(&app->browser->offline_store));
+    else psp_ui_show_status(&app->process->presentation.ui, failure_status, 180);
+    frame->page_dirty |= shown;
+}
+
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 /* Brings the network up for an action about to fetch url, unless a trace
    replays the traffic. When it cannot, the buttons held through the
@@ -1100,11 +1116,12 @@ static void psp_app_dispatch_heavy_action(
                         || (youtube_save && source_entry != NULL
                             && youtube_watch_url_supported(
                                    source_entry->url));
-                    bool zip_preview = trusted_source && (strstr(action.url, "/offline/extract?id=")
-                        || strstr(action.url, "/offline/remove-homebrew?name=") || strstr(action.url, "/offline/homebrew"));
+                    const char *stopping = trusted_source
+                        ? psp_offline_store_route_cancel_status(action.url) : NULL;
+                    bool zip_preview = stopping != NULL;
                     if (zip_preview)
                         psp_work_cooperate_begin(&app->process->presentation.ui, engine_frame,
-                            true, true, false, "STOPPING ZIP CHECK...", "zip-preview", NULL, NULL);
+                            true, true, false, stopping, "zip-preview", NULL, NULL);
                     PspOfflineRouteResult offline_result =
                         trusted_source
                         ? psp_offline_store_handle_url(
@@ -1143,15 +1160,8 @@ static void psp_app_dispatch_heavy_action(
                     }
                 }
                 if (navigates && action.prefer_download) {
-                    bool shown = psp_offline_store_offer_file(
-                        &app->browser->offline_store, engine, action.url);
-                    (void) psp_engine_views_refresh(app->views, engine);
-                    psp_sync_ui(&app->process->presentation.ui, engine, profile);
-                    if (shown) psp_ui_show_file_download(&app->process->presentation.ui,
-                        psp_offline_store_file_preview(&app->browser->offline_store));
-                    frame->page_dirty |= shown;
-                    if (!shown) psp_ui_show_status(&app->process->presentation.ui,
-                                                  "DOWNLOAD PREVIEW UNAVAILABLE", 180);
+                    psp_app_offer_file(app, frame, action.url,
+                                       "DOWNLOAD PREVIEW UNAVAILABLE");
                     break;
                 }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -1404,15 +1414,10 @@ static void psp_app_dispatch_heavy_action(
             break;
         case PSP_UI_ACTION_DOWNLOAD_LINK: {
             char url[NAVIGATION_URL_LIMIT];
-            bool shown = controller_focused_download_url(browser_engine_controller(engine), url, sizeof(url))
-                && psp_offline_store_offer_file(&app->browser->offline_store, engine, url);
-            (void) psp_engine_views_refresh(app->views, engine);
-            psp_sync_ui(&app->process->presentation.ui, engine, profile);
-            if (shown) psp_ui_show_file_download(&app->process->presentation.ui,
-                psp_offline_store_file_preview(&app->browser->offline_store));
-            frame->page_dirty |= shown;
-            if (!shown) psp_ui_show_status(&app->process->presentation.ui,
-                "FOCUS AN HTTPS DOWNLOAD LINK FIRST", 180);
+            psp_app_offer_file(app, frame,
+                controller_focused_download_url(browser_engine_controller(engine), url, sizeof(url))
+                    ? url : NULL,
+                "FOCUS AN HTTPS DOWNLOAD LINK FIRST");
             break;
         }
         case PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD:

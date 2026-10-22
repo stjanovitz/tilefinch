@@ -1,4 +1,6 @@
 #include "tilefinch/session_persistence.h"
+#include "tilefinch/platform.h"
+#include "../src/tilefinch_test_faults.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,6 +155,76 @@ static bool file_contains(const char *path, const char *needle)
     free(bytes);
     fclose(file);
     return found;
+}
+
+static bool write_text(const char *path, const char *text)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = fputs(text, file) >= 0;
+    return fclose(file) == 0 && ok;
+}
+
+static bool exists(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file != NULL) fclose(file);
+    return file != NULL;
+}
+
+/* The shared FAT publication helper, with rename refusing to replace an
+   existing file as the PSP's does. With a backup, every step leaves a
+   complete generation; without one, the destination is replaced. */
+static int test_replace_file_on_fat(void)
+{
+    char path[256], temporary[256], backup[256];
+    snprintf(path, sizeof(path), "%s.replace", persistence_path);
+    snprintf(temporary, sizeof(temporary), "%s.replace.tmp", persistence_path);
+    snprintf(backup, sizeof(backup), "%s.replace.bak", persistence_path);
+    (void) remove(path);
+    (void) remove(backup);
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replace_file_no_replace = true;
+    /* First generation: nothing to rotate. */
+    CHECK(write_text(temporary, "one")
+          && tilefinch_platform_replace_file(temporary, path, backup)
+          && file_contains(path, "one") && !exists(temporary)
+          && !exists(backup));
+    CHECK(write_text(temporary, "two")
+          && tilefinch_platform_replace_file(temporary, path, backup)
+          && file_contains(path, "two") && file_contains(backup, "one"));
+    /* FAT refuses to replace the older backup: only it is removed. */
+    CHECK(write_text(temporary, "three")
+          && tilefinch_platform_replace_file(temporary, path, backup)
+          && file_contains(path, "three") && file_contains(backup, "two"));
+    /* A failed install moves the previous file back. */
+    faults->replace_file_fail_install = true;
+    CHECK(write_text(temporary, "four")
+          && !tilefinch_platform_replace_file(temporary, path, backup)
+          && !faults->replace_file_fail_install
+          && file_contains(path, "three") && file_contains(temporary, "four"));
+    /* A power loss after the rotation leaves the backup and the rewrite. */
+    faults->replace_file_crash_after_backup = true;
+    CHECK(!tilefinch_platform_replace_file(temporary, path, backup)
+          && !exists(path) && file_contains(backup, "three")
+          && file_contains(temporary, "four"));
+    CHECK(tilefinch_platform_replace_file(temporary, path, backup)
+          && file_contains(path, "four"));
+    /* Without a backup the destination is replaced in place. */
+    CHECK(write_text(temporary, "five")
+          && tilefinch_platform_replace_file(temporary, path, NULL)
+          && file_contains(path, "five") && !exists(temporary)
+          && file_contains(backup, "three"));
+    /* A missing temporary file fails without touching anything. */
+    CHECK(!tilefinch_platform_replace_file(temporary, path, NULL)
+          && file_contains(path, "five"));
+    faults->replace_file_no_replace = false;
+    CHECK(write_text(temporary, "six")
+          && tilefinch_platform_replace_file(temporary, path, NULL)
+          && file_contains(path, "six"));
+    (void) remove(path);
+    (void) remove(backup);
+    return 0;
 }
 
 static BrowserCacheEntry *find_cache(BrowserSession *session,
@@ -840,6 +912,7 @@ static int test_storage_load_budget_refusal_preserves_target(void)
 int main(void)
 {
     (void) browser_session_persistence_remove(persistence_path);
+    CHECK(test_replace_file_on_fat() == 0);
     CHECK(test_round_trip_and_clear() == 0);
     CHECK(test_transaction_limits_and_backup() == 0);
     CHECK(test_smaller_live_cache_and_truncated_input() == 0);

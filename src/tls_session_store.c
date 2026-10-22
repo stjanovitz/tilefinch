@@ -1,4 +1,5 @@
 #include "tilefinch/tls_session_store.h"
+#include "tilefinch/platform.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -325,24 +326,6 @@ static int make_path(const char *path, const char *suffix,
     return written > 0 && (size_t) written < TLS_STORE_PATH_BYTES;
 }
 
-static int install_temporary(const char *temporary, const char *path,
-                             const char *backup)
-{
-    /* Mirror session_persistence.c: rotate the primary to backup, then rename
-     * the closed temporary in. FAT may refuse a replacing rename, so retry
-     * after removing only the older backup while the primary is still whole. */
-    int had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) return 0;
-    }
-    if (rename(temporary, path) == 0) return 1;
-    if (had_previous) (void) rename(backup, path);
-    return 0;
-}
-
 static void emit_bytes(FILE *file, uint32_t *hash, const void *data,
                        size_t length, int *ok)
 {
@@ -434,7 +417,7 @@ int tls_session_store_save(const TlsSessionStore *store, const char *path,
         (void) remove(temporary);
         return -1;
     }
-    if (!install_temporary(temporary, path, backup)) {
+    if (!tilefinch_platform_replace_file(temporary, path, backup)) {
         (void) remove(temporary);
         return -1;
     }

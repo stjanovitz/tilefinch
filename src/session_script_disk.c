@@ -129,6 +129,9 @@ struct BrowserScriptDisk {
     bool index_dirty;
     bool index_stamps_dirty;
     unsigned index_retry_wait;
+    /* An I/O failure gets one paced retry, then waits for the next
+       structural change. */
+    bool index_io_retried;
     uint32_t clock;
     size_t count;
     uint64_t total;
@@ -436,7 +439,31 @@ static void index_load(BrowserSession *session)
     if (refused) disk->index_loaded = false;
 }
 
-/* tmp + remove + rename (FAT does not rename over an existing file). */
+/* Publishes a closed temporary index or pack. On failure, *destination_gone
+   says whether the old file is gone as well (FAT cannot rename over a file,
+   so it is removed first); the temporary file is left to the caller. Host
+   tests fail the publication at exactly that point. */
+static bool script_disk_publish(const char *temporary, const char *path,
+                                bool index, bool *destination_gone)
+{
+#ifndef __PSP__
+    unsigned *count = index
+        ? &tilefinch_test_faults()->fail_script_cache_index_renames
+        : &tilefinch_test_faults()->fail_script_cache_pack_renames;
+    if (*count != 0u) {
+        (*count)--;
+        *destination_gone = remove(path) == 0 || errno == ENOENT;
+        return false;
+    }
+#else
+    (void) index;
+#endif
+    if (tilefinch_platform_replace_file(temporary, path, NULL)) return true;
+    struct stat status;
+    *destination_gone = stat(path, &status) != 0;
+    return false;
+}
+
 static bool index_save(BrowserSession *session, bool *allocation_refused)
 {
     if (allocation_refused != NULL) *allocation_refused = false;
@@ -476,12 +503,16 @@ static bool index_save(BrowserSession *session, bool *allocation_refused)
     ok = ok && fwrite(data, 1, length, file) == length;
     if (file != NULL) ok = fclose(file) == 0 && ok;
     budget_free(session->budget, data);
+    bool keep_temporary = false;
     if (ok) {
-        (void) remove(path);
-        ok = rename(temporary, path) == 0;
+        bool destination_gone = false;
+        ok = script_disk_publish(temporary, path, true, &destination_gone);
+        /* The complete temporary copy is now the only one; index_load
+           recovers it. */
+        keep_temporary = !ok && destination_gone;
     }
     if (!ok) {
-        (void) remove(temporary);
+        if (!keep_temporary) (void) remove(temporary);
         return false;
     }
     disk->index_dirty = false;
@@ -1171,9 +1202,13 @@ static bool job_step(BrowserSession *session)
     if (closed != 0 || job->bytes != job->expected_bytes
         || !disk_path(disk, job->group, SCRIPT_DISK_SUFFIX, path,
                       sizeof(path))) goto failed;
-    /* FAT does not rename over an existing file. */
-    (void) remove(path);
-    if (rename(job->temporary, path) != 0) goto failed;
+    bool removed = false;
+    if (!script_disk_publish(job->temporary, path, false, &removed)) {
+        /* The pack this group's index entry names is gone. */
+        ScriptDiskEntry *stale = removed ? index_find(disk, job->group) : NULL;
+        if (stale != NULL) index_remove_at(disk, (size_t) (stale - disk->entries));
+        goto failed;
+    }
     ScriptDiskEntry *existing = index_find(disk, job->group);
     if (existing != NULL) {
         disk->total -= existing->bytes <= disk->total ? existing->bytes
@@ -1250,10 +1285,16 @@ bool browser_session_script_disk_maintenance(BrowserSession *session)
         if (!index_save(session, &allocation_refused)) {
             disk->stats.write_failures++;
             /* A temporary Budget refusal must not strand a published pack
-               without its index. Pace retries to avoid a per-tick OOM loop. */
-            disk->index_dirty = allocation_refused;
-            if (allocation_refused)
-                disk->index_retry_wait = SCRIPT_DISK_RETRY_FIRST;
+               without its index. Pace retries to avoid a per-tick OOM loop.
+               An I/O failure (a publish rename can fail after the old index
+               was removed) is retried once, paced, then left to the next
+               structural change; the next boot recovers a kept .tmp. */
+            bool retry = allocation_refused || !disk->index_io_retried;
+            if (!allocation_refused) disk->index_io_retried = true;
+            disk->index_dirty = retry;
+            if (retry) disk->index_retry_wait = SCRIPT_DISK_RETRY_FIRST;
+        } else {
+            disk->index_io_retried = false;
         }
         return true;
     }

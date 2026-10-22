@@ -1,5 +1,6 @@
 #include "tilefinch/update.h"
 #include "tilefinch/update_history.h"
+#include "tilefinch/install_paths.h"
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -734,6 +735,74 @@ static int test_journal_faults(void)
     return 0;
 }
 
+static bool journal_selects(const char *directory,
+                            const TilefinchUpdateState *expected)
+{
+    TilefinchUpdateState loaded;
+    uint8_t a[TILEFINCH_UPDATE_STATE_BYTES], b[TILEFINCH_UPDATE_STATE_BYTES];
+    return tilefinch_update_journal_load(directory, &loaded, NULL)
+        && tilefinch_update_state_encode(&loaded, a) == TILEFINCH_UPDATE_OK
+        && tilefinch_update_state_encode(expected, b) == TILEFINCH_UPDATE_OK
+        && memcmp(a, b, sizeof(a)) == 0;
+}
+
+/* Some real firmware/storage-driver combinations reject every Memory Stick
+   sync after the checked writes and renames succeeded. Every store in the
+   trial lifecycle (installer PENDING, launcher STARTED, browser floor reseed
+   and HEALTHY) must then report the commit its rename made, so the caller's
+   in-memory state is the one the next load selects. A store that failed
+   after committing STARTED sent the launcher to recovery over a journal
+   that says TRIAL, and a failed HEALTHY store left the browser retrying a
+   confirmation whose generation the card already held. */
+static int test_journal_rejected_sync(void)
+{
+    char directory[] = "/tmp/tilefinch-update-journal-sync.XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_REJECTED);
+    TilefinchUpdateState state = {
+        .generation = 1,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .installed_sequence = 42
+    };
+    CHECK(tilefinch_update_journal_store(directory, &state, NULL, NULL)
+          && journal_selects(directory, &state));
+    state.generation++;
+    state.pending_slot = TILEFINCH_UPDATE_SLOT_B;
+    state.trial = TILEFINCH_UPDATE_TRIAL_PENDING;
+    state.candidate_sequence = 43;
+    CHECK(tilefinch_update_journal_store(directory, &state, NULL, NULL)
+          && journal_selects(directory, &state));
+    /* The launcher's START_TRIAL step: store failure means recovery. */
+    TilefinchUpdateSlot slot = TILEFINCH_UPDATE_SLOT_NONE;
+    CHECK(tilefinch_update_boot_decide(&state, false, true, &slot)
+              == TILEFINCH_UPDATE_BOOT_START_TRIAL
+          && slot == TILEFINCH_UPDATE_SLOT_B
+          && tilefinch_update_state_start_trial(&state)
+          && tilefinch_update_journal_store(directory, &state, NULL, NULL)
+          && journal_selects(directory, &state)
+          && state.trial == TILEFINCH_UPDATE_TRIAL_STARTED);
+    /* The trial browser confirms; a later browser reseeds its floor. */
+    CHECK(tilefinch_update_state_confirm_healthy(&state)
+          && tilefinch_update_journal_store(directory, &state, NULL, NULL)
+          && journal_selects(directory, &state)
+          && state.active_slot == TILEFINCH_UPDATE_SLOT_B
+          && state.trial == TILEFINCH_UPDATE_TRIAL_NONE
+          && tilefinch_update_state_raise_installed_floor(
+              &state, TILEFINCH_UPDATE_SLOT_B, 44)
+          && tilefinch_update_journal_store(directory, &state, NULL, NULL)
+          && journal_selects(directory, &state));
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_SKIPPED);
+    char path[256];
+    for (unsigned copy = 0; copy < 2; copy++) {
+        snprintf(path, sizeof(path), "%s/update-state.%u", directory, copy);
+        remove(path);
+    }
+    CHECK(rmdir(directory) == 0);
+    return 0;
+}
+
 typedef struct {
     size_t fail_at;
     size_t operation;
@@ -952,6 +1021,13 @@ static int test_installer(void)
         .prepare_startup = true
     };
 
+    /* The sweep runs twice: on a device that accepts each Memory Stick sync,
+       then on one that rejects every sync. Interruption at any point keeps
+       slot A either way. */
+    for (unsigned rejecting = 0; rejecting < 2; rejecting++) {
+    tilefinch_memory_stick_sync_set_host_result(
+        rejecting ? TILEFINCH_MEMORY_STICK_SYNC_REJECTED
+                  : TILEFINCH_MEMORY_STICK_SYNC_SKIPPED);
     size_t exercised_faults = 0;
     for (size_t fail_at = 0; fail_at < 256; fail_at++) {
         /* A refused optional preparation still completes and deletes its part. */
@@ -1016,8 +1092,10 @@ static int test_installer(void)
     }
     CHECK(exercised_faults >= 12);
     printf(
-        "installer-faults: %zu interrupted operations retained slot A\n",
-        exercised_faults);
+        "installer-faults: %zu interrupted operations retained slot A"
+        " (syncs %s)\n",
+        exercised_faults, rejecting ? "rejected" : "accepted");
+    }
     options.fault = NULL;
     options.fault_opaque = NULL;
 
@@ -1097,6 +1175,10 @@ static int test_installer(void)
     CHECK(file != NULL
           && fwrite(package.bytes, 1, package.length, file) == package.length
           && fclose(file) == 0);
+    /* The completed install runs on a device that rejects every Memory
+       Stick sync: each one follows completed work and is only a durability
+       hint, so the promoted slot is not reported as "could not be
+       activated", and the verified startup copy is kept. */
     Budget budget;
     budget_init(&budget, 1024 * 1024);
     TilefinchUpdateInstallJob *job =
@@ -1105,11 +1187,15 @@ static int test_installer(void)
     TilefinchUpdateInstallSnapshot snapshot;
     CHECK(tilefinch_update_install_snapshot(job, &snapshot)
           && snapshot.phase == TILEFINCH_UPDATE_INSTALL_PREPARING);
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_REJECTED);
     for (size_t pump = 0; pump < 512; pump++) {
         CHECK(tilefinch_update_install_pump(job, 4));
         CHECK(tilefinch_update_install_snapshot(job, &snapshot));
         if (snapshot.phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE) break;
     }
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_SKIPPED);
     CHECK(snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE
           && snapshot.files_completed == 2);
     char startup_cache[256], startup_temporary[256], startup_source[256];
@@ -1364,6 +1450,8 @@ int main(void)
     CHECK(test_state_and_streaming_hash() == 0);
     puts("test: journal interruption always retains a healthy choice");
     CHECK(test_journal_faults() == 0);
+    puts("test: a rejected journal sync never contradicts the commit");
+    CHECK(test_journal_rejected_sync() == 0);
     puts("test: bounded installer stages and promotes the inactive slot");
     CHECK(test_installer() == 0);
     puts("test: bounded GitHub release history parser");

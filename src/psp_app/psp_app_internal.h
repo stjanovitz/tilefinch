@@ -84,6 +84,7 @@
 #include "tilefinch/psp_voice_component_session.h"
 #include "tilefinch/psp_glyph_component_session.h"
 #include "tilefinch/ui_language.h"
+#include "tilefinch/psp_ui_language_repair.h"
 #include "tilefinch/render.h"
 #include "tilefinch/screenshot_png.h"
 #include "tilefinch/session_persistence.h"
@@ -968,7 +969,7 @@ typedef struct {
     BrowserProfile *profile;
     BrowserTabs *tabs;
     PspProfileStore profile_store;
-    uint64_t youtube_login_restored;
+    uint64_t youtube_login_restored_identity;
     bool youtube_login_pending;
     uint64_t youtube_login_offer_identity;
     PspOfflineStore offline_store;
@@ -982,6 +983,8 @@ typedef struct {
     uint64_t ui_language_request;
     unsigned ui_language_requested;
     bool ui_language_waiting_font;
+    /* The once-per-boot missing-language check has run. */
+    bool ui_language_repair_checked;
     PspUiThemeCatalog *theme_catalog;
 } PspBrowserResources;
 
@@ -1268,6 +1271,7 @@ bool psp_captive_portal_active(const PspInteractiveState *interactive);
 void psp_app_youtube_login_boot(PspProcessResources *, PspBrowserResources *);
 bool psp_app_youtube_login_poll(PspApp *app);
 void psp_app_youtube_login_action(PspApp *, PspAppFrameState *, const PspUiIntent *);
+void psp_app_youtube_login_setting(PspApp *, PspAppFrameState *, unsigned policy);
 bool psp_app_youtube_login_clear(PspApp *app);
 void psp_app_youtube_preresolve_tick(
     PspApp *app, const PspAppFrameState *frame, const PspUiIntent *intent,
@@ -1474,6 +1478,9 @@ BrowserGlyphLanguage psp_ui_language_glyphs(const BrowserProfile *profile);
 bool psp_ui_language_font_available(const PspBrowserResources *browser);
 bool psp_ui_language_handle_frame(PspApp *app, const PspUiIntent *intent, uint64_t now_us);
 void psp_ui_language_destroy(PspBrowserResources *browser);
+/* Once per boot, when the UI is first idle: offers the Interface language
+   row if the saved language's catalog or glyph pack needs a download. */
+bool psp_ui_language_repair_poll(PspApp *app);
 const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack pack);
 
 bool psp_glyph_component_handle_frame(

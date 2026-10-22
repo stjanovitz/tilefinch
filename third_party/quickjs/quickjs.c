@@ -234,6 +234,8 @@ typedef struct JSString JSAtomStruct;
 typedef struct JSObject JSObject;
 
 #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
+#define JS_FUNC_INLINE_REF(p) ((p)->u.func.var_refs == &(p)->u.func.inline_var_ref)
+#define JS_FUNC_HOME(p) (JS_FUNC_INLINE_REF(p) ? NULL : (p)->u.func.home_object)
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING_ROPE(v) ((JSStringRope *)JS_VALUE_GET_PTR(v))
 
@@ -606,6 +608,7 @@ struct JSContext {
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
     /* shapes of new closures, built on first use (see js_closure_shape) */
     JSShape *closure_shape[JS_CLOSURE_SHAPE_COUNT];
+    struct JSClosureMetadataCache *closure_metadata;
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -1136,6 +1139,13 @@ typedef struct JSProperty {
     } u;
 } JSProperty;
 
+/* Only the common empty/get/set names and arities 0..3, not an unbounded
+   intern table. Entries contain scalar/string values, never GC objects. */
+#define JS_CLOSURE_METADATA_SLOTS 12
+struct JSClosureMetadataCache {
+    JSProperty *entries[JS_CLOSURE_METADATA_SLOTS];
+};
+
 /* Empty objects need no speculative second property slot. Shared shapes still
    carry their actual capacity, and ordinary growth admits additional slots. */
 #define JS_PROP_INITIAL_SIZE 1
@@ -1165,6 +1175,7 @@ struct JSShape {
 
 struct JSObject {
     JSGCObjectHeader header;
+    uint8_t shared_closure_metadata : 1;
     /* TRUE if the array prototype is "normal":
        - no small index properties which are get/set or non writable
        - its prototype is Object.prototype
@@ -1217,7 +1228,10 @@ struct JSObject {
             /* also used by JS_CLASS_GENERATOR_FUNCTION, JS_CLASS_ASYNC_FUNCTION and JS_CLASS_ASYNC_GENERATOR_FUNCTION */
             struct JSFunctionBytecode *function_bytecode;
             JSVarRef **var_refs;
-            JSObject *home_object; /* for 'super' access */
+            union {
+                JSObject *home_object; /* for 'super' access */
+                JSVarRef *inline_var_ref; /* one capture, without 'super' */
+            };
         } func;
         struct { /* JS_CLASS_C_FUNCTION: 12/20 bytes */
             JSContext *realm;
@@ -2159,9 +2173,35 @@ void JS_SetExecutionCensusFunctionHook(JSRuntime *rt,
 #endif
 }
 
+#if !defined(__PSP__)
+/* JS_TestRefuseAllocation: allocations to go until the refused one, 0 when
+   disarmed. */
+static unsigned js_test_refuse_countdown;
+
+void JS_TestRefuseAllocation(unsigned nth)
+{
+    js_test_refuse_countdown = nth;
+}
+
+int JS_TestRefusalPending(void)
+{
+    return js_test_refuse_countdown != 0;
+}
+
+static inline BOOL js_test_refuses(void)
+{
+    return unlikely(js_test_refuse_countdown != 0)
+        && --js_test_refuse_countdown == 0;
+}
+#endif
+
 void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
     TF_CENSUS(rt, JS_CENSUS_ALLOCATE, 0);
+#if !defined(__PSP__)
+    if (js_test_refuses())
+        return NULL;
+#endif
     return __js_malloc(&rt->malloc_ctx, size);
 }
 
@@ -2174,6 +2214,13 @@ void js_free_rt(JSRuntime *rt, void *ptr)
 void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
 {
     TF_CENSUS(rt, JS_CENSUS_ALLOCATE, 0);
+#if !defined(__PSP__)
+    /* Only a growth past the block's room allocates. */
+    if (unlikely(js_test_refuse_countdown != 0) && size != 0
+        && size > __js_malloc_usable_size(&rt->malloc_ctx, ptr)
+        && js_test_refuses())
+        return NULL;
+#endif
     return __js_realloc(&rt->malloc_ctx, ptr, size);
 }
 
@@ -2444,19 +2491,22 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     memset(rt, 0, sizeof(*rt));
     {
         const char *cap = getenv("TILEFINCH_JS_ARRAY_CAP_KB");
-        const char *growth = getenv("TILEFINCH_JS_ARRAY_GROWTH_KB");
         rt->fast_array_growth_byte_limit = 128 * 1024;
         if (cap != NULL) {
             long cap_kb = atol(cap);
             if (cap_kb > 0)
                 rt->fast_array_byte_limit = (size_t) cap_kb * 1024;
         }
+#if !defined(__PSP__)
+        /* Host lab knob: the growth step A/B. PSP builds keep the default. */
+        const char *growth = getenv("TILEFINCH_JS_ARRAY_GROWTH_KB");
         if (growth != NULL) {
             long growth_kb = atol(growth);
             if (growth_kb >= 0 && growth_kb <= 16 * 1024)
                 rt->fast_array_growth_byte_limit =
                     (size_t)growth_kb * 1024;
         }
+#endif
     }
     js_malloc_init(&rt->malloc_ctx);
     rt->malloc_ctx.mf = *mf;
@@ -3419,6 +3469,17 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
 
+    if (ctx->closure_metadata) {
+        for (i = 0; i < JS_CLOSURE_METADATA_SLOTS; i++) {
+            JSProperty *props = ctx->closure_metadata->entries[i];
+            if (props) {
+                JS_FreeValue(ctx, props[0].u.value);
+                JS_FreeValue(ctx, props[1].u.value);
+                js_free_rt(rt, props);
+            }
+        }
+        js_free_rt(rt, ctx->closure_metadata);
+    }
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
     js_free_rt(ctx->rt, ctx);
@@ -6501,19 +6562,23 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
     printf("}\n");
 }
 
-/* 'props[]' is used to initialized the object properties. The number
-   of elements depends on the shape. */
-static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
-                                     JSProperty *props)
+/* 'props[]' initializes owned properties. A non-NULL 'shared_props' is an
+   immutable two-slot closure metadata entry; it is borrowed from the realm.
+   The ordinary wrapper below always creates owned properties. */
+static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                     JSProperty *props, JSProperty *shared_props)
 {
     JSObject *p;
     int i;
     
+    assert(!shared_props || (!props && sh->prop_size == 2
+           && sh->prop_count == 2));
     js_trigger_gc(ctx->rt, sizeof(JSObject));
     p = js_malloc(ctx, sizeof(JSObject));
     if (unlikely(!p))
         goto fail;
     p->class_id = class_id;
+    p->shared_closure_metadata = shared_props != NULL;
     p->is_std_array_prototype = 0;
     p->extensible = TRUE;
     p->free_mark = 0;
@@ -6530,7 +6595,8 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->weakref_count = 0;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    p->prop = shared_props ? shared_props
+        : js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
     if (unlikely(!p->prop)) {
         js_free(ctx, p);
     fail:
@@ -6626,6 +6692,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
             p->prop[i] = props[i];
     }
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                     JSProperty *props)
+{
+    return JS_NewObjectFromShape2(ctx, sh, class_id, props, NULL);
 }
 
 static JSObject *get_proto_obj(JSValueConst proto_val)
@@ -6780,6 +6852,94 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
         return NULL;
     return p->u.func.function_bytecode;
 }
+static JSProperty *js_cached_closure_metadata(JSContext *ctx, JSAtom name, int arity)
+{
+    int kind = name == JS_ATOM_empty_string ? 0 : name == JS_ATOM_get ? 1
+        : name == JS_ATOM_set ? 2 : -1;
+    if (kind < 0 || arity < 0 || arity > 3 || !ctx->closure_metadata) return NULL;
+    return ctx->closure_metadata->entries[kind * 4 + arity];
+}
+
+/* Only internal SetFunctionName may switch immutable entries directly.
+   Author definitions always go through the ordinary copy-on-write path. */
+static BOOL js_switch_closure_metadata(JSContext *ctx, JSValueConst value,
+                                       JSAtom name, int flags)
+{
+    JSObject *p;
+    JSProperty *props;
+    if (!JS_IsObject(value) || flags != JS_PROP_CONFIGURABLE) return FALSE;
+    p = JS_VALUE_GET_OBJ(value);
+    if (!p->shared_closure_metadata) return FALSE;
+    JSShapeProperty *properties = get_shape_prop(p->shape);
+    if (properties[0].flags != JS_PROP_CONFIGURABLE
+        || properties[1].flags != JS_PROP_CONFIGURABLE) return FALSE;
+    ctx = p->u.func.function_bytecode->realm;
+    props = js_cached_closure_metadata(ctx, name, JS_VALUE_GET_INT(p->prop[0].u.value));
+    if (!props) return FALSE;
+    p->prop = props;
+    return TRUE;
+}
+
+/* Detach before obtaining any JSProperty pointer that will be written.
+   Refusal leaves the borrower, cache and both values unchanged. */
+static int js_own_closure_metadata(JSContext *ctx, JSObject *p)
+{
+    JSProperty *props;
+    if (likely(!p->shared_closure_metadata)) return 0;
+    assert(p->shape->prop_size == 2);
+    props = js_malloc(ctx, 2 * sizeof(*props));
+    if (!props) return -1;
+    props[0].u.value = JS_DupValue(ctx, p->prop[0].u.value);
+    props[1].u.value = JS_DupValue(ctx, p->prop[1].u.value);
+    p->prop = props;
+    p->shared_closure_metadata = 0;
+    return 0;
+}
+
+static void js_share_closure_metadata(JSContext *ctx, JSValueConst function)
+{
+    JSObject *p;
+    JSShapeProperty *properties;
+    JSString *name;
+    struct JSClosureMetadataCache *cache;
+    int kind, arity, index;
+    if (!JS_IsObject(function)) return;
+    p = JS_VALUE_GET_OBJ(function);
+    if (p->shared_closure_metadata || !js_class_has_bytecode(p->class_id)
+        || !p->shape || !p->prop || p->shape->prop_count != 2
+        || p->shape->prop_size != 2) return;
+    properties = get_shape_prop(p->shape);
+    if (properties[0].atom != JS_ATOM_length || properties[1].atom != JS_ATOM_name
+        || properties[0].flags != JS_PROP_CONFIGURABLE
+        || properties[1].flags != JS_PROP_CONFIGURABLE
+        || JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT
+        || !JS_IsString(p->prop[1].u.value)) return;
+    ctx = p->u.func.function_bytecode->realm;
+    arity = JS_VALUE_GET_INT(p->prop[0].u.value);
+    name = JS_VALUE_GET_STRING(p->prop[1].u.value);
+    kind = name == ctx->rt->atom_array[JS_ATOM_empty_string] ? 0
+        : name == ctx->rt->atom_array[JS_ATOM_get] ? 1
+        : name == ctx->rt->atom_array[JS_ATOM_set] ? 2 : -1;
+    if (kind < 0 || arity < 0 || arity > 3) return;
+    cache = ctx->closure_metadata;
+    if (!cache) {
+        /* Optional optimization: no exception and no failed function when
+           the small, fixed index cannot be allocated. */
+        cache = js_mallocz_rt(ctx->rt, sizeof(*cache));
+        if (!cache) return;
+        ctx->closure_metadata = cache;
+    }
+    index = kind * 4 + arity;
+    if (cache->entries[index]) {
+        JS_FreeValue(ctx, p->prop[0].u.value);
+        JS_FreeValue(ctx, p->prop[1].u.value);
+        js_free(ctx, p->prop);
+        p->prop = cache->entries[index];
+    } else {
+        cache->entries[index] = p->prop;
+    }
+    p->shared_closure_metadata = 1;
+}
 
 static void js_method_set_home_object(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst home_obj)
@@ -6794,7 +6954,7 @@ static void js_method_set_home_object(JSContext *ctx, JSValueConst func_obj,
         return;
     b = p->u.func.function_bytecode;
     if (b->need_home_object) {
-        p1 = p->u.func.home_object;
+        p1 = JS_FUNC_HOME(p);
         if (p1) {
             JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p1));
         }
@@ -6834,10 +6994,16 @@ static int js_method_set_properties(JSContext *ctx, JSValueConst func_obj,
     }
     if (JS_IsException(name_str))
         return -1;
+    if (!flags && js_switch_closure_metadata(ctx, func_obj, name, JS_PROP_CONFIGURABLE)) {
+        JS_FreeValue(ctx, name_str);
+        js_method_set_home_object(ctx, func_obj, home_obj);
+        return 0;
+    }
     if (JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name, name_str,
                                JS_PROP_CONFIGURABLE) < 0)
         return -1;
     js_method_set_home_object(ctx, func_obj, home_obj);
+    js_share_closure_metadata(ctx, func_obj);
     return 0;
 }
 
@@ -7161,7 +7327,7 @@ static void js_bytecode_function_finalizer(JSRuntime *rt, JSValue val)
     JSVarRef **var_refs;
     int i;
 
-    p1 = p->u.func.home_object;
+    p1 = JS_FUNC_HOME(p);
     if (p1) {
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, p1));
     }
@@ -7171,7 +7337,8 @@ static void js_bytecode_function_finalizer(JSRuntime *rt, JSValue val)
         if (var_refs) {
             for(i = 0; i < b->closure_var_count; i++)
                 free_var_ref(rt, var_refs[i]);
-            js_free_rt(rt, var_refs);
+            if (!JS_FUNC_INLINE_REF(p))
+                js_free_rt(rt, var_refs);
         }
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
     }
@@ -7185,7 +7352,7 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
     JSFunctionBytecode *b = p->u.func.function_bytecode;
     int i;
 
-    if (p->u.func.home_object) {
+    if (JS_FUNC_HOME(p)) {
         JS_MarkValue(rt, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object),
                      mark_func);
     }
@@ -7274,11 +7441,13 @@ static void free_object(JSRuntime *rt, JSObject *p)
     /* free all the fields */
     sh = p->shape;
     pr = get_shape_prop(sh);
-    for(i = 0; i < sh->prop_count; i++) {
-        free_property(rt, &p->prop[i], pr->flags);
-        pr++;
+    if (!p->shared_closure_metadata) {
+        for(i = 0; i < sh->prop_count; i++) {
+            free_property(rt, &p->prop[i], pr->flags);
+            pr++;
+        }
+        js_free_rt(rt, p->prop);
     }
-    js_free_rt(rt, p->prop);
     /* as an optimization we destroy the shape immediately without
        putting it in gc_zero_ref_count_list */
     js_free_shape(rt, sh);
@@ -7917,6 +8086,19 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         s->memory_used_count += 2; /* ctx + ctx->class_proto */
         s->memory_used_size += sizeof(JSContext) +
             sizeof(JSValue) * rt->class_count;
+        if (ctx->closure_metadata) {
+            s->memory_used_count++;
+            s->memory_used_size += sizeof(*ctx->closure_metadata);
+            for (int k = 0; k < JS_CLOSURE_METADATA_SLOTS; k++) {
+                JSProperty *props = ctx->closure_metadata->entries[k];
+                if (props) {
+                    s->memory_used_count++;
+                    s->prop_size += 2 * sizeof(*props);
+                    compute_value_size(props[0].u.value, hp);
+                    compute_value_size(props[1].u.value, hp);
+                }
+            }
+        }
         s->binary_object_count += ctx->binary_object_count;
         s->binary_object_size += ctx->binary_object_size;
 
@@ -7975,10 +8157,10 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         p = (JSObject *)gp;
         sh = p->shape;
         s->obj_count++;
-        if (p->prop) {
+        s->prop_count += sh->prop_count;
+        if (p->prop && !p->shared_closure_metadata) {
             s->memory_used_count++;
             s->prop_size += sh->prop_size * sizeof(*p->prop);
-            s->prop_count += sh->prop_count;
             prs = get_shape_prop(sh);
             for(i = 0; i < sh->prop_count; i++) {
                 JSProperty *pr = &p->prop[i];
@@ -8049,18 +8231,23 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
             s->c_func_count++;
             break;
         case JS_CLASS_BYTECODE_FUNCTION: /* u.func */
+        case JS_CLASS_GENERATOR_FUNCTION:
+        case JS_CLASS_ASYNC_FUNCTION:
+        case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
             {
                 JSFunctionBytecode *b = p->u.func.function_bytecode;
                 JSVarRef **var_refs = p->u.func.var_refs;
                 /* home_object: object will be accounted for in list scan */
                 if (var_refs) {
-                    s->memory_used_count++;
-                    s->js_func_size += b->closure_var_count * sizeof(*var_refs);
+                    if (!JS_FUNC_INLINE_REF(p)) {
+                        s->memory_used_count++;
+                        hp->js_func_size += b->closure_var_count * sizeof(*var_refs);
+                    }
                     for (i = 0; i < b->closure_var_count; i++) {
                         if (var_refs[i]) {
                             double ref_count = js_rc(var_refs[i])->ref_count;
-                            s->memory_used_count += 1 / ref_count;
-                            s->js_func_size += sizeof(*var_refs[i]) / ref_count;
+                            hp->memory_used_count += 1 / ref_count;
+                            hp->js_func_size += sizeof(*var_refs[i]) / ref_count;
                             /* handle non object closed values */
                             if (var_refs[i]->pvalue == &var_refs[i]->value) {
                                 /* potential multiple count */
@@ -8993,8 +9180,11 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         JS_DupValue(ctx, proto_val);
     }
 
-    if (js_shape_prepare_update(ctx, p, NULL))
+    if (js_shape_prepare_update(ctx, p, NULL)) {
+        if (proto)
+            JS_FreeValue(ctx, proto_val);
         return -1;
+    }
     sh = p->shape;
     if (sh->proto)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
@@ -9198,13 +9388,14 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     func = js_autoinit_func_table[id];
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
-    js_autoinit_free(ctx->rt, pr);
-    prs->flags &= ~JS_PROP_TMASK;
-    pr->u.value = JS_UNDEFINED;
+    /* A refused initialization keeps the autoinit record, so a later
+       access retries instead of finding a permanent 'undefined'. */
     if (JS_IsException(val))
         return -1;
     if (id == JS_AUTOINIT_ID_MODULE_NS &&
         JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
+        js_autoinit_free(ctx->rt, pr);
+        prs->flags &= ~JS_PROP_TMASK;
         /* WARNING: a varref is returned as a string  ! */
         prs->flags |= JS_PROP_VARREF;
         pr->u.var_ref = JS_VALUE_GET_PTR(val);
@@ -9218,11 +9409,15 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
             JS_FreeValue(ctx, val);
             return -1;
         }
+        js_autoinit_free(ctx->rt, pr);
+        prs->flags &= ~JS_PROP_TMASK;
         prs->flags |= JS_PROP_VARREF;
         pr->u.var_ref = var_ref;
         var_ref->value = val; 
         var_ref->is_const = !(prs->flags & JS_PROP_WRITABLE);
     } else {
+        js_autoinit_free(ctx->rt, pr);
+        prs->flags &= ~JS_PROP_TMASK;
         pr->u.value = val;
     }
     return 0;
@@ -9555,7 +9750,7 @@ static int JS_CheckBrand(JSContext *ctx, JSValueConst obj, JSValueConst func)
     p1 = JS_VALUE_GET_OBJ(func);
     if (!js_class_has_bytecode(p1->class_id))
         goto not_obj;
-    home_obj = p1->u.func.home_object;
+    home_obj = JS_FUNC_HOME(p1);
     if (!home_obj)
         goto not_obj;
     prs = find_own_property(&pr, home_obj, JS_ATOM_Private_brand);
@@ -10223,6 +10418,7 @@ static JSProperty *add_property(JSContext *ctx,
 {
     JSShape *sh, *new_sh;
 
+    if (js_own_closure_metadata(ctx, p)) return NULL;
     if (unlikely(__JS_AtomIsTaggedInt(prop))) {
         /* update is_std_array_prototype */
         if (unlikely(p->is_std_array_prototype)) {
@@ -10806,6 +11002,9 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     uint32_t lpr_idx;
     intptr_t h, h1;
 
+    if (p->shared_closure_metadata
+        && (atom == JS_ATOM_length || atom == JS_ATOM_name)
+        && js_own_closure_metadata(ctx, p)) return -1;
  redo:
     sh = p->shape;
     h1 = atom & sh->prop_hash_mask;
@@ -12081,6 +12280,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         return -1;
     }
     p = JS_VALUE_GET_OBJ(this_obj);
+    if (js_own_closure_metadata(ctx, p)) return -1;
 
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
@@ -12501,12 +12701,13 @@ static BOOL js_object_has_name(JSContext *ctx, JSValueConst obj)
 static int JS_DefineObjectName(JSContext *ctx, JSValueConst obj,
                                JSAtom name, int flags)
 {
-    if (name != JS_ATOM_NULL
-    &&  JS_IsObject(obj)
-    &&  !js_object_has_name(ctx, obj)
-    &&  JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_AtomToString(ctx, name), flags) < 0) {
-        return -1;
+    if (name != JS_ATOM_NULL && JS_IsObject(obj) && !js_object_has_name(ctx, obj)) {
+        if (js_switch_closure_metadata(ctx, obj, name, flags)) return 0;
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_name,
+                                   JS_AtomToString(ctx, name), flags) < 0)
+            return -1;
     }
+    js_share_closure_metadata(ctx, obj);
     return 0;
 }
 
@@ -12520,6 +12721,10 @@ static int JS_DefineObjectNameComputed(JSContext *ctx, JSValueConst obj,
         prop = JS_ValueToAtom(ctx, str);
         if (prop == JS_ATOM_NULL)
             return -1;
+        if (js_switch_closure_metadata(ctx, obj, prop, flags)) {
+            JS_FreeAtom(ctx, prop);
+            return 0;
+        }
         name_str = js_get_function_name(ctx, prop);
         JS_FreeAtom(ctx, prop);
         if (JS_IsException(name_str))
@@ -12527,6 +12732,7 @@ static int JS_DefineObjectNameComputed(JSContext *ctx, JSValueConst obj,
         if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name_str, flags) < 0)
             return -1;
     }
+    js_share_closure_metadata(ctx, obj);
     return 0;
 }
 
@@ -15987,7 +16193,7 @@ static void js_print_object(JSPrintValueState *s, JSObject *p)
             }
             js_printf(s, " ]");
         }
-        if (p->u.func.home_object) {
+        if (JS_FUNC_HOME(p)) {
             js_print_comma(s, &comma_state);
             js_printf(s, "[[HomeObject]]: ");
             js_print_value(s, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object));
@@ -19036,7 +19242,14 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
     p->u.func.home_object = NULL;
     p->u.func.var_refs = NULL;
     if (b->closure_var_count) {
-        var_refs = js_mallocz(ctx, sizeof(var_refs[0]) * b->closure_var_count);
+        /* The unused home-object slot can hold a single capture. Keeping
+           var_refs as an ordinary one-element vector preserves every access
+           fast path. Initialize before any allocation/GC; partially built
+           closures must remain markable and finalizable. */
+        if (b->closure_var_count == 1 && !b->need_home_object)
+            var_refs = &p->u.func.inline_var_ref;
+        else
+            var_refs = js_mallocz(ctx, sizeof(var_refs[0]) * b->closure_var_count);
         if (!var_refs)
             goto fail;
         p->u.func.var_refs = var_refs;
@@ -19174,6 +19387,7 @@ static JSValue js_closure_from_shape(JSContext *ctx, JSFunctionBytecode *b,
     JSShape *sh;
     JSValue func_obj;
     JSObject *p;
+    JSProperty *metadata;
     int idx;
 
     if (b->func_kind == JS_FUNC_NORMAL)
@@ -19186,12 +19400,18 @@ static JSValue js_closure_from_shape(JSContext *ctx, JSFunctionBytecode *b,
     sh = js_closure_shape(ctx, idx, get_proto_obj(ctx->class_proto[class_id]));
     if (!sh)
         return JS_EXCEPTION;
-    func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), class_id, NULL);
+    metadata = idx == JS_CLOSURE_SHAPE_CONSTRUCTOR ? NULL
+        : js_cached_closure_metadata(ctx,
+             b->func_name == JS_ATOM_NULL ? JS_ATOM_empty_string : b->func_name,
+             b->defined_arg_count);
+    func_obj = JS_NewObjectFromShape2(ctx, js_dup_shape(sh), class_id, NULL, metadata);
     if (JS_IsException(func_obj))
         return func_obj;
     p = JS_VALUE_GET_OBJ(func_obj);
-    p->prop[0].u.value = JS_NewInt32(ctx, b->defined_arg_count);
-    p->prop[1].u.value = JS_UNDEFINED;
+    if (!metadata) {
+        p->prop[0].u.value = JS_NewInt32(ctx, b->defined_arg_count);
+        p->prop[1].u.value = JS_UNDEFINED;
+    }
     if (idx == JS_CLOSURE_SHAPE_CONSTRUCTOR) {
         p->prop[2].u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx);
         assert((p->prop[2].u.init.realm_and_id & 3) == 0);
@@ -19223,10 +19443,13 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
         name_atom = b->func_name;
         if (name_atom == JS_ATOM_NULL)
             name_atom = JS_ATOM_empty_string;
-        name = JS_AtomToString(ctx, name_atom);
-        if (JS_IsException(name))
-            goto fail;
-        JS_VALUE_GET_OBJ(func_obj)->prop[1].u.value = name;
+        if (!JS_VALUE_GET_OBJ(func_obj)->shared_closure_metadata) {
+            name = JS_AtomToString(ctx, name_atom);
+            if (JS_IsException(name))
+                goto fail;
+            JS_VALUE_GET_OBJ(func_obj)->prop[1].u.value = name;
+            js_share_closure_metadata(ctx, func_obj);
+        }
         return func_obj;
     }
     if (JS_IsException(func_obj)) {
@@ -19985,7 +20208,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 case OP_SPECIAL_OBJECT_HOME_OBJECT:
                     {
                         JSObject *p1;
-                        p1 = p->u.func.home_object;
+                        p1 = JS_FUNC_HOME(p);
                         if (unlikely(!p1))
                             *sp++ = JS_UNDEFINED;
                         else
@@ -38461,6 +38684,14 @@ static void js_share_child_function_source(JSContext *ctx,
     if (offset > (size_t)parent->source_len
         || (size_t)child->source_len > (size_t)parent->source_len - offset)
         return;
+    /* A tiny exported accessor must not pin an otherwise dead large module.
+       Parsing already owns this exact child copy: keep it rather than trading
+       a few bytes for a reference to the entire backing. Larger spans still
+       share, avoiding quadratic source storage for nested functions. */
+    size_t backing = parent->source_owner ? parent->source_owner->length
+                                          : (size_t)parent->source_len;
+    if (backing >= 64u * 1024u && child->source_len <= 256)
+        return;
     if (!parent->source_owner)
         parent->source_owner = js_adopt_function_source(ctx, &parent->source, parent->source_len);
     JSFunctionSource *owner = parent->source_owner;
@@ -45896,6 +46127,19 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                     JS_ThrowSyntaxError(ctx, "invalid function source span");
                     goto fail;
                 }
+                size_t backing = parent->debug.source_owner
+                    ? parent->debug.source_owner->length
+                    : (size_t)parent->debug.source_len;
+                if (backing >= 64u * 1024u && b->debug.source_len <= 256) {
+                    /* Optional on restore: if this small copy is refused,
+                       retain the existing shared representation instead. */
+                    b->debug.source = js_malloc_rt(ctx->rt, b->debug.source_len);
+                    if (b->debug.source) {
+                        memcpy(b->debug.source, parent->debug.source + offset,
+                               b->debug.source_len);
+                        goto source_span_done;
+                    }
+                }
                 /* Adopt before publishing the first child pointer: adoption
                    may move the backing. Children own only a source ref, not
                    a parent function/context or the serialized input buffer. */
@@ -45914,6 +46158,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                     memcpy(b->debug.source, parent->debug.source + offset,
                            b->debug.source_len);
                 }
+            source_span_done: ;
             } else if (kind == 0) {
                 b->debug.source = js_malloc(ctx, b->debug.source_len);
                 if (!b->debug.source)

@@ -237,6 +237,12 @@ typedef bool (*TilefinchUpdateFaultHook)(
 bool tilefinch_update_journal_load(
     const char *data_dir, TilefinchUpdateState *state,
     unsigned *selected_copy);
+/* Writes the unselected copy and renames it into place. Returns true once
+   that rename has made `state` the selected on-disk state, false when the
+   previous state is still the selected one. The device sync after the rename
+   is a durability hint (tilefinch_memory_stick_sync): it is attempted, but a
+   rejecting device never turns a committed state into a reported failure,
+   so callers' in-memory state always matches what the next load selects. */
 bool tilefinch_update_journal_store(
     const char *data_dir, const TilefinchUpdateState *state,
     TilefinchUpdateFaultHook fault, void *fault_opaque);

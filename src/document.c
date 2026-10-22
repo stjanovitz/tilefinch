@@ -302,6 +302,24 @@ lxb_dom_node_t *document_flat_parent(lxb_dom_node_t *node)
     return slot != NULL ? slot : node->parent;
 }
 
+bool document_node_is_inert(lxb_dom_node_t *node)
+{
+    size_t depth = 0;
+    for (; node != NULL && depth < 512u;
+         node = document_flat_parent(node), depth++) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        lxb_dom_element_t *element = lxb_dom_interface_element(node);
+        if (lxb_dom_element_has_attribute(element,
+                (const lxb_char_t *) "inert", 5)) return true;
+        if (node->local_name == LXB_TAG_DIALOG && node->ns == LXB_NS_HTML
+            && lxb_dom_element_has_attribute(element,
+                (const lxb_char_t *) "open", 4)
+            && lxb_dom_element_has_attribute(element,
+                (const lxb_char_t *) "data-tilefinch-modal", 20)) return false;
+    }
+    return node != NULL;
+}
+
 bool document_shadow_text_rendered(lxb_dom_node_t *text)
 {
     if (document_shadow_carriers_marked == 0 || text == NULL
@@ -1300,6 +1318,7 @@ typedef struct {
     size_t body_bytes;
     size_t body_text_nodes;
     uint16_t glyph_script_mask;
+    uint64_t font_text_pages;
     /* Saturating visible-codepoint counts per DocumentGlyphScript bit and
        the census samples; reduced to DocumentGlyphCensus after the walk. */
     uint16_t glyph_script_counts[DOCUMENT_GLYPH_SCRIPT_KINDS];
@@ -1399,7 +1418,9 @@ static void document_note_glyph_scripts(DocumentStats *stats,
         /* Most top-site text is ASCII. Skip it without calling the UTF-8
            decoder; this pass runs only once in the parser's existing visible
            text/statistics walk. */
+        size_t ascii_begin = at;
         while (at < length && (unsigned char) text[at] < 0x80u) at++;
+        if (at != ascii_begin) stats->font_text_pages |= UINT64_C(1);
         if (at >= length) break;
         unsigned codepoint = 0;
         size_t used = font_utf8_next(text + at, length - at, &codepoint);
@@ -1407,6 +1428,7 @@ static void document_note_glyph_scripts(DocumentStats *stats,
             at++;
             continue;
         }
+        stats->font_text_pages |= UINT64_C(1) << ((codepoint >> 8u) & 63u);
         if ((codepoint >= 0x0590u && codepoint <= 0x08ffu)
             || (codepoint >= 0xfb1du && codepoint <= 0xfdffu)
             || (codepoint >= 0xfe70u && codepoint <= 0xfeffu)
@@ -2216,6 +2238,7 @@ bool document_refresh(PocDocument *document)
     document->body_text_node_count = stats.body_text_nodes;
     document->body_text_length = 0;
     document->glyph_script_mask = stats.glyph_script_mask;
+    document->font_text_pages = stats.font_text_pages;
     document->glyph_census = stats.glyph_census;
     document->glyph_census.offer_mask = 0;
     for (unsigned index = 0; index < DOCUMENT_GLYPH_SCRIPT_KINDS; index++) {
@@ -2418,28 +2441,14 @@ static const char *document_meta_preview_image(PocDocument *document,
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
     lxb_dom_node_t *node = root;
     for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && document_name_is(node, "meta")) {
-            size_t key_length = 0;
-            const char *key = document_attribute(node, "property", &key_length);
-            if (key == NULL) key = document_attribute(node, "name", &key_length);
-            bool image = key != NULL
-                && ((key_length == 8u
-                     && strncasecmp(key, "og:image", key_length) == 0)
-                    || (key_length == 13u
-                        && strncasecmp(key, "twitter:image", key_length) == 0));
-            if (image) {
-                const char *content = document_attribute(node, "content", length);
-                size_t content_length = length == NULL ? 0u : *length;
-                if (content != NULL && content_length >= 9u
-                    && content_length <= 512u
-                    && ((content_length >= 8u
-                         && strncasecmp(content, "https://", 8u) == 0)
-                        || (content_length >= 7u
-                            && strncasecmp(content, "http://", 7u) == 0))) {
-                    return content;
-                }
-            }
+        size_t content_length = 0;
+        const char *content = document_meta_image_content(node, &content_length);
+        if (content != NULL && content_length >= 9u
+            && content_length <= 512u
+            && (strncasecmp(content, "https://", 8u) == 0
+                || strncasecmp(content, "http://", 7u) == 0)) {
+            if (length != NULL) *length = content_length;
+            return content;
         }
         node = document_bounded_next(node, root, false);
     }
@@ -3439,6 +3448,12 @@ void document_destroy(PocDocument *document)
         document_cssom_sheets_destroy(document);
         document_nonce_registry_destroy(document);
         document_adopted_sheets_destroy(document);
+        while (document->registered_properties != NULL) {
+            DocumentRegisteredProperty *property = document->registered_properties;
+            document->registered_properties = property->next;
+            budget_free(document->budget, property);
+        }
+        document->registered_property_count = 0;
         DocumentControlState *state = document->control_states;
         while (state != NULL) {
             DocumentControlState *next = state->next;
@@ -3515,6 +3530,29 @@ bool document_is_refresh_meta(lxb_dom_node_t *node)
     const char *value = document_attribute(node, "http-equiv", &length);
     return value != NULL && length == 7u
         && strncasecmp(value, "refresh", 7u) == 0;
+}
+
+const char *document_meta_image_content(lxb_dom_node_t *node, size_t *length)
+{
+    *length = 0;
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !document_name_is(node, "meta")) return NULL;
+    size_t key_length = 0;
+    const char *key = document_attribute(node, "property", &key_length);
+    if (key == NULL || key_length == 0u)
+        key = document_attribute(node, "name", &key_length);
+    static const char *const keys[] = {
+        "og:image", "og:image:secure_url", "twitter:image"
+    };
+    for (size_t i = 0; key != NULL && i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (key_length == strlen(keys[i])
+            && strncasecmp(key, keys[i], key_length) == 0) {
+            const char *content = document_attribute(node, "content", length);
+            if (content == NULL) *length = 0;
+            return content;
+        }
+    }
+    return NULL;
 }
 
 const char *document_web_app_manifest_href(

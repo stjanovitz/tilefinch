@@ -128,8 +128,9 @@ and closes it. X opens a confirmation overlay
 update-client operation without the menu's auto-install, the app starts the
 client's signed-metadata check over the network exactly as the menu does,
 and the check stops at AVAILABLE. The confirmation shows **Checking
-size...**, then **Install Cyrillic pack (1.0 MB)?** with the verified
-manifest's `package_size`, or the check's own failure message. Only a
+size...**, then the pack's name with the verified manifest's
+`package_size` (**Cyrillic (1.0 MB)**) above **Install this font pack?**,
+or the check's own failure message, all in the interface language. Only a
 second X there raises the menu's `glyph_component_primary_requested`, so
 the download, signature verification, free-space preflight and Memory Stick
 promotion are unchanged and one press can never download. Triangle sets the

@@ -614,3 +614,30 @@ bool tilefinch_host_within(const char *host, size_t host_length,
     return strncasecmp(tail, domain, domain_length) == 0
         && (tail == host || tail[-1] == '.');
 }
+
+int tilefinch_hex_digit(unsigned char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool tilefinch_url_percent_decode(char *text)
+{
+    size_t out = 0, length = strlen(text);
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char) text[i];
+        if (c == '%') {
+            if (length - i < 3) return false;
+            int hi = tilefinch_hex_digit((unsigned char) text[i + 1]);
+            int lo = tilefinch_hex_digit((unsigned char) text[i + 2]);
+            if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return false;
+            c = (unsigned char) (hi * 16 + lo);
+            i += 2;
+        }
+        text[out++] = (char) c;
+    }
+    text[out] = '\0';
+    return true;
+}

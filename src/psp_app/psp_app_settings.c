@@ -305,8 +305,8 @@ void psp_app_seed_video_decoder_choice(
  * The knob it writes -- boot.cfg `experimental_wide_video` -- is read once at
  * startup, before the Media Engine pool is reserved and long before a video
  * can open, so it cannot be applied to a running process: this saves it and
- * offers a restart. That is the whole point of the picker. Every device A/B
- * so far has cost a shutdown, a USB cable, and a hand edit per attempt.
+ * offers a restart, which saves a hand edit of boot.cfg when switching between
+ * the wide program and the 240p compatibility program on a device.
  *
  * Two phases through one action, because the receiver owns the bit that tells
  * them apart: the first press saves and raises the prompt, and a press while
@@ -1655,20 +1655,6 @@ void psp_app_apply_setting(
             enabled ? "YOUTUBE HOME TOPICS ON"
                     : "YOUTUBE HOME TOPICS OFF - RELOAD TO HIDE", 240);
     }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_LOGIN) {
-        unsigned policy = intent->setting.value.unsigned_value;
-        if (policy <= YOUTUBE_LOGIN_NEVER) {
-            browser_profile_set_youtube_login_policy(profile, policy);
-            if (policy == YOUTUBE_LOGIN_NEVER) {
-                if (!psp_app_youtube_login_clear(app))
-                    psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
-            } else if (policy == YOUTUBE_LOGIN_ALWAYS) {
-                /* Always requires the warning and a deliberate confirmation. */
-                browser_profile_set_youtube_login_policy(profile, YOUTUBE_LOGIN_ASK);
-                app->process->presentation.ui.youtube_login_policy = YOUTUBE_LOGIN_ASK;
-                psp_ui_show_youtube_login_offer(&app->process->presentation.ui);
-            }
-            psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
-        }
-    }
+    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_LOGIN)
+        psp_app_youtube_login_setting(app, frame, intent->setting.value.unsigned_value);
 }

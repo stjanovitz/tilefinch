@@ -2,6 +2,7 @@
 #include "tilefinch/file_download.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/update.h"
+#include "tilefinch/url.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -96,7 +97,7 @@ static bool receipt(const char *directory, const char *name, uint32_t *id, bool 
     unsigned char record[80] = {0};
     char path[ZIP_PATH];
     if (strlen(directory) + sizeof("/" ZIP_RECEIPT) > sizeof(path)
-        || !name || !*name || strlen(name) >= 64 || name[0] == '.'
+        || !name || !*name || strlen(name) >= ZIP_INSTALL_FOLDER_NAME_LIMIT || name[0] == '.'
         || strchr(name, '/') || !path_valid(name)) return false;
     snprintf(path, sizeof(path), "%s/" ZIP_RECEIPT, directory);
     if (write) {
@@ -117,34 +118,66 @@ static bool receipt(const char *directory, const char *name, uint32_t *id, bool 
     if (fclose(file)) okay = false;
     if (!okay) { if (write) remove(path); return false; }
     if (write) return true;
-    if (memcmp(record, "TFHB001", 8) || !memchr(record+8, 0, 64)
+    if (memcmp(record, "TFHB001", 8) || !memchr(record+8, 0, ZIP_INSTALL_FOLDER_NAME_LIMIT)
         || strcmp((char *)record+8, name) || u32(record+76) != (uint32_t)crc32(0, record, 76)
         || !u32(record+72)) return false;
     *id = u32(record+72);
     return true;
 }
 
-bool zip_install_list(const char *root, char names[][64], size_t capacity, size_t *count)
+bool zip_install_list(const char *root, char names[][ZIP_INSTALL_FOLDER_NAME_LIMIT],
+    size_t capacity, size_t *count)
 {
-    if (!root || !names || !count || !capacity) return false;
+    if (!root || !count || !capacity) return false;
     *count = 0;
     DIR *dir = opendir(root);
     if (!dir) return false;
     bool okay = true; size_t visited = 0; struct dirent *entry;
     while ((entry = readdir(dir))) {
-        if (++visited > 512) { okay = false; break; }
-        if (entry->d_name[0] == '.' || strlen(entry->d_name) >= 64) continue;
+        if (++visited > ZIP_INSTALL_GAME_SCAN_LIMIT) { okay = false; break; }
+        if (entry->d_name[0] == '.' || strlen(entry->d_name) >= ZIP_INSTALL_FOLDER_NAME_LIMIT) continue;
         char path[ZIP_PATH]; struct stat info; uint32_t id = 0;
         int length = snprintf(path, sizeof(path), "%s/%s", root, entry->d_name);
         if (length < 0 || (size_t)length >= sizeof(path)) { okay = false; break; }
         if (!lstat(path, &info) && S_ISDIR(info.st_mode) && receipt(path, entry->d_name, &id, false)) {
             if (*count == capacity) { okay = false; break; }
-            strcpy(names[(*count)++], entry->d_name);
+            if (names) strcpy(names[*count], entry->d_name);
+            ++*count;
         }
         if (!tilefinch_platform_cooperate("homebrew-list", visited)) { okay = false; break; }
     }
     closedir(dir);
     return okay;
+}
+
+void zip_install_encode_folder_name(const char *name,
+    char output[ZIP_INSTALL_FOLDER_HEX_LIMIT])
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t used = 0;
+    for (; *name && used + 2 < ZIP_INSTALL_FOLDER_HEX_LIMIT; name++) {
+        output[used++] = digits[(unsigned char) *name >> 4];
+        output[used++] = digits[(unsigned char) *name & 15u];
+    }
+    output[used] = 0;
+}
+
+bool zip_install_decode_folder_name(const char *hex,
+    char output[ZIP_INSTALL_FOLDER_NAME_LIMIT])
+{
+    size_t length = strnlen(hex, ZIP_INSTALL_FOLDER_HEX_LIMIT);
+    if (!length || length >= ZIP_INSTALL_FOLDER_HEX_LIMIT || length % 2) return false;
+    for (size_t i = 0; i < length; i += 2) {
+        int high = tilefinch_hex_digit((unsigned char) hex[i]);
+        int low = tilefinch_hex_digit((unsigned char) hex[i + 1]);
+        /* Only the encoder's lowercase spelling, and no NUL byte. */
+        if (high < 0 || low < 0 || (high | low) == 0
+            || (hex[i] >= 'A' && hex[i] <= 'F') || (hex[i + 1] >= 'A' && hex[i + 1] <= 'F'))
+            return false;
+        output[i / 2] = (char) (high * 16 + low);
+    }
+    output[length / 2] = 0;
+    return true;
 }
 
 static bool removal_inventory(ZipInstall *job, const char *relative, unsigned depth)
@@ -184,7 +217,7 @@ ZipInstall *zip_install_prepare_removal(Budget *budget, const char *root,
     const char *name, char *error, size_t error_capacity)
 {
     ZipInstall *job = NULL; struct stat info;
-    if (!budget || !root || !name || strlen(root) >= 256 || !*name || strlen(name) >= 64
+    if (!budget || !root || !name || strlen(root) >= 256 || !*name || strlen(name) >= ZIP_INSTALL_FOLDER_NAME_LIMIT
         || name[0] == '.' || strchr(name, '/') || !path_valid(name)) goto refused;
     job = budget_calloc_category(budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*job));
     if (!job) goto refused;
@@ -408,9 +441,9 @@ ZipInstall *zip_install_prepare(Budget *budget, const char *archive,
     }
     /* Keep every installer-created folder reachable in the bounded manager.
        ZIP deletion does not free this independent installation slot. */
-    char installed[64][64]; size_t installed_count = 0;
-    if (!zip_install_list(game_directory, installed, 64, &installed_count)
-        || installed_count == 64) goto refused;
+    size_t installed_count = 0;
+    if (!zip_install_list(game_directory, NULL, ZIP_INSTALL_MANAGED_LIMIT, &installed_count)
+        || installed_count == ZIP_INSTALL_MANAGED_LIMIT) goto refused;
     return install;
 refused:
     if (error && error_capacity) snprintf(error, error_capacity,
@@ -473,8 +506,7 @@ bool zip_install_begin(ZipInstall *install)
     }
     uint64_t space = 0; struct stat exists;
     if (!tilefinch_update_query_free_space(install->root, &space)
-        || space < OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
-        || install->view.unpacked_bytes > space - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE)
+        || !offline_download_space_admits(space, install->view.unpacked_bytes))
         return fail(install, "Not enough free Memory Stick space");
     if (!lstat(install->view.destination, &exists) || errno != ENOENT)
         return fail(install, "Destination already exists; nothing was replaced");

@@ -13,7 +13,6 @@ static const char *const navigation_keys[] = {
     "X Delete   O Back",
     "X Confirm clear   O Cancel",
     "X or Left/Right change   L/R section",
-    "L/R CATEGORY   X SELECT   O BACK",
     "X OPEN   START SEARCH   SELECT MENU",
     "X OPEN WHEN READY   SELECT MENU",
     "X opens or toggles.  O goes back.",

@@ -30,11 +30,12 @@ PspBasicFallbackDecision psp_basic_fallback_decide(
 bool psp_basic_fallback_recheck(BrowserBasicFallbackMode mode,
                                 bool extracted_view_active,
                                 bool recovery_pending, bool runtime_ok,
-                                bool realm_retired, bool failure_examined)
+                                bool memory_limited_or_retired,
+                                bool failure_examined)
 {
     if (mode == BROWSER_BASIC_FALLBACK_OFF || extracted_view_active
         || recovery_pending) return false;
-    return (!runtime_ok || realm_retired) && !failure_examined;
+    return (!runtime_ok || memory_limited_or_retired) && !failure_examined;
 }
 
 uint8_t psp_basic_fallback_failure_actions(BrowserBasicFallbackMode mode,

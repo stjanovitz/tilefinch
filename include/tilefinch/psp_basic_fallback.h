@@ -12,7 +12,7 @@
  * free of firmware and engine state so every setting and trigger is a host
  * test. The engine decides whether a page qualifies
  * (browser_engine_prepare_basic_view_recovery: scripts stopped or failed,
- * author work settled, the page blank or without a usable action); these
+ * author work settled, memory-limited or blank/without a usable action); these
  * functions decide what the browser does with that answer.
  */
 typedef enum {
@@ -38,13 +38,14 @@ PspBasicFallbackDecision psp_basic_fallback_decide(
     BrowserBasicFallbackMode mode, BrowserBasicViewRecovery recovery);
 
 /* After a page runtime turn: whether a committed page whose scripts have
-   failed (the turn failed, or the page's realm is retired) should be
+   failed (the turn failed, memory admission failed, or the realm retired) should be
    re-examined for the fallback. Pages are otherwise examined only at
    commit; this happens at most once per navigation (failure_examined). */
 bool psp_basic_fallback_recheck(BrowserBasicFallbackMode mode,
                                 bool extracted_view_active,
                                 bool recovery_pending, bool runtime_ok,
-                                bool realm_retired, bool failure_examined);
+                                bool memory_limited_or_retired,
+                                bool failure_examined);
 
 /* The Basic choices a recovery prompt adds (PSP_UI_FAILURE_* bits):
    "Show Basic view" while the failed page's DOM exists and a Basic tree is

@@ -34,7 +34,7 @@ bool psp_queue_menu_profile(Budget *budget)
     psp_ui_media_init(&media); media.presentation = &p;
     psp_ui_media_set(&media, true, true, false, 15000000, 600000000, "Menu profile");
     p.queue_active = p.queue_next = p.track_menu_open = true;
-    p.queue_count = 6; p.track_menu_tab = 3; p.track_menu_selection = 2;
+    p.queue_count = 6; p.track_menu_tab = PSP_UI_MEDIA_TAB_QUEUE; p.track_menu_selection = 2;
     p.audio_track_count = p.subtitle_track_count = 6; p.chapter_count = MEDIA_CHAPTER_LIMIT;
     for (unsigned at = 0; at < 6; at++) {
         snprintf(p.queue_titles[at], 128, "Fixture video %u with a representative medium-length title", at);
@@ -56,8 +56,11 @@ bool psp_queue_menu_profile(Budget *budget)
     bool valid = true;
     for (unsigned phase = 0; phase < PHASES; phase++) {
         for (unsigned repeat = 0; repeat < REPEATS; repeat++) {
-            p.track_menu_tab = 3; p.track_menu_open = true; p.track_menu_selection = 2;
-            if (phase >= 8) p.track_menu_tab = phase % 2u;
+            p.track_menu_tab = PSP_UI_MEDIA_TAB_QUEUE;
+            p.track_menu_open = true; p.track_menu_selection = 2;
+            if (phase >= 8)
+                p.track_menu_tab = phase % 2u == 0u
+                    ? PSP_UI_MEDIA_TAB_AUDIO : PSP_UI_MEDIA_TAB_SUBTITLES;
             unsigned before_redraws = redraws;
             unsigned calls = phase == 0 || phase == 6 ? 128 : 64;
             SceKernelThreadRunStatus before = { .size = sizeof(before) }, after = { .size = sizeof(after) };
@@ -108,7 +111,7 @@ bool psp_queue_shortcut_qualify(void)
     psp_ui_media_init(&media); media.presentation = &p;
     psp_ui_media_set(&media, true, true, false, 1000000, 60000000, "Queue qualification");
     p.queue_active = p.queue_next = p.track_menu_open = true;
-    p.queue_count = 6; p.track_menu_tab = 3; p.track_menu_selection = 2;
+    p.queue_count = 6; p.track_menu_tab = PSP_UI_MEDIA_TAB_QUEUE; p.track_menu_selection = 2;
     if (psp_ui_media_track_menu_height(&media) != 208) return false;
     PspUiInput square = {.pressed = PSP_UI_BUTTON_RELOAD};
     for (unsigned state = 0; state < 4; state++) {
@@ -123,7 +126,7 @@ bool psp_queue_shortcut_qualify(void)
             || !p.track_menu_open || p.track_menu_selection != 2
             || media.current_time_us != 1000000 || media.seek_preview_active) return false;
     }
-    p.track_menu_tab = 0;
+    p.track_menu_tab = PSP_UI_MEDIA_TAB_AUDIO;
     if (psp_ui_media_update(&media, &square).action != PSP_UI_MEDIA_ACTION_NONE) return false;
     p.track_menu_open = false;
     return psp_ui_media_update(&media, &square).action == PSP_UI_MEDIA_ACTION_LOWER_QUALITY;

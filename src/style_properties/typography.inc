@@ -169,7 +169,7 @@ static bool style_property_word_spacing(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->word_spacing = strstr(resolved, "normal") != NULL
@@ -189,7 +189,7 @@ static bool style_property_letter_spacing(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-    char resolved[48];
+    char resolved[STYLE_MATH_SOURCE_CAPACITY];
     if (style_resolve_value(sheet, value, value_length, resolved,
                             sizeof(resolved), 0)) {
         int16_t spacing = 0;
@@ -211,7 +211,7 @@ static bool style_property_font_weight(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             uint16_t weight = 400;
@@ -236,7 +236,7 @@ static bool style_property_font_style(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->font_italic = strstr(resolved, "italic") != NULL
@@ -247,6 +247,16 @@ static bool style_property_font_style(const StylePropertyParse *parse)
     return true;
 }
 
+/* Explicit variation overrides are not exposed yet. The initial value uses
+   the existing bounded weight/optical-size selection and needs no storage. */
+static bool style_property_font_variation_settings(const StylePropertyParse *parse)
+{
+    (void) parse;
+    /* Like the other declaration handlers, ignore unsupported values rather
+       than failing the whole stylesheet. @supports validates normal only. */
+    return true;
+}
+
 static bool style_property_vertical_align(const StylePropertyParse *parse)
 {
     Stylesheet *sheet = parse->sheet;
@@ -254,7 +264,7 @@ static bool style_property_vertical_align(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             if (strcmp(resolved, "super") == 0) {
@@ -357,7 +367,7 @@ static bool style_property_text_align(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             if (strstr(resolved, "center") != NULL) {
@@ -396,7 +406,7 @@ static bool style_property_white_space(const StylePropertyParse *parse)
         *mask |= S_WHITE_SPACE;
         return true;
     }
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->white_space_mode =
@@ -428,8 +438,8 @@ static bool style_property_text_wrap_mode(const StylePropertyParse *parse)
     bool shorthand = parse->name_length == 9;
     bool nowrap = false, wrap = false;
     size_t cursor = 0, start = 0, end = 0, words = 0;
-    while (style_next_top_level(value, value_length, ' ', &cursor, &start,
-                                &end)) {
+    while (style_next_top_level_token(value, value_length, &cursor, &start,
+                                      &end)) {
         if (++words > 2) return true;
         const char *word = value + start;
         size_t length = end - start;
@@ -471,7 +481,7 @@ static bool style_property_overflow_wrap(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             const char *keyword = resolved;
@@ -504,7 +514,7 @@ static bool style_property_overflow_wrap(const StylePropertyParse *parse)
 
 static bool style_property_text_overflow(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -529,7 +539,7 @@ static bool style_property_text_overflow(const StylePropertyParse *parse)
 
 static bool style_property_webkit_line_clamp(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_MATH_SOURCE_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -569,7 +579,7 @@ static bool style_property_word_break(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (style_resolve_value(sheet, value, value_length, resolved,
                             sizeof(resolved), 0)) {
         if (strstr(resolved, "break-all") != NULL) {
@@ -595,7 +605,7 @@ static bool style_property_word_break(const StylePropertyParse *parse)
 }
 static bool style_property_text_transform(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {

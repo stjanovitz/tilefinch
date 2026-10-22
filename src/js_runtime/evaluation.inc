@@ -362,6 +362,8 @@ static void script_runtime_gc_hook(void *opaque, int begin)
         owner->heap_live_after_gc =
             budget_quickjs_pool_js_malloc_current(owner->quickjs_pool);
         owner->heap_collections++;
+        owner->bridge.node_wrapper_sweep_remaining = owner->bridge.wrapper_refs
+            ? owner->bridge.node_count : 0;
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
         if (JS_GetGCCause(owner->runtime) == JS_GC_CAUSE_THRESHOLD)
             owner->gc_threshold_collections++;
@@ -893,11 +895,6 @@ static void script_profile_emit(const char *message)
 {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     tilefinch_platform_log_message(message);
-#elif defined(TILEFINCH_NATIVE_TIER_LAB)
-    /* Whole-page lab diagnostics share one stream with its job trace. The
-       replay runner merges stdout/stderr; splitting a line across buffered
-       stdout and unbuffered stderr corrupts the attribution record. */
-    fprintf(stderr, "%s\n", message);
 #else
     printf("%s\n", message);
 #endif
@@ -1546,33 +1543,8 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
     if (tilefinch_trace_census()) census_print_error("census-exception",
                                                      result->error);
 #endif
+#ifdef JS_RT_TEST_INSTRUMENTS
     JSValue global = JS_GetGlobalObject(context);
-    JSValue selector_value = JS_GetPropertyStr(
-        context, global, "__tilefinchLastMissingSelector");
-    const char *selector = JS_IsString(selector_value)
-                           ? JS_ToCString(context, selector_value) : NULL;
-    if (selector != NULL && selector[0] != '\0') {
-        size_t used = strlen(result->error);
-        if (used + 20 < sizeof(result->error)) {
-            snprintf(result->error + used, sizeof(result->error) - used,
-                     "\nlast empty selector: %s", selector);
-        }
-        JS_FreeCString(context, selector);
-    }
-    JS_FreeValue(context, selector_value);
-    JSValue base64_value = JS_GetPropertyStr(
-        context, global, "__tilefinchBase64Error");
-    const char *base64 = JS_IsString(base64_value)
-                         ? JS_ToCString(context, base64_value) : NULL;
-    if (base64 != NULL && base64[0] != '\0') {
-        size_t used = strlen(result->error);
-        if (used + 20 < sizeof(result->error)) {
-            snprintf(result->error + used, sizeof(result->error) - used,
-                     "\nbase64 diagnostic: %s", base64);
-        }
-        JS_FreeCString(context, base64);
-    }
-    JS_FreeValue(context, base64_value);
     JSValue frame_eval_value = JS_GetPropertyStr(
         context, global, "__tilefinchFrameEvalTelemetry");
     const char *frame_eval = JS_IsString(frame_eval_value)
@@ -1589,6 +1561,7 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
     }
     JS_FreeValue(context, frame_eval_value);
     JS_FreeValue(context, global);
+#endif
     JS_FreeValue(context, exception);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     DomBridge *bridge = JS_GetContextOpaque(context);
@@ -1682,6 +1655,7 @@ static void promise_rejection_tracker(JSContext *context,
     result->promise_rejections = state->count;
     state->last_reported = identity;
     const char *message = js_rt_exception_to_cstring(context, reason);
+#ifdef JS_RT_XHR_DIAGNOSTICS
     DomBridge *private_bridge = JS_GetContextOpaque(context);
     ScriptXHRDiagnostics *private_history = private_bridge == NULL
         || private_bridge->host == NULL ? NULL
@@ -1704,6 +1678,7 @@ static void promise_rejection_tracker(JSContext *context,
             js_rt_saturating_add_size(&private_history->rejection_stages[stage], 1);
         }
     }
+#endif
     snprintf(result->last_promise_rejection,
              sizeof(result->last_promise_rejection), "%s",
              message == NULL ? "unhandled promise rejection" : message);
@@ -2123,7 +2098,7 @@ bool js_rt_evaluate_compiled_source(
  * script_lazy_function_preparse() below); most of a
  * large site's functions never run during a page's life. The functions that
  * do run are compiled a second time, alone, when first called. See "lazy
- * function compilation" in docs/engineering/MEMORY_EXPERIMENTS.md for the
+ * function compilation" in .private-investigations/MEMORY_EXPERIMENTS.md for the
  * measurements behind the threshold. TILEFINCH_JS_LAZY_FUNCTIONS overrides
  * it (0 compiles everything eagerly). eval() and Function bodies are always
  * compiled eagerly.
@@ -2717,6 +2692,28 @@ bool js_rt_current_script_scope_end(JSContext *context,
     return restored;
 }
 
+/* The content blocker's inline-tracker policy: one decision for a classic
+   inline script. `source` is its assembled text; NULL means "the node's
+   own text", which a script of one text child provides without a copy (a
+   script of several children is then left to the caller that assembles
+   it). */
+static bool js_rt_inline_tracker_blocked(DomBridge *bridge, lxb_dom_node_t *node,
+                                         const char *source, size_t length)
+{
+    if (bridge == NULL || bridge->session == NULL || node == NULL
+        || node->first_child == NULL) return false;
+    if (source == NULL && node->first_child->next != NULL) return false;
+    if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || lxb_dom_element_has_attribute(lxb_dom_interface_element(node), (const lxb_char_t *) "src", 3)) return false;
+    size_t type_length = 0;
+    const char *type = document_attribute(node, "type", &type_length);
+    bool module = false;
+    if (!script_type_attribute_classify(type, type_length, &module) || module) return false;
+    if (source == NULL) source = document_text_data(node->first_child, &length);
+    return content_blocker_should_block_inline(bridge->session->content_blocker,
+        bridge->document_url, source, length);
+}
+
 static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
                                  ScriptResult *result)
 {
@@ -2782,16 +2779,6 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
                 bridge->budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
         }
     }
-    ScriptQuotaReservation quota = {0};
-    ScriptQuotaReserveResult quota_status = js_rt_bridge_script_quota_reserve(
-        bridge, SCRIPT_QUOTA_NEW_EXECUTABLE, source_length, &quota);
-    if (quota_status != SCRIPT_QUOTA_RESERVE_GRANTED
-        || !js_rt_bridge_script_quota_commit(bridge, &quota, source_length)) {
-        js_rt_bridge_script_quota_abort(bridge, &quota);
-        snprintf(result->error, sizeof(result->error),
-                 "initial inline script exceeded executable quota");
-        return false;
-    }
     char *source_copy = budget_malloc(bridge->budget, source_length + 1);
     if (source_copy == NULL) return false;
     size_t copied = 0;
@@ -2804,6 +2791,21 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
         copied += length;
     }
     source_copy[copied] = '\0';
+    if (js_rt_inline_tracker_blocked(bridge, node, source_copy, source_length)) {
+        budget_free(bridge->budget, source_copy);
+        return true;
+    }
+    ScriptQuotaReservation quota = {0};
+    ScriptQuotaReserveResult quota_status = js_rt_bridge_script_quota_reserve(
+        bridge, SCRIPT_QUOTA_NEW_EXECUTABLE, source_length, &quota);
+    if (quota_status != SCRIPT_QUOTA_RESERVE_GRANTED
+        || !js_rt_bridge_script_quota_commit(bridge, &quota, source_length)) {
+        js_rt_bridge_script_quota_abort(bridge, &quota);
+        budget_free(bridge->budget, source_copy);
+        snprintf(result->error, sizeof(result->error),
+                 "initial inline script exceeded executable quota");
+        return false;
+    }
     ScriptCurrentScriptScope previous_current_script = {
         .value = JS_UNDEFINED
     };

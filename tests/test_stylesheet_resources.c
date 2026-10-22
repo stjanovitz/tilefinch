@@ -351,6 +351,8 @@ typedef struct {
     /* Non-NULL records a failed transfer (success=0) with this error, the
        way a capture records a response that stopped at its byte cap. */
     const char *error;
+    /* Scheduler pumps the replayed response waits before completing. */
+    unsigned async_delay_pumps;
 } StylesheetReplayRecord;
 
 static uint64_t stylesheet_replay_body_hash(const char *data, size_t length)
@@ -389,7 +391,7 @@ static bool write_stylesheet_replay_record(
         "psp-http-trace=10\n"
         "cookie-values=redacted\n"
         "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=%d\n"
-        "async-delay-pumps=0\nexternal-cancel=0\n"
+        "async-delay-pumps=%u\nexternal-cancel=0\n"
         "transport-timeout=0\nredirect-origin-tainted=0\nerror=%s\n"
         "request-body-length=0\n"
         "request-body-hash=cbf29ce484222325\n"
@@ -425,6 +427,7 @@ static bool write_stylesheet_replay_record(
         "set-cookie-count=0\nresponse-header-0=content-type: %s\n",
         record->url, record->url,
         record->error == NULL ? 1 : 0,
+        record->async_delay_pumps,
         record->error == NULL ? "" : record->error,
         record->request_cookie_bytes,
         record->request_if_none_match == NULL
@@ -1800,6 +1803,234 @@ static bool test_webp_url_preserves_authored_resource(void)
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     if (replay_written) remove_stylesheet_replay(
         replay_directory, sizeof(replay) / sizeof(replay[0]));
+    return ok && clean;
+}
+
+/* Only an image whose source failed for good gets a failure record (and so
+   an error event). Markup no decoder takes is one; this engine's limits
+   are not: an SVG refused because the decoded-bytes quota is spent, a
+   network URL of 2,048 bytes or more, and a data: URL longer than the
+   source-text ceiling are limit skips, like a data: body too large to
+   decode. */
+static bool test_image_limits_record_no_failure(void)
+{
+    static const char head[] =
+        "<!doctype html><body>"
+        "<img id=bad src=\"data:image/svg+xml,not%20an%20svg\">"
+        "<img id=first src=\"data:image/svg+xml,%3Csvg "
+        "xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E"
+        "%3Crect width='4' height='4' fill='%23123456'/%3E%3C/svg%3E\">"
+        "<img id=spent src=\"data:image/svg+xml,%3Csvg "
+        "xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E"
+        "%3Crect width='2' height='2' fill='%23654321'/%3E%3C/svg%3E\">"
+        "<img id=long src=\"https://images.example/";
+    static const char middle[] = "\"><img id=huge src=\"data:image/svg+xml,";
+    static const char tail[] = "\"></body>";
+    const size_t long_path = 2100u, huge_body = 256u * 1024u + 16u;
+    size_t length = sizeof(head) - 1u + long_path + sizeof(middle) - 1u
+        + huge_body + sizeof(tail) - 1u;
+    char *html = malloc(length + 1u);
+    if (html == NULL) return false;
+    char *at = html;
+    memcpy(at, head, sizeof(head) - 1u); at += sizeof(head) - 1u;
+    memset(at, 'a', long_path); at += long_path;
+    memcpy(at, middle, sizeof(middle) - 1u); at += sizeof(middle) - 1u;
+    memset(at, 'b', huge_body); at += huge_body;
+    memcpy(at, tail, sizeof(tail));
+    static const char document_url[] = "https://images.example/page";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    /* The first SVG decodes 64 bytes and leaves 2 of the 66-byte quota,
+       too few for any raster. */
+    bool ok = installed
+        && document_parse(&document, &budget, html, length, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480)
+        && images_load_external(
+            &document, &stylesheet, &images, &budget,
+            document_url, document_url, "strict-origin-when-cross-origin",
+            8, 64 * 1024, 16 * 1024, 66, 1000, NULL, NULL);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *bad = root ? find_element_id(root, "bad") : NULL;
+    lxb_dom_node_t *first = root ? find_element_id(root, "first") : NULL;
+    ok = ok && bad != NULL && first != NULL
+        && image_resource_available(images_find_node(&images, first))
+        && images.stats.unsupported == 1 && images.stats.failed == 0
+        && images.stats.skipped_limit == 3
+        && images.failure_count == 1 && images.failures[0].node == bad;
+    if (!ok) {
+        fprintf(stderr,
+                "image limits loaded=%zu unsupported=%zu failed=%zu "
+                "skipped=%zu failures=%zu\n",
+                images.stats.loaded, images.stats.unsupported,
+                images.stats.failed, images.stats.skipped_limit,
+                images.failure_count);
+    }
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    free(html);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Failure records follow the table's resources. A retry that publishes the
+   source that failed drops the element's record, so recovered images never
+   fill the bounded list. A priority load that is rolled back restores the
+   list: records it noted are dropped and records its discarded resources
+   recovered come back. */
+static bool test_image_failure_records_follow_retries(void)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<img id=net src='net.svg'><img id=slow src='slow.svg'>"
+        "<img id=bad src=\"data:image/svg+xml,not%20an%20svg\">"
+        "</body>";
+    static const char document_url[] = "https://retry.example/page";
+    static const char net_url[] = "https://retry.example/net.svg";
+    static const char slow_url[] = "https://retry.example/slow.svg";
+    static const char svg[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'>"
+        "<rect width='4' height='3' fill='#123456'/></svg>";
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+#define RETRY_RECORD(address, failure, delay) {                              \
+        .url = address, .body = failure == NULL ? svg : "",                 \
+        .effective_url = address, .content_type = "image/svg+xml",           \
+        .request_accept = image_accept, .request_sec_fetch_dest = "image",  \
+        .request_sec_fetch_mode = "no-cors",                                \
+        .request_referer = document_url,                                    \
+        .request_sec_fetch_site = "same-origin",                            \
+        .request_credential_origin = document_url,                          \
+        .request_initiator_url = document_url,                              \
+        .request_referrer_source = document_url,                            \
+        .request_referrer_policy = "strict-origin-when-cross-origin",       \
+        .status = failure == NULL ? 200 : 0,                                \
+        .request_send_low_client_hints = true, .error = failure,            \
+        .async_delay_pumps = delay }
+    static const StylesheetReplayRecord failing[] = {
+        RETRY_RECORD(net_url, "connection reset", 0),
+        RETRY_RECORD(slow_url, "connection reset", 0)
+    };
+    static const StylesheetReplayRecord recovering[] = {
+        RETRY_RECORD(net_url, NULL, 0),
+        RETRY_RECORD(slow_url, NULL, 200)
+    };
+#undef RETRY_RECORD
+    char failing_directory[128] = {0}, recovering_directory[128] = {0};
+    bool written = write_stylesheet_replay(failing_directory, failing, 2)
+        && write_stylesheet_replay(recovering_directory, recovering, 2);
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    char replay_error[256] = {0};
+    bool ok = written && installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *net = root ? find_element_id(root, "net") : NULL;
+    lxb_dom_node_t *slow = root ? find_element_id(root, "slow") : NULL;
+    lxb_dom_node_t *bad = root ? find_element_id(root, "bad") : NULL;
+    ok = ok && net != NULL && slow != NULL && bad != NULL;
+    /* All three fail: two transfers and the markup. */
+    bool replaying = ok && fetch_trace_replay_begin(
+        failing_directory, replay_error, sizeof(replay_error));
+    ok = replaying && images_load_external(
+        &document, &stylesheet, &images, &budget,
+        document_url, document_url, "strict-origin-when-cross-origin",
+        8, 64 * 1024, 16 * 1024, 1024 * 1024, 1000, NULL, NULL);
+    if (replaying) fetch_trace_end();
+    size_t failed_records = images.failure_count;
+    ok = ok && failed_records == 3;
+    /* The retry publishes net and is then rolled back while slow is still
+       in flight: net's record comes back with its source. */
+    size_t recovered_at = 0, restored = 0;
+    FetchScheduler *scheduler = ok
+        ? fetch_scheduler_create(&budget, 2, 1024 * 1024) : NULL;
+    replaying = scheduler != NULL && fetch_trace_replay_begin(
+        recovering_directory, replay_error, sizeof(replay_error));
+    size_t retained_items = images.count;
+    ImagePriorityTarget targets[2] = {
+        {.node = net, .kind = IMAGE_PRIORITY_KIND_DOCUMENT},
+        {.node = slow, .kind = IMAGE_PRIORITY_KIND_DOCUMENT}
+    };
+    ImagePriorityLoadJob *job = replaying ? images_priority_load_begin_batch(
+        &document, &stylesheet, &images, targets, 2, &budget,
+        document_url, document_url, "strict-origin-when-cross-origin",
+        8, 64 * 1024, 16 * 1024, 1024 * 1024, 5000, scheduler, NULL) : NULL;
+    for (size_t pump = 0; job != NULL && pump < 100 && recovered_at == 0;
+         pump++) {
+        if (images_priority_load_pump(job) != IMAGE_PRIORITY_LOAD_PENDING)
+            break;
+        if (image_resource_available(images_find_node(&images, net)))
+            recovered_at = images.failure_count == failed_records - 1u
+                ? pump + 1u : SIZE_MAX;
+    }
+    images_priority_load_destroy(job);
+    bool net_record = false;
+    for (size_t i = 0; i < images.failure_count; i++)
+        net_record |= images.failures[i].node == net
+            && images.failures[i].source_hash
+                   == image_current_source_hash(&stylesheet, net);
+    restored = images.failure_count;
+    ok = ok && job != NULL && recovered_at != 0 && recovered_at != SIZE_MAX
+        && images.count == retained_items && restored == failed_records
+        && net_record;
+    /* A rolled-back load's own failures are dropped: bad's record is
+       discarded first, then noted again by a load that is abandoned. */
+    size_t noted = 0;
+    bool dropped = false;
+    if (replaying) {
+        images_discard_nodes(&images, &bad, 1);
+        dropped = images.failure_count == failed_records - 1u;
+        targets[0] = (ImagePriorityTarget) {
+            .node = bad, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+        };
+        job = dropped ? images_priority_load_begin_batch(
+            &document, &stylesheet, &images, targets, 2, &budget,
+            document_url, document_url, "strict-origin-when-cross-origin",
+            8, 64 * 1024, 16 * 1024, 1024 * 1024, 5000, scheduler, NULL)
+            : NULL;
+        dropped = job != NULL
+            && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING;
+        noted = images.failure_count;
+        images_priority_load_destroy(job);
+        dropped = dropped && noted == failed_records
+            && images.failure_count == failed_records - 1u;
+    }
+    ok = ok && dropped;
+    if (!ok) {
+        fprintf(stderr,
+                "failure retries replay='%s' failed=%zu recovered-at=%zu "
+                "restored=%zu net-record=%d items=%zu/%zu noted=%zu "
+                "final=%zu dropped=%d\n", replay_error, failed_records,
+                recovered_at, restored, net_record, images.count,
+                retained_items, noted, images.failure_count, dropped);
+    }
+    if (replaying) fetch_trace_end();
+    if (scheduler != NULL) fetch_scheduler_destroy(scheduler);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (failing_directory[0] != '\0')
+        remove_stylesheet_replay(failing_directory, 2);
+    if (recovering_directory[0] != '\0')
+        remove_stylesheet_replay(recovering_directory, 2);
     return ok && clean;
 }
 
@@ -3423,6 +3654,15 @@ static bool test_truncated_sheet_applies_only_complete_rules(void)
    application.css is 1,017,243 bytes against the PSP's 768 KiB cap. */
 static bool test_large_sheet_admitted_by_memory(void)
 {
+    Budget staging; budget_init(&staging, 32u * MIB);
+    if (stylesheets_response_byte_limit(&staging, 3u * MIB / 4u, 3u * MIB, 0) != 2u * MIB
+        || stylesheets_response_byte_limit(&staging, 3u * MIB / 4u, MIB / 2u, 0) != MIB / 2u
+        || stylesheets_response_byte_limit(&staging, MIB / 4u, 3u * MIB, 0) != MIB / 4u
+        || stylesheets_response_byte_limit(&staging, 3u * MIB / 4u, 3u * MIB, SIZE_MAX) != 3u * MIB / 4u)
+        return false;
+    budget_init(&staging, 5u * MIB);
+    if (stylesheets_response_byte_limit(&staging, 3u * MIB / 4u, 3u * MIB, 0) != 3u * MIB / 4u)
+        return false;
     static const char document_url[] = "https://document.example/page.html";
     static const char stylesheet_url[] = "https://document.example/big.css";
     static const char html[] =
@@ -3466,6 +3706,10 @@ static bool test_large_sheet_admitted_by_memory(void)
         bool admitted;
     } cases[] = {
         { "room", 32u * MIB, true },
+        /* The retained source has a rule ceiling even though its utility
+           text contains 25,600 blocks. Admission must reserve that bounded
+           parse, not a nonexistent full-source AST. */
+        { "bounded-parse", 9u * MIB, true },
         { "tight", 5u * MIB, false },
     };
     bool all = length > floor_bytes;
@@ -3803,10 +4047,286 @@ static bool test_rebuild_preserves_admitted_links(void)
     return ok;
 }
 
+/* A rebuild whose previous pass applied an @import (never a <link>) must not
+   treat a DOM beyond the reservation walk's node bound as cancelled, and
+   must not walk the whole document a second time looking for the import.
+   Parsing and document refresh cap a document at 65,536 nodes, so the
+   extra nodes are attached directly, as the paths that tolerate a failed
+   refresh leave a live DOM. */
+static bool test_rebuild_with_import_survives_large_document(void)
+{
+    static const char page[] = "https://admission.test/page";
+    static const char html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=a.css>"
+        "<style>@import 'imp.css';</style></head><body>"
+        "<div id=target>x</div></body></html>";
+    const size_t extra_nodes = 70000u;
+    Budget budget;
+    budget_init(&budget, 96u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    StylesheetDocumentResources resources = {.budget = &budget};
+    const char *names[] = {"a.css", "imp.css"};
+    const char *css[] = {"#target{color:#112233}",
+        "#target{background-color:#445566}"};
+    bool ok = installed;
+    for (size_t i = 0; i < 2u && ok; i++) {
+        size_t length = strlen(css[i]);
+        unsigned char *bytes = budget_malloc(&budget, length);
+        if (bytes == NULL) { ok = false; break; }
+        memcpy(bytes, css[i], length);
+        BrowserSharedBody *body = browser_shared_body_take(&budget, bytes, length);
+        char url[128];
+        snprintf(url, sizeof(url), "https://admission.test/%s", names[i]);
+        ok = body != NULL && stylesheet_document_resources_retain(
+            &resources, url, url, "no-referrer", body, length, false,
+            TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+        browser_shared_body_release(body);
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ExternalStylesheetStats stats = {0};
+    StylesheetDocumentResources staged = {0};
+    if (ok) {
+        /* The previous pass applied both: a.css by link, imp.css by import. */
+        resources.items[0].rules_applied = true;
+        resources.items[1].rules_applied = true;
+        resources.items[0].link_originated = true;
+    }
+    ok = ok && document_parse(&document, &budget, html, sizeof(html) - 1u, 17);
+    lxb_dom_node_t *target = !ok ? NULL : find_element_id(
+        lxb_dom_interface_node(document.html), "target");
+    lxb_dom_node_t *body = target == NULL ? NULL : target->parent;
+    ok = ok && body != NULL;
+    for (size_t i = 0; i < extra_nodes && ok; i++) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            body->owner_document, (const lxb_char_t *) "b", 1, NULL);
+        ok = element != NULL;
+        if (ok) lxb_dom_node_insert_child(body, lxb_dom_interface_node(element));
+    }
+    ok = ok && stylesheet_build(&sheet, &budget, &document, 480)
+        && stylesheet_document_resources_copy_for_rebuild(&staged, &resources);
+    bool loaded = ok && stylesheets_load_external_tracked_with_context(
+        &document, &sheet, &budget, page, page, "no-referrer", 4u,
+        4096u, 4096u, 60000, NULL, NULL, &staged, &stats);
+    ComputedStyle style = {0};
+    if (target != NULL) style = style_for_node(&sheet, target, NULL);
+    /* One document walk (plus a few nodes of reservation) is the cost; a
+       second full walk would double it. */
+    bool single_walk = stats.work_units < extra_nodes + extra_nodes / 2u;
+    if (!loaded || style.color != 0x112233u || style.background != 0x445566u
+        || !single_walk)
+        fprintf(stderr, "large import rebuild ok=%d loaded=%d color=%06x "
+                "background=%06x work=%zu\n", ok, loaded,
+                (unsigned) style.color, (unsigned) style.background,
+                stats.work_units);
+    ok = ok && loaded && style.color == 0x112233u
+        && style.background == 0x445566u && single_walk
+        && staged.items[0].rules_applied;
+    stylesheet_document_resources_destroy(&staged);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    stylesheet_document_resources_destroy(&resources);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
+/* An @import replayed from the ledger's retained body is applied by the
+   rebuild like a fetched one, so the pass must record it as applied: the
+   suffix loader seeds its URL deduplication from that bit, and a later
+   link to the imported URL is a duplicate, not a second application. */
+static bool test_rebuild_records_retained_import_as_applied(void)
+{
+    static const char page[] = "https://admission.test/page";
+    static const char html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=main.css></head><body>"
+        "<div id=target>x</div></body></html>";
+    static const char imported[] = "https://admission.test/imp.css";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    StylesheetDocumentResources resources = {.budget = &budget};
+    const char *names[] = {"main.css", "imp.css"};
+    const char *css[] = {"@import 'imp.css';#target{color:#112233}",
+        "#target{background-color:#445566}"};
+    bool ok = installed;
+    for (size_t i = 0; i < 2u && ok; i++) {
+        size_t length = strlen(css[i]);
+        unsigned char *bytes = budget_malloc(&budget, length);
+        if (bytes == NULL) { ok = false; break; }
+        memcpy(bytes, css[i], length);
+        BrowserSharedBody *body = browser_shared_body_take(&budget, bytes, length);
+        char url[128];
+        snprintf(url, sizeof(url), "https://admission.test/%s", names[i]);
+        ok = body != NULL && stylesheet_document_resources_retain(
+            &resources, url, url, "no-referrer", body, length, false,
+            TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+        browser_shared_body_release(body);
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ExternalStylesheetStats stats = {0};
+    StylesheetDocumentResources staged = {0};
+    ok = ok && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480)
+        && stylesheet_document_resources_copy_for_rebuild(&staged, &resources)
+        && stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, page, page, "no-referrer", 4u,
+            4096u, 4096u, 1000, NULL, NULL, &staged, &stats);
+    lxb_dom_node_t *target = !ok ? NULL : find_element_id(
+        lxb_dom_interface_node(document.html), "target");
+    ComputedStyle style = target == NULL ? (ComputedStyle) {0}
+        : style_for_node(&sheet, target, NULL);
+    bool import_applied = stylesheet_document_resources_link_applied(
+        &staged, page, imported, sizeof(imported) - 1u);
+    ok = ok && target != NULL && stats.retained_body_hits == 2u
+        && stats.imports_loaded == 1u
+        && style.color == 0x112233u && style.background == 0x445566u
+        && staged.items[0].rules_applied && import_applied;
+    /* A link appended later to the imported URL is the same sheet. */
+    lxb_dom_element_t *link = !ok ? NULL : lxb_dom_document_create_element(
+        target->owner_document, (const lxb_char_t *) "link", 4, NULL);
+    ok = ok && link != NULL
+        && lxb_dom_element_set_attribute(link, (const lxb_char_t *) "rel", 3,
+               (const lxb_char_t *) "stylesheet", 10) != NULL
+        && lxb_dom_element_set_attribute(link, (const lxb_char_t *) "href", 4,
+               (const lxb_char_t *) imported, sizeof(imported) - 1u) != NULL;
+    if (ok) lxb_dom_node_insert_child(target->parent,
+                                      lxb_dom_interface_node(link));
+    ExternalStylesheetStats suffix_stats = {0};
+    lxb_dom_node_t *suffix[1] = {link == NULL ? NULL
+                                 : lxb_dom_interface_node(link)};
+    FetchScheduler *scheduler = ok
+        ? fetch_scheduler_create(&budget, 1, 4096) : NULL;
+    ok = ok && scheduler != NULL
+        && stylesheets_append_ordered_suffix_with_context(
+            &sheet, &budget, suffix, 1, page, page, "no-referrer",
+            &document.content_security_policy, 4u, 4096u, 4096u, 1000,
+            scheduler, NULL, &staged, &suffix_stats)
+        && suffix_stats.duplicate == 1u && suffix_stats.attempted == 0u;
+    fetch_scheduler_destroy(scheduler);
+    if (!ok) fprintf(stderr, "retained import hits=%zu imports=%zu "
+        "color=%06x background=%06x applied=%d suffix dup=%zu attempted=%zu\n",
+        stats.retained_body_hits, stats.imports_loaded,
+        (unsigned) style.color, (unsigned) style.background,
+        (int) import_applied, suffix_stats.duplicate,
+        suffix_stats.attempted);
+    stylesheet_document_resources_destroy(&staged);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    stylesheet_document_resources_destroy(&resources);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
+/* A retained @import the rebuild skips (here past the byte budget; the
+   memory-pressure skip takes the same return) put no rule in the sheet, so
+   the pass must not record it as applied: a link appended later to the
+   imported URL then applies its rules instead of being a duplicate. */
+static bool test_rebuild_skipped_retained_import_is_not_applied(void)
+{
+    static const char page[] = "https://admission.test/page";
+    static const char html[] = "<!doctype html><html><head>"
+        "<link rel=stylesheet href=main.css></head><body>"
+        "<div id=target>x</div></body></html>";
+    static const char imported[] = "https://admission.test/imp.css";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    StylesheetDocumentResources resources = {.budget = &budget};
+    const char *names[] = {"main.css", "imp.css"};
+    /* main.css (about 1.5 KiB) is charged before its import; imp.css
+       (3 KiB) then no longer fits the 4 KiB total. */
+    char main_css[1600], imported_css[3100];
+    int main_length = snprintf(main_css, sizeof(main_css),
+        "@import 'imp.css';#target{color:#112233}/*%01400d*/", 0);
+    int imported_length = snprintf(imported_css, sizeof(imported_css),
+        "#target{background-color:#445566}/*%03000d*/", 0);
+    const char *css[] = {main_css, imported_css};
+    bool ok = installed && main_length > 1400 && imported_length > 3000;
+    for (size_t i = 0; i < 2u && ok; i++) {
+        size_t length = strlen(css[i]);
+        unsigned char *bytes = budget_malloc(&budget, length);
+        if (bytes == NULL) { ok = false; break; }
+        memcpy(bytes, css[i], length);
+        BrowserSharedBody *body = browser_shared_body_take(&budget, bytes, length);
+        char url[128];
+        snprintf(url, sizeof(url), "https://admission.test/%s", names[i]);
+        ok = body != NULL && stylesheet_document_resources_retain(
+            &resources, url, url, "no-referrer", body, length, false,
+            TILEFINCH_CREDENTIALS_INCLUDE, NULL);
+        browser_shared_body_release(body);
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ExternalStylesheetStats stats = {0};
+    StylesheetDocumentResources staged = {0};
+    ok = ok && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480)
+        && stylesheet_document_resources_copy_for_rebuild(&staged, &resources)
+        && stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, page, page, "no-referrer", 4u,
+            4096u, 4096u, 1000, NULL, NULL, &staged, &stats);
+    lxb_dom_node_t *target = !ok ? NULL : find_element_id(
+        lxb_dom_interface_node(document.html), "target");
+    ComputedStyle style = target == NULL ? (ComputedStyle) {0}
+        : style_for_node(&sheet, target, NULL);
+    bool import_applied = stylesheet_document_resources_link_applied(
+        &staged, page, imported, sizeof(imported) - 1u);
+    bool skipped = ok && target != NULL && stats.skipped_limit == 1u
+        && style.color == 0x112233u && style.background != 0x445566u
+        && staged.items[0].rules_applied && !import_applied;
+    /* A link appended later to the imported URL applies it. */
+    lxb_dom_element_t *link = !skipped ? NULL : lxb_dom_document_create_element(
+        target->owner_document, (const lxb_char_t *) "link", 4, NULL);
+    ok = skipped && link != NULL
+        && lxb_dom_element_set_attribute(link, (const lxb_char_t *) "rel", 3,
+               (const lxb_char_t *) "stylesheet", 10) != NULL
+        && lxb_dom_element_set_attribute(link, (const lxb_char_t *) "href", 4,
+               (const lxb_char_t *) imported, sizeof(imported) - 1u) != NULL;
+    if (ok) lxb_dom_node_insert_child(target->parent,
+                                      lxb_dom_interface_node(link));
+    ExternalStylesheetStats suffix_stats = {0};
+    lxb_dom_node_t *suffix[1] = {link == NULL ? NULL
+                                 : lxb_dom_interface_node(link)};
+    FetchScheduler *scheduler = ok
+        ? fetch_scheduler_create(&budget, 1, 4096) : NULL;
+    ok = ok && scheduler != NULL
+        && stylesheets_append_ordered_suffix_with_context(
+            &sheet, &budget, suffix, 1, page, page, "no-referrer",
+            &document.content_security_policy, 4u, 4096u, 4096u, 1000,
+            scheduler, NULL, &staged, &suffix_stats);
+    fetch_scheduler_destroy(scheduler);
+    ComputedStyle after = target == NULL ? (ComputedStyle) {0}
+        : style_for_node(&sheet, target, NULL);
+    ok = ok && suffix_stats.attempted == 1u
+        && after.background == 0x445566u
+        && stylesheet_document_resources_link_applied(
+               &staged, page, imported, sizeof(imported) - 1u);
+    if (!ok) fprintf(stderr, "skipped retained import skipped=%d limit=%zu "
+        "color=%06x background=%06x applied=%d suffix dup=%zu "
+        "attempted=%zu after=%06x\n", (int) skipped, stats.skipped_limit,
+        (unsigned) style.color, (unsigned) style.background,
+        (int) import_applied, suffix_stats.duplicate,
+        suffix_stats.attempted, (unsigned) after.background);
+    stylesheet_document_resources_destroy(&staged);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    stylesheet_document_resources_destroy(&resources);
+    ok = ok && budget.current == 0u;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    return ok;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--skipped-import-only") == 0)
+        return test_rebuild_skipped_retained_import_is_not_applied() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--retained-admission-only") == 0)
         return test_rebuild_preserves_admitted_links() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--retained-import-only") == 0)
+        return test_rebuild_records_retained_import_as_applied() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--complete-census-only") == 0)
         return test_complete_selector_census_reopens_retained_sources_once() ? 0 : 1;
 #define RUN_TEST(test) do {                                                  \
@@ -3821,6 +4341,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_redirected_publication_refusal_sweep);
     RUN_TEST(test_resource_ledger_url_and_provenance_refusals);
     RUN_TEST(test_rebuild_preserves_admitted_links);
+    RUN_TEST(test_rebuild_with_import_survives_large_document);
+    RUN_TEST(test_rebuild_records_retained_import_as_applied);
+    RUN_TEST(test_rebuild_skipped_retained_import_is_not_applied);
     RUN_TEST(test_integrity_mismatch_rejects_stylesheet);
     RUN_TEST(test_integrity_is_scoped_to_each_link_element);
     RUN_TEST(test_integrity_rechecks_cross_origin_redirect);
@@ -3843,6 +4366,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_css_data_svg_mask_uses_bounded_image_pipeline);
     RUN_TEST(test_webp_url_preserves_authored_resource);
     RUN_TEST(test_icon_images_do_not_spend_image_count);
+    RUN_TEST(test_image_limits_record_no_failure);
+    RUN_TEST(test_image_failure_records_follow_retries);
     RUN_TEST(test_css_paint_layers_keep_distinct_resources);
     RUN_TEST(test_invalid_href_has_terminal_state);
     RUN_TEST(test_blocker_bypasses_fresh_cached_stylesheet);

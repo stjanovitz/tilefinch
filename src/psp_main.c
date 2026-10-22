@@ -336,22 +336,6 @@ int main(int argc, char *argv[])
     psp_counter("stylesheet", "scoped-variables",
                 stylesheet.custom_rule_count);
     psp_counter("stylesheet", "deferred-bytes", stylesheet.deferred_bytes);
-    psp_counter("stylesheet-diagnostics", "declarations",
-                stylesheet.diagnostic_declarations);
-    psp_counter("stylesheet-diagnostics", "supported",
-                stylesheet.diagnostic_supported_declarations);
-    psp_counter("stylesheet-diagnostics", "rejected",
-                stylesheet.diagnostic_rejected_declarations);
-    psp_counter("stylesheet-diagnostics", "deferred",
-                stylesheet.diagnostic_deferred_declarations);
-    psp_counter("stylesheet-diagnostics", "custom-drops",
-                stylesheet.diagnostic_custom_property_drops);
-    psp_counter("stylesheet-diagnostics", "selector-drops",
-                stylesheet.diagnostic_selector_drops);
-    psp_counter("stylesheet-diagnostics", "unknown-media",
-                stylesheet.diagnostic_unknown_media_features);
-    psp_counter("stylesheet-diagnostics", "supports-false",
-                stylesheet.diagnostic_supports_false_queries);
     psp_counter("tiles", "hits", cache.hits);
     psp_counter("tiles", "misses", cache.misses);
     psp_counter("tiles", "evictions", cache.evictions);

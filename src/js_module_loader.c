@@ -976,8 +976,13 @@ static void runtime_import_map_prepare(ScriptRuntime *runtime)
     size_t retained = 0;
     unsigned maps = 0;
     lxb_dom_node_t *root = lxb_dom_interface_node(runtime->document->html);
-    lxb_dom_node_t *node = root;
-    for (size_t visited = 0; node != NULL && visited < 65536u; visited++) {
+    /* A document too large to scan completely gets no import map rather
+       than one that misses a later map. */
+    DomDocumentOrderTraversal walk = {
+        .next = root, .boundary = root, .visit_limit = 65536u,
+    };
+    for (lxb_dom_node_t *node = dom_document_order_next(&walk); node != NULL;
+         node = dom_document_order_next(&walk)) {
         size_t type_length = 0, tag_length = 0;
         const char *tag = document_element_name(node, &tag_length);
         const char *type = document_attribute(node, "type", &type_length);
@@ -1001,14 +1006,8 @@ static void runtime_import_map_prepare(ScriptRuntime *runtime)
                 return;
             }
         }
-        if (node->first_child != NULL) node = node->first_child;
-        else {
-            unsigned depth = 0;
-            while (node != root && node->next == NULL && depth++ < 512) node = node->parent;
-            node = node == root || depth >= 512 ? NULL : node->next;
-        }
     }
-    if (node != NULL) runtime_import_map_clear(runtime);
+    if (walk.exhausted) runtime_import_map_clear(runtime);
 }
 
 static const ScriptImportMapEntry *runtime_import_map_match(
@@ -2177,6 +2176,12 @@ static bool script_runtime_evaluate_external_typed_at(
                                          &runtime->result);
         }
     }
+    /* HTML's classic-script cleanup checkpoint precedes restoring
+       currentScript. Load events and later tasks run outside that scope.
+       Segmented registrations still have only one, final checkpoint. */
+    if (evaluated && dispatch_completion) {
+        evaluated = js_rt_runtime_run_jobs(runtime);
+    }
     if (current_script_active
         && !js_rt_current_script_scope_end(
                runtime->context, &previous_current_script,
@@ -2187,9 +2192,6 @@ static bool script_runtime_evaluate_external_typed_at(
      * Intermediate registrations must not expose a microtask checkpoint or
      * refreshed host state before every later registration has run.
      */
-    if (evaluated && dispatch_completion) {
-        evaluated = js_rt_runtime_run_jobs(runtime);
-    }
     if (evaluated && dispatch_completion) {
         evaluated = js_rt_runtime_refresh(runtime);
     }

@@ -179,6 +179,57 @@ static int test_ancestor_filter_canonical_tokens(void)
 }
 
 
+/* HTML type selectors match without ASCII case in an HTML document, so the
+   rule prefilter, the rule index and the ancestor filter must reach the same
+   answer as the matcher for legacy uppercase author CSS. Foreign elements
+   keep exact names. */
+static int uppercase_type_selector_case(bool indexed)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><style>"
+        "TD{color:#123456}TD SPAN{padding-top:7px}Td>B{padding-right:5px}"
+        "td{padding-bottom:2px}"
+        "FOREIGNOBJECT{padding-left:9px}"
+        "</style><table><tr><td id=cell><span id=inner>x</span>"
+        "<b id=bold>y</b></td></tr></table>"
+        "<svg><foreignObject id=fo></foreignObject></svg>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    if (!indexed) CHECK(setenv("TILEFINCH_DISABLE_STYLE_INDEX", "1", 1) == 0);
+    Stylesheet sheet = {0};
+    bool built = stylesheet_build(&sheet, &budget, &document, 480);
+    CHECK(built);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *cell = find_id(root, "cell");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    lxb_dom_node_t *bold = find_id(root, "bold");
+    lxb_dom_node_t *foreign = find_id(root, "fo");
+    CHECK(cell != NULL && inner != NULL && bold != NULL && foreign != NULL);
+    ComputedStyle cell_style = style_for_node(&sheet, cell, NULL);
+    ComputedStyle inner_style = style_for_node(&sheet, inner, NULL);
+    ComputedStyle bold_style = style_for_node(&sheet, bold, NULL);
+    ComputedStyle foreign_style = style_for_node(&sheet, foreign, NULL);
+    if (!indexed) CHECK(unsetenv("TILEFINCH_DISABLE_STYLE_INDEX") == 0);
+    CHECK(cell_style.color == 0x123456 && cell_style.padding.bottom == 2);
+    CHECK(inner_style.padding.top == 7);
+    CHECK(bold_style.padding.right == 5);
+    CHECK(foreign_style.padding.left == 0);
+    CHECK(sheet.rule_index_ready == indexed);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_uppercase_type_selectors(void)
+{
+    CHECK(uppercase_type_selector_case(true) == 0);
+    CHECK(uppercase_type_selector_case(false) == 0);
+    return 0;
+}
+
 /* Attribute tests and argument-less pseudo-classes compile to instructions
    that must agree with the string matcher on every node, and rules naming
    an unimplemented pseudo-element must not survive to matching. */
@@ -921,12 +972,15 @@ static int test_registered_custom_properties(void)
         "@property --reg-length{syntax:'<length>';inherits:true;"
         "initial-value:5px}"
         "@property --reg-any{syntax:\"*\";inherits:false}"
+        "@property --reg-unit{syntax:'<length>';inherits:true;initial-value:1px}"
         /* No initial-value for a typed syntax: invalid, ignored. */
         "@property --reg-bad{syntax:\"<length>\";inherits:false}"
         "@layer properties{@supports (-webkit-hyphens:none){"
         "*{--reg-color:#123456}}}"
         ".outer{--reg-color:#ff0000;--reg-any:abc;--reg-bad:outer}"
-        ".reset{--reg-length:initial}";
+        ".reset{--reg-length:initial}"
+        ".outer{font-size:16px;--reg-unit:calc(1em / 16)}"
+        "#inner{font-size:10px;width:calc(40 * var(--reg-unit))}";
     Budget budget;
     budget_init(&budget, 16u * MIB);
     CHECK(budget_install_lexbor(&budget));
@@ -944,7 +998,7 @@ static int test_registered_custom_properties(void)
     CHECK(stylesheet_build(&sheet, &budget, &document, 480));
     uint64_t signature = stylesheet_parse_context_signature(&sheet);
     CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
-    CHECK(sheet.registered_property_count == 3
+    CHECK(sheet.registered_property_count == 4
           && stylesheet_parse_context_signature(&sheet) != signature);
     char value[64];
     CHECK(custom_property_text(&sheet, outer, "--reg-color", value,
@@ -956,6 +1010,12 @@ static int test_registered_custom_properties(void)
     CHECK(custom_property_text(&sheet, inner, "--reg-length", value,
                                sizeof(value)) == 3
           && strcmp(value, "5px") == 0);
+    CHECK(custom_property_text(&sheet, inner, "--reg-unit", value,
+                               sizeof(value)) == 3
+          && strcmp(value, "1px") == 0);
+    ComputedStyle outer_style = style_for_node(&sheet, outer, NULL);
+    ComputedStyle inner_style = style_for_node(&sheet, inner, &outer_style);
+    CHECK(inner_style.width == 40);
     CHECK(custom_property_text(&sheet, reset, "--reg-length", value,
                                sizeof(value)) == 3
           && strcmp(value, "5px") == 0);
@@ -977,6 +1037,179 @@ static int test_registered_custom_properties(void)
                                       sizeof(value)) == 0);
     }
     style_variable_cache_end(&sheet);
+    stylesheet_destroy(&sheet);
+    /* Registration storage refusal must not install a partial entry. */
+    char registration_initial[256];
+    memset(registration_initial, 'a', sizeof(registration_initial) - 1u);
+    registration_initial[sizeof(registration_initial) - 1u] = '\0';
+    for (size_t failure = 0; failure < 8; failure++) {
+        CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+        DocumentRegisteredProperty registration = {
+            .name = "--allocation-test", .initial_value = registration_initial,
+            .inherits = true
+        };
+        budget_inject_failure_after(&budget, failure);
+        bool registered = stylesheet_register_api_property(&sheet, &registration);
+        budget_clear_failure_injection(&budget);
+        CHECK(sheet.registered_property_count == (registered ? 1u : 0u));
+        CHECK(sheet.custom_value_long_bytes
+              == (registered ? sizeof(registration_initial) : 0u));
+        CHECK(stylesheet_register_api_property(&sheet, &registration));
+        CHECK(sheet.registered_property_count == 1);
+        stylesheet_destroy(&sheet);
+    }
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A registered <length> in em converts on the declaring element, which
+   needs that element's font. Sibling components must not each re-cascade
+   the whole shared ancestor chain to find it, and the values must equal
+   the uncached resolution's. */
+static int test_registered_length_ancestor_reuse(void)
+{
+    enum { DEPTH = 15, CARDS = 100 };
+    static const char css[] =
+        "@property --gap{syntax:'<length>';inherits:true;initial-value:0px}"
+        ".deep{font-size:12px}.card{--gap:1em;font-size:20px}"
+        ".card i{font-size:10px;width:var(--gap)}"
+        ".card.big{font-size:30px}";
+    char html[8192];
+    size_t used = 0;
+    for (int i = 0; i < DEPTH; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<div class=deep>");
+    for (int i = 0; i < CARDS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<p class='card%s'><i id=c%d>x</i></p>",
+            i % 7 == 3 ? " big" : "", i);
+    CHECK(used < sizeof(html));
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    int expected[CARDS];
+    /* Uncached: every lookup converts afresh. */
+    for (int i = 0; i < CARDS; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "c%d", i);
+        lxb_dom_node_t *leaf = find_id(root, id);
+        CHECK(leaf != NULL);
+        char value[64];
+        CHECK(custom_property_text(&sheet, leaf, "--gap", value,
+                                   sizeof(value)) > 0);
+        expected[i] = atoi(value);
+        CHECK(expected[i] == (i % 7 == 3 ? 30 : 20));
+    }
+    /* A layout-like pass: one variable cache, top-down styles. */
+    CHECK(style_variable_cache_begin(&sheet, &budget));
+    uint64_t queries = sheet.rule_index_queries;
+    for (int i = 0; i < CARDS; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "c%d", i);
+        lxb_dom_node_t *leaf = find_id(root, id);
+        char value[64];
+        CHECK(custom_property_text(&sheet, leaf, "--gap", value,
+                                   sizeof(value)) > 0
+              && atoi(value) == expected[i]);
+    }
+    uint64_t spent = sheet.rule_index_queries - queries;
+    style_variable_cache_end(&sheet);
+    fprintf(stderr, "registered length reuse: %llu rule queries for %d "
+            "cards at depth %d\n", (unsigned long long) spent, CARDS, DEPTH);
+    /* Each card's own cascade, not its whole chain (DEPTH + 3 each). */
+    CHECK(spent < (uint64_t) CARDS * 4u * 3u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Design-token names past the cache slot's inline bytes are still cached:
+   a sibling's lookup is answered by its parent's entry instead of a winner
+   search on every ancestor. */
+static int test_long_variable_names_cached(void)
+{
+    enum { ITEMS = 40 };
+    static const char css[] =
+        ":root{--wp--preset--gradient--vivid-cyan-blue-to-vivid-purple-x:"
+        "#123456;--short:var(--wp--preset--gradient--vivid-cyan-blue-to-"
+        "vivid-purple-x)}"
+        ".item{color:var(--wp--preset--gradient--vivid-cyan-blue-to-vivid-"
+        "purple-x)}.item b{color:var(--short)}";
+    char html[4096];
+    size_t used = (size_t) snprintf(html, sizeof(html), "<div><div>");
+    for (int i = 0; i < ITEMS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<p class=item id=p%d><b>x</b></p>", i);
+    CHECK(used < sizeof(html));
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    CHECK(style_variable_cache_begin(&sheet, &budget));
+    uint64_t hits = sheet.variable_cache_hits;
+    for (int i = 0; i < ITEMS; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "p%d", i);
+        lxb_dom_node_t *item = find_id(root, id);
+        CHECK(item != NULL && item->first_child != NULL);
+        ComputedStyle style = style_for_node(&sheet, item, NULL);
+        ComputedStyle bold = style_for_node(&sheet, item->first_child,
+                                            &style);
+        CHECK(style.color == 0x123456 && bold.color == 0x123456);
+    }
+    uint64_t gained = sheet.variable_cache_hits - hits;
+    style_variable_cache_end(&sheet);
+    fprintf(stderr, "long variable names: %llu cache hits for %d items\n",
+            (unsigned long long) gained, ITEMS);
+    CHECK(gained >= (uint64_t) ITEMS * 2u - 2u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Motion metadata keeps exactly the animation declarations of each rule,
+   in any ASCII case, and nothing from rules without one. */
+static int test_motion_source_declarations(void)
+{
+    static const char css[] =
+        ".plain{color:red;transition:opacity 1s}"
+        ".named{color:blue;Animation-Name:spin;margin:0}"
+        ".vendor{-WEBKIT-animation:spin 1s}"
+        ".shorthand{animation:spin 2s linear}"
+        ".quoted{content:'animation:none'}"
+        "@keyframes spin{from{opacity:0}to{opacity:1}}";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<p>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    CHECK(sheet.motion_css != NULL);
+    CHECK(strstr(sheet.motion_css, ".named{Animation-Name:spin;}") != NULL);
+    CHECK(strstr(sheet.motion_css, ".vendor{-WEBKIT-animation:spin 1s;}")
+          != NULL);
+    CHECK(strstr(sheet.motion_css, ".shorthand{animation:spin 2s linear;}")
+          != NULL);
+    CHECK(strstr(sheet.motion_css, ".plain") == NULL
+          && strstr(sheet.motion_css, ".quoted") == NULL);
+    CHECK(sheet.motion_css_rules == 3 && sheet.motion_css_keyframes == 1);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0);
@@ -1131,8 +1364,16 @@ static int test_computed_style_payload_storage(void)
         CHECK(result.color == expected.color && result.width == expected.width);
         CHECK(budget.current == retained);
     }
-    CHECK(budget.failure_count == failures + 1u);
+    CHECK(budget.failure_count == failures);
     budget.limit = limit;
+    /* Pressure preflight avoids an allocator refusal. Still exercise the
+       real allocation rollback separately while there is ordinary room. */
+    budget_inject_failure_after(&budget, 0);
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                           nodes[0], &parent, &result));
+    budget_clear_failure_injection(&budget);
+    CHECK(budget.failure_count == failures + 1u && budget.current == retained
+        && result.color == expected.color && result.width == expected.width);
     layout_reuse_cache_reset(reuse);
     layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
     for (unsigned i = 0; i < 128; i++) {
@@ -1148,7 +1389,7 @@ static int test_computed_style_payload_storage(void)
                                                nodes[i], &parent, &result));
         CHECK(result.color == 0x123456 && budget.current == retained);
     }
-    CHECK(budget.failure_count == failures + 1u);
+    CHECK(budget.failure_count == failures);
     for (unsigned i = 0; i < 128; i++)
         CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
                                               nodes[i], &parent, &result));
@@ -1284,6 +1525,1672 @@ static int test_unrelated_container_custom_rules(void)
     ComputedStyle result = style_for_node(&sheet, node, NULL);
     CHECK(result.color == 0xff0000u);
     CHECK(style_container_consults(&sheet) == before);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Container conditions use the media grammar: calc() and every length
+   unit, inline-size/block-size, vw against the viewport, and media-only
+   features are unknown (false). */
+static int test_container_condition_grammar(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.box{container-type:inline-size}"
+        "p{color:#000000}"
+        "@container (min-width: calc(20rem + 1px)){#calc{color:#ff0000}}"
+        "@container (inline-size > 50vw){#vw{color:#ff0000}}"
+        "@container (width >= 3in){#inch{color:#ff0000}}"
+        "@container (hover: none){#media{color:#ff0000}}"
+        "</style><div id=box class=box><p id=calc>A</p><p id=vw>B</p>"
+        "<p id=inch>C</p><p id=media>D</p></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    static const char *const ids[] = {"calc", "vw", "inch", "media"};
+    /* 321 px is the calc() threshold, 240 px half the viewport, 288 px
+       three inches. Hover is a media feature, never a container one. */
+    static const struct { int width; uint32_t colors[4]; } turns[] = {
+        {320, {0x000000, 0xff0000, 0xff0000, 0x000000}},
+        {321, {0xff0000, 0xff0000, 0xff0000, 0x000000}},
+        {240, {0x000000, 0x000000, 0x000000, 0x000000}},
+    };
+    for (size_t turn = 0; turn < sizeof(turns) / sizeof(turns[0]); turn++) {
+        CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+              && style_container_layout_state_add(
+                  &sheet, box, turns[turn].width, 100, 0, 0));
+        for (size_t i = 0; i < 4; i++) {
+            ComputedStyle style = style_for_node(
+                &sheet, find_id(root, ids[i]), NULL);
+            if (style.color != turns[turn].colors[i])
+                fprintf(stderr, "container %d px #%s=%06x, want %06x\n",
+                        turns[turn].width, ids[i], (unsigned) style.color,
+                        (unsigned) turns[turn].colors[i]);
+            CHECK(style.color == turns[turn].colors[i]);
+        }
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Utility CSS repeats one @container prelude per class. Identical preludes
+   (name, condition and enclosing query) share one of the 63 query ids, so
+   a block past the 63rd still applies; a different enclosing query or name
+   keeps its own id. */
+static int test_container_query_registration_dedup(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    enum { BLOCKS = 80 };
+    static char page[16384];
+    size_t length = 0;
+    int wrote = snprintf(page, sizeof(page),
+        "<!doctype html><style>.box{container:card / inline-size}"
+        "p{color:#000000}");
+    CHECK(wrote > 0);
+    length = (size_t) wrote;
+    for (unsigned i = 0; i < BLOCKS; i++) {
+        wrote = snprintf(page + length, sizeof(page) - length,
+                         "@container (width > 100px){#t%u{color:#ff0000}}", i);
+        CHECK(wrote > 0 && (size_t) wrote < sizeof(page) - length);
+        length += (size_t) wrote;
+    }
+    wrote = snprintf(page + length, sizeof(page) - length,
+        "@container (width > 100px){@container (width > 400px)"
+        "{#nested{color:#ff0000}}}"
+        "@container card (width > 100px){#named{color:#ff0000}}"
+        "@container other (width > 100px){#other{color:#ff0000}}"
+        "</style><div id=box class=box><p id=nested>N</p><p id=named>M</p>"
+        "<p id=other>O</p>");
+    CHECK(wrote > 0 && (size_t) wrote < sizeof(page) - length);
+    length += (size_t) wrote;
+    for (unsigned i = 0; i < BLOCKS; i++) {
+        wrote = snprintf(page + length, sizeof(page) - length,
+                         "<p id=t%u>T</p>", i);
+        CHECK(wrote > 0 && (size_t) wrote < sizeof(page) - length);
+        length += (size_t) wrote;
+    }
+    CHECK(document_parse(&document, &budget, page, length, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    /* (width > 100px); nested (width > 400px); card; other. */
+    CHECK(sheet.conditional_queries != NULL
+          && sheet.conditional_queries->query_count == 4);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    CHECK(box != NULL);
+    for (int turn = 0; turn < 2; turn++) {
+        int width = turn == 0 ? 300 : 50;
+        CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+              && style_container_layout_state_add(&sheet, box, width, 100,
+                                                  0, 0));
+        uint32_t want = turn == 0 ? 0xff0000u : 0x000000u;
+        for (unsigned i = 0; i < BLOCKS; i++) {
+            char id[8];
+            snprintf(id, sizeof(id), "t%u", i);
+            ComputedStyle style = style_for_node(&sheet, find_id(root, id),
+                                                 NULL);
+            if (style.color != want)
+                fprintf(stderr, "container %d px #%s=%06x, want %06x\n",
+                        width, id, (unsigned) style.color, (unsigned) want);
+            CHECK(style.color == want);
+        }
+        CHECK(style_for_node(&sheet, find_id(root, "nested"), NULL).color
+              == 0x000000u);
+        CHECK(style_for_node(&sheet, find_id(root, "named"), NULL).color
+              == want);
+        /* No ancestor is named `other`. */
+        CHECK(style_for_node(&sheet, find_id(root, "other"), NULL).color
+              == 0x000000u);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Condition answers are kept per container state: siblings under one
+   container share them, and a store that changes the container's size
+   (a live update, or the next measured pass) answers afresh. */
+static int test_container_condition_cache_follows_state(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.box{container-type:inline-size}"
+        "p{color:#000000}@container (width > 200px){p{color:#ff0000}}"
+        "</style><div id=box class=box><p id=a>A</p><p id=b>B</p>"
+        "<div id=inner class=box><p id=c>C</p></div></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    lxb_dom_node_t *inner = find_id(root, "inner");
+    CHECK(box != NULL && inner != NULL);
+    CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+          && style_container_layout_state_add(&sheet, box, 300, 100, 0, 0)
+          && style_container_layout_state_add(&sheet, inner, 100, 50, 0, 0));
+    CHECK(style_for_node(&sheet, find_id(root, "a"), NULL).color == 0xff0000u);
+    CHECK(style_for_node(&sheet, find_id(root, "b"), NULL).color == 0xff0000u);
+    /* The nearest container answers, not the shared outer result. */
+    CHECK(style_for_node(&sheet, find_id(root, "c"), NULL).color == 0x000000u);
+    /* Same geometry: the stored answers stay. Changed: they start over. */
+    CHECK(style_container_layout_state_add(&sheet, box, 300, 100, 0, 0)
+          && style_container_layout_state_add(&sheet, inner, 250, 50, 0, 0));
+    CHECK(style_for_node(&sheet, find_id(root, "c"), NULL).color == 0xff0000u);
+    CHECK(style_container_layout_state_add(&sheet, box, 150, 100, 0, 0));
+    CHECK(style_for_node(&sheet, find_id(root, "a"), NULL).color == 0x000000u);
+    CHECK(style_for_node(&sheet, find_id(root, "b"), NULL).color == 0x000000u);
+    CHECK(style_for_node(&sheet, find_id(root, "c"), NULL).color == 0xff0000u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A container prelude's `not`, `and` and `or` are condition keywords, not
+   container names (CSS Containment 3): `not` negates, and the reserved
+   words, `none` and functions cannot name a container. */
+static int test_container_condition_keywords(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.box{container:card / inline-size}"
+        "p{color:#000000}"
+        "@container not (width > 400px){#not{color:#ff0000}}"
+        "@container NOT (width < 200px){#upper{color:#ff0000}}"
+        "@container card not (width < 200px){#named{color:#ff0000}}"
+        "@container (width > 100px) and (width < 400px){#and{color:#ff0000}}"
+        "@container (width > 400px) or (width < 350px){#or{color:#ff0000}}"
+        "@container not ((width > 100px) and (width < 200px)){#nested{color:#ff0000}}"
+        "@container and (width > 1px){#and_name{color:#ff0000}}"
+        "@container or (width > 1px){#or_name{color:#ff0000}}"
+        "@container none (width > 1px){#none_name{color:#ff0000}}"
+        "@container card foo (width > 1px){#junk{color:#ff0000}}"
+        "@container not(width > 1px){#function{color:#ff0000}}"
+        "</style><div id=box class=box>"
+        "<p id=not>A</p><p id=upper>B</p><p id=named>C</p><p id=and>D</p>"
+        "<p id=or>E</p><p id=nested>F</p><p id=and_name>G</p>"
+        "<p id=or_name>H</p><p id=none_name>I</p><p id=junk>J</p>"
+        "<p id=function>K</p></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    static const char *const ids[] = {
+        "not", "upper", "named", "and", "or", "nested",
+        "and_name", "or_name", "none_name", "junk", "function"};
+    enum { ID_COUNT = sizeof(ids) / sizeof(ids[0]) };
+    static const struct { int width; bool matched[ID_COUNT]; } turns[] = {
+        {300, {true, true, true, true, true, true,
+               false, false, false, false, false}},
+        {150, {true, false, false, true, true, false,
+               false, false, false, false, false}},
+        {500, {false, true, true, false, true, true,
+               false, false, false, false, false}},
+    };
+    for (size_t turn = 0; turn < sizeof(turns) / sizeof(turns[0]); turn++) {
+        CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+              && style_container_layout_state_add(
+                  &sheet, box, turns[turn].width, 100, 0, 0));
+        for (size_t i = 0; i < ID_COUNT; i++) {
+            ComputedStyle style = style_for_node(
+                &sheet, find_id(root, ids[i]), NULL);
+            uint32_t want = turns[turn].matched[i] ? 0xff0000u : 0x000000u;
+            if (style.color != want)
+                fprintf(stderr, "container %d px #%s=%06x, want %06x\n",
+                        turns[turn].width, ids[i], (unsigned) style.color,
+                        (unsigned) want);
+            CHECK(style.color == want);
+        }
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Size container features beyond width and height (CSS Containment 3):
+   orientation and aspect-ratio, in plain, min-/max- and range forms, are
+   retained and answered against the container's content box. Both relate
+   the two axes, so an inline-size container never answers them; a style()
+   query stays unsupported and is never retained. */
+static int test_container_ratio_features(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>.box{container-type:size}"
+        ".row{container-type:inline-size}p{color:#000000}"
+        "@container (orientation: landscape){#land{color:#ff0000}}"
+        "@container (orientation: portrait){#port{color:#ff0000}}"
+        "@container (aspect-ratio > 1){#wide{color:#ff0000}}"
+        "@container (min-aspect-ratio: 16/9){#cinema{color:#ff0000}}"
+        "@container (max-aspect-ratio: 1 / 2){#tall{color:#ff0000}}"
+        "@container (aspect-ratio: 2/1){#exact{color:#ff0000}}"
+        "@container (1/2 <= aspect-ratio < 3/2){#band{color:#ff0000}}"
+        "@container (MIN-ASPECT-RATIO: 16/9) and (width < 400px)"
+        "{#mixed{color:#ff0000}}"
+        "@container (orientation: landscape) or style(--x: 1)"
+        "{#style{color:#ff0000}}"
+        "@container (aspect-ratio > 1){#inline{color:#ff0000}}"
+        "@container (orientation: landscape){#lone{color:#ff0000}}"
+        "</style><div id=lone-row class=row><p id=lone>K</p></div>"
+        "<div id=box class=box>"
+        "<p id=land>A</p><p id=port>B</p><p id=wide>C</p>"
+        "<p id=cinema>D</p><p id=tall>E</p><p id=exact>F</p>"
+        "<p id=band>G</p><p id=mixed>H</p><p id=style>I</p>"
+        "<div id=row class=row><p id=inline>J</p></div></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    lxb_dom_node_t *row = find_id(root, "row");
+    lxb_dom_node_t *lone_row = find_id(root, "lone-row");
+    static const char *const ids[] = {
+        "land", "port", "wide", "cinema", "tall", "exact", "band", "mixed",
+        "style", "inline", "lone"};
+    enum { RATIO_ID_COUNT = sizeof(ids) / sizeof(ids[0]) };
+    /* #inline sits in an inline-size container inside the size one: the
+       ratio query skips it and answers against #box, which is why it
+       follows #wide. #lone has only an inline-size container, which cannot
+       answer orientation, so it stays false; #style is never retained.
+       Turns three and four differ only in the container's height. */
+    static const struct {
+        int width, height;
+        bool matched[RATIO_ID_COUNT];
+    } turns[] = {
+        {320, 180, {true, false, true, true, false, false, false, true,
+                    false, true, false}},
+        {200, 100, {true, false, true, true, false, true, false, true,
+                    false, true, false}},
+        {100, 100, {false, true, false, false, false, false, true, false,
+                    false, false, false}},
+        {100, 200, {false, true, false, false, true, false, true, false,
+                    false, false, false}},
+        {640, 360, {true, false, true, true, false, false, false, false,
+                    false, true, false}},
+    };
+    for (size_t turn = 0; turn < sizeof(turns) / sizeof(turns[0]); turn++) {
+        CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+              && style_container_layout_state_add(
+                  &sheet, box, turns[turn].width, turns[turn].height, 0, 0)
+              && style_container_layout_state_add(
+                  &sheet, row, turns[turn].width, 20, 0, 0)
+              && style_container_layout_state_add(
+                  &sheet, lone_row, turns[turn].width, 20, 0, 0));
+        for (size_t i = 0; i < RATIO_ID_COUNT; i++) {
+            ComputedStyle style = style_for_node(
+                &sheet, find_id(root, ids[i]), NULL);
+            uint32_t want = turns[turn].matched[i] ? 0xff0000u : 0x000000u;
+            if (style.color != want)
+                fprintf(stderr, "container %dx%d #%s=%06x, want %06x\n",
+                        turns[turn].width, turns[turn].height, ids[i],
+                        (unsigned) style.color, (unsigned) want);
+            CHECK(style.color == want);
+        }
+    }
+    /* Height alone flips orientation for an unchanged width: the measured
+       geometry, and so the relayout signature, must carry it. */
+    CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+          && style_container_layout_state_add(&sheet, box, 300, 100, 0, 0));
+    uint64_t landscape = style_container_layout_state_signature(&sheet);
+    CHECK(style_for_node(&sheet, find_id(root, "land"), NULL).color
+          == 0xff0000u);
+    CHECK(style_container_layout_state_begin(&sheet, &budget, 16)
+          && style_container_layout_state_add(&sheet, box, 300, 400, 0, 0));
+    CHECK(style_container_layout_state_signature(&sheet) != landscape);
+    CHECK(style_for_node(&sheet, find_id(root, "land"), NULL).color
+          == 0x000000u
+          && style_for_node(&sheet, find_id(root, "port"), NULL).color
+             == 0xff0000u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Shorthand components split at the top level only: a space inside rgb(),
+   calc() or color-mix() never ends a component, whether the value is
+   written inline or substituted through var(). Each spelling must compute
+   what its comma or plain-length sibling computes. */
+static int test_shorthand_top_level_components(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#o-rgb{outline:2px solid rgb(0 0 0 / 50%)}"
+        "#o-rgb-var{--c:rgb(0 0 0 / 50%);outline:2px solid var(--c)}"
+        "#o-rgb-ref{outline:2px solid rgba(0,0,0,0.5)}"
+        "#o-calc{outline:calc(1px + 1px) solid red}"
+        "#o-calc-var{--o:calc(1px + 1px) solid red;outline:var(--o)}"
+        "#o-calc-ref{outline:2px solid red}"
+        "#o-mix{outline:1px dashed color-mix(in srgb, red 50%, blue)}"
+        "#o-mix-ref{outline:1px dashed red;"
+        "outline-color:color-mix(in srgb, red 50%, blue)}"
+        "#r-calc{border-radius:calc(4px + 2px)}"
+        "#r-calc-ref{border-radius:6px}"
+        "#r-var{--r:calc(4px + 2px) 3px;border-radius:var(--r)}"
+        "#r-var-ref{border-radius:6px 3px}"
+        "</style><p id=plain>x</p>"
+        "<p id=o-rgb>x</p><p id=o-rgb-var>x</p><p id=o-rgb-ref>x</p>"
+        "<p id=o-calc>x</p><p id=o-calc-var>x</p><p id=o-calc-ref>x</p>"
+        "<p id=o-mix>x</p><p id=o-mix-ref>x</p>"
+        "<p id=r-calc>x</p><p id=r-calc-ref>x</p>"
+        "<p id=r-var>x</p><p id=r-var-ref>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle plain = style_for_node(&sheet, find_id(root, "plain"), NULL);
+    static const struct { const char *id, *reference; } outlines[] = {
+        {"o-rgb", "o-rgb-ref"}, {"o-rgb-var", "o-rgb-ref"},
+        {"o-calc", "o-calc-ref"}, {"o-calc-var", "o-calc-ref"},
+        {"o-mix", "o-mix-ref"},
+    };
+    for (size_t i = 0; i < sizeof(outlines) / sizeof(outlines[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, outlines[i].id), NULL);
+        ComputedStyle b = style_for_node(
+            &sheet, find_id(root, outlines[i].reference), NULL);
+        if (a.outline_state != b.outline_state
+            || a.outline_color != b.outline_color
+            || a.outline_alpha != b.outline_alpha)
+            fprintf(stderr, "#%s outline %04x %06x/%u, want %04x %06x/%u\n",
+                    outlines[i].id, a.outline_state,
+                    (unsigned) a.outline_color, (unsigned) a.outline_alpha,
+                    b.outline_state, (unsigned) b.outline_color,
+                    (unsigned) b.outline_alpha);
+        CHECK(b.outline_state != plain.outline_state
+              && a.outline_state == b.outline_state
+              && a.outline_color == b.outline_color
+              && a.outline_alpha == b.outline_alpha);
+    }
+    static const struct { const char *id, *reference; } radii[] = {
+        {"r-calc", "r-calc-ref"}, {"r-var", "r-var-ref"},
+    };
+    for (size_t i = 0; i < sizeof(radii) / sizeof(radii[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, radii[i].id), NULL);
+        ComputedStyle b = style_for_node(
+            &sheet, find_id(root, radii[i].reference), NULL);
+        if (a.border_radius != b.border_radius)
+            fprintf(stderr, "#%s border-radius %d, want %d\n",
+                    radii[i].id, a.border_radius, b.border_radius);
+        CHECK(b.border_radius != plain.border_radius
+              && a.border_radius == b.border_radius);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The four-edge shorthands take one to four components (border-radius
+   takes one to four radii, gap one or two lengths). One more makes the
+   whole declaration invalid, so the earlier declaration in the same rule
+   survives, exactly as if the invalid one were absent. */
+static int test_box_shorthand_component_limits(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "p{margin:7px;padding:7px;inset:7px;border-width:7px;"
+        "border-color:red;border-style:dashed;border-radius:7px;gap:7px}"
+        "#margin{margin:1px 2px 3px 4px 5px}"
+        "#margin-auto{margin:auto auto auto auto auto}"
+        "#margin-var{--m:1px 2px 3px 4px 5px;margin:var(--m)}"
+        "#padding{padding:1px 2px 3px 4px 5px}"
+        "#inset{inset:1px 2px 3px 4px 5px}"
+        "#border-width{border-width:1px 2px 3px 4px 5px}"
+        "#border-color{border-color:blue blue blue blue blue}"
+        "#border-style{border-style:solid solid solid solid solid}"
+        "#border-radius{border-radius:1px 2px 3px 4px 5px}"
+        "#gap{gap:1px 2px 3px}"
+        "#margin-four{margin:1px 2px 3px 4px}"
+        "</style><p id=plain>x</p><p id=margin>x</p><p id=margin-auto>x</p>"
+        "<p id=margin-var>x</p><p id=padding>x</p><p id=inset>x</p>"
+        "<p id=border-width>x</p><p id=border-color>x</p>"
+        "<p id=border-style>x</p><p id=border-radius>x</p><p id=gap>x</p>"
+        "<p id=margin-four>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle plain = style_for_node(&sheet, find_id(root, "plain"), NULL);
+    CHECK(plain.margin.top == 7 && plain.margin.left == 7
+          && !plain.margin_left_auto && plain.padding.right == 7
+          && plain.top == 7 && plain.left == 7 && plain.border.bottom == 7
+          && plain.border_radius == 7 && plain.gap == 7);
+    static const char *const invalid[] = {
+        "margin", "margin-auto", "margin-var", "padding", "inset",
+        "border-width", "border-color", "border-style", "border-radius",
+        "gap",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, invalid[i]), NULL);
+        bool same_lines = true;
+        for (unsigned side = 0; side < STYLE_BORDER_SIDE_COUNT; side++) {
+            same_lines &= computed_style_border_line(
+                &a, (StyleBorderSide) side) == computed_style_border_line(
+                &plain, (StyleBorderSide) side);
+        }
+        bool same = memcmp(&a.margin, &plain.margin, sizeof(a.margin)) == 0
+            && a.margin_top_auto == plain.margin_top_auto
+            && a.margin_left_auto == plain.margin_left_auto
+            && memcmp(&a.padding, &plain.padding, sizeof(a.padding)) == 0
+            && a.top == plain.top && a.right == plain.right
+            && a.bottom == plain.bottom && a.left == plain.left
+            && memcmp(&a.border, &plain.border, sizeof(a.border)) == 0
+            && a.border_color == plain.border_color
+            && a.border_color_set == plain.border_color_set
+            && same_lines && a.border_radius == plain.border_radius
+            && a.gap == plain.gap && a.row_gap == plain.row_gap;
+        if (!same)
+            fprintf(stderr, "#%s: margin %d %d %d %d (auto %d), border %d "
+                    "%d %d %d, radius %d, gap %d/%d: declaration with too "
+                    "many components was not dropped\n", invalid[i],
+                    a.margin.top, a.margin.right, a.margin.bottom,
+                    a.margin.left, a.margin_left_auto, a.border.top,
+                    a.border.right, a.border.bottom, a.border.left,
+                    a.border_radius, a.row_gap, a.gap);
+        CHECK(same);
+    }
+    ComputedStyle four = style_for_node(
+        &sheet, find_id(root, "margin-four"), NULL);
+    CHECK(four.margin.top == 1 && four.margin.right == 2
+          && four.margin.bottom == 3 && four.margin.left == 4);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* transition-timing-function and the transition shorthand take only a
+   valid <easing-function>: cubic-bezier() with four numbers and both x
+   values in [0, 1], steps() with a positive integer (two or more for
+   jump-none) and an optional step position, and linear() with two or more
+   stops. An invalid one drops the declaration, so the earlier ease-out in
+   the same rule stays; a valid one serializes canonically. */
+static int test_transition_timing_function_grammar(void)
+{
+    static const struct { const char *value, *computed; } cases[] = {
+        {"EASE-IN", "ease-in"},
+        {"cubic-bezier(.2,.8,.2,1)", "cubic-bezier(0.2, 0.8, 0.2, 1)"},
+        {"cubic-bezier(0, -2, 1, 3)", "cubic-bezier(0, -2, 1, 3)"},
+        {"cubic-bezier(calc(0.5), 0, 1, 1)", "cubic-bezier(0.5, 0, 1, 1)"},
+        /* Math arguments take the range their literal forms take. */
+        {"steps(calc(12), end)", "steps(12, end)"},
+        {"steps(calc(6 * 2.2))", "steps(13)"},
+        {"cubic-bezier(0.3, calc(-12), 0.7, 1)",
+         "cubic-bezier(0.3, -12, 0.7, 1)"},
+        {"cubic-bezier(0.3, -12, 0.7, max(1, 25))",
+         "cubic-bezier(0.3, -12, 0.7, 25)"},
+        {"linear(0, calc(20 * 0.6) 50%, 1)", "linear(0, 12 50%, 1)"},
+        {"steps(calc(0))", NULL},
+        {"cubic-bezier(calc(1.5), 0, 0, 1)", NULL},
+        {"steps(4)", "steps(4)"},
+        {"steps(4, END)", "steps(4, end)"},
+        {"steps(+3,jump-both)", "steps(3, jump-both)"},
+        {"steps(2, jump-none)", "steps(2, jump-none)"},
+        {"linear(0, .25 50%, 1)", "linear(0, 0.25 50%, 1)"},
+        {"linear(0, 25% 75% .5, 1)", "linear(0, 25% 75% 0.5, 1)"},
+        {"steps(foo)", NULL},
+        {"steps(\")\" 1s)", NULL},
+        {"cubic-bezier(a,b,c,d)", NULL},
+        {"cubic-bezier(1.5, 0, 0, 1)", NULL},
+        {"cubic-bezier(0, 0, -0.1, 1)", NULL},
+        {"cubic-bezier(0, 0, 1)", NULL},
+        {"cubic-bezier(0, 0, 1, 1, 1)", NULL},
+        {"cubic-bezier(0, 0, 1, 0x1)", NULL},
+        {"cubic-bezier(0, 0, 1, 1.)", NULL},
+        {"steps()", NULL},
+        {"steps(0)", NULL},
+        {"steps(-1)", NULL},
+        {"steps(1.5)", NULL},
+        {"steps(1, jump-none)", NULL},
+        {"steps(2, middle)", NULL},
+        {"steps(2, end, end)", NULL},
+        {"steps(2,)", NULL},
+        {"steps(1)x)", NULL},
+        {"linear()", NULL},
+        {"linear(1)", NULL},
+        {"linear(0, x, 1)", NULL},
+        {"linear(0, 50% 1 25%, 1)", NULL},
+        {"linear(0, 1 2, 1)", NULL},
+        {"bounce", NULL},
+    };
+    enum { CASES = sizeof(cases) / sizeof(cases[0]) };
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char page[16384];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>"
+        "#var{--e:steps(foo);transition-timing-function:var(--e)}");
+    for (size_t i = 0; i < CASES; i++) {
+        int written = snprintf(page + used, sizeof(page) - used,
+            "#l%zu{transition-timing-function:ease-out;"
+            "transition-timing-function:%s}"
+            "#s%zu{transition:opacity 1s ease-out;"
+            "transition:opacity 1s %s}", i, cases[i].value, i,
+            cases[i].value);
+        CHECK(written > 0 && (size_t) written < sizeof(page) - used);
+        used += (size_t) written;
+    }
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</style><p id=var>x</p>");
+    for (size_t i = 0; i < CASES; i++) {
+        int written = snprintf(page + used, sizeof(page) - used,
+                               "<p id=l%zu>x</p><p id=s%zu>x</p>", i, i);
+        CHECK(written > 0 && (size_t) written < sizeof(page) - used);
+        used += (size_t) written;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, page, used, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    StyleTransitionComputed computed;
+    CHECK(style_transition_computed(&sheet, find_id(root, "var"),
+                                    PSEUDO_NONE, &computed)
+          && strcmp(style_transition_timing(&computed, 0), "ease") == 0);
+    for (size_t i = 0; i < CASES; i++) {
+        const char *expected = cases[i].computed != NULL
+            ? cases[i].computed : "ease-out";
+        for (unsigned shorthand = 0; shorthand < 2u; shorthand++) {
+            char id[16];
+            snprintf(id, sizeof(id), "%c%zu", shorthand ? 's' : 'l', i);
+            CHECK(style_transition_computed(&sheet, find_id(root, id),
+                                            PSEUDO_NONE, &computed));
+            const char *timing = style_transition_timing(&computed, 0);
+            if (strcmp(timing, expected) != 0)
+                fprintf(stderr, "%s: %s computed \"%s\", want \"%s\"\n",
+                        shorthand ? "transition" : "transition-timing-function",
+                        cases[i].value, timing, expected);
+            CHECK(strcmp(timing, expected) == 0);
+        }
+        char direct[STYLE_TIMING_FUNCTION_CAPACITY];
+        CHECK(style_timing_function(cases[i].value, strlen(cases[i].value),
+                                    direct, sizeof(direct))
+              == (cases[i].computed != NULL));
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Writes linear(0, ..., 1) with `stops` stops in all into `output`,
+   serialized as the computed value is or, when `compact`, in the shortest
+   authored form (",.0169 1.69%"); its length. */
+static size_t long_linear_easing(char *output, size_t size, unsigned stops,
+                                 double step, bool compact)
+{
+    size_t used = (size_t) snprintf(output, size, "linear(0");
+    for (unsigned i = 1; i + 1u < stops && used < size; i++) {
+        char number[32];
+        snprintf(number, sizeof(number), "%g", i * step);
+        used += (size_t) snprintf(output + used, size - used, "%s%s %g%%",
+                                  compact ? "," : ", ",
+                                  compact && number[0] == '0'
+                                      ? number + 1 : number,
+                                  i * step * 100.0);
+    }
+    if (used < size)
+        used += (size_t) snprintf(output + used, size - used, ", 1)");
+    return used;
+}
+
+/* A linear() of many stops is a valid timing item: up to
+   STYLE_TIMING_FUNCTION_CAPACITY bytes serialized in one item, and up to
+   STYLE_TIMING_LIST_TEXT_CAPACITY across a list, in the longhand, the
+   shorthand and the style attribute. A longer one, or a list past the
+   shared text (three such items), is rejected like an invalid value, so
+   the earlier declaration stays. */
+static int test_transition_long_linear_easing(void)
+{
+    static char easing[1024], over[2048], third[1024], compact[1024];
+    static char page[16384];
+    size_t easing_length = long_linear_easing(easing, sizeof(easing), 60,
+                                              0.0169, false);
+    size_t over_length = long_linear_easing(over, sizeof(over), 100,
+                                            0.0101, false);
+    /* Three of these overflow the list's shared text, while their
+       compact authored form still fits the retained value limit. */
+    size_t third_length = long_linear_easing(third, sizeof(third), 50,
+                                             0.0199, false);
+    size_t compact_length = long_linear_easing(compact, sizeof(compact),
+                                               50, 0.0199, true);
+    CHECK(easing_length > 512u
+          && easing_length < STYLE_TIMING_FUNCTION_CAPACITY
+          && over_length >= STYLE_TIMING_FUNCTION_CAPACITY
+          && over_length < sizeof(over) - 1u
+          && 3u * (third_length + 1u) > STYLE_TIMING_LIST_TEXT_CAPACITY
+          && 3u * compact_length + 40u < STYLE_TRANSITION_VALUE_CAPACITY);
+    char direct[STYLE_TIMING_FUNCTION_CAPACITY];
+    CHECK(style_timing_function(easing, easing_length, direct,
+                                sizeof(direct))
+          && strcmp(direct, easing) == 0
+          && !style_timing_function(over, over_length, direct,
+                                    sizeof(direct)));
+    int written = snprintf(page, sizeof(page),
+        "<!doctype html><style>"
+        "#l{transition-timing-function:ease-out;"
+        "transition-timing-function:%s}"
+        "#s{transition:color 3s ease-in;transition:opacity 1s %s}"
+        "#two{transition:opacity 1s %s,top 2s %s}"
+        "#three{transition:color 3s ease-in;"
+        "transition:opacity 1s %s,top 2s %s,left 3s %s}"
+        "#over{transition-timing-function:ease-out;"
+        "transition-timing-function:%s}"
+        "</style><p id=l>x</p><p id=s>x</p><p id=two>x</p>"
+        "<p id=three>x</p><p id=over>x</p>"
+        "<p id=inline style='transition:opacity 1s %s'>x</p>",
+        easing, easing, easing, easing, compact, compact, compact, over,
+        easing);
+    CHECK(written > 0 && (size_t) written < sizeof(page));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, page, (size_t) written, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const struct {
+        const char *id;
+        unsigned count;
+        const char *timing; /* NULL: the long easing */
+        double duration_ms;
+    } cases[] = {
+        {"l", 1, NULL, 0.0}, {"s", 1, NULL, 1000.0},
+        {"two", 2, NULL, 1000.0}, {"three", 1, "ease-in", 3000.0},
+        {"over", 1, "ease-out", 0.0}, {"inline", 1, NULL, 1000.0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        StyleTransitionComputed computed;
+        CHECK(style_transition_computed(&sheet, find_id(root, cases[i].id),
+                                        PSEUDO_NONE, &computed));
+        bool ok = computed.timing_count == cases[i].count
+            && computed.duration_ms[0] == cases[i].duration_ms;
+        for (unsigned item = 0; ok && item < cases[i].count; item++)
+            ok = strcmp(style_transition_timing(&computed, item),
+                        cases[i].timing != NULL ? cases[i].timing : easing)
+                == 0;
+        if (!ok)
+            fprintf(stderr, "#%s: %u timings, %g ms, first \"%.40s\"\n",
+                    cases[i].id, computed.timing_count,
+                    computed.duration_ms[0],
+                    style_transition_timing(&computed, 0));
+        CHECK(ok);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* style_transition_computed_untimed() gives the property, duration and
+   delay lists style_transition_computed() gives, whichever rules win which
+   longhands, without the easings: validated sheet easings are only
+   recognized, while style-attribute and var() values still validate theirs
+   (an invalid one drops the whole declaration in both). */
+static int test_transition_untimed_matches_full(void)
+{
+    static char easing[1024];
+    static char page[8192];
+    (void) long_linear_easing(easing, sizeof(easing), 60, 0.0169, false);
+    int written = snprintf(page, sizeof(page),
+        "<!doctype html><style>"
+        "#long{transition:transform .4s %s}"
+        "#split{transition:opacity 1s %s .2s;transition-duration:3s}"
+        "#late{transition-property:top;transition:color 2s ease-in 1s}"
+        "#word{transition:linear 1s}"
+        "#list{transition:opacity 1s linear(0, .5, 1),"
+        "transform 2s steps(2, jump-none) .5s, top 3s allow-discrete}"
+        "#timing{transition-timing-function:%s;transition-delay:4s}"
+        "#varbad{--e:steps(foo);transition:opacity 2s var(--e)}"
+        "#vargood{--e:ease-in;transition:top 3s var(--e) 1s}"
+        "#wide{transition:inherit}"
+        "</style>"
+        "<p id=long>x</p><p id=split>x</p><p id=late>x</p><p id=word>x</p>"
+        "<p id=list>x</p><p id=timing>x</p><p id=varbad>x</p>"
+        "<p id=vargood>x</p><p id=wide>x</p>"
+        "<p id=attrbad style='transition:opacity 5s steps(foo)'>x</p>"
+        "<p id=attrgood style='transition:opacity 5s cubic-bezier(0,0,1,9)'>"
+        "x</p><p id=none>x</p>",
+        easing, easing, easing);
+    CHECK(written > 0 && (size_t) written < sizeof(page));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, page, (size_t) written, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const struct { const char *id; double duration_ms; } cases[] = {
+        {"long", 400.0}, {"split", 3000.0}, {"late", 2000.0},
+        {"word", 1000.0}, {"list", 1000.0}, {"timing", 0.0},
+        {"varbad", 0.0}, {"vargood", 3000.0}, {"wide", 0.0},
+        {"attrbad", 0.0}, {"attrgood", 5000.0}, {"none", 0.0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        lxb_dom_node_t *node = find_id(root, cases[i].id);
+        StyleTransitionComputed full, untimed;
+        CHECK(style_transition_computed(&sheet, node, PSEUDO_NONE, &full)
+              && style_transition_computed_untimed(&sheet, node, PSEUDO_NONE,
+                                                   &untimed));
+        bool ok = full.property_count == untimed.property_count
+            && full.duration_count == untimed.duration_count
+            && full.delay_count == untimed.delay_count
+            && full.duration_ms[0] == cases[i].duration_ms
+            && untimed.timing_count == 1
+            && strcmp(style_transition_timing(&untimed, 0), "ease") == 0;
+        for (unsigned item = 0; ok && item < full.property_count; item++)
+            ok = strcmp(full.properties[item], untimed.properties[item]) == 0;
+        for (unsigned item = 0; ok && item < full.duration_count; item++)
+            ok = full.duration_ms[item] == untimed.duration_ms[item];
+        for (unsigned item = 0; ok && item < full.delay_count; item++)
+            ok = full.delay_ms[item] == untimed.delay_ms[item];
+        if (!ok)
+            fprintf(stderr, "#%s: full %u/%s/%g ms, untimed %u/%s/%g ms\n",
+                    cases[i].id, full.property_count, full.properties[0],
+                    full.duration_ms[0], untimed.property_count,
+                    untimed.properties[0], untimed.duration_ms[0]);
+        CHECK(ok);
+    }
+    /* The full form still serializes the winners' easings. */
+    StyleTransitionComputed list;
+    CHECK(style_transition_computed(&sheet, find_id(root, "list"),
+                                    PSEUDO_NONE, &list)
+          && list.timing_count == 3 && list.property_count == 3
+          && strcmp(list.properties[2], "top") == 0
+          && strcmp(style_transition_timing(&list, 0), "linear(0, 0.5, 1)")
+              == 0
+          && strcmp(style_transition_timing(&list, 1),
+                    "steps(2, jump-none)") == 0
+          && strcmp(style_transition_timing(&list, 2), "ease") == 0
+          && list.delay_ms[1] == 500.0);
+    StyleTransitionComputed split;
+    CHECK(style_transition_computed(&sheet, find_id(root, "split"),
+                                    PSEUDO_NONE, &split)
+          && strcmp(style_transition_timing(&split, 0), easing) == 0
+          && split.delay_ms[0] == 200.0 && split.duration_ms[0] == 3000.0);
+    StyleTransitionComputed word;
+    CHECK(style_transition_computed(&sheet, find_id(root, "word"),
+                                    PSEUDO_NONE, &word)
+          && strcmp(word.properties[0], "all") == 0
+          && strcmp(style_transition_timing(&word, 0), "linear") == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Two maximal linear() items (each STYLE_TIMING_FUNCTION_CAPACITY bytes
+   serialized with its NUL) fit one timing list beside the initial "ease"
+   it always keeps. */
+static int test_transition_two_maximal_linear_easings(void)
+{
+    /* Serialized: "linear(0" + 109 x ", 0.5 50%" + 3 x ", 0.25 50%"
+       + ", 1)" = 1023 bytes. Authored compactly to stay well inside the
+       retained value limit. */
+    static char authored[1024], expected[1024], page[4096];
+    size_t authored_used = (size_t) snprintf(authored, sizeof(authored),
+                                             "linear(0");
+    size_t expected_used = (size_t) snprintf(expected, sizeof(expected),
+                                             "linear(0");
+    for (unsigned i = 0; i < 112u; i++) {
+        bool quarter = i < 3u;
+        authored_used += (size_t) snprintf(
+            authored + authored_used, sizeof(authored) - authored_used,
+            quarter ? ",.25 50%%" : ",.5 50%%");
+        expected_used += (size_t) snprintf(
+            expected + expected_used, sizeof(expected) - expected_used,
+            quarter ? ", 0.25 50%%" : ", 0.5 50%%");
+    }
+    authored_used += (size_t) snprintf(authored + authored_used,
+                                       sizeof(authored) - authored_used,
+                                       ",1)");
+    expected_used += (size_t) snprintf(expected + expected_used,
+                                       sizeof(expected) - expected_used,
+                                       ", 1)");
+    CHECK(expected_used + 1u == STYLE_TIMING_FUNCTION_CAPACITY);
+    char direct[STYLE_TIMING_FUNCTION_CAPACITY];
+    CHECK(style_timing_function(authored, authored_used, direct,
+                                sizeof(direct))
+          && strcmp(direct, expected) == 0);
+    int written = snprintf(page, sizeof(page),
+        "<!doctype html><style>"
+        "#two{transition-timing-function:ease-out;"
+        "transition-timing-function:%s,%s}"
+        "</style><p id=two>x</p>", authored, authored);
+    CHECK(written > 0 && (size_t) written < sizeof(page));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, page, (size_t) written, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    StyleTransitionComputed computed;
+    CHECK(style_transition_computed(&sheet, find_id(root, "two"),
+                                    PSEUDO_NONE, &computed));
+    bool ok = computed.timing_count == 2
+        && strcmp(style_transition_timing(&computed, 0), expected) == 0
+        && strcmp(style_transition_timing(&computed, 1), expected) == 0;
+    if (!ok)
+        fprintf(stderr, "two maximal easings: %u timings, first \"%.20s\"\n",
+                computed.timing_count, style_transition_timing(&computed, 0));
+    CHECK(ok);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* minmax(<inflexible-breadth>, <track-breadth>) rejects a floor or a
+   ceiling outside its grammar instead of reading a garbage floor as 0:
+   the track is invalid, and so is the declaration holding it. */
+static int test_grid_minmax_arguments(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#bad{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:minmax(foo, 1fr) 1fr}"
+        "#good{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:minmax(40px, 1fr) 1fr}"
+        "#mixed{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:repeat(2, minmax(calc(50% - 1rem), 1fr))}"
+        "#pair{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:minmax(min(100%, 20rem), 1fr) 1fr}"
+        "#fill{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:"
+        "repeat(auto-fill, minmax(min(100%, 20rem), 1fr))}"
+        "#upper{display:grid;grid-template-columns:100px 100px;"
+        "grid-template-columns:minmax(AUTO, 1fr) 1fr}"
+        "</style><div id=bad>x</div><div id=good>x</div>"
+        "<div id=mixed>x</div><div id=pair>x</div><div id=fill>x</div>"
+        "<div id=upper>x</div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    static const struct {
+        const char *text;
+        bool valid;
+        uint8_t type;
+        unsigned value, minimum;
+    } tracks[] = {
+        {"minmax(100px, 1fr)", true, GRID_TRACK_FLEX, 1000, 100},
+        {"minmax( auto ,1fr )", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(0, 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(min-content, 200px)", true, GRID_TRACK_FIXED, 200, 0},
+        {"minmax(10%, 2fr)", true, GRID_TRACK_FLEX, 2000, 0},
+        {"minmax(max(10px, 5px), 1fr)", true, GRID_TRACK_FLEX, 1000, 10},
+        /* A floor mixing a percentage with a length is a valid
+           <length-percentage>; like a percentage it leaves the pixel
+           minimum 0. */
+        {"minmax(calc(50% - 1rem), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(min(100%, 20rem), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(max(100px, 20%), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(clamp(10px, 5%, 2rem), 3fr)", true, GRID_TRACK_FLEX, 3000,
+         0},
+        {"minmax(AUTO, 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(Min-Content, 200px)", true, GRID_TRACK_FIXED, 200, 0},
+        {"minmax(MAX-CONTENT, 2fr)", true, GRID_TRACK_FLEX, 2000, 0},
+        {"minmax(calc(50% - foo), 1fr)", false, 0, 0, 0},
+        {"minmax(min(100%, 2fr), 1fr)", false, 0, 0, 0},
+        {"minmax(foo, 1fr)", false, 0, 0, 0},
+        {"minmax(1fr, 100px)", false, 0, 0, 0},
+        {"minmax(-5px, 1fr)", false, 0, 0, 0},
+        {"minmax(, 1fr)", false, 0, 0, 0},
+        {"minmax(10px)", false, 0, 0, 0},
+        {"minmax(1px, 2px, 3px)", false, 0, 0, 0},
+        {"minmax(10px, bar)", false, 0, 0, 0},
+        {"minmax(10px, minmax(1px, 2px))", false, 0, 0, 0},
+        {"minmax(10px, fit-content(5px))", false, 0, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(tracks) / sizeof(tracks[0]); i++) {
+        uint8_t type = 0;
+        unsigned value = 0, minimum = 0;
+        bool valid = style_parse_grid_track(
+            &sheet, tracks[i].text, strlen(tracks[i].text), &type, &value,
+            &minimum);
+        bool ok = valid == tracks[i].valid
+            && (!valid || (type == tracks[i].type
+                           && value == tracks[i].value
+                           && minimum == tracks[i].minimum));
+        if (!ok)
+            fprintf(stderr, "%s: %s type %u value %u minimum %u\n",
+                    tracks[i].text, valid ? "accepted" : "rejected",
+                    type, value, minimum);
+        CHECK(ok);
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle bad = style_for_node(&sheet, find_id(root, "bad"), NULL);
+    ComputedStyle good = style_for_node(&sheet, find_id(root, "good"), NULL);
+    CHECK(stylesheet_grid_track_type(&sheet, &bad, false, 0)
+              == GRID_TRACK_FIXED
+          && stylesheet_grid_track_value(&sheet, &bad, false, 0) == 100
+          && stylesheet_grid_track_type(&sheet, &good, false, 0)
+              == GRID_TRACK_FLEX
+          && stylesheet_grid_track_minimum(&sheet, &good, false, 0) == 40);
+    /* Mixed floors keep the declaration: the 100px template is replaced. */
+    static const char *const replaced[] = {"mixed", "pair", "upper"};
+    for (size_t i = 0; i < sizeof(replaced) / sizeof(replaced[0]); i++) {
+        ComputedStyle style =
+            style_for_node(&sheet, find_id(root, replaced[i]), NULL);
+        bool ok = stylesheet_grid_track_count(&sheet, &style, false) == 2
+            && stylesheet_grid_track_type(&sheet, &style, false, 0)
+                == GRID_TRACK_FLEX
+            && stylesheet_grid_track_value(&sheet, &style, false, 0) == 1000
+            && stylesheet_grid_track_minimum(&sheet, &style, false, 0) == 0;
+        if (!ok) fprintf(stderr, "#%s lost its grid template\n", replaced[i]);
+        CHECK(ok);
+    }
+    ComputedStyle upper = style_for_node(&sheet, find_id(root, "upper"), NULL);
+    CHECK(stylesheet_grid_track_automatic_minimum(&sheet, &upper, false, 0));
+    /* repeat(auto-fill, ...) leaves no explicit tracks: the 100px pair is
+       gone, and the auto-fill column count (0) is what survives. */
+    ComputedStyle fill = style_for_node(&sheet, find_id(root, "fill"), NULL);
+    CHECK(stylesheet_grid_track_count(&sheet, &fill, false) == 0
+          && computed_style_grid_column_count(&fill) == 0
+          && computed_style_grid_column_template_id(&fill) == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* grid-auto-rows/columns take a <track-size>+ list. Two tracks fit the
+   computed style; a third, or any invalid track, drops the declaration
+   instead of being ignored, and a list starting with whitespace (an empty
+   var() before it) still parses. A second track is always stored non-zero
+   (an auto one included), and one the packed field cannot hold drops the
+   declaration rather than being clamped. */
+static int test_grid_auto_track_lists(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#three{grid-auto-rows:7px;grid-auto-rows:10px 20px 30px;"
+        "grid-auto-columns:7px;grid-auto-columns:10px 20px 30px}"
+        "#bad{grid-auto-rows:7px;grid-auto-rows:10px foo;"
+        "grid-auto-columns:7px;grid-auto-columns:10px foo}"
+        "#two{grid-auto-rows:10px 20px;grid-auto-columns:1fr 30px}"
+        "#lead{--empty: ;grid-auto-rows:var(--empty) 10px 20px;"
+        "grid-auto-columns:var(--empty) 15px}"
+        "#auto{grid-auto-rows:100px auto;grid-auto-columns:1fr min-content}"
+        "#zero{grid-auto-rows:10px 0px;grid-auto-columns:10px 0fr}"
+        "#fit{grid-auto-rows:7px;grid-auto-rows:auto fit-content(200px);"
+        "grid-auto-columns:7px;grid-auto-columns:10px fit-content(5px)}"
+        "#wide{grid-auto-rows:7px;grid-auto-rows:10px 17fr;"
+        "grid-auto-columns:7px;grid-auto-columns:10px 164%}"
+        "#edge{grid-auto-rows:10px 16383px;grid-auto-columns:10px 163.83%}"
+        "#over{grid-auto-rows:7px;grid-auto-rows:10px 16384px;"
+        "grid-auto-columns:7px;grid-auto-columns:10px 16.384fr}"
+        "#alt{display:grid;grid-auto-flow:column;grid-auto-columns:100px auto;"
+        "justify-content:start}"
+        "#alt>i{display:block;width:20px;height:5px}"
+        "</style><div id=three>x</div><div id=bad>x</div>"
+        "<div id=two>x</div><div id=lead>x</div><div id=auto>x</div>"
+        "<div id=zero>x</div><div id=fit>x</div><div id=wide>x</div>"
+        "<div id=edge>x</div><div id=over>x</div>"
+        "<div id=alt><i id=c0></i><i id=c1></i><i id=c2></i></div>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const struct {
+        const char *id;
+        uint16_t row_type, row_value, row_second;
+        uint16_t column_type, column_value, column_second;
+    } expected[] = {
+        {"three", GRID_TRACK_FIXED, 7, 0, GRID_TRACK_FIXED, 7, 0},
+        {"bad", GRID_TRACK_FIXED, 7, 0, GRID_TRACK_FIXED, 7, 0},
+        {"two", GRID_TRACK_FIXED, 10, (GRID_TRACK_FIXED << 14) | 20,
+         GRID_TRACK_FLEX, 1000, (GRID_TRACK_FIXED << 14) | 30},
+        {"lead", GRID_TRACK_FIXED, 10, (GRID_TRACK_FIXED << 14) | 20,
+         GRID_TRACK_FIXED, 15, 0},
+        /* An auto second track is present (non-zero) and decodes back to
+           auto; so does a zero-sized fixed or flexible one. */
+        {"auto", GRID_TRACK_FIXED, 100, GRID_TRACK_AUTO_VALUE + 1u,
+         GRID_TRACK_FLEX, 1000, GRID_TRACK_MIN_CONTENT_VALUE + 1u},
+        {"zero", GRID_TRACK_FIXED, 10, GRID_TRACK_FIXED << 14,
+         GRID_TRACK_FIXED, 10, GRID_TRACK_FLEX << 14},
+        /* A second track the 14-bit packing cannot hold drops the list. */
+        {"fit", GRID_TRACK_FIXED, 7, 0, GRID_TRACK_FIXED, 7, 0},
+        {"wide", GRID_TRACK_FIXED, 7, 0, GRID_TRACK_FIXED, 7, 0},
+        {"edge", GRID_TRACK_FIXED, 10, (GRID_TRACK_FIXED << 14) | 16383,
+         GRID_TRACK_FIXED, 10, (GRID_TRACK_PERCENT << 14) | 16383},
+        {"over", GRID_TRACK_FIXED, 7, 0, GRID_TRACK_FIXED, 7, 0},
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        ComputedStyle style = style_for_node(
+            &sheet, find_id(root, expected[i].id), NULL);
+        bool ok = style.grid_auto_row_type == expected[i].row_type
+            && style.grid_auto_row_value == expected[i].row_value
+            && style.grid_auto_row_second == expected[i].row_second
+            && style.grid_auto_column_type == expected[i].column_type
+            && style.grid_auto_column_value == expected[i].column_value
+            && style.grid_auto_column_second == expected[i].column_second;
+        if (!ok)
+            fprintf(stderr, "#%s rows %u/%u/%04x columns %u/%u/%04x\n",
+                    expected[i].id, style.grid_auto_row_type,
+                    style.grid_auto_row_value, style.grid_auto_row_second,
+                    style.grid_auto_column_type, style.grid_auto_column_value,
+                    style.grid_auto_column_second);
+        CHECK(ok);
+    }
+    ComputedStyle autos = style_for_node(&sheet, find_id(root, "auto"), NULL);
+    CHECK(grid_auto_second_type(autos.grid_auto_row_second) == GRID_TRACK_AUTO
+          && grid_auto_second_value(autos.grid_auto_row_second)
+              == GRID_TRACK_AUTO_VALUE
+          && grid_auto_second_type(autos.grid_auto_column_second)
+              == GRID_TRACK_AUTO
+          && grid_auto_second_value(autos.grid_auto_column_second)
+              == GRID_TRACK_MIN_CONTENT_VALUE);
+    /* Implicit columns alternate 100px and auto: the auto column fits its
+       20px item instead of repeating 100px. */
+    LayoutDocument layout = {0};
+    CHECK(layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    const LayoutNodeBox *grid = layout_box_for_node(
+        &layout, find_id(root, "alt"));
+    const LayoutNodeBox *c1 = layout_box_for_node(&layout, find_id(root, "c1"));
+    const LayoutNodeBox *c2 = layout_box_for_node(&layout, find_id(root, "c2"));
+    if (grid == NULL || c1 == NULL || c2 == NULL
+        || c1->x != grid->x + 100 || c2->x != grid->x + 120)
+        fprintf(stderr, "alternating columns: c1 %d c2 %d, grid %d\n",
+                c1 != NULL ? c1->x : -1, c2 != NULL ? c2->x : -1,
+                grid != NULL ? grid->x : -1);
+    CHECK(grid != NULL && c1 != NULL && c2 != NULL
+          && c1->x == grid->x + 100 && c2->x == grid->x + 120);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The two length parsers (parse_style_length, which compiles math into a
+   StyleLength, and style_parse_length, which resolves to pixels at once)
+   agree on what a length is: a bare parenthesized value or a top-level
+   expression is not one, a parenthesized term inside a math function is,
+   and env() resolves (the safe-area insets to 0, any other name to its
+   fallback). Declarations that use either parser drop such a value. */
+static int test_length_parsers_agree(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#paren{margin-top:7px;margin-top:(10px);"
+        "padding-top:7px;padding-top:(10px)}"
+        "#env{margin-top:env(unknown, 9px);padding-top:env(unknown, 9px)}"
+        "</style><p id=paren>x</p><p id=env>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    static const struct { const char *text; int pixels; } cases[] = {
+        {"1px", 1},
+        {"calc((1px + 2px) * 2)", 6},
+        {"calc(1px + (2px))", 3},
+        {"min((1px), 2px)", 1},
+        {"env(x, 1px)", 1},
+        {"ENV(x,4px)", 4},
+        {"calc(env(x, 3px) + 1px)", 4},
+        {"env(safe-area-inset-top)", 0},
+        {"env(safe-area-inset-left, 5px)", 0},
+        {"(1px)", INT_MIN},
+        {"(10px)", INT_MIN},
+        {"((1px))", INT_MIN},
+        {"1px + 2px", INT_MIN},
+        {"-(1px)", INT_MIN},
+        {"env(x)", INT_MIN},
+        {"env()", INT_MIN},
+        {"env(x 1px)", INT_MIN},
+        {"env(safe-area-inset-top, foo)", INT_MIN},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *text = cases[i].text;
+        StyleLength compiled = 0;
+        bool compiled_ok = parse_style_length(&sheet, text, strlen(text),
+                                              &compiled, NULL);
+        int resolved = style_parse_length(&sheet, text, strlen(text),
+                                          INT_MIN, NULL);
+        bool ok = cases[i].pixels == INT_MIN
+            ? !compiled_ok && resolved == INT_MIN
+            : compiled_ok && compiled == cases[i].pixels
+              && resolved == cases[i].pixels;
+        if (!ok)
+            fprintf(stderr, "%s: parse_style_length %s %d, "
+                    "style_parse_length %d, want %d\n", text,
+                    compiled_ok ? "accepted" : "rejected", (int) compiled,
+                    resolved, cases[i].pixels);
+        CHECK(ok);
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle paren = style_for_node(&sheet, find_id(root, "paren"), NULL);
+    ComputedStyle env = style_for_node(&sheet, find_id(root, "env"), NULL);
+    if (paren.margin.top != 7 || paren.padding.top != 7
+        || env.margin.top != 9 || env.padding.top != 9)
+        fprintf(stderr, "(10px) margin %d padding %d; env() margin %d "
+                "padding %d\n", paren.margin.top, paren.padding.top,
+                env.margin.top, env.padding.top);
+    CHECK(paren.margin.top == 7 && paren.padding.top == 7
+          && env.margin.top == 9 && env.padding.top == 9);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Mask and background layers share one component scanner, so a
+   backslash-escaped quote inside url() is part of the URL in a mask as it
+   already was in a background: the position and size after it still
+   apply, as they do for the same layer without the escape. */
+static int test_layer_components_skip_escapes(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#escaped{mask:url(\"a\\\"b.png\") center / 5px no-repeat}"
+        "#plain{mask:url(\"ab.png\") center / 5px no-repeat}"
+        "#bare{-webkit-mask:url(a\\\"b.png) left 25% / 6px}"
+        "#bare-ref{-webkit-mask:url(ab.png) left 25% / 6px}"
+        "</style><p id=escaped>x</p><p id=plain>x</p>"
+        "<p id=bare>x</p><p id=bare-ref>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const struct { const char *id, *reference; } pairs[] = {
+        {"escaped", "plain"}, {"bare", "bare-ref"},
+    };
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, pairs[i].id), NULL);
+        ComputedStyle b = style_for_node(
+            &sheet, find_id(root, pairs[i].reference), NULL);
+        StylePaintStack sa = style_paint_stack_copy(&sheet, &a);
+        StylePaintStack sb = style_paint_stack_copy(&sheet, &b);
+        CHECK(sa.mask_count == 1 && sb.mask_count == 1
+              && sb.masks[0].width != 0);
+        const StylePaintLayer *la = &sa.masks[0], *lb = &sb.masks[0];
+        bool same = la->kind == lb->kind && la->width == lb->width
+            && la->height == lb->height && la->position_x == lb->position_x
+            && la->position_y == lb->position_y && la->fit == lb->fit
+            && la->flags == lb->flags
+            && la->position_edges == lb->position_edges;
+        if (!same)
+            fprintf(stderr, "#%s mask %ux%u at %d,%d flags %u, want %ux%u "
+                    "at %d,%d flags %u\n", pairs[i].id, la->width,
+                    la->height, la->position_x, la->position_y, la->flags,
+                    lb->width, lb->height, lb->position_x, lb->position_y,
+                    lb->flags);
+        CHECK(same);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* thin, medium and thick are <line-width> keywords wherever a line width
+   is accepted: in the outline and border shorthands as well as in
+   outline-width and border-width, inline or through var(), and in any
+   ASCII case. Every spelling computes what its pixel sibling computes,
+   and the longhands agree on the pixel value of each keyword. */
+static int test_line_width_keywords(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#o-thick{outline:thick solid red}"
+        "#o-thick-ref{outline:5px solid red}"
+        "#o-upper{outline:solid THICK red}"
+        "#o-var{--o:thin dashed blue;outline:var(--o)}"
+        "#o-var-ref{outline:1px dashed blue}"
+        "#b-thick{border:THICK solid red}"
+        "#b-thick-ref{border:5px solid red}"
+        "#b-side{border-left:Thin SOLID red}"
+        "#b-side-ref{border-left:1px solid red}"
+        "#b-var{--b:thick dotted red;border-top:var(--b)}"
+        "#b-var-ref{border-top:5px dotted red}"
+        "#w-thin{outline-width:thin;border-width:thin}"
+        "#w-medium{outline-width:medium;border-width:medium}"
+        "#w-thick{outline-width:THICK;border-width:thick}"
+        "#i-pair{border-inline-width:thick thin;border-block-width:medium}"
+        "#i-var{--i:thick thin;border-inline-width:var(--i)}"
+        "#i-pair-ref{border-width:3px 1px 3px 5px}"
+        "#i-var-ref{border-left-width:5px;border-right-width:1px}"
+        "#i-percent{border-width:2px;border-inline-width:10% 5px}"
+        "#i-percent-ref{border-width:2px}"
+        "</style><p id=plain>x</p>"
+        "<p id=o-thick>x</p><p id=o-thick-ref>x</p><p id=o-upper>x</p>"
+        "<p id=o-var>x</p><p id=o-var-ref>x</p>"
+        "<p id=b-thick>x</p><p id=b-thick-ref>x</p>"
+        "<p id=b-side>x</p><p id=b-side-ref>x</p>"
+        "<p id=b-var>x</p><p id=b-var-ref>x</p>"
+        "<p id=w-thin>x</p><p id=w-medium>x</p><p id=w-thick>x</p>"
+        "<p id=i-pair>x</p><p id=i-var>x</p><p id=i-pair-ref>x</p>"
+        "<p id=i-var-ref>x</p>"
+        "<p id=i-percent>x</p><p id=i-percent-ref>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle plain = style_for_node(&sheet, find_id(root, "plain"), NULL);
+    static const struct { const char *id, *reference; } pairs[] = {
+        {"o-thick", "o-thick-ref"}, {"o-upper", "o-thick-ref"},
+        {"o-var", "o-var-ref"}, {"b-thick", "b-thick-ref"},
+        {"b-side", "b-side-ref"}, {"b-var", "b-var-ref"},
+        {"i-pair", "i-pair-ref"}, {"i-var", "i-var-ref"},
+        {"i-percent", "i-percent-ref"},
+    };
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, pairs[i].id), NULL);
+        ComputedStyle b = style_for_node(
+            &sheet, find_id(root, pairs[i].reference), NULL);
+        bool same_lines = true, plain_lines = true;
+        for (unsigned side = 0; side < STYLE_BORDER_SIDE_COUNT; side++) {
+            unsigned line = computed_style_border_line(
+                &b, (StyleBorderSide) side);
+            same_lines &= computed_style_border_line(
+                &a, (StyleBorderSide) side) == line;
+            plain_lines &= computed_style_border_line(
+                &plain, (StyleBorderSide) side) == line;
+        }
+        bool same = a.outline_state == b.outline_state
+            && a.outline_color == b.outline_color
+            && memcmp(&a.border, &b.border, sizeof(a.border)) == 0
+            && a.border_color == b.border_color && same_lines;
+        if (!same)
+            fprintf(stderr, "#%s outline %04x border %d %d %d %d, "
+                    "want %04x border %d %d %d %d\n", pairs[i].id,
+                    a.outline_state, a.border.top, a.border.right,
+                    a.border.bottom, a.border.left, b.outline_state,
+                    b.border.top, b.border.right, b.border.bottom,
+                    b.border.left);
+        CHECK(same);
+        CHECK(b.outline_state != plain.outline_state || !plain_lines
+              || memcmp(&b.border, &plain.border, sizeof(b.border)) != 0);
+    }
+    static const struct { const char *id; int width; } widths[] = {
+        {"w-thin", 1}, {"w-medium", 3}, {"w-thick", 5},
+    };
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, widths[i].id), NULL);
+        if ((int) computed_style_outline_width(&a) != widths[i].width
+            || a.border.top != widths[i].width
+            || a.border.left != widths[i].width)
+            fprintf(stderr, "#%s outline-width %u border-width %d, want %d\n",
+                    widths[i].id, computed_style_outline_width(&a),
+                    a.border.top, widths[i].width);
+        CHECK((int) computed_style_outline_width(&a) == widths[i].width
+              && a.border.top == widths[i].width
+              && a.border.left == widths[i].width);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The shared top-level scanner skips a backslash escape, as the layer
+   component scanner does: an escaped quote inside a string neither closes
+   nor reopens it, so the comma after it still separates layers. */
+static int test_top_level_scanner_escapes(void)
+{
+    static const char layers[] = "url(\"a\\\"b.png\") center, red";
+    size_t cursor = 0, start = 0, end = 0;
+    size_t length = sizeof(layers) - 1u;
+    CHECK(style_next_top_level(layers, length, ',', &cursor, &start, &end));
+    CHECK(end - start == strlen("url(\"a\\\"b.png\") center")
+          && memcmp(layers + start, "url(", 4) == 0);
+    CHECK(style_next_top_level(layers, length, ',', &cursor, &start, &end));
+    CHECK(end - start == 3 && memcmp(layers + start, "red", 3) == 0);
+    CHECK(!style_next_top_level(layers, length, ',', &cursor, &start, &end));
+    /* An escaped space is part of the token, not a separator. */
+    static const char words[] = "a\\ b c";
+    cursor = 0;
+    CHECK(style_next_top_level_token(words, sizeof(words) - 1u, &cursor,
+                                     &start, &end)
+          && start == 0 && end == 4);
+    CHECK(style_next_top_level_token(words, sizeof(words) - 1u, &cursor,
+                                     &start, &end)
+          && start == 5 && end == 6);
+    CHECK(!style_next_top_level_token(words, sizeof(words) - 1u, &cursor,
+                                      &start, &end));
+    /* A trailing lone backslash is an ordinary byte. */
+    static const char trailing[] = "a, b\\";
+    cursor = 0;
+    CHECK(style_next_top_level(trailing, sizeof(trailing) - 1u, ',',
+                               &cursor, &start, &end)
+          && end - start == 1);
+    CHECK(style_next_top_level(trailing, sizeof(trailing) - 1u, ',',
+                               &cursor, &start, &end)
+          && end - start == 2);
+
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#escaped{background:url(\"a\\\"b.png\") center, red}"
+        "#plain{background:url(\"ab.png\") center, red}"
+        "</style><p id=escaped>x</p><p id=plain>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle escaped =
+        style_for_node(&sheet, find_id(root, "escaped"), NULL);
+    ComputedStyle plain = style_for_node(&sheet, find_id(root, "plain"), NULL);
+    if (!escaped.has_background || escaped.background != plain.background)
+        fprintf(stderr, "escaped layer colour %d %06x, want %06x\n",
+                (int) escaped.has_background, (unsigned) escaped.background,
+                (unsigned) plain.background);
+    CHECK(plain.has_background && escaped.has_background
+          && escaped.background == plain.background);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Space-separated components are separated by any run of CSS
+   whitespace: a tab, a newline or two spaces between box-shadow,
+   text-wrap, @supports, or retained scroll-padding components must
+   compute what one space computes. */
+static int test_whitespace_separated_components(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char page[] =
+        "<!doctype html><style>"
+        "#s-tab{box-shadow:0 0\t4px red}"
+        "#s-lines{box-shadow:0 0\n4px  red,\n1px 1px\t0 blue}"
+        "#s-ref{box-shadow:0 0 4px red}"
+        "#w-double{white-space:pre;text-wrap:wrap  pretty}"
+        "#w-ref{white-space:pre;text-wrap:wrap pretty}"
+        "@supports (translate:10px\t20px){#q-translate{order:1}}"
+        "@supports (color-scheme:light  dark){#q-scheme{order:1}}"
+        "@supports (scroll-margin:1px\n2px){#q-margin{order:1}}"
+        "@supports (contain-intrinsic-size:auto\t10px){#q-size{order:1}}"
+        "#p-tab{scroll-padding:1px\t2px}"
+        "#p-double{scroll-padding:1px  2px 3px}"
+        "</style><p id=plain>x</p>"
+        "<p id=s-tab>x</p><p id=s-lines>x</p><p id=s-ref>x</p>"
+        "<p id=w-double>x</p><p id=w-ref>x</p>"
+        "<p id=q-translate>x</p><p id=q-scheme>x</p><p id=q-margin>x</p>"
+        "<p id=q-size>x</p><p id=p-tab>x</p><p id=p-double>x</p>";
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle plain = style_for_node(&sheet, find_id(root, "plain"), NULL);
+    ComputedStyle ref = style_for_node(&sheet, find_id(root, "s-ref"), NULL);
+    CHECK(stylesheet_box_shadow_count(&sheet, &ref) == 1);
+    const StyleBoxShadow *expected = stylesheet_box_shadow(&sheet, &ref, 0);
+    static const char *const shadows[] = {"s-tab", "s-lines"};
+    for (size_t i = 0; i < 2; i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, shadows[i]), NULL);
+        size_t count = stylesheet_box_shadow_count(&sheet, &a);
+        if (count != i + 1u)
+            fprintf(stderr, "#%s box-shadow layers %zu, want %zu\n",
+                    shadows[i], count, i + 1u);
+        CHECK(count == i + 1u
+              && memcmp(stylesheet_box_shadow(&sheet, &a, 0), expected,
+                        sizeof(*expected)) == 0);
+    }
+    ComputedStyle wrap = style_for_node(
+        &sheet, find_id(root, "w-double"), NULL);
+    ComputedStyle wrap_ref = style_for_node(
+        &sheet, find_id(root, "w-ref"), NULL);
+    if (wrap.white_space_mode != wrap_ref.white_space_mode)
+        fprintf(stderr, "#w-double white-space %u, want %u\n",
+                (unsigned) wrap.white_space_mode,
+                (unsigned) wrap_ref.white_space_mode);
+    CHECK(wrap_ref.white_space_mode != WHITE_SPACE_PRE
+          && wrap.white_space_mode == wrap_ref.white_space_mode);
+    static const char *const supported[] = {
+        "q-translate", "q-scheme", "q-margin", "q-size",
+    };
+    for (size_t i = 0; i < 4; i++) {
+        ComputedStyle a = style_for_node(
+            &sheet, find_id(root, supported[i]), NULL);
+        if (a.order == plain.order)
+            fprintf(stderr, "#%s @supports rule did not apply\n",
+                    supported[i]);
+        CHECK(a.order != plain.order);
+    }
+    static const struct {
+        const char *id;
+        const char *edges[4];
+    } paddings[] = {
+        {"p-tab", {"1px", "2px", "1px", "2px"}},
+        {"p-double", {"1px", "2px", "3px", "2px"}},
+    };
+    for (size_t i = 0; i < 2; i++) {
+        StyleRetainedBoxValues box;
+        CHECK(style_retained_box_values(
+            &sheet, find_id(root, paddings[i].id), "scroll-padding", NULL,
+            &box));
+        bool same = box.present_mask == 15u;
+        for (size_t side = 0; side < 4; side++)
+            same &= strcmp(box.values[side], paddings[i].edges[side]) == 0;
+        if (!same)
+            fprintf(stderr, "#%s scroll-padding mask %u '%s' '%s' '%s' '%s'\n",
+                    paddings[i].id, (unsigned) box.present_mask,
+                    box.values[0], box.values[1], box.values[2],
+                    box.values[3]);
+        CHECK(same);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A long value written through var() reaches each property's parser
+   whole: every resolve buffer is sized from a named class (keywords,
+   one math value, or open-ended), and each long spelling below is past
+   the buffer its property used to resolve into. Each one must compute
+   what the short spelling on its sibling computes. */
+static int test_long_var_values_per_property(void)
+{
+    char translations[512] = "";
+    for (size_t i = 0; i < 14; i++)
+        strcat(translations, "translate(1px, 2px) ");
+    /* Few terms (the math compiler bounds its nodes), long spellings. */
+    char sum24[256] = "calc(10.000000000000px", sum22[256];
+    for (size_t i = 0; i < 6; i++) strcat(sum24, " + 2.000000000000px");
+    memcpy(sum22, sum24, sizeof(sum22));
+    strcat(sum24, " + 2.000000000000px)");
+    strcat(sum22, ")");
+    char icons[160] = "\"";
+    for (size_t i = 0; i < 20; i++) {
+        char escape[8];
+        snprintf(escape, sizeof(escape), "\\e9%02zu", i);
+        strcat(icons, escape);
+    }
+    strcat(icons, "\"");
+    static const char image[] = "https://static.example.test/assets/"
+        "icons/navigation/arrow-right-long-variant-v2-dark-theme.svg";
+    static const char clip[] = "inset(5px calc(5px + 0px) calc(5px + 0px) "
+        "calc(5px + 0px) round 4px calc(4px + 0px) calc(4px + 0px) "
+        "calc(4px + 0px))";
+    static const char outline[] = "3px solid light-dark(light-dark("
+        "rgba(255.0,0.0,0.0,1.0),rgba(1.0,1.0,1.0,1.0)),light-dark("
+        "rgba(2.0,2.0,2.0,1.0),rgba(3.0,3.0,3.0,1.0)))";
+    /* Line names are bounded by STYLE_GRID_AREA_NAME_CAPACITY; a value
+       formatted over several lines still runs past 192 bytes. */
+    static const char area[] = "header-row-start-line-aaaaaa\n"
+        "                                / sidebar-column-start-line-bb\n"
+        "                                / header-row-end-line-cccccccc\n"
+        "                                / sidebar-column-end-line-dddd";
+    CHECK(strlen(translations) > 256u && strlen(sum24) > 128u
+          && strlen(sum24) < STYLE_MATH_SOURCE_CAPACITY
+          && strlen(sum22) > 128u && strlen(icons) > 96u
+          && strlen(image) + 7u > 96u && strlen(clip) > 96u
+          && strlen(outline) > 128u && strlen(area) > 192u);
+    char css[4096];
+    int written = snprintf(css, sizeof(css),
+        "#clip-long{--v:%s;clip-path:var(--v)}"
+        "#clip-short{clip-path:inset(5px round 4px)}"
+        "#icon-long::before{--v:%s;content:var(--v)}"
+        "#image-long::before{--v:url(%s);content:var(--v)}"
+        "#transform-long{--v:%s;transform:var(--v)}"
+        "#transform-short{transform:translate(14px, 28px)}"
+        "#outline-long{--v:%s;outline:var(--v)}"
+        "#outline-short{outline:3px solid #ff0000}"
+        "#lh-long{--v:%s;line-height:var(--v)}"
+        "#lh-short{line-height:24px}"
+        "#fs-long{--v:%s;font-size:var(--v)}"
+        "#fs-short{font-size:22px}"
+        "#area-long{--v:%s;grid-area:var(--v)}"
+        "#area-short{grid-area:header-row-start-line-aaaaaa / "
+        "sidebar-column-start-line-bb / header-row-end-line-cccccccc / "
+        "sidebar-column-end-line-dddd}",
+        clip, icons, image, translations, outline, sum24, sum22, area);
+    CHECK(written > 0 && (size_t) written < sizeof(css));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<p id=plain>x</p><p id=clip-long>x</p><p id=clip-short>x</p>"
+        "<p id=icon-long>x</p><p id=image-long>x</p>"
+        "<p id=transform-long>x</p><p id=transform-short>x</p>"
+        "<p id=outline-long>x</p><p id=outline-short>x</p>"
+        "<p id=lh-long>x</p><p id=lh-short>x</p>"
+        "<p id=fs-long>x</p><p id=fs-short>x</p>"
+        "<p id=area-long>x</p><p id=area-short>x</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480)
+          && stylesheet_add_css(&sheet, css, (size_t) written));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+#define STYLE_OF(id) style_for_node(&sheet, find_id(root, id), NULL)
+    ComputedStyle plain = STYLE_OF("plain");
+    ComputedStyle a = STYLE_OF("clip-long"), b = STYLE_OF("clip-short");
+    if (a.clip_path_state != b.clip_path_state)
+        fprintf(stderr, "long clip-path %04x, want %04x\n",
+                a.clip_path_state, b.clip_path_state);
+    CHECK(b.clip_path_state != plain.clip_path_state
+          && a.clip_path_state == b.clip_path_state);
+    lxb_dom_node_t *icon_node = find_id(root, "icon-long");
+    ComputedStyle icon_parent = style_for_node(&sheet, icon_node, NULL);
+    ComputedStyle icon = style_for_pseudo(&sheet, icon_node, PSEUDO_BEFORE,
+                                          &icon_parent);
+    if (icon.generated_text_length != 60u)
+        fprintf(stderr, "long content text %u bytes, want 60\n",
+                (unsigned) icon.generated_text_length);
+    CHECK(icon.generated_content && icon.generated_text_length == 60u);
+    lxb_dom_node_t *image_node = find_id(root, "image-long");
+    ComputedStyle image_parent = style_for_node(&sheet, image_node, NULL);
+    ComputedStyle pictured = style_for_pseudo(&sheet, image_node,
+                                              PSEUDO_BEFORE, &image_parent);
+    CHECK(pictured.generated_content && pictured.generated_image
+          && pictured.generated_text != NULL
+          && strstr(pictured.generated_text, "arrow-right-long") != NULL);
+    a = STYLE_OF("transform-long");
+    b = STYLE_OF("transform-short");
+    if (a.has_transform != b.has_transform || a.transform_x != b.transform_x
+        || a.transform_y != b.transform_y)
+        fprintf(stderr, "long transform %d %d,%d, want %d %d,%d\n",
+                a.has_transform, a.transform_x, a.transform_y,
+                b.has_transform, b.transform_x, b.transform_y);
+    CHECK(b.has_transform && a.has_transform
+          && a.transform_x == b.transform_x
+          && a.transform_y == b.transform_y);
+    a = STYLE_OF("outline-long");
+    b = STYLE_OF("outline-short");
+    if (a.outline_state != b.outline_state
+        || a.outline_color != b.outline_color)
+        fprintf(stderr, "long outline %04x %06x, want %04x %06x\n",
+                a.outline_state, (unsigned) a.outline_color,
+                b.outline_state, (unsigned) b.outline_color);
+    CHECK(b.outline_state != plain.outline_state
+          && a.outline_state == b.outline_state
+          && a.outline_color == b.outline_color
+          && a.outline_alpha == b.outline_alpha);
+    a = STYLE_OF("lh-long");
+    b = STYLE_OF("lh-short");
+    if (a.line_height != b.line_height)
+        fprintf(stderr, "long line-height %d, want %d\n",
+                a.line_height, b.line_height);
+    CHECK(b.line_height != plain.line_height
+          && a.line_height == b.line_height);
+    a = STYLE_OF("fs-long");
+    b = STYLE_OF("fs-short");
+    if (a.font_size != b.font_size)
+        fprintf(stderr, "long font-size %d, want %d\n",
+                a.font_size, b.font_size);
+    CHECK(b.font_size != plain.font_size && a.font_size == b.font_size);
+    a = STYLE_OF("area-long");
+    b = STYLE_OF("area-short");
+    if (memcmp(a.grid_placement, b.grid_placement,
+               sizeof(a.grid_placement)) != 0)
+        fprintf(stderr, "long grid-area placement differs\n");
+    CHECK(memcmp(b.grid_placement, plain.grid_placement,
+                 sizeof(b.grid_placement)) != 0
+          && memcmp(a.grid_placement, b.grid_placement,
+                    sizeof(a.grid_placement)) == 0);
+#undef STYLE_OF
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -1739,6 +3646,86 @@ static int test_retained_focus_descendants(void)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A bounded-out sheet without adopted sources (restored from the compiled
+   stylesheet cache, or past STYLE_SOURCE_NODE_LIMIT <style> sources) has
+   no confinement to fail closed: a focus move with a sibling focus rule
+   keeps the scoped invalidation instead of resetting the reuse cache. */
+static int test_bounded_out_sheet_keeps_focus_fast_path(void)
+{
+    for (int variant = 0; variant < 2; variant++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        char html[4096];
+        size_t length = 0;
+        if (variant == 1) {
+            /* One more source than the sheet records. */
+            for (unsigned i = 0; i <= STYLE_SOURCE_NODE_LIMIT; i++) {
+                int wrote = snprintf(html + length, sizeof(html) - length,
+                                     "<style>.s%u{color:red}</style>", i);
+                CHECK(wrote > 0 && (size_t) wrote < sizeof(html) - length);
+                length += (size_t) wrote;
+            }
+        }
+        int wrote = snprintf(html + length, sizeof(html) - length,
+            "<style>label{color:#123456}"
+            "input:focus + label{color:#654321}</style>"
+            "<input id=input><label id=label>L</label><p id=p>Text</p>");
+        CHECK(wrote > 0 && (size_t) wrote < sizeof(html) - length);
+        length += (size_t) wrote;
+        CHECK(document_parse(&document, &budget, html, length, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        if (variant == 0) {
+            CHECK(!sheet.style_sources_bounded_out);
+            /* What navigation_compiled_stylesheet_cache_store does before
+               the next document adopts the sheet. */
+            stylesheet_prepare_for_document_reuse(&sheet);
+        }
+        CHECK(sheet.style_sources_bounded_out
+              && sheet.adopted_source_count == 0);
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *input = find_id(root, "input");
+        lxb_dom_node_t *label = find_id(root, "label");
+        lxb_dom_node_t *p = find_id(root, "p");
+        CHECK(input != NULL && label != NULL && p != NULL);
+        uint32_t rules[128];
+        CHECK(style_focus_nonlocal_rules(&sheet, input, rules, 128u)
+              != SIZE_MAX);
+        LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+        CHECK(reuse != NULL);
+        layout_reuse_cache_enable_retained_matches(reuse);
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        ComputedStyle style;
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, label,
+                                                NULL, &style);
+        CHECK(style.color == 0x123456);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, p,
+                                                NULL, &style);
+        LayoutReuseStats before = {0}, after = {0};
+        layout_reuse_cache_stats(reuse, &before);
+        BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+        CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(input),
+            (const lxb_char_t *) "data-tilefinch-focus", 20,
+            (const lxb_char_t *) "", 0) != NULL);
+        document_allocation_owner_leave(&document, owner);
+        layout_reuse_cache_invalidate_focus(reuse, input);
+        layout_reuse_cache_stats(reuse, &after);
+        CHECK(after.full_resets == before.full_resets
+              && after.scoped_invalidations == before.scoped_invalidations + 1u);
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, label,
+                                                NULL, &style);
+        CHECK(style.color == 0x654321);
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
     return 0;
 }
 
@@ -3549,7 +5536,11 @@ static int test_transition_candidate_rejection(void)
         for (size_t n = 0; n < 2u; n++) {
             for (PseudoElement pseudo = PSEUDO_NONE; pseudo <= PSEUDO_BEFORE;
                  pseudo++) {
+                /* Text past timing_text_used is never written or read:
+                   start both alike so the whole records compare. */
                 StyleTransitionComputed fast, linear;
+                memset(&fast, 0, sizeof(fast));
+                memset(&linear, 0, sizeof(linear));
                 uint64_t before = sheet.selector_match_calls;
                 CHECK(style_transition_computed(&sheet, nodes[n], pseudo,
                                                 &fast));
@@ -3633,6 +5624,89 @@ static int test_shadow_scope_allocation_refusal(void)
     return 0;
 }
 
+/* One angle grammar: @supports answers what the rotate and scale
+   properties apply (grad, rad, turn, percentages), hue units are ASCII
+   case-insensitive, and a huge hue normalizes instead of looping. */
+static int test_angle_grammar_agreement(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><style>"
+        "@supports (rotate: 100grad){#grad{color:#ff0000}}"
+        "@supports (rotate: 3.141592653589793rad){#rad{color:#ff0000}}"
+        "@supports (rotate: 0.75TURN){#turn{color:#ff0000}}"
+        "@supports (scale: 50%){#percent{color:#ff0000}}"
+        "@supports (rotate: 45deg){#oblique{color:#ff0000}}"
+        "#applied{rotate:100grad;scale:50%}"
+        "#hue{color:hsl(120DEG 100% 50%)}"
+        "#huge{color:hsl(1e300 100% 50%)}"
+        "</style><p id=grad>A</p><p id=rad>B</p><p id=turn>C</p>"
+        "<p id=percent>D</p><p id=oblique>E</p><p id=applied>F</p>"
+        "<p id=hue>G</p><p id=huge>H</p>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 23)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const char *const supported[] = {"grad", "rad", "turn", "percent"};
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        ComputedStyle style = style_for_node(
+            &sheet, find_id(root, supported[i]), NULL);
+        if (style.color != 0xff0000)
+            fprintf(stderr, "@supports disagrees for #%s\n", supported[i]);
+        CHECK(style.color == 0xff0000);
+    }
+    ComputedStyle oblique = style_for_node(&sheet, find_id(root, "oblique"), NULL);
+    ComputedStyle applied = style_for_node(&sheet, find_id(root, "applied"), NULL);
+    ComputedStyle hue = style_for_node(&sheet, find_id(root, "hue"), NULL);
+    ComputedStyle huge = style_for_node(&sheet, find_id(root, "huge"), NULL);
+    CHECK(oblique.color != 0xff0000
+          && applied.individual_rotate_quadrants == 1
+          && applied.transform_scale_q14 == 8192);
+    if (hue.color != 0x00ff00)
+        fprintf(stderr, "hsl(120DEG ...)=%06x\n", (unsigned) hue.color);
+    CHECK(hue.color == 0x00ff00);
+    (void) huge;
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* letter-spacing accepts any expression the math compiler does, not just
+   one that fits a short buffer once var() is substituted. */
+static int test_long_math_letter_spacing(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><style>"
+        "#sum{letter-spacing:calc(1px + 1px + 1px + 1px + 1px + 1px + 1px"
+        " + 1px + 1px + 1px)}"
+        ":root{--track:calc(0.25px + 0.25px + 0.25px + 0.25px)}"
+        "#var{letter-spacing:clamp(1px, calc(var(--track) + 1px), 3px)}"
+        "</style><p id=sum>A</p><p id=var>B</p>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 23)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle sum = style_for_node(&sheet, find_id(root, "sum"), NULL);
+    ComputedStyle var = style_for_node(&sheet, find_id(root, "var"), NULL);
+    if (sum.letter_spacing_fixed != 10 * 64
+        || var.letter_spacing_fixed != 2 * 64)
+        fprintf(stderr, "long math letter-spacing: %d %d\n",
+                (int) sum.letter_spacing_fixed,
+                (int) var.letter_spacing_fixed);
+    CHECK(sum.letter_spacing_fixed == 10 * 64
+          && var.letter_spacing_fixed == 2 * 64);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_padding_initial_shorthand(void)
 {
     Budget budget;
@@ -3641,9 +5715,19 @@ static int test_padding_initial_shorthand(void)
     static const char html[] = "<!doctype html><style>"
         "button{padding:8px;box-sizing:content-box;width:24px;height:24px;"
         "border:0}#reset{padding:unset}#initial{padding:initial}"
-        "#invalid{padding:unset 4px}</style>"
+        "#invalid{padding:unset 4px}"
+        "input{border:2px solid #123456}"
+        "#border-invalid{border:1px solid var(--missing-border-color)}"
+        "#border-initial{border:initial}"
+        ".display-reset{display:flex}"
+        "#display-initial{display:initial}#display-unset{display:unset}"
+        "#display-invalid{display:var(--missing-display)}</style>"
         "<button id=reset></button><button id=initial></button>"
-        "<button id=invalid></button>";
+        "<button id=invalid></button>"
+        "<input id=border-invalid><input id=border-initial>"
+        "<div class=display-reset id=display-initial>A</div>"
+        "<div class=display-reset id=display-unset>B</div>"
+        "<div class=display-reset id=display-invalid>C</div>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -3663,6 +5747,22 @@ static int test_padding_initial_shorthand(void)
         CHECK(box != NULL && box->width == (i == 2 ? 40 : 24)
             && box->height == (i == 2 ? 40 : 24));
     }
+    const char *border_ids[] = {"border-invalid", "border-initial"};
+    const char *display_ids[] = {
+        "display-initial", "display-unset", "display-invalid"
+    };
+    for (size_t i = 0; i < 3; i++)
+        CHECK(style_for_node(&sheet, find_id(root, display_ids[i]), NULL).display
+              == DISPLAY_INLINE);
+    for (size_t i = 0; i < 2; i++) {
+        ComputedStyle style = style_for_node(
+            &sheet, find_id(root, border_ids[i]), NULL);
+        CHECK(style.border.top == 0 && style.border.right == 0
+              && style.border.bottom == 0 && style.border.left == 0);
+        for (unsigned side = 0; side < STYLE_BORDER_SIDE_COUNT; side++)
+            CHECK(computed_style_border_line(
+                      &style, (StyleBorderSide) side) == STYLE_BORDER_NONE);
+    }
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -3670,9 +5770,538 @@ static int test_padding_initial_shorthand(void)
     return 0;
 }
 
+static int test_variable_background_shorthand(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><html data-theme=light><style>"
+        ".bar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:99;"
+        "background:var(--theme-panel-background-color);"
+        "box-shadow:0 -2px 8px #ddd;padding:0 16px;"
+        "-webkit-transform:translateY(0);transform:translateY(0);transition-duration:200ms;"
+        "height:var(--bar-height)}"
+        "[data-theme=light]{--theme-panel-background-color:#ffffff;--bar-height:72px}"
+        "</style><nav id=probe class=bar>Menu</nav>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 23)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "probe");
+    CHECK(node != NULL);
+    ComputedStyle style = style_for_node(&sheet, node, NULL);
+    CHECK(style.has_background && style.background == 0xffffff
+        && style.background_alpha == 255);
+    static const struct {
+        const char *alias, *canonical, *value;
+    } aliases[] = {
+        {"-webkit-flex", "flex", "1 1 auto"},
+        {"-ms-flex", "flex", "1 1 auto"},
+        {"-webkit-flex-direction", "flex-direction", "column"},
+        {"-ms-flex-direction", "flex-direction", "column"},
+        {"-webkit-flex-wrap", "flex-wrap", "wrap"},
+        {"-ms-flex-wrap", "flex-wrap", "wrap"},
+        {"-webkit-flex-grow", "flex-grow", "2"},
+        {"-ms-flex-positive", "flex-grow", "2"},
+        {"-webkit-flex-shrink", "flex-shrink", "2"},
+        {"-ms-flex-negative", "flex-shrink", "2"},
+        {"-webkit-flex-basis", "flex-basis", "20px"},
+        {"-ms-flex-preferred-size", "flex-basis", "20px"},
+        {"-webkit-justify-content", "justify-content", "center"},
+        {"-ms-flex-pack", "-webkit-box-pack", "justify"},
+        {"-webkit-align-items", "align-items", "center"},
+        {"-ms-flex-align", "-webkit-box-align", "center"},
+        {"-webkit-align-self", "align-self", "center"},
+        {"-ms-flex-item-align", "align-self", "center"},
+        {"-webkit-align-content", "align-content", "center"},
+        {"-webkit-order", "order", "2"},
+        {"-ms-flex-order", "order", "2"},
+        {"-webkit-transform", "transform", "translateY(3px)"},
+        {"-webkit-transform-origin", "transform-origin", "left top"},
+        {"-webkit-box-shadow", "box-shadow", "0 1px 2px #123456"},
+        {"-webkit-box-sizing", "box-sizing", "border-box"}
+    };
+    /* Every supported alias must compile to the canonical instruction, not
+       an index derived from a different array. Mix it with a variable so the
+       complete block takes the deferred-program path. */
+    for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+        char css[512], alias_selector[32], canonical_selector[32];
+        snprintf(alias_selector, sizeof(alias_selector), ".alias-%zu", i);
+        snprintf(canonical_selector, sizeof(canonical_selector), ".canonical-%zu", i);
+        int length = snprintf(css, sizeof(css),
+            "%s{background:var(--theme-panel-background-color);%s:%s}"
+            "%s{background:var(--theme-panel-background-color);%s:%s}",
+            alias_selector, aliases[i].alias, aliases[i].value,
+            canonical_selector, aliases[i].canonical, aliases[i].value);
+        CHECK(length > 0 && (size_t) length < sizeof(css)
+            && stylesheet_add_css(&sheet, css, (size_t) length));
+        const StyleRule *a = find_rule(&sheet, alias_selector);
+        const StyleRule *c = find_rule(&sheet, canonical_selector);
+        CHECK(a != NULL && c != NULL);
+        const StyleDeclaration *ad = stylesheet_rule_declaration(&sheet, a);
+        const StyleDeclaration *cd = stylesheet_rule_declaration(&sheet, c);
+        CHECK(ad != NULL && cd != NULL
+            && ad->deferred_program_offset != UINT32_MAX
+            && cd->deferred_program_offset != UINT32_MAX
+            && ad->deferred_program_count == 2
+            && cd->deferred_program_count == 2);
+        for (size_t op = 0; op < 2; op++) {
+            CHECK(sheet.deferred_instructions[ad->deferred_program_offset + op].property_index
+                == sheet.deferred_instructions[cd->deferred_program_offset + op].property_index);
+        }
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_fixed_implicit_column_overflow(void)
+{
+    static const size_t counts[] = {24, 30, 300};
+    for (size_t variant = 0; variant < sizeof(counts) / sizeof(counts[0]); variant++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        char html[16384];
+        size_t length = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><style>body{margin:0}.outer{display:flex;"
+            "flex-direction:column}.wrapper{position:relative}"
+            "#grid{display:grid;grid-auto-flow:column;grid-auto-columns:37px;"
+            "gap:3px;overflow:hidden;align-items:start}"
+            ".item{display:block;height:20px}.item:last-child{height:67px}"
+            "#after{height:10px}</style><div class=outer><div class=wrapper>"
+            "<div id=grid>");
+        for (size_t i = 0; i < counts[variant]; i++) {
+            int written = snprintf(html + length, sizeof(html) - length,
+                "<i class=item id=item%zu></i>", i);
+            CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+            length += (size_t) written;
+        }
+        int written = snprintf(html + length, sizeof(html) - length,
+            "</div></div><div id=after></div></div>");
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        length += (size_t) written;
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, html, length, 29)
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *grid = layout_box_for_node(&layout, find_id(root, "grid"));
+        const LayoutNodeBox *after = layout_box_for_node(&layout, find_id(root, "after"));
+        CHECK(grid != NULL && grid->height == 67 && after != NULL
+            && after->y == grid->y + 67);
+        for (size_t i = 0; i < counts[variant]; i++) {
+            char id[32];
+            snprintf(id, sizeof(id), "item%zu", i);
+            const LayoutNodeBox *box = layout_box_for_node(&layout, find_id(root, id));
+            CHECK(box != NULL && box->x == grid->x + (int) i * 40
+                && box->y == grid->y && box->width == 37
+                && box->height == (i + 1 == counts[variant] ? 67 : 20));
+        }
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+static int test_legacy_grid_gap_shorthand(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><style>"
+        "body{margin:0}:root{--gutter:5px 12px}"
+        ".grid{display:grid;grid-template-columns:30px 30px;"
+        "grid-template-rows:20px 20px;grid-gap:var(--gutter)}"
+        "#override{grid-gap:7px;column-gap:9px}"
+        "#important{grid-gap:4px 11px!important;gap:1px}"
+        "#reset{grid-gap:12px;grid-gap:initial}"
+        "#invalid{grid-gap:3px;grid-gap:1px 2px 3px}"
+        ".grid i{display:block;height:20px}"
+        "</style><div class=grid id=probe><i id=a></i><i id=b></i><i id=c></i></div>"
+        "<div class=grid id=override></div><div class=grid id=important></div>"
+        "<div class=grid id=reset></div><div class=grid id=invalid></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 23)
+        && stylesheet_build(&sheet, &budget, &document, 480)
+        && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *a = layout_box_for_node(&layout, find_id(root, "a"));
+    const LayoutNodeBox *b = layout_box_for_node(&layout, find_id(root, "b"));
+    const LayoutNodeBox *c = layout_box_for_node(&layout, find_id(root, "c"));
+    CHECK(a != NULL && b != NULL && c != NULL
+        && b->x == a->x + 42 && c->y == a->y + 25);
+    const char *ids[] = {"override", "important", "reset", "invalid"};
+    const int rows[] = {7, 4, 0, 3}, columns[] = {9, 11, 0, 3};
+    for (size_t i = 0; i < 4; i++) {
+        ComputedStyle style = style_for_node(&sheet, find_id(root, ids[i]), NULL);
+        CHECK(style.row_gap == rows[i] && style.gap == columns[i]);
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_grid_auto_repeat_whitespace(void)
+{
+    static const char *const values[] = {
+        "repeat(auto-fill,minmax(160px,1fr))",
+        "repeat(\n auto-fill,\n minmax(160px,1fr)\n)",
+        "repeat(\t auto-fit, minmax(var(--minimum), 1fr))"
+    };
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        char html[1024];
+        int length = snprintf(html, sizeof(html),
+            "<!doctype html><style>body{margin:0}#grid{--minimum:160px;"
+            "display:grid;width:480px;gap:20px;grid-template-columns:%s}"
+            "#grid>div{height:30px}</style><div id=grid>"
+            "<div id=a>A</div><div id=b>B</div><div id=c>C</div></div>",
+            values[i]);
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        PocDocument document = {0}; Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, &budget, html, (size_t) length, 23)
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *a = layout_box_for_node(&layout, find_id(root, "a"));
+        const LayoutNodeBox *b = layout_box_for_node(&layout, find_id(root, "b"));
+        const LayoutNodeBox *c = layout_box_for_node(&layout, find_id(root, "c"));
+        CHECK(a != NULL && b != NULL && c != NULL
+            && a->width == 230 && b->width == 230 && b->x == 250
+            && a->y == b->y && c->x == a->x && c->y == a->y + 50);
+        layout_destroy(&layout); stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+static int test_unused_symbol_rules_do_not_exhaust_live_content(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<!doctype html><body><i id=target class=s2047></i>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    char css[100000];
+    size_t length = 0;
+    for (unsigned i = 0; i < 2048; i++) {
+        int count = snprintf(css + length, sizeof(css) - length,
+                             ".s%u::before{content:'\\%x'}", i, 0xe000u + i);
+        CHECK(count > 0 && (size_t) count < sizeof(css) - length);
+        length += (size_t) count;
+    }
+    CHECK(stylesheet_add_css(&sheet, css, length));
+    lxb_dom_node_t *target = find_id(lxb_dom_interface_node(document.html), "target");
+    ComputedStyle parent = style_for_node(&sheet, target, NULL);
+    ComputedStyle pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    CHECK(pseudo.generated_text_length == 3 && pseudo.generated_text != NULL
+          && memcmp(pseudo.generated_text, "\xee\x9f\xbf", 3) == 0);
+    CHECK(sheet.generated_text_count == 1 && sheet.generated_text_bytes == 4);
+    const char *retained = pseudo.generated_text;
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    CHECK(pseudo.generated_text == retained && sheet.generated_text_count == 1);
+    static const char replacement[] = ".s2047::before{content:'\\e001'}";
+    CHECK(stylesheet_add_css(&sheet, replacement, sizeof(replacement) - 1));
+    budget_inject_failure_after(&budget, 0);
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    budget_clear_failure_injection(&budget);
+    CHECK(pseudo.generated_text == NULL && pseudo.generated_text_length == 0);
+    pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
+    CHECK(pseudo.generated_text != NULL && pseudo.generated_text_length == 3
+          && memcmp(pseudo.generated_text, "\xee\x80\x81", 3) == 0
+          && sheet.generated_text_count == 2
+          && memcmp(retained, "\xee\x9f\xbf", 3) == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_centered_content_sized_grid_rows(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0}; Stylesheet sheet = {0}; LayoutDocument layout = {0};
+    static const char html[] = "<!doctype html><style>body{margin:0;line-height:1.5}"
+        ".grid{display:grid;width:40px;height:40px;place-content:center}"
+        "i{font-size:20px}i::before{content:'+';"
+        "display:inline-block;line-height:1;vertical-align:-.125em}"
+        ".end{align-content:end}.two{height:80px;row-gap:10px}"
+        "</style><div class=grid><i id=center></i></div>"
+        "<div class='grid end'><i id=end></i></div>"
+        "<div class='grid two'><i id=first></i><i id=second></i></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *center = layout_box_for_node(&layout, find_id(root, "center"));
+    const LayoutNodeBox *end = layout_box_for_node(&layout, find_id(root, "end"));
+    const LayoutNodeBox *first = layout_box_for_node(&layout, find_id(root, "first"));
+    const LayoutNodeBox *second = layout_box_for_node(&layout, find_id(root, "second"));
+    CHECK(center && end && first && second);
+    CHECK(center->height > 0 && center->height < 40
+          && center->y == (40 - center->height) / 2);
+    CHECK(end->y + end->height == 80);
+    CHECK(first->y == 80 + (80 - first->height - second->height - 10) / 2
+          && second->y == first->y + first->height + 10);
+    layout_destroy(&layout); stylesheet_destroy(&sheet); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_external_stylesheet_utf8_signature(void)
+{
+    Budget budget; budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0}; Stylesheet sheet = {0};
+    static const char html[] = "<!doctype html><body><div id=target></div>";
+    static const char css[] = "\xef\xbb\xbf/* sheet */:root{--rgb:255,255,255}"
+        "#target{background-color:rgba(var(--rgb),.75);color:#112233}";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && stylesheet_add_css_from(&sheet, css, sizeof(css) - 1,
+                                     "https://styles.test/main.css"));
+    lxb_dom_node_t *target = find_id(lxb_dom_interface_node(document.html), "target");
+    ComputedStyle style = style_for_node(&sheet, target, NULL);
+    CHECK(style.has_background && style.background == 0xffffff
+          && style.background_alpha == 191 && style.color == 0x112233);
+    stylesheet_destroy(&sheet);
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    /* An embedded U+FEFF is an identifier character, not whitespace. */
+    static const char embedded[] = "#target\xef\xbb\xbf{color:red}";
+    CHECK(stylesheet_add_css_from(&sheet, embedded, sizeof(embedded) - 1,
+                                 "https://styles.test/main.css"));
+    style = style_for_node(&sheet, target, NULL);
+    CHECK(style.color != 0xff0000);
+    stylesheet_destroy(&sheet); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_focus_shadow_probe_work(size_t first)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<style>"
+        ":root{--ring:0 0 0 1px red,0 0 0 3px blue,0 0 0 5px green}"
+        ".other :is(a,button):focus-visible{box-shadow:0 0 0 2px red}"
+        ".layered:focus-visible{box-shadow:var(--ring)}"
+        ".simple:focus-visible{box-shadow:0 0 0 3px blue}"
+        ".relative{font-size:10px}.relative:focus-visible{font-size:20px;box-shadow:0 0 0 1em red}"
+        ".context{--ring:0 0 0 2px red}.context:has(.state:focus-visible){--ring:0 0 0 7px red}"
+        ".state:focus-visible{box-shadow:var(--ring)}"
+        "</style><a id=unrelated>plain</a><a id=layered class=layered>layers</a>"
+        "<a id=simple class=simple>simple</a><a id=relative class=relative>relative</a>"
+        "<section class=context><a id=state class=state>state</a></section>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    CHECK(style_variable_cache_begin(&sheet, &budget));
+    static const char *ids[] = {"unrelated", "layered", "simple", "relative", "state"};
+    for (size_t i = first; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), ids[i]);
+        CHECK(node != NULL);
+        ComputedStyle normal = style_for_node(&sheet, node, NULL);
+        char ring[128];
+        CHECK(custom_property_text(&sheet, node, "--ring", ring, sizeof(ring)) > 0);
+        uint64_t candidates = sheet.rule_index_candidates;
+        StyleBoxShadow shadow;
+        size_t layer = SIZE_MAX;
+        bool admitted = style_node_focus_outset_shadow(&sheet, node, NULL,
+                                                       &normal, &shadow, &layer);
+        CHECK(document_attribute(node, "data-tilefinch-focus", NULL) == NULL);
+        if (i < 2) {
+            CHECK(!admitted && sheet.rule_index_candidates == candidates);
+        } else {
+            CHECK(admitted && layer == 0 && shadow.spread == (i == 2 ? 3 : i == 3 ? 20 : 7));
+        }
+        uint64_t hits = sheet.variable_cache_hits;
+        char restored_ring[128];
+        CHECK(custom_property_text(&sheet, node, "--ring", restored_ring,
+                  sizeof(restored_ring)) == strlen(ring)
+              && strcmp(ring, restored_ring) == 0 && sheet.variable_cache_hits > hits);
+        ComputedStyle restored = style_for_node(&sheet, node, NULL);
+        CHECK(memcmp(&normal, &restored, sizeof(normal)) == 0);
+        /* Declining a retained slot must not suppress the actual focused
+           cascade, including layered rings and focus-relative units. */
+        CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+            (const lxb_char_t *) "data-tilefinch-focus", 20,
+            (const lxb_char_t *) "true", 4) != NULL);
+        style_variable_cache_invalidate_node(&sheet, node);
+        ComputedStyle focused = style_for_node(&sheet, node, NULL);
+        CHECK(stylesheet_box_shadow_count(&sheet, &focused) == (i == 1 ? 3 : i == 0 ? 0 : 1));
+        CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(node),
+            (const lxb_char_t *) "data-tilefinch-focus", 20) == LXB_STATUS_OK);
+        style_variable_cache_invalidate_node(&sheet, node);
+    }
+    style_variable_cache_end(&sheet);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_focus_has_anchor_scope(void)
+{
+    static const struct { const char *css; bool outside_local; } cases[] = {
+        {".menu:has(:focus){padding:7px}.menu:has(:focus){--ink:red}", true},
+        {".wrap > .menu:has(> :focus) + .result{color:red}", true},
+        {".menu:has(:focus-within){background:red}", true},
+        {".wrap[data-state=ready] .menu:first-child:has(button:focus-visible) + .result{color:red}", true},
+        {".menu:has(+ #outside:focus){color:red}", false},
+        {".menu:has(~ #outside:focus){color:red}", false},
+        {".menu:not(:has(:focus)) .child{color:red}", false},
+        {".menu:has(:is(:focus)){color:red}", false}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        const char *html = "<!doctype html><div class=wrap data-state=ready><div class=menu>"
+            "<button id=inside>Inside</button><span class=child>Child</span>"
+            "</div><button id=outside>Outside</button><div class=result>Result</div></div>";
+        CHECK(document_parse(&document, &budget, html, strlen(html), 32u)
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && stylesheet_add_css(&sheet, cases[i].css, strlen(cases[i].css)));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *outside = find_id(root, "outside");
+        lxb_dom_node_t *inside = find_id(root, "inside");
+        CHECK(outside != NULL && inside != NULL);
+        bool local = style_focus_change_is_local(&sheet, outside);
+        if (local != cases[i].outside_local) {
+            fprintf(stderr, "focus anchor case %zu local=%u\n", i, local);
+            return 1;
+        }
+        bool inside_local = style_focus_change_is_local(&sheet, inside);
+        if (i < 4u) CHECK(!inside_local);
+        size_t length = 0;
+        CHECK(document_attribute(outside, "data-tilefinch-focus", &length) == NULL
+            && document_attribute(inside, "data-tilefinch-focus", &length) == NULL);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--letter-spacing-only") == 0)
+        return test_long_math_letter_spacing();
+    if (argc == 2 && strcmp(argv[1], "--angle-grammar-only") == 0)
+        return test_angle_grammar_agreement();
+    if (argc == 2 && strcmp(argv[1], "--container-grammar-only") == 0)
+        return test_container_condition_grammar();
+    if (argc == 2 && strcmp(argv[1], "--long-var-properties-only") == 0)
+        return test_long_var_values_per_property();
+    if (argc == 2 && strcmp(argv[1], "--container-keywords-only") == 0)
+        return test_container_condition_keywords();
+    if (argc == 2 && strcmp(argv[1], "--container-ratio-only") == 0)
+        return test_container_ratio_features();
+    if (argc == 2 && strcmp(argv[1], "--container-dedup-only") == 0)
+        return test_container_query_registration_dedup();
+    if (argc == 2 && strcmp(argv[1], "--shorthand-components-only") == 0)
+        return test_shorthand_top_level_components();
+    if (argc == 2 && strcmp(argv[1], "--line-width-keywords-only") == 0)
+        return test_line_width_keywords();
+    if (argc == 2 && strcmp(argv[1], "--box-component-limits-only") == 0)
+        return test_box_shorthand_component_limits();
+    if (argc == 2 && strcmp(argv[1], "--timing-function-grammar-only") == 0)
+        return test_transition_timing_function_grammar();
+    if (argc == 2 && strcmp(argv[1], "--long-linear-easing-only") == 0)
+        return test_transition_long_linear_easing();
+    if (argc == 2 && strcmp(argv[1], "--untimed-transitions-only") == 0)
+        return test_transition_untimed_matches_full();
+    if (argc == 2 && strcmp(argv[1], "--two-maximal-easings-only") == 0)
+        return test_transition_two_maximal_linear_easings();
+    if (argc == 2 && strcmp(argv[1], "--grid-minmax-only") == 0)
+        return test_grid_minmax_arguments();
+    if (argc == 2 && strcmp(argv[1], "--grid-auto-tracks-only") == 0)
+        return test_grid_auto_track_lists();
+    if (argc == 2 && strcmp(argv[1], "--length-parsers-only") == 0)
+        return test_length_parsers_agree();
+    if (argc == 2 && strcmp(argv[1], "--layer-escapes-only") == 0)
+        return test_layer_components_skip_escapes();
+    if (argc == 2 && strcmp(argv[1], "--whitespace-components-only") == 0)
+        return test_whitespace_separated_components();
+    if (argc == 2 && strcmp(argv[1], "--top-level-escapes-only") == 0)
+        return test_top_level_scanner_escapes();
+    if (argc == 2 && strcmp(argv[1], "--uppercase-tags-only") == 0)
+        return test_uppercase_type_selectors();
+    CHECK(test_uppercase_type_selectors() == 0);
+    if (argc == 2 && strcmp(argv[1], "--focus-has-anchor-only") == 0)
+        return test_focus_has_anchor_scope();
+    CHECK(test_focus_has_anchor_scope() == 0);
+    if (argc == 2 && strcmp(argv[1], "--focus-shadow-probe-only") == 0)
+        return test_focus_shadow_probe_work(0);
+    if (argc == 2 && strcmp(argv[1], "--focus-shadow-layered-only") == 0)
+        return test_focus_shadow_probe_work(1);
+    CHECK(test_focus_shadow_probe_work(0) == 0);
+    if (argc == 2 && strcmp(argv[1], "--external-bom-only") == 0)
+        return test_external_stylesheet_utf8_signature();
+    CHECK(test_external_stylesheet_utf8_signature() == 0);
+    if (argc == 2 && strcmp(argv[1], "--centered-auto-rows-only") == 0)
+        return test_centered_content_sized_grid_rows();
+    CHECK(test_centered_content_sized_grid_rows() == 0);
+    if (argc == 2 && strcmp(argv[1], "--live-symbols-only") == 0)
+        return test_unused_symbol_rules_do_not_exhaust_live_content();
+    CHECK(test_unused_symbol_rules_do_not_exhaust_live_content() == 0);
+    if (argc == 2 && strcmp(argv[1], "--auto-repeat-only") == 0)
+        return test_grid_auto_repeat_whitespace();
+    CHECK(test_grid_auto_repeat_whitespace() == 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-gap-only") == 0)
+        return test_legacy_grid_gap_shorthand();
+    if (argc == 2 && strcmp(argv[1], "--implicit-column-overflow-only") == 0)
+        return test_fixed_implicit_column_overflow();
+    if (argc == 2 && strcmp(argv[1], "--variable-background-only") == 0)
+        return test_variable_background_shorthand();
+    CHECK(test_fixed_implicit_column_overflow() == 0);
+    CHECK(test_variable_background_shorthand() == 0);
+    CHECK(test_legacy_grid_gap_shorthand() == 0);
     CHECK(test_padding_initial_shorthand() == 0);
+    CHECK(test_long_math_letter_spacing() == 0);
+    CHECK(test_angle_grammar_agreement() == 0);
+    CHECK(test_container_condition_grammar() == 0);
+    CHECK(test_container_condition_keywords() == 0);
+    CHECK(test_container_ratio_features() == 0);
+    CHECK(test_container_query_registration_dedup() == 0);
+    CHECK(test_container_condition_cache_follows_state() == 0);
+    CHECK(test_shorthand_top_level_components() == 0);
+    CHECK(test_line_width_keywords() == 0);
+    CHECK(test_box_shorthand_component_limits() == 0);
+    CHECK(test_transition_timing_function_grammar() == 0);
+    CHECK(test_transition_long_linear_easing() == 0);
+    CHECK(test_transition_two_maximal_linear_easings() == 0);
+    CHECK(test_transition_untimed_matches_full() == 0);
+    CHECK(test_grid_minmax_arguments() == 0);
+    CHECK(test_grid_auto_track_lists() == 0);
+    CHECK(test_length_parsers_agree() == 0);
+    CHECK(test_layer_components_skip_escapes() == 0);
+    CHECK(test_whitespace_separated_components() == 0);
+    CHECK(test_top_level_scanner_escapes() == 0);
+    CHECK(test_long_var_values_per_property() == 0);
     if (argc == 2 && strcmp(argv[1], "--padding-reset-only") == 0) return 0;
     /* The selector offset and container query share one field. Exercise the
        full admitted offset range so longer ordinary selectors cannot silently
@@ -3707,6 +6336,12 @@ int main(int argc, char **argv)
         return test_long_custom_property_values();
     if (argc == 2 && strcmp(argv[1], "--registered-only") == 0)
         return test_registered_custom_properties();
+    if (argc == 2 && strcmp(argv[1], "--registered-reuse-only") == 0)
+        return test_registered_length_ancestor_reuse();
+    if (argc == 2 && strcmp(argv[1], "--long-variable-names-only") == 0)
+        return test_long_variable_names_cached();
+    if (argc == 2 && strcmp(argv[1], "--motion-source-only") == 0)
+        return test_motion_source_declarations();
     if (argc == 2 && strcmp(argv[1], "--attribute-names-only") == 0)
         return test_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--shadow-scope-refusal-only") == 0)
@@ -3744,6 +6379,9 @@ int main(int argc, char **argv)
     CHECK(test_retained_nested_selector_invalidation() == 0);
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
+    if (argc == 2 && strcmp(argv[1], "--bounded-out-focus-only") == 0)
+        return test_bounded_out_sheet_keeps_focus_fast_path();
+    CHECK(test_bounded_out_sheet_keeps_focus_fast_path() == 0);
     CHECK(test_retained_keyless_lost_match() == 0);
     CHECK(test_retained_scoped_invalidation() == 0);
     CHECK(test_ancestor_filter_canonical_tokens() == 0);
@@ -3758,6 +6396,9 @@ int main(int argc, char **argv)
     CHECK(test_custom_rule_footprint() == 0);
     CHECK(test_long_custom_property_values() == 0);
     CHECK(test_registered_custom_properties() == 0);
+    CHECK(test_registered_length_ancestor_reuse() == 0);
+    CHECK(test_long_variable_names_cached() == 0);
+    CHECK(test_motion_source_declarations() == 0);
     CHECK(test_svg_raster_token_gate() == 0);
     CHECK(test_large_sheet_compiles_every_rule() == 0);
     CHECK(test_shared_selector_programs() == 0);

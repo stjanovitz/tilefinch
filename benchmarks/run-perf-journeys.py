@@ -28,7 +28,7 @@ Usage:
 
 --record    writes this run's values as the baselines of the journeys run
             (a new journey, or a deliberate reset recorded in
-            docs/engineering/PERFORMANCE_LEDGER.md).
+            .private-investigations/PERFORMANCE_LEDGER.md).
 --ratchet   lowers baselines that this run beat by more than their
             tolerance; it never raises one. A regression is fixed, or the
             baseline is raised by hand with the reason in the ledger.

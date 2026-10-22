@@ -2,6 +2,11 @@
 
 This is an inventory, not a runtime shaper. Rare clusters outside this list
 still use the ordinary scalar fallback. All interface clusters are included.
+
+FROZEN: this is the producer of the published v3-v11 hi.sequences files,
+whose bytes tilefinch-ui-translations-generated-check compares. Its cluster
+splitter deliberately does not keep ZWJ/ZWNJ after a virama; that is fixed
+in indic_sequences.py for new catalogs. Do not change this file.
 """
 import unicodedata
 

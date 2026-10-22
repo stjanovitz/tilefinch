@@ -1229,7 +1229,7 @@ int main(int argc, char **argv)
                     command->x, command->y, command->width, command->height,
                     command->color, command->font_size,
                     (int) draw_command_font_family(command),
-                    draw_command_font_weight_code(command) >= 60 ? 1 : 0);
+                    draw_uses_bold_face(command) ? 1 : 0);
             if (command->type == DRAW_TEXT && command->text != NULL) {
                 fprintf(layout_file, "%.*s", (int) command->text_length,
                         command->text);

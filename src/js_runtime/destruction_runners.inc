@@ -2,6 +2,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     Budget *budget = runtime->budget;
+    image_preloads_destroy(runtime);
 #ifndef TILEFINCH_NO_TRACE
     if (tilefinch_trace_gc()) {
         ScriptHeapGrowth growth;
@@ -115,6 +116,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
                      runtime->bridge.trusted_stable_script_wrap);
         JS_FreeValue(runtime->context,
                      runtime->bridge.trusted_retire_native_node_state);
+        JS_FreeValue(runtime->context,
+                     runtime->bridge.trusted_hold_event_state);
+        JS_FreeValue(runtime->context,
+                     runtime->bridge.trusted_release_event_holders);
         JS_FreeValue(runtime->context, runtime->bridge.trusted_node_wrap);
         JS_FreeValue(runtime->context, runtime->bridge.current_script);
         JS_FreeValue(runtime->context, runtime->function_to_string);
@@ -126,8 +131,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         }
         JS_FreeValue(runtime->context, runtime->host_global);
         runtime->host_global = JS_UNDEFINED;
+#ifdef JS_RT_XHR_DIAGNOSTICS
         JS_FreeValue(runtime->context, runtime->private_outcome_classifier);
         runtime->private_outcome_classifier = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->xhr_diagnostics_install);
+        runtime->xhr_diagnostics_install = JS_UNDEFINED;
+#endif
         JS_FreeValue(runtime->context, runtime->dispatch_submit_handle);
         JS_FreeValue(
             runtime->context, runtime->dom_content_loaded_dispatch);
@@ -173,6 +182,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->dispatch_at = JS_UNDEFINED;
         runtime->bridge.trusted_stable_script_wrap = JS_UNDEFINED;
         runtime->bridge.trusted_retire_native_node_state = JS_UNDEFINED;
+        runtime->bridge.trusted_hold_event_state = JS_UNDEFINED;
+        runtime->bridge.trusted_release_event_holders = JS_UNDEFINED;
         runtime->bridge.trusted_node_wrap = JS_UNDEFINED;
         runtime->bridge.current_script = JS_NULL;
         for (size_t slot = 0; slot < SCRIPT_WORKER_REALM_LIMIT; slot++) {
@@ -220,7 +231,9 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
     budget_free(budget, runtime->validation_phases);
 #endif
+#ifdef JS_RT_XHR_DIAGNOSTICS
     budget_free(budget, runtime->xhr_diagnostics);
+#endif
     budget_free(budget, runtime->image_load_states);
     budget_free(budget, runtime);
 }

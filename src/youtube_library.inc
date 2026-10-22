@@ -89,12 +89,13 @@ static bool lite_html_playlist_card(YoutubeLiteHtml *html,
         && lite_html_text(html, "</section>");
 }
 
-static void lite_channel_metadata(const YoutubeLiteSpan *scope, char channel[25])
+static void lite_channel_metadata(const YoutubeLiteSpan *scope,
+                                  char channel[YOUTUBE_CHANNEL_ID_CAPACITY])
 {
     YoutubeLiteSpan object;
     if (channel[0] == '\0'
         && lite_json_key(scope, "channelMetadataRenderer", NULL, &object)) {
-        char id[25] = {0};
+        char id[YOUTUBE_CHANNEL_ID_CAPACITY] = {0};
         if (lite_member_string(&object, "externalId", id, sizeof(id), false)
             && lite_valid_account_id(id, true)) memcpy(channel, id, sizeof(id));
     }

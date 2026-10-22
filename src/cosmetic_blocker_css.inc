@@ -1,0 +1,7 @@
+":is([class^=\"ad-slot-\"],[class*=\" ad-slot-\"],[class*=\"\\9 ad-slot-\"],[class*=\"\\a ad-slot-\"],[class*=\"\\c ad-slot-\"],[class*=\"\\d ad-slot-\"]),"
+":is([class^=\"ad-banner-\"],[class*=\" ad-banner-\"],[class*=\"\\9 ad-banner-\"],[class*=\"\\a ad-banner-\"],[class*=\"\\c ad-banner-\"],[class*=\"\\d ad-banner-\"]),"
+"ins.adsbygoogle,.advertisement,.advertising,.ad-banner,.ad-container,"
+".ad-slot,.ad-wrapper,.sponsored,.promoted,.promotedlink,[data-ad],[data-ad-slot],"
+"[data-csa-c-slot-id^=\"adplacements:\"],"
+"[data-ad-client],[aria-label=\"advertisement\"],"
+"[aria-label=\"sponsored\"]{display:none!important}"

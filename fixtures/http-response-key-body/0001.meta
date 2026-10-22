@@ -1,0 +1,31 @@
+psp-http-trace=3
+method=POST
+url=https://visual-body.test/query
+success=1
+async-delay-pumps=0
+external-cancel=0
+transport-timeout=0
+error=
+request-body-length=7
+request-body-hash=c80150d239d58f98
+request-cookie-bytes=0
+request-has-cf-clearance=0
+request-extra-header-bytes=0
+request-send-client-hints=0
+request-send-low-client-hints=1
+request-sec-fetch-user=1
+request-upgrade-insecure=1
+status=200
+length=6
+effective-url=https://visual-body.test/query
+content-type=text/plain; charset=utf-8
+etag=
+last-modified=
+cf-mitigated=
+accept-ch=
+critical-ch=
+server=fixture
+cf-ray=
+response-header-count=1
+set-cookie-count=0
+response-header-0=content-type: text/plain; charset=utf-8

@@ -107,20 +107,38 @@ static bool lite_html_search_filters(YoutubeLiteHtml *html, const char *url, con
     return ok && lite_html_text(html, "</form></details>");
 }
 
-static bool lite_chapter_number(const YoutubeLiteSpan *value, unsigned *number)
+/* A JSON number, or the same digits quoted. */
+static void lite_chapter_unquote(const YoutubeLiteSpan *value,
+                                 const char **at, const char **end)
 {
-    const char *at = value->start;
-    const char *end = value->end;
-    if (at < end && *at == '"') { at++; end--; }
+    *at = value->start;
+    *end = value->end;
+    if (*end - *at >= 2 && **at == '"') { (*at)++; (*end)--; }
+}
+
+/* A chapter start in milliseconds, at most the one-week start ceiling. */
+static bool lite_chapter_millis(const YoutubeLiteSpan *value, unsigned *millis)
+{
+    const unsigned ceiling = YOUTUBE_START_MAXIMUM_SECONDS * 1000u;
+    const char *at, *end;
+    lite_chapter_unquote(value, &at, &end);
     if (at == end || end - at > 9) return false;
     unsigned n = 0;
     for (; at < end; at++) {
-        if (*at < '0' || *at > '9' || n > (604800000u - (unsigned) (*at - '0')) / 10u)
+        if (*at < '0' || *at > '9' || n > (ceiling - (unsigned) (*at - '0')) / 10u)
             return false;
         n = n * 10 + (unsigned) (*at - '0');
     }
-    *number = n;
+    *millis = n;
     return true;
+}
+
+/* A chapter link's start, read like every other start time. */
+static bool lite_chapter_seconds(const YoutubeLiteSpan *value, unsigned *seconds)
+{
+    const char *at, *end;
+    lite_chapter_unquote(value, &at, &end);
+    return youtube_start_seconds_parse(at, end, seconds);
 }
 
 /* Returns the end of one declared chapter object, never an old visibility
@@ -133,9 +151,9 @@ static const char *lite_chapter_next(YoutubeLiteWatch *watch, const YoutubeLiteS
         && (!found || other.start < object.start)) { object = other; found = true; }
     if (!found) return NULL;
     unsigned seconds = 0;
-    char title[80] = {0};
+    char title[MEDIA_CHAPTER_TITLE_CAPACITY] = {0};
     bool valid = lite_json_member(&object, "timeRangeStartMillis", &value)
-        && lite_chapter_number(&value, &seconds);
+        && lite_chapter_millis(&value, &seconds);
     if (valid) seconds /= 1000u;
     else {
         YoutubeLiteSpan endpoint;
@@ -144,16 +162,16 @@ static const char *lite_chapter_next(YoutubeLiteWatch *watch, const YoutubeLiteS
             && lite_member_string(&endpoint, "videoId", id, sizeof(id), false)
             && strcmp(id, watch->video.id) == 0
             && lite_json_member(&endpoint, "startTimeSeconds", &value)
-            && lite_chapter_number(&value, &seconds);
+            && lite_chapter_seconds(&value, &seconds);
     }
-    valid = valid && seconds <= 604800u
+    valid = valid && seconds <= YOUTUBE_START_MAXIMUM_SECONDS
         && (!watch->duration_seconds || seconds < watch->duration_seconds)
         && lite_text_runs(&object, "title", title, sizeof(title)) && title[0];
     if (valid && watch->chapter_count < YOUTUBE_LITE_MAXIMUM_CHAPTERS
         && (!watch->chapter_count || seconds > watch->chapters[watch->chapter_count - 1].seconds)) {
         YoutubeLiteChapter *chapter = &watch->chapters[watch->chapter_count++];
         chapter->seconds = seconds;
-        memcpy(chapter->title, title, sizeof(title));
+        memcpy(chapter->title, title, sizeof(chapter->title));
     }
     return object.end;
 }

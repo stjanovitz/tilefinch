@@ -610,7 +610,9 @@ static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page,
 
 /* The stylesheet's recorded sources are compared by address during style
    append; one that is freed could be mistaken for a later element at its
-   address, so its sheet stops vouching for any source. */
+   address, so its sheet stops vouching for any source. Until the next
+   rebuild its adopted rules apply by document scope alone, and the next
+   relayout rebuilds (navigation_relayout_body). */
 static void navigation_retire_style_sources(Stylesheet *sheet,
                                             const lxb_dom_node_t *root)
 {
@@ -689,7 +691,10 @@ static bool navigation_mutation_is_transient(
 static bool navigation_mutations_are_semantic_only(
     const NavigationSession *session, const ScriptMutationJournal *mutations)
 {
+    /* A required rebuild is never skipped: the flag would stay set, and
+       each later relayout would pause the image preloads again for it. */
     if (session == NULL || mutations == NULL || mutations->count == 0
+        || session->style_rebuild_required
         || mutations->overflowed || mutations->resource_rebuild_required
         || mutations->image_resource_scan_required
         || mutations->image_resource_refresh_required) {
@@ -740,7 +745,7 @@ static bool navigation_focus_parent_style(
            pure translation (the translate(-50%, -50%) centring idiom) is
            baked into every descendant command and box by layout, so it
            composites nothing and focus paint stays exact under it. */
-        bool translation_only = parent->transform_scale_q6 == 64
+        bool translation_only = parent->transform_scale_q14 == 16384
             && parent->individual_rotate_quadrants == 0
             && !parent->has_perspective;
         if (parent->opacity != 255
@@ -811,8 +816,9 @@ static bool navigation_layout_provisional(const NavigationSession *session);
 static bool navigation_focus_geometry_unchanged(
     NavigationSession *session, const ScriptMutationJournal *mutations)
 {
+    /* Unadmitted optional images have not changed the installed geometry.
+       A pending publication or a journaled image change still blocks reuse. */
     if (session == NULL || !session->page.loaded || session->style_rebuild_required
-        || session->page.image_continuation_pending
         || session->page.visual_image_publication_pending
         || navigation_layout_provisional(session)
         || mutations == NULL || mutations->count == 0
@@ -861,7 +867,9 @@ static bool navigation_mutations_are_paint_only_focus(
     bool *border_paint, bool *local)
 {
     if (border_paint != NULL) *border_paint = false;
+    /* As for a semantic-only skip: a required rebuild is never skipped. */
     if (session == NULL || mutations == NULL || mutations->count == 0
+        || session->style_rebuild_required
         || mutations->count > NAVIGATION_FOCUS_PAINT_CANDIDATE_LIMIT
         || mutations->overflowed || mutations->resource_rebuild_required
         || mutations->image_resource_scan_required
@@ -1338,6 +1346,13 @@ static bool navigation_try_append_style_sources(
         return navigation_style_append_refused("adopted changed");
     if (seen != sheet->style_source_count)
         return navigation_style_append_refused("source removed");
+    /* A document source past the table's bound leaves every adopted source
+       without a bit, so shadow-only rules would reach the whole document.
+       The rebuild orders document sources first and declines the adopted
+       sources that no longer fit instead. */
+    if (sheet->adopted_source_count != 0
+        && first_adopted > STYLE_SOURCE_NODE_LIMIT - sheet->style_source_count)
+        return navigation_style_append_refused("source bound");
     /* The journal describes image changes exactly, or they are ruled out
        here: otherwise the rebuild must re-derive the image table. */
     uint64_t fingerprint = 0;
@@ -1496,6 +1511,33 @@ static bool navigation_try_append_style_sources(
         && !navigation_load_web_fonts(session, document_url))
         session->performance.mutation_style_append_fallbacks++;
     session->performance.mutation_style_appends++;
+    return true;
+}
+
+static bool navigation_rescope_unchanged_sources(NavigationSession *session)
+{
+    Stylesheet *sheet = &session->page.stylesheet;
+    const ExternalStylesheetStats *external = &session->page.external_stylesheets;
+    if (sheet->style_sources_bounded_out || sheet->adopted_scopes_failed
+        || external->skipped_pressure != 0 || external->skipped_limit != 0
+        || external->failed != 0 || external->truncated != 0
+        || external->deadline_cancelled != 0) return false;
+    lxb_dom_node_t *sources[DOCUMENT_ADOPTED_TIER_LIMIT];
+    uint32_t revisions[DOCUMENT_ADOPTED_TIER_LIMIT];
+    size_t count = document_adopted_sheets_active(&session->page.document,
+        sources, revisions, DOCUMENT_ADOPTED_TIER_LIMIT);
+    if (count == SIZE_MAX || count != sheet->adopted_source_count) return false;
+    uint64_t signature = 0;
+    for (size_t i = 0; i < count; i++)
+        signature = document_adopted_tier_hash(signature, sources[i], revisions[i]);
+    if (signature != sheet->adopted_sources_signature) return false;
+    bool global = false;
+    const lxb_dom_node_t *changed[DOCUMENT_ADOPTION_ROOT_LIMIT];
+    size_t changed_count = 0;
+    if (!stylesheet_set_adopted_scopes(sheet, &session->page.document,
+            changed, DOCUMENT_ADOPTION_ROOT_LIMIT, &changed_count, &global)) return false;
+    if (global || changed_count != 0)
+        layout_reuse_cache_reset(session->page.layout_reuse);
     return true;
 }
 
@@ -1846,7 +1888,8 @@ static void navigation_evict_layout_reuse_under_pressure(
 {
     if (session == NULL || session->page.layout_reuse == NULL) return;
     if (!budget_pressure_required(
-            session->budget, 384u * 1024u, 512u * 1024u)) return;
+            session->budget, LAYOUT_REUSE_STYLE_WORKING_BYTES,
+            LAYOUT_REUSE_STYLE_RESERVE_BYTES)) return;
     /* Selector results are much smaller than resolved ComputedStyles and
        remain valid through this pressure decision. Reclaim values first;
        destroying and immediately recreating both tables makes every update
@@ -1854,7 +1897,8 @@ static void navigation_evict_layout_reuse_under_pressure(
        all DOM/stylesheet changes. */
     (void) layout_reuse_cache_reclaim_styles(session->page.layout_reuse);
     if (!budget_pressure_required(
-            session->budget, 384u * 1024u, 512u * 1024u)) return;
+            session->budget, LAYOUT_REUSE_STYLE_WORKING_BYTES,
+            LAYOUT_REUSE_STYLE_RESERVE_BYTES)) return;
     layout_reuse_cache_destroy(session->page.layout_reuse);
     session->page.layout_reuse = NULL;
     session->performance.layout_reuse_pressure_evictions++;
@@ -2824,7 +2868,8 @@ static bool navigation_mutations_are_hidden_only(
 }
 
 static bool navigation_relayout_body(NavigationSession *session,
-                                     StyleWebFonts **retained_fonts);
+                                     StyleWebFonts **retained_fonts,
+                                     bool *restart_after_retirement);
 
 /* These writes leave every node and text buffer borrowed by the incumbent
    intact. Structural/text mutations, dropped journal entries and resource
@@ -2870,7 +2915,12 @@ bool navigation_relayout(NavigationSession *session)
     }
 #endif
     StyleWebFonts *retained_fonts = NULL;
-    bool ok = navigation_relayout_body(session, &retained_fonts);
+    bool ok = false;
+    for (unsigned attempt = 0; attempt < 2u; attempt++) {
+        bool restart = false;
+        ok = navigation_relayout_body(session, &retained_fonts, &restart);
+        if (!restart) break;
+    }
     if (retained_fonts != NULL)
         stylesheet_release_web_fonts(session->budget, retained_fonts);
 #ifndef TILEFINCH_NO_TRACE
@@ -2905,7 +2955,8 @@ bool navigation_relayout(NavigationSession *session)
 }
 
 static bool navigation_relayout_body(NavigationSession *session,
-                                     StyleWebFonts **retained_fonts)
+                                     StyleWebFonts **retained_fonts,
+                                     bool *restart_after_retirement)
 {
     if (session == NULL || !session->page.loaded) return false;
     tilefinch_platform_trace_step("relayout-prepare");
@@ -2941,6 +2992,14 @@ static bool navigation_relayout_body(NavigationSession *session,
         && navigation_mutations_are_canvas_paint_only(
             session, &mutations)) return true;
     session->canvas_paint_damage_pending = false;
+    /* A sheet whose sources were bounded out by a retirement holds
+       shadow-only adopted rules it now refuses everywhere (fail closed).
+       Rebuild it rather than lay out its components unstyled. */
+    const Stylesheet *page_sheet = &session->page.stylesheet;
+    if (page_sheet->style_sources_bounded_out
+        && page_sheet->adopted_source_count != 0
+        && page_sheet->adopted_shadow_only_mask != 0)
+        session->style_rebuild_required = true;
     bool conservative_scan = !mutation_driven
         || mutations.conservative_resource_scan;
     bool full_rebuild = session->style_rebuild_required
@@ -2952,6 +3011,17 @@ static bool navigation_relayout_body(NavigationSession *session,
         && !session->style_rebuild_required
         && mutations.resource_rebuild_required
         && !mutations.retirement_unobserved;
+    if (full_rebuild || conservative_scan
+        || mutations.image_resource_scan_required
+        || mutations.image_resource_refresh_required) {
+        /* Detached-image jobs borrow this cascade and share the JPEG lane.
+           Requeue them before changing resources, not after the replacement
+           is attached: decoder contention is not a failed required layout.
+           Child realms share that same process-wide decoder. */
+        script_runtime_pause_image_preloads(session->page.runtime);
+        for (size_t i = 0; i < session->page.frame_count; i++)
+            script_runtime_pause_image_preloads(session->page.frames[i].runtime);
+    }
     bool appended_images = false, style_append_done = false;
 #if NAVIGATION_RELAYOUT_PHASE_LOG
     const NavigationPerformance *counters = &session->performance;
@@ -3045,6 +3115,19 @@ static bool navigation_relayout_body(NavigationSession *session,
             } else {
                 full_rebuild = true;
             }
+        }
+        /* Overflow describes unknown mutations, not necessarily changed
+           CSS. A complete source census lets us keep the admitted cascade
+           while updating its adoption scopes. Changed source identity,
+           content, policy, order or incomplete admission keeps the rebuild. */
+        if (full_rebuild && mutation_driven
+            && !session->style_rebuild_required
+            && !mutations.retirement_unobserved
+            && !navigation_fingerprint_part_changed(session, 2)
+            && navigation_rescope_unchanged_sources(session)) {
+            full_rebuild = false;
+            image_rebuild = true;
+            session->page.compiled_stylesheet_cacheable = false;
         }
     }
 #ifndef TILEFINCH_NO_TRACE
@@ -3380,6 +3463,14 @@ static bool navigation_relayout_body(NavigationSession *session,
         }
         return true;
     }
+    /* Rebuildable owner caches must not consume the workspace for required
+       style/layout. Do this only on the already-expensive full path, never
+       for ordinary focus, scrolling or canvas updates. */
+    size_t rebuild_reserve = session->budget->limit / 8u;
+    if (rebuild_reserve > 4u*1024u*1024u) rebuild_reserve = 4u*1024u*1024u;
+    if (session->reclaim_optional != NULL
+        && budget_remaining(session->budget) < rebuild_reserve)
+        session->reclaim_optional(session->reclaim_optional_opaque);
     int old_height = session->page.layout.height;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Full rebuild steps (fast relayouts print tilefinch-relayout-phases). */
@@ -3400,7 +3491,11 @@ static bool navigation_relayout_body(NavigationSession *session,
     /* Keep only the independently owned font registry, not the old rules or
        layout. The wrapper releases it on every success/refusal path. */
     if (session->web_fonts_enabled && session->web_font_mode != WEB_FONTS_OFF) {
-        *retained_fonts = session->page.stylesheet.web_fonts;
+        if (*retained_fonts == NULL)
+            *retained_fonts = session->page.stylesheet.web_fonts;
+        else if (session->page.stylesheet.web_fonts != NULL)
+            stylesheet_release_web_fonts(session->budget,
+                session->page.stylesheet.web_fonts);
         session->page.stylesheet.web_fonts = NULL;
     }
     stylesheet_destroy(&session->page.stylesheet);
@@ -3437,7 +3532,7 @@ static bool navigation_relayout_body(NavigationSession *session,
         /* Display-retarget counters describe the page, not one table. */
         ImageResources counters = {0};
         counters.retarget = session->page.images.retarget;
-        images_destroy(&session->page.images);
+        images_prepare_external_rebuild(&session->page.images);
         FULL_RELAYOUT_STEP();
         if (!stylesheets_load_external_tracked_with_context(
                 &session->page.document, &session->page.stylesheet,
@@ -3480,7 +3575,16 @@ static bool navigation_relayout_body(NavigationSession *session,
         stylesheet_share_unchanged_web_fonts(&session->page.stylesheet,
             *retained_fonts, session->maximum_font_face_backend_bytes);
         navigation_ensure_layout_reuse(session);
-        if (!images_load_external_reusing_layout_styles_excluding(
+        bool images_loaded = false;
+        /* A mutation can consume the shared ceiling while reclaimable VM
+           storage still fits its separate heap limit. Retry only a genuine
+           allocator refusal: collect once, then stop exhausted page realms
+           as the required-layout recovery below does. Cancellation, policy
+           errors and injected faults retain the ordinary fail-closed path. */
+        for (unsigned attempt = 0; attempt < 3u; attempt++) {
+            size_t image_failures = session->budget->failure_count;
+            size_t image_injections = session->budget->injected_failure_count;
+            images_loaded = images_rebuild_external_reusing_rasters(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, session->budget,
                 session->page.resource_base_url,
@@ -3491,7 +3595,32 @@ static bool navigation_relayout_body(NavigationSession *session,
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session, session->page.layout_reuse,
-                session->fonts, session->viewport.css_width, deferred, deferred_count)) {
+                session->fonts, session->viewport.css_width, deferred, deferred_count);
+            if (images_loaded || attempt == 2u || session->page.runtime == NULL
+                || session->budget->failure_count == image_failures
+                || session->budget->injected_failure_count != image_injections)
+                break;
+            if (!tilefinch_platform_cooperate("image-rebuild-retry", attempt))
+                break;
+            if (attempt == 0)
+                (void) script_runtime_collect_and_trim(session->page.runtime);
+            else {
+                if (!navigation_retire_exhausted_script_realms_mode(
+                        session, true, false)) break;
+                /* CSS admission may already have skipped sources while
+                   memory was tight. Rebuild it with the released headroom,
+                   not with an unstyled or fallback-expanded component tree.
+                   The wrapper retries once; the retired realm cannot
+                   request another retry. Keep the original font owner. */
+                session->page.images.retarget = counters.retarget;
+                session->style_rebuild_required = true;
+                *restart_after_retirement = true;
+                return false;
+            }
+        }
+        if (!images_loaded) {
+            snprintf(session->last_error, sizeof(session->last_error),
+                     "could not rebuild page image resources");
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
@@ -3523,6 +3652,10 @@ static bool navigation_relayout_body(NavigationSession *session,
 #endif
     size_t rebuild_failures = session->budget->failure_count;
     size_t rebuild_injections = session->budget->injected_failure_count;
+    size_t layout_free = budget_remaining(session->budget);
+    if (layout_free < rebuild_reserve)
+        (void) images_reclaim_rebuildable_rasters(&session->page.images,
+            session->browser_session, rebuild_reserve - layout_free);
     bool built = navigation_build_layout(
         session, &session->page.layout, session->fonts, session->images);
 #if !defined(__PSP__)
@@ -5078,13 +5211,6 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             /* Face changes invalidate sizing and ch-dependent styles, not
                the font-independent cascade. Use the same transaction as
                application-font publication. */
-#ifndef __PSP__
-            if (tilefinch_test_faults()->legacy_web_font_work) {
-                layout_reuse_cache_destroy(session->page.layout_reuse);
-                session->page.layout_reuse = NULL;
-                session->performance.layout_reuse_retained_bytes = 0;
-            } else
-#endif
             layout_reuse_cache_begin_font_publication(session->page.layout_reuse);
             bool relaid_out = false;
 #if !defined(__PSP__)
@@ -5214,6 +5340,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
 static void navigation_accumulate_script_metrics(
     NavigationSession *session, const ExternalScriptMetrics *metrics)
 {
+    if (metrics->skipped_pressure != 0u)
+        session->page.script_memory_limited = true;
     if (metrics->failed != 0u || metrics->skipped_cross_origin != 0u
         || metrics->skipped_quota != 0u
         || metrics->skipped_pressure != 0u
@@ -5904,6 +6032,9 @@ bool navigation_advance_runtime(NavigationSession *session,
                 callback_budget);
             return true;
         }
+#if NAVIGATION_CAPABILITY_TRACES_COMPILED
+        /* Lab error context (last_script_error_context is read only by the
+           host lab): decode a generated function's source into it. */
         unsigned long generated_line = 0, generated_column = 0;
         bool captured_generated_source = false;
         if (tilefinch_trace_eval_source()
@@ -5972,6 +6103,7 @@ bool navigation_advance_runtime(NavigationSession *session,
                      original_error);
             session->page.script_result.success = false;
         }
+#endif
         page_capability_trace_report(session);
         snprintf(session->last_error, sizeof(session->last_error), "%s",
                  session->page.script_result.error[0] == '\0'

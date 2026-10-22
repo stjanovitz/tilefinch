@@ -1789,6 +1789,7 @@ static int test_foundation(void)
     CHECK(test_image_node_cap_ownership(&budget));
     CHECK(test_image_refresh_transfers_shared_ownership(&budget));
     CHECK(test_decoded_media_surface_ownership(&budget));
+    CHECK(test_decoded_media_surface_refresh(&budget));
     CHECK(test_decoded_media_surface_replaces_poster(&budget));
     CHECK(test_mutable_surface_cache_invalidation(&budget));
     CHECK(test_picture_source_media_selection(&budget));
@@ -1811,6 +1812,8 @@ static int test_foundation(void)
     puts("test: bounded inline SVG symbol/use raster resource");
     CHECK(test_inline_svg_symbol_use_resource(&budget));
     CHECK(test_external_svg_symbol_use_resource(&budget));
+    CHECK(test_external_svg_sprite_indexed_once(&budget));
+    CHECK(test_compact_adopted_sheet_indices(&budget));
     CHECK(test_stylesheet_shared_cache_body(&budget));
     CHECK(test_stylesheet_transient_retry_recovers(&budget));
     CHECK(test_stylesheet_transient_retry_cap(&budget));

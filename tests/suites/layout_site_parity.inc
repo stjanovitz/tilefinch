@@ -967,6 +967,22 @@ static int test_intrinsic_float_rows(void)
     CHECK(group->width == 24 && group->height == 20);
     CHECK(left->y == right->y && right->x - left->x == 14);
     CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}.group{display:inline-block;"
+        "font-size:0;line-height:0}.item{display:inline-block;width:40px;"
+        "height:20px;vertical-align:top}.right{float:right;height:50px}"
+        ".taller{height:30px}</style><div class=group id=group>"
+        "<i class=item id=before></i><b class='item right' id=float></b>"
+        "<i class='item taller' id=after></i></div>"));
+    group = parity_box(&page, "group");
+    const LayoutNodeBox *before = parity_box(&page, "before");
+    const LayoutNodeBox *floating = parity_box(&page, "float");
+    const LayoutNodeBox *after = parity_box(&page, "after");
+    CHECK(group && before && floating && after);
+    CHECK(group->width == 120 && group->height == 50
+          && before->y == floating->y && after->y == before->y
+          && before->x < after->x && after->x < floating->x);
+    CHECK(parity_page_destroy(&page));
     return 0;
 }
 
@@ -1040,6 +1056,23 @@ static int test_positioned_percentage_height_after_flow(void)
 {
     ParityPage page;
     CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}#host{position:absolute;top:55px;"
+        "bottom:0;width:100%;display:flex;flex-direction:column}#surface{"
+        "position:relative;flex-basis:50%;flex-grow:1}#tools{position:absolute;"
+        "top:0;right:0;height:100%;display:flex;flex-direction:column;"
+        "flex-wrap:wrap-reverse;column-gap:10px}#tools>div{width:40px;height:80px}"
+        "</style><div id=host><div id=surface><div><div id=tools>"
+        "<div id=first></div><div></div><div id=third></div>"
+        "</div></div></div></div>"));
+    const LayoutNodeBox *surface = parity_box(&page, "surface");
+    const LayoutNodeBox *tools = parity_box(&page, "tools");
+    const LayoutNodeBox *first = parity_box(&page, "first");
+    const LayoutNodeBox *third = parity_box(&page, "third");
+    CHECK(surface && tools && first && third && surface->height == 217);
+    CHECK(tools->height == surface->height && third->y == first->y
+          && third->x == first->x - 50);
+    CHECK(parity_page_destroy(&page));
+    CHECK(parity_page_load(&page,
         "<!doctype html><style>body{margin:0;font:14px/14px sans-serif}"
         ".outer{position:relative;width:448px}"
         ".line{display:flex;height:23px}.next{display:flex;position:absolute;"
@@ -1079,7 +1112,8 @@ static int test_page_font_normal_leading(void)
         fonts.sans.data_length, 2u * MIB));
     int metric = font_metric_height_fixed_at_size(&web, 922);
     CHECK(metric > 0 && metric < (922 * 6 + 2) / 5
-          && font_line_height_fixed_at_size(&web, 922) == metric
+          && font_line_height_fixed_at_size(&web, 922)
+                 == ((metric + 32) / 64) * 64
           && font_line_height_fixed_at_size(&fonts.sans, 922) > metric);
     font_face_destroy(&web);
     font_set_destroy(&fonts);
@@ -1323,6 +1357,344 @@ static int test_nested_flex_baseline(void)
         "nested baseline: marker=%d/%d label=%d atomic-y=%d\n",
         baseline->y, baseline->height, label_baseline, atomic->y);
     CHECK(baseline->y + baseline->height == label_baseline && atomic->height == 70);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* align-items:baseline aligns the items' text baselines, which include
+   the half-leading of each item's line-height (CSS Flexbox 8.5,
+   CSS 2.1 10.8.1): two items whose line-heights differ must still share
+   one baseline. */
+static int test_flex_row_baseline_line_height(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        "#row{display:flex;align-items:baseline}"
+        "#tight{line-height:16px}#loose{line-height:40px}</style>"
+        "<div id=row><span id=tight>Tight</span><span id=loose>Loose</span></div>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    const DrawCommand *tight = text_command(&page.layout, "Tight");
+    const DrawCommand *loose = text_command(&page.layout, "Loose");
+    CHECK(tight && loose && tight->height != loose->height);
+    int tight_baseline = tight->y + font_line_baseline_at_size(
+        &fonts.sans, 16 * 64, tight->height);
+    int loose_baseline = loose->y + font_line_baseline_at_size(
+        &fonts.sans, 16 * 64, loose->height);
+    if (tight_baseline != loose_baseline) fprintf(stderr,
+        "flex baseline: tight=%d (y=%d h=%d) loose=%d (y=%d h=%d)\n",
+        tight_baseline, tight->y, tight->height,
+        loose_baseline, loose->y, loose->height);
+    CHECK(tight_baseline == loose_baseline);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* A naturally sized column flex container exports its first item's first
+   baseline (CSS Flexbox 8.5). Relative positioning and z-index leave a box
+   in flow (CSS Position 3, 3.4), so their text sets that baseline just as
+   it does in a row; only out-of-flow (absolute) text is skipped. Each first
+   item here is a row flex container, which exports no completed line
+   baseline, so the column scans the item's text. */
+static int test_column_flex_positioned_item_baseline(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        ".atomic{display:inline-block;width:200px}"
+        ".col{display:flex;flex-direction:column}.row{display:flex}"
+        ".label{font-size:12px;line-height:18px}"
+        ".tail{font-size:20px;line-height:26px}"
+        ".badge{position:absolute;top:0;left:300px;font-size:30px;line-height:40px}"
+        ".marker{display:inline-block;width:1px;height:1px}</style>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<span class=label style=position:relative>Relative</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m1 class=marker></span></div>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<span class=label style=z-index:1>Stacked</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m2 class=marker></span></div>"
+        "<div><span class=atomic><span class=col>"
+        "<span class=row style=position:relative><span class=label>Moved</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m3 class=marker></span></div>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<span style=position:relative><span class=badge>Badge</span></span>"
+        "<span class=label>Flowing</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m4 class=marker></span></div>";
+    static const char *const labels[] = {
+        "Relative", "Stacked", "Moved", "Flowing"
+    };
+    static const char *const markers[] = { "m1", "m2", "m3", "m4" };
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        const LayoutNodeBox *marker = parity_box(&page, markers[i]);
+        const DrawCommand *label = text_command(&page.layout, labels[i]);
+        CHECK(marker && label);
+        int label_baseline = label->y + font_line_baseline_at_size(
+            &fonts.sans, 12 * 64, label->height);
+        if (marker->y + marker->height != label_baseline) {
+            fprintf(stderr, "column baseline %s: marker=%d label=%d\n",
+                    labels[i], marker->y + marker->height, label_baseline);
+            failures++;
+        }
+    }
+    CHECK(failures == 0);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* Row align-items:baseline uses the same first baseline: text in an
+   absolutely positioned descendant is out of flow and must not set it,
+   while relatively positioned or z-indexed text does (see above). */
+static int test_flex_row_out_of_flow_baseline(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        "#row{display:flex;align-items:baseline}.inner{display:flex}"
+        ".label{font-size:12px;line-height:18px}"
+        ".badge{position:absolute;top:0;left:300px;font-size:30px;line-height:40px}"
+        "#outer{line-height:16px}</style>"
+        "<div id=row><span class=inner>"
+        "<span style=position:relative><span class=badge>Badge</span></span>"
+        "<span class=label style=z-index:1>Inner</span></span>"
+        "<span id=outer>Outer</span></div>";
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    const DrawCommand *inner = text_command(&page.layout, "Inner");
+    const DrawCommand *outer = text_command(&page.layout, "Outer");
+    CHECK(inner && outer);
+    int inner_baseline = inner->y + font_line_baseline_at_size(
+        &fonts.sans, 12 * 64, inner->height);
+    int outer_baseline = outer->y + font_line_baseline_at_size(
+        &fonts.sans, 16 * 64, outer->height);
+    if (inner_baseline != outer_baseline) fprintf(stderr,
+        "row out-of-flow baseline: inner=%d outer=%d\n",
+        inner_baseline, outer_baseline);
+    CHECK(inner_baseline == outer_baseline);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* Out-of-flow text with no out-of-flow node box of its own must not set a
+   flex first baseline either: an absolutely positioned ::before/::after
+   (painted without a node box) and absolutely positioned form controls.
+   Column cases compare a marker after the inline-block column with the
+   first item's label; row cases compare the item's label with an outer
+   item's text. */
+static int test_flex_out_of_flow_generated_baseline(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        ".atomic{display:inline-block;width:200px}"
+        ".col{display:flex;flex-direction:column}.row{display:flex}"
+        ".label{font-size:12px;line-height:18px}"
+        ".tail{font-size:20px;line-height:26px}"
+        ".badged::before{content:'NEW';position:absolute;top:0;left:300px;"
+        "font-size:30px;line-height:40px}"
+        ".abs{position:absolute;top:0;left:300px;font-size:30px;"
+        "line-height:40px;height:40px}"
+        ".marker{display:inline-block;width:1px;height:1px}"
+        ".base{display:flex;align-items:baseline}.inner{display:flex}"
+        ".outer{line-height:16px}</style>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<span class='label badged'>Pseudo</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m1 class=marker></span></div>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<input class=abs value=Badge><span class=label>Control</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m2 class=marker></span></div>"
+        "<div><span class=atomic><span class=col><span class=row>"
+        "<button class=abs>Badge</button><span class=label>Button</span></span>"
+        "<span class=tail>Tail</span></span></span>"
+        "<span id=m3 class=marker></span></div>"
+        "<div class=base><span class=inner>"
+        "<span class='label badged'>RowPseudo</span></span>"
+        "<span class=outer>OuterA</span></div>"
+        "<div class=base><span class=inner>"
+        "<input class=abs value=Badge><span class=label>RowControl</span>"
+        "</span><span class=outer>OuterB</span></div>";
+    static const char *const labels[] = { "Pseudo", "Control", "Button" };
+    static const char *const markers[] = { "m1", "m2", "m3" };
+    static const char *const row_labels[] = { "RowPseudo", "RowControl" };
+    static const char *const row_outers[] = { "OuterA", "OuterB" };
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        const LayoutNodeBox *marker = parity_box(&page, markers[i]);
+        const DrawCommand *label = text_command(&page.layout, labels[i]);
+        CHECK(marker && label);
+        int label_baseline = label->y + font_line_baseline_at_size(
+            &fonts.sans, 12 * 64, label->height);
+        if (marker->y + marker->height != label_baseline) {
+            fprintf(stderr, "column out-of-flow baseline %s: marker=%d "
+                    "label=%d\n", labels[i], marker->y + marker->height,
+                    label_baseline);
+            failures++;
+        }
+    }
+    for (size_t i = 0; i < sizeof(row_labels) / sizeof(row_labels[0]); i++) {
+        const DrawCommand *inner = text_command(&page.layout, row_labels[i]);
+        const DrawCommand *outer = text_command(&page.layout, row_outers[i]);
+        CHECK(inner && outer);
+        int inner_baseline = inner->y + font_line_baseline_at_size(
+            &fonts.sans, 12 * 64, inner->height);
+        int outer_baseline = outer->y + font_line_baseline_at_size(
+            &fonts.sans, 16 * 64, outer->height);
+        if (inner_baseline != outer_baseline) {
+            fprintf(stderr, "row out-of-flow baseline %s: inner=%d "
+                    "outer=%d\n", row_labels[i], inner_baseline,
+                    outer_baseline);
+            failures++;
+        }
+    }
+    CHECK(failures == 0);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* Stacked slides: a baseline-aligned item whose in-flow label follows 100
+   absolutely positioned slides, each in a relatively positioned wrapper
+   (200 descendant boxes). The out-of-flow walk is one bounded pass (256
+   boxes, a 32-entry range list); the run of slides must still skip as one
+   range rather than overflow the list. The old walk restarted for every
+   skipped slide and visited 20,100 boxes per baseline here. */
+static int test_flex_row_many_out_of_flow_baseline(void)
+{
+    static const char head[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        "#row{display:flex;align-items:baseline}.inner{display:flex}"
+        ".label{font-size:12px;line-height:18px}"
+        ".slide{position:absolute;top:0;left:300px;font-size:30px;"
+        "line-height:40px}#outer{line-height:16px}</style>"
+        "<div id=row><span class=inner>";
+    static const char slide[] =
+        "<span style=position:relative><span class=slide>Slide</span></span>";
+    static const char tail[] =
+        "<span class=label>Inner</span></span>"
+        "<span id=outer>Outer</span></div>";
+    char html[sizeof(head) + 100 * (sizeof(slide) - 1) + sizeof(tail)];
+    size_t length = 0;
+    memcpy(html, head, sizeof(head) - 1);
+    length += sizeof(head) - 1;
+    for (int i = 0; i < 100; i++) {
+        memcpy(html + length, slide, sizeof(slide) - 1);
+        length += sizeof(slide) - 1;
+    }
+    memcpy(html + length, tail, sizeof(tail));
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    const DrawCommand *inner = text_command(&page.layout, "Inner");
+    const DrawCommand *outer = text_command(&page.layout, "Outer");
+    CHECK(inner && outer);
+    int inner_baseline = inner->y + font_line_baseline_at_size(
+        &fonts.sans, 12 * 64, inner->height);
+    int outer_baseline = outer->y + font_line_baseline_at_size(
+        &fonts.sans, 16 * 64, outer->height);
+    if (inner_baseline != outer_baseline) fprintf(stderr,
+        "row stacked slides baseline: inner=%d outer=%d\n",
+        inner_baseline, outer_baseline);
+    CHECK(inner_baseline == outer_baseline);
+    font_set_destroy(&fonts);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
+/* A generated flex item's box lives in the flex order plan, not in
+   layout->node_boxes, and has no descendant boxes. Its relatively
+   positioned (and z-indexed) text is in the positioned paint phase, still
+   in flow, so it sets the item's baseline. The old out-of-flow walk did
+   pointer arithmetic between the plan's box and node_boxes and read
+   records outside the array (an ASan report in the sanitize preset). */
+static int test_flex_generated_positioned_item_baseline(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0;font:16px sans-serif}"
+        ".row{display:flex;align-items:baseline;line-height:16px}"
+        ".rel::before{content:'$';position:relative;font-size:28px;"
+        "line-height:34px}"
+        ".stack::before{content:'#';position:relative;z-index:2;"
+        "font-size:28px;"
+        "line-height:34px}</style>"
+        "<div class='row rel'><span id=a>Rel</span></div>"
+        "<div class='row stack'><span id=b>Stack</span></div>";
+    static const char *const labels[] = { "Rel", "Stack" };
+    static const char *const marks[] = { "$", "#" };
+    ParityPage page;
+    CHECK(parity_page_load(&page, html));
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, &page.budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 2 * MIB, FONT_SET_FACE_SANS));
+    layout_destroy(&page.layout);
+    page.layout_ready = layout_build(&page.layout, &page.budget,
+        &page.document, &page.sheet, &fonts, NULL, 480);
+    CHECK(page.layout_ready);
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        const DrawCommand *label = text_command(&page.layout, labels[i]);
+        const DrawCommand *mark = text_command(&page.layout, marks[i]);
+        CHECK(label && mark);
+        if (!draw_command_has_positioned_phase(mark)) {
+            fprintf(stderr, "generated item %s: not positioned phase\n",
+                    marks[i]);
+            failures++;
+        }
+        int label_baseline = label->y + font_line_baseline_at_size(
+            &fonts.sans, 16 * 64, label->height);
+        int mark_baseline = mark->y + font_line_baseline_at_size(
+            &fonts.sans, 28 * 64, mark->height);
+        if (label_baseline != mark_baseline) {
+            fprintf(stderr, "generated item baseline %s: label=%d mark=%d\n",
+                    labels[i], label_baseline, mark_baseline);
+            failures++;
+        }
+    }
+    CHECK(failures == 0);
     font_set_destroy(&fonts);
     CHECK(parity_page_destroy(&page));
     return 0;
@@ -1914,7 +2286,7 @@ static int test_generated_rounded_border_sides(void)
     tile_cache_destroy(&cache);
     size_t index = (size_t) (border - page.layout.commands);
     layout_scale_range(&page.layout, index, page.layout.link_count,
-        page.layout.control_count, page.layout.node_box_count, 0, 0, 128, NULL);
+        page.layout.control_count, page.layout.node_box_count, 0, 0, 32768, NULL);
     for (unsigned i = 0; i < 4; i++) CHECK(draw_command_stroke_side(border, i) == (i + 1) * 2);
     layout_rotate_range_quadrants(&page.layout, index, page.layout.link_count,
         page.layout.control_count, page.layout.node_box_count, 0, 0, 1, NULL);
@@ -2139,6 +2511,12 @@ static int test_site_parity(void)
     CHECK(test_generated_inline_padding() == 0);
     CHECK(test_fractional_tracking() == 0);
     CHECK(test_nested_flex_baseline() == 0);
+    CHECK(test_flex_row_baseline_line_height() == 0);
+    CHECK(test_column_flex_positioned_item_baseline() == 0);
+    CHECK(test_flex_row_out_of_flow_baseline() == 0);
+    CHECK(test_flex_generated_positioned_item_baseline() == 0);
+    CHECK(test_flex_out_of_flow_generated_baseline() == 0);
+    CHECK(test_flex_row_many_out_of_flow_baseline() == 0);
     CHECK(test_css_replacement_image() == 0);
     CHECK(test_button_content_centering() == 0);
     CHECK(test_nested_toolbar_intrinsics() == 0);

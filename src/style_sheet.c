@@ -63,17 +63,47 @@ typedef struct {
 #define STYLE_PARSED_IR_CONTAINER_END UINT16_C(2)
 #define STYLE_PARSED_IR_KEYFRAMES UINT16_C(3)
 
+/* Whether `text` holds "animation" in any ASCII case. Every declaration
+   name the motion scan keeps contains it, so a rule without it is skipped
+   in one byte pass instead of a declaration-by-declaration parse. */
+static bool stylesheet_text_mentions_animation(const char *text,
+                                               size_t length)
+{
+    static const char rest[] = "nimation";
+    for (size_t at = 0; length >= 9u && at <= length - 9u; at++) {
+        if ((text[at] | 0x20) != 'a') continue;
+        size_t i = 0;
+        while (i < 8u && (text[at + 1u + i] | 0x20) == rest[i]) i++;
+        if (i == 8u) return true;
+    }
+    return false;
+}
+
+/* Bounds of the motion scheduler's CSS source: all of it, one rule's
+   header or (animation-only) body, and how many keyframes blocks and
+   animated style rules it keeps. Past any of them it is bounded out. */
+#define STYLE_MOTION_CSS_MAXIMUM_BYTES (64u * 1024u)
+#define STYLE_MOTION_CSS_MAXIMUM_RULE_BYTES 4096u
+#define STYLE_MOTION_CSS_MAXIMUM_KEYFRAMES 16u
+#define STYLE_MOTION_CSS_MAXIMUM_RULES 128u
+
 /* Optional scheduler metadata. Refusal leaves ordinary styling intact and
-   the bootstrap can still discover inline motion from the DOM. */
+   the bootstrap can still discover inline motion from the DOM. Anything
+   not kept sets motion_css_bounded_out: the source is then incomplete. */
 static void stylesheet_note_motion_source(
     Stylesheet *sheet, const char *header, size_t header_length,
     const char *body, size_t body_length, bool keyframes)
 {
-    enum { maximum_bytes = 64 * 1024, maximum_rule_bytes = 4096 };
+    enum {
+        maximum_bytes = STYLE_MOTION_CSS_MAXIMUM_BYTES,
+        maximum_rule_bytes = STYLE_MOTION_CSS_MAXIMUM_RULE_BYTES
+    };
     if (sheet == NULL || sheet->budget == NULL
         || sheet->motion_css_bounded_out || sheet->motion_css_source_blocked
         || sheet->parsing_scoped_source
         || sheet->current_container_query != 0) return;
+    if (!keyframes && !stylesheet_text_mentions_animation(body, body_length))
+        return;
     char declarations[maximum_rule_bytes];
     size_t kept = 0;
     if (!keyframes) {
@@ -97,7 +127,10 @@ static void stylesheet_note_motion_source(
                          || (name_length > 17 && name[17] == '-'))
                         && span_case_equal(name, 17, "-webkit-animation"));
                 if (animation) {
-                    if (length >= sizeof(declarations) - kept) return;
+                    if (length >= sizeof(declarations) - kept) {
+                        sheet->motion_css_bounded_out = true;
+                        return;
+                    }
                     memcpy(declarations + kept, item, length);
                     kept += length;
                     declarations[kept++] = ';';
@@ -111,8 +144,9 @@ static void stylesheet_note_motion_source(
     }
     if (header_length > maximum_rule_bytes
         || body_length > maximum_rule_bytes
-        || (keyframes ? sheet->motion_css_keyframes >= 16
-                      : sheet->motion_css_rules >= 128)) {
+        || (keyframes
+            ? sheet->motion_css_keyframes >= STYLE_MOTION_CSS_MAXIMUM_KEYFRAMES
+            : sheet->motion_css_rules >= STYLE_MOTION_CSS_MAXIMUM_RULES)) {
         sheet->motion_css_bounded_out = true;
         return;
     }
@@ -310,6 +344,22 @@ static bool style_parsed_ir_builder_append(
     return true;
 }
 
+/* The Stylesheet.diagnostic_* counters measure what the cascade dropped or
+   rejected, for the host lab and test reports. They compile out with the
+   trace switches (shipping PSP builds). The fields stay, since public
+   struct layouts must not depend on that private define. */
+#ifndef TILEFINCH_NO_TRACE
+static void diagnostic_saturating_add(uint64_t *value, size_t increment)
+{
+    if (value == NULL || *value == UINT64_MAX || increment == 0) return;
+    uint64_t add = (uint64_t) increment;
+    *value = add > UINT64_MAX - *value ? UINT64_MAX : *value + add;
+}
+#define STYLE_DIAGNOSTIC_COUNT(sheet, field) \
+    diagnostic_saturating_add(&(sheet)->field, 1)
+#else
+#define STYLE_DIAGNOSTIC_COUNT(sheet, field) ((void) 0)
+#endif
 
 #include "style_sheet/declarations.inc"
 #include "style_sheet/transitions.inc"
@@ -793,13 +843,9 @@ static bool attribute_selector_targets_identity(const char *text,
 uint32_t stylesheet_identity_token_hash(bool id, const char *text,
                                         size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261) ^ (id ? UINT32_C(0x23) : UINT32_C(0x2e));
-    hash *= UINT32_C(16777619);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) text[i];
-        hash *= UINT32_C(16777619);
-    }
-    return hash;
+    const char *kind = id ? "#" : ".";
+    return style_fnv1a(style_fnv1a(STYLE_FNV1A_SEED, kind, 1, false),
+                       text, length, false);
 }
 
 static void relational_tokens_add(StyleRuleFilter *filter, uint32_t *tokens,
@@ -959,12 +1005,8 @@ static bool selector_attribute_name_byte(unsigned char value);
 
 uint32_t stylesheet_identity_attribute_hash(const char *name, size_t length)
 {
-    uint32_t hash = (UINT32_C(2166136261) ^ UINT32_C(0x5b)) * UINT32_C(16777619);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) tolower((unsigned char) name[i]);
-        hash *= UINT32_C(16777619);
-    }
-    return hash;
+    return style_fnv1a(style_fnv1a(STYLE_FNV1A_SEED, "[", 1, false),
+                       name, length, true);
 }
 
 bool style_selector_identity_tokens(const char *text, size_t length,
@@ -1562,11 +1604,23 @@ static uint32_t style_rule_key_hash(SelectorType type, const char *text,
        and confirms collisions with an exact type/length/text comparison.
        A 64-bit FNV multiply therefore bought no correctness while being
        particularly expensive on 32-bit Allegrex. */
-    uint32_t hash = UINT32_C(2166136261) ^ (uint32_t) type;
-    for (size_t i = 0; i < length; i++) {
-        hash = (hash ^ (unsigned char) text[i]) * UINT32_C(16777619);
-    }
+    uint32_t hash = style_fnv1a(STYLE_FNV1A_SEED ^ (uint32_t) type, text,
+                                length, type == SELECTOR_TAG);
     return hash == 0 ? UINT32_C(1) : hash;
+}
+
+/* Tag buckets fold ASCII case (style_rule_key_hash); every other key is
+   exact. */
+static bool style_rule_key_text_equal(SelectorType type, const char *left,
+                                      const char *right, size_t length)
+{
+    if (memcmp(left, right, length) == 0) return true;
+    if (type != SELECTOR_TAG) return false;
+    for (size_t i = 0; i < length; i++) {
+        if (style_ascii_lower((unsigned char) left[i])
+            != style_ascii_lower((unsigned char) right[i])) return false;
+    }
+    return true;
 }
 
 const char *style_rule_fast_key(const StyleRule *rule)
@@ -1669,12 +1723,12 @@ static bool style_rule_bucket_key_matches(
             rule, scratch, sizeof(scratch), &derived_type, &derived_length);
         return derived != NULL && derived_type == type
             && derived_length == length
-            && memcmp(derived, text, length) == 0;
+            && style_rule_key_text_equal(type, derived, text, length);
     }
     const char *fast_key = style_rule_fast_key(rule);
     return rule->type == type
         && fast_key != NULL && rule->fast_key_length == length
-        && memcmp(fast_key, text, length) == 0;
+        && style_rule_key_text_equal(type, fast_key, text, length);
 }
 
 StyleRuleIndexBucket *style_rule_find_bucket(
@@ -2031,6 +2085,15 @@ bool stylesheet_build_context(Stylesheet *sheet, Budget *budget,
         !tilefinch_csp_allows_style_attribute(
             &document->content_security_policy);
     sheet->noscript_rendered = document->noscript_rendered;
+    sheet->font_text_pages = document->font_text_pages;
+    sheet->api_registrations = document->registered_properties;
+    for (const DocumentRegisteredProperty *property = document->registered_properties;
+         property != NULL; property = property->next) {
+        if (!stylesheet_register_api_property(sheet, property)) {
+            stylesheet_destroy(sheet);
+            return false;
+        }
+    }
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
     StyleCssParseContext parse = {
         .sheet = sheet,
@@ -2068,7 +2131,16 @@ bool stylesheet_build_context_deferred(
         !tilefinch_csp_allows_style_attribute(
             &document->content_security_policy);
     sheet->noscript_rendered = document->noscript_rendered;
+    sheet->font_text_pages = document->font_text_pages;
+    sheet->api_registrations = document->registered_properties;
     sheet->document_rules_deferred = true;
+    for (const DocumentRegisteredProperty *property = document->registered_properties;
+         property != NULL; property = property->next) {
+        if (!stylesheet_register_api_property(sheet, property)) {
+            stylesheet_destroy(sheet);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2084,6 +2156,8 @@ bool stylesheet_reset_document_rules(Stylesheet *sheet)
     bool block_inline_style_attributes =
         sheet->block_inline_style_attributes;
     bool noscript_rendered = sheet->noscript_rendered;
+    uint64_t font_text_pages = sheet->font_text_pages;
+    const DocumentRegisteredProperty *api_registrations = sheet->api_registrations;
     stylesheet_destroy(sheet);
     bool initialized = stylesheet_initialize(
         sheet, budget, viewport_width, viewport_height);
@@ -2092,6 +2166,15 @@ bool stylesheet_reset_document_rules(Stylesheet *sheet)
         sheet->block_inline_style_attributes =
             block_inline_style_attributes;
         sheet->noscript_rendered = noscript_rendered;
+        sheet->font_text_pages = font_text_pages;
+        sheet->api_registrations = api_registrations;
+        for (const DocumentRegisteredProperty *property = api_registrations;
+             property != NULL; property = property->next) {
+            if (!stylesheet_register_api_property(sheet, property)) {
+                stylesheet_destroy(sheet);
+                return false;
+            }
+        }
     }
     return initialized;
 }
@@ -2273,36 +2356,9 @@ static bool stylesheet_parse_elements_body(StyleCssParseContext *parse,
         lxb_dom_node_t *element = input->elements[i];
         size_t name_length = 0;
         const char *name = document_element_name(element, &name_length);
-        size_t override_length = 0;
-        const char *override = document_cssom_sheet_text(element, &override_length);
-        if (name == NULL || !span_equal(name, name_length, "style")) {
-            parsed = false;
-            break;
-        }
-        stylesheet_note_style_source(parse->sheet, element);
-        if (!tilefinch_csp_allows_inline_style(input->policy, element)) continue;
-        unsigned scope_begin = parse->sheet->next_order;
-        bool scoped = document_shadow_carrier_containing(element) != NULL;
-        if (scoped && !stylesheet_reserve_shadow_scope(parse->sheet))
-            continue;
-        parse->sheet->parsing_scoped_source = scoped;
-        if (override != NULL) {
-            TILEFINCH_WORK_ADD(css_bytes, override_length);
-            parsed = parse_css_range(parse, override, 0, override_length);
-        }
-        for (lxb_dom_node_t *child = override == NULL ? element->first_child : NULL;
-             parsed && child != NULL; child = child->next) {
-            size_t length = 0;
-            const char *css = document_text_data(child, &length);
-            if (css == NULL) continue;
-            TILEFINCH_WORK_ADD(css_bytes, length);
-            parsed = parse_css_range(parse, css, 0, length);
-        }
-        parse->sheet->parsing_scoped_source = false;
-        if (scoped) {
-            stylesheet_note_shadow_scope(parse->sheet, element, scope_begin,
-                                         parse->sheet->next_order);
-        }
+        /* The caller hands over only <style> elements. */
+        parsed = name != NULL && span_equal(name, name_length, "style")
+            && stylesheet_parse_style_element(parse, element, input->policy);
     }
     return parsed;
 }
@@ -2319,6 +2375,15 @@ static bool stylesheet_add_css_from_context_internal(
        { NULL, 0 }; both representations must be equivalent.  Returning
        before dropping the index also makes a semantic no-op allocation-free. */
     if (length == 0) return true;
+    /* External UTF-8 byte streams consume their signature during decoding.
+       Do not turn it into part of the first selector, or strip U+FEFF from
+       authored CSS strings / the middle of a source. */
+    if (source_base_url != NULL && length >= 3u
+        && memcmp(css, "\xef\xbb\xbf", 3u) == 0) {
+        css += 3;
+        length -= 3u;
+        if (length == 0) return true;
+    }
     /* Parsing can append some valid rules before rejecting a malformed
        suffix.  Invalidate observers before the first possible mutation,
        including that conservative failure case. */
@@ -3262,6 +3327,7 @@ bool stylesheet_append_sources_tracked(
     if (sheet == NULL || sheet->budget == NULL || append == NULL) return false;
     size_t old_count = sheet->count;
     size_t old_sources = sheet->style_source_count;
+    unsigned old_adopted_end = sheet->adopted_rule_order_end;
     if (old_count > UINT16_MAX || after_source > old_sources) return false;
     unsigned *old_orders = old_count == 0 ? NULL
         : budget_malloc(sheet->budget, old_count * sizeof(*old_orders));
@@ -3336,6 +3402,18 @@ bool stylesheet_append_sources_tracked(
             scope->begin = stylesheet_inserted_rule_order(
                 scope->begin, tail_start, boundary, appended_orders);
             scope->end = last + 1u;
+        }
+        if (sheet->adopted_rule_order_end != 0) {
+            unsigned end = stylesheet_inserted_rule_order(
+                sheet->adopted_rule_order_end - 1u, tail_start,
+                boundary, appended_orders) + 1u;
+            if (old_adopted_end != 0) {
+                unsigned old_end = stylesheet_inserted_rule_order(
+                    old_adopted_end - 1u, tail_start, boundary,
+                    appended_orders) + 1u;
+                if (old_end > end) end = old_end;
+            }
+            sheet->adopted_rule_order_end = end;
         }
         for (size_t j = 1; j < sheet->shadow_scope_count; j++) {
             StyleShadowScope moving = sheet->shadow_scopes[j];
@@ -3619,6 +3697,7 @@ bool stylesheet_add_adopted_sheet(Stylesheet *sheet,
     if (!known && stylesheet_style_source_known(sheet, node)
         && sheet->adopted_source_count < UINT8_MAX) {
         sheet->adopted_source_count++;
+        sheet->adopted_rule_order_end = sheet->next_order;
         sheet->adopted_sources_signature = document_adopted_tier_hash(
             sheet->adopted_sources_signature, node, revision);
     }
@@ -3633,16 +3712,6 @@ static int stylesheet_compare_scope_roots(const void *left,
     return a < b ? -1 : a > b;
 }
 
-static uint64_t stylesheet_scope_mask_of(const StyleAdoptedScopeRoot *roots,
-                                         size_t count,
-                                         const lxb_dom_node_t *root)
-{
-    for (size_t i = 0; i < count; i++) {
-        if (roots[i].root == root) return roots[i].mask;
-    }
-    return 0;
-}
-
 static uint64_t stylesheet_remap_scope_mask(uint64_t mask,
                                             const uint8_t remap[64])
 {
@@ -3653,6 +3722,107 @@ static uint64_t stylesheet_remap_scope_mask(uint64_t mask,
     }
     return result;
 }
+
+/* The root table holds one entry per adoption list, the document's
+   included; its count must not wrap at the registry's limit. */
+_Static_assert(DOCUMENT_ADOPTION_ROOT_LIMIT
+               <= (UINTMAX_C(1) << (8u * sizeof(((Stylesheet *) 0)
+                                                ->adopted_scope_root_count))) - 1u,
+               "adopted_scope_root_count must hold DOCUMENT_ADOPTION_ROOT_LIMIT");
+
+/* Sets adopted_order_varies when `order` lists a source out of place. */
+static void stylesheet_note_adopted_order(Stylesheet *sheet,
+                                          const uint8_t order[64],
+                                          size_t sources)
+{
+    for (size_t k = 0; k < sources && k < 64u; k++) {
+        if (order[k] != 0 && order[k] != k + 1u)
+            sheet->adopted_order_varies = true;
+    }
+}
+
+/* A refused scope update keeps the build and the committed root table.
+   Confined sources are declined; document scope/order needs no
+   allocation (adopted_document_mask/order are already current). */
+static bool stylesheet_refuse_adopted_scopes(Stylesheet *sheet,
+                                             const uint8_t document_order[64],
+                                             size_t sources, bool *global)
+{
+    sheet->adopted_scopes_failed = true;
+    stylesheet_note_adopted_order(sheet, document_order, sources);
+    stylesheet_drop_rule_index(sheet);
+    stylesheet_drop_custom_rule_index(sheet);
+    if (global != NULL) *global = true;
+    return false;
+}
+
+/* The roots whose confined sources or order differ between the new and
+   the committed table (both sorted by root, each root once), written to
+   `changed` up to `capacity`; the count is returned. With `remap`, old
+   source bits are renumbered to the new ones first. A changed document
+   entry, or more roots than fit, sets *overflow. */
+static size_t stylesheet_adopted_scope_changes(const PocDocument *document,
+    const StyleAdoptedScopeRoot *roots, size_t root_count,
+    const StyleAdoptedScopeRoot *old, size_t old_count,
+    const uint8_t *remap, size_t previous_count,
+    const lxb_dom_node_t **changed, size_t capacity, bool *overflow)
+{
+    size_t reported = 0;
+    bool tracked = remap != NULL;
+    for (size_t pass = 0; pass < 2; pass++) {
+        const StyleAdoptedScopeRoot *from = pass == 0 ? roots : old;
+        size_t from_count = pass == 0 ? root_count : old_count;
+        const StyleAdoptedScopeRoot *against = pass == 0 ? old : roots;
+        size_t against_count = pass == 0 ? old_count : root_count;
+        for (size_t i = 0; i < from_count; i++) {
+            StyleAdoptedScopeRoot translated;
+            const StyleAdoptedScopeRoot *entry = &from[i];
+            if (tracked && pass == 1) {
+                translated = *entry;
+                translated.mask = stylesheet_remap_scope_mask(entry->mask, remap);
+                memset(translated.order, 0, sizeof(translated.order));
+                for (size_t k = 0; k < previous_count; k++)
+                    translated.order[remap[k]] = entry->order[k];
+                entry = &translated;
+            }
+            const StyleAdoptedScopeRoot *match = style_adopted_scope_root_lookup(
+                against, against_count, entry->root);
+            uint64_t other = match == NULL ? 0 : match->mask;
+            if (tracked && pass == 0)
+                other = stylesheet_remap_scope_mask(other, remap);
+            bool same_order = false;
+            if (match != NULL) {
+                uint8_t order[64] = {0};
+                const uint8_t *other_order = match->order;
+                if (tracked && pass == 0) {
+                    for (size_t bit = 0; bit < previous_count; bit++)
+                        order[remap[bit]] = other_order[bit];
+                    other_order = order;
+                }
+                same_order = memcmp(other_order, entry->order,
+                                    sizeof(entry->order)) == 0;
+            }
+            if (other == entry->mask && same_order) continue;
+            /* A root listed with a different mask is reported once. A root
+               only the old table lists is reported while it lives: the
+               registry forgets a carrier before it is destroyed. */
+            if (pass == 1 && (other != 0
+                              || (from[i].root != NULL
+                                  && !document_adoption_root_known(
+                                         document, from[i].root)))) continue;
+            if (from[i].root == NULL) *overflow = true;
+            if (changed != NULL && reported < capacity)
+                changed[reported] = from[i].root;
+            else *overflow = true;
+            reported++;
+        }
+    }
+    return reported;
+}
+
+/* The roots a scope update builds stay on the stack up to this many; more
+   go to a budget block (DOCUMENT_ADOPTION_ROOT_LIMIT entries are 20 KiB). */
+#define STYLE_ADOPTED_SCOPE_STACK_ROOTS 8u
 
 bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
     const PocDocument *document,
@@ -3684,16 +3854,27 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
            that all previously scoped sources still exist. */
         if (remap[i] == UINT8_MAX) tracked = false;
     }
-    StyleAdoptedScopeRoot roots[DOCUMENT_ADOPTION_ROOT_LIMIT];
+    /* Compute: every active root's confined sources and their order. */
+    size_t active_lists = 0;
+    bool active = false;
+    for (size_t index = 0; sources != 0
+         && document_adoption_list_at(document, index, NULL, NULL, NULL,
+                                      &active); index++)
+        if (active) active_lists++;
+    StyleAdoptedScopeRoot stack_roots[STYLE_ADOPTED_SCOPE_STACK_ROOTS];
+    StyleAdoptedScopeRoot *roots = stack_roots;
+    if (active_lists > STYLE_ADOPTED_SCOPE_STACK_ROOTS)
+        roots = budget_malloc(sheet->budget, active_lists * sizeof(*roots));
+    size_t root_capacity = roots == NULL ? 0 : active_lists;
     size_t root_count = 0;
     uint64_t document_mask = 0, shadow_mask = 0;
     uint8_t document_order[64] = {0};
     const lxb_dom_node_t *root = NULL;
-    lxb_dom_node_t *const *list = NULL;
+    lxb_dom_node_t *list[DOCUMENT_ADOPTED_SHEETS_PER_ROOT] = {0};
     size_t length = 0;
-    bool active = false;
+    bool refused = false;
     for (size_t index = 0; sources != 0
-         && document_adoption_list_at(document, index, &root, &list,
+         && document_adoption_list_at(document, index, &root, list,
                                       &length, &active); index++) {
         if (!active) continue;
         StyleAdoptedScopeRoot entry = {.root = root};
@@ -3714,70 +3895,32 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
         } else {
             shadow_mask |= mask;
         }
-        if (root_count < DOCUMENT_ADOPTION_ROOT_LIMIT) {
+        if (root_count < root_capacity) {
             entry.mask = mask;
             roots[root_count++] = entry;
+        } else {
+            refused = true;
         }
     }
     uint64_t shadow_only = shadow_mask & ~document_mask;
-    /* Keep order even for document-adopted sources shared by roots. */
-    qsort(roots, root_count, sizeof(roots[0]),
-          stylesheet_compare_scope_roots);
-    /* Report what moved: every root whose confined sources differ. */
-    size_t reported = 0;
-    bool overflow = false;
-    const StyleAdoptedScopeRoot *old = sheet->adopted_scope_roots;
-    size_t old_count = sheet->adopted_scope_root_count;
-    for (size_t pass = 0; pass < 2; pass++) {
-        const StyleAdoptedScopeRoot *from = pass == 0 ? roots : old;
-        size_t from_count = pass == 0 ? root_count : old_count;
-        const StyleAdoptedScopeRoot *against = pass == 0 ? old : roots;
-        size_t against_count = pass == 0 ? old_count : root_count;
-        for (size_t i = 0; i < from_count; i++) {
-            StyleAdoptedScopeRoot translated;
-            const StyleAdoptedScopeRoot *entry = &from[i];
-            if (tracked && pass == 1) {
-                translated = *entry;
-                translated.mask = stylesheet_remap_scope_mask(entry->mask, remap);
-                memset(translated.order, 0, sizeof(translated.order));
-                for (size_t k = 0; k < previous_count; k++)
-                    translated.order[remap[k]] = entry->order[k];
-                entry = &translated;
-            }
-            uint64_t other = stylesheet_scope_mask_of(
-                against, against_count, entry->root);
-            if (tracked && pass == 0)
-                other = stylesheet_remap_scope_mask(other, remap);
-            bool same_order = false;
-            for (size_t k = 0; k < against_count; k++) {
-                if (against[k].root == entry->root) {
-                    uint8_t order[64] = {0};
-                    const uint8_t *other_order = against[k].order;
-                    if (tracked && pass == 0) {
-                        for (size_t bit = 0; bit < previous_count; bit++)
-                            order[remap[bit]] = other_order[bit];
-                        other_order = order;
-                    }
-                    same_order = memcmp(other_order, entry->order,
-                                        sizeof(entry->order)) == 0;
-                    break;
-                }
-            }
-            if (other == entry->mask && same_order) continue;
-            /* A root listed with a different mask is reported once. A root
-               only the old table lists is reported while it lives: the
-               registry forgets a carrier before it is destroyed. */
-            if (pass == 1 && (other != 0
-                              || (from[i].root != NULL
-                                  && !document_adoption_root_known(
-                                         document, from[i].root)))) continue;
-            if (from[i].root == NULL) overflow = true;
-            if (changed != NULL && reported < capacity)
-                changed[reported] = from[i].root;
-            else overflow = true;
-            reported++;
-        }
+    if (refused) {
+        /* The root block was refused: nothing to diff or install. */
+        sheet->adopted_document_mask = document_mask;
+        memcpy(sheet->adopted_document_order, document_order,
+               sizeof(document_order));
+        return stylesheet_refuse_adopted_scopes(sheet, document_order,
+                                                sources, global);
     }
+    /* Keep order even for document-adopted sources shared by roots. */
+    if (root_count > 1)
+        qsort(roots, root_count, sizeof(roots[0]),
+              stylesheet_compare_scope_roots);
+    /* Diff: report every root whose confined sources differ. */
+    bool overflow = false;
+    size_t reported = stylesheet_adopted_scope_changes(
+        document, roots, root_count, sheet->adopted_scope_roots,
+        sheet->adopted_scope_root_count, tracked ? remap : NULL,
+        previous_count, changed, capacity, &overflow);
     if (changed_count != NULL)
         *changed_count = reported < capacity ? reported : capacity;
     uint64_t old_shadow = sheet->adopted_shadow_only_mask;
@@ -3790,6 +3933,7 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
         *global = overflow
             || ((shadow_only ^ old_shadow) & (tracked ? existing : UINT64_MAX)) != 0
             || document_mask != old_document;
+    /* Install. */
     sheet->adopted_document_mask = document_mask;
     memcpy(sheet->adopted_document_order, document_order,
            sizeof(document_order));
@@ -3806,17 +3950,9 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
         }
 #endif
         if (root_count != 0 && table == NULL) {
-            /* Keep the build and committed root table. Decline confined
-               sources, but document scope/order needs no allocation. */
-            sheet->adopted_scopes_failed = true;
-            for (size_t k = 0; k < sources && k < 64u; k++) {
-                if (document_order[k] != 0 && document_order[k] != k + 1u)
-                    sheet->adopted_order_varies = true;
-            }
-            stylesheet_drop_rule_index(sheet);
-            stylesheet_drop_custom_rule_index(sheet);
-            if (global != NULL) *global = true;
-            return false;
+            if (roots != stack_roots) budget_free(sheet->budget, roots);
+            return stylesheet_refuse_adopted_scopes(sheet, document_order,
+                                                    sources, global);
         }
         budget_free(sheet->budget, sheet->adopted_scope_roots);
         sheet->adopted_scope_roots = table;
@@ -3824,7 +3960,7 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
     if (root_count != 0)
         memcpy(sheet->adopted_scope_roots, roots,
                root_count * sizeof(roots[0]));
-    sheet->adopted_scope_root_count = (uint8_t) root_count;
+    sheet->adopted_scope_root_count = (uint16_t) root_count;
     /* The rule indexes set shadow-scoped rules apart by this mask. */
     if (shadow_only != sheet->adopted_shadow_only_mask
         || sheet->adopted_scopes_failed) {
@@ -3834,12 +3970,9 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
     sheet->adopted_shadow_only_mask = shadow_only;
     sheet->adopted_scopes_failed = false;
     sheet->adopted_order_varies = false;
-    for (size_t i = 0; i < root_count; i++) {
-        for (size_t k = 0; k < sources && k < 64u; k++) {
-            if (roots[i].order[k] != 0 && roots[i].order[k] != k + 1u)
-                sheet->adopted_order_varies = true;
-        }
-    }
+    for (size_t i = 0; i < root_count; i++)
+        stylesheet_note_adopted_order(sheet, roots[i].order, sources);
+    if (roots != stack_roots) budget_free(sheet->budget, roots);
     return true;
 }
 
@@ -3926,8 +4059,10 @@ uint64_t stylesheet_parse_context_signature(const Stylesheet *sheet)
             &sheet->registered_properties[i];
         hash = stylesheet_signature_bytes(
             hash, property->name, property->name_length + 1u);
-        hash = stylesheet_signature_bytes(
-            hash, &property->inherits, sizeof(property->inherits));
+        uint8_t flags = (property->inherits ? 1u : 0u)
+            | (property->length_syntax ? 2u : 0u)
+            | (property->registered_by_api ? 4u : 0u);
+        hash = stylesheet_signature_bytes(hash, &flags, sizeof(flags));
         if (property->initial_value != NULL) {
             hash = stylesheet_signature_bytes(
                 hash, property->initial_value,

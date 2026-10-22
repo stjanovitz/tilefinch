@@ -70,6 +70,7 @@ typedef struct {
     char source_referrer_policies[STYLE_WEB_FONT_SOURCE_LIMIT]
                                  [STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY];
     size_t source_count;
+    uint8_t text_priority[STYLE_WEB_FONT_SOURCE_LIMIT];
 } StyleWebFontFaceSource;
 
 typedef struct {
@@ -152,6 +153,27 @@ struct StyleMathProgram {
 #define STYLE_LENGTH_PROGRAM_END INT32_C(0x4000ffff)
 #define STYLE_MATH_Q16 INT64_C(65536)
 #define STYLE_MATH_SOURCE_CAPACITY 256u
+/* style_resolve_value() buffers. A declaration whose var()-substituted
+   value does not fit its buffer is dropped, so each parser resolves into
+   the class of the longest value its property can take:
+   - STYLE_CUSTOM_RESOLVED_CAPACITY (style.h): open-ended values, i.e.
+     shorthands, lists, several components, functions (colours, images,
+     shapes, transforms), strings and names;
+   - STYLE_MATH_SOURCE_CAPACITY: one number, length or angle, which a math
+     function may spell (the math compiler refuses longer source), or one
+     of the property's keywords;
+   - STYLE_KEYWORD_RESOLVED_CAPACITY: values made of keywords only (the
+     longest, such as text-transform's `full-width full-size-kana
+     capitalize`, are under 40 bytes), and comparisons against a keyword.
+   Narrower named classes tied to storage (STYLE_GRID_AREA_NAME_CAPACITY,
+   STYLE_RETAINED_VALUE_CAPACITY) document their own bound. These are
+   stack buffers in leaf parsers reached through the property table, so a
+   buffer is live only for its own declaration. */
+#define STYLE_KEYWORD_RESOLVED_CAPACITY 96u
+/* ComputedStyle.transform_scale_q14 is Q14 (16384 = 1.0) and clamps at
+   255/64 (3.98x), the largest factor the retained display list draws. */
+#define STYLE_TRANSFORM_SCALE_Q14_ONE 16384u
+#define STYLE_TRANSFORM_SCALE_Q14_MAX 65280u
 #define STYLE_MATH_NODE_LIMIT 32u
 #define STYLE_MATH_STACK_LIMIT 8u
 #define STYLE_MATH_NESTING_LIMIT 8u
@@ -726,14 +748,38 @@ static inline bool style_token_bloom_missing(StyleTokenBloom required,
     return false;
 }
 
+/* ASCII lowercase. HTML type selectors match without ASCII case, so tag
+   keys and tokens hash folded: a foreign element's exact name only shares
+   a bucket or token with its case variants, which the matcher tells apart. */
+static inline unsigned char style_ascii_lower(unsigned char value)
+{
+    return value >= 'A' && value <= 'Z' ? (unsigned char) (value + 32u)
+                                        : value;
+}
+
+/* 32-bit FNV-1a of a byte span, continued from `hash` (STYLE_FNV1A_SEED,
+   or that seed mixed with a key type). `fold` lowers ASCII letters first,
+   for tag names and other case-insensitive keys; a key's every hash must
+   agree on it. Tables that keep 0 for an empty slot apply their own
+   sentinel to the result. */
+#define STYLE_FNV1A_SEED UINT32_C(2166136261)
+static inline uint32_t style_fnv1a(uint32_t hash, const void *data,
+                                   size_t length, bool fold)
+{
+    const unsigned char *bytes = data;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = bytes[i];
+        if (fold) value = style_ascii_lower(value);
+        hash = (hash ^ value) * UINT32_C(16777619);
+    }
+    return hash;
+}
+
 static inline uint32_t style_token_hash(
     StyleSelectorOpcode opcode, const char *text, size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261) ^ (uint32_t) opcode;
-    for (size_t i = 0; i < length; i++) {
-        hash = (hash ^ (unsigned char) text[i]) * UINT32_C(16777619);
-    }
-    return hash;
+    return style_fnv1a(STYLE_FNV1A_SEED ^ (uint32_t) opcode, text, length,
+                       opcode == STYLE_SELECTOR_TAG);
 }
 
 static inline StyleTokenBloom style_compound_token_bloom(
@@ -867,6 +913,20 @@ typedef struct StyleClassTokenCache {
 bool style_subject_has_class(const Stylesheet *sheet,
                              const StyleMatchSubject *subject,
                              const char *key, size_t key_length);
+/* A rule's fast-reject key against a prepared subject: an ID, a class, or
+   (any other type) a tag name. Style, custom and transition rules store
+   the key differently but all test it here. */
+static inline bool style_subject_key_matches(const Stylesheet *sheet,
+    const StyleMatchSubject *subject, SelectorType type,
+    const char *key, size_t length)
+{
+    if (type == SELECTOR_ID)
+        return subject->id != NULL && subject->id_length == length
+            && memcmp(subject->id, key, length) == 0;
+    if (type == SELECTOR_CLASS)
+        return style_subject_has_class(sheet, subject, key, length);
+    return style_subject_tag_matches(subject, key, length);
+}
 /* Bracket a stretch in which the DOM does not change. The outermost begin
    forgets every cached class list: attribute storage can be reused once
    the DOM changes, so a pointer and length identify a list only inside. */
@@ -959,8 +1019,37 @@ typedef struct StyleAdoptedScopeRoot {
     uint8_t order[64];
 } StyleAdoptedScopeRoot;
 
+/* The entry of `root` in a root table sorted by root address (each root
+   listed once), or NULL. */
+static inline const StyleAdoptedScopeRoot *style_adopted_scope_root_lookup(
+    const StyleAdoptedScopeRoot *roots, size_t count,
+    const lxb_dom_node_t *root)
+{
+    size_t low = 0, high = count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        uintptr_t at = (uintptr_t) roots[middle].root;
+        if (at == (uintptr_t) root) return &roots[middle];
+        if (at < (uintptr_t) root) low = middle + 1u;
+        else high = middle;
+    }
+    return NULL;
+}
+
 uint64_t style_adopted_cascade_order(const Stylesheet *sheet,
                                     const lxb_dom_node_t *node, unsigned order);
+/* The per-element part of style_adopted_cascade_order: the root entries of
+   the element's nearest adopting carrier and of the document, found once
+   for every adopted rule the element matches. Zero-initialize it. */
+typedef struct {
+    const StyleAdoptedScopeRoot *carrier;
+    const StyleAdoptedScopeRoot *document;
+    bool ready;
+} StyleAdoptedOrderContext;
+uint64_t style_adopted_cascade_order_in(const Stylesheet *sheet,
+                                        const lxb_dom_node_t *node,
+                                        StyleAdoptedOrderContext *context,
+                                        unsigned order);
 
 /* Whether a rule of cascade order `order` may apply to `node`: false only
    for a rule of an adopted sheet that just shadow roots adopt, at an
@@ -971,6 +1060,22 @@ bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
 /* The adopted source (its bit, as in Stylesheet.adopted_shadow_only_mask)
    holding the rule of cascade order `order`; 0 for a document source. */
 uint64_t style_adopted_source_bit(const Stylesheet *sheet, unsigned order);
+/* Whether adopted rules are admitted by document scope (and ordered by the
+   document's adoption) alone, failing confined sources closed: after a
+   refused scope update, and while the sheet's sources are bounded out. A
+   bounded-out sheet no longer vouches for its source addresses or the
+   carriers its scopes were derived from (one may have been freed), but
+   rule orders still say which adopted source holds each rule. Without an
+   adopted source no rule has a source bit, so a bounded-out sheet (one
+   restored from the compiled-stylesheet cache, or past
+   STYLE_SOURCE_NODE_LIMIT sources) changes no admission and keeps the
+   unconfined fast paths. */
+static inline bool style_adopted_scopes_document_only(const Stylesheet *sheet)
+{
+    return sheet->adopted_scopes_failed
+        || (sheet->style_sources_bounded_out
+            && sheet->adopted_source_count != 0);
+}
 /* The adopted sources whose carriers contain `node`, memoized on
    `subject` when it was prepared for `node`. */
 uint64_t style_subject_adopted_scope(const Stylesheet *sheet,
@@ -1043,7 +1148,8 @@ static inline bool style_adopted_rule_in_scope(const Stylesheet *sheet,
                                                const StyleMatchSubject *subject)
 {
     return (sheet->adopted_shadow_only_mask == 0
-            && sheet->shadow_scope_count == 0 && !sheet->adopted_scopes_failed)
+            && sheet->shadow_scope_count == 0
+            && !style_adopted_scopes_document_only(sheet))
         || style_shadow_scope_admits(sheet, order, selector,
                                      selector_length, node, subject);
 }
@@ -1075,9 +1181,18 @@ typedef struct StyleContainerState {
     uint32_t name_bits;
     int content_width;
     int content_height;
+    /* Container conditions answered against this geometry, by query id
+       (bit id - 1): a condition depends only on the selected container's
+       size and the sheet's fixed viewport, so each is evaluated once per
+       stored state, not once per element. A store that changes the state
+       starts both masks over. */
+    uint64_t conditions_evaluated;
+    uint64_t conditions_matched;
     uint8_t type;
     bool occupied;
 } StyleContainerState;
+_Static_assert(STYLE_CONTAINER_QUERY_LIMIT <= 64u,
+               "query ids must fit the per-container condition masks");
 
 typedef struct StyleContainerLogEntry {
     lxb_dom_node_t *node;
@@ -1107,9 +1222,23 @@ enum {
     STYLE_CONTAINER_TYPE_SIZE
 };
 
-/* Host regression seam. Production never arms it; the browser remains
-   single-threaded while style probes mutate their temporary marker. */
-void style_test_inject_focus_marker_remove_failures(size_t count);
+/* The native attribute that marks the focused element for :focus and
+   :focus-within. Focus probes save its value (shorter than the capacity)
+   and toggle it on the live DOM; the browser is single-threaded. */
+#define STYLE_FOCUS_MARKER "data-tilefinch-focus"
+#define STYLE_FOCUS_MARKER_VALUE_CAPACITY 64u
+
+/* Every attribute a supported state pseudo-class reads (simple_pseudo_matches
+   in style_match.c), paired with text that finds the pseudo-class in a
+   selector (":focus" also finds :focus-within and :focus-visible). An
+   attribute write can change such a selector's answer only through these
+   pairs or an [attribute] selector. */
+typedef struct {
+    const char *attribute;
+    const char *pseudo;
+} StylePseudoAttribute;
+extern const StylePseudoAttribute style_pseudo_attributes[];
+extern const size_t style_pseudo_attribute_count;
 
 /* Ordinary selectors fit ten offset bits; the 63 one-based @container ids
    fit the remaining six. Keep this packed field and the PSP rule size. */
@@ -1292,6 +1421,7 @@ _Static_assert(STYLE_CUSTOM_VALUE_CAPACITY <= UINT16_MAX
 
 /* CSS initial font size and the engine's used-font-size clamp (px). */
 #define STYLE_DEFAULT_FONT_PX 16
+#define STYLE_GENERATED_SCALAR_LENGTH UINT8_MAX
 #define STYLE_FONT_MIN_PX 6
 #define STYLE_FONT_MAX_PX 128
 
@@ -1417,12 +1547,40 @@ bool style_math_resolve_number_thousandths(
 bool style_math_resolve_number_thousandths_in(
     const Stylesheet *sheet, const char *text, size_t length,
     int minimum, int maximum, int *thousandths);
-bool style_math_identifier_equal(const char *text, size_t length,
-                                 const char *wanted);
+bool style_math_resolve_number_thousandths_wide(
+    const Stylesheet *sheet, const char *text, size_t length,
+    int64_t *thousandths);
 bool style_math_candidate(const Stylesheet *sheet, const char *text,
                           size_t length, StyleMathParser *parser,
                           StyleMathCandidate *candidate, int *root_output,
                           int em_basis, int rem_basis, int ch_basis);
+
+/* The one set of registration rules @property and CSS.registerProperty()
+   share. The cascade computes only <length> as a type; any other valid
+   syntax keeps its initial value and inheritance as an untyped token
+   stream. */
+typedef enum {
+    STYLE_REGISTRATION_INVALID = 0,
+    STYLE_REGISTRATION_UNIVERSAL,
+    STYLE_REGISTRATION_LENGTH,
+    STYLE_REGISTRATION_UNTYPED
+} StyleRegistrationSyntax;
+/* `syntax` is the unquoted syntax string; `initial` is NULL when no initial
+   value was given. INVALID when the name is not a custom property name, the
+   syntax string does not parse, a non-universal syntax has no initial value,
+   or a <length> initial value is not computationally independent. */
+StyleRegistrationSyntax style_registered_property_check(
+    const char *name, size_t name_length,
+    const char *syntax, size_t syntax_length,
+    const char *initial, size_t initial_length);
+
+/* A size container condition (the @container prelude after its name) for a
+   content box of width x height, with the media condition grammar; vw/vh
+   lengths resolve against the viewport. A top-level comma separates
+   alternatives. Unknown features and syntax are false. */
+bool style_container_condition_matches(const char *text, size_t length,
+                                       int width, int height,
+                                       int viewport_width, int viewport_height);
 bool style_math_resolve_media_length(const char *text, size_t length,
                                       int width, int height, int32_t *pixels_q8);
 bool style_parse_letter_spacing(const Stylesheet *sheet, const char *text,
@@ -1437,6 +1595,12 @@ uint64_t style_parse_border(
     const Stylesheet *sheet, const char *text, size_t length,
     int *width, uint32_t *color, uint8_t *alpha, unsigned *line_style,
     uint64_t edge_mask);
+/* The one <line-width> keyword map (thin 1, medium 3, thick 5 px, as
+   Chrome draws them), shared by border-width, outline-width and the
+   border and outline shorthands; ASCII case-insensitive. */
+bool style_line_width_keyword(const char *text, size_t length, int *width);
+/* A border <line-style> keyword as STYLE_BORDER_*, or UINT_MAX. */
+unsigned style_border_line_style(const char *text, size_t length);
 bool style_set_border_color(
     Stylesheet *sheet, ComputedStyle *style, StyleBorderSide side,
     uint32_t color, uint8_t alpha);
@@ -1444,13 +1608,24 @@ bool style_copy_border_color(
     Stylesheet *sheet, ComputedStyle *target, const ComputedStyle *source,
     StyleBorderSide side);
 bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text, size_t length, int values[2], bool automatic[2], bool percentages[2]);
-bool style_parse_pair(const Stylesheet *sheet, const char *text, size_t length, int *first, int *second);
 bool style_parse_grid_line(const Stylesheet *sheet, const char *text, size_t length, int *line, int *span);
 bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
                             size_t length, uint8_t *type, unsigned *value,
                             unsigned *minimum);
 bool style_parse_color_with_alpha(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color, uint8_t *alpha);
-bool style_font_span_equal(const char *text, size_t length, const char *wanted);
+/* The degrees in one `unit` (deg, grad, rad or turn, ASCII
+   case-insensitive); false for any other unit. */
+bool style_angle_unit_degrees(const char *unit, size_t length, double *scale);
+/* A CSS <angle> in degrees (finite, not normalized): a number and one of
+   those units, surrounding whitespace allowed. A unitless zero is an angle
+   only where `unitless_zero` (transform functions, gradients, rotate). */
+bool style_parse_angle_degrees(const char *text, size_t length,
+                               bool unitless_zero, double *degrees);
+/* The rotate and scale properties as the retained display list applies
+   them (NUL-terminated values): quarter turns about z, and one uniform
+   factor in Q14. @supports asks the same functions. */
+bool style_rotate_value_quadrants(const char *value, uint8_t *quadrants);
+bool style_scale_value_q14(const char *value, uint16_t *scale_q14);
 int style_font_size_from_fixed(int fixed, uint8_t *fraction);
 const char *style_store_generated_text(Stylesheet *sheet, const char *text, size_t length);
 uint8_t style_store_counter_operations(
@@ -1461,6 +1636,20 @@ bool style_parse_padding_pair(Stylesheet *sheet, const char *text, size_t length
 bool style_parse_image_url(Stylesheet *sheet, const char *text, size_t length, const char **output);
 /* Shared paren/quote-aware top-level list iterator; *cursor starts at zero. */
 bool style_next_top_level(const char *text, size_t length, char separator, size_t *cursor, size_t *start, size_t *end);
+/* The same scan for whitespace-separated shorthand components: the next
+   non-empty token outside parentheses and quotes, so `rgb(0 0 0 / 50%)` or
+   `calc(1px + 1px)` stays one token. *cursor starts at zero; false once no
+   token remains. */
+bool style_next_top_level_token(const char *text, size_t length, size_t *cursor, size_t *start, size_t *end);
+/* One CSS <easing-function> (a keyword, cubic-bezier(), steps() or
+   linear()) checked against its grammar and serialized as computed values
+   are: keywords lower-case, numbers canonical, arguments separated by
+   ", ". The one validator behind transition-timing-function, the
+   transition shorthand and, through __tilefinchTimingFunction, CSS
+   animations and Element.animate(). False for an invalid value or one
+   whose serialization does not fit `output_size`. */
+bool style_timing_function(const char *text, size_t length,
+                           char *output, size_t output_size);
 /* Bounded `linear-gradient()`; false for anything outside that grammar,
    which makes the declaration invalid and triggers the fallback path. */
 bool style_parse_gradient(const Stylesheet *sheet, const char *text, size_t length, StyleGradient *gradient);
@@ -1553,6 +1742,8 @@ size_t style_append_css_codepoint(char *output, size_t length, size_t capacity, 
 bool declaration_is_important(const char *value, size_t length);
 bool style_deferred_focus_shadow(const Stylesheet *sheet,
     const StyleDeclaration *declaration, bool outset);
+bool style_deferred_focus_shadow_exceeds(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, lxb_dom_node_t *node, size_t layers);
 size_t declaration_value_length(const char *value, size_t length);
 size_t skip_css_space_and_comments(const char *text, size_t length,
                                    size_t at);

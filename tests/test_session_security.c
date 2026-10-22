@@ -1759,6 +1759,299 @@ static int test_bounded_origin_private_file_system(Budget *budget)
     return 0;
 }
 
+static TilefinchRequestContext overlay_test_context(const char *url)
+{
+    return (TilefinchRequestContext) {
+        .target_url = url, .initiator_url = url, .top_level_url = url,
+        .method = "GET", .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true
+    };
+}
+
+/* Every request carries a private overlay of the jar. It must cost only
+   what it copies, yet stage Set-Cookie exactly as the jar would, through
+   the per-domain and global eviction limits. */
+static int test_cookie_overlay_footprint_and_equivalence(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session, mirror;
+    static char overlay_header[8192], jar_header[8192];
+    static const char *const urls[] = {
+        "https://www.a.test/", "https://www.b.test/", "https://www.c.test/"
+    };
+    CHECK(browser_session_init(&session, budget, 32u * 1024u)
+          && browser_session_init(&mirror, budget, 32u * 1024u));
+    size_t before = budget->current;
+    BrowserCookieOverlay *empty =
+        browser_session_cookie_overlay_create(budget, &session);
+    size_t empty_cost = budget->current - before;
+    browser_cookie_overlay_destroy(empty);
+    fprintf(stderr, "cookie overlay: empty jar %zu bytes\n", empty_cost);
+    CHECK(empty != NULL && empty_cost < 1024u);
+    for (unsigned i = 0; i < 40u; ++i) {
+        char cookie[96];
+        const char *url = urls[i % 2u];
+        snprintf(cookie, sizeof(cookie), "seed%u=v%u; Domain=%s; Path=/",
+                 i, i, i % 2u ? "b.test" : "a.test");
+        TilefinchRequestContext context = overlay_test_context(url);
+        CHECK(browser_session_cookie_set_http_context(&session, &context, cookie)
+              && browser_session_cookie_set_http_context(&mirror, &context, cookie));
+    }
+    before = budget->current;
+    BrowserCookieOverlay *overlay =
+        browser_session_cookie_overlay_create(budget, &session);
+    size_t populated_cost = budget->current - before;
+    fprintf(stderr, "cookie overlay: 40 cookies %zu bytes (table entry %zu)\n",
+            populated_cost, sizeof(BrowserCookieEntry));
+    CHECK(overlay != NULL
+          && populated_cost < 40u * sizeof(BrowserCookieEntry) + 4096u);
+    /* Grow through both limits: a.test past its per-domain bound, then a new
+       domain past the global table. */
+    for (unsigned i = 0; i < 48u; ++i) {
+        char cookie[96];
+        const char *url = urls[i < 24u ? 0 : 2];
+        snprintf(cookie, sizeof(cookie), "staged%u=w%u; Domain=%s; Path=/",
+                 i, i, i < 24u ? "a.test" : "c.test");
+        TilefinchRequestContext context = overlay_test_context(url);
+        bool staged = browser_cookie_overlay_set_http_context(
+            overlay, &context, cookie);
+        bool published = browser_session_cookie_set_http_context(
+            &mirror, &context, cookie);
+        CHECK(staged == published);
+        for (size_t u = 0; u < 3u; ++u) {
+            TilefinchRequestContext read = overlay_test_context(urls[u]);
+            CHECK(browser_cookie_overlay_header_context(
+                      overlay, &read, overlay_header, sizeof(overlay_header))
+                  && browser_session_cookie_header_context(
+                      &mirror, &read, jar_header, sizeof(jar_header))
+                  && strcmp(overlay_header, jar_header) == 0);
+        }
+    }
+    CHECK(contains_cookie(overlay_header, "staged47"));
+    /* A missing session still has no jar to read. */
+    CHECK(!browser_session_cookie_get(
+              NULL, urls[0], jar_header, sizeof(jar_header))
+          && !browser_session_cookie_header(
+              NULL, urls[0], jar_header, sizeof(jar_header)));
+    browser_cookie_overlay_destroy(overlay);
+    browser_session_destroy(&mirror);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* A jar whose matching cookies outgrow BROWSER_COOKIE_HEADER_CAPACITY sends a
+   bounded header that keeps the site's credentials, rather than going out
+   with no cookies at all (review 2026-10-21 M4). */
+static int test_cookie_header_bound(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    BrowserCookieDiagnostics diagnostics;
+    static char header[BROWSER_COOKIE_HEADER_CAPACITY];
+    static char overlay_header[BROWSER_COOKIE_HEADER_CAPACITY];
+    static const char *const credentials[] = {"account", "sid"};
+    char small[512] = "stale";
+    TilefinchRequestContext context =
+        overlay_test_context("https://www.bound.test/");
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    browser_session_set_credential_cookies(&session, "bound.test",
+                                           credentials, 2);
+    browser_session_cookie_diagnostics(&session, true, NULL);
+    /* 26 older cookies of 161 bytes each: about 4.2 KB of header from
+       3.1 KB of values, inside the default 4 KiB jar. */
+    for (unsigned i = 0; i < 26u; ++i) {
+        char cookie[256];
+        snprintf(cookie, sizeof(cookie),
+                 "filler-cookie-with-a-long-name-number-%02u=%0120u; "
+                 "Domain=bound.test; Path=/", i, i);
+        CHECK(browser_session_cookie_set_http_context(
+            &session, &context, cookie));
+    }
+    CHECK(browser_session_cookie_set_http_context(
+              &session, &context, "account=a1b2c3; Domain=bound.test; Path=/")
+          && browser_session_cookie_set_http_context(
+              &session, &context, "sid=s1d; Domain=bound.test; Path=/")
+          && browser_session_cookie_set_http_context(
+              &session, &context, "session=x9; Path=/; HttpOnly")
+          && browser_session_cookie_set_http_context(
+              &session, &context, "__Secure-token=t0k; Path=/; Secure"));
+    CHECK(browser_session_cookie_header_context(
+        &session, &context, header, sizeof(header)));
+    CHECK(strlen(header) < BROWSER_COOKIE_HEADER_CAPACITY
+          && contains_cookie(header, "account")
+          && contains_cookie(header, "sid")
+          && contains_cookie(header, "session")
+          && contains_cookie(header, "__Secure-token"));
+    /* The credentials take 55 bytes; 24 fillers fill the rest in header
+       order, and kept cookies keep that order. */
+    CHECK(contains_cookie(header, "filler-cookie-with-a-long-name-number-23")
+          && !contains_cookie(header, "filler-cookie-with-a-long-name-number-24")
+          && !contains_cookie(header, "filler-cookie-with-a-long-name-number-25")
+          && strstr(header, "filler-cookie-with-a-long-name-number-23")
+                 < strstr(header, "account=")
+          && strncmp(header, "filler-cookie-with-a-long-name-number-00=", 41)
+                 == 0);
+    /* Only the header the transport sends counts omissions: neither a
+       header built from the jar nor a document.cookie read does. */
+    char *script_cookies = budget_malloc(budget, BROWSER_COOKIE_HEADER_CAPACITY);
+    CHECK(script_cookies != NULL
+          && browser_session_cookie_get(&session, "https://www.bound.test/",
+              script_cookies, BROWSER_COOKIE_HEADER_CAPACITY));
+    budget_free(budget, script_cookies);
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.header_omissions == 0u);
+    /* The transport's request-private copy sends the same header. */
+    BrowserCookieOverlay *overlay =
+        browser_session_cookie_overlay_create(budget, &session);
+    CHECK(overlay != NULL
+          && browser_cookie_overlay_header_context(
+              overlay, &context, overlay_header, sizeof(overlay_header))
+          && strcmp(overlay_header, header) == 0);
+    browser_cookie_overlay_destroy(overlay);
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.header_omissions == 2u);
+    /* A buffer below the bound still gets all or nothing. */
+    CHECK(!browser_session_cookie_header_context(
+              &session, &context, small, sizeof(small))
+          && small[0] == '\0');
+    /* One cookie no header could carry is left out on its own. */
+    static char huge[4200];
+    memcpy(huge, "huge=", 5);
+    memset(huge + 5, 'h', 4092);
+    snprintf(huge + 5 + 4092, sizeof(huge) - 5 - 4092, "; Path=/; Secure");
+    session.maximum_cookie_bytes = 16u * 1024u;
+    TilefinchRequestContext big = overlay_test_context("https://big.test/");
+    CHECK(browser_session_cookie_set_http_context(&session, &big, huge)
+          && browser_session_cookie_set_http_context(
+              &session, &big, "small=1; Path=/; Secure")
+          && browser_session_cookie_header_context(
+              &session, &big, header, sizeof(header))
+          && strcmp(header, "small=1") == 0);
+    overlay = browser_session_cookie_overlay_create(budget, &session);
+    CHECK(overlay != NULL
+          && browser_cookie_overlay_header_context(
+              overlay, &big, overlay_header, sizeof(overlay_header))
+          && strcmp(overlay_header, "small=1") == 0);
+    browser_cookie_overlay_destroy(overlay);
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.header_omissions == 3u);
+    /* Credentials read straight from the jar, whatever the header size. */
+    const char *value = NULL;
+    size_t length = 0;
+    CHECK(browser_session_cookie_value_context(
+              &session, &big, "huge", &value, &length)
+          && length == 4092u && value[0] == 'h'
+          && !browser_session_cookie_value_context(
+              &session, &big, "account", &value, &length)
+          && value == NULL && length == 0
+          && browser_session_cookie_value_context(
+              &session, &context, "sid", &value, &length)
+          && length == 3u && memcmp(value, "s1d", 3) == 0);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* When the bounded header leaves a cookie out, a less specific cookie of
+   the same name must not be sent in its place: the server reads the first
+   value of a name, which would then be the shadowed one (review 1021b
+   NM2). */
+static int test_cookie_header_bound_same_name(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    static char header[BROWSER_COOKIE_HEADER_CAPACITY];
+    static char large[4200];
+    TilefinchRequestContext root = overlay_test_context("https://shadow.test/");
+    TilefinchRequestContext app =
+        overlay_test_context("https://shadow.test/app/page");
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    session.maximum_cookie_bytes = 16u * 1024u;
+    /* Across ranks: an older HttpOnly id at / (rank 1) is shadowed by a
+       script-visible id at /app (rank 2) too large for any header. */
+    CHECK(browser_session_cookie_set_http_context(
+              &session, &root, "id=stale; Path=/; HttpOnly")
+          && browser_session_cookie_set_http_context(
+              &session, &root, "other=1; Path=/"));
+    memcpy(large, "id=", 3);
+    memset(large + 3, 'n', 4094);
+    snprintf(large + 3 + 4094, sizeof(large) - 3 - 4094, "; Path=/app");
+    CHECK(browser_session_cookie_set_http_context(&session, &app, large));
+    CHECK(browser_session_cookie_header_context(
+              &session, &app, header, sizeof(header))
+          && strcmp(header, "other=1") == 0);
+    /* The page at / sees only its own id, which fits. */
+    CHECK(browser_session_cookie_header_context(
+              &session, &root, header, sizeof(header))
+          && strcmp(header, "id=stale; other=1") == 0);
+    /* Within one rank: neither id is HttpOnly. */
+    CHECK(browser_session_cookie_set_http_context(
+              &session, &root, "id=; Path=/; Max-Age=0")
+          && browser_session_cookie_set_http_context(
+              &session, &root, "id=stale; Path=/"));
+    CHECK(browser_session_cookie_header_context(
+              &session, &app, header, sizeof(header))
+          && strcmp(header, "other=1") == 0);
+    /* The most specific member may still go out alone when a later,
+       shadowed one does not fit. */
+    CHECK(browser_session_cookie_set_http_context(
+              &session, &root, "id=; Path=/; Max-Age=0")
+          && browser_session_cookie_set_http_context(
+              &session, &app, "id=; Path=/app; Max-Age=0")
+          && browser_session_cookie_set_http_context(
+              &session, &app, "id=fresh; Path=/app"));
+    large[3 + 4094] = '\0';
+    CHECK(browser_session_cookie_set_http_context(&session, &root, large));
+    CHECK(browser_session_cookie_header_context(
+              &session, &app, header, sizeof(header))
+          && strcmp(header, "id=fresh; other=1") == 0);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* A request-private overlay is sized to the live cookies. It grows only
+   for a cookie that passed its checks, and under budget pressure grows by
+   the one slot the cookie needs (review 1021b NM6). */
+static int test_cookie_overlay_growth_follows_checks(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    static char header[BROWSER_COOKIE_HEADER_CAPACITY];
+    static char large[1200];
+    TilefinchRequestContext context =
+        overlay_test_context("https://grow.test/");
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    session.maximum_cookie_bytes = 1024u;
+    CHECK(browser_session_cookie_set_http_context(&session, &context, "a=1; Path=/")
+          && browser_session_cookie_set_http_context(&session, &context, "b=2; Path=/"));
+    BrowserCookieOverlay *overlay =
+        browser_session_cookie_overlay_create(budget, &session);
+    CHECK(overlay != NULL);
+    /* Refused for its bytes: the full table must not grow. */
+    memcpy(large, "big=", 4);
+    memset(large + 4, 'x', 1100);
+    snprintf(large + 4 + 1100, sizeof(large) - 4 - 1100, "; Path=/");
+    size_t before = budget->current;
+    CHECK(!browser_cookie_overlay_set_http_context(overlay, &context, large));
+    CHECK(budget->current == before);
+    /* Room for the value and one more slot, not for eight: still stored. */
+    size_t limit = budget->limit;
+    budget->limit = budget->current + 3u * sizeof(BrowserCookieEntry) + 256u;
+    CHECK(browser_cookie_overlay_set_http_context(overlay, &context, "c=3; Path=/"));
+    budget->limit = limit;
+    CHECK(browser_cookie_overlay_header_context(
+              overlay, &context, header, sizeof(header))
+          && strcmp(header, "a=1; b=2; c=3") == 0);
+    browser_cookie_overlay_destroy(overlay);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_cookie_service_handoff_retention(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -1832,6 +2125,16 @@ static int test_cookie_admission_diagnostics(Budget *budget)
     budget->limit = limit;
     browser_session_cookie_diagnostics(&session, false, &diagnostics);
     CHECK(diagnostics.allocation_refusals == 1u && diagnostics.refused == 2u);
+    /* A path beyond the inline slot draws on the long-path allowance; its
+       refusal is a byte refusal too. */
+    char deep[BROWSER_ORIGIN_LIMIT + 64u];
+    int used = snprintf(deep, sizeof(deep), "deep=value; Secure; Path=/");
+    while ((size_t) used + 2u < sizeof(deep)) deep[used++] = 'd';
+    deep[used] = '\0';
+    session.maximum_cookie_long_path_bytes = 1;
+    CHECK(!browser_session_cookie_set_http(&session, "https://other.test/", deep));
+    browser_session_cookie_diagnostics(&session, false, &diagnostics);
+    CHECK(diagnostics.byte_refusals == 2u && diagnostics.refused == 3u);
     browser_session_destroy(&session);
     CHECK(budget->current == baseline);
     browser_session_cookie_diagnostics(NULL, false, &diagnostics);
@@ -1846,7 +2149,11 @@ int main(void)
     budget_init(&budget, 1024u * 1024u);
     size_t empty_budget = budget.current;
     CHECK(test_cookie_admission_diagnostics(&budget) == 0);
+    CHECK(test_cookie_header_bound(&budget) == 0);
+    CHECK(test_cookie_header_bound_same_name(&budget) == 0);
+    CHECK(test_cookie_overlay_growth_follows_checks(&budget) == 0);
     CHECK(test_cookie_service_handoff_retention(&budget) == 0);
+    CHECK(test_cookie_overlay_footprint_and_equivalence(&budget) == 0);
     TilefinchRequestContext opaque_context = {
         .target_url = "https://opaque.test/api",
         .initiator_url = "https://opaque.test/frame",

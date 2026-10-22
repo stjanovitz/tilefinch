@@ -194,7 +194,7 @@ typedef enum {
     PSP_MEDIA_CODEC_STAGE_AUDIO_SIGNAL = 6,
     PSP_MEDIA_CODEC_STAGE_WORKER_WAIT = 7,
     PSP_MEDIA_CODEC_STAGE_AVC_STOP = 8,
-    PSP_MEDIA_CODEC_STAGE_AUDIO_EDRAM = 9,
+    /* 9 named sceAudiocodecReleaseEDRAM, which nothing calls any more. */
     PSP_MEDIA_CODEC_STAGE_MPEG_DELETE = 10,
     PSP_MEDIA_CODEC_STAGE_MPEG_FINISH = 11,
     /* Appended, never renumbered: a stage number is what a hang log names. */
@@ -338,10 +338,6 @@ typedef struct {
     /* An AAC work buffer has been attached to the codec control block and
        must be detached at teardown. */
     bool audio_edram;
-    /* ...and it came from the firmware's own grant, so the detach is a real
-       sceAudiocodecReleaseEDRAM. False for PMPlayer's pool-backed substitute,
-       whose storage the pool owns and firmware must never be asked to free. */
-    bool audio_edram_real;
     atomic_bool playing;
     atomic_bool buffering;
     atomic_bool audio_stop;
@@ -546,7 +542,6 @@ typedef struct {
        release/acquire handoff on codec_job_state publishes both. */
     bool codec_teardown_finish_runtime;
     bool codec_teardown_ran;
-    int codec_teardown_edram_release;
     /* The same handoff for a reset that rebuilds the decoder object: the worker
        reports whether it ran and what firmware returned, and the main thread
        reads both only after the job has published. */
@@ -629,7 +624,7 @@ static size_t psp_media_heap_capacity_lower_bound;
  *
  * Which form to use is a question about who wrote the range, not about who
  * reads it. Firmware calls that run on the main CPU -- sceMpegInitAu,
- * sceMpegGetAvcNalAu, sceAudiocodecCheckNeedMem, sceAudiocodecGetEDRAM,
+ * sceMpegGetAvcNalAu, sceAudiocodecCheckNeedMem,
  * sceAudiocodecInit and the rest of the control-block calls -- store through
  * this cache, so a pure invalidate over their output destroys it before it
  * reaches memory. Only ranges the Media Engine writes exclusively, with no
@@ -729,9 +724,9 @@ static bool psp_media_backend_is_quarantined;
    only ever runs after that job has been collected. Memory-only on purpose:
    a firmware or mode fix must get to re-test the program after a restart. */
 static bool psp_media_wide_program_rejected;
-/* The experimental wide-video knob, published once from boot configuration
-   before any video opens and read-only afterwards. Absent or unrecognized
-   spellings leave the proven program as the only selectable one. */
+/* The decoder-program knob, published once from boot configuration before
+   any video opens and read-only afterwards. Until it is published only the
+   proven program is selectable. */
 static int psp_media_wide_program_mode = PSP_MEDIA_WIDE_PROGRAM_OFF;
 /*
  * Where in the frame the advance the browser is making right now runs, which
@@ -2864,13 +2859,6 @@ void media_psp_backend_set_wide_program(const char *name)
 {
     psp_media_wide_program_mode =
         (int) psp_media_wide_program_configured(name);
-    /* `no-boot` restores the historical process-start assumption, which is
-       exactly the cache this seeds. Published once at boot before any video
-       can open, so seeding here and nowhere else keeps every later reset --
-       suspend, a forced runtime restart, a failed teardown -- meaning
-       "unknown" for both spellings, which is what they both meant before. */
-    if (!psp_media_cold_boot_call_enabled(psp_media_wide_program_mode))
-        psp_media_me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;
     psp_media_log(
         "tilefinch-media-decoder: event=wide-program-knob value=%s",
         psp_media_wide_program_name(psp_media_wide_program_mode));
@@ -3569,8 +3557,6 @@ static const char *psp_media_codec_stage_name(int stage)
         return "sceKernelWaitEventFlag-codec";
     case PSP_MEDIA_CODEC_STAGE_AVC_STOP:
         return "sceMpegAvcDecodeStop";
-    case PSP_MEDIA_CODEC_STAGE_AUDIO_EDRAM:
-        return "sceAudiocodecReleaseEDRAM";
     case PSP_MEDIA_CODEC_STAGE_MPEG_DELETE:
         return "sceMpegDelete";
     case PSP_MEDIA_CODEC_STAGE_MPEG_FINISH:
@@ -3655,36 +3641,6 @@ static MediaBackendResult psp_media_decode_staged_video(
     nal.mode = backend->decoder_primed ? 0 : 3;
     backend->last_nal_mode = nal.mode;
 
-    /*
-     * The Annex-B experiment. This runs on the codec worker, which is where
-     * the bridge itself is entered, and touches only this backend's own
-     * staging copy of the access unit -- no firmware call, no allocation, and
-     * nothing the main thread can observe mid-rewrite. It is deliberately
-     * scoped to the wide program: the proven program is the one that decodes
-     * AVCC today and must not be perturbed by an experiment aimed at the one
-     * that does not.
-     */
-    unsigned annexb_nals = 0;
-    bool annexb = psp_media_wide_program_annexb(psp_media_wide_program_mode)
-        && backend->mpeg_mode == 5;
-    if (annexb
-        && !psp_media_annexb_rewrite(
-               backend->packet_staging, backend->last_packet_bytes,
-               backend->nal_length_size, &annexb_nals)) {
-        backend->video_timestamps = backend->codec_job_timestamps_before;
-        psp_media_log_failure(backend, "annexb-rewrite", -1);
-        psp_media_log(
-            "tilefinch-media-decoder: event=annexb-rewrite-rejected "
-            "nal-prefix=%d nal-size=%u",
-            (int) backend->nal_length_size,
-            (unsigned) backend->last_packet_bytes);
-        psp_media_error(
-            error, error_size,
-            "PSP AVC Annex-B rewrite rejected a %u-byte access unit",
-            (unsigned) backend->last_packet_bytes);
-        return MEDIA_BACKEND_ERROR;
-    }
-    (void) annexb_nals;
 
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
     /* Record the priming transaction, not every steady-state AU. The latter
@@ -3693,7 +3649,7 @@ static MediaBackendResult psp_media_decode_staged_video(
        was meant to measure. Refusals still dump their exact AU head/state, and
        the optional bounded AU capture remains available for packet-level
        diagnosis. Shipping builds compile the entire block out. */
-    if (!primed_before || annexb) {
+    if (!primed_before) {
         char head[33];
         size_t head_bytes = backend->last_packet_bytes < 16u
             ? backend->last_packet_bytes : 16u;
@@ -3704,15 +3660,6 @@ static MediaBackendResult psp_media_decode_staged_video(
             "primed=%d head=%s",
             nal.mode, nal.nal_prefix_size, nal.nal_size,
             nal.sps_size, nal.pps_size, primed_before ? 1 : 0, head);
-        /* The head above is already the converted framing, so one extra line
-           records how many units it covers when the explicit experiment is
-           active. */
-        if (annexb) {
-            psp_media_log(
-                "tilefinch-media-decoder: event=annexb-submit "
-                "nals=%u nal-size=%u head=%s",
-                annexb_nals, (unsigned) backend->last_packet_bytes, head);
-        }
         /*
          * Commit the submitted bytes to the card before entering the bridge.
          * sceMpegGetAvcNalAu is where every device session so far has either
@@ -4389,9 +4336,8 @@ static MediaBackendResult psp_media_drain_staged_video(
  * stream the ME rejected left the engine wedged, teardown walked its bounded
  * steps correctly, and then hung forever in the tail. The codec worker already
  * owns every other firmware codec call and every bounded-wait/quarantine
- * mechanism built around it, so the tail runs there too. sceAudiocodecReleaseEDRAM
- * joins it for uniformity: it is the same class of call and must still happen
- * after the audio channel has been released.
+ * mechanism built around it, so the tail runs there too, after the audio
+ * channel has been released.
  *
  * Runs on the codec worker for a dispatched teardown job, and directly on the
  * main thread only when no worker exists to dispatch to (an early create
@@ -4403,15 +4349,7 @@ static MediaBackendResult psp_media_run_teardown_job(
     (void) error;
     (void) error_size;
     if (backend->audio_edram) {
-        if (backend->audio_edram_real) {
-            /* Only a real call gets the stage: a reported stage names the
-               firmware call a hung teardown is inside, and the substitute's
-               release is a store that cannot hang. */
-            psp_media_codec_stage(
-                backend, PSP_MEDIA_CODEC_STAGE_AUDIO_EDRAM);
-            backend->codec_teardown_edram_release =
-                sceAudiocodecReleaseEDRAM(backend->audio_codec);
-        } else if (backend->audio_codec != NULL) {
+        if (backend->audio_codec != NULL) {
             /* PMPlayer's cooleyesAudiocodecReleaseEDRAM frees control word 3
                and zeroes it. Only the zeroing is ours to do: the storage is
                pool-owned, so it is reclaimed by the rewind at the end of a
@@ -4422,7 +4360,6 @@ static MediaBackendResult psp_media_run_teardown_job(
             backend->audio_codec[3] = 0;
         }
         backend->audio_edram = false;
-        backend->audio_edram_real = false;
     }
     if (backend->mpeg_created) {
         psp_media_codec_stage(
@@ -7344,7 +7281,6 @@ static void psp_media_destroy(void *opaque)
     int channel_release = 0;
     unsigned channel_release_attempts = 0;
     uint32_t channel_release_wait_us = 0;
-    int edram_release = 0;
     int codec_stop_signal = 0;
     int codec_thread_wait = 0;
     int codec_thread_refer = 0;
@@ -7560,7 +7496,6 @@ static void psp_media_destroy(void *opaque)
         teardown_route = "inline";
         (void) psp_media_run_teardown_job(backend, NULL, 0);
     }
-    edram_release = backend->codec_teardown_edram_release;
     if (backend->codec_teardown_finish_runtime) {
         psp_mpeg_runtime_initialized = false;
         /* A failed stream can leave the selected Media Engine program in a
@@ -7644,7 +7579,7 @@ static void psp_media_destroy(void *opaque)
         "codec-event-delete=0x%08X codec-emergency-event-delete=0x%08X "
         "codec-quiesce-wait=%uus "
         "mpeg-teardown=%s queue=%d ran=%d wait=%uus "
-        "edram-release=0x%08X runtime-reset=%d",
+        "runtime-reset=%d",
         (unsigned) stop_signal, (unsigned) thread_wait,
         (unsigned) thread_release_wait, (unsigned) thread_terminate,
         (unsigned) thread_refer,
@@ -7659,7 +7594,6 @@ static void psp_media_destroy(void *opaque)
         codec_quiesce_wait_us,
         teardown_route, teardown_queue,
         backend->codec_teardown_ran ? 1 : 0, teardown_wait_us,
-        (unsigned) edram_release,
         backend->codec_teardown_finish_runtime ? 1 : 0);
     (void) codec_quiesce_wait_us;
     (void) teardown_route;
@@ -7680,7 +7614,6 @@ static void psp_media_destroy(void *opaque)
     (void) codec_thread_delete;
     (void) codec_event_delete;
     (void) codec_emergency_event_delete;
-    (void) edram_release;
     for (unsigned slot = 0; slot < PSP_MEDIA_SURFACE_SLOTS; slot++)
         psp_media_release(backend->surfaces[slot]);
     psp_media_release(backend->audio_queue);
@@ -8058,8 +7991,6 @@ static bool psp_media_backend_create_track_info(
     if (!psp_media_decoder_policy(
             avc_profile, avc_level, backend->decoded_width,
             backend->decoded_height, wide_program_enabled,
-            psp_media_baseline_boot_call_enabled(
-                psp_media_wide_program_mode),
             &decoder_policy)) {
         psp_media_error(
             error, error_size,
@@ -8426,39 +8357,17 @@ static bool psp_media_backend_create_track_info(
         }
         /*
          * Attach the AAC work buffer. PMPlayer never calls the firmware
-         * grant for it -- see psp_media_pool_audiocodec_edram -- so neither
-         * does the default; `experimental_wide_video=edram-real` restores the
-         * sceAudiocodecGetEDRAM/ReleaseEDRAM pair for the A/B.
-         *
-         * Only the real grant is followed by a cache op, and it has to be a
-         * writeback-invalidate: sceAudiocodecGetEDRAM writes the buffer
-         * pointer into control word 3 from the main CPU, so a pure invalidate
-         * discards it exactly the way it discarded CheckNeedMem's size, and
-         * the decode then fails with 0x807F0001 on a block whose work buffer
-         * reads back as zero. The pool substitute is a plain CPU store into
-         * that same block and needs nothing at all here -- the writeback
-         * below publishes it.
+         * grant for it -- see psp_media_pool_audiocodec_edram -- and neither
+         * does Tilefinch: no sceAudiocodecGetEDRAM or ReleaseEDRAM call is
+         * made at all. The substitute is a plain CPU store into the control
+         * block and needs no cache op here -- the writeback below publishes
+         * it.
          */
         unsigned edram_bytes = 0;
-        bool real_edram =
-            psp_media_real_edram_enabled(psp_media_wide_program_mode);
         if (status >= 0) {
-            if (real_edram) {
-                native_stage = "sceAudiocodecGetEDRAM";
-                status = sceAudiocodecGetEDRAM(
-                    backend->audio_codec, PSP_CODEC_AAC);
-                if (status >= 0) {
-                    sceKernelDcacheWritebackInvalidateRange(
-                        backend->audio_codec,
-                        psp_media_cache_extent(
-                            PSP_MEDIA_AUDIO_CODEC_BYTES));
-                    backend->audio_edram_real = true;
-                }
-            } else {
-                native_stage = "audiocodec-pool-edram";
-                status = psp_media_pool_audiocodec_edram(
-                    backend, &edram_bytes);
-            }
+            native_stage = "audiocodec-pool-edram";
+            status = psp_media_pool_audiocodec_edram(
+                backend, &edram_bytes);
         }
         /*
          * Say which mechanism supplied the buffer, how big firmware asked for
@@ -8468,10 +8377,9 @@ static bool psp_media_backend_create_track_info(
          * ended in a freeze or a power-off somewhere past this point.
          */
         psp_media_log(
-            "tilefinch-media-decoder: event=audio-edram mode=%s size=%u "
+            "tilefinch-media-decoder: event=audio-edram mode=pool size=%u "
             "status=0x%08X buffer=0x%08X high=%d",
-            real_edram ? "real" : "pool",
-            real_edram ? (unsigned) backend->audio_codec[4] : edram_bytes,
+            edram_bytes,
             (unsigned) status,
             (unsigned) backend->audio_codec[3],
             psp_media_me_invisible(

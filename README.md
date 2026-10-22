@@ -4,6 +4,9 @@
 from-scratch layout engine, JavaScript, and hardware-assisted video, all
 running on the handheld itself.*
 
+**[Download the latest release](https://github.com/stjanovitz/tilefinch/releases/latest)**
+· [What's new](CHANGELOG.md) · [Install guide](#install)
+
 | Wikipedia | 360p video playback |
 |---|---|
 | ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![Host-rendered preview of Tilefinch's native player overlay over Sprite Fright, with chapter markers and playback controls](docs/sprite-fright-player.png) |
@@ -35,7 +38,7 @@ coding agents are capable of. A web browser tests all three.
 | **Reader, Basic view and offline** | Reader mode reflows articles; Basic view rescues pages whose scripts fail, keeping their links, tables and simple search forms. Save articles, and install small manifest-backed web apps for offline use with their icon and the same-origin resources already loaded, then update, reinstall, or remove them. |
 | **Text entry** | The PSP system keyboard or the faster Danzeff radial keyboard, with completion from local bookmarks and history. |
 | **Games** | Bounded Canvas 2D and WebGL 1 for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
-| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, On/Smart/Off website fonts, translated browser menus, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Hindi, and color-emoji glyph packs. |
+| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, On/Smart/Off website fonts, translated browser menus, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Simplified and Traditional Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Devanagari (Hindi), Bengali–Assamese, and color-emoji glyph packs. |
 | **Native PSP interface** | An immediate home screen, Collections, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
 | **Optional XMB redirect** | With ARK-4, Sony's Internet Browser icon can launch Tilefinch; holding L opens the original browser instead. |
 | **Updates** | Signed in-app updates with A/B slots, a trial boot, automatic rollback, explicit approval, and an optional picker for signed earlier versions. |
@@ -57,7 +60,7 @@ coding agents are capable of. A web browser tests all three.
 | Area | What makes it interesting |
 |---|---|
 | **A browser, not a port** | The style, layout, paint, policy, media, and native interface layers are original C11. Lexbor, QuickJS, curl, Mbed TLS, nghttp2, and FreeType are vendored and hash-pinned ([notices](THIRD_PARTY_NOTICES.md)). It is enough of a browser that chatgpt.com's logged-out chat, with over a hundred JavaScript modules, client-side hydration, and a streamed answer, has run end to end on a PSP-3000, helped by a validating preparser, scoped style invalidation, and a profile-optimized JavaScript engine ([architecture](docs/ARCHITECTURE.md#quickjs-is-vendored-and-changed-in-place)). |
-| **One strict memory ledger** | DOM, JavaScript, CSS, resources, layout, and tiles share one 24 MiB page budget. Every table and loop is bounded, and a refused allocation is a tested, recoverable path rather than an exception. |
+| **One strict memory ledger** | DOM, JavaScript, CSS, resources, layout, and tiles share one 32 MiB page budget with voice recognition. Every table and loop is bounded, and a refused allocation is a tested, recoverable path rather than an exception. |
 | **Useful pixels before the download ends** | Streaming HTML and CSS, preload discovery, resumable layout, priority for visible resources, lazily loaded bootstrap modules, and bounded caches of compiled styles and scripts all aim at first paint on a 333 MHz in-order core. |
 | **Deterministic rendering** | Host and PSP share the same layout and rasterizer, down to ordered RGB565 dithering. Fidelity floors measured against Chrome references may only move upward ([fidelity workflow](docs/FIDELITY.md)). |
 | **Firmware video acceleration** | A raw-NAL bridge and a bounded H.264 recovery-point rewriter feed the PSP's Media Engine, and two guarded decode surfaces overlap color conversion with presentation ([media state machine](docs/engineering/PSP_MEDIA_SESSION_STATE.md)). |
@@ -66,10 +69,6 @@ coding agents are capable of. A web browser tests all three.
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine, so memory is never freed beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS, CSP, SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
 | **Hardware-aware gates** | The optimized host suite is backed by sanitizer, hostile-input, WPT, fidelity, and PSP cross-build gates, plus ratchets on executable size and hot-function size ([engineering guide](AGENTS.md)). |
-
-Detailed performance and memory experiment ledgers are kept locally and in
-the private development archive, not in this public repository. Public
-engineering documentation describes the current contracts and reproducible checks.
 
 ## What you need
 
@@ -209,10 +208,9 @@ Choose with Left/Right, press X to install, then restart Tilefinch to apply.
 English is built in; downloadable translations are available for Spanish,
 French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
 Hindi, Arabic, Portuguese, Bengali and Assamese. Choosing a language also downloads its required
-glyph pack if it is not already installed. Advanced messages not yet translated remain
-in English, and English stays available if a download fails.
-New catalog entries need published translation/pack downloads and a compatible
-browser build before they can be installed.
+glyph pack if it is not already installed. Menus, controls and status notices are
+translated; advanced messages not yet translated remain in English, and English
+stays available if a download fails.
 
 This changes Tilefinch's menus—not the text of websites, games, or subtitles.
 Preferred video, audio and subtitle languages are separate settings.
@@ -223,10 +221,11 @@ The built-in fonts cover Latin text, with compact fallbacks for some Chinese,
 Japanese, Korean and emoji characters. **Settings → Appearance → Language &
 emoji** offers additional page-text packs: Japanese, Simplified Chinese,
 Traditional Chinese, Korean, Cyrillic (including Russian and Ukrainian),
-Extended Latin, Arabic, Hebrew and Devanagari (Hindi), plus a color emoji pack.
+Extended Latin, Arabic, Hebrew, Devanagari (Hindi) and Bengali–Assamese, plus a
+color emoji pack.
 A page using a missing pack can also offer to install it while you browse.
 
-Confirm the corresponding pack download and restart to use it. Square removes
+Confirm the pack download; it takes effect without a restart. Square removes
 an installed pack. Packs add glyph coverage; they do not translate page text.
 Arabic and Hebrew have right-to-left layout support. Hindi covers common
 syllables and interface clusters; unusual conjuncts may still use fallback
@@ -357,18 +356,10 @@ how to report.
 
 ## Building from source
 
-The desktop lab builds and tests the same engine on your computer, at PSP
-screen sizes and memory profiles. The first configure downloads hash-pinned
-dependencies; host builds need libcurl development headers and zlib.
-
-```sh
-cmake --preset release
-cmake --build build-preset-release
-ctest --test-dir build-preset-release
-```
-
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) has the full workflow; read
-[CONTRIBUTING.md](CONTRIBUTING.md) before sending changes.
+The desktop lab builds and tests the same engine on your computer.
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#quick-start) has the build steps
+and the full workflow; read [CONTRIBUTING.md](CONTRIBUTING.md) before sending
+changes.
 
 ## How it works
 

@@ -16,6 +16,12 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/resources.h"
+#include "tilefinch/render.h"
+#include "tilefinch/platform.h"
+#include "tilefinch/navigation.h"
+#include "tilefinch/js_runtime.h"
+#include "../src/image_decode_internal.h"
+#include "../src/data_url.h"
 
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -499,6 +505,167 @@ static Bytes jpeg_synthetic(int width, int height, int channels, int quality)
     return jpeg;
 }
 
+/* stb_image_write emits three-component JPEGs even for one-channel input.
+   Build an actual single-component baseline image with varying DC blocks. */
+static void jpeg_bits(Bytes *out, unsigned value, unsigned count,
+    unsigned *pending, unsigned *pending_count)
+{
+    for (unsigned bit = count; bit > 0; bit--) {
+        *pending = (*pending << 1) | ((value >> (bit - 1)) & 1u);
+        if (++*pending_count == 8) {
+            unsigned char byte = (unsigned char) *pending;
+            bytes_append(out, &byte, 1);
+            if (byte == 255) {
+                byte = 0;
+                bytes_append(out, &byte, 1);
+            }
+            *pending_count = 0;
+            *pending = 0;
+        }
+    }
+}
+
+static Bytes jpeg_gray_blocks(int width, int height)
+{
+    Bytes out = {0};
+    const unsigned char head[] = {255,216,255,219,0,67,0};
+    bytes_append(&out, head, sizeof(head));
+    unsigned char quant[64];
+    memset(quant, 1, sizeof(quant));
+    bytes_append(&out, quant, sizeof(quant));
+    const unsigned char frame[] = {255,192,0,11,8,
+        (unsigned char)(height >> 8),(unsigned char)height,
+        (unsigned char)(width >> 8),(unsigned char)width,1,1,17,0};
+    bytes_append(&out, frame, sizeof(frame));
+    unsigned char tables[51] = {255,196,0,49,0};
+    tables[8] = 12; /* DC categories 0..11 all have four-bit codes. */
+    for (unsigned i = 0; i < 12; i++) tables[21 + i] = (unsigned char)i;
+    tables[33] = 16; /* AC table zero; its sole symbol is EOB. */
+    tables[34] = 1;
+    bytes_append(&out, tables, sizeof(tables));
+    const unsigned char scan[] = {255,218,0,8,1,1,0,0,63,0};
+    bytes_append(&out, scan, sizeof(scan));
+    unsigned pending = 0, count = 0;
+    int previous = 0;
+    for (int y = 0; y < height; y += 8) for (int x = 0; x < width; x += 8) {
+        int dc = (32 + ((x / 8 * 17 + y / 8 * 31) % 192) - 128) * 8;
+        int delta = dc - previous;
+        previous = dc;
+        unsigned magnitude = (unsigned)(delta < 0 ? -delta : delta), bits = 0;
+        for (unsigned n = magnitude; n != 0; n >>= 1) bits++;
+        jpeg_bits(&out, bits, 4, &pending, &count);
+        if (bits) jpeg_bits(&out, delta < 0
+            ? (unsigned)(delta - 1) & ((1u << bits) - 1u) : (unsigned)delta,
+            bits, &pending, &count);
+        jpeg_bits(&out, 0, 1, &pending, &count);
+    }
+    if (count) jpeg_bits(&out, 255, 8 - count, &pending, &count);
+    const unsigned char end[] = {255,217};
+    bytes_append(&out, end, sizeof(end));
+    return out;
+}
+
+static bool cancel_gray_row(void *context, const char *phase, size_t units)
+{
+    (void)context;
+    (void)units;
+    return strcmp(phase,"image-jpeg-decode")!=0;
+}
+
+static int test_jpeg_gray_rows(Budget *budget)
+{
+    static const int sizes[][4] = {{621,877,465,658},{97,65,73,49},
+        {9,17,8,13},{64,64,64,49},{1,17,1,13}};
+    for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
+        int w=sizes[i][0], h=sizes[i][1], tw=sizes[i][2], th=sizes[i][3];
+        Bytes jpeg = jpeg_gray_blocks(w,h);
+        int rw=0,rh=0,n=0;
+        unsigned char *full = stbi_load_from_memory(jpeg.data,
+            (int)jpeg.length,&rw,&rh,&n,4);
+        CHECK(full != NULL && rw==w && rh==h && n==1);
+        unsigned char *reference = nearest_reference(full,w,h,tw,th);
+        stbi_image_free(full);
+        size_t bytes=(size_t)tw*th*4u, limit=budget->limit;
+        budget->limit = bytes + 32u*1024u;
+        DecodeRun run=decode_at(budget,&jpeg,w,h,tw,th);
+        CHECK(run.status == IMAGE_DECODE_SUCCEEDED);
+        CHECK(run.peak_delta <= bytes + 32u*1024u);
+        CHECK(memcmp(run.pixels,reference,bytes)==0);
+        image_resource_free_decoded(budget,run.pixels);
+        budget->limit=limit;
+        ImageResource image={.encoded=jpeg.data,.encoded_length=jpeg.length,
+            .source_width=w,.source_height=h,.width=tw,.height=th};
+        unsigned char *gray=NULL;
+        TilefinchPlatformServices services={.cooperate=cancel_gray_row};
+        tilefinch_platform_set_services(&services);
+        CHECK(image_resource_decode_gray_checked(&image,budget,&gray)
+              ==IMAGE_DECODE_TRANSIENT_FAILURE && gray==NULL);
+        tilefinch_platform_set_services(NULL);
+        CHECK(budget->current==0);
+        budget->limit=bytes/4u+32u*1024u;
+        CHECK(image_resource_decode_gray_checked(&image,budget,&gray)
+              ==IMAGE_DECODE_SUCCEEDED);
+        for(size_t pixel=0;pixel<bytes/4u;pixel++)
+            CHECK(gray[pixel]==reference[pixel*4u]);
+        image_resource_free_decoded(budget,gray);
+        budget->limit=limit;
+        /* Every optional allocation must roll back and permit a clean retry. */
+        for(size_t point=0;point<4;point++) {
+            budget_inject_failure_after(budget,point);
+            ImageDecodeStatus status=image_resource_decode_gray_checked(
+                &image,budget,&gray);
+            budget_clear_failure_injection(budget);
+            if(status==IMAGE_DECODE_SUCCEEDED)
+                image_resource_free_decoded(budget,gray);
+            else CHECK(status==IMAGE_DECODE_TRANSIENT_FAILURE && gray==NULL);
+            CHECK(budget->current==0);
+        }
+        if(i==0) {
+            /* Render the same samples through the normal RGBA and compact
+               pressure paths. Cache hits must remain exact too. */
+            uint16_t frames[2][96u*64u];
+            for(unsigned lane=0;lane<2;lane++) {
+                ImageResource source=image;
+                if(lane==0) {
+                    source.pixels=reference;
+                    source.encoded=NULL;
+                    source.width=tw;
+                    source.height=th;
+                } else {source.width=w;source.height=h;}
+                DrawCommand command={.type=DRAW_IMAGE,.image=&source,
+                    .x=-19,.y=-31,.width=tw,.height=th,.opacity_scale=193,
+                    .image_fit=LAYOUT_IMAGE_FIT_STRETCH};
+                LayoutDocument layout={.budget=budget,.commands=&command,
+                    .count=1,.width=96,.scroll_width=96,.height=64,
+                    .page_background=0x102040};
+                TileCache cache={0};
+                CHECK(tile_cache_init(&cache,budget,&layout,1));
+                CHECK(tile_cache_set_frame(&cache,frames[lane],96u*64u));
+                if(lane==1) budget->limit=budget->current+400u*1024u;
+                CHECK(tile_cache_render_frame(&cache,0,96,64,NULL));
+                if(lane==1) {
+                    bool compact=false;
+                    for(size_t n=0;n<TILEFINCH_IMAGE_CACHE_ENTRIES;n++)
+                        compact|=cache.scaled_images[n].valid
+                            && cache.scaled_images[n].grayscale;
+                    CHECK(compact);
+                    CHECK(memcmp(frames[0],frames[1],sizeof(frames[0]))==0);
+                    tile_cache_invalidate_rect(&cache,0,0,96,64);
+                    CHECK(tile_cache_render_frame(&cache,0,96,64,NULL));
+                    CHECK(memcmp(frames[0],frames[1],sizeof(frames[0]))==0);
+                }
+                budget->limit=limit;
+                tile_cache_destroy(&cache);
+                CHECK(budget->current==0);
+            }
+        }
+        free(reference);
+        free(jpeg.data);
+        CHECK(budget->current==0);
+    }
+    return 0;
+}
+
 static int test_jpeg_incomplete_header(Budget *budget)
 {
     Bytes jpeg = jpeg_synthetic(97, 65, 3, 85);
@@ -678,6 +845,93 @@ static int test_decode_allocation_refusals(Budget *budget)
 
 #include "suites/image_decode_webp_alpha.inc"
 
+static int test_rebuild_during_detached_decode(Budget *budget)
+{
+    CHECK(budget_install_lexbor(budget));
+    /* Generated solid-color 8x8 JPEG. Pre-encode this fixture rather than
+       invoking stb's test writer, whose signed bit-buffer shifts trip UBSan. */
+    static const char jpeg[] = "data:image/jpeg;base64,"
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkM"
+        "EQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4I"
+        "CA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+        "Hh4eHh4eHh4eHh7/wAARCAAIAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAA"
+        "AAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJx"
+        "FDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+        "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2"
+        "t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEB"
+        "AQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSEx"
+        "BhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZH"
+        "SElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmq"
+        "srO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIR"
+        "AxEAPwDzmiiiv0U+EP/Z";
+    static BrowserSession cache;
+    static NavigationSession navigation;
+    CHECK(browser_session_init(&cache, budget, MIB));
+    unsigned char *copy = NULL;
+    size_t length = 0;
+    char mime[32];
+    CHECK(data_url_decode(budget, jpeg, sizeof(jpeg)-1u, 4096u, &copy,
+        &length, mime, sizeof(mime)) == DATA_URL_DECODED);
+    BrowserSharedBody *body = browser_shared_body_take(budget, copy, length);
+    CHECK(body != NULL);
+    TilefinchRequestContext context = {
+        .target_url = "https://preload.test/image.jpg",
+        .initiator_url = "https://preload.test/",
+        .top_level_url = "https://preload.test/", .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_IMAGE};
+    TilefinchResourceGrant grant = {.destination = TILEFINCH_DESTINATION_IMAGE,
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .final_same_origin = true, .final_same_site = true};
+    CHECK(browser_session_cache_put_http_shared_resource(&cache,
+        context.target_url, body, "", "", "image/jpeg", "immutable", "",
+        tilefinch_platform_monotonic_time_ns(), &context, &grant)
+        && browser_session_cache_set_resource_response_provenance(&cache,
+            context.target_url, &context, context.target_url, "")
+        && navigation_init(&navigation, budget, 2));
+    browser_shared_body_release(body);
+    navigation_attach_browser_session(&navigation, &cache);
+    navigation_enable_scripts(&navigation, 8u * MIB, 1500);
+    navigation_enable_external_resources(&navigation, 2, 32768, 32768,
+        4, 65536, 65536, MIB, 1500);
+    const char page[] = "<!doctype html><style>p{height:800px}</style>"
+        "<a href=/next>Keep reading</a><p>Readable article</p>";
+    CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+        "https://preload.test/", page, sizeof(page)-1u, 480, NULL, NULL, true));
+    CHECK(script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "globalThis.loads=0;globalThis.errors=0;globalThis.preload=new Image();"
+        "preload.onload=()=>loads++;preload.onerror=()=>errors++;"
+        "preload.src='/image.jpg'", "<detached-decode>",
+        &navigation.page.script_result));
+    for (size_t i = 0; i < 32u && !image_decode_busy(); i++)
+        CHECK(script_runtime_advance(navigation.page.runtime, 0, 0,
+                                    &navigation.page.script_result));
+    CHECK(image_decode_busy());
+    /* The decoder result still belongs to the preload. A generic resource
+       consumer must not steal it simply because the host worker is READY. */
+    CHECK(!images_decode_worker_wait_cancelled(budget) && image_decode_busy());
+    CHECK(navigation_set_scroll(&navigation, 100));
+    navigation.style_rebuild_required = true;
+    CHECK(navigation_relayout(&navigation)
+        && navigation.page.loaded && navigation.page.runtime != NULL
+        && navigation.page.layout.count != 0 && !image_decode_busy()
+        && navigation_current(&navigation)->scroll_y == 100);
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(navigation_advance_runtime(&navigation, 16, 4));
+    CHECK(script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "pocSummary=JSON.stringify([loads,errors,preload.complete,"
+        "preload.naturalWidth,preload.naturalHeight])", "<preload-resumed>",
+        &navigation.page.script_result)
+        && strcmp(navigation.page.script_result.summary, "[1,0,true,8,8]") == 0);
+    navigation_destroy(&navigation);
+    CHECK(images_decode_worker_shutdown(budget));
+    browser_session_destroy(&cache);
+    CHECK(budget->current == 0 && budget_uninstall_lexbor(budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     Budget budget;
@@ -691,11 +945,13 @@ int main(int argc, char **argv)
         {"png-formats", test_png_formats},
         {"large-png", test_large_png_peak},
         {"jpeg", test_jpeg_scaled},
+        {"jpeg-gray-rows", test_jpeg_gray_rows},
         {"jpeg-incomplete-header", test_jpeg_incomplete_header},
         {"webp", test_webp_accounting},
         {"allocation-refusals", test_decode_allocation_refusals},
         {"webp-alpha", test_webp_alpha_byte_history},
         {"webp-alpha-filters", test_webp_alpha_filters},
+        {"rebuild-preload", test_rebuild_during_detached_decode},
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         if (only != NULL && strcmp(only, tests[i].name) != 0) continue;

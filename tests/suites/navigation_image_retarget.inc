@@ -340,8 +340,47 @@ static bool test_display_retarget_follows_painted_size(void)
     pinned = toggle != NULL && toggle->width == 400 && toggle->height == 200
         && (toggle->retarget_flags & IMAGE_RETARGET_PINNED) != 0;
 
+    /* A required rebuild must not compete with reproducible pixels. The
+       pinned image remains untouched; an unpinned alias group restores the
+       identical full pixels after workspace pressure has passed. */
+    shown = pinned ? retarget_image(&navigation, "big") : NULL;
+    size_t reference_bytes = shown == NULL ? 0
+        : (size_t) shown->width * (size_t) shown->height * 4u;
+    unsigned char *reference = reference_bytes == 0 ? NULL : malloc(reference_bytes);
+    if (reference != NULL) memcpy(reference, shown->pixels, reference_bytes);
+    size_t old_limit = budget.limit;
+    size_t old_drops = navigation.page.images.retarget.drops;
+    budget.limit = budget.current;
+    size_t failures = budget.failure_count;
+    budget_inject_failure_after(&budget, 0u);
+    size_t reclaimed = reference == NULL ? 0
+        : images_reclaim_rebuildable_rasters(&navigation.page.images,
+            navigation.browser_session, reference_bytes);
+    bool pressure_layout = reclaimed >= reference_bytes
+        && budget.failure_count == failures;
+    bool restore_refused = images_retarget_display_step(
+        &navigation.page.images, &navigation.page.layout,
+        navigation.browser_session, navigation.incremental_relayouts)
+        == IMAGE_RETARGET_RETRY;
+    budget_clear_failure_injection(&budget);
+    budget.limit = old_limit;
+    bool pressure_dropped = pressure_layout
+        && navigation.page.images.retarget.drops > old_drops;
+    navigation.page.image_retarget.settled = false;
+    retarget_pump(&navigation);
+    shown = pressure_layout ? retarget_image(&navigation, "big") : NULL;
+    toggle = pressure_layout ? retarget_image(&navigation, "toggle") : NULL;
+    const ImageResource *alias = pressure_layout
+        ? retarget_image(&navigation, "alias") : NULL;
+    bool pressure_restored = shown != NULL && shown->pixels != NULL
+        && shown->width == 400 && shown->height == 200
+        && alias != NULL && alias->pixels == shown->pixels
+        && memcmp(reference, shown->pixels, reference_bytes) == 0
+        && toggle != NULL && toggle->pixels != NULL
+        && (toggle->retarget_flags & IMAGE_RETARGET_PINNED) != 0;
+    free(reference);
     bool ok = committed && reduced && dropped && grown && stable && restored
-        && pinned;
+        && pinned && pressure_dropped && pressure_restored && restore_refused;
     if (!ok) {
         fprintf(stderr,
                 "display-retarget committed=%d reduced=%d dropped=%d "
@@ -353,6 +392,8 @@ static bool test_display_retarget_follows_painted_size(void)
                 navigation.page.images.retarget.grows,
                 navigation.page.images.retarget.drops,
                 navigation.last_error);
+        fprintf(stderr, "pressure layout=%d dropped=%d restored=%d\n",
+                pressure_layout, pressure_dropped, pressure_restored);
         for (size_t i = 0; i < navigation.page.images.count; i++) {
             const ImageResource *item = &navigation.page.images.items[i];
             fprintf(stderr, "  image %zu: %dx%d full %dx%d pixels=%d "

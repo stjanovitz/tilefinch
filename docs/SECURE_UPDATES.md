@@ -808,14 +808,26 @@ records the number of install units and the longest unit on completion; the UI
 also reports progress during the fallback verification phase.
 
 The two updater-state records contain a generation, active slot, pending slot,
-trial state, and checksum. Each state transition writes the older copy first
-through a temporary file, synchronizes it, and retains the other valid
-generation. The launcher selects the newest valid record; it never relies on
+trial state, and checksum. Each state transition replaces the older copy
+through a temporary file and a rename, then synchronizes the device, and
+retains the other valid generation. The launcher selects the newest valid record; it never relies on
 one FAT rename being an atomic transaction. A fresh manual installation with
 no journal boots slot A from the same in-memory default instead of forcing a
 Memory Stick device sync before first use. The first update transaction
 persists that default together with its pending trial before the candidate can
 run.
+
+Some real firmware and Memory Stick driver combinations reject every device
+sync even though the checked writes and renames before it succeeded. Each
+updater sync follows completed work and is a durability hint
+(`tilefinch_memory_stick_sync`): a rejected sync never reports a committed
+journal state or a promoted slot as failed, and never sends the launcher to
+recovery over a journal that already says the trial started. Safety does not
+rest on the sync, because the dual-copy journal and the launcher's full slot
+verification keep the previously healthy slot launchable. On such a device,
+though, a power cut soon after a transition can roll the journal back one
+generation; in particular the started-trial record, and with it the recovery
+screen after a hung trial, is only as durable as the driver makes it.
 
 Before first execution, the launcher independently verifies the pending slot's
 complete root chain, signed manifest, and files. It records that a trial is
@@ -984,7 +996,8 @@ The central invariant is:
 > After every injected failure, the previously healthy slot still launches.
 
 The installer sweep interrupts staged writes, file/device syncs,
-inactive-slot renames, and every redundant-journal operation. A transition
+inactive-slot renames, and every redundant-journal operation, once with every
+device sync accepted and once with every one rejected. A transition
 that was already durably journaled may recover as a valid pending trial; in
 all cases the previously active slot and its bytes must remain available.
 

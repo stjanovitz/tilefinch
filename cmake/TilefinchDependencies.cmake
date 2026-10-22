@@ -76,7 +76,7 @@ option(PSP_BROWSER_BUILD_TESTS "Build the Tilefinch test suite" ON)
 option(PSP_BROWSER_BUILD_HOSTILE_PARSER_HARNESS
        "Build the deterministic sanitizer-oriented parser harness" OFF)
 option(PSP_BROWSER_BUILD_JSC_SPIKE
-       "Build the macOS-only JavaScriptCore diagnostic runner" ON)
+       "Build the macOS-only JavaScriptCore diagnostic runner" OFF)
 option(PSP_BROWSER_BUILD_HOST_MEDIA_LAB
        "Build the FFmpeg-backed host-only video playback lab" OFF)
 option(PSP_BROWSER_ENABLE_HOST_MEDIA_AUDIO
@@ -106,7 +106,7 @@ option(PSP_BROWSER_SYSTEM_FREETYPE
 option(PSP_BROWSER_USE_COMPILER_CACHE
        "Use ccache or sccache when one is available" ON)
 option(PSP_BROWSER_USE_BELLARD_QUICKJS
-       "Use pinned upstream QuickJS instead of QuickJS-NG" OFF)
+       "Use the vendored Bellard QuickJS (third_party/quickjs) instead of QuickJS-NG" ON)
 option(TILEFINCH_PROFILE_LAYOUT_FLOW
     "Enable intrusive exclusive layout-flow timers in PSP validation builds" OFF)
 # The unlocked Budget ledger has exactly one owning thread. Host test builds
@@ -204,12 +204,6 @@ option(PSP_BROWSER_QUICKJS_PORTABLE_REGION
        "Enable the bounded architecture-neutral QuickJS region tier" ON)
 option(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY
        "Pack dense arrays of one-character Latin-1 strings" ON)
-option(PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH
-       "Apply the experimental Bellard QuickJS VM patch" OFF)
-option(PSP_BROWSER_QUICKJS_NATIVE_TRACE
-       "Build the experimental GNU lightning QuickJS native trace tier" OFF)
-set(PSP_BROWSER_LIGHTNING_ROOT "" CACHE PATH
-    "GNU lightning installation prefix for the experimental native trace tier")
 set(PSP_BROWSER_VENDOR_DIR "" CACHE PATH "Optional directory containing lexbor/ and quickjs-ng/")
 set(PSP_BROWSER_WAMR_SOURCE_DIR "" CACHE PATH
     "Optional prepared WAMR 2.4.5 source tree for bounded WebAssembly")
@@ -240,6 +234,8 @@ set(PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-parser-init-refusal.patch")
 set(PSP_BROWSER_LEXBOR_STATIC_TABLES_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-compact-static-tables.patch")
+set(PSP_BROWSER_LEXBOR_ATTRIBUTE_LIFETIME_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-attribute-value-lifetime.patch")
 set(PSP_BROWSER_STB_JPEG_SCALE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/stb-31c1ad37-jpeg-scaled-idct.patch")
 set(PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH
@@ -275,6 +271,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_LEXBOR_TOKENIZER_PATCH}"
     "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
     "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
+    "${PSP_BROWSER_LEXBOR_ATTRIBUTE_LIFETIME_PATCH}"
     "${PSP_BROWSER_STB_JPEG_SCALE_PATCH}"
     "${PSP_BROWSER_STB_TRUETYPE_REFUSAL_PATCH}"
     "${PSP_BROWSER_WEBP_ALPHA_PATCH}"
@@ -349,23 +346,6 @@ if(PSP_BROWSER_USE_COMPILER_CACHE AND NOT CMAKE_C_COMPILER_LAUNCHER)
     endif()
 endif()
 
-if(PSP_BROWSER_QUICKJS_NATIVE_TRACE)
-    if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)
-        message(FATAL_ERROR
-            "The native trace experiment currently requires Bellard QuickJS")
-    endif()
-    find_path(PSP_BROWSER_LIGHTNING_INCLUDE_DIR lightning.h
-        HINTS "${PSP_BROWSER_LIGHTNING_ROOT}/include" REQUIRED)
-    find_library(PSP_BROWSER_LIGHTNING_LIBRARY lightning
-        HINTS "${PSP_BROWSER_LIGHTNING_ROOT}/lib" REQUIRED)
-endif()
-
-if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-   AND PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH)
-    message(FATAL_ERROR
-        "The property-fault diagnostic currently targets the portable Bellard baseline, not the experimental VM patch")
-endif()
-
 set(LEXBOR_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(LEXBOR_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(LEXBOR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -398,7 +378,8 @@ foreach(lexbor_patch IN ITEMS
         "${PSP_BROWSER_LEXBOR_MRAW_PATCH}"
         "${PSP_BROWSER_LEXBOR_FRAGMENT_CLONE_PATCH}"
         "${PSP_BROWSER_LEXBOR_PARSER_REFUSAL_PATCH}"
-        "${PSP_BROWSER_LEXBOR_STATIC_TABLES_PATCH}")
+        "${PSP_BROWSER_LEXBOR_STATIC_TABLES_PATCH}"
+        "${PSP_BROWSER_LEXBOR_ATTRIBUTE_LIFETIME_PATCH}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${PSP_BROWSER_LEXBOR_SOURCE_DIR}
@@ -450,9 +431,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-            "8f631504b07ce22eeb8344a74b25dff33fc14b413d1f166fbfdc815854882a1d")
+            "39ca86ac54ff0b558887f8621818a33ad6d9fd0a0a719a2e0b87784fd901e422")
     set(tilefinch_quickjs_vendor_h_sha256
-            "e6ad7449c0c79e298bbfbddcc9d5ad6cc9b0291f5223ae7ed83cd5ba99fba656")
+            "dad5142d022c9fd6f835f47cdfe1752bbcc55e41b73650108bb11e309ace62ca")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
     if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -509,14 +490,6 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-array-repack.patch"
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-native-string-gc.patch"
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-property-fault-trace.patch")
-    if(PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH)
-        message(FATAL_ERROR
-            "The experimental Bellard VM patch is no longer applied at "
-            "configure time. Its patch files remain under patches/ as "
-            "history; build it from a branch that applies them to "
-            "third_party/quickjs, or from a commit before the engine was "
-            "vendored.")
-    endif()
     set(quickjs_SOURCE_DIR "${tilefinch_quickjs_vendor_dir}")
     # Lab variants (a capture-getter control, compact character/byte-array
     # control, the property-fault trace) are the only remaining patch users.
@@ -533,19 +506,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "dfbeecd890d21774c58b2e66f7e2524537e7b8380977a286f8fa89168a0a2096")
+            "4145f63a11d5b415dead67fc9bbe6c65d02d5f8911a47cc970e94844498b9e70")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "fb60b0b2009dfc3c2c5189cf7fe5ea7ffe38c0e57e90d94c401e396739f35952")
+            "d0d21d57b7c4535356801bac1f1977932b2a2b33a5bef122b7e4900e8b85dbec")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "d6d23501f3be4dbd521c67100c1396e4982cc85d63d3506bd5c2196f50cc4a8d")
+            "64a5a5d11805d07295eedae8c19727e00a20b92adfc86265e4fccbb4e595aa75")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "aab0a42eb1f877d9e0436105f6906d2e6cf81178c954077dc0e4731701786a44")
+            "9ad077b7e2d5b270a7adbe3c54a14e2b93fdf93428032119f1b98352464293aa")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "260d4bb82acd5032e8f02c426e5be2068706248a2087c33738696e1b13bc4559")
+            "76f5dfca1ccbf6ecfb38b355c4b6e66bb3c2fd8c3a9e6f3d60c4ea40b76081bf")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "9eb87333efa56f2415c07005956a34c6521351221dcfc022ceb07ec575ef8cba")
+            "786e3bc4c50cd4cf129c67f0a3f21bb999390dc5457a277ea2eb6e1b87c41475")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "64f9ecc23f45d78538202505ef3273a60ec5f811b53d97650332aad9331be8ba")
+            "89a0a1e475a1371813db92cd51fc935ee81d8b7da7f6a243cdbacfe00bdb6924")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -594,7 +567,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "0c8e4b3b4042537398dd389c2d7363e41942d00710f101afbdc483a52e7912bd")
+                   "697e2f818fd5c2bea87f10705bf5941ad7e2f680ddc9740ba938ec5c398a294d")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack reached "
                     "${tilefinch_quickjs_variant_baseline}, not the pinned "
@@ -739,17 +712,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
         target_compile_definitions(qjs PRIVATE
             CONFIG_DISABLE_PORTABLE_REGION=1)
     endif()
-    if(PSP_BROWSER_QUICKJS_NATIVE_TRACE)
-        target_sources(qjs PRIVATE src/native_trace.c)
-        target_include_directories(qjs PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            "${PSP_BROWSER_LIGHTNING_INCLUDE_DIR}")
-        target_compile_definitions(qjs PRIVATE CONFIG_NATIVE_TRACE=1)
-        target_link_libraries(qjs PUBLIC "${PSP_BROWSER_LIGHTNING_LIBRARY}")
-    endif()
     # Profile-guided optimisation of the engine objects on the PSP
-    # (PERFORMANCE_LEDGER.md, "Profile-guided engine build"). Both are off by
-    # default and neither touches any other object.
+    # (.private-investigations/PERFORMANCE_LEDGER.md, "Profile-guided engine
+    # build"). Both are off by default and neither touches any other object.
     #
     # GENERATE instruments the engine with arc and value counters (libgcov).
     # A PSP program never runs exit(), so the browser writes the counters
@@ -887,7 +852,8 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
         # grouping. The EBOOT's default link script would gather those
         # sections but the PSPLink PRX's linkfile.prx does not, so the two
         # would get different layouts; and whole-function ordering was
-        # measured on its own and rejected (PERFORMANCE_LEDGER.md,
+        # measured on its own and rejected
+        # (.private-investigations/PERFORMANCE_LEDGER.md,
         # "Profile-ordered code layout"). Blocks inside each function are
         # still laid out by the profile.
         target_compile_options(qjs PRIVATE
@@ -904,7 +870,8 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     endif()
     # Engine-only compiler flags for optimisation experiments, applied after
     # the defaults and the PGO options above, so they can override either;
-    # empty for every preset.
+    # empty for shipping presets. The sanitizer preset uses -O1 to avoid
+    # unoptimized interpreter spill frames exhausting its unchanged stack guard.
     set(PSP_BROWSER_QUICKJS_OPT_FLAGS "" CACHE STRING
         "Extra compile options for the vendored QuickJS objects only")
     if(PSP_BROWSER_QUICKJS_OPT_FLAGS)

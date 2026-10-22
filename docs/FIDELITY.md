@@ -37,6 +37,30 @@ header names are omitted and mark a read unsuitable for anonymous acquisition.
 These diagnostics, like the underlying page responses, belong in private
 capture storage, never public fixtures. They do not authorize live requests.
 
+Acquisition plan v3 represents distinct request Origin variants independently,
+including an explicitly absent Origin. Its bounded evidence counts each
+method/URL/Origin/resource-type combination and must reconcile exactly with the
+unmatched-request ledger. The allowlist pins every variant; acquisition and
+final route closure verify the exact recorded Origin and preserve all existing
+variants. Missing, duplicate, opaque, malformed, or overflowing evidence fails
+closed. Earlier v1/v2 plans remain readable. This does not authorize credentials,
+telemetry, author writes, or an incomplete reference capture.
+
+`--inline-trackers` enables the shared Basic inline-bundle policy during a
+reference capture. Use `--content-blocker basic` for its native comparison and
+retain the same network exclusions. Original document bytes and script text
+stay intact. Blocking records the rule-table digest, rule ID and source digest;
+guard tampering, overflow or mismatched evidence makes the capture ineligible.
+Unrelated author errors and denied crypto remain unchanged. Without the flag,
+existing capture policies remain unchanged.
+
+`--cosmetic-blocking` applies the native built-in cosmetic stylesheet verbatim
+to each parsed reference document. The selected mode and shared source digest
+are part of capture identity. Missing, disabled, replaced, or modified styles
+fail readiness; the retained HTML and ordinary content remain unchanged. Apply
+the emitted stylesheet with native `--user-css` for the same comparison policy.
+Neither option relaxes resource, network, geometry, clock, or teardown checks.
+
 The host-only trace recorder can acquire an explicitly approved permission
 check with `--method OPTIONS --origin HTTPS_ORIGIN --preflight-method GET`
 and `--preflight-headers NAMES` (HEAD is also supported). Approved read-only
@@ -58,285 +82,74 @@ Scenario definitions, trace digests, commands, metrics, and floor values are
 committed, so an authorized maintainer can rebuild the evidence without
 redistributing site captures.
 
+Paintable-image and heading audits traverse bounded open shadow trees as well
+as the document. Required content markers must be visibly rendered; a matching
+title or hidden component alone is insufficient. Failed successful-status
+images inside components remain qualification failures. Traversal exceeding
+the element, root, or evidence ceiling is explicitly incomplete.
+
+Chromium window diagnostics may opt into `--mobile-auto-fit` when author
+overflow makes `innerWidth` larger than the emulated physical screen. This
+mode independently checks touch/coarse input, device pixel ratio, screen and
+visual-viewport geometry, protocol layout metrics, and unchanged before/after
+profiles. It captures the unmodified physical surface without a CSS clip and
+requires exact PNG dimensions, including the final row. Running animations or
+an editable focus are refused rather than rewritten. The mode is restricted
+to bounded scroll windows at device pixel ratio one; its
+`mobile-auto-fit-window-diagnostic-v1` receipt is diagnostic, not a canonical
+fidelity-floor reference. It does not waive resource, request, clock, or
+teardown checks, nor prove coverage of internal scrolling panes.
+
+Bounded diagnostics can select one visible vertical scrolling element with
+`--scroll-selector CSS`. The selector must resolve uniquely; hidden, missing,
+ambiguous and non-scrolling surfaces fail. Receipts retain the element's real
+offset, maximum, viewport bounds and outer-page position before and after each
+screenshot. Geometry changes invalidate the sequence. An element window is not
+a full-document or canonical fidelity-floor reference.
+
+`--dedicated-workers` is a separate, opt-in Chromium window diagnostic. Its
+isolated browser transport holds automatic worker-resume commands until a
+debugger gate stops the first script. Clock/RNG, request and capability policies
+are installed on that paused frame before original author code resumes; retained
+script responses are not rewritten. Worker HTTP work is intercepted by the
+owning page and independently reconciled with worker Network events. Native
+wall-time timers are replaced by bounded timers advanced only on recorded ticks.
+Worker clock and message counters are retained separately from the page's clock.
+This does not claim bit-identical cross-realm task ordering with the engine.
+
+Workers must reach a bounded task checkpoint without pending timers or message
+publication. Final publication requires actual target-detach acknowledgements
+after terminating the now-idle workers, not merely attempts to stop them. Shared
+workers, nested workers, service workers, worklets, uncontrolled sockets and
+cryptographic telemetry remain unavailable. Missing routes, failed policy setup,
+clock drift, pending work or teardown failure prevent qualification. The worker
+diagnostic scope cannot serve as a canonical fidelity-floor oracle. It uses no
+existing browser profile or account, and the temporary browser profile is removed
+after closure. Both helper sources are part of census receipt identity.
+This worker launcher currently requires a POSIX host; ordinary captures do not.
+Window diagnostics preserve the manifest's navigation fragment separately from
+the fragment-free HTTP response key. Receipts retain both requested and observed
+navigation URLs, so a fragment-routed view cannot silently become the default
+page state while still matching the same HTTP document.
+
 ## What is measured
 
-Modern system-font stacks keep a distinct fallback identity from Arial.
-Bounded ASCII advance profiles at small-text and heading sizes reuse the
-existing metric-sans outlines, with the same interpolation for measurement
-and painting; no additional font face is introduced. Platform-specific
-outlines and non-ASCII glyphs remain fallbacks, not exact font emulation.
-Prefixed line clamping affects vertical legacy boxes, not ordinary blocks.
-Float exclusions survive ordinary block boundaries so negative margins can
-still reach them; expired entries are recycled when new floats need slots.
-Reduced regressions cover these cases, including a full inherited float set.
-Layout scratch and retained style/command sizes do not grow. No fidelity floor
-is changed.
+Every scenario is a retained, response-keyed trace with a manifest of
+checkpoints. The native lab and Chrome each render every checkpoint at
+480×272 from the same trace and replay clock, and a checkpoint counts only
+when both request ledgers have closed. The scoreboard then compares the two
+frames; the floors in `tests/fidelity-baselines.tsv` hold the per-checkpoint
+minimums for the structural scores below. Engine fixes that move a score are
+recorded in [Floor history](#floor-history); per-batch fix notes are kept in
+the private development archive, and CHANGELOG.md is the public record.
 
-Text tracking is retained in signed 26.6 pixels through measurement, inline
-boundaries, bidi placement, scaling and painting. Fractional tracking shares
-the existing display-command scale word and style alignment padding; retained
-records do not grow. Independent split-run pixel and wrapping checks cover it.
-Treadline's exact screenshots were refreshed for its authored `.3px` and `.7px`
-labels, previously rounded to `0px` and `1px`. Their corrected tracking changes
-text pixels, not menu geometry or game output. No fidelity floor was lowered.
-
-Ordinary-element `content:url()` uses the existing bounded, source-keyed image
-loader and replacement layout, including subtree suppression. Unknown video
-and frame dimensions use independent defaults rather than treating the fallback
-box as an intrinsic ratio. Definite-height flow buttons center anonymous content
-without moving positioned decorations or overriding flex/grid alignment. Reduced
-tests cover these paths and zero-owned-byte teardown; no fidelity floor changes.
-The two search-form engine goldens include the corrected centered button label
-(one raster row lower). An offline Chrome render with the same pinned fonts
-confirmed the centered alignment; field geometry and all non-button pixels stay
-unchanged. These are reviewed engine goldens, not lowered fidelity floors.
-
-Named font declarations retain bounded resolution programs when their face is
-declared by a later stylesheet. Font shorthand replay preserves subsequent
-declarations in the same block. Generated inline content inherits white-space,
-so an icon cannot wrap out of a nowrap navigation label. Explicit underline
-inheritance resolves against the parent independently of ancestor decoration
-propagation. Reduced regression tests cover these cases, including zero-owned-
-byte teardown. Retaining the font program adds 102 declaration bytes in the
-grid counter fixture; its other work counters remain unchanged.
-
-The application admits up to 32 stylesheet requests and 3 MiB of CSS input,
-matching its existing bounded resource ledger. The shared page Budget,
-individual file ceiling and parse/layout headroom checks are unchanged.
-Viewport scroll events target Document and bubble to Window, allowing author
-scroll-driven controls to update without a browser-specific workaround.
-
-Reference capture explicitly checks touch/coarse-pointer emulation before
-author execution. Its per-target protocol audit includes favicon requests and
-redirect hops, including document completion after a cross-process frame handoff.
-Only cancellation after a fulfilled retained response is accepted; unexplained
-transport failure remains disqualifying. Denied unload beacons to explicitly
-excluded telemetry routes are counted separately, not silently discarded.
-These checks do not make partial page initialization or an unclosed resource
-trace a qualified comparison. No fidelity floor is lowered for this batch.
-
-Compact percentage-width text controls contribute their edges, rather than
-their default editing width, to a cyclic min-content calculation. Generated
-text includes letter spacing in intrinsic widths, including the boundary
-between author text and a generated suffix. Placeholder text resolves its
-own color, font and opacity without changing entered values. Table headers
-use the UA bold default unless author CSS overrides it.
-
-Inline fragment backgrounds and borders follow the fragment's text baseline.
-Their padding and borders paint outside the text without enlarging the line
-box. Generated masks retain their explicit size, position and repetition.
-Same-color rounded generated borders retain unequal side widths in existing
-command fields; scaling and quarter turns transform those widths too. Reduced
-geometry and pixel tests cover these paths; no fidelity floor was lowered.
-
-Diagnostic native captures adapt fully captured, anonymous visual redirect
-chains to the native recorder's completed-fetch format. The source trace stays
-immutable, the terminal body must match its length and hash, and the derived
-trace digest and exact hop chain are retained in the invocation receipt.
-Missing/ambiguous visual hops, credentialed chains and policy-sensitive chains
-are refused. This adapter does not change production fetch or image loading.
-
-These control and decoration fixes measure 4,785,392 bytes of shipping
-`.text` after consolidation. A user-approved 2 KiB increase sets the cap to
-4,786,432 bytes. Page memory ceilings and the validation cap stay unchanged;
-unequal border widths reuse existing command storage without a raster surface,
-and placeholder rule partitions add eight bytes per stylesheet.
-
-Horizontal flex rows treat in-flow generated text and decorations as virtual
-items, rather than reserving space at the container edges. They participate in
-ordering, gaps, wrapping, shrink and cross-axis alignment without synthetic DOM
-nodes. Percentage edges use the container's inline size. Reduced tests cover
-normal/reversed/ordered rows, percentage padding, wrapped lines and positioned
-pseudos that must remain outside the flex item list.
-
-Font discovery retains up to eight named families so early text faces do not
-exclude later icon faces. The existing download-attempt, encoded-byte,
-per-response, backend and shared page-memory budgets remain authoritative.
-One spare text-only command bit retains the sixth family bit independently of
-compositing filters; display commands remain 56 bytes on PSP. Regressions cover
-late generated glyphs, the family ceiling, all family/fallback/filter combinations
-and clean teardown. Shipping `.text` measures 4,786,400 bytes, within the existing
-4,786,432-byte cap; no limit increase was required.
-
-Named web-font families retain up to six distinct authored weights rather
-than merging all light/medium faces into one regular slot. Selection follows
-the CSS weight-search order. Deferred loading admits used weights and one
-normal-weight fallback, reconsidering other weights when later layouts use
-them. Font-relative geometry contributes demand even in empty text boxes.
-The global source ceiling remains 64, with existing download and backend
-budgets authoritative. Measurement, ellipsis and painting share the same
-synthetic-bold rule so an already-heavier authored face is not emboldened
-again. Where italic must be synthesized, metric-sans and serif bold-italic
-text use the available real bold face.
-
-Variable weight ranges use one decoded backend with at most 16 stable weight
-instances, four axes and 32 named instances. The requested weight and default
-size-dependent optical axis are applied to outlines and metrics; other axes
-remain at their font defaults. Excess weight instances use the nearest already
-admitted instance rather than growing storage. Arbitrary variation settings,
-explicit optical-sizing controls and variation-dependent GPOS positioning are
-not implemented. Static bounded kern plans retain their complete source tables;
-tables with no consumable plan are discarded, along with unused substitution,
-name and hint-program tables in reconstructed WOFF2 streams.
-
-Font loading prioritizes requested faces before fallbacks, and does not fetch
-an unused fallback after the requested family faces have loaded. The default
-per-response ceiling is 128 KiB within the unchanged 256 KiB total encoded
-allowance. Retained backends remain capped at 256 KiB per face. Temporary
-opening/reconstruction has a separate 1 MiB ceiling under these defaults,
-charged to the same page Budget and included in Smart's headroom check. Refusal
-and cancellation discard staged ownership without changing a published face.
-
-Inline-block baselines use their line-box baseline,
-not the lowest vertically shifted glyph; single-line inline fragments align
-their generated content as a group. No retained node or draw-command storage
-was added for baselines.
-
-Static import maps are snapshotted before first module resolution, with
-128 entries, 32 maps, 32 scopes per map and a 64 KiB retained-string ceiling. Exact,
-prefix and scoped mappings retain ordinary module fetch/CSP/CORS admission;
-blocked mappings never fall back to an unrelated URL. Late map changes are
-not supported, and child realms never inherit the top document's map.
-Cached modules retain their original specifiers and re-resolve them against
-the new document's map, preserving bytecode reuse across revisits.
-Readiness transitions emit `readystatechange` before the
-corresponding DOM-ready and load events, allowing waiting components to
-initialize without a site-specific workaround. Client geometry reads use
-the retained padding box rather than adding padding to used widths twice.
-
-These fixes measure 4,792,332 bytes of shipping `.text`. A user-approved
-6 KiB increase sets its cap to 4,792,576 bytes. Page-memory, download and
-validation limits are unchanged. Reduced regressions and retained-input
-comparison captures cover weight selection, grouped inline baselines,
-readiness event order, client boxes and import-map resolution. No fidelity
-floor was lowered.
-
-Content-sized grid rows now stretch earlier auto-sized items to their final
-track height, carrying that size through bounded percentage-height chains
-and preserving flex order, reverse columns, height limits and full-box links.
-This updates retained geometry without a second whole-row layout or a new
-raster surface. Empty icon buttons synthesize their baseline at the content
-edge. DOM interfaces expose their standard object tags so libraries do not
-mistake elements for plain objects during cloning. Rounded image tile spans
-use fitted per-side corner radii, preventing rectangular gaps when an authored
-radius exceeds half the image size.
-
-The batch measures 4,795,176 bytes of shipping `.text`; a user-approved 3 KiB
-increase sets its cap to 4,795,648 bytes. Production page-memory limits remain
-unchanged. Reduced regressions cover final row sizing, empty-button baselines,
-DOM brands and circular/unequal image corners. No fidelity floor was lowered.
-
-Complete synchronous geometry layouts can now move into presentation when
-document, cascade, container, font and viewport generations still match and
-the mutation journal requires no resource replacement. Immutable image bodies
-and loaded font faces have lifetime keys, retaining bounded raster caches
-across layout updates without trusting recycled addresses. Raw image buffers
-still evict conservatively; pressure reclamation and cache byte ceilings remain
-unchanged. Pixel comparisons and lifetime/refusal regressions cover the reuse.
-The shipping image measures 4,796,684 bytes of `.text`; the approved 2 KiB
-increase sets its cap to 4,797,696 bytes, without changing page-memory limits.
-
-Content-sized grid rows apply center/end alignment after final row sizing,
-without applying it twice when definite-height row sharing already aligned
-the item. URL masks can retain a gradient background through alpha and
-generated-content painting rather than substituting a solid text color.
-The gradient uses the existing bounded ramp table and raster setup cache;
-display commands and page-memory ceilings do not grow. At the style-cache
-entry ceiling, a large document-order scan preserves entries used in the
-current build instead of cyclically evicting them. Fresh resolution remains
-authoritative whenever optional cache admission is declined.
-Reduced regressions fail with the prior behavior and pass with these fixes.
-The shipping image measures 4,798,552 bytes of `.text`; the approved 1 KiB
-increase sets its cap to 4,798,720 bytes. No fidelity floor is lowered.
-
-Inline replaced images resolve percentage heights against their immediate
-definite block, not a positioned ancestor or the viewport. An intervening
-auto-height block keeps that percentage indefinite. Blockified single-line
-inputs retain the same minimum text height as their inline equivalents, even
-when empty or using `appearance:none`; explicit heights remain authoritative.
-
-The shared SVG decoder supports bounded local `clipPath` geometry and nested
-viewport clipping, including forward references, inline-style precedence,
-`objectBoundingBox` units and transformed object bounds. External clip URLs
-never fetch. Clipping admits 128 definitions/uses, 4096 shape bindings and
-32 nested clip/viewport levels. Its two byte-per-pixel scratch masks are
-Budget-owned and released after decoding; unclipped images allocate no masks.
-This is not complete SVG/CSS masking or arbitrary-angle CSS border rotation.
-Pixel and allocation-refusal tests cover the supported path. No fidelity floor
-was lowered for these changes.
-
-The measured shipping `.text` after this batch is 4,780,144 bytes. A reviewed
-6 KiB increase sets its cap to 4,780,288 bytes; page memory ceilings and the
-validation cap are unchanged. The extra code supplies shared clipping and
-layout behavior, not site-specific rendering rules.
-
-Ordinary component selectors are admitted up to 1023 bytes, retaining only
-their actual text in the stylesheet arena. Rewrite/nesting scratch remains
-bounded to 256 bytes; neither ordinary nor sparse rule records grow. Reduced
-229- and 521-byte selectors check functional alternatives, specificity,
-ancestor/child combinators, variable-backed badge colors and full-bleed sizing.
-The former 191/255-byte admission ceilings dropped these valid rules. Packed
-compound offsets reserve ten bits independently of the six container-query
-bits; indexed and fallback matching must agree.
-
-Definite single-line flex rows establish stretched cross sizes before laying
-out percentage-height descendants. Reduced tests include nested links,
-padding/borders/margins and non-stretched centered items.
-
-The Chrome replay's bounded Intl facade includes the engine's limited
-`Segmenter` behavior, checked against the bootstrap implementation. It must
-neither substitute native ICU segmentation nor stop otherwise compatible
-page initialization by omitting that constructor.
-
-Explicit `box-sizing: inherit` follows the originating element's parent,
-including generated boxes and variable-backed declarations. Universal
-border-box resets therefore retain the available width through nested padded
-containers. Reduced tests cover content-box overrides, initial/unset values
-and declaration order; invalid keywords do not erase an earlier valid value.
-
-Generated text decorations honor their used line height and horizontal
-alignment. Solid, square generated decorations also retain bounded horizontal
-`skew()` / `skewX()` painting without an offscreen surface. This is not general
-affine-transform support: text, image, rounded, gradient and blurred spans
-still decline that specialized path. Pixel tests cover both shear directions,
-`transform:none` overrides and all-or-nothing span refusal.
-
-Absolutely positioned generated boxes center automatic margins when both
-opposing insets and a definite size are supplied. Their square solid borders
-and fills also retain non-quarter rotations in a fixed-size display command,
-with bounded fixed-point coverage instead of an offscreen surface. Unsupported
-spans decline before any command is changed; ancestor quarter turns, scaling
-and viewport clones preserve the payload. Rare rotation uses existing optional
-paint-stack padding, without growing ordinary styles or display commands.
-
-Inline SVGs with definite CSS dimensions that change the authored viewport
-ratio apply those dimensions before viewBox mapping and cache hashing. This
-preserves the artwork's proportions instead of stretching a raster made for
-the old viewport. Uniform resizes retain the existing display-retarget path.
-The linked shipping `.text` for this follow-up is 4,783,952 bytes. The approved
-4 KiB cap increase sets the ceiling to 4,784,384 bytes; page memory ceilings
-and the validation cap remain unchanged. The shared rotated-fill painter is
-outside the ordinary raster hot path and allocates no intermediate surface.
-
-Large sampled external stylesheets can be re-sampled transactionally when
-script-inserted subtrees introduce new selector tokens. The document census
-is capped at 16,384 nodes; eight optional hydration repairs are allowed per
-page. A refused replacement keeps the published styles and layout intact.
-These bounds do not change the fidelity floors.
-
-Generated inline text ignores non-applicable width declarations, while
-inline-block decorations reserve their full advance and align to the line
-baseline. Single-line nested flex rows also re-align their children after
-cross-axis stretching. External CSS animation metadata is retained within
-64 KiB, 128 rules and 16 keyframes, including parsed-stylesheet cache reuse;
-its source is available only to trusted animation initialization, not page
-scripts. Optional metadata refusal does not fail ordinary styling.
-
-The host trace recorder accepts an optional canonical HTTPS `--origin` for
-anonymous cross-origin requests. Capture the actual Origin-sensitive response
-instead of fabricating CORS metadata or disabling enforcement. A diagnostic
-response replacement is not a qualified reference: ledger closure remains
-required for scoreboard admission.
+The advance tables in `src/font.c` (`system_sans_advances`,
+`system_sans_small_advances`) and the pair table in
+`src/font_system_pairs.inc` (about 19 KiB of read-only data) were measured
+at 13 px and 22 px outside the repository. No generator or raw measurements
+were committed and the measuring setup was not recorded, so they are fixed
+data: re-measure all three together, with the tool committed, rather than
+editing rows by hand.
 
 The always-available [search form pixel regression](../tests/visual/search-form/README.md)
 also covers the reduced script-free search form, middle/lower results,
@@ -529,6 +342,38 @@ Compare native output only with matched clock turns and content anchors;
 fractional scroll positions can show different content when layout heights
 differ. Never move a fidelity floor using a mismatched comparison.
 
+For expanding feeds, `capture-reference.js --scroll-window-px 4096` instead
+sweeps the first 4,096 scroll pixels and records five verified viewports within
+that window. The explicit limit is 1–16,384 pixels. Each viewport must have
+complete painted resources, stable geometry and the unchanged mobile input
+profile; off-window lazy images are not claimed as captured. Network, CORS,
+scheduler and teardown checks are unchanged. Receipts use the distinct
+`viewport-window-diagnostic-v1` scope and record the actual document extent and
+window limit. They are not accepted as full-document receipts or fidelity-floor
+oracles. Label strips with absolute scroll offsets, not whole-page percentages.
+
+An additional `--retained-query-posts` window diagnostic may replay at most
+32 exact anonymous same-origin HTTPS GraphQL query bodies. It requires bounded
+canonical JSON request sidecars whose lengths and hashes match the trace, and
+rejects mutations, subscriptions, batches and persisted-only queries. This flag
+does not acquire responses or authorize live POSTs. Acquisition must separately
+review and record the exact anonymous queries. Both page shims and the HTTP
+interceptor require the original body and JSON content type; changed bodies and
+unrecorded requests remain blocked. The separate
+`retained-query-window-diagnostic-v1` scope is not a full-page or fidelity-floor
+oracle. The ordinary GET/HEAD-only policy remains the default.
+For this static diagnostic only, explicitly declared WebSocket service
+exclusions remain denied before networking and are counted as blocked services,
+not replayed live updates. Undeclared sockets still invalidate the capture.
+
+For a reviewed non-consenting choice offered by a page, a plain window capture
+may use `--click-text LABEL` once. The actual visible control is clicked, the
+action is recorded, and every subsequent request still passes the same offline
+policy. It never edits away an overlay or grants network access. Its separate
+`interaction-window-diagnostic-v1` scope cannot qualify a default-state oracle;
+any comparison must reproduce the same action. Do not use it to accept tracking,
+submit credentials, or continue a challenge.
+
 ## Running the scoreboard
 
 ```sh
@@ -626,6 +471,20 @@ tool's `--help` output for the versioned JSON schema and complete threshold
 set.
 
 ## Known evidence limits
+
+`CSS.registerProperty` and `@property` apply one set of registration rules
+within the existing 256-property and custom-value bounds: a custom property
+name, a syntax string that parses, an initial value for any syntax but `*`,
+and a computationally independent initial value for `<length>`. Only
+`<length>` is computed as a type; any other valid syntax (Tailwind's
+`<color>`, for example) keeps its initial value and inheritance but is
+substituted as untyped tokens and is not interpolated by type. Registered
+`em`/`rem`/`ch` lengths inherit computed pixels rather than being evaluated
+again against a descendant's font. Registrations survive stylesheet rebuilds,
+override same-name `@property` rules, and are not reused across documents.
+The callable is lazy so unused registration support does not consume a
+JavaScript wrapper in small realms. This is not full Properties and Values
+API coverage.
 
 A fidelity score covers visual structure only, within these limits:
 
@@ -768,3 +627,14 @@ the frame is more faithful.
   Missing slots, changed geometry and complex compositing still require
   layout. Detached streaming previews clear the native decoration identity.
   Existing fidelity floors remain unchanged.
+
+- **2026-10, worker-backed initialization and positioned controls.** Blob
+  construction shares the existing 512 KiB Blob-URL payload bound; public
+  TextEncoder retains its 256 KiB limit. Worker text reuses the trusted UTF-8
+  decoder, and workers expose bounded, realm-local ImageData values. Initial
+  document fragments are visible to parser-blocking scripts, not just final
+  history entries. Positioned percentage sizes use the actual positioned
+  containing block, including through intermediate normal-flow boxes. Reduced
+  regressions cover worker startup, URL revocation, Unicode and byte bounds,
+  fragment visibility and reverse-wrapped controls. Existing fidelity floors
+  and page-memory ceilings remain unchanged.

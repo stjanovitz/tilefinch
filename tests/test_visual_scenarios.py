@@ -884,6 +884,19 @@ class VisualScenarioTest(unittest.TestCase):
             result = qualify(item, trace, reference_state, candidate_state)
             self.assertEqual(result.status, "ELIGIBLE", result.details)
 
+            for scope in ("viewport-window-diagnostic-v1",
+                          "mobile-auto-fit-window-diagnostic-v1",
+                          "element-scroll-window-diagnostic-v1",
+                          "dedicated-worker-window-diagnostic-v1"):
+                with self.subTest(scope=scope):
+                    diagnostic = copy.deepcopy(baseline)
+                    diagnostic["capture_scope"] = scope
+                    write_state(reference_state, diagnostic)
+                    result = qualify(item, trace, reference_state, candidate_state)
+                    self.assertEqual(result.status, "NOT_COMPARABLE", result.details)
+                    self.assertIn("reference-full-document-is-diagnostic", result.details)
+            write_state(reference_state, baseline)
+
             retained_failure = copy.deepcopy(baseline)
             retained_failure["replay_ledger"] = {
                 **healthy_reference_replay_ledger(),

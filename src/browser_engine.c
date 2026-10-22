@@ -1,4 +1,5 @@
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/file_download.h"
 #include "tilefinch_test_faults.h"
 #include "tilefinch/page_find.h"
 #include "tilefinch/linked_video_preview.h"
@@ -26,6 +27,16 @@
 #define BROWSER_BLANK_READER_SETTLE_TICKS 12u
 #define BROWSER_RECOVERY_SETTLE_US UINT64_C(250000)
 
+/* What a history traversal restores in its target document. */
+typedef struct {
+    int scroll_y;
+    int focus_kind;
+    size_t focus_index;
+    uint64_t focus_identity;
+    NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
+    size_t control_count;
+} BrowserHistoryView;
+
 typedef struct {
     NavigationLoad *load;
     SiteAdapterLoad *adapter;
@@ -34,13 +45,7 @@ typedef struct {
     TilefinchDiagnosticSubsystem failure_subsystem;
     TilefinchDiagnosticCode failure_code;
     size_t previous_history_index;
-    int restore_scroll_y;
-    int restore_focus_kind;
-    size_t restore_focus_index;
-    uint64_t restore_focus_identity;
-    NavigationHistoryControl restore_controls[
-        NAVIGATION_HISTORY_CONTROL_LIMIT];
-    size_t restore_control_count;
+    BrowserHistoryView restore;
     BrowserNavigationJobMetrics metrics;
     uint64_t started_us;
     uint64_t generation;
@@ -50,7 +55,7 @@ typedef struct {
     bool history_forward;
     bool record_history;
     char url[NAVIGATION_URL_LIMIT];
-    char download_filename[128];
+    char download_filename[FILE_DOWNLOAD_FILENAME_LIMIT];
 } BrowserEngineNavigationWork;
 
 /* The load preview on screen. NONE: nothing. FRAME: a frame is presented
@@ -81,6 +86,9 @@ static bool browser_preview_view_live(BrowserPreviewView view)
 
 /* Largest url-encoded body a script form submission may send. */
 #define BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT (64u * 1024u)
+/* Nodes a whole-document walk (history controls, provider controls, a
+   restored focus target) visits at most. */
+#define BROWSER_ENGINE_DOM_WALK_LIMIT 8192u
 
 typedef enum {
     YOUTUBE_SIGNIN_IDLE, YOUTUBE_SIGNIN_ACCOUNT, YOUTUBE_SIGNIN_RECOVERING,
@@ -418,7 +426,7 @@ static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
        Opening them later changes visibility, not provenance. */
     lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html);
     lxb_dom_node_t *node = root;
-    for (unsigned visited = 0u; node != NULL && visited < 8192u;
+    for (unsigned visited = 0u; node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
          visited++, node = browser_engine_history_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_A) continue;
         size_t action_length = 0;
@@ -604,10 +612,25 @@ void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
     };
 }
 
-static size_t browser_engine_reclaim_script_bytecode(void *opaque,
-                                                     size_t needed_bytes)
+static size_t browser_engine_reclaim_accelerators(void *opaque,
+                                                 size_t needed_bytes)
 {
-    return browser_session_script_bytecode_reclaim(opaque, needed_bytes);
+    size_t reclaimed = browser_session_script_bytecode_reclaim(opaque, needed_bytes);
+    if (reclaimed < needed_bytes)
+        reclaimed += browser_session_decoded_image_reclaim(
+            opaque, needed_bytes - reclaimed);
+    return reclaimed;
+}
+
+static void browser_engine_reclaim_for_full_relayout(void *opaque)
+{
+    BrowserEngine *engine = opaque;
+    /* The required rebuild will replace these accelerators anyway. This is
+       an owner boundary, not an allocation hook: cache metadata may be
+       retired here without invalidating a loader's borrowed response. */
+    if (engine->render_ready) (void)tile_cache_reclaim_optional(&engine->render);
+    if (engine->session_ready)
+        (void)browser_session_cache_reclaim(&engine->session, SIZE_MAX);
 }
 
 void browser_config_init(BrowserConfig *config,
@@ -715,6 +738,8 @@ bool browser_config_apply_psp_memory_profile(
         config->javascript.maximum_total_bytes = 1u * MIB;
     if (config->javascript.maximum_file_bytes > 256u * KIB)
         config->javascript.maximum_file_bytes = 256u * KIB;
+    if (config->resources.maximum_font_file_bytes > 128u * KIB)
+        config->resources.maximum_font_file_bytes = 128u * KIB;
     return script_execution_policy_for_profile(
         SCRIPT_EXECUTION_PROFILE_PSP_STRICT,
         &config->javascript.execution_policy);
@@ -747,6 +772,10 @@ bool browser_config_apply_psp_app_defaults(BrowserConfig *config)
     config->javascript.network_timeout_ms =
         BROWSER_PSP_APP_NETWORK_TIMEOUT_MS;
     config->resources.enabled = true;
+    /* A single useful face may use the shared encoded-font allowance.
+       Aggregate downloads and retained decoded-face storage do not grow. */
+    config->resources.maximum_font_file_bytes =
+        config->resources.maximum_font_bytes;
     /* Modern mobile shells split their critical component rules across many
        small sheets and occasionally one 700 KiB decoded module. Keep the
        limits hard, but retain a small tail allowance for late mobile-header
@@ -1410,13 +1439,13 @@ static bool browser_engine_restore_candidate_controls(
             && browser_engine_history_url_matches_document(
                    target->url, candidate->page.document_url)) {
             if (!browser_engine_restore_controls(
-                candidate, work->restore_controls,
-                work->restore_control_count)) return false;
+                candidate, work->restore.controls,
+                work->restore.control_count)) return false;
         } else {
             /* The response redirected or otherwise committed a different
                document.  Ordinal control state belongs to the requested
                history document and must never populate an unrelated form. */
-            work->restore_control_count = 0u;
+            work->restore.control_count = 0u;
         }
     }
     return true;
@@ -2059,6 +2088,8 @@ static bool browser_engine_paint_progressive_preview(
 static bool browser_engine_configure_navigation(BrowserEngine *engine)
 {
     NavigationSession *navigation = &engine->navigation;
+    navigation->reclaim_optional = browser_engine_reclaim_for_full_relayout;
+    navigation->reclaim_optional_opaque = engine;
     navigation->declared_css_width = engine->config.declared_css_width;
     navigation->declared_css_height = engine->config.declared_css_height;
     navigation_attach_browser_session(navigation, &engine->session);
@@ -2190,6 +2221,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
                        "browser session initialization failed");
         goto failed;
     }
+    youtube_lite_session_register_credentials(&engine->session);
     browser_session_module_bytecode_set_limit(
         &engine->session, config->module_bytecode_cache_limit);
     browser_session_script_bytecode_set_limit(
@@ -2198,11 +2230,11 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
     (void) browser_session_script_disk_configure(
         &engine->session, config->script_cache_dir,
         config->script_cache_write, config->script_cache_limit);
-    /* Script bytecode (module and classic) lives in room the page is not
-       using. It is released before the page Budget refuses anything, so it
-       can speed up a revisit but never be the reason an allocation fails. */
+    /* Reproducible accelerators use otherwise-free room, never the required
+       page's last bytes. Pixel reclamation leaves response metadata intact:
+       an allocating caller may still be borrowing that metadata. */
     budget_set_reclaim_hook(&engine->budget,
-                            browser_engine_reclaim_script_bytecode,
+                            browser_engine_reclaim_accelerators,
                             &engine->session);
     engine->session_ready = true;
     BROWSER_ENGINE_CREATE_MARK(session_ready_us);
@@ -2922,8 +2954,7 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
     return true;
 }
 
-static const char youtube_signin_entry[] =
-    "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
+static const char youtube_signin_entry[] = YOUTUBE_LITE_SIGNIN_URL;
 
 static bool browser_engine_youtube_auth_origin(const char *url)
 {
@@ -2956,7 +2987,7 @@ static void browser_engine_note_youtube_signin_navigation(BrowserEngine *engine,
         && browser_engine_youtube_signin_continue_available(engine)) {
         engine->youtube_signin_state = YOUTUBE_SIGNIN_HANDOFF;
     } else if (strcmp(url, youtube_signin_entry) == 0
-        || strcmp(url, "https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fwww.youtube.com%2F") == 0) {
+        || strcmp(url, YOUTUBE_LITE_ACCOUNT_CHOOSER_URL) == 0) {
         engine->youtube_signin_retries = 0;
         engine->youtube_signin_state = YOUTUBE_SIGNIN_ACCOUNT;
         engine->youtube_login_events |= BROWSER_YOUTUBE_LOGIN_STARTED;
@@ -3147,18 +3178,36 @@ static lxb_dom_node_t *browser_engine_history_focus(
     return browser_engine_semantic_focus(engine, kind, ordinal, NULL);
 }
 
-static void browser_engine_navigation_restore_view(
+/* Copies the restorable view of a history entry, the one place its
+   control records are clamped. */
+static void browser_engine_history_view_from_entry(
+    BrowserHistoryView *view, const NavigationEntry *entry)
+{
+    view->scroll_y = entry->scroll_y;
+    view->focus_kind = entry->focus_kind;
+    view->focus_index = entry->focus_index;
+    view->focus_identity = entry->focus_identity;
+    view->control_count = entry->control_count;
+    if (view->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
+        view->control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    memcpy(view->controls, entry->controls,
+           view->control_count * sizeof(*view->controls));
+}
+
+/* Applies a committed history document's saved focus, then its scroll.
+   Returns whether the scroll position was applied. */
+static bool browser_engine_navigation_restore_view(
     BrowserEngine *engine, const BrowserEngineNavigationWork *work)
 {
-    if (engine == NULL || work == NULL || !work->history_move) return;
+    if (engine == NULL || work == NULL || !work->history_move) return false;
     lxb_dom_node_t *focus = browser_engine_history_focus(
-        engine, work->restore_focus_kind, work->restore_focus_index,
-        work->restore_focus_identity);
+        engine, work->restore.focus_kind, work->restore.focus_index,
+        work->restore.focus_identity);
     if (focus != NULL) (void) controller_focus_node(&engine->controller, focus);
     /* Focus notifications may relayout or reveal. History owns the exact
        viewport, so apply its saved position after those side effects. */
-    (void) navigation_set_scroll(
-        &engine->navigation, work->restore_scroll_y);
+    return navigation_set_scroll(
+        &engine->navigation, work->restore.scroll_y);
 }
 
 static NavigationEntry *browser_engine_restorable_entry(BrowserEngine *engine)
@@ -3204,22 +3253,33 @@ static void browser_engine_store_current_controls(BrowserEngine *engine)
     NavigationEntry *entry = browser_engine_restorable_entry(engine);
     if (entry == NULL) return;
     entry->control_count = 0u;
-    /* Disclosure visibility determines all subsequent control ordinals.
-       Reserve these records first; a full eight-entry snapshot may omit
-       later text values, but must not assign them to the wrong controls. */
+    /* Disclosure visibility determines all subsequent control ordinals, so
+       it is recorded first: one record whose bits are the open states by
+       disclosure ordinal, leaving the other slots for values. A document
+       with more disclosures than the bits hold saves no values, which
+       could otherwise be assigned to the wrong controls. */
     lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html);
     lxb_dom_node_t *node = root;
+    NavigationHistoryControl *disclosures = NULL;
     unsigned ordinal = 0u;
-    for (unsigned visited = 0u; node != NULL && visited < 8192u
-         && entry->control_count < NAVIGATION_HISTORY_CONTROL_LIMIT;
+    for (unsigned visited = 0u; node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
          visited++, node = browser_engine_history_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_DETAILS) continue;
-        NavigationHistoryControl *saved = &entry->controls[entry->control_count++];
-        saved->control_index = (uint16_t) ordinal++;
-        saved->value_length = 0x4000u;
-        saved->value[0] = lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
-            (const lxb_char_t *) "open", 4u) ? 1 : 0;
+        if (disclosures == NULL) {
+            disclosures = &entry->controls[entry->control_count++];
+            memset(disclosures, 0, sizeof(*disclosures));
+            disclosures->value_length = NAVIGATION_HISTORY_CONTROL_DISCLOSURES;
+        }
+        if (ordinal >= 8u * sizeof(disclosures->value)) {
+            disclosures->control_index = (uint16_t) ordinal;
+            return;
+        }
+        if (lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                (const lxb_char_t *) "open", 4u))
+            disclosures->value[ordinal / 8u] |= (char) (1u << (ordinal % 8u));
+        ordinal++;
     }
+    if (disclosures != NULL) disclosures->control_index = (uint16_t) ordinal;
     const LayoutDocument *layout = &engine->navigation.page.layout;
     for (size_t index = 0;
          index < layout->control_count
@@ -3251,7 +3311,7 @@ static void browser_engine_store_current_controls(BrowserEngine *engine)
         NavigationHistoryControl *saved =
             &entry->controls[entry->control_count++];
         saved->control_index = (uint16_t) index;
-        saved->value_length = (uint16_t) value_length | (option_count ? 0x8000u : 0u);
+        saved->value_length = (uint16_t) value_length | (option_count ? NAVIGATION_HISTORY_CONTROL_OPTIONS : 0u);
         if (value_length != 0u)
             memcpy(saved->value, value, value_length);
         if (value_length < sizeof(saved->value)) saved->value[value_length] = '\0';
@@ -3270,27 +3330,28 @@ static bool browser_engine_restore_controls(
     lxb_dom_node_t *root = lxb_dom_interface_node(navigation->page.document.html);
     lxb_dom_node_t *node = root;
     unsigned ordinal = 0u;
-    bool have_disclosure = false;
+    const NavigationHistoryControl *disclosures = NULL;
     for (size_t at = 0; at < count; at++)
-        have_disclosure |= controls[at].value_length == 0x4000u;
-    for (unsigned visited = 0u; have_disclosure && node != NULL && visited < 8192u;
+        if (controls[at].value_length == NAVIGATION_HISTORY_CONTROL_DISCLOSURES) disclosures = &controls[at];
+    unsigned recorded = disclosures == NULL ? 0u : disclosures->control_index;
+    if (recorded > 8u * sizeof(disclosures->value))
+        recorded = 8u * sizeof(disclosures->value);
+    for (unsigned visited = 0u; ordinal < recorded && node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
          visited++, node = browser_engine_history_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_DETAILS) continue;
-        for (size_t at = 0; at < count; at++) {
-            if (controls[at].value_length != 0x4000u
-                || controls[at].control_index != ordinal) continue;
-            bool open = lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
-                (const lxb_char_t *) "open", 4u);
-            if (open == (controls[at].value[0] != 0)) continue;
-            if (controls[at].value[0]) {
-                if (lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
-                        (const lxb_char_t *) "open", 4u,
-                        (const lxb_char_t *) "", 0u) == NULL) return false;
-            } else if (lxb_dom_element_remove_attribute(lxb_dom_interface_element(node),
-                    (const lxb_char_t *) "open", 4u) != LXB_STATUS_OK) return false;
-            disclosed = true;
-        }
+        bool wanted = (((unsigned char) disclosures->value[ordinal / 8u]
+                        >> (ordinal % 8u)) & 1u) != 0u;
         ordinal++;
+        bool open = lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+            (const lxb_char_t *) "open", 4u);
+        if (open == wanted) continue;
+        if (wanted) {
+            if (lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "open", 4u,
+                    (const lxb_char_t *) "", 0u) == NULL) return false;
+        } else if (lxb_dom_element_remove_attribute(lxb_dom_interface_element(node),
+                (const lxb_char_t *) "open", 4u) != LXB_STATUS_OK) return false;
+        disclosed = true;
     }
     if (disclosed) {
         layout_reuse_cache_reset(navigation->page.layout_reuse);
@@ -3299,17 +3360,17 @@ static bool browser_engine_restore_controls(
     }
     for (size_t at = 0; at < count; at++) {
         const NavigationHistoryControl *saved = &controls[at];
-        if (saved->value_length == 0x4000u) continue;
+        if (saved->value_length == NAVIGATION_HISTORY_CONTROL_DISCLOSURES) continue;
         if (saved->control_index >= navigation->page.layout.control_count)
             continue;
         lxb_dom_node_t *node = navigation->page.layout.controls[
             saved->control_index].node;
         if (node != NULL) {
-            if (saved->value_length & 0x8000u) {
+            if (saved->value_length & NAVIGATION_HISTORY_CONTROL_OPTIONS) {
                 char state[128];
                 memcpy(state, saved->value, sizeof(state));
                 size_t restored = controller_select_history(node, state,
-                    saved->value_length & 0x7fffu, true);
+                    saved->value_length & NAVIGATION_HISTORY_CONTROL_LENGTH_MASK, true);
                 if (restored == SIZE_MAX) return false;
                 selected |= restored != 0;
             } else if (saved->value_length < sizeof(saved->value))
@@ -3503,7 +3564,7 @@ static void browser_engine_census_page_fonts(BrowserEngine *engine)
            this family. The two sans bold faces are 77 KB (DejaVu Sans) and
            98 KB (TilefinchSans); a page styled only with Arial, or only
            with sans-serif, never draws the other one. */
-        if (draw_command_font_weight_code(command) >= 65u) {
+        if (draw_uses_bold_face(command)) {
             requested |= serif ? FONT_SET_FACE_SERIF_BOLD
                 : (family == FONT_METRIC_SANS || family == FONT_SYSTEM_SANS)
                     ? FONT_SET_FACE_METRIC_SANS_BOLD
@@ -3627,7 +3688,7 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     work->adapter = NULL;
     if (succeeded) {
         browser_engine_census_page_fonts(engine);
-        browser_engine_navigation_restore_view(engine, work);
+        (void) browser_engine_navigation_restore_view(engine, work);
         if (!work->history_move)
             browser_engine_apply_initial_navigation_view(engine, true);
         if (had_provisional && provisional_scroll_y > 0) {
@@ -4056,12 +4117,7 @@ typedef struct {
     size_t previous_index;
     char previous_url[NAVIGATION_URL_LIMIT];
     char url[NAVIGATION_URL_LIMIT];
-    int scroll_y;
-    int focus_kind;
-    size_t focus_index;
-    uint64_t focus_identity;
-    NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
-    size_t control_count;
+    BrowserHistoryView view;
 } BrowserHistoryRestore;
 
 /* Snapshot the target before any navigation preparation can mutate the
@@ -4080,15 +4136,7 @@ static bool browser_engine_prepare_history(BrowserEngine *engine, bool forward,
                          : navigation_back(&engine->navigation, &entry);
     if (!moved || entry == NULL) return false;
     snprintf(restore->url, sizeof(restore->url), "%s", entry->url);
-    restore->scroll_y = entry->scroll_y;
-    restore->focus_kind = entry->focus_kind;
-    restore->focus_index = entry->focus_index;
-    restore->focus_identity = entry->focus_identity;
-    restore->control_count = entry->control_count;
-    if (restore->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
-        restore->control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
-    memcpy(restore->controls, entry->controls,
-           restore->control_count * sizeof(*restore->controls));
+    browser_engine_history_view_from_entry(&restore->view, entry);
     return true;
 }
 
@@ -4110,10 +4158,11 @@ static BrowserHistoryRestoreStatus browser_engine_restore_history_document(
     if (!browser_engine_settle_same_document_events(engine))
         return HISTORY_RESTORE_SETTLE_FAILED;
     lxb_dom_node_t *focus = browser_engine_history_focus(
-        engine, restore->focus_kind, restore->focus_index, restore->focus_identity);
+        engine, restore->view.focus_kind, restore->view.focus_index,
+        restore->view.focus_identity);
     if (focus != NULL && !controller_focus_node(&engine->controller, focus))
         return HISTORY_RESTORE_INPUT_FAILED;
-    if (!navigation_set_scroll(&engine->navigation, restore->scroll_y)
+    if (!navigation_set_scroll(&engine->navigation, restore->view.scroll_y)
         || !browser_engine_finish_input(engine, true))
         return HISTORY_RESTORE_INPUT_FAILED;
     return HISTORY_RESTORE_OK;
@@ -4140,21 +4189,13 @@ bool browser_engine_begin_navigation_history(
     size_t previous_index = restore.previous_index;
     const char *previous_url = restore.previous_url;
     const char *url = restore.url;
-    int scroll_y = restore.scroll_y;
-    int focus_kind = restore.focus_kind;
-    size_t focus_index = restore.focus_index;
-    const NavigationHistoryControl *restore_controls = restore.controls;
-    size_t restore_control_count = restore.control_count;
     if (navigation_url_is_same_document(
             &engine->navigation, previous_url)) {
         BrowserEngineNavigationWork *work = &engine->navigation_work;
         *work = (BrowserEngineNavigationWork) {
             .status = BROWSER_NAVIGATION_JOB_SUCCEEDED,
             .previous_history_index = previous_index,
-            .restore_scroll_y = scroll_y,
-            .restore_focus_kind = focus_kind,
-            .restore_focus_index = focus_index,
-            .restore_focus_identity = restore.focus_identity,
+            .restore = restore.view,
             .started_us = tilefinch_platform_monotonic_time_us(),
             .history_move = true,
             .history_forward = forward
@@ -4184,14 +4225,15 @@ bool browser_engine_begin_navigation_history(
        instead of binding the incumbent controls to the target URL. Do this
        even when request preparation fails so a later retry still has the
        original target state. */
+    const BrowserHistoryView *view = &restore.view;
     NavigationEntry *target_entry =
         &engine->navigation.history[engine->navigation.history_index];
-    target_entry->focus_kind = focus_kind;
-    target_entry->focus_index = focus_index;
-    target_entry->focus_identity = restore.focus_identity;
-    target_entry->control_count = restore_control_count;
-    memcpy(target_entry->controls, restore_controls,
-           restore_control_count * sizeof(*restore_controls));
+    target_entry->focus_kind = view->focus_kind;
+    target_entry->focus_index = view->focus_index;
+    target_entry->focus_identity = view->focus_identity;
+    target_entry->control_count = view->control_count;
+    memcpy(target_entry->controls, view->controls,
+           view->control_count * sizeof(*view->controls));
     if (!began) {
         browser_engine_rollback_same_document_cursor(engine, forward);
         return false;
@@ -4200,13 +4242,7 @@ bool browser_engine_begin_navigation_history(
     work->history_move = true;
     work->history_forward = forward;
     work->previous_history_index = previous_index;
-    work->restore_scroll_y = scroll_y;
-    work->restore_focus_kind = focus_kind;
-    work->restore_focus_index = focus_index;
-    work->restore_focus_identity = restore.focus_identity;
-    work->restore_control_count = restore_control_count;
-    memcpy(work->restore_controls, restore_controls,
-           restore_control_count * sizeof(*restore_controls));
+    work->restore = *view;
     return true;
 }
 
@@ -5018,19 +5054,11 @@ bool browser_engine_commit_history_html(BrowserEngine *engine, const char *url,
         return browser_engine_commit_html(engine, url, html, html_length, false);
     BrowserEngineNavigationWork *work = &engine->navigation_work;
     work->history_move = true;
-    work->restore_scroll_y = entry->scroll_y;
-    work->restore_focus_kind = entry->focus_kind;
-    work->restore_focus_index = entry->focus_index;
-    work->restore_focus_identity = entry->focus_identity;
-    work->restore_control_count = entry->control_count;
-    if (work->restore_control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
-        work->restore_control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
-    memcpy(work->restore_controls, entry->controls,
-           work->restore_control_count * sizeof(*entry->controls));
+    browser_engine_history_view_from_entry(&work->restore, entry);
     bool loaded = browser_engine_commit_html(engine, url, html, html_length, false);
-    if (loaded) browser_engine_navigation_restore_view(engine, work);
+    if (loaded) (void) browser_engine_navigation_restore_view(engine, work);
     work->history_move = false;
-    work->restore_control_count = 0;
+    work->restore.control_count = 0;
     return loaded;
 }
 
@@ -5237,11 +5265,6 @@ bool browser_engine_history_move(BrowserEngine *engine, bool forward)
     size_t previous_index = restore.previous_index;
     const char *previous_url = restore.previous_url;
     const char *url = restore.url;
-    int scroll_y = restore.scroll_y;
-    int focus_kind = restore.focus_kind;
-    size_t focus_index = restore.focus_index;
-    const NavigationHistoryControl *restore_controls = restore.controls;
-    size_t restore_control_count = restore.control_count;
     if (navigation_url_is_same_document(
             &engine->navigation, previous_url)) {
         BrowserHistoryRestoreStatus result =
@@ -5261,23 +5284,19 @@ bool browser_engine_history_move(BrowserEngine *engine, bool forward)
     }
     BrowserEngineNavigationWork *work = &engine->navigation_work;
     work->history_move = true;
-    work->restore_control_count = restore_control_count;
-    memcpy(work->restore_controls, restore_controls,
-           restore_control_count * sizeof(*restore_controls));
+    work->restore = restore.view;
     bool loaded = browser_engine_load_url(engine, url, false);
+    /* Like the cooperative path, restore while the move is still marked. */
+    bool restored = loaded && browser_engine_navigation_restore_view(engine, work);
     work->history_move = false;
-    work->restore_control_count = 0u;
+    work->restore.control_count = 0u;
     if (!loaded) {
         if (engine->navigation.history_index != previous_index) {
             browser_engine_rollback_same_document_cursor(engine, forward);
         }
         return false;
     }
-    lxb_dom_node_t *focus_node =
-        browser_engine_history_focus(engine, focus_kind, focus_index, restore.focus_identity);
-    if (focus_node != NULL)
-        (void) controller_focus_node(&engine->controller, focus_node);
-    return navigation_set_scroll(&engine->navigation, scroll_y);
+    return restored;
 }
 
 bool browser_engine_replace_history(
@@ -6721,7 +6740,7 @@ static bool browser_engine_publish_youtube_home(BrowserEngine *engine,
     engine->youtube_browsing_generation = engine->navigation.generation;
     navigation_set_scroll(&engine->navigation, scroll);
     lxb_dom_node_t *root = lxb_dom_interface_node(engine->navigation.page.document.html), *node = root;
-    for (unsigned visited = 0; focus_id[0] != '\0' && node != NULL && visited < 8192;
+    for (unsigned visited = 0; focus_id[0] != '\0' && node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
          visited++, node = browser_engine_history_walk_next(root, node)) {
         size_t length = 0;
         const char *id = document_attribute(node, "id", &length);
@@ -8246,11 +8265,8 @@ static bool browser_engine_has_script_degradation(
     bool heap_rejected = navigation->page.runtime != NULL
         && script_runtime_heap_rejections(navigation->page.runtime) != 0u;
     /* A realm retired by navigation_retire_exhausted_script_realms no longer
-       exposes its allocator counter. Its exact engine-authored summary is the
-       durable evidence for that already-completed transition. */
-    bool memory_realm_retired = navigation->page.runtime == NULL
-        && strcmp(result->summary,
-                  "JavaScript stopped at its memory limit") == 0;
+       exposes its allocator counter; that retirement sets
+       script_degradation_observed. */
     return navigation->page.script_degradation_observed
         || result->scripts_failed != 0u
         || result->external_scripts_failed != 0u
@@ -8259,7 +8275,7 @@ static bool browser_engine_has_script_degradation(
         || result->host_compile_rejections != 0u
         || result->host_compile_watchdog_aborts != 0u
         || result->uncaught_callback_errors != 0u
-        || result->interrupted || heap_rejected || memory_realm_retired;
+        || result->interrupted || heap_rejected;
 }
 
 static bool browser_engine_recovery_wall_settled(
@@ -8723,10 +8739,14 @@ BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
 {
     if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    bool memory_limited = engine != NULL
+        && (engine->navigation.page.script_memory_limited
+            || engine->navigation.page.script_result.host_compile_memory_refusals
+                   != 0u);
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready
         || !browser_engine_has_script_degradation(&engine->navigation)
-        || (!browser_engine_page_is_visually_blank(engine)
+        || (!memory_limited && !browser_engine_page_is_visually_blank(engine)
             && browser_engine_has_visible_action_target(engine))) {
         if (engine != NULL) engine->basic_view_recovery_generation = 0u;
         return BROWSER_BASIC_VIEW_RECOVERY_NONE;

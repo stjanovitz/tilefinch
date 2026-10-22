@@ -314,6 +314,115 @@ static int test_layout(void)
 #include "suites/layout_regression_positioning.inc"
 #include "suites/layout_regression_fonts.inc"
 
+static int test_column_flex_scroller_height(void)
+{
+    for (unsigned nested = 0; nested < 3; nested++) {
+        if (nested == 0) {
+            const char *page =
+                    "<!doctype html><style>body{margin:0}"
+                    "#shell{display:flex;flex-direction:column;width:200px;height:"
+                    "200px;gap:5px}"
+                    "#head{height:30px;flex-shrink:0}#foot{height:20px;flex-shrink:0}"
+                    "#pane{flex:1;min-height:0;overflow:auto;background:#eee}"
+                    "#long{height:500px}</style><div id=shell><div id=head>Header</div>"
+                    "<div id=pane><div id=long>Content</div></div><div "
+                    "id=foot>Footer</div></div>";
+            Budget budget;
+            budget_init(&budget, 4u * MIB);
+            CHECK(budget_install_lexbor(&budget));
+            PocDocument document = {0};
+            Stylesheet sheet = {0};
+            LayoutDocument layout = {0};
+            CHECK(
+                    document_parse(&document, &budget, page, strlen(page), 17) &&
+                    stylesheet_build(&sheet, &budget, &document, 200) &&
+                    layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 200));
+            lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+            const LayoutNodeBox *pane =
+                    layout_box_for_node(&layout, find_id(root, "pane"));
+            const LayoutNodeBox *foot =
+                    layout_box_for_node(&layout, find_id(root, "foot"));
+            CHECK(pane != NULL && foot != NULL && pane->y == 35 &&
+                        pane->height == 140 && pane->client_height == 140 &&
+                        pane->content_height >= 500 && foot->y == 180);
+            layout_destroy(&layout);
+            stylesheet_destroy(&sheet);
+            document_destroy(&document);
+            CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+            continue;
+        }
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        const char *tail =
+                nested != 2
+                        ? "<!doctype "
+                            "html><style>body{margin:0}#shell{display:flex;flex-direction:"
+                "column;height:200px;gap:5px}"
+                            "#head{height:30px;flex-shrink:0}#pane{flex:1;min-height:0;"
+                            "display:grid;grid-template-rows:minmax(0,1fr)}"
+                            "#inner{overflow:auto;min-height:0}#long{height:500px}</style>"
+                            "<div id=shell><div id=head>Header</div><div id=pane><div "
+                            "id=inner><div "
+                            "id=long>Content</div></div></div><div></div><div></div></div>"
+                        : "<!doctype "
+                            "html><style>body{margin:0}#shell{display:flex;flex-direction:"
+                            "column;height:200px}"
+                            "#head{height:30px;flex-shrink:0}#pane{flex:1;min-height:auto}#"
+                            "long{height:500px}</style>"
+                            "<div id=shell><div id=head>Header</div><div id=pane><div "
+                            "id=long>Content</div></div></div>";
+        CHECK(document_parse(&document, &budget, tail, strlen(tail), 17) &&
+                    stylesheet_build(&sheet, &budget, &document, 200) &&
+                    layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 200));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const LayoutNodeBox *pane =
+                layout_box_for_node(&layout, find_id(root, "pane"));
+        CHECK(pane != NULL && pane->height == (nested != 2 ? 155 : 500));
+        if (nested != 2) {
+            const LayoutNodeBox *inner =
+                    layout_box_for_node(&layout, find_id(root, "inner"));
+            CHECK(inner != NULL && inner->height == 155 &&
+                        inner->content_height >= 500);
+        }
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+static int test_individual_calc_translate(void)
+{
+    const char *page =
+            "<!doctype html><style>body{margin:0}"
+            "#pill{position:fixed;left:50%;top:20px;width:140px;height:40px;"
+            "--shift:calc(calc(1 / 2 * 100%) * -1);translate:var(--shift) 0}"
+            "</style><div id=pill>Pill</div>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, strlen(page), 17)
+            && stylesheet_build(&sheet, &budget, &document, 480)
+            && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    const LayoutNodeBox *pill = layout_box_for_node(&layout,
+            find_id(lxb_dom_interface_node(document.html), "pill"));
+    CHECK(pill != NULL && pill->x == 170 && pill->y == 0 && pill->width == 140
+            && layout.fixed_count == 1 && layout.fixed_ranges[0].inset == 20);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_auto_grid_block_alignment(void)
 {
     for (unsigned end = 0; end < 2; end++) {
@@ -353,6 +462,45 @@ static int test_auto_grid_block_alignment(void)
             CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
         }
     }
+    return 0;
+}
+
+static int test_style_cache_preserves_layout_workspace(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><style>div{width:80px;color:#123456}"
+        "</style><div>Readable</div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, &budget, &document, &viewport));
+    LayoutReuseCache *cache = layout_reuse_cache_create(&budget);
+    CHECK(cache != NULL);
+    layout_reuse_cache_prepare(cache, &sheet, NULL, NULL, 480);
+    lxb_dom_node_t *node = document_body_node(&document)->first_child;
+    CHECK(node != NULL);
+    ComputedStyle parent = layout_initial_root_style(), first, second;
+    size_t limit = budget.limit, failures = budget.failure_count;
+    budget.limit = budget.current + 896u * 1024u;
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, NULL, node,
+        &parent, &first));
+    CHECK(first.width == 80 && first.color == 0x123456
+        && cache->style_payload_count == 0 && budget.failure_count == failures);
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, NULL, node,
+        &parent, &second) && memcmp(&first, &second, sizeof(first)) == 0);
+    budget.limit = limit;
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, NULL, node,
+        &parent, &second) && cache->style_payload_count != 0);
+    CHECK(layout_reuse_cache_resolve_style(cache, &sheet, NULL, node,
+        &parent, &second) && memcmp(&first, &second, sizeof(first)) == 0);
+    layout_reuse_cache_destroy(cache);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
 
@@ -418,8 +566,74 @@ static int test_oversized_style_cache_scan(void)
     return 0;
 }
 
+static int test_grid_column_metadata_refusal(void)
+{
+    Budget budget;
+    budget_init(&budget, 64u * 1024u);
+    LayoutDocument layout = {.budget = &budget};
+    lxb_dom_node_t nodes[129] = {0};
+    const int tracks[] = {120, 230};
+    const int *widths = NULL;
+    unsigned origin = 0;
+    budget_inject_failure_after(&budget, 0);
+    layout_record_grid_columns(&layout, &nodes[0], tracks, 2, 0);
+    CHECK(layout_grid_columns_for_node(&layout, &nodes[0], &widths, &origin) == 0
+          && widths == NULL && layout.grid_columns_refused);
+    budget_clear_failure_injection(&budget);
+    layout_destroy(&layout);
+    layout.budget = &budget;
+    for (size_t i = 0; i < 129; i++)
+        layout_record_grid_columns(&layout, &nodes[i], tracks, 2, 1);
+    CHECK(layout.grid_column_count == 128);
+    CHECK(layout_grid_columns_for_node(&layout, &nodes[127], &widths, &origin) == 2
+          && widths[0] == 120 && widths[1] == 230 && origin == 1);
+    CHECK(layout_grid_columns_for_node(&layout, &nodes[128], NULL, NULL) == 0);
+    const int resized[] = {350};
+    layout_record_grid_columns(&layout, &nodes[0], resized, 1, 0);
+    CHECK(layout_grid_columns_for_node(&layout, &nodes[0], &widths, &origin) == 1
+          && widths[0] == 350 && origin == 0);
+    layout_destroy(&layout);
+    CHECK(budget.current == 0 && budget.allocation_count == budget.free_count);
+    return 0;
+}
+
+static int test_legacy_mobile_style_fallbacks(void)
+{
+    ParityPage page;
+    CHECK(parity_page_load(&page,
+        "<!doctype html><style>body{margin:0}div{width:30px;height:30px}"
+        "#rounded{border-radius:8px;border-radius:0\\9}"
+        "#icon{-webkit-filter:invert(100%)}"
+        "#plain{filter:invert(100%);filter:none}"
+        "</style><div id=rounded></div><div id=icon></div><div id=plain></div>"));
+    lxb_dom_node_t *root = lxb_dom_interface_node(page.document.html);
+    ComputedStyle rounded = style_for_node(&page.sheet, find_id(root, "rounded"), NULL);
+    ComputedStyle icon = style_for_node(&page.sheet, find_id(root, "icon"), NULL);
+    ComputedStyle plain = style_for_node(&page.sheet, find_id(root, "plain"), NULL);
+    CHECK(rounded.border_radius == 8);
+    CHECK(icon.has_filter && computed_style_filter_code(&icon) == STYLE_FILTER_INVERT);
+    CHECK(!plain.has_filter && computed_style_filter_code(&plain) == 0);
+    CHECK(style_parse_length(&page.sheet, "2remnant", 8, -123, NULL) == -123);
+    CHECK(style_parse_length(&page.sheet, "0\\9", 3, -123, NULL) == -123);
+    CHECK(style_parse_length(&page.sheet, "2rem", 4, -123, NULL) == 32);
+    CHECK(parity_page_destroy(&page));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--legacy-mobile-styles-only") == 0)
+        return test_legacy_mobile_style_fallbacks();
+    CHECK(test_legacy_mobile_style_fallbacks() == 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
+        return test_grid_column_metadata_refusal();
+    CHECK(test_grid_column_metadata_refusal() == 0);
+    if (argc == 2 && strcmp(argv[1], "--individual-translate-only") == 0)
+        return test_individual_calc_translate();
+    if (argc == 2 && strcmp(argv[1], "--column-scroller-only") == 0)
+        return test_column_flex_scroller_height();
+    CHECK(test_individual_calc_translate() == 0);
+    CHECK(test_column_flex_scroller_height() == 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && strcmp(argv[1], "--page-font-leading-only") == 0)
         return test_page_font_normal_leading();
@@ -460,6 +674,8 @@ int main(int argc, char **argv)
         return test_fractional_tracking();
     if (argc == 2 && strcmp(argv[1], "--nested-flex-baseline-only") == 0)
         return test_nested_flex_baseline();
+    if (argc == 2 && strcmp(argv[1], "--flex-row-baseline-only") == 0)
+        return test_flex_row_baseline_line_height();
     if (argc == 2 && strcmp(argv[1], "--css-replacement-image-only") == 0)
         return test_css_replacement_image();
     if (argc == 2 && strcmp(argv[1], "--button-content-centering-only") == 0)
@@ -470,14 +686,29 @@ int main(int argc, char **argv)
         return test_auto_grid_block_alignment();
     if (argc == 2 && strcmp(argv[1], "--oversized-style-cache-only") == 0)
         return test_oversized_style_cache_scan();
+    if (argc == 2 && strcmp(argv[1], "--style-workspace-only") == 0)
+        return test_style_cache_preserves_layout_workspace();
     if (argc == 2 && strcmp(argv[1], "--container-cache-only") == 0) {
         Budget budget;
         budget_init(&budget, 32u * 1024u * 1024u);
         budget_install_lexbor(&budget);
         return test_container_queries_one_pass(&budget);
     }
+    if (argc == 2 && strcmp(argv[1], "--container-ratio-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        budget_install_lexbor(&budget);
+        return test_container_ratio_features_layout(&budget);
+    }
+    if (argc == 2 && strcmp(argv[1], "--size-containment-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 32u * 1024u * 1024u);
+        budget_install_lexbor(&budget);
+        return test_container_size_containment_layout(&budget);
+    }
     CHECK(test_auto_grid_block_alignment() == 0);
     CHECK(test_oversized_style_cache_scan() == 0);
+    CHECK(test_style_cache_preserves_layout_workspace() == 0);
     if (argc == 3 && strcmp(argv[1], "--visual-regression") == 0) {
         unsigned selected = (unsigned) strtoul(argv[2], NULL, 10);
         if (selected >= 1 && selected <= 4)

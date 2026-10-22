@@ -1,20 +1,4 @@
-static void diagnostic_saturating_add(uint64_t *value, size_t increment)
-{
-    if (value == NULL || *value == UINT64_MAX || increment == 0) return;
-    uint64_t add = (uint64_t) increment;
-    *value = add > UINT64_MAX - *value ? UINT64_MAX : *value + add;
-}
-
 static bool stylesheet_prefers_dark;
-static bool span_contains_literal(const char *text, size_t length,
-                                  const char *literal)
-{
-    size_t wanted = strlen(literal);
-    if (text == NULL || wanted == 0 || wanted > length) return false;
-    for (size_t i = 0; i + wanted <= length; i++)
-        if (memcmp(text + i, literal, wanted) == 0) return true;
-    return false;
-}
 
 void stylesheet_set_prefers_dark_color_scheme(bool dark)
 {
@@ -907,14 +891,7 @@ static size_t style_selector_admission_decode_token(
 static uint32_t style_selector_admission_token_hash(
     unsigned char kind, const unsigned char *text, size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261) ^ kind;
-    for (size_t i = 0; i < length; i++) {
-        unsigned char value = text[i];
-        if (kind == 't') value = (unsigned char) tolower(value);
-        hash ^= value;
-        hash *= UINT32_C(16777619);
-    }
-    return hash;
+    return style_fnv1a(STYLE_FNV1A_SEED ^ kind, text, length, kind == 't');
 }
 
 static bool style_selector_admission_token_present(
@@ -1068,7 +1045,7 @@ static bool selector_to_rule(
                     sheet->source_rule_token_bloom,
                     sheet->source_rule_token_bloom_words, selector, length);
             if (!priority && !secondary) {
-                diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_selector_drops);
                 return true;
             }
         }
@@ -1130,7 +1107,7 @@ static bool selector_to_rule(
            quoted attribute values and escaped colons are not syntax. */
         if (pseudo_parentheses == 0 && value == ':' && at + 1u < length
             && selector[at + 1u] == ':') {
-            diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
+            STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_selector_drops);
             return true;
         }
     }
@@ -1139,9 +1116,7 @@ static bool selector_to_rule(
     memset(&base, 0, sizeof(base));
     base.pseudo = (uint8_t) pseudo;
     if (length >= STYLE_SELECTOR_TEXT_CAPACITY) {
-        if (sheet->diagnostic_selector_drops != UINT64_MAX) {
-            sheet->diagnostic_selector_drops++;
-        }
+        STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_selector_drops);
         return true;
     }
     base.selector_length = (uint16_t) length;
@@ -1404,8 +1379,8 @@ static bool supports_retained_layout_value(
     }
     if (span_case_equal(name, name_length, "contain-intrinsic-size")) {
         size_t cursor = 0, start = 0, end = 0, lengths = 0;
-        while (style_next_top_level(
-                   value, value_length, ' ', &cursor, &start, &end)) {
+        while (style_next_top_level_token(
+                   value, value_length, &cursor, &start, &end)) {
             if (span_case_equal(value + start, end - start, "auto")) {
                 continue;
             }
@@ -1431,52 +1406,26 @@ static bool supports_retained_layout_value(
     if (span_case_equal(name, name_length, "translate")) {
         if (span_case_equal(value, value_length, "none")) return true;
         size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level(
-                   value, value_length, ' ', &cursor, &start, &end)) {
+        while (style_next_top_level_token(
+                   value, value_length, &cursor, &start, &end)) {
             if (++count > 2
                 || !retained_presentation_length(
                        sheet, value + start, end - start, true)) return false;
         }
         return count == 1 || count == 2;
     }
-    if (span_case_equal(name, name_length, "scale")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        char text[64];
+    if (span_case_equal(name, name_length, "scale")
+        || span_case_equal(name, name_length, "rotate")) {
+        /* Exactly what the retained display list applies. */
+        char text[STYLE_RETAINED_VALUE_CAPACITY];
         if (value_length == 0 || value_length >= sizeof(text)) return false;
         memcpy(text, value, value_length);
         text[value_length] = '\0';
-        char *end = NULL;
-        double first = strtod(text, &end);
-        if (end == text || !isfinite(first) || first < 0.0) return false;
-        while (isspace((unsigned char) *end)) end++;
-        if (*end == '\0') return true;
-        char *second_end = NULL;
-        double second = strtod(end, &second_end);
-        while (second_end != NULL && isspace((unsigned char) *second_end)) {
-            second_end++;
-        }
-        return second_end != end && *second_end == '\0'
-            && isfinite(second) && second >= 0.0
-            && fabs(first - second) < 0.000001;
-    }
-    if (span_case_equal(name, name_length, "rotate")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        char text[48];
-        if (value_length == 0 || value_length >= sizeof(text)) return false;
-        memcpy(text, value, value_length);
-        text[value_length] = '\0';
-        char *end = NULL;
-        double angle = strtod(text, &end);
-        if (end == text || !isfinite(angle)) return false;
-        if (strncasecmp(end, "deg", 3) == 0) end += 3;
-        else if (strncasecmp(end, "turn", 4) == 0) {
-            angle *= 360.0;
-            end += 4;
-        } else return false;
-        while (isspace((unsigned char) *end)) end++;
-        double quarter = angle / 90.0;
-        return *end == '\0'
-            && fabs(quarter - round(quarter)) < 0.000001;
+        uint16_t scale = 0;
+        uint8_t quadrants = 0;
+        return name_length == 5
+            ? style_scale_value_q14(text, &scale)
+            : style_rotate_value_quadrants(text, &quadrants);
     }
     if (span_case_equal(name, name_length, "cursor")) {
         static const char *const values[] = {
@@ -1593,8 +1542,8 @@ static bool supports_retained_layout_value(
     if (span_case_equal(name, name_length, "scroll-padding")
         || span_case_equal(name, name_length, "scroll-margin")) {
         size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level(
-                   value, value_length, ' ', &cursor, &start, &end)) {
+        while (style_next_top_level_token(
+                   value, value_length, &cursor, &start, &end)) {
             if (++count > 4
                 || (!(span_case_equal(
                           name, name_length, "scroll-padding")
@@ -1745,8 +1694,8 @@ static bool supports_retained_layout_value(
     }
     if (span_case_equal(name, name_length, "color-scheme")) {
         size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level(
-                   value, value_length, ' ', &cursor, &start, &end)) {
+        while (style_next_top_level_token(
+                   value, value_length, &cursor, &start, &end)) {
             const char *word = value + start;
             size_t word_length = end - start;
             if (!span_case_equal(word, word_length, "normal")
@@ -1987,6 +1936,9 @@ static bool supports_matches_depth(Stylesheet *sheet, const char *text,
     }
     normalized_name[name_length] = '\0';
     name = normalized_name;
+    if (span_case_equal(name, name_length, "font-variation-settings")) {
+        return span_case_equal(value, value_length, "normal");
+    }
     if (span_case_equal(value, value_length, "revert-rule")) {
         return supports_implemented_property(sheet, name, name_length);
     }
@@ -2004,7 +1956,7 @@ static bool supports_matches_depth(Stylesheet *sheet, const char *text,
         return supports_implemented_property(sheet, name, name_length);
     }
     if (span_equal(name, name_length, "display")) {
-        char resolved[48];
+        char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (!style_resolve_value(sheet, value, value_length, resolved,
                            sizeof(resolved), 0)) return false;
         static const char *supported[] = {
@@ -2101,14 +2053,13 @@ static void diagnose_declarations(Stylesheet *sheet, const char *text,
                 at = end + (end < length);
                 continue;
             }
-            diagnostic_saturating_add(&sheet->diagnostic_declarations, 1);
+            STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_declarations);
             if (declaration_is_important(value, value_length)) {
                 value_length = declaration_value_length(value, value_length);
                 trim(&value, &value_length);
             }
-            if (span_contains_literal(value, value_length, "var(")) {
-                diagnostic_saturating_add(
-                    &sheet->diagnostic_deferred_declarations, 1);
+            if (span_contains_text(value, value_length, "var(")) {
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_deferred_declarations);
                 at = end + (end < length);
                 continue;
             }
@@ -2121,11 +2072,9 @@ static void diagnose_declarations(Stylesheet *sheet, const char *text,
                              && supports_matches_depth(
                                     sheet, condition, (size_t) written, 0);
             if (supported) {
-                diagnostic_saturating_add(
-                    &sheet->diagnostic_supported_declarations, 1);
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_supported_declarations);
             } else {
-                diagnostic_saturating_add(
-                    &sheet->diagnostic_rejected_declarations, 1);
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_rejected_declarations);
                 diagnostic_record_rejected_property(
                     sheet, name, name_length);
             }

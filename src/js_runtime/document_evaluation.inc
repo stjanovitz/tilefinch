@@ -250,12 +250,12 @@ ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
         if (set < 0) evaluated = false;
     }
     JS_FreeValue(runtime->context, global);
+    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (!js_rt_current_script_scope_end(
             runtime->context, &previous_current_script,
             &runtime->result)) evaluated = false;
     budget_free(runtime->budget, copy);
     js_lazy_webpack_recover_failure(runtime);
-    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     if (evaluated) runtime->result.scripts_evaluated++;
     runtime->result.success = evaluated;
@@ -263,6 +263,12 @@ ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
     if (source_bytes != NULL) *source_bytes = source_length;
     return evaluated ? SCRIPT_INLINE_DATA_APPLIED
                      : SCRIPT_INLINE_DATA_FAILED;
+}
+
+bool script_runtime_block_inline_tracker(ScriptRuntime *runtime, lxb_dom_node_t *node)
+{
+    return runtime != NULL
+        && js_rt_inline_tracker_blocked(&runtime->bridge, node, NULL, 0);
 }
 
 bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
@@ -300,6 +306,12 @@ bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
         }
         source_copy[copied] = '\0';
     }
+    if (!module && source_copy != NULL
+        && js_rt_inline_tracker_blocked(&runtime->bridge, script_node,
+                                        source_copy, source_length)) {
+        budget_free(runtime->budget, source_copy);
+        return true;
+    }
     ScriptCurrentScriptScope previous_current_script = {
         .value = JS_UNDEFINED
     };
@@ -336,13 +348,13 @@ bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
                    : SCRIPT_COMPILE_SOURCE_INLINE,
             &runtime->result);
     }
+    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (current_script_active
         && !js_rt_current_script_scope_end(
                runtime->context, &previous_current_script,
                &runtime->result)) evaluated = false;
     budget_free(runtime->budget, source_copy);
     js_lazy_webpack_recover_failure(runtime);
-    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     if (evaluated) runtime->result.scripts_evaluated++;
     runtime->result.success = evaluated;

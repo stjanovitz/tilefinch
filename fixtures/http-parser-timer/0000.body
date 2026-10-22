@@ -1,0 +1,1 @@
+<!doctype html><body><script>setTimeout(()=>document.body.setAttribute('data-early',document.getElementById('tail')?'late':'early'),0)</script><p>Streaming content remains readable while initialization runs.</p><p>More response bytes separate the first script from the final parser checkpoint.</p><a id=tail href=/next>Continue</a></body>

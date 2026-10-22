@@ -13,7 +13,6 @@
 #include "tilefinch/user_agent.h"
 
 #define FILE_VALIDATOR_LIMIT 160u
-#define FILE_PATH_LIMIT (OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u)
 
 struct FileDownloadManager {
     Budget *budget;
@@ -24,9 +23,10 @@ struct FileDownloadManager {
     FILE *output;
     uint32_t id;
     uint64_t request_id, offset, received, total, available;
-    uint64_t speed_time, speed_bytes;
-    uint32_t speed;
+    OfflineDownloadSpeed speed;
     bool headers_valid, length_known;
+    /* A 416 confirmed the partial file already holds the whole entity. */
+    bool resume_complete;
     char validator[FILE_VALIDATOR_LIMIT];
     char error[OFFLINE_LIBRARY_FAILURE_LIMIT];
 };
@@ -37,33 +37,6 @@ bool file_download_url_supported(const char *url)
     return tilefinch_url_parse(url, &parsed)
         && parsed.scheme == TILEFINCH_URL_SCHEME_HTTPS
         && parsed.length < TILEFINCH_URL_SERIALIZED_LIMIT;
-}
-
-static int hex_digit(unsigned char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static bool percent_decode(char *text)
-{
-    size_t out = 0, length = strlen(text);
-    for (size_t i = 0; i < length; i++) {
-        unsigned char c = (unsigned char) text[i];
-        if (c == '%') {
-            if (length - i < 3) return false;
-            int hi = hex_digit((unsigned char) text[i + 1]);
-            int lo = hex_digit((unsigned char) text[i + 2]);
-            if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return false;
-            c = (unsigned char) (hi * 16 + lo);
-            i += 2;
-        }
-        text[out++] = (char) c;
-    }
-    text[out] = '\0';
-    return true;
 }
 
 /* Response filenames are advisory. Use one conservative, portable basename,
@@ -141,7 +114,7 @@ static bool disposition_name(const char *header, bool extended,
         char *value = strchr(output + 6, '\'');
         if (value == NULL) return false;
         memmove(output, value + 1, strlen(value + 1) + 1);
-        return percent_decode(output) && output[0] != '\0';
+        return tilefinch_url_percent_decode(output) && output[0] != '\0';
     }
     return false;
 }
@@ -161,7 +134,7 @@ bool file_download_filename(const char *url, const char *disposition,
         if (size >= sizeof(candidate)) return false;
         memcpy(candidate, url + first, size);
         candidate[size] = '\0';
-        if (!percent_decode(candidate)) candidate[0] = '\0';
+        if (!tilefinch_url_percent_decode(candidate)) candidate[0] = '\0';
     }
     sanitize_filename(candidate, output);
     return true;
@@ -262,19 +235,6 @@ static bool file_size(const char *path, uint64_t *size)
     return true;
 }
 
-static bool decimal(const char *text, uint64_t *value)
-{
-    uint64_t parsed = 0;
-    if (text == NULL || !isdigit((unsigned char) *text)) return false;
-    for (; *text != '\0'; text++) {
-        unsigned digit = (unsigned char) *text - '0';
-        if (digit > 9 || parsed > (UINT64_MAX - digit) / 10u) return false;
-        parsed = parsed * 10u + digit;
-    }
-    *value = parsed;
-    return true;
-}
-
 static bool safe_validator(const char *value)
 {
     size_t length = strnlen(value, FILE_VALIDATOR_LIMIT);
@@ -288,7 +248,7 @@ static bool safe_validator(const char *value)
 
 static bool save_validator(FileDownloadManager *manager)
 {
-    char path[FILE_PATH_LIMIT], temporary[FILE_PATH_LIMIT];
+    char path[FILE_DOWNLOAD_PATH_LIMIT], temporary[FILE_DOWNLOAD_PATH_LIMIT];
     if (!offline_library_item_path(manager->library, manager->id, ".file.meta", path, sizeof(path))
         || !offline_library_item_path(manager->library, manager->id, ".file.meta.tmp", temporary, sizeof(temporary))) return false;
     FILE *file = fopen(temporary, "wb");
@@ -298,15 +258,17 @@ static bool save_validator(FileDownloadManager *manager)
                                         manager->validator) > 0;
     if (fflush(file) != 0 || ferror(file)) okay = false;
     if (fclose(file) != 0) okay = false;
-    if (!okay) { remove(temporary); return false; }
-    if (remove(path) != 0 && errno != ENOENT) { remove(temporary); return false; }
-    return rename(temporary, path) == 0;
+    if (!okay || !tilefinch_platform_replace_file(temporary, path, NULL)) {
+        remove(temporary);
+        return false;
+    }
+    return true;
 }
 
 static void load_validator(FileDownloadManager *manager)
 {
     manager->validator[0] = '\0';
-    char path[FILE_PATH_LIMIT];
+    char path[FILE_DOWNLOAD_PATH_LIMIT];
     if (!offline_library_item_path(manager->library, manager->id, ".file.meta", path, sizeof(path))) return;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return;
@@ -344,12 +306,41 @@ static void stop(FileDownloadManager *manager, OfflineItemState state, const cha
     OfflineLibraryItem *item = offline_library_find_mutable(manager->library, manager->id);
     if (message != NULL && message != manager->error)
         snprintf(manager->error, sizeof(manager->error), "%s", message);
-    if (item != NULL) {
+    /* A completed download is already persisted as READY; skip a second,
+       identical index write. */
+    if (item != NULL && (item->state != state
+                         || strcmp(item->failure_reason, manager->error) != 0)) {
         item->state = state;
         snprintf(item->failure_reason, sizeof(item->failure_reason), "%s", manager->error);
         offline_library_save(manager->library);
     }
     manager->id = 0;
+}
+
+/* A resume of a partial file that already holds every byte is answered
+   416. Finish it only when the server names exactly that length for the
+   same strong validator; otherwise forget the validator so the next try
+   starts from zero. The 416 body is never file data. */
+static bool range_not_satisfiable(FileDownloadManager *manager, const FetchResult *response)
+{
+    char range[128];
+    unsigned long long complete = 0;
+    char tail;
+    const char *validator = manager->validator[0] == 'E' ? response->etag : response->last_modified;
+    if (manager->offset != 0 && safe_validator(manager->validator)
+        && !strcmp(validator, manager->validator + 2)
+        && fetch_response_header_value(response, "content-range", range, sizeof(range))
+        && sscanf(range, "bytes */%llu%c", &complete, &tail) == 1
+        && complete == manager->offset) {
+        manager->resume_complete = true;
+        manager->length_known = true;
+        manager->total = manager->received = manager->offset;
+        return false;
+    }
+    manager->validator[0] = '\0';
+    save_validator(manager);
+    snprintf(manager->error, sizeof(manager->error), "Resume could not be verified; retry to restart");
+    return false;
 }
 
 static bool headers(void *opaque, const FetchResult *response)
@@ -358,9 +349,11 @@ static bool headers(void *opaque, const FetchResult *response)
     OfflineLibraryItem *item = offline_library_find_mutable(manager->library, manager->id);
     char length[64], range[128], encoding[64];
     uint64_t declared = 0, total = 0;
+    if (item != NULL && response->status_code == 416 && manager->offset != 0)
+        return range_not_satisfiable(manager, response);
     bool known = fetch_response_header_value(response, "content-length", length, sizeof(length));
     if (item == NULL || (response->status_code != 200 && response->status_code != 206)
-        || (known && !decimal(length, &declared))
+        || (known && !offline_download_parse_decimal(length, &declared))
         || (fetch_response_header_value(response, "content-encoding", encoding, sizeof(encoding))
             && strcasecmp(encoding, "identity"))
         || (!strncasecmp(response->content_type, "text/html", 9) && !attachment(response))) {
@@ -368,13 +361,12 @@ static bool headers(void *opaque, const FetchResult *response)
         return false;
     }
     if (response->status_code == 206) {
-        unsigned long long first = 0, last = 0, complete = 0;
-        char tail;
+        uint64_t first = 0, last = 0, complete = 0;
         const char *validator = manager->validator[0] == 'E' ? response->etag : response->last_modified;
         if (manager->offset == 0 || !safe_validator(manager->validator)
             || strcmp(validator, manager->validator + 2)
             || !fetch_response_header_value(response, "content-range", range, sizeof(range))
-            || sscanf(range, "bytes %llu-%llu/%llu%c", &first, &last, &complete, &tail) != 3
+            || !offline_download_parse_content_range(range, &first, &last, &complete)
             || first != manager->offset || last < first || complete == 0
             || complete > FILE_DOWNLOAD_LIMIT || last != complete - 1u
             || (known && declared != complete - first)) {
@@ -410,8 +402,7 @@ static bool headers(void *opaque, const FetchResult *response)
     }
     if ((known && total > FILE_DOWNLOAD_LIMIT)
         || !tilefinch_update_query_free_space(manager->library->directory, &manager->available)
-        || manager->available < OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
-        || (known && total - manager->offset > manager->available - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE)) {
+        || !offline_download_space_admits(manager->available, known ? total - manager->offset : 0)) {
         snprintf(manager->error, sizeof(manager->error), "File is too large or Memory Stick space is insufficient");
         return false;
     }
@@ -419,18 +410,29 @@ static bool headers(void *opaque, const FetchResult *response)
     manager->total = total;
     item->content_bytes = known ? total : FILE_DOWNLOAD_LIMIT;
     item->downloaded_bytes = manager->offset;
-    char path[FILE_PATH_LIMIT], final[FILE_PATH_LIMIT];
+    char path[FILE_DOWNLOAD_PATH_LIMIT], final[FILE_DOWNLOAD_PATH_LIMIT];
     struct stat exists;
     if (!file_download_path(manager->library, manager->id, final, sizeof(final))
         || stat(final, &exists) == 0
         || !offline_library_item_path(manager->library, manager->id, ".file.part", path, sizeof(path))
-        || !offline_library_save(manager->library) || !save_validator(manager)) {
+        || !offline_library_save(manager->library)) {
         snprintf(manager->error, sizeof(manager->error), "Download metadata or destination is unavailable");
         return false;
     }
+    /* Truncate a stale partial file before persisting a new validator: a
+       validator must never describe bytes of a different entity. */
     manager->output = fopen(path, manager->offset != 0 ? "ab" : "wb");
-    manager->headers_valid = manager->output != NULL;
-    return manager->headers_valid;
+    if (manager->output == NULL) {
+        snprintf(manager->error, sizeof(manager->error), "Download file could not be opened on the Memory Stick");
+        return false;
+    }
+    if (!save_validator(manager)) {
+        close_output(manager);
+        snprintf(manager->error, sizeof(manager->error), "Download metadata or destination is unavailable");
+        return false;
+    }
+    manager->headers_valid = true;
+    return true;
 }
 
 static bool body(void *opaque, const unsigned char *data, size_t length)
@@ -439,8 +441,7 @@ static bool body(void *opaque, const unsigned char *data, size_t length)
     if (!manager->headers_valid || manager->output == NULL
         || manager->received > FILE_DOWNLOAD_LIMIT || length > FILE_DOWNLOAD_LIMIT - manager->received
         || (manager->length_known && (manager->received > manager->total || length > manager->total - manager->received))
-        || manager->available < OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
-        || length > manager->available - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
+        || !offline_download_space_admits(manager->available, length)
         || fwrite(data, 1, length, manager->output) != length) {
         snprintf(manager->error, sizeof(manager->error), "Memory Stick write failed or file exceeded its limit");
         return false;
@@ -449,13 +450,7 @@ static bool body(void *opaque, const unsigned char *data, size_t length)
     manager->available -= length;
     OfflineLibraryItem *item = offline_library_find_mutable(manager->library, manager->id);
     if (item != NULL) item->downloaded_bytes = manager->received;
-    uint64_t now = tilefinch_platform_monotonic_time_us();
-    if (now >= manager->speed_time && now - manager->speed_time >= 250000u) {
-        uint64_t rate = (manager->received - manager->speed_bytes) * UINT64_C(1000000) / (now - manager->speed_time);
-        manager->speed = rate > UINT32_MAX ? UINT32_MAX : (uint32_t) rate;
-        manager->speed_bytes = manager->received;
-        manager->speed_time = now;
-    }
+    offline_download_speed_sample(&manager->speed, manager->received);
     return true;
 }
 
@@ -490,16 +485,16 @@ bool file_download_start(FileDownloadManager *manager, uint32_t id)
     manager->offset = 0;
     manager->headers_valid = false;
     manager->length_known = false;
+    manager->resume_complete = false;
     manager->total = manager->available = 0;
-    manager->speed = 0;
-    char path[FILE_PATH_LIMIT];
+    char path[FILE_DOWNLOAD_PATH_LIMIT];
     load_validator(manager);
     if (safe_validator(manager->validator)
         && offline_library_item_path(manager->library, id, ".file.part", path, sizeof(path)))
         file_size(path, &manager->offset);
     if (manager->offset >= FILE_DOWNLOAD_LIMIT) manager->offset = 0;
-    manager->received = manager->speed_bytes = manager->offset;
-    manager->speed_time = tilefinch_platform_monotonic_time_us();
+    manager->received = manager->offset;
+    offline_download_speed_reset(&manager->speed, manager->offset);
     char extra[256] = {0};
     if (manager->offset != 0)
         snprintf(extra, sizeof(extra), "Range: bytes=%llu-\nIf-Range: %s",
@@ -519,7 +514,7 @@ bool file_download_start(FileDownloadManager *manager, uint32_t id)
        Keep its HTTPS trust boundary on every hop and use the existing
        context-aware cookie snapshot, which never forwards origin credentials
        to a different host. No cookie is written into download metadata. */
-    char cookies[FETCH_SET_COOKIE_LIMIT] = {0};
+    char cookies[BROWSER_COOKIE_HEADER_CAPACITY] = {0};
     if (!browser_session_cookie_header_context(manager->session, &context, cookies, sizeof(cookies))) {
         stop(manager, OFFLINE_ITEM_PAUSED, "Download request failed its security policy");
         return false;
@@ -549,15 +544,15 @@ bool file_download_pump(FileDownloadManager *manager)
         stop(manager, OFFLINE_ITEM_PAUSED, "Download was removed");
         return true;
     }
-    FetchPumpQuota quota = {.maximum_body_callbacks = 2, .maximum_body_bytes = 32768, .maximum_time_us = 2000};
-    fetch_scheduler_pump_bounded(manager->scheduler, 1, 0, &quota, NULL);
+    offline_download_pump_transfer(manager->scheduler);
     bool success = false;
     FetchStreamMetrics metrics;
     if (!fetch_scheduler_take_stream(manager->scheduler, manager->request_id, &success, &metrics, manager->completion)) return false;
     manager->request_id = 0;
-    bool okay = success && manager->headers_valid && manager->output != NULL
-        && (!manager->length_known || manager->received == manager->total)
-        && metrics.bytes_received == manager->received - manager->offset;
+    bool okay = manager->resume_complete
+        || (success && manager->headers_valid && manager->output != NULL
+            && (!manager->length_known || manager->received == manager->total)
+            && metrics.bytes_received == manager->received - manager->offset);
     if (manager->output != NULL && fflush(manager->output) != 0) okay = false;
     close_output(manager);
     if (manager->error[0] != '\0') okay = false;
@@ -573,21 +568,18 @@ bool file_download_pump(FileDownloadManager *manager)
            strand a completed file behind a downloading record. */
         OfflineLibraryItem *item = offline_library_find_mutable(manager->library, manager->id);
         item->state = OFFLINE_ITEM_READY;
+        item->failure_reason[0] = '\0';
         item->content_bytes = item->downloaded_bytes = manager->received;
         okay = offline_library_save(manager->library);
         if (!okay) snprintf(manager->error, sizeof(manager->error), "Completed download state could not be saved");
     }
     if (okay) {
-        char part[FILE_PATH_LIMIT], final[FILE_PATH_LIMIT];
+        char part[FILE_DOWNLOAD_PATH_LIMIT], final[FILE_DOWNLOAD_PATH_LIMIT];
         struct stat exists;
         okay = offline_library_item_path(manager->library, manager->id, ".file.part", part, sizeof(part))
             && file_download_path(manager->library, manager->id, final, sizeof(final))
             && stat(final, &exists) != 0 && errno == ENOENT && rename(part, final) == 0;
         if (!okay) snprintf(manager->error, sizeof(manager->error), "File could not be published without overwriting an existing file");
-    }
-    if (okay) {
-        OfflineLibraryItem *item = offline_library_find_mutable(manager->library, manager->id);
-        item->content_bytes = item->downloaded_bytes = manager->received;
     }
     stop(manager, okay ? OFFLINE_ITEM_READY : OFFLINE_ITEM_PAUSED, NULL);
     return true;
@@ -607,21 +599,14 @@ bool file_download_active(const FileDownloadManager *manager, uint32_t *id)
     return true;
 }
 
-bool file_download_snapshot(const FileDownloadManager *manager, uint32_t id, OfflineDownloadSnapshot *snapshot)
+bool file_download_progress(const FileDownloadManager *manager, uint32_t id,
+                            uint64_t *total_bytes, uint64_t *available_bytes,
+                            uint32_t *bytes_per_second)
 {
-    if (manager == NULL || snapshot == NULL) return false;
-    const OfflineLibraryItem *item = offline_library_find(manager->library, id);
-    if (item == NULL || item->type != OFFLINE_ITEM_FILE) return false;
-    *snapshot = (OfflineDownloadSnapshot) {.id = id, .downloaded_bytes = item->downloaded_bytes,
-        .total_bytes = item->state == OFFLINE_ITEM_READY ? item->content_bytes : 0,
-        .active = manager->id == id};
-    if (snapshot->active) {
-        snapshot->phase = OFFLINE_DOWNLOAD_FILE;
-        snapshot->total_bytes = manager->length_known ? manager->total : 0;
-        snapshot->available_bytes = manager->available;
-        snapshot->bytes_per_second = manager->speed;
-    }
-    snprintf(snapshot->failure_reason, sizeof(snapshot->failure_reason), "%s", item->failure_reason);
+    if (manager == NULL || id == 0 || manager->id != id) return false;
+    *total_bytes = manager->length_known ? manager->total : 0;
+    *available_bytes = manager->available;
+    *bytes_per_second = manager->speed.bytes_per_second;
     return true;
 }
 

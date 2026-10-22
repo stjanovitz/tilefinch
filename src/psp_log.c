@@ -1,5 +1,6 @@
 #define TILEFINCH_PSP_LOG_IMPLEMENTATION 1
 #include "tilefinch/psp_log.h"
+#include "tilefinch/install_paths.h"
 #include "tilefinch/psp_threads.h"
 
 #include <pspiofilemgr.h>
@@ -134,16 +135,17 @@ static bool path_is_on_memory_stick(const char *path)
             || strncmp(path, "msfat0:", 7u) == 0);
 }
 
-static int sync_persistent_storage(void)
+static void sync_persistent_storage(void)
 {
     /* A PSPLink host0: validation run keeps every diagnostic artifact on the
        Mac. Touching ms0: in that mode adds latency and violates the device
        loop's zero-Memory-Stick-I/O contract without making the host file any
-       more durable. fflush/fclose are the only meaningful operations there. */
-    if (!persistent_paths_on_memory_stick) return 0;
-    int result = sceIoSync("ms0:", 0);
-    if (result < 0) result = sceIoSync("msfat0:", 0);
-    return result;
+       more durable. fflush/fclose are the only meaningful operations there.
+       On the Memory Stick the sync is an optional durability hint: some real
+       firmware/storage-driver combinations reject it even though the checked
+       write and stdio flush succeeded, so its result never marks either
+       diagnostic artifact unusable. */
+    if (persistent_paths_on_memory_stick) (void) tilefinch_memory_stick_sync();
 }
 
 static void sibling_path(char *output, size_t size, const char *argv0,
@@ -207,14 +209,9 @@ static bool crash_record_write(const char *state,
     SceOff offset = sceIoLseek(crash_fd, 0, PSP_SEEK_SET);
     int written = offset < 0
         ? -1 : sceIoWrite(crash_fd, record, sizeof(record));
-    int synchronized = synchronize_device ? sync_persistent_storage() : 0;
+    if (synchronize_device) sync_persistent_storage();
     bool okay = offset >= 0
         && written == (int) sizeof(record);
-    /* Some real firmware/storage-driver combinations reject sceIoSync even
-       though the checked write and stdio flush succeed.  Keep the attempt,
-       but do not declare both diagnostic artifacts unusable solely because
-       this optional durability hint is unsupported. */
-    (void) synchronized;
     (void) sceKernelSignalSema(crash_semaphore, 1);
     if (!okay) persistent_healthy = 0;
     return okay;
@@ -509,7 +506,7 @@ bool psp_log_flush(bool synchronize_device)
     /* PSPLink output is a best-effort mirror. Its availability must never
        downgrade the durable on-card diagnostic artifact. */
     (void) fflush(stdout);
-    if (synchronize_device) (void) sync_persistent_storage();
+    if (synchronize_device) sync_persistent_storage();
     last_flush_ms = now_ms();
     if (locked) (void) sceKernelSignalSema(log_semaphore, 1);
     if (!okay) {

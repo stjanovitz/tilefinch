@@ -27,6 +27,7 @@ static const StylePropertyEntry style_property_table[] = {
     { "padding", 7, style_property_padding },
     { "row-gap", 7, style_property_row_gap },
     { "z-index", 7, style_property_z_index },
+    { "grid-gap", 8, style_property_gap },
     { "grid-row", 8, style_property_grid_row },
     { "overflow", 8, style_property_overflow },
     { "position", 8, style_property_position },
@@ -215,6 +216,7 @@ static const StylePropertyEntry style_property_table[] = {
     { "border-inline-end-color", 23, style_property_border_color },
     { "border-inline-end-width", 23, style_property_border_inline_end_width },
     { "border-top-right-radius", 23, style_property_border_corner_radius },
+    { "font-variation-settings", 23, style_property_font_variation_settings },
     { "border-block-start-color", 24, style_property_border_color },
     { "border-block-start-width", 24, style_property_border_block_start_width },
     { "-webkit-box-ordinal-group", 25, style_property_webkit_box_ordinal_group },
@@ -224,31 +226,73 @@ static const StylePropertyEntry style_property_table[] = {
     { "border-bottom-right-radius", 26, style_property_border_corner_radius },
 };
 
-bool style_deferred_focus_shadow(const Stylesheet *sheet,
-    const StyleDeclaration *declaration, bool outset)
+/* The next box-shadow value of `declaration`'s compiled deferred program
+   (from instruction *at, which advances), as a span of its deferred text.
+   False past the last or for a program out of the sheet's bounds. */
+static bool style_deferred_box_shadow_next(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, size_t *at,
+    const char **value, size_t *length)
 {
     size_t offset = declaration->deferred_program_offset;
     size_t count = declaration->deferred_program_count;
     if (offset > sheet->deferred_instruction_count
         || count > sheet->deferred_instruction_count - offset) return false;
-    for (size_t i = 0; i < count; i++) {
-        const StyleDeferredInstruction *op = &sheet->deferred_instructions[offset + i];
+    while (*at < count) {
+        const StyleDeferredInstruction *op =
+            &sheet->deferred_instructions[offset + (*at)++];
         if (op->property_index >= sizeof(style_property_table) / sizeof(style_property_table[0])
             || style_property_table[op->property_index].handler != style_property_box_shadow
             || op->value_offset > declaration->deferred_length
             || op->value_length > declaration->deferred_length - op->value_offset) continue;
+        *value = declaration->deferred_declarations + op->value_offset;
+        *length = op->value_length;
+        return true;
+    }
+    return false;
+}
+
+bool style_deferred_focus_shadow(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, bool outset)
+{
+    const char *value = NULL;
+    size_t length = 0;
+    for (size_t at = 0; style_deferred_box_shadow_next(
+             sheet, declaration, &at, &value, &length);) {
         bool inset = false;
-        const char *value = declaration->deferred_declarations + op->value_offset;
-        size_t length = declaration_value_length(value, op->value_length);
+        length = declaration_value_length(value, length);
         trim(&value, &length);
         if (span_case_equal(value, length, "none")) continue;
-        if (outset) for (size_t at = 0; at + 5u <= length; at++) {
-            if (strncasecmp(value + at, "inset", 5) == 0) { inset = true; break; }
+        if (outset) for (size_t i = 0; i + 5u <= length; i++) {
+            if (strncasecmp(value + i, "inset", 5) == 0) { inset = true; break; }
         }
         if (!inset) return true;
     }
     /* Uncompiled programs simply keep full-layout focus fallback. */
     return false;
+}
+
+bool style_deferred_focus_shadow_exceeds(const Stylesheet *sheet,
+    const StyleDeclaration *declaration, lxb_dom_node_t *node, size_t layers)
+{
+    StyleResolveScratch saved = *sheet->resolve_scratch;
+    sheet->resolve_scratch->resolution_node = node;
+    sheet->resolve_scratch->resolution_pseudo = PSEUDO_NONE;
+    bool exceeds = false;
+    const char *text = NULL;
+    size_t text_length = 0;
+    for (size_t at = 0; !exceeds && style_deferred_box_shadow_next(
+             sheet, declaration, &at, &text, &text_length);) {
+        char value[STYLE_CUSTOM_RESOLVED_CAPACITY];
+        StyleBoxShadow shadows[STYLE_BOX_SHADOW_LIMIT];
+        uint8_t shadow_count = 0;
+        exceeds = style_resolve_value(sheet, text, text_length,
+                                      value, sizeof(value), 0)
+            && style_parse_box_shadow(sheet, value, strlen(value), shadows,
+                                      &shadow_count)
+            && shadow_count > layers;
+    }
+    *sheet->resolve_scratch = saved;
+    return exceeds;
 }
 
 static const StylePropertyEntry *style_property_lookup(const char *name,
@@ -276,48 +320,55 @@ static const StylePropertyEntry *style_property_lookup(const char *name,
     while (written > 0 && normalized[written - 1] == ' ') written--;
     name = normalized;
     name_length = written;
-    /* Older mobile stylesheets commonly emit three flexbox generations in
+    /* Older mobile stylesheets emit prefixed filters and several flexbox generations in
        declaration order. Map the 2012 vendor spellings onto the canonical
        compact flex implementation so the last supported declaration wins,
        without retaining a second layout model. Canonical properties stay on
        the binary-search hot path; only vendor-prefixed names pay this small
        bounded scan. */
     if (name_length != 0 && name[0] == '-') {
-        static const StylePropertyEntry legacy_aliases[] = {
-            { "-webkit-flex", 12, style_property_flex },
-            { "-ms-flex", 8, style_property_flex },
-            { "-webkit-flex-direction", 22,
-              style_property_flex_direction },
-            { "-ms-flex-direction", 18, style_property_flex_direction },
-            { "-webkit-flex-wrap", 17, style_property_flex_wrap },
-            { "-ms-flex-wrap", 13, style_property_flex_wrap },
-            { "-webkit-flex-grow", 17, style_property_flex_grow },
-            { "-ms-flex-positive", 17, style_property_flex_grow },
-            { "-webkit-flex-shrink", 19, style_property_flex_shrink },
-            { "-ms-flex-negative", 17, style_property_flex_shrink },
-            { "-webkit-flex-basis", 18, style_property_flex_basis },
-            { "-ms-flex-preferred-size", 23, style_property_flex_basis },
-            { "-webkit-justify-content", 23,
-              style_property_justify_content },
-            { "-ms-flex-pack", 13, style_property_webkit_box_pack },
-            { "-webkit-align-items", 19, style_property_align_items },
-            { "-ms-flex-align", 14, style_property_webkit_box_align },
-            { "-webkit-align-self", 18, style_property_align_self },
-            { "-ms-flex-item-align", 19, style_property_align_self },
-            { "-webkit-align-content", 21, style_property_align_content },
-            { "-webkit-order", 13, style_property_order },
-            { "-ms-flex-order", 14, style_property_order },
-            { "-webkit-transform", 17, style_property_transform },
-            { "-webkit-transform-origin", 24,
-              style_property_transform_origin },
-            { "-webkit-box-shadow", 18, style_property_box_shadow },
-            { "-webkit-box-sizing", 18, style_property_box_sizing }
+        static const struct {
+            const char *name;
+            const char *canonical;
+        } legacy_aliases[] = {
+            { "-webkit-filter", "filter" },
+            { "-webkit-flex", "flex" },
+            { "-ms-flex", "flex" },
+            { "-webkit-flex-direction", "flex-direction" },
+            { "-ms-flex-direction", "flex-direction" },
+            { "-webkit-flex-wrap", "flex-wrap" },
+            { "-ms-flex-wrap", "flex-wrap" },
+            { "-webkit-flex-grow", "flex-grow" },
+            { "-ms-flex-positive", "flex-grow" },
+            { "-webkit-flex-shrink", "flex-shrink" },
+            { "-ms-flex-negative", "flex-shrink" },
+            { "-webkit-flex-basis", "flex-basis" },
+            { "-ms-flex-preferred-size", "flex-basis" },
+            { "-webkit-justify-content", "justify-content" },
+            { "-ms-flex-pack", "-webkit-box-pack" },
+            { "-webkit-align-items", "align-items" },
+            { "-ms-flex-align", "-webkit-box-align" },
+            { "-webkit-align-self", "align-self" },
+            { "-ms-flex-item-align", "align-self" },
+            { "-webkit-align-content", "align-content" },
+            { "-webkit-order", "order" },
+            { "-ms-flex-order", "order" },
+            { "-webkit-transform", "transform" },
+            { "-webkit-transform-origin", "transform-origin" },
+            { "-webkit-box-shadow", "box-shadow" },
+            { "-webkit-box-sizing", "box-sizing" }
         };
         for (size_t at = 0;
              at < sizeof(legacy_aliases) / sizeof(legacy_aliases[0]); at++) {
-            const StylePropertyEntry *entry = &legacy_aliases[at];
-            if (name_length == entry->name_length
-                && memcmp(name, entry->name, name_length) == 0) return entry;
+            if (strlen(legacy_aliases[at].name) == name_length
+                && memcmp(name, legacy_aliases[at].name, name_length) == 0) {
+                /* Deferred programs store an index into the canonical table.
+                   Returning an entry in a separate array made subtraction
+                   undefined and could replay an unrelated property. */
+                name = legacy_aliases[at].canonical;
+                name_length = strlen(name);
+                break;
+            }
         }
     }
     size_t low = 0;

@@ -5,7 +5,7 @@ static bool style_property_display(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved, sizeof(resolved), 0)) {
             bool recognized = true;
             if (strcmp(resolved, "none") == 0) style->display = DISPLAY_NONE;
@@ -76,7 +76,9 @@ static bool style_property_display(const StylePropertyParse *parse)
                 style->display = DISPLAY_FLEX;
             }
             else if (strcmp(resolved, "grid") == 0) style->display = DISPLAY_GRID;
-            else if (strcmp(resolved, "inline") == 0) {
+            else if (strcmp(resolved, "inline") == 0
+                     || strcmp(resolved, "initial") == 0
+                     || strcmp(resolved, "unset") == 0) {
                 style->display = DISPLAY_INLINE;
             } else {
                 recognized = false;
@@ -92,7 +94,7 @@ static bool style_property_display(const StylePropertyParse *parse)
 
 static bool style_property_appearance(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -199,28 +201,11 @@ static bool background_shorthand_token_known(const char *token, size_t length)
 
 static bool background_shorthand_recognized(const char *resolved)
 {
-    size_t length = strlen(resolved);
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) resolved[at])) at++;
-        size_t start = at;
-        int depth = 0;
-        char quote = 0;
-        while (at < length) {
-            char c = resolved[at];
-            if (quote != 0) {
-                if (c == quote) quote = 0;
-                at++;
-                continue;
-            }
-            if (c == '\'' || c == '"') { quote = c; at++; continue; }
-            if (c == '(') depth++;
-            else if (c == ')') { if (depth > 0) depth--; }
-            else if (depth == 0 && isspace((unsigned char) c)) break;
-            at++;
-        }
-        if (at > start
-            && background_shorthand_token_known(resolved + start,
-                                                at - start)) {
+    size_t length = strlen(resolved), cursor = 0, start = 0, end = 0;
+    while (style_next_top_level_token(resolved, length, &cursor, &start,
+                                      &end)) {
+        if (background_shorthand_token_known(resolved + start,
+                                             end - start)) {
             return true;
         }
     }
@@ -475,7 +460,7 @@ static bool style_property_background(const StylePropertyParse *parse)
                       sheet, value, value_length, &target->background,
                       &target->background_alpha);
             if (!parsed && !shorthand) {
-                char color_keyword[64];
+                char color_keyword[STYLE_KEYWORD_RESOLVED_CAPACITY];
                 current_color = style_resolve_value(
                     sheet, value, value_length, color_keyword,
                     sizeof(color_keyword), 0)
@@ -607,7 +592,7 @@ static bool style_property_object_fit(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->object_fit = strstr(resolved, "scale-down") != NULL
@@ -676,7 +661,7 @@ static bool object_position_set_keyword(
 
 static bool style_property_object_position(const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(
             parse->sheet, parse->value, parse->value_length,
             resolved, sizeof(resolved), 0)) return true;
@@ -749,7 +734,7 @@ static bool style_property_object_position(const StylePropertyParse *parse)
 
 static bool style_property_transform_origin(const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(
             parse->sheet, parse->value, parse->value_length,
             resolved, sizeof(resolved), 0)) return true;

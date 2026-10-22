@@ -10,7 +10,7 @@ static void usage(const char *program)
             "[--activate] [--follow-action] [--reload N] [--output FILE] "
             "[--user-css FILE] "
             "[--scroll-y N | --scroll-bottom] "
-            "[--limit-mb N] [--psp-profile strict|realistic] "
+            "[--limit-mb N] [--psp-profile strict|realistic] [--psp-fonts] "
             "[--low-memory-navigation] "
             "[--adaptive-resources | --no-adaptive-resources] "
             "[--forced-dark] "
@@ -568,7 +568,8 @@ static void dump_probe_dom(lxb_dom_node_t *node, unsigned depth,
                    (int) style_length, style == NULL ? "" : style);
             /* Geometry-bearing attributes (SVG sizing, form controls). */
             static const char *const extra[] = {
-                "width", "height", "viewBox", "type", "d", "role"
+                "width", "height", "viewBox", "type", "d", "role",
+                "data-tilefinch-reader-kind", "data-tilefinch-reader-root"
             };
             for (size_t e = 0; e < sizeof(extra) / sizeof(extra[0]); e++) {
                 size_t value_length = 0;

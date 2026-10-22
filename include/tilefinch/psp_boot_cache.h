@@ -21,7 +21,8 @@ bool psp_boot_pbp_payload(const uint8_t header[40], size_t bytes,
                           uint32_t file_size, uint32_t *offset, uint32_t *size);
 
 /* The authoritative PBP remains unchanged. Creation/adoption compares all module
-   bytes with DATA.PSP and saves a bounded .receipt reuse hint. Subsequent boots
+   bytes with DATA.PSP and saves a bounded .receipt reuse hint (after a new copy,
+   only once a Memory Stick flush is accepted). Subsequent boots
    trust the selected path and unchanged file metadata, not a new byte/hash scan.
    Same-metadata corruption is an accepted safe-mode recovery case, not detected
    by this optimization. Partial temporaries are never executed. Caller-owned
@@ -35,6 +36,14 @@ PspBootCacheResult psp_boot_cache_prepare(
     void *scratch, size_t scratch_bytes,
     PspBootCacheSpaceQuery query_space, PspBootCacheWorkStarted work_started,
     void *context);
+
+/* The one startup copy in the install's data directory: the module and its
+   temporary sibling (the receipt is the module path plus ".receipt"). The
+   launcher prepares it at boot and the updater after promotion. */
+#define PSP_BOOT_CACHE_MODULE_NAME "startup-module.prx"
+#define PSP_BOOT_CACHE_TEMPORARY_NAME "startup-module.tmp"
+bool psp_boot_cache_paths(const char *data_directory, char *cache,
+                          char *temporary, size_t size);
 
 /* An explicitly requested application update reclaims this optional copy
    before its free-space check. Never touches slots, journals or user files. */

@@ -17,7 +17,7 @@ static bool parse_empty_clip_rect(const Stylesheet *sheet,
                                   bool *empty)
 {
     if (empty == NULL) return false;
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, value, value_length, resolved,
                        sizeof(resolved), 0)) return false;
     char *at = resolved;

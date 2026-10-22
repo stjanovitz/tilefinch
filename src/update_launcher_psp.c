@@ -484,10 +484,8 @@ static bool launcher_boot_slot(
     }
     char cache[TILEFINCH_INSTALL_PATH_LIMIT];
     char temporary[TILEFINCH_INSTALL_PATH_LIMIT];
-    int cache_length = snprintf(cache, sizeof(cache), "%s/startup-module.prx", paths->data_dir);
-    int temporary_length = snprintf(temporary, sizeof(temporary), "%s/startup-module.tmp", paths->data_dir);
-    if (allow_module && cache_length > 0 && (size_t)cache_length < sizeof(cache)
-        && temporary_length > 0 && (size_t)temporary_length < sizeof(temporary)
+    if (allow_module
+        && psp_boot_cache_paths(paths->data_dir, cache, temporary, sizeof(cache))
         && psp_boot_cache_prepare(eboot, cache, temporary,
             launcher_boot_scratch, sizeof(launcher_boot_scratch),
             launcher_cache_space, launcher_cache_work_started,

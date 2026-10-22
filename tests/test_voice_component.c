@@ -354,6 +354,28 @@ int main(void)
                  &paths, model, sizeof(model))
                  == TILEFINCH_VOICE_COMPONENT_SHARED
           && tilefinch_voice_component_remove(&paths));
+
+    /* Some real firmware/storage-driver combinations reject every Memory
+       Stick sync after checked writes and renames succeeded (PPSSPP accepts
+       them). The syncs are durability hints there: the reinstall that
+       promotes and clears the removal marker, and the removal that writes
+       it, both report the work they completed. */
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_REJECTED);
+    CHECK(write_package(package_path, &package)
+          && run_install(&budget, package_path, root, &package)
+                 == TILEFINCH_UPDATE_INSTALL_COMPLETE
+          && access(marker, F_OK) != 0
+          && tilefinch_voice_component_resolve(
+                 &paths, model, sizeof(model))
+                 == TILEFINCH_VOICE_COMPONENT_SHARED
+          && tilefinch_voice_component_remove(&paths)
+          && access(marker, F_OK) == 0
+          && tilefinch_voice_component_resolve(
+                 &paths, model, sizeof(model))
+                 == TILEFINCH_VOICE_COMPONENT_NONE);
+    tilefinch_memory_stick_sync_set_host_result(
+        TILEFINCH_MEMORY_STICK_SYNC_SKIPPED);
     CHECK(budget.current == 0);
     remove(package_path);
     CHECK(unlink(marker) == 0);

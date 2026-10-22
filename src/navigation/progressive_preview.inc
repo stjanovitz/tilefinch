@@ -275,6 +275,15 @@ static bool navigation_stream_preview_may_have_visible_pixels(
     if (sheet->generated_text_count != 0 || sheet->image_url_count != 0) {
         return true;
     }
+    /* Unused scalar declarations no longer allocate literal strings. They
+       still constitute authored visible content, including type-only pseudos
+       on otherwise empty nodes. */
+    for (size_t i = 0; i < sheet->declaration_count; i++) {
+        if ((sheet->declarations[i].values_flags
+             & STYLE_DECLARATION_VALUES_GENERATED_CONTENT) != 0) return true;
+        if ((i & 255u) == 255u && !tilefinch_platform_cooperate(
+                "streaming-preview-generated-content", i)) return true;
+    }
     lxb_dom_node_t *node = body->first_child;
     size_t visited = 0;
     while (node != NULL && node != body) {

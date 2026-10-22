@@ -60,11 +60,13 @@ extern bool (*psp_glyph_component_session_test_identity)(
 #endif
 
 /* Boot attachment is deliberately inert for the embedded-only defaults. It
-   verifies signed metadata before opening a selected pack and never writes. */
+   verifies signed metadata before opening a selected pack and never writes.
+   `language` is the page glyph selection; a non-Latin interface language's
+   pack attaches after it, never in its place. */
 bool psp_glyph_component_session_attach_selected(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
-    bool color_emoji);
+    BrowserGlyphLanguage interface_language, bool color_emoji);
 void psp_glyph_component_session_destroy(PspGlyphComponentSession *session);
 /* Detaches every runtime pack, as an install does before it promotes a new
    generation (the provider must not read a directory being rotated). */
@@ -114,7 +116,8 @@ bool psp_glyph_component_session_active(
 bool psp_glyph_component_session_reattach(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
-    bool color_emoji, uint16_t script_mask, BrowserEngine *engine);
+    BrowserGlyphLanguage interface_language, bool color_emoji,
+    uint16_t script_mask, BrowserEngine *engine);
 /* The offer's confirmation: select the pack's operation without the menu's
    auto-install, so the client's signed-metadata check stops at AVAILABLE
    with the verified package size. The caller begins the check. */
@@ -128,5 +131,10 @@ bool psp_glyph_component_session_remove(
     PspGlyphComponentSession *session,
     const TilefinchInstallPaths *paths, TilefinchGlyphPack pack,
     BrowserEngine *engine);
+/* The toast's second line, under the pack's name, after a completed
+   install: a catalog line saying whether the page already redrew (RELAID).
+   Only a language pack says "Language pack". */
+const char *psp_glyph_component_installed_status(TilefinchGlyphPack pack,
+                                                 bool relaid);
 
 #endif

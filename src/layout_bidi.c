@@ -326,7 +326,7 @@ static bool bidi_ancestor_listed(lxb_dom_node_t **nodes, size_t count,
  * it had no direction change: about three seconds per layout of a large
  * article on a PSP. One walk records the elements that contain RTL text and
  * whether any element can change direction at all; anything uncertain
- * leaves bidi_prepared false and the per-paragraph scan decides as before.
+ * leaves bidi_prepared false and the per-paragraph scan decides.
  */
 void layout_bidi_prepare(LayoutContext *context, Budget *budget)
 {
@@ -981,15 +981,11 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
                               uint32_t codepoint, uint32_t previous,
                               const char *sequence, size_t sequence_length)
 {
-    bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_at_weight(
-        layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
-    FontFamily family = font_context_metric_family(
-        layout->web_fonts, draw_command_font_family(command), face);
-    unsigned weight = (unsigned) draw_command_font_weight_code(command) * 10u;
-    bool synthetic_bold = font_face_needs_synthetic_bold(
-        layout->fonts, layout->web_fonts, face, weight);
+    DrawTextFace resolved = draw_command_text_face(layout, command);
+    const FontFace *face = resolved.face;
+    FontFamily family = resolved.metric_family;
+    bool bold_face = resolved.bold_face;
+    bool synthetic_bold = resolved.synthetic_bold;
     char encoded[4];
     size_t length = sequence == NULL
         ? bidi_encode(codepoint, encoded) : sequence_length;
@@ -1497,30 +1493,21 @@ void layout_bidi_translate_commands(LayoutDocument *layout,
     }
 }
 
-static int bidi_scale_fixed(int value, int origin_x_twice, uint8_t scale_q6)
-{
-    int64_t origin_fixed = (int64_t) origin_x_twice * 32;
-    int64_t scaled = origin_fixed
-        + ((int64_t) value - origin_fixed) * scale_q6 / 64;
-    return scaled > INT_MAX ? INT_MAX : (scaled < INT_MIN ? INT_MIN
-                                                          : (int) scaled);
-}
-
 void layout_bidi_scale_commands(LayoutDocument *layout,
                                 size_t command_start,
-                                int origin_x_twice, uint8_t scale_q6)
+                                int origin_x_twice, uint16_t scale_q14)
 {
-    if (layout == NULL || scale_q6 == 64u) return;
+    if (layout == NULL || scale_q14 == 16384u) return;
     for (size_t i = 0; i < layout->bidi_command_count; i++) {
         const LayoutBidiCommand *command = &layout->bidi_commands[i];
         if (command->command_index < command_start) continue;
         for (size_t glyph = 0; glyph < command->glyph_count; glyph++) {
             LayoutBidiGlyph *item = &layout->bidi_glyphs[
                 command->glyph_start + glyph];
-            item->x_fixed = bidi_scale_fixed(
-                item->x_fixed, origin_x_twice, scale_q6);
-            uint32_t advance = ((uint32_t) item->advance_fixed * scale_q6
-                                + 32u) / 64u;
+            item->x_fixed = scale_fixed_around_center(
+                item->x_fixed, origin_x_twice, scale_q14);
+            uint32_t advance = ((uint32_t) item->advance_fixed * scale_q14
+                                + 8192u) / 16384u;
             item->advance_fixed = (uint16_t) (
                 advance > UINT16_MAX ? UINT16_MAX : advance);
         }

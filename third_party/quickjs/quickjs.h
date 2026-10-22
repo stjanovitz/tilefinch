@@ -370,6 +370,15 @@ JSRuntime *JS_NewRuntime(void);
 /* info lifetime must exceed that of rt */
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
 void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
+#if !defined(__PSP__)
+/* Tilefinch host test seam: refuse the `nth` (1-based) heap allocation or
+   growth any runtime makes from now on, once, as a full heap would; 0
+   disarms. JS_TestRefusalPending() answers whether an armed refusal has
+   yet to happen. Not thread-safe: a test arms it around one synchronous
+   call. Absent from PSP builds. */
+void JS_TestRefuseAllocation(unsigned nth);
+int JS_TestRefusalPending(void);
+#endif
 #ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
 uint64_t JS_GetEvalRopePhysicalWork(JSRuntime *rt);
 uint64_t JS_GetGCRunCount(JSRuntime *rt);

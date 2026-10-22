@@ -87,6 +87,21 @@ void tilefinch_platform_retire_frame(const uint16_t *pixels);
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units);
 void tilefinch_platform_log_message(const char *message);
+/* Publishes the closed file TEMPORARY under PATH on a filesystem whose
+   rename may refuse to replace an existing file (the PSP's FAT).
+
+   With BACKUP, the previous PATH is first rotated to BACKUP (an older
+   BACKUP is removed only if the rename refuses to replace it, while PATH is
+   still whole) and moved back if TEMPORARY cannot be installed, so a
+   complete generation exists under PATH or BACKUP at every instant.
+   Without BACKUP, an atomic replace is tried first; only when that fails
+   (and TEMPORARY exists) is PATH removed and the rename retried, so a power
+   loss in that window leaves just TEMPORARY.
+
+   TEMPORARY is never removed: on failure the caller decides whether it is
+   discarded or kept for recovery. */
+bool tilefinch_platform_replace_file(const char *temporary, const char *path,
+                                     const char *backup);
 /* Validation builds: name a step of engine work so that a visible gap
    between two cooperate checkpoints can be attributed to the steps that ran
    inside it (`label` must be a string literal). No-op otherwise. */

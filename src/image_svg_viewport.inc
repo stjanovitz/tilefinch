@@ -7,6 +7,10 @@ typedef struct SvgClipDefinition {
     char id[64];
     NSVGimage *image;
     bool object_space;
+    bool luminance_mask;
+    bool alpha_mask;
+    bool region_object_space;
+    float region[4];
     struct SvgClipDefinition *next;
 } SvgClipDefinition;
 
@@ -15,13 +19,26 @@ typedef struct SvgClipUse {
     char id[64];
     float transform[6];
     float rectangle[4];
+    /* Object-bounding-box transform, resolved once after parsing. */
+    float object_transform[6];
+    unsigned char object_state;
     bool viewport;
+    bool mask;
 } SvgClipUse;
 
 typedef struct {
     NSVGshape *shape;
     SvgClipUse *clip;
 } SvgClipBinding;
+
+/* Half-open [x0, y0, x1, y1] pixel rectangles bound the clip work: outside
+   rect a mask is zero, and identity means it is 255 everywhere. */
+typedef struct {
+    unsigned char *pixels;
+    SvgClipUse *clip;
+    int rect[4];
+    bool identity;
+} SvgClipMask;
 
 typedef struct {
     float min_x, min_y, width, height;
@@ -35,15 +52,31 @@ typedef struct {
     bool failed;
     SvgClipUse *clip_stack[NSVG_MAX_ATTR];
     unsigned element_depth, clip_count, definition_count;
+    /* Nonzero inside a clipPath or mask past the definition limit: its
+       content is dropped rather than drawn as artwork. */
+    unsigned discard_depth;
+    /* A 256-bit filter of the ids of definitions dropped at that limit, so
+       a mask that names one is ignored like an unresolved clip rather than
+       hiding its artwork. A collision only ignores a missing mask. */
+    uint32_t discarded_ids[8];
     NSVGparser *clip_parser;
     SvgClipDefinition *definitions;
     SvgClipBinding *bindings;
     size_t binding_count, binding_capacity, binding_cursor;
     float root_transform[6];
-    unsigned char *mask, *scratch_mask;
+    unsigned char *scratch_mask;
     size_t mask_bytes;
-    SvgClipUse *cached_clip;
+    /* Two most recent masks, so A, B-inside-A, A alternation rebuilds
+       neither. The second buffer is optional and only taken with ample
+       budget headroom. Outside scratch_rect the scratch coverage is zero. */
+    SvgClipMask masks[2];
+    unsigned active_mask;
+    bool second_mask_refused;
+    int scratch_rect[4];
+    int capture_row;
     bool mask_active, mask_capture;
+    bool luminance_capture;
+    unsigned mask_opacity, mask_luminance;
 } SvgViewportParser;
 
 static SvgViewportParser *svg_clips;
@@ -182,12 +215,36 @@ static const char *svg_clip_attribute(const char **attributes, const char *name)
     return attribute;
 }
 
+static unsigned svg_clip_id_bit(const char *id)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (size_t i = 0; id[i] != '\0'; i++)
+        hash = (hash ^ (unsigned char) id[i]) * UINT32_C(16777619);
+    return (unsigned) (hash & 255u);
+}
+
+static void svg_clip_note_discarded(SvgViewportParser *context,
+                                    const char *id)
+{
+    if (id == NULL || id[0] == '\0') return;
+    unsigned bit = svg_clip_id_bit(id);
+    context->discarded_ids[bit / 32u] |= UINT32_C(1) << (bit % 32u);
+}
+
+static bool svg_clip_discarded(const SvgViewportParser *context,
+                               const char *id)
+{
+    if (id == NULL || id[0] == '\0') return false;
+    unsigned bit = svg_clip_id_bit(id);
+    return (context->discarded_ids[bit / 32u] & (UINT32_C(1) << (bit % 32u)))
+        != 0;
+}
+
+/* Past the bookkeeping limits the artwork degrades to unclipped, as it
+   rendered before clipping support, rather than failing the image. */
 static SvgClipUse *svg_clip_use(SvgViewportParser *context, SvgClipUse *parent)
 {
-    if (context->clip_count == SVG_CLIP_LIMIT) {
-        context->failed = true;
-        return NULL;
-    }
+    if (context->clip_count == SVG_CLIP_LIMIT) return NULL;
     SvgClipUse *use = svg_malloc(sizeof(*use));
     if (use == NULL) { context->failed = true; return NULL; }
     memset(use, 0, sizeof(*use));
@@ -228,14 +285,19 @@ static void svg_viewport_start(void *opaque, const char *name,
     SvgClipUse *clip = context->element_depth != 0
         ? context->clip_stack[context->element_depth - 1] : NULL;
     context->clip_stack[context->element_depth++] = clip;
+    if (context->discard_depth != 0) return;
     if (context->clip_parser != NULL) {
-        if (strcmp(name, "clipPath") == 0) { context->failed = true; return; }
+        if (strcmp(name, "clipPath") == 0 || strcmp(name, "mask") == 0) {
+            context->failed = true; return;
+        }
         nsvg__startElement(context->clip_parser, name, attributes);
         return;
     }
-    if (strcmp(name, "clipPath") == 0) {
+    if (strcmp(name, "clipPath") == 0 || strcmp(name, "mask") == 0) {
         if (context->definition_count == SVG_CLIP_LIMIT) {
-            context->failed = true;
+            svg_clip_note_discarded(
+                context, svg_clip_attribute(attributes, "id"));
+            context->discard_depth = context->element_depth;
             return;
         }
         SvgClipDefinition *definition = svg_malloc(sizeof(*definition));
@@ -246,10 +308,28 @@ static void svg_viewport_start(void *opaque, const char *name,
             return;
         }
         memset(definition, 0, sizeof(*definition));
+        definition->luminance_mask = strcmp(name, "mask") == 0;
+        if (definition->luminance_mask) {
+            const char *type = svg_clip_attribute(attributes, "mask-type");
+            definition->alpha_mask = type != NULL && strcmp(type, "alpha") == 0;
+            const char *units = svg_clip_attribute(attributes, "maskUnits");
+            definition->region_object_space = units == NULL
+                || strcmp(units, "userSpaceOnUse") != 0;
+            static const char *const names[] = {"x", "y", "width", "height"};
+            for (unsigned i = 0; i < 4; i++) {
+                float basis = definition->region_object_space ? 1.0f
+                    : (i % 2 == 0 ? context->parser->viewWidth
+                                  : context->parser->viewHeight);
+                const char *value = svg_clip_attribute(attributes, names[i]);
+                definition->region[i] = nsvg__parseCoordinate(context->parser,
+                    value != NULL ? value : i < 2 ? "-10%" : "120%", 0, basis);
+            }
+        }
         const char *id = svg_clip_attribute(attributes, "id");
         if (id != NULL && strlen(id) < sizeof(definition->id))
             memcpy(definition->id, id, strlen(id) + 1);
-        const char *units = svg_clip_attribute(attributes, "clipPathUnits");
+        const char *units = svg_clip_attribute(attributes,
+            definition->luminance_mask ? "maskContentUnits" : "clipPathUnits");
         definition->object_space = units != NULL
             && strcmp(units, "objectBoundingBox") == 0;
         definition->next = context->definitions;
@@ -292,29 +372,42 @@ static void svg_viewport_start(void *opaque, const char *name,
     const char *overflow = svg_clip_attribute(attributes, "overflow");
     if (nested && (overflow == NULL || strncmp(overflow, "visible", 7) != 0)) {
         SvgClipUse *use = svg_clip_use(context, clip);
-        if (use == NULL) return;
-        use->viewport = true;
-        memcpy(use->rectangle, rectangle, sizeof(rectangle));
-        memcpy(use->transform, parent_transform, sizeof(parent_transform));
-        clip = use;
+        if (context->failed) return;
+        if (use != NULL) {
+            use->viewport = true;
+            memcpy(use->rectangle, rectangle, sizeof(rectangle));
+            memcpy(use->transform, parent_transform, sizeof(parent_transform));
+            clip = use;
+        }
     }
     const char *reference = svg_clip_attribute(attributes, "clip-path");
     char reference_id[64];
     if (svg_clip_local_id(reference, reference_id)) {
         SvgClipUse *use = svg_clip_use(context, clip);
-        if (use == NULL) return;
-        memcpy(use->id, reference_id, strlen(reference_id) + 1);
-        memcpy(use->transform, first != NULL ? first->xform
-               : nsvg__getAttr(p)->xform, sizeof(use->transform));
-        clip = use;
+        if (context->failed) return;
+        if (use != NULL) {
+            memcpy(use->id, reference_id, strlen(reference_id) + 1);
+            memcpy(use->transform, first != NULL ? first->xform
+                   : nsvg__getAttr(p)->xform, sizeof(use->transform));
+            clip = use;
+        }
+    }
+    reference = svg_clip_attribute(attributes, "mask");
+    if (svg_clip_local_id(reference, reference_id)) {
+        SvgClipUse *use = svg_clip_use(context, clip);
+        if (context->failed) return;
+        if (use != NULL) {
+            use->mask = true;
+            memcpy(use->id, reference_id, strlen(reference_id) + 1);
+            memcpy(use->transform, first != NULL ? first->xform
+                   : nsvg__getAttr(p)->xform, sizeof(use->transform));
+            clip = use;
+        }
     }
     context->clip_stack[context->element_depth - 1] = clip;
     for (NSVGshape *shape = first; shape != NULL && clip != NULL; shape = shape->next) {
         if ((shape->flags & NSVG_FLAGS_VISIBLE) == 0) continue;
-        if (context->binding_count == SVG_CLIP_SHAPE_LIMIT) {
-            context->failed = true;
-            return;
-        }
+        if (context->binding_count == SVG_CLIP_SHAPE_LIMIT) break;
         if (context->binding_count == context->binding_capacity) {
             size_t capacity = context->binding_capacity != 0
                 ? context->binding_capacity * 2 : 16;
@@ -333,8 +426,14 @@ static void svg_viewport_end(void *opaque, const char *name)
     SvgViewportParser *context = opaque;
     if (context->failed) return;
     if (context->element_depth == 0) { context->failed = true; return; }
+    if (context->discard_depth != 0) {
+        if (context->element_depth == context->discard_depth)
+            context->discard_depth = 0;
+        context->element_depth--;
+        return;
+    }
     if (context->clip_parser != NULL) {
-        if (strcmp(name, "clipPath") == 0) {
+        if (strcmp(name, "clipPath") == 0 || strcmp(name, "mask") == 0) {
             NSVGparser *parser = context->clip_parser;
             nsvg__endElement(parser, "g");
             context->definitions->image = parser->image;
@@ -349,7 +448,7 @@ static void svg_viewport_end(void *opaque, const char *name)
 static void svg_viewport_content(void *opaque, const char *text)
 {
     SvgViewportParser *context = opaque;
-    if (!context->failed) nsvg__content(context->clip_parser != NULL
+    if (!context->failed && context->discard_depth == 0) nsvg__content(context->clip_parser != NULL
         ? context->clip_parser : context->parser, text);
 }
 
@@ -381,7 +480,10 @@ static NSVGimage *svg_parse_viewports(char *source, Budget *budget)
 {
     SvgViewportParser *context = budget_calloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*context));
-    if (context == NULL) return NULL;
+    if (context == NULL) {
+        svg_allocation_failed = true;
+        return NULL;
+    }
     svg_clips = context;
     NSVGparser *p = nsvg__createParser();
     context->parser = p;
@@ -409,17 +511,34 @@ static bool svg_raster_coverage(void *opaque, unsigned char *coverage,
     if (svg_clips == NULL) return true;
     NSVGrasterizer *r = opaque;
     if (svg_clips->mask_capture) {
+        row += svg_clips->capture_row;
         unsigned char *destination = svg_clips->scratch_mask
             + (size_t) row * (size_t) r->width;
-        for (int x = first; x <= last; x++)
-            if (coverage[x] > destination[x]) destination[x] = coverage[x];
+        int *rect = svg_clips->scratch_rect;
+        if (first < rect[0]) rect[0] = first;
+        if (row < rect[1]) rect[1] = row;
+        if (last + 1 > rect[2]) rect[2] = last + 1;
+        if (row + 1 > rect[3]) rect[3] = row + 1;
+        for (int x = first; x <= last; x++) {
+            if (svg_clips->luminance_capture) {
+                unsigned alpha = (unsigned) nsvg__div255(
+                    coverage[x] * svg_clips->mask_opacity);
+                destination[x] = (unsigned char) nsvg__div255(
+                    alpha * svg_clips->mask_luminance
+                    + (255u - alpha) * destination[x]);
+            } else if (coverage[x] > destination[x]) destination[x] = coverage[x];
+        }
         return false;
     }
-    if (svg_clips->mask_active) {
-        const unsigned char *mask = svg_clips->mask
+    const SvgClipMask *active = &svg_clips->masks[svg_clips->active_mask];
+    if (svg_clips->mask_active && !active->identity) {
+        const int *rect = active->rect;
+        const unsigned char *mask = active->pixels
             + (size_t) row * (size_t) r->width;
+        bool inside = row >= rect[1] && row < rect[3];
         for (int x = first; x <= last; x++)
-            coverage[x] = (unsigned char) nsvg__div255(coverage[x] * mask[x]);
+            coverage[x] = inside && x >= rect[0] && x < rect[2]
+                ? (unsigned char) nsvg__div255(coverage[x] * mask[x]) : 0;
     }
     return true;
 }
@@ -454,10 +573,39 @@ static bool svg_clip_raster_shape(NSVGrasterizer *r, const NSVGshape *source,
     }
     if (r->nedges != 0)
         qsort(r->edges, (size_t) r->nedges, sizeof(NSVGedge), nsvg__cmpEdge);
-    NSVGpaint white = {.type = NSVG_PAINT_COLOR, .color = 0xffffffffu};
-    NSVGcachedPaint paint;
-    nsvg__initPaint(&paint, &white, 1);
-    nsvg__rasterizeSortedEdges(r, 0, 0, scale, &paint, shape.fillRule);
+    /* Rows outside the edges' vertical extent produce no coverage. Shift
+       the sorted edges by whole rows so the scanline loop visits only the
+       covered band; integer shifts of values below 2^23 are exact, so the
+       coverage is unchanged. */
+    int full_height = r->height, row0 = 0, row1 = 0;
+    if (r->nedges != 0) {
+        float top = r->edges[0].y0, bottom = r->edges[0].y1;
+        for (int i = 1; i < r->nedges; i++)
+            if (r->edges[i].y1 > bottom) bottom = r->edges[i].y1;
+        const float limit = 8388608.0f;
+        float rows = (float) full_height;
+        if (top >= -limit && bottom <= limit) {
+            float first = floorf(top / NSVG__SUBSAMPLES) - 1.0f;
+            float last = ceilf(bottom / NSVG__SUBSAMPLES) + 1.0f;
+            row0 = first <= 0.0f ? 0 : first >= rows ? full_height : (int) first;
+            row1 = last <= 0.0f ? 0 : last >= rows ? full_height : (int) last;
+        } else row1 = full_height;
+    }
+    if (row1 > row0) {
+        float shift = (float) (row0 * NSVG__SUBSAMPLES);
+        for (int i = 0; shift != 0.0f && i < r->nedges; i++) {
+            r->edges[i].y0 -= shift;
+            r->edges[i].y1 -= shift;
+        }
+        NSVGpaint white = {.type = NSVG_PAINT_COLOR, .color = 0xffffffffu};
+        NSVGcachedPaint paint;
+        nsvg__initPaint(&paint, &white, 1);
+        r->height = row1 - row0;
+        svg_clips->capture_row = row0;
+        nsvg__rasterizeSortedEdges(r, 0, 0, scale, &paint, shape.fillRule);
+        svg_clips->capture_row = 0;
+        r->height = full_height;
+    }
     while (shape.paths != NULL) {
         NSVGpath *next = shape.paths->next;
         svg_free(shape.paths->pts);
@@ -474,6 +622,14 @@ static bool svg_clip_raster_shape(NSVGrasterizer *r, const NSVGshape *source,
 static bool svg_clip_object_transform(SvgViewportParser *context,
                                       SvgClipUse *use, float transform[6])
 {
+    /* Every caller passes the use's own transform under the fixed root
+       transform, so the result is a property of the use. */
+    if (use->object_state != 0) {
+        if (use->object_state == 1)
+            memcpy(transform, use->object_transform, sizeof(use->object_transform));
+        return use->object_state == 1;
+    }
+    use->object_state = 2;
     float determinant = transform[0] * transform[3]
                         - transform[1] * transform[2];
     if (!isfinite(determinant) || fabsf(determinant) < 1e-6f) return false;
@@ -508,7 +664,76 @@ static bool svg_clip_object_transform(SvgViewportParser *context,
                    bounds[3] - bounds[1], bounds[0], bounds[1]};
     nsvg__xformMultiply(box, transform);
     memcpy(transform, box, sizeof(box));
+    memcpy(use->object_transform, box, sizeof(box));
+    use->object_state = 1;
     return true;
+}
+
+static void svg_clip_scratch_clear(SvgViewportParser *context, int width)
+{
+    int *rect = context->scratch_rect;
+    for (int y = rect[1]; y < rect[3]; y++)
+        memset(context->scratch_mask + (size_t) y * (size_t) width + (size_t) rect[0],
+               0, (size_t) (rect[2] - rect[0]));
+    rect[0] = rect[1] = INT_MAX;
+    rect[2] = rect[3] = INT_MIN;
+}
+
+/* mask *= scratch, restricted to where both can be nonzero. */
+static void svg_clip_mask_multiply(SvgViewportParser *context,
+                                   SvgClipMask *target, int width)
+{
+    const int *s = context->scratch_rect;
+    int *m = target->rect;
+    int x0 = s[0] > m[0] ? s[0] : m[0], y0 = s[1] > m[1] ? s[1] : m[1];
+    int x1 = s[2] < m[2] ? s[2] : m[2], y1 = s[3] < m[3] ? s[3] : m[3];
+    if (x0 >= x1 || y0 >= y1) x0 = y0 = x1 = y1 = 0;
+    for (int y = y0; y < y1; y++) {
+        size_t at = (size_t) y * (size_t) width;
+        unsigned char *mask = target->pixels + at;
+        const unsigned char *scratch = context->scratch_mask + at;
+        /* div255(255 * s) == s exactly for every byte s. */
+        if (target->identity)
+            memcpy(mask + x0, scratch + x0, (size_t) (x1 - x0));
+        else for (int x = x0; x < x1; x++)
+            mask[x] = (unsigned char) nsvg__div255(mask[x] * scratch[x]);
+    }
+    m[0] = x0; m[1] = y0; m[2] = x1; m[3] = y1;
+    target->identity = false;
+}
+
+static const SvgClipDefinition *svg_clip_definition(
+    const SvgViewportParser *context, const char *id)
+{
+    const SvgClipDefinition *definition = context->definitions;
+    while (definition != NULL && strcmp(definition->id, id) != 0)
+        definition = definition->next;
+    return definition;
+}
+
+/* Exported artwork repeats one clip on many sibling groups, each with its
+   own use. Uses with identical fields and ancestry produce the same mask
+   unless an object bounding box ties it to the bound shapes. */
+static bool svg_clip_equivalent(const SvgViewportParser *context,
+                                const SvgClipUse *a, const SvgClipUse *b)
+{
+    for (unsigned depth = 0; depth <= SVG_VIEWPORT_DEPTH_LIMIT; depth++) {
+        if (a == b) return true;
+        if (a == NULL || b == NULL || a->viewport != b->viewport
+            || a->mask != b->mask || strcmp(a->id, b->id) != 0
+            || memcmp(a->transform, b->transform, sizeof(a->transform)) != 0
+            || memcmp(a->rectangle, b->rectangle, sizeof(a->rectangle)) != 0)
+            return false;
+        if (!a->viewport) {
+            const SvgClipDefinition *definition = svg_clip_definition(context, a->id);
+            if (definition != NULL && (definition->object_space
+                || (definition->luminance_mask
+                    && definition->region_object_space))) return false;
+        }
+        a = a->parent;
+        b = b->parent;
+    }
+    return false;
 }
 
 static void svg_raster_shape(void *opaque, int width, int height, float scale)
@@ -519,15 +744,50 @@ static void svg_raster_shape(void *opaque, int width, int height, float scale)
     if (context->binding_cursor == context->binding_count
         || context->bindings[context->binding_cursor].shape != opaque) return;
     SvgClipUse *clip = context->bindings[context->binding_cursor++].clip;
-    if (context->cached_clip == clip) { context->mask_active = true; return; }
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned slot = (context->active_mask + i) & 1u;
+        SvgClipMask *cached = &context->masks[slot];
+        if (cached->clip == NULL
+            || !svg_clip_equivalent(context, cached->clip, clip)) continue;
+        cached->clip = clip;
+        context->active_mask = slot;
+        context->mask_active = true;
+        return;
+    }
     size_t bytes = (size_t) width * (size_t) height;
     if (context->mask_bytes == 0) {
-        context->mask = svg_malloc(bytes);
+        context->masks[0].pixels = svg_malloc(bytes);
         context->scratch_mask = svg_malloc(bytes);
-        if (context->mask == NULL || context->scratch_mask == NULL) return;
+        if (context->masks[0].pixels == NULL || context->scratch_mask == NULL)
+            return;
         context->mask_bytes = bytes;
+        memset(context->scratch_mask, 0, bytes);
+        context->scratch_rect[0] = context->scratch_rect[1] = INT_MAX;
+        context->scratch_rect[2] = context->scratch_rect[3] = INT_MIN;
     }
-    memset(context->mask, 255, bytes);
+    unsigned target_slot = context->active_mask;
+    if (context->masks[target_slot].clip != NULL) {
+        /* Keep the current mask as the alternate. A refused or unaffordable
+           second buffer only means rebuilding in place, never a failure. */
+        SvgClipMask *other = &context->masks[target_slot ^ 1u];
+        if (other->pixels == NULL && !context->second_mask_refused) {
+            if (bytes <= budget_remaining(svg_budget) / 4u)
+                other->pixels = budget_malloc_category(
+                    svg_budget, BUDGET_CATEGORY_RESOURCE, bytes);
+            context->second_mask_refused = other->pixels == NULL;
+        }
+        if (other->pixels != NULL) target_slot ^= 1u;
+    }
+#ifndef __PSP__
+    tilefinch_test_faults()->svg_clip_mask_builds++;
+#endif
+    SvgClipMask *target = &context->masks[target_slot];
+    target->clip = NULL;
+    target->identity = true;
+    target->rect[0] = target->rect[1] = 0;
+    target->rect[2] = width;
+    target->rect[3] = height;
+    context->active_mask = target_slot;
     NSVGrasterizer *r = nsvgCreateRasterizer();
     if (r == NULL) return;
     r->width = width;
@@ -542,7 +802,9 @@ static void svg_raster_shape(void *opaque, int width, int height, float scale)
             svg_allocation_failed = true;
             break;
         }
-        memset(context->scratch_mask, 0, bytes);
+        svg_cooperate();
+        svg_clip_scratch_clear(context, width);
+        bool identity = false;
         float transform[6];
         memcpy(transform, use->transform, sizeof(transform));
         nsvg__xformPremultiply(transform, context->root_transform);
@@ -558,29 +820,77 @@ static void svg_raster_shape(void *opaque, int width, int height, float scale)
             if (w > 0 && h > 0)
                 okay = svg_clip_raster_shape(r, &shape, transform, scale);
         } else {
-            SvgClipDefinition *definition = context->definitions;
-            while (definition != NULL && strcmp(definition->id, use->id) != 0)
-                definition = definition->next;
-            if (definition != NULL && definition->image != NULL) {
+            const SvgClipDefinition *definition = svg_clip_definition(context, use->id);
+            if (definition != NULL && definition->image != NULL
+                && definition->luminance_mask == use->mask) {
                 bool has_area = !definition->object_space
                     || svg_clip_object_transform(context, use, transform);
                 for (NSVGshape *shape = definition->image->shapes;
                      has_area && okay && shape != NULL; shape = shape->next) {
+                    context->luminance_capture = definition->luminance_mask;
+                    if (definition->luminance_mask) {
+                        /* Solid-color luminance masks share the existing
+                           bounded coverage buffers; no RGBA surface. Complex
+                           paints/strokes are refused rather than silently
+                           treated as an opaque clipping silhouette. */
+                        if (shape->stroke.type != NSVG_PAINT_NONE
+                            || (shape->fill.type != NSVG_PAINT_COLOR
+                                && shape->fill.type != NSVG_PAINT_NONE)) {
+                            okay = false;
+                            break;
+                        }
+                        if (shape->fill.type == NSVG_PAINT_NONE) continue;
+                        unsigned color = shape->fill.color;
+                        float red = (float) (color & 255u) / 255.0f;
+                        float green = (float) ((color >> 8) & 255u) / 255.0f;
+                        float blue = (float) ((color >> 16) & 255u) / 255.0f;
+                        red = red <= .04045f ? red / 12.92f
+                            : powf((red + .055f) / 1.055f, 2.4f);
+                        green = green <= .04045f ? green / 12.92f
+                            : powf((green + .055f) / 1.055f, 2.4f);
+                        blue = blue <= .04045f ? blue / 12.92f
+                            : powf((blue + .055f) / 1.055f, 2.4f);
+                        context->mask_luminance = definition->alpha_mask ? 255u
+                            : (unsigned) (
+                            (red * .2126f + green * .7152f + blue * .0722f)
+                            * 255.0f + .5f);
+                        context->mask_opacity = (unsigned) (
+                            (float) (color >> 24) * shape->opacity + .5f);
+                    }
                     if ((shape->flags & NSVG_FLAGS_VISIBLE) != 0)
                         okay = svg_clip_raster_shape(r, shape, transform, scale);
                 }
+                context->luminance_capture = false;
+                if (okay && definition->luminance_mask) {
+                    svg_clip_mask_multiply(context, target, width);
+                    svg_clip_scratch_clear(context, width);
+                    memcpy(transform, use->transform, sizeof(transform));
+                    nsvg__xformPremultiply(transform, context->root_transform);
+                    bool area = !definition->region_object_space
+                        || svg_clip_object_transform(context, use, transform);
+                    float x = definition->region[0], y = definition->region[1];
+                    float w = definition->region[2], h = definition->region[3];
+                    float points[] = {x,y, x,y, x+w,y, x+w,y,
+                        x+w,y, x+w,y+h, x+w,y+h,
+                        x+w,y+h, x,y+h, x,y+h, x,y+h, x,y, x,y};
+                    NSVGpath path = {.pts = points, .npts = 13, .closed = 1};
+                    NSVGshape rectangle = {.paths = &path,
+                        .fillRule = NSVG_FILLRULE_NONZERO};
+                    if (area && w > 0 && h > 0)
+                        okay = svg_clip_raster_shape(r, &rectangle, transform, scale);
+                }
             }
             /* An unresolved local clip is ignored, as an invalid URL value,
-               rather than hiding otherwise valid artwork. */
-            else memset(context->scratch_mask, 255, bytes);
+               rather than hiding otherwise valid artwork; so is a mask whose
+               definition fell past our definition limit. */
+            else if (!use->mask || svg_clip_discarded(context, use->id))
+                identity = true;
         }
         if (!okay) { svg_allocation_failed = true; break; }
-        for (size_t i = 0; i < bytes; i++)
-            context->mask[i] = (unsigned char) nsvg__div255(
-                context->mask[i] * context->scratch_mask[i]);
+        if (!identity) svg_clip_mask_multiply(context, target, width);
     }
     context->mask_capture = false;
     nsvgDeleteRasterizer(r);
-    context->cached_clip = clip;
+    target->clip = clip;
     context->mask_active = true;
 }

@@ -24,18 +24,18 @@ function preflightShape(headers) {
 /* OOPIFs have separate Fetch domains. Use the documented non-flattened CDP
    target tunnel so every frame stays paused until hermetic routing is ready.
    This does not alter site isolation or rewrite cross-origin responses. */
-async function installInterception(root, onRequest, runHost, track, onFailure = () => {}, audit = null) {
+async function installInterception(root, onRequest, runHost, track, onFailure = () => {}, audit = null, workerSetup = null) {
   const sessions = new Set([root]);
   const children = new Map();
   const pending = new Map();
   let nextId = 0;
   let failures = 0, overflow = false;
   const fail = (error) => { failures += 1; onFailure(error); };
-  const attach = async (session) => {
+  const attach = async (session, worker = false, networkOwner = session) => {
     if (audit) {
-      session.on("Network.requestWillBeSent", (event) => audit.networkBegin(session, event));
-      session.on("Network.loadingFinished", (event) => audit.networkEnd(session, event));
-      session.on("Network.loadingFailed", (event) => audit.networkEnd(session, event, true));
+      session.on("Network.requestWillBeSent", (event) => audit.networkBegin(networkOwner, event));
+      session.on("Network.loadingFinished", (event) => audit.networkEnd(networkOwner, event));
+      session.on("Network.loadingFailed", (event) => audit.networkEnd(networkOwner, event, true));
       await runHost("request-audit-enable", () => session.send("Network.enable"));
     }
     session.on("Fetch.requestPaused", (event) => {
@@ -56,8 +56,8 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
         else promise.resolve(value.result || {});
       } else if (value.method) child.emit(value.method, value.params || {});
     });
-    session.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
-      if (targetInfo.type !== "iframe") return;
+    session.on("Target.attachedToTarget", ({ sessionId, targetInfo, waitingForDebugger }) => {
+      if (targetInfo.type !== "iframe" && !(workerSetup && targetInfo.type === "worker")) return;
       track((async () => {
         if (sessions.size >= 64) { overflow = true; throw new Error("capture exceeds 64 frame targets"); }
         const child = new EventEmitter();
@@ -78,7 +78,13 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
         };
         children.set(child._captureKey, child);
         sessions.add(child);
-        await attach(child);
+        let resumeWorker = null;
+        if (targetInfo.type === "worker") {
+          if (!waitingForDebugger) throw new Error("worker target was not paused before author execution");
+          resumeWorker = await workerSetup(child, targetInfo);
+        }
+        await attach(child, targetInfo.type === "worker", targetInfo.type === "worker" ? networkOwner : child);
+        if (resumeWorker) await resumeWorker();
         await runHost("frame-target-resume", () => child.send("Runtime.runIfWaitingForDebugger"));
       })().catch((error) => { fail(error); throw error; }));
     });
@@ -86,6 +92,7 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
       const key = `${session._captureKey || "root"}\0${sessionId}`;
       const child = children.get(key);
       if (!child) return;
+      if (child._captureWorkerDetached) child._captureWorkerDetached();
       children.delete(key); // Count all admitted targets, not only live targets.
       for (const [command, promise] of pending) {
         if (command.startsWith(`${key}\0`)) {
@@ -93,16 +100,17 @@ async function installInterception(root, onRequest, runHost, track, onFailure = 
         }
       }
     });
-    await runHost("redirect-interception-enable", () => session.send("Fetch.enable", {
+    if (!worker) await runHost("redirect-interception-enable", () => session.send("Fetch.enable", {
       patterns: [{ urlPattern: "http://*", requestStage: "Request" },
         { urlPattern: "https://*", requestStage: "Request" }],
     }));
-    await runHost("redirect-interception-cache-disable", () => session.send("Network.setCacheDisabled", {
+    if (!worker) await runHost("redirect-interception-cache-disable", () => session.send("Network.setCacheDisabled", {
       cacheDisabled: true,
     }));
     await runHost("frame-target-auto-attach", () => session.send("Target.setAutoAttach", {
       autoAttach: true, waitForDebuggerOnStart: true, flatten: false,
-      filter: [{ type: "iframe", exclude: false }, { exclude: true }],
+      filter: [{ type: "iframe", exclude: false },
+        ...(workerSetup ? [{type:"worker", exclude:false}] : []), { exclude: true }],
     }));
   };
   await attach(root);
@@ -144,6 +152,9 @@ function cdpRoute(session, event, onAbort = () => {}, onFulfill = () => {}) {
       method: () => event.request.method,
       resourceType: () => String(event.resourceType || "other").toLowerCase(),
       headers: () => headers,
+      postDataBuffer: () => typeof event.request.postData === "string"
+        && Buffer.byteLength(event.request.postData,"utf8") <= 16384
+        ? Buffer.from(event.request.postData,"utf8") : null,
     }),
     abort: (code) => {
       onAbort(event.request.method, event.request.url);
@@ -317,25 +328,41 @@ function createRequestAudit() {
           error: String(request.failure()?.errorText || "request failed").slice(0, 256) });
       }
     },
-    summary(intercepted) {
-      return { version: preflightDeniedParents ? "browser-request-audit-v3" : "browser-request-audit-v2", observed, intercepted,
+    summary(interceptedCount) {
+      return { version: preflightDeniedParents ? "browser-request-audit-v3" : "browser-request-audit-v2", observed, intercepted:interceptedCount,
         ...(preflightDeniedParents ? { preflight_denied_parents: preflightDeniedParents } : {}),
+        ...(pending.size ? {pending_requests:Array.from(pending).slice(0, 32).map(key => {
+          const request = networks.get(key);
+          return request ? {...request, fulfilled:fulfilled.has(key), intercepted:intercepted.has(key)}
+            : {method:typeof key.method === "function" ? key.method() : "unknown",
+               url:typeof key.url === "function" ? key.url().slice(0,2048) : "unknown"};
+        })} : {}),
         pending: pending.size, overflow, failures: failures.slice(),
         ready: !overflow && pending.size === 0 && deniedPreflightParents.size === 0
           && abortedPreflights.size === 0
-          && observed === intercepted + preflightDeniedParents
+          && observed === interceptedCount + preflightDeniedParents
           && failures.every((failure) => failure.expected) };
     },
   });
 }
 
-function createOriginEvidence() {
+function createOriginEvidence({ variants = false } = {}) {
   const entries = new Map();
-  let overflow = false, conflicts = false;
+  let overflow = false, conflicts = false, total = 0;
   return {
-    record(method, url, requestOrigin) {
-      const key = `${method}\0${url}`;
+    record(method, url, requestOrigin, resourceType = "unknown") {
       const origin = String(requestOrigin || "");
+      if (variants) {
+        const key = `${method}\0${url}\0${origin}\0${resourceType}`;
+        if (++total > 1000000) { overflow = true; return; }
+        const previous = entries.get(key);
+        if (previous) previous.occurrences += 1;
+        else if (entries.size >= 512) overflow = true;
+        else entries.set(key, { method, url, request_origin: origin,
+          resource_type: resourceType, occurrences: 1 });
+        return;
+      }
+      const key = `${method}\0${url}`;
       const previous = entries.get(key);
       if (previous && previous.request_origin !== origin) conflicts = true;
       else if (!previous) {
@@ -344,9 +371,11 @@ function createOriginEvidence() {
       }
     },
     summary() {
-      return { version: "unmatched-request-origin-v1", overflow, conflicts,
+      return { version: variants ? "unmatched-request-origin-v2" : "unmatched-request-origin-v1",
+        overflow, ...(variants ? {total} : {conflicts}),
         entries: [...entries.values()].sort((a, b) => {
-          const left = `${a.method}\0${a.url}`, right = `${b.method}\0${b.url}`;
+          const suffix = row => variants ? `\0${row.request_origin}\0${row.resource_type}` : "";
+          const left = `${a.method}\0${a.url}${suffix(a)}`, right = `${b.method}\0${b.url}${suffix(b)}`;
           return left < right ? -1 : left > right ? 1 : 0;
         }) };
     },
@@ -359,11 +388,36 @@ function createOriginEvidence() {
 function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadings = true,
   retainedFailures = [] } = {}) {
   const limit = Math.max(0, Math.min(4096, imageLimit));
-  const all = document.images;
+  const all = [], headingNodes = [], roots = [document];
+  let visited = 0, traversalTruncated = false;
+  /* document.images/querySelectorAll omit open component trees. Traverse
+     each root once, with independent DOM/root bounds, including hidden
+     elements so visibility below remains the authority. */
+  for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+    const walker = document.createTreeWalker(roots[rootIndex], NodeFilter.SHOW_ELEMENT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (++visited > 65536) { traversalTruncated = true; break; }
+      if (node instanceof HTMLImageElement) {
+        if (all.length >= limit) traversalTruncated = true;
+        else all.push(node);
+      }
+      if (includeHeadings && /^(H1|H2|H3)$/.test(node.tagName)) {
+        if (headingNodes.length >= limit) traversalTruncated = true;
+        else headingNodes.push(node);
+      }
+      if (node.shadowRoot) {
+        if (roots.length >= 256) traversalTruncated = true;
+        else roots.push(node.shadowRoot);
+      }
+    }
+    if (visited > 65536) break;
+  }
   const images = [];
   const failures = new Set(retainedFailures.slice(0, 4096));
   let incomplete = 0;
-  let truncated = all.length > limit;
+  let truncated = traversalTruncated;
+  const parent = (node) => node.assignedSlot || node.parentElement
+    || node.getRootNode()?.host || null;
   for (let index = 0; index < Math.min(all.length, limit); index += 1) {
     const image = all[index];
     const rect = image.getBoundingClientRect();
@@ -371,8 +425,8 @@ function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadin
     if (!image.checkVisibility({ opacityProperty: true, visibilityProperty: true,
       contentVisibilityAuto: true })) continue;
     let left = rect.left, right = rect.right, top = rect.top, bottom = rect.bottom;
-    let ancestor = image.parentElement;
-    for (let depth = 0; ancestor && depth < 256; depth += 1, ancestor = ancestor.parentElement) {
+    let ancestor = parent(image);
+    for (let depth = 0; ancestor && depth < 256; depth += 1, ancestor = parent(ancestor)) {
       if (ancestor === document.body || ancestor === document.documentElement) continue;
       const style = getComputedStyle(ancestor), bounds = ancestor.getBoundingClientRect();
       if (style.overflowX !== "visible") {
@@ -403,7 +457,6 @@ function visualEvidence({ fullDocument = false, imageLimit = 4096, includeHeadin
   const documentHeight = Math.max(innerHeight, root.scrollHeight,
     html.clientHeight, html.scrollHeight, html.offsetHeight,
     body ? body.clientHeight : 0, body ? body.scrollHeight : 0, body ? body.offsetHeight : 0);
-  const headingNodes = includeHeadings ? document.querySelectorAll("h1,h2,h3") : [];
   const headings = [];
   truncated ||= headingNodes.length > limit;
   for (let index = 0; index < Math.min(headingNodes.length, limit); index += 1) {

@@ -188,7 +188,7 @@ if(TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE)
     list(APPEND TILEFINCH_CORE_SOURCES "${TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE}")
 endif()
 
-if(PSP OR TILEFINCH_NATIVE_TIER_STATIC_CORE)
+if(PSP)
     add_library(tilefinch_core STATIC ${TILEFINCH_CORE_SOURCES})
 else()
     # Every host executable used to statically link this large archive.  One
@@ -210,11 +210,12 @@ if(TILEFINCH_BUDGET_CALLSITE_TRACE)
     target_compile_definitions(tilefinch_core PUBLIC
         TILEFINCH_BUDGET_CALLSITE_TRACE=1)
 endif()
-if(TILEFINCH_NATIVE_TIER_STATIC_CORE AND NOT PSP)
-    target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NATIVE_TIER_LAB=1)
-endif()
 target_include_directories(tilefinch_core PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Interface translations are published beside the signed glyph packs.
+set_property(SOURCE src/ui_language.c APPEND PROPERTY COMPILE_DEFINITIONS
+    TILEFINCH_GLYPH_COMPONENT_REPOSITORY_OWNER="${TILEFINCH_GLYPH_COMPONENT_REPOSITORY_OWNER}"
+    TILEFINCH_GLYPH_COMPONENT_REPOSITORY_NAME="${TILEFINCH_GLYPH_COMPONENT_REPOSITORY_NAME}")
 if(PSP)
     enable_language(ASM)
     target_sources(tilefinch_core PRIVATE

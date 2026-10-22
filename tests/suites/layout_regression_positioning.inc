@@ -1685,7 +1685,7 @@
         CHECK(command.type == DRAW_ROTATED_FILL
             && (command.text_length & 65535u) == 16 && command.text_length >> 16 == 16);
         layout_rotate_range_quadrants(&span, 0, 0, 0, 0, 40, 40, 1, NULL);
-        layout_scale_range(&span, 0, 0, 0, 0, 40, 40, 128, NULL);
+        layout_scale_range(&span, 0, 0, 0, 0, 40, 40, 32768, NULL);
         CHECK((command.text_length & 65535u) == 32 && command.text_length >> 16 == 32);
         CHECK(viewport_context_init(&span.viewport, 40, 40, 80, 80));
         LayoutDocument visual = {0};
@@ -2571,7 +2571,7 @@
           && high_style.has_transform && high_style.transform_x == 5
           && high_style.transform_y == 6
           && scaled_style.has_transform
-          && scaled_style.transform_scale_q6 == 26
+          && scaled_style.transform_scale_q14 == 6554
           && origin_paint != NULL
           && (origin_paint->components
               & STYLE_PAINT_COMPONENT_TRANSFORM_ORIGIN) != 0

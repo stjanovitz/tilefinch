@@ -2080,6 +2080,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
     document_allocation_owner_leave(runtime->document, previous_owner);
     bool evaluated = !JS_IsException(evaluated_value);
     JS_FreeValue(runtime->context, evaluated_value);
+    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (!js_rt_current_script_scope_end(
             runtime->context, &previous_current_script,
             &runtime->result)) evaluated = false;
@@ -2093,7 +2094,6 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
     lazy_trace_memory(runtime, "source-released", source_url,
                       bundle->compressed_source_length,
                       plan->factory_count);
-    if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
     if (evaluated) evaluated = js_rt_runtime_refresh(runtime);
     lazy_trace_memory(runtime, "executed", source_url, source_length,
                       plan->factory_count);

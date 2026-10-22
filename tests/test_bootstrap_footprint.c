@@ -73,6 +73,8 @@ int main(void)
         .viewport = viewport,
         .execution_policy = policy,
         .defer_document_scripts = true,
+        /* Measure the shipping realm: no test-only probes. */
+        .omit_test_probes = true,
     };
     ScriptResult result;
     memset(&result, 0, sizeof(result));

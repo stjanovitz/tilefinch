@@ -38,6 +38,10 @@
  * alignment linear textures require.
  */
 #define PSP_MEDIA_PRESENT_COLUMN_ALIGN 16
+/* The largest decoded picture the rotated (portrait) presentation, its crop
+   and its pillarbox probe accept. */
+#define PSP_MEDIA_PRESENT_ROTATION_MAX_WIDTH 640
+#define PSP_MEDIA_PRESENT_ROTATION_MAX_HEIGHT 512
 #define PSP_MEDIA_PRESENT_MAX_QUADS 2
 #define PSP_MEDIA_PRESENT_MAX_BANDS 4
 
@@ -154,7 +158,9 @@ bool psp_media_present_has_portrait_content(
 bool psp_media_present_portrait_probe_due(
     uint16_t *playback_ms, uint8_t *phase, unsigned elapsed_ms,
     bool playing, bool new_frame);
-void psp_media_present_quad_vertices(
+/* The four-vertex fan for a clockwise quad. A landscape quad is drawn as a
+   two-vertex sprite and needs no helper. */
+void psp_media_present_clockwise_vertices(
     const PspMediaPresentQuad *quad, PspMediaPresentVertex vertices[4]);
 
 /*

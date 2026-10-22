@@ -522,8 +522,7 @@ setup, pause, and multiplayer surfaces remain ordinary accessible HTML.
 
 The 30fps target remains a physical-device qualification requirement, not a
 guarantee from host tests. Device runs on a PSP-3000 in October 2026
-(validation build, installed package; see the
-[performance ledger](../../docs/engineering/PERFORMANCE_LEDGER.md)) are close:
+(validation build, installed package) are close:
 the bot-driven long soak missed 1-2 of about 1,340 two-vblank deadlines and
 the Onslaught soak 0-1, and an Onslaught boss wave with real input and audio
 missed 3 of 2,176 (readiness p95 28.2 ms). The late frame that remains in the

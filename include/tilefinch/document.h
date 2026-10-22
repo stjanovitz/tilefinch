@@ -16,6 +16,13 @@ typedef struct DocumentControlState DocumentControlState;
 typedef struct DocumentNonceSlot DocumentNonceSlot;
 typedef struct DocumentNonceRegistry DocumentNonceRegistry;
 typedef struct DocumentAdoptedSheets DocumentAdoptedSheets;
+typedef struct DocumentRegisteredProperty {
+    struct DocumentRegisteredProperty *next;
+    const char *name;
+    const char *initial_value;
+    bool inherits;
+    bool length_syntax;
+} DocumentRegisteredProperty;
 typedef struct MediaDeclaredVideoCache MediaDeclaredVideoCache;
 
 #define DOCUMENT_CONTROL_VALUE_LIMIT 512u
@@ -157,6 +164,9 @@ typedef struct {
        The PSP frontend uses this compact hint to attach installed fallback
        packs lazily; it is not serialized and causes no storage I/O here. */
     uint16_t glyph_script_mask;
+    /* Conservative 256-codepoint page bloom from the same visible-text
+       census. Used only to prioritize bounded web-font subset admission. */
+    uint64_t font_text_pages;
     /* The same pass's usage census, for the in-page language-pack offer. */
     DocumentGlyphCensus glyph_census;
     /* Existing parser-census fact that keeps ordinary LTR pages out of the
@@ -215,6 +225,8 @@ typedef struct {
     /* Constructed stylesheets and the adoptedStyleSheets lists naming them;
        see document_adopted_sheets_active(). NULL until a page adopts one. */
     DocumentAdoptedSheets *adopted_sheets;
+    DocumentRegisteredProperty *registered_properties;
+    uint16_t registered_property_count;
     struct DocumentCssomSheets *cssom_sheets;
     /* The document's character encoding (a TilefinchEncoding). Zero is
        UTF-8, the default for documents not built by a sniffing parser. */
@@ -384,9 +396,12 @@ bool document_nonce_clone_subtree(lxb_dom_node_t *source,
    budget admits that many roots, DOM_BRIDGE_SHADOW_ROOT_LIMIT). Kept
    within uint8_t for the sorted index; the registry exists only on pages
    that adopt sheets. */
-#define DOCUMENT_ADOPTION_ROOT_LIMIT 128u
+#define DOCUMENT_ADOPTION_ROOT_LIMIT 256u
 #define DOCUMENT_CONSTRUCTED_SHEET_LIMIT 128u
 #define DOCUMENT_CONSTRUCTED_TEXT_LIMIT (1024u * 1024u)
+/* CSSOM override entries: at most one per script DOM handle, so this is
+   SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX (js_runtime.h asserts they agree). */
+#define DOCUMENT_CSSOM_SHEET_LIMIT 16352u
 /* CSSOM edits never change DOM text. Overrides have reusable Budget-owned
    storage, one entry per admitted DOM handle and at most 1 MiB UTF-8 text
    per source (the bridge's 256 Ki UTF-16-unit quota). Aggregate text and
@@ -475,10 +490,11 @@ size_t document_adoptions_discard_subtree(PocDocument *document,
                                           size_t capacity);
 /* The adoption lists in cascade order, for scoping: the index-th list's
    root (NULL: the document), sheets and whether it is active (the document,
-   or a connected shadow root). False past the last list. */
+   or a connected shadow root). Copies at most DOCUMENT_ADOPTED_SHEETS_PER_ROOT
+   pointers into the caller's sheets array. False past the last list. */
 bool document_adoption_list_at(const PocDocument *document, size_t index,
                                const lxb_dom_node_t **root,
-                               lxb_dom_node_t *const **sheets, size_t *count,
+                               lxb_dom_node_t **sheets, size_t *count,
                                bool *active);
 /* The parsed form cached for `sheet` at text `revision`: borrowed, valid
    until the next registry change. False when there is none. */
@@ -628,6 +644,11 @@ const char *document_attribute(lxb_dom_node_t *node, const char *name,
                                size_t *length);
 /* An HTML <meta http-equiv=refresh> (ASCII case-insensitive). */
 bool document_is_refresh_meta(lxb_dom_node_t *node);
+/* The one rule for a page's preview image: a <meta> whose property (or,
+   when that is absent or empty, name) is og:image, og:image:secure_url or
+   twitter:image, ASCII case-insensitive. Returns its content and length,
+   or NULL. Each caller applies its own scheme and length limits. */
+const char *document_meta_image_content(lxb_dom_node_t *node, size_t *length);
 /* CSP distinguishes authored/setAttribute style text from declarations made
    through the CSSOM. Lexbor attribute nodes provide a stable, clone-safe
    provenance slot without adding a page-sized side table. */
@@ -659,6 +680,9 @@ bool document_shadow_trees_present(void);
 lxb_dom_node_t *document_flat_first_child(lxb_dom_node_t *node);
 lxb_dom_node_t *document_flat_next_sibling(lxb_dom_node_t *node);
 lxb_dom_node_t *document_flat_parent(lxb_dom_node_t *node);
+/* Explicit inertness follows the flat tree; an active modal dialog escapes
+   ancestor inertness but not its own inert attribute. Bounded, no allocation. */
+bool document_node_is_inert(lxb_dom_node_t *node);
 const char *document_control_value(lxb_dom_node_t *node, size_t *length);
 bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
                                 const char *value, size_t length);

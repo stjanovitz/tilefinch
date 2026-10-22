@@ -308,8 +308,9 @@ frame. Restoration is sequential and transactional in bounded 16 KiB idle
 slices: a target store is unchanged until the whole file validates. Local
 storage must finish before the first real navigation proceeds; an unfinished
 cache restore is cancelled when navigation starts, because the cache is an
-optimization and must not overwrite responses produced by the new page.
-Booting directly to a page retains synchronous restoration so author script
+optimization and must not overwrite responses produced by the new page. If
+navigation cancels a cache snapshot before it was read, exit keeps that
+on-disk generation instead of rotating an empty live cache over it. Booting directly to a page retains synchronous restoration so author script
 observes the persisted local-storage state from its first instruction. Profile
 settings and bookmarks live in `profile.cfg` and remain part of the pre-HOME
 load because the native UI needs them.
@@ -418,8 +419,9 @@ adds no storage path. Deciding whether to show it reads nothing for ordinary
 pages; for a page whose census qualifies it runs the resolver's few `stat`
 calls once, and it never writes. Its **Install** is the menu's install above.
 Native UI translations live in `data/ui-language/<code>-vN.tful`, at most
-32 KiB per supported non-English language plus one installation temporary.
-Only explicit installation writes them; startup verifies the selected file's
+64 KiB per supported non-English language plus one installation temporary.
+Only explicit installation writes them, and a successful install removes
+that language's older-version files; startup verifies the selected file's
 SHA-256 against the browser catalog. Missing, incompatible or corrupt data
 falls back to English. Painting never reads or writes these files.
 

@@ -1,5 +1,6 @@
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/budget_quickjs.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
@@ -19,6 +20,8 @@
 #include "tilefinch/text_encoding.h"
 
 #include "js_runtime_internal.h"
+#include "image_decode_internal.h"
+#include "tilefinch/image_retarget.h"
 
 #include <stdio.h>
 #include <ctype.h>
@@ -57,6 +60,9 @@ static void runtime_configure_property_fault_trace(JSRuntime *runtime);
 
 /* The runtime remains one translation unit: these ordered private seams keep
    QuickJS/DOM state static while separating responsibilities for review. */
+static size_t image_preloads_pending(const ScriptRuntime *runtime);
+static void image_preload_cancel_job(ScriptRuntime *runtime);
+static void image_preloads_destroy(ScriptRuntime *runtime);
 #include "js_runtime/bridge_state.inc"
 #include "js_runtime/host_primitives.inc"
 #include "js_runtime/game_audio_slots.inc"
@@ -65,6 +71,7 @@ static void runtime_configure_property_fault_trace(JSRuntime *runtime);
 #include "js_runtime/document_state.inc"
 #include "js_runtime/heavy_pages.inc"
 #include "js_runtime/event_loop.inc"
+#include "js_runtime/image_preloads.inc"
 #include "js_runtime/result_snapshot.inc"
 #include "js_runtime/legacy_surface.inc"
 #include "js_runtime/runtime_creation.inc"

@@ -3,17 +3,6 @@ static uint64_t render_now_us(void)
     return tilefinch_platform_monotonic_time_us();
 }
 
-static unsigned draw_font_weight(const DrawCommand *command)
-{
-    uint8_t code = draw_command_font_weight_code(command);
-    return code != 0 ? (unsigned) code * 10u : 400u;
-}
-
-static bool draw_uses_bold_face(const DrawCommand *command)
-{
-    return draw_font_weight(command) >= 650u;
-}
-
 static const uint8_t font5x7[91][7] = {
     [' ']={0,0,0,0,0,0,0}, ['!']={4,4,4,4,4,0,4},
     ['#']={10,31,10,10,31,10,0}, ['-']={0,0,0,31,0,0,0},
@@ -241,19 +230,122 @@ static bool node_is_descendant(const lxb_dom_node_t *node,
     return false;
 }
 
-static void box_visual_origin(const LayoutDocument *layout,
-                              const LayoutNodeBox *box, int *x, int *y)
+/* A frame-local hint for the allocation-free overflow path. It never
+   outlives the immutable composition pass or substitutes partial answers. */
+enum { OVERFLOW_FALLBACK_ORIGINS = 16, OVERFLOW_FALLBACK_CLIPS = 64 };
+typedef struct {
+    LayoutPositionedClipIndex positioned;
+    struct { const LayoutNodeBox *box; int x, y; } origins[OVERFLOW_FALLBACK_ORIGINS];
+    /* Reuse the same storage for a bitmap prefix when the index fills. */
+    uint32_t clips[OVERFLOW_FALLBACK_CLIPS];
+    size_t clip_count;
+    size_t origin_count, origin_next;
+    bool clips_complete;
+    bool prepared;
+} OverflowFallback;
+_Static_assert(sizeof(OverflowFallback) <= 1024u,
+               "overflow fallback hints must stay small and stack bounded");
+#if defined(__PSP__)
+_Static_assert(sizeof(OverflowFallback) <= 768u,
+               "overflow fallback hints must fit the PSP stack allowance");
+#endif
+
+static void overflow_fallback_prepare(const LayoutDocument *layout,
+                                      OverflowFallback *fallback)
 {
+    if (fallback == NULL || fallback->prepared) return;
+    layout_positioned_clip_index_prepare(layout, &fallback->positioned);
+    fallback->clips_complete = true;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        if (!box->clips_x && !box->clips_y) continue;
+        if (fallback->clip_count == OVERFLOW_FALLBACK_CLIPS || i > UINT32_MAX) {
+            fallback->clips_complete = false;
+            memset(fallback->clips, 0, sizeof(fallback->clips));
+            size_t prefix = OVERFLOW_FALLBACK_CLIPS * 32u;
+            if (prefix > layout->node_box_count) prefix = layout->node_box_count;
+            for (size_t at = 0; at < prefix; at++) {
+                if (layout->node_boxes[at].clips_x || layout->node_boxes[at].clips_y)
+                    fallback->clips[at / 32u] |= UINT32_C(1) << (at % 32u);
+            }
+            break;
+        }
+        fallback->clips[fallback->clip_count++] = (uint32_t) i;
+    }
+    fallback->prepared = true;
+}
+
+typedef struct { size_t cursor, word; uint32_t pending; } OverflowClipCursor;
+
+static inline const LayoutNodeBox *overflow_clip_next(
+    const LayoutDocument *layout, const OverflowFallback *fallback,
+    OverflowClipCursor *cursor)
+{
+    size_t at;
+    if (fallback == NULL) {
+        if (cursor->cursor >= layout->node_box_count) return NULL;
+        at = cursor->cursor++;
+    } else if (fallback->clips_complete) {
+        if (cursor->cursor == fallback->clip_count) return NULL;
+        at = fallback->clips[cursor->cursor++];
+    } else {
+        while (cursor->pending == 0 && cursor->word < OVERFLOW_FALLBACK_CLIPS)
+            cursor->pending = fallback->clips[cursor->word++];
+        if (cursor->pending != 0) {
+            at = (cursor->word - 1u) * 32u
+                + (unsigned) __builtin_ctz(cursor->pending);
+            cursor->pending &= cursor->pending - 1u;
+        } else {
+            if (cursor->cursor < OVERFLOW_FALLBACK_CLIPS * 32u)
+                cursor->cursor = OVERFLOW_FALLBACK_CLIPS * 32u;
+            if (cursor->cursor >= layout->node_box_count) return NULL;
+            at = cursor->cursor++;
+        }
+    }
+    return &layout->node_boxes[at];
+}
+
+static bool overflow_command_escapes_clip(const LayoutDocument *layout,
+                                         size_t index, const LayoutNodeBox *box,
+                                         OverflowFallback *fallback)
+{
+    return layout_positioned_command_escapes_clip_indexed(layout, index, box,
+        fallback == NULL ? NULL : &fallback->positioned);
+}
+static void box_visual_origin(const LayoutDocument *layout,
+                              const LayoutNodeBox *box, int *x, int *y,
+                              OverflowFallback *fallback)
+{
+    if (fallback != NULL) {
+        for (size_t i = 0; i < fallback->origin_count; i++) {
+            if (fallback->origins[i].box != box) continue;
+            *x = fallback->origins[i].x;
+            *y = fallback->origins[i].y;
+            return;
+        }
+    }
     *x = box->x;
     *y = box->y;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *ancestor = &layout->node_boxes[i];
+        /* Only a scrolled ancestor changes this origin. Avoid walking DOM
+           ancestry for every stationary box in the allocation-free fallback. */
+        if (ancestor->scroll_x == 0 && ancestor->scroll_y == 0) continue;
         if (ancestor == box || ancestor->node == NULL || box->node == NULL
             || !node_is_descendant(box->node->parent, ancestor->node)) {
             continue;
         }
         *x -= ancestor->scroll_x;
         *y -= ancestor->scroll_y;
+    }
+    if (fallback != NULL) {
+        size_t at = fallback->origin_next;
+        fallback->origins[at].box = box;
+        fallback->origins[at].x = *x;
+        fallback->origins[at].y = *y;
+        fallback->origin_next = (at + 1u) % OVERFLOW_FALLBACK_ORIGINS;
+        if (fallback->origin_count < OVERFLOW_FALLBACK_ORIGINS)
+            fallback->origin_count++;
     }
 }
 
@@ -266,8 +358,10 @@ static int overflow_clip_radius(const LayoutDocument *layout,
 static bool overflow_command_geometry(const LayoutDocument *layout,
                                       size_t index, int *dx, int *dy,
                                       int *clip_left, int *clip_top,
-                                      int *clip_right, int *clip_bottom)
+                                      int *clip_right, int *clip_bottom,
+                                      OverflowFallback *fallback)
 {
+    overflow_fallback_prepare(layout, fallback);
     bool found = false;
     *dx = 0;
     *dy = 0;
@@ -275,18 +369,20 @@ static bool overflow_command_geometry(const LayoutDocument *layout,
     *clip_top = INT_MIN / 2;
     *clip_right = INT_MAX / 2;
     *clip_bottom = INT_MAX / 2;
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        const LayoutNodeBox *box = &layout->node_boxes[i];
+    OverflowClipCursor cursor = {0};
+    for (size_t visit = 0; visit < layout->node_box_count; visit++) {
+        const LayoutNodeBox *box = overflow_clip_next(layout, fallback, &cursor);
+        if (box == NULL) break;
         if ((!box->clips_x && !box->clips_y)
             || index < box->scroll_command_start
             || index >= box->scroll_command_end
-            || layout_positioned_command_escapes_clip(
-                   layout, index, box)) continue;
+            || overflow_command_escapes_clip(
+                   layout, index, box, fallback)) continue;
         found = true;
         *dx -= box->scroll_x;
         *dy -= box->scroll_y;
         int x = 0, y = 0;
-        box_visual_origin(layout, box, &x, &y);
+        box_visual_origin(layout, box, &x, &y, fallback);
         int left, top, right, bottom;
         layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         if (box->clips_x) {
@@ -595,20 +691,23 @@ static bool rounded_rect_clip_row_span(int rect_x, int rect_y,
 
 static size_t overflow_rounded_clips(const LayoutDocument *layout,
                                      size_t index, RoundedClip *clips,
-                                     size_t capacity)
+                                     size_t capacity, OverflowFallback *fallback)
 {
+    overflow_fallback_prepare(layout, fallback);
     size_t count = 0;
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        const LayoutNodeBox *box = &layout->node_boxes[i];
+    OverflowClipCursor cursor = {0};
+    for (size_t visit = 0; visit < layout->node_box_count; visit++) {
+        const LayoutNodeBox *box = overflow_clip_next(layout, fallback, &cursor);
+        if (box == NULL) break;
         if (!box->clips_x || !box->clips_y
             || layout_node_box_clip_radius(box) == 0
             || index < box->scroll_command_start
             || index >= box->scroll_command_end
-            || layout_positioned_command_escapes_clip(
-                   layout, index, box)) continue;
+            || overflow_command_escapes_clip(
+                   layout, index, box, fallback)) continue;
         if (count >= capacity) continue;
         int x = 0, y = 0;
-        box_visual_origin(layout, box, &x, &y);
+        box_visual_origin(layout, box, &x, &y, fallback);
         int left, top, right, bottom;
         layout_node_box_clip_rect(box, x, y, &left, &top, &right, &bottom);
         int radius = overflow_clip_radius(layout, box);
@@ -655,6 +754,22 @@ typedef struct {
     uint32_t resolved_color_source;
     uint32_t resolved_color_value;
 } RasterTarget;
+
+/* The command box clamped to the target. command->x and command->width are
+   retained-layout coordinates with no bound of their own, so the far edge
+   is widened before comparison and narrowed only once it is known to sit
+   inside the int-bounded target. An empty result has x1 <= x0 or y1 <= y0. */
+static inline void raster_command_bounds(const RasterTarget *target,
+                                         const DrawCommand *command,
+                                         int *x0, int *y0, int *x1, int *y1)
+{
+    int64_t right = (int64_t) command->x + command->width;
+    int64_t bottom = (int64_t) command->y + command->height;
+    *x0 = command->x > target->left ? command->x : target->left;
+    *y0 = command->y > target->top ? command->y : target->top;
+    *x1 = right < target->right ? (int) right : target->right;
+    *y1 = bottom < target->bottom ? (int) bottom : target->bottom;
+}
 
 typedef enum {
     FORCED_DARK_NONE = 0,
@@ -703,6 +818,18 @@ struct RenderOverflowCache {
 
 #define RENDER_OVERFLOW_SIGNATURE_EMPTY UINT64_C(14695981039346656037)
 
+/* Render yields to the frontend at two cadences, both outside frame
+   composition (which overwrites the incumbent buffer and cannot yield).
+   rasterize_tile yields after a tile once 8 ms of tile raster has
+   accumulated since its last yield, which keeps a long first frame (the
+   load preview's is ~0.1 s on the PSP) responsive without a clock read per
+   command. render_prepare_checkpoint yields every 128 command visits,
+   inside a tile's command loop and in build_fixed_cache, so one expensive
+   tile or fixed-layer pass cannot run unbroken until the tile ends.
+   Neither aborts the frame: a cancel request persists to the caller's next
+   checkpoint. */
+#define RENDER_COOPERATE_PHASE "render-prepare"
+
 static bool render_platform_cooperate(TileCache *cache, const char *phase,
                                       size_t work)
 {
@@ -717,9 +844,9 @@ static bool render_platform_cooperate(TileCache *cache, const char *phase,
 
 static void render_prepare_checkpoint(TileCache *cache)
 {
-    if (cache->frame_composing || cache->raster_cooperate_phase == NULL) return;
+    if (cache->frame_composing) return;
     if ((++cache->preparation_visits & 127u) != 0) return;
-    (void) render_platform_cooperate(cache, cache->raster_cooperate_phase,
+    (void) render_platform_cooperate(cache, RENDER_COOPERATE_PHASE,
                                      cache->preparation_visits);
 }
 

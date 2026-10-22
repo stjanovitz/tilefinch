@@ -5,6 +5,7 @@
 
 #include "style_internal.h"
 #include "style_cache_internal.h"
+#include "tilefinch_test_faults.h"
 #include "tilefinch/platform.h"
 
 #include <math.h>
@@ -331,10 +332,10 @@ static bool modern_length_component(const char **cursor, int *value,
     return true;
 }
 
-static bool modern_scale_value(const char *value, uint8_t *scale_q6)
+bool style_scale_value_q14(const char *value, uint16_t *scale_q14)
 {
     if (modern_keyword(value, "none")) {
-        *scale_q6 = 64;
+        *scale_q14 = 16384;
         return true;
     }
     char *end = NULL;
@@ -356,13 +357,41 @@ static bool modern_scale_value(const char *value, uint8_t *scale_q6)
     /* The retained display list has one exact scale. Reject non-uniform
        values rather than silently distorting one axis. */
     if (fabs(first - second) > 0.000001) return false;
-    double fixed = first * 64.0;
-    if (fixed > 255.0) fixed = 255.0;
-    *scale_q6 = (uint8_t) (fixed + 0.5);
+    double fixed = first * (double) STYLE_TRANSFORM_SCALE_Q14_ONE;
+    if (fixed > (double) STYLE_TRANSFORM_SCALE_Q14_MAX)
+        fixed = (double) STYLE_TRANSFORM_SCALE_Q14_MAX;
+    *scale_q14 = (uint16_t) (fixed + 0.5);
     return true;
 }
 
-static bool modern_rotate_value(const char *value, uint8_t *quadrants)
+static bool modern_translation_component(const Stylesheet *sheet,
+    const char **cursor, int *value, bool *percent)
+{
+    const char *start = *cursor;
+    while (isspace((unsigned char) *start)) start++;
+    const char *end = start;
+    unsigned depth = 0;
+    while (*end != '\0' && (depth != 0 || !isspace((unsigned char) *end))) {
+        if ((size_t) (end - start) >= STYLE_RETAINED_VALUE_CAPACITY) return false;
+        if (*end == '(') {
+            if (++depth > 16u) return false;
+        } else if (*end == ')') {
+            if (depth == 0) return false;
+            depth--;
+        }
+        end++;
+    }
+    StyleLength length = 0;
+    if (depth != 0 || end == start
+        || !parse_dimension_length((Stylesheet *) sheet, start,
+                                   (size_t) (end - start), &length, percent))
+        return false;
+    *value = length;
+    *cursor = end;
+    return true;
+}
+
+bool style_rotate_value_quadrants(const char *value, uint8_t *quadrants)
 {
     if (modern_keyword(value, "none")) {
         *quadrants = 0;
@@ -372,24 +401,10 @@ static bool modern_rotate_value(const char *value, uint8_t *quadrants)
     if ((value[0] == 'z' || value[0] == 'Z')
         && isspace((unsigned char) value[1])) {
         value += 2;
-        while (isspace((unsigned char) *value)) value++;
     }
-    char *end = NULL;
-    double angle = strtod(value, &end);
-    if (end == value || !isfinite(angle)) return false;
-    if (strncasecmp(end, "deg", 3) == 0) end += 3;
-    else if (strncasecmp(end, "turn", 4) == 0) {
-        angle *= 360.0;
-        end += 4;
-    } else if (strncasecmp(end, "grad", 4) == 0) {
-        angle *= 0.9;
-        end += 4;
-    } else if (strncasecmp(end, "rad", 3) == 0) {
-        angle *= 57.29577951308232;
-        end += 3;
-    } else if (angle != 0.0) return false;
-    while (isspace((unsigned char) *end)) end++;
-    if (*end != '\0') return false;
+    double angle = 0.0;
+    if (!style_parse_angle_degrees(value, strlen(value), true, &angle))
+        return false;
     double quarter = angle / 90.0;
     long rounded = lround(quarter);
     /* Quarter turns are exact in the compact axis-aligned display list.
@@ -623,17 +638,19 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         const char *cursor = value;
         int x = 0, y = 0;
         bool xp = false, yp = false;
-        if (modern_length_component(&cursor, &x, &xp)) {
+        if (modern_translation_component(sheet, &cursor, &x, &xp)) {
             while (isspace((unsigned char) *cursor)) cursor++;
             if (*cursor != '\0'
-                && !modern_length_component(&cursor, &y, &yp)) {
+                && !modern_translation_component(sheet, &cursor, &y, &yp)) {
                 x = y = 0;
             }
             while (isspace((unsigned char) *cursor)) cursor++;
             if (*cursor == '\0') {
                 bool compatible_x = style->transform_x <= STYLE_LENGTH_DIRECT_LIMIT
+                    && (x <= STYLE_LENGTH_DIRECT_LIMIT || style->transform_x == 0)
                     && (style->transform_x == 0 || style->transform_x_percent == xp);
                 bool compatible_y = style->transform_y <= STYLE_LENGTH_DIRECT_LIMIT
+                    && (y <= STYLE_LENGTH_DIRECT_LIMIT || style->transform_y == 0)
                     && (style->transform_y == 0 || style->transform_y_percent == yp);
                 /* The compact transform record holds one unit kind per
                    axis. Preserve an earlier transform instead of adding a
@@ -651,12 +668,14 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     }
     if ((mask & STYLE_MODERN_SCALE) != 0
         && retained_modern_value(sheet, node, "scale", value)) {
-        uint8_t scale = 64;
-        if (modern_scale_value(value, &scale)) {
-            unsigned combined = (unsigned) style->transform_scale_q6 * scale;
-            style->transform_scale_q6 = (uint8_t) (
-                combined / 64u > 255u ? 255u : combined / 64u);
-            style->has_transform |= scale != 64;
+        uint16_t scale = 16384;
+        if (style_scale_value_q14(value, &scale)) {
+            unsigned combined = (unsigned) style->transform_scale_q14 * scale
+                / STYLE_TRANSFORM_SCALE_Q14_ONE;
+            style->transform_scale_q14 = (uint16_t) (
+                combined > STYLE_TRANSFORM_SCALE_Q14_MAX
+                    ? STYLE_TRANSFORM_SCALE_Q14_MAX : combined);
+            style->has_transform |= scale != 16384;
         }
     }
     /* Tilefinch's retained display list is intrinsically flat. Accepting
@@ -713,7 +732,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
     if ((mask & STYLE_MODERN_ROTATE) != 0
         && retained_modern_value(sheet, node, "rotate", value)) {
         uint8_t quadrants = 0;
-        if (modern_rotate_value(value, &quadrants)) {
+        if (style_rotate_value_quadrants(value, &quadrants)) {
             style->individual_rotate_quadrants = (uint8_t) (
                 (style->individual_rotate_quadrants + quadrants) & 3u);
             style->has_transform |= quadrants != 0;
@@ -1124,8 +1143,9 @@ static ComputedStyle default_style(const Stylesheet *sheet,
                            .border_color = UINT32_MAX,
                            .border_alpha = 255,
                            .opacity = 255,
-                           .transform_scale_q6 = 64,
+                           .transform_scale_q14 = 16384,
                            .min_width_auto = true,
+                           .min_height_auto = true,
                            .max_width = STYLE_LENGTH_NONE,
                            .max_height = STYLE_LENGTH_NONE,
                            .object_position_x =
@@ -1722,15 +1742,8 @@ static bool rule_fast_matches(const Stylesheet *sheet,
     if (!rule->has_fast_key) return true;
     const char *fast_key = style_rule_fast_key(rule);
     if (fast_key == NULL) return true;
-    size_t length = rule->fast_key_length;
-    if (rule->type == SELECTOR_ID) {
-        return subject->id != NULL && subject->id_length == length
-               && memcmp(subject->id, fast_key, length) == 0;
-    }
-    if (rule->type == SELECTOR_CLASS)
-        return style_subject_has_class(sheet, subject, fast_key, length);
-    return subject->tag != NULL && subject->tag_length == length
-           && memcmp(subject->tag, fast_key, length) == 0;
+    return style_subject_key_matches(sheet, subject, rule->type, fast_key,
+                                     rule->fast_key_length);
 }
 
 
@@ -2384,12 +2397,9 @@ void style_retained_matches_invalidate_tokens(
 static uint32_t style_retained_key_hash(unsigned type, const char *key,
                                         size_t length)
 {
-    uint32_t hash = 2166136261u ^ type;
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) key[i];
-        hash *= 16777619u;
-    }
-    return hash | 1u; /* 0 marks an empty slot */
+    return style_fnv1a(STYLE_FNV1A_SEED ^ type, key, length,
+                       type == SELECTOR_TAG)
+        | 1u; /* 0 marks an empty slot */
 }
 
 static bool style_retained_key_present(const uint32_t *set, size_t mask,
@@ -2706,6 +2716,7 @@ typedef struct {
     uint64_t orders[128];
     size_t count;
     bool overflow;
+    StyleAdoptedOrderContext adopted;
 } StyleCascadeMatches;
 
 static void style_apply_or_collect(const Stylesheet *sheet,
@@ -2717,7 +2728,8 @@ static void style_apply_or_collect(const Stylesheet *sheet,
     } else if (matches->count < 128u) {
         size_t at = matches->count++;
         matches->rules[at] = (uint32_t) (rule - sheet->rules);
-        matches->orders[at] = style_adopted_cascade_order(sheet, node, rule->order);
+        matches->orders[at] = style_adopted_cascade_order_in(
+            sheet, node, &matches->adopted, rule->order);
     } else matches->overflow = true;
 }
 
@@ -2886,10 +2898,10 @@ static void style_apply_matching_ordered_range(const Stylesheet *sheet,
             style_retained_note(sheet, candidate);
             if (!style_container_query_matches(
                     sheet, style_rule_container_query(rule), node)) continue;
-        } else if (!style_container_query_matches(
-                sheet, style_rule_container_query(rule), node)
-            || !style_rule_selector_matches_subject(
-                sheet, candidate, node, subject)) continue;
+        } else if (!style_rule_selector_matches_subject(
+                sheet, candidate, node, subject)
+            || !style_container_query_matches(
+                sheet, style_rule_container_query(rule), node)) continue;
         if (trace_position) style_trace_position_match(sheet, rule, node);
         style_apply_or_collect(sheet, rule, style, parent, node, collected);
         if (retained != NULL) {
@@ -3609,6 +3621,7 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
     }
     if (mask & S_MIN_HEIGHT) {
         style->min_height = values->min_height;
+        style->min_height_auto = values->min_height_auto;
         style->min_height_percent = values->min_height_percent;
     }
     if (mask & S_OVERFLOW_X) {
@@ -3642,7 +3655,7 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
     if (mask & S_OPACITY) style->opacity = values->opacity;
     if (mask & S_TRANSFORM) {
         style->has_transform = values->has_transform;
-        style->transform_scale_q6 = values->transform_scale_q6;
+        style->transform_scale_q14 = values->transform_scale_q14;
         style->individual_rotate_quadrants =
             values->individual_rotate_quadrants;
         style->transform_x_percent = values->transform_x_percent;
@@ -3785,7 +3798,8 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
         style->generated_text_length = values->generated_text_length;
         style->generated_text = values->generated_text;
         style->generated_attr_length = values->generated_attr_length;
-        style->generated_attr = values->generated_attr;
+        memcpy(&style->generated_attr, &values->generated_attr,
+               sizeof(style->generated_attr));
         style->generated_expression = values->generated_expression;
         style->generated_image = values->generated_image;
     }
@@ -4555,6 +4569,17 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
                                            lxb_dom_node_t *node,
                                            const ComputedStyle *parent);
 
+static void style_materialize_generated_scalar(
+    const Stylesheet *sheet, ComputedStyle *style)
+{
+    if (style->generated_attr_length != STYLE_GENERATED_SCALAR_LENGTH) return;
+    style->generated_text = style_store_generated_text(
+        (Stylesheet *) sheet, style->generated_scalar, 3);
+    memset(&style->generated_attr, 0, sizeof(style->generated_attr));
+    style->generated_attr_length = 0;
+    if (style->generated_text == NULL) style->generated_text_length = 0;
+}
+
 /* The whole resolution (cascade, retained modern properties, var() walks)
    is one class-token scope: those later steps test the same class lists
    against hundreds of candidate rules. */
@@ -4563,6 +4588,7 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
 {
     style_class_tokens_scope_begin(sheet);
     ComputedStyle style = style_for_node_scoped(sheet, node, parent);
+    style_materialize_generated_scalar(sheet, &style);
     style_class_tokens_scope_end(sheet);
     return style;
 }
@@ -4761,7 +4787,7 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
         && style.height != STYLE_LENGTH_NONE) style.height = 0;
     if (style.clip_rect_empty
         && (style.out_of_flow || style.fixed_position)) style.hidden = true;
-    if (style.has_transform && style.transform_scale_q6 == 0) {
+    if (style.has_transform && style.transform_scale_q14 == 0) {
         style.hidden = true;
     }
     /* A text-rich server document may be staged behind body{display:none}
@@ -4854,8 +4880,6 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
             style.filter_code |= STYLE_FONT_CH_PENDING;
             unsigned font_slot = font_family_web_slot(style.font_family);
             if (font_slot < TILEFINCH_WEB_FONT_FAMILY_LIMIT) {
-                ((Stylesheet *) sheet)->metric_web_font_families |=
-                    (uint8_t) (1u << font_slot);
                 const WebFontSet *fonts = stylesheet_web_font_set(sheet);
                 if (fonts != NULL) {
                     ((Stylesheet *)sheet)->metric_web_font_faces |=
@@ -4876,8 +4900,8 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
     return style;
 }
 
-bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *node,
-                                     bool outset)
+static bool focus_shadow_rule_matches(const Stylesheet *sheet, lxb_dom_node_t *node,
+                                     bool outset, bool exact)
 {
     if (!stylesheet_prepare_focus_rule_index((Stylesheet *) sheet)) return false;
     StyleMatchSubject subject = style_match_subject(sheet, node);
@@ -4888,15 +4912,23 @@ bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *
         if (declaration == NULL) continue;
         /* Admit only actual shadow instructions, not unrelated deferred
            outlines in a block which also contains a concrete shadow:none. */
-        if (style_deferred_focus_shadow(sheet, declaration, outset))
-            return true;
-        if ((declaration->mask_high & S2_BOX_SHADOW) == 0) continue;
-        ComputedStyle values;
-        stylesheet_declaration_values(sheet, declaration, &values);
-        const StyleBoxShadow *shadow = stylesheet_box_shadow(sheet, &values, 0);
-        if (shadow != NULL && (!outset || !style_box_shadow_is_inset(shadow))) return true;
+        bool candidate = style_deferred_focus_shadow(sheet, declaration, outset);
+        if (!candidate && (declaration->mask_high & S2_BOX_SHADOW) != 0) {
+            ComputedStyle values;
+            stylesheet_declaration_values(sheet, declaration, &values);
+            const StyleBoxShadow *shadow = stylesheet_box_shadow(sheet, &values, 0);
+            candidate = shadow != NULL && (!outset || !style_box_shadow_is_inset(shadow));
+        }
+        if (candidate && (!exact || style_rule_selector_matches_subject(
+                sheet, sheet->focus_rule_indices[i], node, &subject))) return true;
     }
     return false;
+}
+
+bool style_node_focus_shadow_may_match(const Stylesheet *sheet, lxb_dom_node_t *node,
+                                     bool outset)
+{
+    return focus_shadow_rule_matches(sheet, node, outset, false);
 }
 
 static bool focus_token_at(const char *text, size_t length, size_t at,
@@ -4966,6 +4998,62 @@ static bool focus_token_inside_has(const char *text, size_t token_at)
         if (has_stack[i]) return true;
     }
     return false;
+}
+
+/* A descendant :has(:focus) cannot observe a focus move outside its anchor.
+   Prove only a simple positive anchor here. Nested functions, selector lists,
+   escapes and sibling-relative arguments retain the conservative fallback. */
+static bool focus_has_anchor_absent(lxb_dom_node_t *node,
+    const char *text, size_t length, size_t token_at)
+{
+    size_t has_at = SIZE_MAX;
+    unsigned parentheses = 0u, brackets = 0u;
+    char quote = '\0';
+    for (size_t at = 0; at < length; at++) {
+        if (text[at] == ',' || text[at] == '\\') return false;
+        char c = text[at];
+        if (quote != '\0') {
+            if (c == quote) quote = '\0';
+            continue;
+        }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c == '[') { if (++brackets > 16u) return false; continue; }
+        if (c == ']') { if (brackets == 0u) return false; brackets--; continue; }
+        if (brackets != 0u) continue;
+        if ((at + 5u <= length && !memcmp(text + at, ":host", 5u))
+            || (at + 6u <= length && !memcmp(text + at, ":scope", 6u))
+            || (at + 2u <= length && text[at] == ':' && text[at + 1u] == ':'))
+            return false;
+        if (at + 5u <= token_at && !memcmp(text + at, ":has(", 5u)) {
+            if (parentheses != 0u) return false;
+            has_at = at;
+            break;
+        }
+        if (c == '(') { if (++parentheses > 16u) return false; }
+        if (c == ')') { if (parentheses == 0u) return false; parentheses--; }
+    }
+    if (has_at == SIZE_MAX || has_at == 0u) return false;
+    unsigned char last = (unsigned char) text[has_at - 1u];
+    if (!(isalnum(last) || last == '_' || last == '-' || last == '*'
+          || last == ']' || last == ')'))
+        return false;
+    size_t end = has_at + 5u;
+    for (; end < length && text[end] != ')'; end++) {
+        char c = text[end];
+        if (c == '(' || c == '[' || c == '\\' || c == '+' || c == '~'
+            || c == ',' || c == '\'' || c == '"') return false;
+    }
+    if (end == length || token_at < has_at + 5u || token_at >= end)
+        return false;
+    for (size_t at = end + 1u; at < length; at++)
+        if (text[at] == ',' || text[at] == '\\') return false;
+    size_t visited = 0u;
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (++visited > 128u) return false;
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && style_selector_matches(at, text, has_at)) return false;
+    }
+    return true;
 }
 
 static bool focus_selector_probe_range(
@@ -5050,9 +5138,6 @@ static bool focus_selector_probe_range(
     return true;
 }
 
-/* A compound :focus-within carrier can change only on the focused node's
-   ancestor chain. Boolean wrappers keep that scope; relative selectors
-   inside them, :has(), escapes and excessive nesting stay conservative. */
 static bool focus_retained_value_unchanged(
     const Stylesheet *sheet, lxb_dom_node_t *node, lxb_dom_node_t *subject,
     const StyleCustomRule *rule);
@@ -5090,6 +5175,11 @@ static bool focus_descendant_opacity_unchanged(
     return true;
 }
 
+/* A compound :focus-within carrier can change only on the focused node's
+   ancestor chain. Boolean wrappers (:is/:not/:where) keep that scope, and a
+   :has() argument is safe once no ancestor matches its carrier prefix;
+   other relative selectors, escapes and excessive nesting stay
+   conservative. */
 static bool focus_within_may_affect_ancestor(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *text, size_t length, size_t token_at,
@@ -5211,6 +5301,37 @@ static bool focus_within_may_affect_ancestor(
     return false;
 }
 
+typedef enum {
+    FOCUS_TOKEN_LOCAL,     /* proven to restyle no other element */
+    FOCUS_TOKEN_NONLOCAL,  /* may restyle another element */
+    FOCUS_TOKEN_SUBJECT    /* on the subject compound: the caller decides */
+} FocusTokenReach;
+
+/* Where the :focus/:focus-within token at `at` (recognised by
+   focus_token_at) can reach when `node`'s focus changes. `rightmost` is
+   the start of the selector's subject compound; custom_rule, self_local and
+   rule are passed to focus_within_may_affect_ancestor. */
+static FocusTokenReach focus_token_reach(
+    const Stylesheet *sheet, lxb_dom_node_t *node,
+    const char *selector, size_t length, size_t at, bool within,
+    size_t rightmost, const StyleCustomRule *custom_rule, bool self_local,
+    const StyleRule *rule)
+{
+    if (focus_has_anchor_absent(node, selector, length, at))
+        return FOCUS_TOKEN_LOCAL;
+    if (within)
+        return focus_within_may_affect_ancestor(sheet, node, selector, length,
+                at, custom_rule, self_local, rule)
+            ? FOCUS_TOKEN_NONLOCAL : FOCUS_TOKEN_LOCAL;
+    if (at >= rightmost && !focus_token_inside_has(selector, at))
+        return FOCUS_TOKEN_SUBJECT;
+    size_t probe_at = 0, probe_length = 0;
+    return !focus_selector_probe_range(selector, length, at,
+                                       &probe_at, &probe_length)
+            || style_selector_matches(node, selector + probe_at, probe_length)
+        ? FOCUS_TOKEN_NONLOCAL : FOCUS_TOKEN_LOCAL;
+}
+
 static bool focus_selector_side_effects_are_local(
     const Stylesheet *sheet, lxb_dom_node_t *node, bool allow_pseudos,
     bool *pseudo_retry)
@@ -5225,33 +5346,19 @@ static bool focus_selector_side_effects_are_local(
         const StyleRule *rule = &sheet->rules[i];
         const char *selector = rule->selector;
         size_t length = rule->selector_length;
+        size_t rightmost = style_rule_rightmost_compound(rule);
         for (size_t at = 0; at < length; at++) {
             size_t token_length = 0;
             bool within = false;
             if (!focus_token_at(
                     selector, length, at, &token_length, &within)) continue;
-            if (within) {
-                if (focus_within_may_affect_ancestor(
-                        sheet, node, selector, length, at, NULL,
-                        rule->pseudo == PSEUDO_NONE, rule)) return false;
-                at += token_length - 1u;
-                continue;
-            }
-            bool relational =
-                at < style_rule_rightmost_compound(rule)
-                || focus_token_inside_has(selector, at);
-            if (relational) {
-                size_t probe_at = 0, probe_length = 0;
-                if (!focus_selector_probe_range(
-                        selector, length, at,
-                        &probe_at, &probe_length)
-                    || style_selector_matches(
-                        node, selector + probe_at, probe_length)) {
-                    return false;
-                }
-            } else if (rule->pseudo != PSEUDO_NONE
-                       && (!allow_pseudos || rule->pseudo == PSEUDO_PLACEHOLDER)
-                       && style_rule_selector_matches(sheet, i, node)) {
+            FocusTokenReach reach = focus_token_reach(sheet, node, selector,
+                length, at, within, rightmost, NULL,
+                rule->pseudo == PSEUDO_NONE, rule);
+            if (reach == FOCUS_TOKEN_NONLOCAL) return false;
+            if (reach == FOCUS_TOKEN_SUBJECT && rule->pseudo != PSEUDO_NONE
+                && (!allow_pseudos || rule->pseudo == PSEUDO_PLACEHOLDER)
+                && style_rule_selector_matches(sheet, i, node)) {
                 if (pseudo_retry != NULL && !allow_pseudos
                     && rule->pseudo != PSEUDO_PLACEHOLDER) *pseudo_retry = true;
                 return false;
@@ -5271,26 +5378,12 @@ static bool focus_selector_side_effects_are_local(
             bool within = false;
             if (!focus_token_at(
                     selector, length, at, &token_length, &within)) continue;
-            if (within) {
-                if (focus_within_may_affect_ancestor(
-                        sheet, node, selector, length, at, rule, false, NULL)) return false;
-                at += token_length - 1u;
-                continue;
-            }
-            bool relational = at < rightmost
-                || focus_token_inside_has(selector, at);
-            if (relational) {
-                size_t probe_at = 0, probe_length = 0;
-                if (!focus_selector_probe_range(
-                        selector, length, at,
-                        &probe_at, &probe_length)
-                    || style_selector_matches(
-                        node, selector + probe_at, probe_length)) {
-                    return false;
-                }
-            } else if (style_selector_matches(node, selector, length)
-                       && !focus_retained_value_unchanged(
-                              sheet, node, node, rule)) {
+            FocusTokenReach reach = focus_token_reach(sheet, node, selector,
+                length, at, within, rightmost, rule, false, NULL);
+            if (reach == FOCUS_TOKEN_NONLOCAL) return false;
+            if (reach == FOCUS_TOKEN_SUBJECT
+                && style_selector_matches(node, selector, length)
+                && !focus_retained_value_unchanged(sheet, node, node, rule)) {
                 /*
                  * A directly matched custom property can inherit into any
                  * descendant even when this node's concrete ComputedStyle
@@ -5305,41 +5398,90 @@ static bool focus_selector_side_effects_are_local(
     return true;
 }
 
-static size_t focus_marker_remove_failures;
-
-void style_test_inject_focus_marker_remove_failures(size_t count)
-{
-    focus_marker_remove_failures = count;
-}
-
 static bool set_focus_marker(lxb_dom_node_t *node, bool focused)
 {
-    static const lxb_char_t name[] = "data-tilefinch-focus";
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
     lxb_dom_element_t *element = lxb_dom_interface_element(node);
     if (focused) {
         return lxb_dom_element_set_attribute(
-            element, name, sizeof(name) - 1,
+            element, (const lxb_char_t *) STYLE_FOCUS_MARKER,
+            sizeof(STYLE_FOCUS_MARKER) - 1u,
             (const lxb_char_t *) "", 0) != NULL;
     }
-    if (focus_marker_remove_failures != 0) {
-        focus_marker_remove_failures--;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->focus_marker_remove_failures != 0) {
+        tilefinch_test_faults()->focus_marker_remove_failures--;
         return false;
     }
+#endif
     return lxb_dom_element_remove_attribute(
-        element, name, sizeof(name) - 1) == LXB_STATUS_OK;
+        element, (const lxb_char_t *) STYLE_FOCUS_MARKER,
+        sizeof(STYLE_FOCUS_MARKER) - 1u) == LXB_STATUS_OK;
 }
 
-static bool restore_focus_marker(
-    lxb_dom_node_t *node, bool originally_focused,
-    const char *original_value, size_t original_length)
+/* A focus probe toggles the native focus marker on one element to resolve
+   the other state's style, then puts the real marker back. The document's
+   style listeners stay quiet meanwhile: the probe is no style change unless
+   the marker cannot be restored, which leaves the live DOM in the probe
+   state and is reported as one. */
+typedef struct {
+    lxb_dom_node_t *node;
+    /* The node's variable-cache entries are dropped around each toggle and
+       after the restore when set (the probe resolves variables). */
+    Stylesheet *variables;
+    bool focused;  /* The real marker state. */
+    bool touched;  /* A toggle was attempted, so end must restore. */
+    size_t length;
+    char value[STYLE_FOCUS_MARKER_VALUE_CAPACITY];
+} FocusMarkerProbe;
+
+/* Saves the real marker and enters quiet mode; false (and nothing to end)
+   when its value is too long to save. */
+static bool focus_marker_probe_begin(FocusMarkerProbe *probe,
+                                     lxb_dom_node_t *node,
+                                     const Stylesheet *variables)
 {
-    static const lxb_char_t name[] = "data-tilefinch-focus";
-    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
-    if (!originally_focused) return set_focus_marker(node, false);
-    return lxb_dom_element_set_attribute(
-        lxb_dom_interface_element(node), name, sizeof(name) - 1u,
-        (const lxb_char_t *) original_value, original_length) != NULL;
+    probe->node = node;
+    probe->variables = (Stylesheet *) variables;
+    probe->touched = false;
+    probe->length = 0;
+    const char *original = document_attribute(node, STYLE_FOCUS_MARKER,
+                                              &probe->length);
+    if (probe->length >= sizeof(probe->value)) return false;
+    probe->focused = original != NULL;
+    if (probe->length != 0) memcpy(probe->value, original, probe->length);
+    probe->value[probe->length] = '\0';
+    document_style_quiet_begin();
+    return true;
+}
+
+static bool focus_marker_probe_set(FocusMarkerProbe *probe, bool focused)
+{
+    probe->touched = true;
+    bool set = set_focus_marker(probe->node, focused);
+    if (probe->variables != NULL)
+        style_variable_cache_invalidate_node(probe->variables, probe->node);
+    return set;
+}
+
+/* Restores the real marker (one attempt) and leaves quiet mode. */
+static bool focus_marker_probe_end(FocusMarkerProbe *probe)
+{
+    bool restored = true;
+    if (probe->touched) {
+        restored = probe->focused
+            ? lxb_dom_element_set_attribute(
+                  lxb_dom_interface_element(probe->node),
+                  (const lxb_char_t *) STYLE_FOCUS_MARKER,
+                  sizeof(STYLE_FOCUS_MARKER) - 1u,
+                  (const lxb_char_t *) probe->value, probe->length) != NULL
+            : set_focus_marker(probe->node, false);
+    }
+    document_style_quiet_end();
+    if (!restored) document_style_changed();
+    if (probe->variables != NULL)
+        style_variable_cache_invalidate_node(probe->variables, probe->node);
+    return restored;
 }
 
 /* Duplicate declarations (including a non-focus alternative in a selector
@@ -5352,23 +5494,15 @@ static bool focus_retained_value_unchanged(
 {
     if (rule->pseudo != PSEUDO_NONE
         || (rule->name[0] == '-' && rule->name[1] == '-')) return false;
-    size_t length = 0;
-    const char *original = document_attribute(node, "data-tilefinch-focus", &length);
-    if (length > 63u) return false;
-    bool focused = original != NULL;
-    char saved[64], before[STYLE_CUSTOM_RESOLVED_CAPACITY], after[STYLE_CUSTOM_RESOLVED_CAPACITY];
-    if (length != 0u) memcpy(saved, original, length);
-    saved[length] = '\0';
+    FocusMarkerProbe probe;
+    if (!focus_marker_probe_begin(&probe, node, sheet)) return false;
+    char before[STYLE_CUSTOM_RESOLVED_CAPACITY], after[STYLE_CUSTOM_RESOLVED_CAPACITY];
     bool found_before = style_retained_property_value(
         sheet, subject, rule->name, rule->name_length, before, sizeof(before));
-    bool changed = set_focus_marker(node, !focused);
-    style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
+    bool changed = focus_marker_probe_set(&probe, !probe.focused);
     bool found_after = changed && style_retained_property_value(
         sheet, subject, rule->name, rule->name_length, after, sizeof(after));
-    bool restored = restore_focus_marker(node, focused, saved, length);
-    if (!restored) restored = restore_focus_marker(node, focused, saved, length);
-    if (!restored) document_style_changed();
-    style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
+    bool restored = focus_marker_probe_end(&probe);
     return restored && found_before && found_after && strcmp(before, after) == 0;
 }
 
@@ -5495,24 +5629,51 @@ bool style_node_focus_outset_shadow(const Stylesheet *sheet, lxb_dom_node_t *nod
     const ComputedStyle *parent, const ComputedStyle *style, StyleBoxShadow *output,
     size_t *layer_index)
 {
-    size_t count = stylesheet_box_shadow_count(sheet, style), length = 0;
+    size_t count = stylesheet_box_shadow_count(sheet, style);
     if (!style_node_focus_shadow_may_match(sheet, node, true)) return false;
-    const char *original = document_attribute(node, "data-tilefinch-focus", &length);
-    if (length > 63) return false;
-    char saved[64];
-    if (length) memcpy(saved, original, length);
-    saved[length] = 0;
-    document_style_quiet_begin();
-    bool changed = set_focus_marker(node, true);
-    style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
-    ComputedStyle focused = changed ? style_for_node(sheet, node, parent) : *style;
-    bool restored = restore_focus_marker(node, original != NULL, saved, length);
-    if (!restored) restored = restore_focus_marker(node, original != NULL, saved, length);
-    document_style_quiet_end();
-    style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
-    if (!restored) document_style_changed();
+    FocusMarkerProbe probe;
+    if (!focus_marker_probe_begin(&probe, node, NULL)) return false;
+    /* The hypothetical marker is rolled back before returning. Preserve
+       the real layout's caches rather than emptying them for every control;
+       none of their selector/variable answers may cross into this probe. */
+    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
+    sheet->resolve_scratch->variable_cache = NULL;
+    sheet->resolve_scratch->variable_cache_lease = NULL;
+    sheet->resolve_scratch->ancestor_bloom_cache = NULL;
+    sheet->resolve_scratch->retained_matches = NULL;
+    bool changed = focus_marker_probe_set(&probe, true);
+    /* Fast keys deliberately over-admit functional selectors. Do not resolve
+       every control's hypothetical cascade merely because a ring exists in
+       an unrelated component. The marker is already present, so the exact
+       scoped selector test preserves :focus/:focus-within semantics. */
+    style_class_tokens_scope_begin(sheet);
+    bool matches = changed && focus_shadow_rule_matches(sheet, node, true, true);
+    bool layered = false;
+    StyleMatchSubject subject = style_match_subject(sheet, node);
+    for (size_t i = 0; matches && i < sheet->focus_rule_count; i++) {
+        size_t index = sheet->focus_rule_indices[i];
+        const StyleRule *rule = &sheet->rules[index];
+        const StyleDeclaration *d = stylesheet_rule_declaration(sheet, &sheet->rules[index]);
+        if (rule->pseudo == PSEUDO_NONE && d != NULL && d->deferred_program_count != 0
+            && rule_fast_matches(sheet, rule, &subject)
+            && style_rule_selector_matches_subject(sheet, index, node, &subject)
+            && style_deferred_focus_shadow_exceeds(sheet, d, node, count + 1u)) {
+            layered = true;
+            break;
+        }
+    }
+    /* The retained fast path can add only one layer. Decline obviously
+       larger effects before resolving a whole hypothetical cascade. This
+       is only slot admission: full focus layout still resolves all rules,
+       including an overriding simple shadow, without changing pixels. */
+    ComputedStyle focused = matches && !layered ? style_for_node(sheet, node, parent) : *style;
+    style_class_tokens_scope_end(sheet);
+    bool restored = focus_marker_probe_end(&probe);
+    *sheet->resolve_scratch = saved_scratch;
+    if (!restored)
+        style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
     size_t focused_count = stylesheet_box_shadow_count(sheet, &focused);
-    if (!changed || !restored || focused_count == 0
+    if (!matches || layered || !restored || focused_count == 0
         || (count != focused_count && count != focused_count - 1u))
         return false;
     size_t index = focused_count - 1u;
@@ -5603,7 +5764,7 @@ static bool focus_pseudo_translation(
         || computed_style_outline_width(normal) != 0
         || normal->transform_x_percent || normal->transform_y_percent
         || focused->transform_x_percent || focused->transform_y_percent
-        || normal->transform_scale_q6 != 64 || focused->transform_scale_q6 != 64
+        || normal->transform_scale_q14 != 16384 || focused->transform_scale_q14 != 16384
         || normal->individual_rotate_quadrants || focused->individual_rotate_quadrants)
         return false;
     StylePaintStack paint = style_paint_stack_copy(sheet, normal);
@@ -5625,34 +5786,22 @@ static StyleFocusChange focus_change_classify(
     ComputedStyle *focused, StyleFocusPseudoTranslation *translation, bool *local,
     bool *pseudo_retry)
 {
-    static const char marker[] = "data-tilefinch-focus";
     if (local != NULL) *local = false;
     if (pseudo_retry != NULL) *pseudo_retry = false;
     if (sheet == NULL || node == NULL || normal == NULL || focused == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
         return STYLE_FOCUS_CHANGE_UNSAFE;
     }
-    size_t original_length = 0;
-    const char *original = document_attribute(
-        node, marker, &original_length);
-    bool originally_focused = original != NULL;
-    if (original_length > 63) return STYLE_FOCUS_CHANGE_UNSAFE;
-    char original_value[64];
-    if (original != NULL && original_length != 0) {
-        memcpy(original_value, original, original_length);
-    }
-    original_value[original_length] = '\0';
+    FocusMarkerProbe probe;
+    if (!focus_marker_probe_begin(&probe, node, sheet))
+        return STYLE_FOCUS_CHANGE_UNSAFE;
     ComputedStyle pseudo_focused[2];
     bool pseudo_ok = true;
     if (translation != NULL) *translation = (StyleFocusPseudoTranslation) {0};
 
-    /* The marker is restored below: the probe is no host style change
-       unless restoration fails. */
-    document_style_quiet_begin();
-    bool focused_set = set_focus_marker(node, true);
+    bool focused_set = focus_marker_probe_set(&probe, true);
     bool ok = focused_set;
     if (focused_set) {
-        style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
         *focused = style_for_node(sheet, node, parent);
         /*
          * Probe dependencies while the marker is present. This proves both
@@ -5667,10 +5816,9 @@ static StyleFocusChange focus_change_classify(
                     i == 0 ? PSEUDO_BEFORE : PSEUDO_AFTER, focused);
         }
     }
-    bool normal_set = focused_set && set_focus_marker(node, false);
+    bool normal_set = focused_set && focus_marker_probe_set(&probe, false);
     ok = ok && normal_set;
     if (normal_set) {
-        style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
         *normal = style_for_node(sheet, node, parent);
         ok = ok && focus_selector_side_effects_are_local(sheet, node, translation != NULL, pseudo_retry);
         if (ok && translation != NULL) {
@@ -5704,19 +5852,7 @@ static StyleFocusChange focus_change_classify(
             }
         }
     }
-    bool restored = restore_focus_marker(
-        node, originally_focused, original_value, original_length);
-    if (!restored) {
-        /* Lexbor normally makes attribute replacement atomic. If a reduced
-           harness or future allocator fault reports failure after mutation,
-           make one best-effort restoration attempt before
-           returning UNSAFE so a probe cannot leave the live DOM focused. */
-        restored = restore_focus_marker(
-            node, originally_focused, original_value, original_length);
-    }
-    document_style_quiet_end();
-    if (!restored) document_style_changed();
-    style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
+    bool restored = focus_marker_probe_end(&probe);
     if (local != NULL) *local = ok && restored;
     if (!ok || !restored || !pseudo_ok) return STYLE_FOCUS_CHANGE_UNSAFE;
     if (translation != NULL && (translation->visibility_changed || translation->dx[0] || translation->dx[1]
@@ -5839,17 +5975,10 @@ static bool focus_rule_may_reach_others(const Stylesheet *sheet,
         size_t token_length = 0;
         bool within = false;
         if (!focus_token_at(selector, length, at, &token_length, &within)) continue;
-        if (within) {
-            if (focus_within_may_affect_ancestor(sheet, node, selector, length,
-                    at, NULL, rule->pseudo == PSEUDO_NONE, rule)) return true;
-        } else if (at < style_rule_rightmost_compound(rule)
-                   || focus_token_inside_has(selector, at)) {
-            size_t probe_at = 0, probe_length = 0;
-            if (!focus_selector_probe_range(selector, length, at,
-                    &probe_at, &probe_length)
-                || style_selector_matches(node, selector + probe_at, probe_length))
-                return true;
-        }
+        if (focus_token_reach(sheet, node, selector, length, at, within,
+                style_rule_rightmost_compound(rule), NULL,
+                rule->pseudo == PSEUDO_NONE, rule) == FOCUS_TOKEN_NONLOCAL)
+            return true;
         at += token_length - 1u;
     }
     return false;
@@ -5862,17 +5991,12 @@ size_t style_focus_nonlocal_rules(const Stylesheet *sheet,
     if (sheet == NULL || node == NULL || rules == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT
         || sheet->adopted_shadow_only_mask != 0 || sheet->shadow_scope_count != 0
-        || sheet->adopted_scopes_failed
+        || style_adopted_scopes_document_only(sheet)
         || !stylesheet_prepare_focus_rule_index((Stylesheet *) sheet)
         || sheet->focus_rule_count > RULE_LIMIT) return SIZE_MAX;
-    size_t length = 0;
-    const char *original = document_attribute(node, "data-tilefinch-focus", &length);
-    if (length > 63u) return SIZE_MAX;
-    bool focused = original != NULL, affected[RULE_LIMIT] = {false};
-    char saved[64];
-    if (length != 0) memcpy(saved, original, length);
-    saved[length] = '\0';
-    document_style_quiet_begin();
+    FocusMarkerProbe probe;
+    if (!focus_marker_probe_begin(&probe, node, NULL)) return SIZE_MAX;
+    bool affected[RULE_LIMIT] = {false};
     bool ok = true;
     for (unsigned state = 0; ok && state < 2; state++) {
         for (size_t i = 0; i < sheet->focus_rule_count; i++) {
@@ -5884,12 +6008,9 @@ size_t style_focus_nonlocal_rules(const Stylesheet *sheet,
             }
             affected[i] = affected[i] || focus_rule_may_reach_others(sheet, node, rule);
         }
-        if (state == 0 && ok) ok = set_focus_marker(node, !focused);
+        if (state == 0 && ok) ok = focus_marker_probe_set(&probe, !probe.focused);
     }
-    bool restored = restore_focus_marker(node, focused, saved, length);
-    if (!restored) restored = restore_focus_marker(node, focused, saved, length);
-    document_style_quiet_end();
-    if (!restored) document_style_changed();
+    bool restored = focus_marker_probe_end(&probe);
     if (!ok || !restored) return SIZE_MAX;
     size_t count = 0;
     for (size_t i = 0; i < sheet->focus_rule_count; i++) {
@@ -5921,16 +6042,12 @@ static bool focus_custom_properties_inert(const Stylesheet *sheet,
             size_t token_length = 0;
             bool within = false;
             if (!focus_token_at(selector, length, at, &token_length, &within)) continue;
-            if (within) {
-                if (focus_within_may_affect_ancestor(
-                        sheet, node, selector, length, at, NULL, false, NULL)) return false;
-            } else if (at < rightmost || focus_token_inside_has(selector, at)) {
-                size_t probe_at = 0, probe_length = 0;
-                if (!focus_selector_probe_range(selector, length, at,
-                        &probe_at, &probe_length)
-                    || style_selector_matches(node, selector + probe_at, probe_length))
-                    return false;
-            } else if (style_selector_matches(node, selector, length)) return false;
+            FocusTokenReach reach = focus_token_reach(sheet, node, selector,
+                length, at, within, rightmost, NULL, false, NULL);
+            if (reach == FOCUS_TOKEN_NONLOCAL
+                || (reach == FOCUS_TOKEN_SUBJECT
+                    && style_selector_matches(node, selector, length)))
+                return false;
             at += token_length - 1u;
         }
     }
@@ -5943,22 +6060,13 @@ bool style_focus_custom_properties_unchanged(const Stylesheet *sheet,
     if (sheet == NULL || node == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT
         || sheet->adopted_shadow_only_mask != 0 || sheet->shadow_scope_count != 0
-        || sheet->adopted_scopes_failed) return false;
-    size_t length = 0;
-    const char *original = document_attribute(node, "data-tilefinch-focus", &length);
-    if (length > 63u) return false;
-    bool focused = original != NULL;
-    char saved[64];
-    if (length != 0) memcpy(saved, original, length);
-    saved[length] = '\0';
-    document_style_quiet_begin();
-    bool inert = focus_custom_properties_inert(sheet, node);
-    bool ok = inert && set_focus_marker(node, !focused)
+        || style_adopted_scopes_document_only(sheet)) return false;
+    FocusMarkerProbe probe;
+    if (!focus_marker_probe_begin(&probe, node, NULL)) return false;
+    bool ok = focus_custom_properties_inert(sheet, node)
+        && focus_marker_probe_set(&probe, !probe.focused)
         && focus_custom_properties_inert(sheet, node);
-    bool restored = !inert || restore_focus_marker(node, focused, saved, length);
-    if (!restored) restored = restore_focus_marker(node, focused, saved, length);
-    document_style_quiet_end();
-    if (!restored) document_style_changed();
+    bool restored = focus_marker_probe_end(&probe);
     return ok && restored;
 }
 
@@ -6035,7 +6143,7 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
                                           ? parent->color_alpha : 255,
                            .background_alpha = 255,
                            .opacity = 255,
-                           .transform_scale_q6 = 64,
+                           .transform_scale_q14 = 16384,
                            .font_scale = parent != NULL ? parent->font_scale : 2,
                            .font_size = parent != NULL ? parent->font_size : 16,
                            .font_size_fraction = parent != NULL
@@ -6128,6 +6236,7 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     resolve_sizing_em_lengths(&style);
     resolve_relative_line_height(&style);
     resolve_overflow_clip_margin(&style);
+    style_materialize_generated_scalar(sheet, &style);
     if (!style.generated_expression && style.generated_attr != NULL
         && style.generated_attr_length != 0) {
         size_t attribute_length = 0;
@@ -6189,17 +6298,6 @@ static bool has_ascii_equal(const char *first, const char *second,
             != tolower((unsigned char) second[i])) return false;
     }
     return true;
-}
-
-static bool has_selector_contains(const char *selector, size_t length,
-                                  const char *needle)
-{
-    size_t needle_length = strlen(needle);
-    if (needle_length == 0 || needle_length > length) return false;
-    for (size_t i = 0; i + needle_length <= length; i++) {
-        if (memcmp(selector + i, needle, needle_length) == 0) return true;
-    }
-    return false;
 }
 
 static bool has_selector_mentions_attribute(
@@ -6371,12 +6469,7 @@ static bool has_selector_token_is_relational(
 
 static uint32_t has_token_hash(const unsigned char *bytes, size_t length)
 {
-    uint32_t hash = 2166136261u;
-    for (size_t i = 0; i < length; i++) {
-        hash ^= bytes[i];
-        hash *= 16777619u;
-    }
-    return hash;
+    return style_fnv1a(STYLE_FNV1A_SEED, bytes, length, false);
 }
 
 /* The identifier after a '.' at `dot`, decoded the way
@@ -6454,7 +6547,7 @@ static bool has_collect_class_hashes(const char *selector, size_t length,
                                      uint32_t *hashes, size_t capacity,
                                      size_t *count, bool *overflow)
 {
-    if (!has_selector_contains(selector, length, ":has(")) return true;
+    if (!span_contains_text(selector, length, ":has(")) return true;
     for (size_t i = 0; i + 1 < length; i++) {
         if (selector[i] != '.') continue;
         unsigned char token[256];
@@ -6591,7 +6684,7 @@ static bool has_selector_attribute_change_sensitive(
     const char *old_value, size_t old_length,
     const char *new_value, size_t new_length)
 {
-    if (!has_selector_contains(selector, selector_length, ":has(")) {
+    if (!span_contains_text(selector, selector_length, ":has(")) {
         return false;
     }
     bool is_class = name_length == 5
@@ -6612,27 +6705,12 @@ static bool has_selector_attribute_change_sensitive(
                     selector, selector_length, '#',
                     new_value, new_length, NULL));
     }
-    struct PseudoAttribute {
-        const char *attribute;
-        const char *pseudo;
-    };
-    /* Every attribute a supported pseudo-class reads (style_match.c). */
-    static const struct PseudoAttribute pseudos[] = {
-        {"checked", ":checked"}, {"disabled", ":disabled"},
-        {"disabled", ":enabled"}, {"required", ":required"},
-        {"required", ":optional"}, {"readonly", ":read-only"},
-        {"selected", ":checked"}, {"open", ":open"}, {"open", ":modal"},
-        {"data-tilefinch-modal", ":modal"},
-        {"data-tilefinch-popover-open", ":popover-open"},
-        {"data-tilefinch-popover-open", ":open"},
-        {"href", ":link"}, {"data-tilefinch-focus", ":focus"}
-    };
-    for (size_t i = 0; i < sizeof(pseudos) / sizeof(pseudos[0]); i++) {
-        size_t attribute_length = strlen(pseudos[i].attribute);
-        if (name_length == attribute_length
-            && has_ascii_equal(name, pseudos[i].attribute, name_length)
-            && has_selector_contains(
-                selector, selector_length, pseudos[i].pseudo)) return true;
+    for (size_t i = 0; i < style_pseudo_attribute_count; i++) {
+        const StylePseudoAttribute *pseudo = &style_pseudo_attributes[i];
+        if (name_length == strlen(pseudo->attribute)
+            && has_ascii_equal(name, pseudo->attribute, name_length)
+            && span_contains_text(
+                selector, selector_length, pseudo->pseudo)) return true;
     }
     return false;
 }

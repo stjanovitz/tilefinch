@@ -1,0 +1,70 @@
+--- a/source/lexbor/dom/interfaces/attr.c
++++ b/source/lexbor/dom/interfaces/attr.c
+@@ -210,7 +210,8 @@
+ lxb_dom_attr_set_value(lxb_dom_attr_t *attr,
+                        const lxb_char_t *value, size_t value_len)
+ {
+-    lexbor_str_t old_value, *new_value;
++    lexbor_str_t old_value, new_value;
++    lxb_status_t status = LXB_STATUS_OK;
+     lxb_dom_document_t *doc = lxb_dom_interface_node(attr)->owner_document;
+ 
+     if (attr->value == NULL) {
+@@ -221,32 +222,34 @@
+     }
+ 
+     old_value = *attr->value;
+-    new_value = attr->value;
+-
+-    lexbor_str_init(new_value, doc->text, value_len);
+-    if (new_value->data == NULL) {
++    /* Stage the replacement so allocation failure preserves the old value. */
++    lexbor_str_init(&new_value, doc->text, value_len);
++    if (new_value.data == NULL) {
+         return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+     }
+ 
+-    memcpy(new_value->data, value, sizeof(lxb_char_t) * value_len);
++    memcpy(new_value.data, value, sizeof(lxb_char_t) * value_len);
+ 
+-    new_value->data[value_len] = 0x00;
+-    new_value->length = value_len;
++    new_value.data[value_len] = 0x00;
++    new_value.length = value_len;
++    *attr->value = new_value;
+ 
+     if (!(lxb_dom_document_opt(doc) & LXB_DOM_DOCUMENT_OPT_WO_EVENTS)
+         && doc->attr_mutation->change != NULL && attr->owner != NULL)
+     {
+-        return doc->attr_mutation->change(attr->owner, attr->node.local_name,
++        status = doc->attr_mutation->change(attr->owner, attr->node.local_name,
+                                           old_value.data, old_value.length,
+-                                          new_value->data, new_value->length,
++                                          new_value.data, new_value.length,
+                                           LXB_NS__UNDEF);
+     }
+ 
++    /* Callbacks borrow the old bytes, including when they report failure.
++     * A callback may replace the value again, so do not touch attr here. */
+     if (old_value.data != NULL) {
+         lexbor_mraw_free(doc->text, old_value.data);
+     }
+ 
+-    return LXB_STATUS_OK;
++    return status;
+ }
+ 
+ lxb_status_t
+--- a/source/lexbor/dom/interfaces/element.c
++++ b/source/lexbor/dom/interfaces/element.c
+@@ -259,7 +259,9 @@
+     if (attr != NULL) {
+         status = lxb_dom_attr_set_value(attr, value, value_len);
+         if (status != LXB_STATUS_OK) {
+-            return lxb_dom_attr_interface_destroy(attr);
++            /* This is an existing linked attribute, not a new allocation.
++             * A refused replacement must not destroy its identity. */
++            return NULL;
+         }
+ 
+         return attr;

@@ -121,6 +121,18 @@ int main(void)
     CHECK(!tilefinch_url_parse("https://[::ffff:1.2.3.999]/", &url));
     CHECK(!tilefinch_url_parse("https://[::ffff:1.2.3]/", &url));
 
+    /* libpsl's decoder needs only the bytes an offset's tag names: a graph
+       may end in a one-byte offset list and a return value. Graph for the
+       single key "a" (value 0): root list, end-char 'a', child list, value. */
+    static const unsigned char short_tail[] = {0x81, 0xe1, 0x81, 0x80};
+    CHECK(tilefinch_public_suffix_test_lookup(
+              short_tail, sizeof(short_tail), "a") == 0
+          && tilefinch_public_suffix_test_lookup(
+              short_tail, sizeof(short_tail), "b") == -1);
+    /* A two-byte offset needs both bytes; a truncated one is refused. */
+    static const unsigned char truncated[] = {0x81, 0xe1, 0x40};
+    CHECK(tilefinch_public_suffix_test_lookup(
+              truncated, sizeof(truncated), "a") == -1);
     bool is_public_suffix = false;
     CHECK(tilefinch_public_suffix_classify("com", &is_public_suffix)
           && is_public_suffix);

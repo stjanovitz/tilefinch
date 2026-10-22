@@ -274,12 +274,26 @@
           definition.localName !== definition.name &&
           createdAttributeCount === 1 &&
           node.getAttribute("is") === definition.name;
+      let createdChildCount = 0;
+      if (synchronousCreation) {
+        if (node.__handle === undefined) createdChildCount = node.childNodes.length;
+        else {
+          /* The native carrier is a shadow root, not a light-DOM child.
+             Attaching a shadow tree is permitted during construction. */
+          const shadowHandle = globalThis.__tilefinchShadowRootForHost?.(node)?.__handle,
+            children = __tilefinchChildNodes(node.__handle) || [];
+          if (shadowHandle === undefined) createdChildCount = children.length;
+          else for (let index = 0; index < children.length; index++)
+            if (children[index] !== shadowHandle) {
+              createdChildCount = 1;
+              break;
+            }
+        }
+      }
       if (
         synchronousCreation &&
         ((createdAttributeCount !== 0 && !allowedCustomizedBuiltinAttribute) ||
-          (node.__handle === undefined
-            ? node.childNodes.length
-            : (__tilefinchChildNodes(node.__handle) || []).length) !== 0 ||
+          createdChildCount !== 0 ||
           node.parentNode !== null ||
           node.ownerDocument !== expectedDocument ||
           String(node.localName).toLowerCase() !== expectedLocalName ||
@@ -1115,16 +1129,21 @@
     /* Author sheets are reflected lazily because native style parsing owns
        page rendering.  Keep the script-visible CSSOM bounded and avoid doing
        this work unless a page actually inspects it. */
-    const authorSheets = new WeakMap(),
-      authorSheet = (node, source, href) => {
-        let sheet = authorSheets.get(node);
+    /* Keep the sheet -> owner cycle on the owner, not in a global WeakMap
+       whose values this collector marks strongly. Reuse the DOM private
+       slot rather than constructing another ownership factory at startup. */
+    const ownerState = globalThis.__tilefinchTakeOwnerAttributeState;
+    delete globalThis.__tilefinchTakeOwnerAttributeState;
+    const authorSheet = (node, source, href) => {
+        const state = ownerState(node, true);
+        let sheet = state.sheet;
         if (!sheet) {
           sheet = new CSSStyleSheet();
           sheet.__constructed = false;
           sheet.ownerNode = node;
           sheet.href = href;
           sheet.__authorSource = null;
-          authorSheets.set(node, sheet);
+          state.sheet = sheet;
         }
         source = String(source || "");
         /* Untouched sheets use the original lazy DOM reflection. Only a
@@ -1133,10 +1152,13 @@
           ? undefined : nativeSheetRevision(node.__handle);
         if (sheet.__authorSource !== source || sheet.__authorRevision !== revision) {
           sheet.__constructed = true;
-          sheet.replaceSync(source);
+          const override = nativeSheetText(node.__handle);
+          sheet.replaceSync(typeof override === "string" ? override : source);
           sheet.__constructed = false;
           sheet.__authorSource = source;
-          if (revision !== undefined) sheet.__authorRevision = revision;
+          if (revision !== undefined || typeof override === "string")
+            sheet.__authorRevision = revision === undefined
+              ? nativeSheetRevision(node.__handle) : revision;
         }
         return sheet;
       };
@@ -1275,6 +1297,7 @@
      */
     if (!definitions.size && root?.ownerDocument === document) return;
     for (const node of descendants(root)) {
+      globalThis.__tilefinchShadowRootForHost?.(node, true);
       const definition = definitionFor(node);
       upgradeOne(node, definition);
       synchronizeFormOwner(node, definition);
@@ -1314,6 +1337,7 @@
     if (!definedAnywhere) return;
     for (const node of descendants(root))
       if (node.__tilefinchCustomElementState === "custom") {
+        globalThis.__tilefinchShadowRootForHost?.(node, false);
         const definition = definitionFor(node);
         if (node.__tilefinchCustomElementConnectedState) {
         node.__tilefinchCustomElementConnectedState = false;

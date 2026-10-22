@@ -98,8 +98,7 @@ globalThis.__tilefinchInstallWorker = (
   )
     throw new Error("Worker bootstrap is unavailable");
 
-  const WORKER_OPFS_FILE_LIMIT = 64 * 1024,
-    workerSourceForBlob = (blob) => workerIntrinsics.sourceForBlob(blob);
+  const workerSourceForBlob = (blob) => workerIntrinsics.sourceForBlob(blob);
 
   /* Dedicated workers share selected Web Platform constructors with their
      owner, but never the owner's arbitrary global properties.  Keep this
@@ -110,7 +109,7 @@ globalThis.__tilefinchInstallWorker = (
     "AbortController", "AbortSignal", "AnimationEvent", "BroadcastChannel", "ByteLengthQueuingStrategy",
     "CompressionStream", "CountQueuingStrategy", "Crypto", "CryptoKey",
     "DecompressionStream", "DOMException", "DOMRect", "ErrorEvent", "Event", "EventSource",
-    "EventTarget", "File", "FileList", "FileReader", "FormData",
+    "EventTarget", "File", "FileList", "FileReader", "FormData", "ImageData",
     "FileSystemHandle", "FileSystemFileHandle", "FileSystemDirectoryHandle",
     "FileSystemWritableFileStream", "FileSystemSyncAccessHandle",
     "FileReaderSync",
@@ -213,6 +212,21 @@ globalThis.__tilefinchInstallWorker = (
               writable:false,configurable:false});
       };
     for(const name of names)install(name);
+    install('ImageData',OwnerImageData=>class ImageData{
+      constructor(...args){
+        /* Share the bounded canvas validator/allocation, but expose a local
+           view and prototype. Typed-array input retains its exact identity. */
+        const owner=new OwnerImageData(...args),source=owner.data,
+          data=args[0] instanceof Uint8ClampedArray?args[0]:
+            new Uint8ClampedArray(source.buffer,source.byteOffset,source.length);
+        Object.defineProperties(this,{
+          data:{value:data,enumerable:true},
+          width:{value:owner.width,enumerable:true},
+          height:{value:owner.height,enumerable:true},
+          colorSpace:{value:owner.colorSpace,enumerable:true}
+        });
+      }
+    });
     install('Intl',original=>{
       if(!original||typeof original!=='object')return original;
       const local={};
@@ -1059,8 +1073,10 @@ globalThis.__tilefinchInstallWorker = (
       opfsReadScratchBytes: 0, opfsReadCloneBytes: 0,
       terminations: 0, lastId: 0, lastTerminationReason: 0,
       lastTaskMs: 0,
-    },
-    workerProgressProperties = {
+    };
+  /* Host-test counters (test-probe realms only). */
+  if (globalThis.__tilefinchTestProbes && globalThis.__tilefinchRootCensus) {
+    const workerProgressProperties = {
       workers: () => activeWorkers,
       workerStarts: () => workerProgress.starts,
       workerStartCompletions: () => workerProgress.startCompletions,
@@ -1089,10 +1105,10 @@ globalThis.__tilefinchInstallWorker = (
       workerLastTerminationReason: () => workerProgress.lastTerminationReason,
       workerLastTaskMs: () => workerProgress.lastTaskMs,
     };
-  for (const key of Object.keys(workerProgressProperties)) {
-    Object.defineProperty(globalThis.__tilefinchRootCensus, key, {
-      get: workerProgressProperties[key],
-    });
+    for (const key of Object.keys(workerProgressProperties))
+      Object.defineProperty(globalThis.__tilefinchRootCensus, key, {
+        get: workerProgressProperties[key],
+      });
   }
   globalThis.Worker = class Worker extends EventTarget {
     constructor(url, options) {
@@ -1965,33 +1981,14 @@ globalThis.__tilefinchInstallWorker = (
                       return Reflect.apply(direct, this, [value]);
                     });
                   defineMethod(SyncType.prototype, "read", function(buffer, options) {
-                    const target = localMutableBytes(buffer),
-                      owner = ownerForMethod(this),
-                      readOptions = syncAccessOptions(options),
-                      size = owner.getSize(),
-                      available = readOptions?.at === undefined
-                        ? size : Math.max(0, size - readOptions.at),
-                      copyLength = Math.min(
-                        target.byteLength, available,
-                        WORKER_OPFS_FILE_LIMIT,
-                      ),
-                      copy = new ownerIntrinsics.Uint8Array(copyLength),
-                      count = owner.read(copy, readOptions);
-                    workerProgress.opfsReadScratchBytes += copyLength;
-                    if (count > 0) {
-                      const exact = count === copy.byteLength
-                        ? copy : copy.slice(0, count);
-                      workerProgress.opfsReadCloneBytes += count;
-                      target.set(cloneWorkerValue(
-                        exact, state.cloneIntrinsics));
-                    }
-                    return count;
+                    const bytes = ownerMutableBytes(buffer),
+                      owner = ownerForMethod(this);
+                    return owner.read(bytes, syncAccessOptions(options));
                   });
                   defineMethod(SyncType.prototype, "write", function(buffer, options) {
-                    localMutableBytes(buffer);
+                    const bytes = ownerMutableBytes(buffer);
                     return ownerForMethod(this).write(
-                      cloneWorkerValue(buffer, ownerIntrinsics),
-                      syncAccessOptions(options));
+                      bytes, syncAccessOptions(options));
                   });
                   for (const name of ["truncate", "getSize", "flush"])
                     defineMethod(SyncType.prototype, name, function(...args) {
@@ -2025,6 +2022,16 @@ globalThis.__tilefinchInstallWorker = (
                   if (LocalArrayBuffer.isView(value)) return new LocalUint8Array(
                     value.buffer, value.byteOffset, value.byteLength);
                   throw new TypeError("Expected an ArrayBuffer or view");
+                },
+                ownerMutableBytes = value => {
+                  /* Both realms share one runtime. These synchronous methods
+                     consume/copy the bytes before returning and retain no
+                     caller buffer, so only the view needs an owner prototype.
+                     Structured cloning here copies unrelated backing bytes
+                     and pays generic message serialization on every write. */
+                  const view = localMutableBytes(value);
+                  return new ownerIntrinsics.Uint8Array(
+                    view.buffer, view.byteOffset, view.byteLength);
                 },
                 syncAccessOptions = options => {
                   if (options == null) return undefined;

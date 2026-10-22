@@ -247,7 +247,11 @@ static uint32_t ui_media_menu_signature(
     uintptr_t face = (uintptr_t) presentation->title_font;
     for (unsigned byte = 0; byte < sizeof(face); byte++)
         hash = ui_media_menu_hash_byte(hash, (unsigned char) (face >> (byte * 8u)));
-    if (presentation->track_menu_tab == 3 && presentation->queue_active) {
+    /* A glyph-pack change replaces the glyphs the menu's labels drew with. */
+    uint32_t epoch = psp_ui_chrome_font_epoch();
+    for (unsigned byte = 0; byte < sizeof(epoch); byte++)
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) (epoch >> (byte * 8u)));
+    if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE && presentation->queue_active) {
         hash = ui_media_menu_hash_byte(hash, presentation->queue_count);
         hash = ui_media_menu_hash_byte(hash, presentation->queue_loading);
         hash = ui_media_menu_hash_byte(hash, presentation->queue_failed);
@@ -266,7 +270,7 @@ static uint32_t ui_media_menu_signature(
     unsigned current_chapter = 0;
     uint64_t time = media->seek_preview_active
         ? media->seek_preview_time_us : media->current_time_us;
-    for (size_t at = 0; presentation->track_menu_tab == 2
+    for (size_t at = 0; presentation->track_menu_tab == PSP_UI_MEDIA_TAB_CHAPTERS
          && at < presentation->chapter_count && at < MEDIA_CHAPTER_LIMIT; at++) {
         uint32_t seconds = presentation->chapters[at].seconds;
         if ((uint64_t) seconds * 1000000u <= time) current_chapter = (unsigned) at + 1u;
@@ -275,16 +279,16 @@ static uint32_t ui_media_menu_signature(
         hash = ui_media_menu_hash_string(hash, presentation->chapters[at].title,
                                         sizeof(presentation->chapters[at].title));
     }
-    if (presentation->track_menu_tab == 2)
+    if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_CHAPTERS)
         hash = ui_media_menu_hash_byte(hash, (unsigned char) current_chapter);
-    if (presentation->track_menu_tab == 0)
+    if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_AUDIO)
         hash = ui_media_menu_hash_byte(hash, (unsigned char) (presentation->selected_audio_track + 1));
-    if (presentation->track_menu_tab == 1)
+    if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_SUBTITLES)
         hash = ui_media_menu_hash_byte(hash, (unsigned char) (presentation->selected_subtitle_track + 1));
     size_t audio_count = presentation->audio_track_count;
     if (audio_count > PSP_UI_MEDIA_TRACK_LIMIT)
         audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
-    for (size_t at = 0; presentation->track_menu_tab == 0 && at < audio_count; at++) {
+    for (size_t at = 0; presentation->track_menu_tab == PSP_UI_MEDIA_TAB_AUDIO && at < audio_count; at++) {
         hash = ui_media_menu_hash_string(
             hash, presentation->audio_tracks[at].label,
             sizeof(presentation->audio_tracks[at].label));
@@ -292,7 +296,7 @@ static uint32_t ui_media_menu_signature(
     size_t subtitle_count = presentation->subtitle_track_count;
     if (subtitle_count > PSP_UI_MEDIA_TRACK_LIMIT)
         subtitle_count = PSP_UI_MEDIA_TRACK_LIMIT;
-    for (size_t at = 0; presentation->track_menu_tab == 1 && at < subtitle_count; at++) {
+    for (size_t at = 0; presentation->track_menu_tab == PSP_UI_MEDIA_TAB_SUBTITLES && at < subtitle_count; at++) {
         hash = ui_media_menu_hash_string(
             hash, presentation->subtitle_tracks[at].label,
             sizeof(presentation->subtitle_tracks[at].label));
@@ -406,7 +410,7 @@ void psp_ui_media_composite_8888_cached(
         || menu_cache->edram_epoch != edram_epoch;
     bool source_changed = content_changed
         || menu_cache->selection != presentation->track_menu_selection
-        || (presentation->track_menu_tab == 3
+        || (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE
             && menu_cache->automatic_next != presentation->automatic_next);
     if (source_changed) {
         /* The painter fills the entire opaque rectangle before any ink;

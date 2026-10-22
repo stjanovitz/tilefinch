@@ -86,4 +86,11 @@ const char *tilefinch_referrer_policy_name(uint8_t code);
 uint8_t tilefinch_referrer_policy_code(const char *value, size_t length,
                                        bool fold_case);
 
+/* Value of one hexadecimal digit (either case), or -1. */
+int tilefinch_hex_digit(unsigned char c);
+/* Decodes %XX escapes of a NUL-terminated string in place. Refuses (with
+   the string unspecified) a truncated or non-hex escape and an encoded
+   NUL. */
+bool tilefinch_url_percent_decode(char *text);
+
 #endif

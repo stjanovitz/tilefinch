@@ -131,6 +131,225 @@ static bool test_svg_local_clips_preserve_artwork(void)
     return okay && budget.current == 0;
 }
 
+static bool test_svg_solid_luminance_mask(void)
+{
+    static const char markup[] =
+        "<svg width='80' height='20' viewBox='0 0 80 20'>"
+        "<defs><mask id='ink' fill='white' maskUnits='userSpaceOnUse' "
+        "x='0' y='0' width='30' height='20'>"
+        "<path d='M0 0h40v20H0z'/><rect x='10' width='10' height='20' fill='black'/>"
+        "</mask></defs><g mask='url(#ink)'><rect width='40' height='20' fill='red'/></g>"
+        "<mask id='alpha' mask-type='alpha'><rect x='40' width='20' height='20' fill='black'/></mask>"
+        "<rect x='40' width='20' height='20' fill='blue' mask='url(#alpha)'/>"
+        "<rect x='60' width='20' height='20' fill='green' mask='url(#missing)'/>"
+        "</svg>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    unsigned char *pixels = image_svg_decode(markup, sizeof(markup) - 1,
+        &budget, MIB, &width, &height);
+    bool okay = pixels != NULL && width == 80 && height == 20;
+    for (int x = 5; okay && x < 40; x += 10) {
+        const unsigned char *pixel = pixels + (10u * 80u + (unsigned) x) * 4u;
+        okay = pixel[3] == (x == 5 || x == 25 ? 255 : 0);
+        if (pixel[3] != 0) okay = okay && pixel[0] == 255 && pixel[1] == 0;
+    }
+    okay = okay && pixels[(10u * 80u + 45u) * 4u + 2u] == 255
+        && pixels[(10u * 80u + 45u) * 4u + 3u] == 255
+        && pixels[(10u * 80u + 65u) * 4u + 3u] == 0;
+    budget_free(&budget, pixels);
+    for (size_t failure = 0; okay && failure < 160; failure++) {
+        budget_inject_failure_after(&budget, failure);
+        pixels = image_svg_decode(markup, sizeof(markup) - 1,
+            &budget, MIB, &width, &height);
+        budget_clear_failure_injection(&budget);
+        budget_free(&budget, pixels);
+        okay = budget.current == 0;
+    }
+    return okay && budget.current == 0;
+}
+
+static size_t svg_test_append(char *buffer, size_t used, size_t capacity,
+                              const char *text)
+{
+    size_t length = strlen(text);
+    if (used >= capacity || length >= capacity - used) return capacity;
+    memcpy(buffer + used, text, length + 1);
+    return used + length;
+}
+
+static const unsigned char *svg_test_pixel(const unsigned char *pixels,
+                                           int width, int x, int y)
+{
+    return pixels + ((size_t) y * (size_t) width + (size_t) x) * 4u;
+}
+
+/* Exported charts carry one clip-path attribute per element and clipped
+   map groups can exceed the bound-shape limit. Past the bookkeeping limits
+   the artwork renders unclipped, as it did before clipping support, instead
+   of the whole image failing. */
+static bool test_svg_clip_limits_degrade_unclipped(void)
+{
+    enum { CAPACITY = 256u * 1024u };
+    char *markup = malloc(CAPACITY);
+    if (markup == NULL) return false;
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    bool okay = true;
+    for (unsigned scenario = 0; okay && scenario < 5; scenario++) {
+        size_t used = svg_test_append(markup, 0, CAPACITY,
+            "<svg width='40' height='40' viewBox='0 0 40 40'>"
+            "<defs><clipPath id='left'><rect width='10' height='40'/>"
+            "</clipPath></defs>");
+        if (scenario == 0) {
+            /* More clip-path uses than SVG_CLIP_LIMIT (128). */
+            for (unsigned i = 0; i < 128; i++)
+                used = svg_test_append(markup, used, CAPACITY,
+                    "<rect width='40' height='20' fill='#ff0000' "
+                    "clip-path='url(#left)'/>");
+            used = svg_test_append(markup, used, CAPACITY,
+                "<rect y='20' width='40' height='20' fill='#0000ff' "
+                "clip-path='url(#left)'/>");
+        } else if (scenario == 1) {
+            /* More definitions than the limit: the excess definition's
+               content is not artwork, and references to it are ignored. */
+            for (unsigned i = 0; i < 127; i++)
+                used = svg_test_append(markup, used, CAPACITY,
+                    "<clipPath><rect width='1' height='1'/></clipPath>");
+            used = svg_test_append(markup, used, CAPACITY,
+                "<clipPath id='extra'><rect width='40' height='40' "
+                "fill='#00ff00'/></clipPath>"
+                "<rect width='40' height='20' fill='#ff0000' "
+                "clip-path='url(#left)'/>"
+                "<rect y='20' width='40' height='20' fill='#0000ff' "
+                "clip-path='url(#extra)'/>");
+        } else if (scenario == 3 || scenario == 4) {
+            /* A mask past the definition limit is ignored like a clip,
+               since the limit is ours; a mask that never existed still
+               hides its artwork. */
+            for (unsigned i = 0; i < 127; i++)
+                used = svg_test_append(markup, used, CAPACITY,
+                    "<mask><rect width='1' height='1' fill='#fff'/></mask>");
+            used = svg_test_append(markup, used, CAPACITY,
+                "<mask id='extra'><rect width='40' height='40' "
+                "fill='#00ff00'/></mask>"
+                "<rect width='40' height='20' fill='#ff0000' "
+                "clip-path='url(#left)'/>");
+            used = svg_test_append(markup, used, CAPACITY, scenario == 3
+                ? "<rect y='20' width='40' height='20' fill='#0000ff' "
+                  "mask='url(#extra)'/>"
+                : "<rect y='20' width='40' height='20' fill='#0000ff' "
+                  "mask='url(#absent)'/>");
+        } else {
+            /* More bound shapes than SVG_CLIP_SHAPE_LIMIT (4096). */
+            used = svg_test_append(markup, used, CAPACITY,
+                "<g clip-path='url(#left)'>"
+                "<rect width='40' height='20' fill='#ff0000'/>");
+            for (unsigned i = 0; i < 4095; i++)
+                used = svg_test_append(markup, used, CAPACITY,
+                    "<rect width='1' height='1' fill='#ff0000'/>");
+            used = svg_test_append(markup, used, CAPACITY,
+                "<rect y='20' width='40' height='20' fill='#0000ff'/></g>");
+        }
+        used = svg_test_append(markup, used, CAPACITY, "</svg>");
+        okay = used < CAPACITY;
+        int width = 0, height = 0;
+        unsigned char *pixels = okay ? image_svg_decode(markup, used,
+            &budget, MIB, &width, &height) : NULL;
+        okay = pixels != NULL && width == 40 && height == 40;
+        if (!okay) fprintf(stderr, "SVG clip limit scenario %u refused\n", scenario);
+        if (okay) {
+            const unsigned char *clipped_in = svg_test_pixel(pixels, 40, 5, 10);
+            const unsigned char *clipped_out = svg_test_pixel(pixels, 40, 30, 10);
+            const unsigned char *beyond = svg_test_pixel(pixels, 40, 30, 30);
+            okay = clipped_in[0] == 255 && clipped_in[3] == 255
+                && clipped_out[3] == 0
+                && (scenario == 4 ? beyond[3] == 0
+                    : beyond[2] == 255 && beyond[1] == 0
+                      && beyond[3] == 255);
+            if (!okay) fprintf(stderr, "SVG clip limit scenario %u: in=%u/%u "
+                "out=%u beyond=%u,%u,%u,%u\n", scenario, clipped_in[0],
+                clipped_in[3], clipped_out[3], beyond[0], beyond[1],
+                beyond[2], beyond[3]);
+        }
+        budget_free(&budget, pixels);
+        okay = okay && budget.current == 0;
+    }
+    free(markup);
+    return okay;
+}
+
+/* Clip and mask coverage is rebuilt only when the clip actually changes:
+   repeated identical uses and A, B-inside-A, A alternation reuse the two
+   most recent masks. The optional second mask buffer can be refused at any
+   point without changing a single pixel. */
+static bool test_svg_clip_masks_rebuild_only_on_change(void)
+{
+    static const char header[] =
+        "<svg width='120' height='80' viewBox='0 0 120 80'>"
+        "<defs><clipPath id='outer'><rect x='4' y='4' width='100' height='70' rx='9'/>"
+        "</clipPath><clipPath id='inner'><circle cx='50' cy='40' r='25'/></clipPath>"
+        "<clipPath id='box' clipPathUnits='objectBoundingBox'>"
+        "<rect x='.2' y='.2' width='.6' height='.6'/></clipPath>"
+        "<mask id='fade' maskUnits='userSpaceOnUse' x='0' y='0' width='120' height='80'>"
+        "<rect width='120' height='80' fill='#808080'/></mask></defs>";
+    static const char group[] =
+        "<g clip-path='url(#outer)'><rect x='0' y='0' width='120' height='30' fill='#ff0000'/>"
+        "<g clip-path='url(#inner)'><rect x='20' y='10' width='80' height='60' fill='#00ff00'/></g>"
+        "<rect x='0' y='50' width='120' height='30' fill='#0000ff'/>"
+        "<g mask='url(#fade)'><rect x='60' y='0' width='20' height='80' fill='#ffff00'/></g>"
+        "<path d='M70 20h40v40h-40z' fill='#00ffff' clip-path='url(#box)'/></g>";
+    char markup[4096];
+    size_t used = svg_test_append(markup, 0, sizeof(markup), header);
+    for (unsigned i = 0; i < 6; i++)
+        used = svg_test_append(markup, used, sizeof(markup), group);
+    used = svg_test_append(markup, used, sizeof(markup), "</svg>");
+    if (used >= sizeof(markup)) return false;
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    tilefinch_test_faults()->svg_clip_mask_builds = 0;
+    unsigned char *reference = image_svg_decode(markup, used, &budget, MIB,
+        &width, &height);
+    unsigned builds = tilefinch_test_faults()->svg_clip_mask_builds;
+    bool okay = reference != NULL && width == 120 && height == 80;
+    /* Per group: outer, inner-in-outer, back to outer (cached), fade,
+       box (object bounding box: never shared). The first group also pays
+       for the outer mask once more after the fade evicts it. */
+    if (okay && builds > 6u * 4u) {
+        fprintf(stderr, "SVG clip mask builds %u\n", builds);
+        okay = false;
+    }
+    okay = okay && svg_test_pixel(reference, 120, 10, 10)[0] == 255
+        && svg_test_pixel(reference, 120, 110, 10)[3] == 0
+        && svg_test_pixel(reference, 120, 50, 40)[1] == 255
+        && svg_test_pixel(reference, 120, 90, 40)[2] == 255
+        && svg_test_pixel(reference, 120, 10, 40)[3] == 0;
+    size_t bytes = (size_t) width * (size_t) height * 4u;
+    size_t retained = budget.current;
+    bool degraded = false;
+    for (size_t failure = 0; okay && failure < 400; failure++) {
+        budget_inject_failure_after(&budget, failure);
+        int w = 0, h = 0;
+        unsigned char *pixels = image_svg_decode(markup, used, &budget, MIB,
+            &w, &h);
+        bool injected = budget.injected_failure_count != 0;
+        budget_clear_failure_injection(&budget);
+        if (pixels != NULL) {
+            okay = w == width && h == height
+                && memcmp(pixels, reference, bytes) == 0;
+            if (!okay) fprintf(stderr, "SVG clip refusal %zu changed pixels\n",
+                               failure);
+            degraded = degraded || injected;
+        }
+        budget_free(&budget, pixels);
+        okay = okay && budget.current == retained;
+        if (!injected) break;
+    }
+    budget_free(&budget, reference);
+    return okay && degraded && budget.current == 0;
+}
+
 #define SVG_RETARGET_STRIPES(fill)                                          \
     "<rect width='256' height='256' fill='#ffffff'/>"                       \
     "<rect x='0' width='32' height='256' fill='" fill "'/>"                 \
@@ -224,9 +443,12 @@ static const ImageResource *svg_retarget_icon(NavigationSession *navigation,
 static bool test_inline_svg_css_viewport_preserves_circle(void)
 {
     static const char html[] =
-        "<!doctype html><style>svg{display:block;width:32px;height:20px}</style>"
+        "<!doctype html><style>svg{display:block;width:32px;height:20px}"
+        "#ratio svg{width:23px;height:auto}</style>"
         "<div id=icon><svg width=32 height=32 viewBox='0 0 18 18'>"
-        "<circle cx=9 cy=9 r=5 fill='blue'/></svg></div>";
+        "<circle cx=9 cy=9 r=5 fill='blue'/></svg></div>"
+        "<div id=ratio><svg viewBox='0 0 158 110'>"
+        "<rect width=158 height=110 fill='red'/></svg></div>";
     Budget budget;
     budget_init(&budget, 8u * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -243,8 +465,39 @@ static bool test_inline_svg_css_viewport_preserves_circle(void)
         && svg_retarget_pixel(image, 4, 10)[3] == 0
         && svg_retarget_pixel(image, 16, 5)[3] > 240
         && svg_retarget_pixel(image, 16, 14)[3] > 240;
+    const ImageResource *ratio = okay
+        ? svg_retarget_icon(&navigation, "ratio") : NULL;
+    okay = okay && ratio != NULL && ratio->width == 23 && ratio->height == 16;
     if (!okay) fprintf(stderr, "CSS SVG viewport mismatch %dx%d\n",
         image == NULL ? 0 : image->width, image == NULL ? 0 : image->height);
+    if (okay) {
+        /* Deferred raster materialization can leave the outgoing table above
+           its discovery allowance. A same-markup refresh transfers existing
+           pixels; it must not erase the icon or allocate a replacement. */
+        lxb_dom_node_t *nodes[] = {image->node};
+        const void *pixels = image->pixels;
+        size_t decoded = navigation.page.images.stats.decoded_bytes;
+        okay = images_refresh_external_nodes(
+            &navigation.page.document, &navigation.page.stylesheet,
+            &navigation.page.images, nodes, 1u, &budget,
+            "https://viewport.test/", "https://viewport.test/", NULL,
+            8, 524288, 262144, 1, 1000, NULL, NULL);
+        image = images_find_node(&navigation.page.images, nodes[0]);
+        okay = okay && image != NULL && image->pixels == pixels
+            && navigation.page.images.stats.decoded_bytes == decoded;
+        /* Changed artwork cannot use this exception to decode over quota. */
+        lxb_dom_node_t *circle = nodes[0]->first_child;
+        okay = okay && circle != NULL
+            && lxb_dom_element_set_attribute(lxb_dom_interface_element(circle),
+                (const lxb_char_t *) "fill", 4,
+                (const lxb_char_t *) "red", 3) != NULL
+            && images_refresh_external_nodes(
+                &navigation.page.document, &navigation.page.stylesheet,
+                &navigation.page.images, nodes, 1u, &budget,
+                "https://viewport.test/", "https://viewport.test/", NULL,
+                8, 524288, 262144, 1, 1000, NULL, NULL)
+            && images_find_node(&navigation.page.images, nodes[0]) == NULL;
+    }
     if (ready) navigation_destroy(&navigation);
     return okay && budget.current == 0;
 }
@@ -336,17 +589,20 @@ static bool test_svg_oversize_initial_raster_preserves_intrinsic_size(void)
         budget_inject_failure_after(&scratch, fail);
         size_t calls = 0;
         int width = 0, height = 0, source_width = -1, source_height = -1;
+        bool limited = false;
         unsigned char *pixels = image_svg_decode_bounded(
             svg, sizeof(svg) - 1u, &scratch, 72u * 24u * 4u,
             &width, &height, svg_oversize_test_target, &calls,
-            &source_width, &source_height);
+            &source_width, &source_height, &limited);
         if (pixels != NULL) {
             fallback_succeeded = true;
             refusal_clean = refusal_clean && calls == 1 && width == 72
-                && height == 24 && source_width == 3000 && source_height == 1000;
+                && height == 24 && source_width == 3000 && source_height == 1000
+                && !limited;
         } else {
+            /* A refused allocation is a limit, never the markup's fault. */
             refusal_clean = refusal_clean && width == 0 && height == 0
-                && source_width == -1 && source_height == -1;
+                && source_width == -1 && source_height == -1 && limited;
         }
         budget_free(&scratch, pixels);
         refusal_clean = refusal_clean && scratch.current == 0
@@ -358,16 +614,39 @@ static bool test_svg_oversize_initial_raster_preserves_intrinsic_size(void)
     int width = 72, height = 24;
     unsigned char *pixels = image_svg_decode_bounded(
         svg, sizeof(svg) - 1u, &budget, 72u * 24u * 4u,
-        &width, &height, svg_oversize_test_target, &calls, NULL, NULL);
+        &width, &height, svg_oversize_test_target, &calls, NULL, NULL,
+        NULL);
     refusal_clean = refusal_clean && pixels != NULL && calls == 0;
     budget_free(&budget, pixels);
+    /* Markup no decoder takes, by contrast, is not a limit. */
+    static const char not_svg[] = "not an svg";
+    bool markup_limited = true;
+    width = height = 0;
+    pixels = image_svg_decode_bounded(
+        not_svg, sizeof(not_svg) - 1u, &budget, MIB, &width, &height,
+        NULL, NULL, NULL, NULL, &markup_limited);
+    refusal_clean = refusal_clean && pixels == NULL && !markup_limited;
+    /* A quota below one pixel, or one the target cannot meet, is. */
+    bool quota_limited = false;
+    width = height = 0;
+    pixels = image_svg_decode_bounded(
+        svg, sizeof(svg) - 1u, &budget, 2u, &width, &height,
+        NULL, NULL, NULL, NULL, &quota_limited);
+    refusal_clean = refusal_clean && pixels == NULL && quota_limited;
+    quota_limited = false;
+    width = height = 0;
+    pixels = image_svg_decode_bounded(
+        svg, sizeof(svg) - 1u, &budget, 64u, &width, &height,
+        NULL, NULL, NULL, NULL, &quota_limited);
+    refusal_clean = refusal_clean && pixels == NULL && quota_limited;
     static const char small_svg[] =
         "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='32'>"
         "<circle cx='32' cy='16' r='14' fill='blue'/></svg>";
     width = height = 0;
     pixels = image_svg_decode_bounded(
         small_svg, sizeof(small_svg) - 1u, &budget, 64u * 32u * 4u,
-        &width, &height, svg_oversize_test_target, &calls, NULL, NULL);
+        &width, &height, svg_oversize_test_target, &calls, NULL, NULL,
+        NULL);
     int direct_width = 0, direct_height = 0;
     unsigned char *direct = image_svg_decode(
         small_svg, sizeof(small_svg) - 1u, &budget, 64u * 32u * 4u,

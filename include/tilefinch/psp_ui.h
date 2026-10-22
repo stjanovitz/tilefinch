@@ -128,7 +128,8 @@ typedef struct {
 
 typedef struct {
     char origin[48];
-    char detail[32];
+    /* Size and a translated place: up to 3 bytes a character. */
+    char detail[64];
     /* A BrowserSiteStoragePolicy, or 3 for "Memory Stick this session". */
     uint8_t state;
 } PspUiSiteStorageRow;
@@ -136,7 +137,8 @@ typedef struct {
 /* Filled by the frontend when Site data & storage opens. */
 typedef struct {
     uint8_t count;
-    char stick_free[32];
+    /* The translated "Free space:" and a size. */
+    char stick_free[64];
     PspUiSiteStorageRow rows[PSP_UI_SITE_STORAGE_ROW_LIMIT];
 } PspUiSiteStorageView;
 
@@ -622,6 +624,25 @@ typedef struct {
     bool wrapped;
 } PspUiFindView;
 
+/* What a status toast offers beyond its text. One at a time: every
+   psp_ui_show_status resets it to PLAIN. */
+typedef enum {
+    PSP_UI_TOAST_PLAIN = 0,
+    /* toast_payload is the TilefinchTlsGuidance second line. It outlives
+       the toast: the failure sheet for the same failure shows the clock
+       hint. */
+    PSP_UI_TOAST_TLS,
+    /* X opens the Wi-Fi sign-in check, O dismisses. */
+    PSP_UI_TOAST_WIFI_SIGN_IN,
+    /* X stops page scripts, O keeps reading. */
+    PSP_UI_TOAST_HEAVY_SCRIPTS,
+    /* The language-pack offer; toast_payload is the TilefinchGlyphPack. */
+    PSP_UI_TOAST_GLYPH_OFFER,
+    /* The saved interface language needs a download; toast_payload is the
+       TilefinchUiLanguage. */
+    PSP_UI_TOAST_LANGUAGE_REPAIR
+} PspUiToastKind;
+
 typedef struct {
     bool chrome_visible;
     PspUiScreen screen;
@@ -660,9 +681,9 @@ typedef struct {
     bool update_cancel_enabled;
     uint8_t validation_power_test_phase : 1;
     uint8_t validation_media_test_phase : 1;
-    /* Zero for an ordinary status. Other values are TilefinchTlsGuidance;
-       share the validation byte instead of enlarging the 1 KiB state. */
-    uint8_t tls_toast_guidance : 3;
+    /* PspUiToastKind; shares the validation byte instead of enlarging the
+       1 KiB state. */
+    uint8_t toast_kind : 3;
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
     unsigned youtube_audio_only : 1;
@@ -697,7 +718,6 @@ typedef struct {
     unsigned third_party_cookie_site_allowed : 1;
     unsigned reader_site_always : 1;
     unsigned captive_portal_active : 1;
-    unsigned captive_portal_suggested : 1;
     /* Explicit user handoff of ordinary PSP controls to the active page.
        HOME remains firmware-owned; Start+Select exits this mode. */
     unsigned page_gamepad_capture : 1;
@@ -762,9 +782,9 @@ typedef struct {
     uint8_t basic_mode : 1;
     /* BrowserBasicFallbackMode, in the same byte's spare bits. */
     uint8_t basic_fallback_mode : 2;
-    /* Zero, or the TilefinchGlyphPack plus one of the language-pack offer
-       the toast is showing; the byte's last four spare bits. */
-    uint8_t glyph_offer_plus_one : 4;
+    /* The toast_kind's TilefinchTlsGuidance or TilefinchGlyphPack; the
+       byte's last four spare bits. */
+    uint8_t toast_payload : 4;
     /* Page-status booleans share a byte; adding a catalog entry must not
        enlarge every supervisor snapshot beyond its existing 1 KiB bound. */
     uint8_t loading : 1;
@@ -868,12 +888,10 @@ typedef struct {
     /* One of the four direction bits, or zero. */
     uint16_t focus_repeat_direction;
     /* -1, 0 or 1. Then, in the same byte, Settings > Browsing & input >
-       Heavy pages (BrowserHeavyPagesMode), the status "page scripts still
-       running" (X stops them, O keeps reading) and the recovery sheet
-       titled for a page too heavy for the PSP. */
+       Heavy pages (BrowserHeavyPagesMode) and the recovery sheet titled for
+       a page too heavy for the PSP. */
     int8_t analog_scroll_direction : 2;
     uint8_t heavy_pages_mode : 2;
-    uint8_t heavy_scripts_suggested : 1;
     uint8_t failure_recovery_heavy : 1;
     uint8_t web_font_mode : 2;
     /* Uses alignment padding before the cursor coordinates. */
@@ -1004,6 +1022,16 @@ typedef struct {
     char label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
 } PspUiMediaTrack;
 
+/* PspUiMediaPresentation.track_menu_tab. The values are stored, hashed into
+   the menu cache key and logged; the painted order is Chapters, Audio,
+   Subtitles, Queue (media_menu_tabs in psp_ui.c). */
+typedef enum {
+    PSP_UI_MEDIA_TAB_AUDIO = 0,
+    PSP_UI_MEDIA_TAB_SUBTITLES = 1,
+    PSP_UI_MEDIA_TAB_CHAPTERS = 2,
+    PSP_UI_MEDIA_TAB_QUEUE = 3
+} PspUiMediaTab;
+
 /* Player-only presentation storage is owned beside the media session rather
    than copied into every transient UI snapshot. This keeps the hot
    PspUiMediaState at its established 288-byte bound while allowing a bounded
@@ -1011,7 +1039,7 @@ typedef struct {
 typedef struct {
     const FontFace *title_font;
     bool track_menu_open;
-    uint8_t track_menu_tab;
+    uint8_t track_menu_tab; /* PspUiMediaTab */
     uint8_t track_menu_selection;
     uint8_t audio_track_count;
     uint8_t subtitle_track_count;
@@ -1278,6 +1306,20 @@ void psp_ui_show_wifi_sign_in_status(
 #define PSP_UI_GLYPH_OFFER_ARMING_MS 600u
 void psp_ui_show_glyph_offer(PspUiState *ui, uint8_t pack);
 bool psp_ui_glyph_offer_visible(const PspUiState *ui);
+/* The saved interface language could not load at boot because its
+   catalog, or the glyph pack it needs, is missing, damaged or too old. A
+   three-line toast like the language-pack offer, with the same timing and
+   arming: the language's English name, what is missing, "X Open   O Back".
+   Its text stays English, since the catalog is what is missing. Once
+   armed, X opens Settings > Appearance > Language & emoji with Interface
+   language focused on that language, so a second X starts the ordinary
+   download; O closes it at once. Shown over Home or a settled page only:
+   ready() is false over a menu or panel, another toast, a loading page,
+   page fullscreen, gamepad capture or a Wi-Fi sign-in, and show() then
+   shows nothing so the caller can retry. */
+bool psp_ui_language_repair_offer_ready(const PspUiState *ui);
+bool psp_ui_show_language_repair_offer(PspUiState *ui, unsigned language,
+                                       bool font_pack);
 /* The confirmation's state, published by the app as the signed metadata
    check runs. Ignored unless the confirmation for that pack is showing. */
 void psp_ui_set_glyph_offer_size(PspUiState *ui, uint8_t pack,
@@ -1529,6 +1571,9 @@ void psp_ui_media_composite_without_track_menu(
 unsigned psp_ui_media_track_menu_height(const PspUiMediaState *media);
 /* Zero while refused/off-owner glyphs still require an ordinary repaint. */
 uint32_t psp_ui_media_raster_generation(void);
+/* Changes whenever retained chrome glyphs are replaced (faces rebound or a
+   glyph-pack change), so it keys every retained chrome raster. Never 0. */
+uint32_t psp_ui_chrome_font_epoch(void);
 void psp_ui_media_raster_track_menu(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride);

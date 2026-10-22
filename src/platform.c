@@ -1,10 +1,12 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/work_ledger.h"
+#include "tilefinch_test_faults.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
@@ -22,6 +24,60 @@ void tilefinch_platform_set_services(const TilefinchPlatformServices *services)
     if (services == NULL) memset(&installed_services, 0,
                                  sizeof(installed_services));
     else installed_services = *services;
+}
+
+#ifndef __PSP__
+/* Host tests can make rename refuse to replace a file, as FAT does. */
+static int replace_rename(const char *from, const char *to)
+{
+    struct stat status;
+    if (tilefinch_test_faults()->replace_file_no_replace
+        && stat(from, &status) == 0 && stat(to, &status) == 0) {
+        errno = EEXIST;
+        return -1;
+    }
+    return rename(from, to);
+}
+
+static bool replace_fault(bool *fault)
+{
+    bool fire = *fault;
+    *fault = false;
+    return fire;
+}
+#else
+#define replace_rename rename
+#endif
+
+bool tilefinch_platform_replace_file(const char *temporary, const char *path,
+                                     const char *backup)
+{
+    if (temporary == NULL || path == NULL) return false;
+    if (backup == NULL) {
+        if (replace_rename(temporary, path) == 0) return true;
+        /* Remove the destination only for a temporary file that exists. */
+        struct stat status;
+        return stat(temporary, &status) == 0 && remove(path) == 0
+            && replace_rename(temporary, path) == 0;
+    }
+    bool had_previous = replace_rename(path, backup) == 0;
+    if (!had_previous) {
+        if (errno == ENOENT) return replace_rename(temporary, path) == 0;
+        (void) remove(backup);
+        had_previous = replace_rename(path, backup) == 0;
+        if (!had_previous && errno != ENOENT) return false;
+    }
+    bool refuse_install = false;
+#ifndef __PSP__
+    /* A power loss right after the previous file moved aside. */
+    if (replace_fault(&tilefinch_test_faults()->replace_file_crash_after_backup))
+        return false;
+    refuse_install = replace_fault(
+        &tilefinch_test_faults()->replace_file_fail_install);
+#endif
+    if (!refuse_install && replace_rename(temporary, path) == 0) return true;
+    if (had_previous) (void) replace_rename(backup, path);
+    return false;
 }
 
 uint64_t tilefinch_platform_wall_time_ns(void)

@@ -498,7 +498,8 @@ struct LayoutReuseCache {
 enum {
     LINE_ATOMIC_BASELINE,
     LINE_ATOMIC_TOP,
-    LINE_ATOMIC_BOTTOM
+    LINE_ATOMIC_BOTTOM,
+    LINE_ATOMIC_FLOAT
 };
 typedef struct {
     lxb_dom_node_t *node;
@@ -1164,8 +1165,8 @@ static inline size_t layout_pointer_hash(const void *pointer)
 /* CSS font-weight boundaries: at or above LAYOUT_BOLD_FACE_WEIGHT the bold
    face is selected; between LAYOUT_SYNTHETIC_WEIGHT and the bold boundary a
    synthetic emboldening pass runs when no bold face exists.  DrawCommand
-   stores weights in ten-unit increments, so the encoded twin of the bold
-   boundary is LAYOUT_BOLD_FACE_WEIGHT / 10. */
+   stores weights in ten-unit increments; draw_command_font_weight() decodes
+   them and draw_uses_bold_face() applies the bold boundary. */
 #define LAYOUT_BOLD_FACE_WEIGHT TILEFINCH_FONT_BOLD_FACE_WEIGHT
 #define LAYOUT_SYNTHETIC_WEIGHT TILEFINCH_FONT_SYNTHETIC_WEIGHT
 
@@ -1231,7 +1232,7 @@ void layout_bidi_translate_commands(
     LayoutDocument *layout, size_t command_start, int dx);
 void layout_bidi_scale_commands(
     LayoutDocument *layout, size_t command_start,
-    int origin_x_twice, uint8_t scale_q6);
+    int origin_x_twice, uint16_t scale_q14);
 void layout_bidi_rebase_command(
     LayoutDocument *layout, size_t command_index, int old_x_fixed);
 DrawCommand *layout_add_command(LayoutDocument *layout, DrawCommand command);
@@ -1245,6 +1246,13 @@ bool layout_intern_gradient(LayoutDocument *layout, const StyleGradient *gradien
 FlexLineMetrics flex_line_metrics(LayoutContext *context, FlexItemIterator *iterator, FlatItem *item, int content_width, int gap);
 GeneratedPseudoFlow generated_pseudo_flow( LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, PseudoElement pseudo, int width, int containing_height);
 bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end, size_t link_start, size_t link_end, size_t control_start, size_t control_end, int origin_y, int height, int inset, bool from_bottom);
+void layout_record_grid_columns(LayoutDocument *layout,
+    lxb_dom_node_t *node, const int *widths, unsigned count, unsigned origin);
+/* The size-contained content height of `node`'s recorded box (see
+   LayoutDocument.node_container_contained_heights); -1 marks it definite.
+   No-op unless container geometry is being collected. */
+void layout_note_contained_height(LayoutDocument *layout,
+                                  const lxb_dom_node_t *node, int height);
 bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node, int x, int y,
                   int width, int height, int client_width, int client_height,
                   int content_width, int content_height,
@@ -1268,7 +1276,6 @@ bool attribute_is(lxb_dom_node_t *node, const char *name, const char *wanted);
 bool layout_node_is_hidden_input(lxb_dom_node_t *node);
 bool build_paint_order(LayoutDocument *layout, LayoutContext *context);
 bool build_spatial_index(LayoutDocument *layout, LayoutContext *context);
-bool draw_uses_bold_face(const DrawCommand *command);
 bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item);
 bool flex_iterator_next(FlexItemIterator *iterator, FlatItem *item);
 bool flex_order_plan_build(FlexOrderPlan *plan, LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style);
@@ -1398,8 +1405,16 @@ int intrinsic_text_width(LayoutContext *context, lxb_dom_node_t *node, const Com
 int intrinsic_positioned_width(LayoutContext *context, lxb_dom_node_t *node,
                                const ComputedStyle *parent, int limit);
 int layout_fixed_scale_floor(int value, int numerator, int denominator);
-int layout_box_first_text_baseline(const LayoutDocument *layout,
-                                   const LayoutNodeBox *box);
+int scale_fixed_around_center(int value_fixed, int origin_twice,
+                              uint16_t scale_q14);
+/* The first text baseline among the box's commands, in layout coordinates
+   and including each line's half-leading (the baseline inline layout aligns
+   on). Text in relative, sticky and z-indexed boxes stays in flow and
+   counts; text in out-of-flow (absolute or fixed) descendants does not
+   (CSS Flexbox 8.5, CSS Position 3, 3.4). False, leaving *baseline
+   unchanged, when there is none. */
+bool layout_box_first_text_baseline(const LayoutDocument *layout,
+                                    const LayoutNodeBox *box, int *baseline);
 /* All text-measurement tracking arguments below are signed 26.6 pixels. */
 int measured_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, bool kerning);
@@ -1446,7 +1461,7 @@ size_t utf8_line_segment_length(const char *text, size_t available,
                                 bool *discard);
 uint16_t alpha_opacity_scale(uint8_t alpha);
 uint32_t blend_color_over(uint32_t foreground, uint8_t alpha, uint32_t background);
-uint8_t draw_font_weight(const ComputedStyle *style);
+uint8_t draw_font_weight_code_for_style(const ComputedStyle *style);
 uint8_t text_decoration_bits(const ComputedStyle *style);
 void align_flex_row_items(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int stretch_free, size_t stretch_lines);
 void layout_border_triangle(DrawCommand *command, const StyleEdges *borders,
@@ -1456,6 +1471,8 @@ void layout_mask_background_gradient(LayoutContext *context,
                                       DrawCommand *command);
 void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
                               int target_height);
+int layout_fit_column_scroller(LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, const FlexOrderPlan *order, int width, int height);
 bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
                         size_t command_start, size_t link_start,
                         size_t control_start, const ComputedStyle *style,
@@ -1504,7 +1521,7 @@ bool grid_placement_reserve(GridPlacementState *state, LayoutContext *context,
                             FlexItemIterator *iterator, FlatItem *item);
 void layout_finish_work_slice(LayoutContext *context);
 void layout_flush_line(LineState *line);
-void layout_scale_range(LayoutDocument *layout, size_t command_start, size_t link_start, size_t control_start, size_t node_box_start, int origin_x_twice, int origin_y_twice, uint8_t scale_q6, lxb_dom_node_t *source);
+void layout_scale_range(LayoutDocument *layout, size_t command_start, size_t link_start, size_t control_start, size_t node_box_start, int origin_x_twice, int origin_y_twice, uint16_t scale_q14, lxb_dom_node_t *source);
 void layout_rotate_range_quadrants(LayoutDocument *layout,
                                    size_t command_start, size_t link_start,
                                    size_t control_start,
@@ -1523,7 +1540,7 @@ bool layout_rotate_solid_command_span(LayoutDocument *layout, size_t start,
     size_t end, int origin_x_twice, int origin_y_twice, int16_t rotation_q6);
 void layout_transform_command_span(
     LayoutDocument *layout, size_t command_start, size_t command_end,
-    int origin_x_twice, int origin_y_twice, uint8_t scale_q6,
+    int origin_x_twice, int origin_y_twice, uint16_t scale_q14,
     uint8_t rotate_quadrants, int dx, int dy);
 void layout_style_for_node_into(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, ComputedStyle *result);
 void layout_translate_range(LayoutDocument *layout, size_t command_start, size_t link_start, size_t control_start, size_t node_box_start, int dx, int dy, const char *phase, lxb_dom_node_t *source);

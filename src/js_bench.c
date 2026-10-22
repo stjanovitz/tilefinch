@@ -883,7 +883,7 @@ static int js_bench_measure_compile(const char *name, const char *source,
 }
 
 /* The compile working set of every JavaScript record of a trace, for the
-   script admission model (docs/engineering/MEMORY_EXPERIMENTS.md, "Script
+   script admission model (.private-investigations/MEMORY_EXPERIMENTS.md, "Script
    admission by compile working set"). Each record compiles once on its own
    fresh pool runtime, the way the browser compiles a page script (lazy
    function threshold and preparsing on, modules of 8 KiB or more with

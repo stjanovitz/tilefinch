@@ -72,6 +72,11 @@ bool psp_offline_store_accept_file(PspOfflineStore *store);
 void psp_offline_store_discard_file(PspOfflineStore *store);
 bool psp_offline_store_install_prepared_zip(PspOfflineStore *store);
 void psp_offline_store_discard_zip(PspOfflineStore *store);
+/* The toast for cancelling an offline route that reads the Memory Stick's
+   game folder or a ZIP (installed-homebrew list, ZIP install or removal
+   preview), which the caller runs under a cancellable supervisor scope;
+   NULL for every other route. Parsed exactly as handle_url parses it. */
+const char *psp_offline_store_route_cancel_status(const char *url);
 PspOfflineRouteResult psp_offline_store_handle_url(
     PspOfflineStore *store, BrowserEngine *engine,
     const BrowserProfile *profile, const char *url, const char *source_title,

@@ -1,19 +1,20 @@
 (() => {
-  const wrap = globalThis.__tilefinchWrap;
-  const retentionStats = globalThis.__tilefinchRetentionStats;
-  const documentListeners = globalThis.__tilefinchDocumentListeners;
-  const boundedAncestorPath = globalThis.__tilefinchBoundedAncestorPath;
-  const cssSupportsNative = globalThis.__tilefinchCssSupports;
+  const wrap = __tilefinchRealmGlobal.__tilefinchWrap;
+  const retentionStats = __tilefinchRealmGlobal.__tilefinchRetentionStats;
+  const documentListeners = __tilefinchRealmGlobal.__tilefinchDocumentListeners;
+  const boundedAncestorPath = __tilefinchRealmGlobal.__tilefinchBoundedAncestorPath;
+  const cssSupportsNative = __tilefinchRealmGlobal.__tilefinchCssSupports;
   /* Same cap dom.js applies, for the walks here that only need the bound. */
-  const ancestorLimit = globalThis.__tilefinchAncestorLimit;
+  const ancestorLimit = __tilefinchRealmGlobal.__tilefinchAncestorLimit;
   /* Web IDL exposes interface members as enumerable; class syntax defines
      them non-enumerable, so interfaces written as classes flip them here. */
   const {
+    createPrivateSlot,
     reflectString,
     reflectBoolean,
     reflectEnumerated,
     secondaryDocumentPrototype,
-  } = globalThis.__tilefinchDomShared;
+  } = __tilefinchRealmGlobal.__tilefinchDomShared;
   const enumerateInterfaceMembers = (constructor) => {
     const prototype = constructor.prototype;
     for (const key of Reflect.ownKeys(prototype)) {
@@ -26,29 +27,17 @@
         });
     }
   };
-  /* See the matching declarations in dom.js: hardening.js only sees the
-     globals that exist when it runs, so anything created on first write has
-     to be declared non-enumerable here instead. */
-  for (const [name, initial] of [
-    ["__tilefinchBase64Error", ""],
-  ])
-    Object.defineProperty(globalThis, name, {
-      enumerable: false,
-      configurable: false,
-      writable: true,
-      value: initial,
-    });
   const trustedJSONParse = JSON.parse;
   const trustedJSONStringify = JSON.stringify;
-  const decodeUtf8ValidNative = globalThis.__tilefinchDecodeUtf8Valid;
-  const encodeUtf8Native = globalThis.__tilefinchEncodeUtf8;
-  const encodingNameNative = globalThis.__tilefinchEncodingName;
-  const decodeSingleByteNative = globalThis.__tilefinchDecodeSingleByte;
-  const cryptoRandomFillNative = globalThis.__tilefinchCryptoRandomFill;
-  delete globalThis.__tilefinchDecodeUtf8Valid;
-  delete globalThis.__tilefinchEncodeUtf8;
-  delete globalThis.__tilefinchEncodingName;
-  delete globalThis.__tilefinchDecodeSingleByte;
+  const decodeUtf8ValidNative = __tilefinchRealmGlobal.__tilefinchDecodeUtf8Valid;
+  const encodeUtf8Native = __tilefinchRealmGlobal.__tilefinchEncodeUtf8;
+  const encodingNameNative = __tilefinchRealmGlobal.__tilefinchEncodingName;
+  const decodeSingleByteNative = __tilefinchRealmGlobal.__tilefinchDecodeSingleByte;
+  const cryptoRandomFillNative = __tilefinchRealmGlobal.__tilefinchCryptoRandomFill;
+  delete __tilefinchRealmGlobal.__tilefinchDecodeUtf8Valid;
+  delete __tilefinchRealmGlobal.__tilefinchEncodeUtf8;
+  delete __tilefinchRealmGlobal.__tilefinchEncodingName;
+  delete __tilefinchRealmGlobal.__tilefinchDecodeSingleByte;
   const trustedString = String,
     trustedStringToWellFormed = Function.call.bind(
       String.prototype.toWellFormed,
@@ -152,21 +141,21 @@
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
-  const trustedEnqueueMicrotask = globalThis.__tilefinchEnqueueMicrotask;
+  const trustedEnqueueMicrotask = __tilefinchRealmGlobal.__tilefinchEnqueueMicrotask;
   const trustedQueueCheckpointContinuation =
-    globalThis.__tilefinchQueueCheckpointContinuation;
-  if (globalThis.queueMicrotask === undefined)
+    __tilefinchRealmGlobal.__tilefinchQueueCheckpointContinuation;
+  if (__tilefinchRealmGlobal.queueMicrotask === undefined)
     /* A property definition names the function "queueMicrotask". */
-    globalThis.queueMicrotask = {
+    __tilefinchRealmGlobal.queueMicrotask = {
       queueMicrotask: (callback) => {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
         trustedEnqueueMicrotask(() => {
           try {
-            globalThis.__tilefinchRunTask(
+            __tilefinchRealmGlobal.__tilefinchRunTask(
               "microtask",
               callback,
-              globalThis,
+              __tilefinchRealmGlobal,
               [],
             );
           } catch (error) {
@@ -175,10 +164,10 @@
         });
       },
     }.queueMicrotask;
-  delete globalThis.__tilefinchEnqueueMicrotask;
-  delete globalThis.__tilefinchQueueCheckpointContinuation;
-  if (globalThis.CSS === undefined)
-    globalThis.CSS = {
+  delete __tilefinchRealmGlobal.__tilefinchEnqueueMicrotask;
+  delete __tilefinchRealmGlobal.__tilefinchQueueCheckpointContinuation;
+  if (__tilefinchRealmGlobal.CSS === undefined)
+    __tilefinchRealmGlobal.CSS = {
       escape(value) {
         const text = String(value);
         let output = "";
@@ -219,6 +208,8 @@
           : !!cssSupportsNative(String(property), String(value));
       },
     };
+  /* File-private helpers assigned inside the blocks below. */
+  let isNativeFunction, detachNode;
   {
     const selectorPseudoClasses = new Set([
         "active", "any-link", "autofill", "blank", "buffering", "checked",
@@ -394,7 +385,7 @@
         plainCompound + String.raw`|\s+` + plainCompound + ")*",
       plainSelector = new RegExp(String.raw`^\s*` + plainComplex +
         String.raw`(?:\s*,\s*` + plainComplex + String.raw`)*\s*$`);
-    globalThis.__tilefinchAssertSelector = (value) => {
+    __tilefinchRealmGlobal.__tilefinchAssertSelector = (value) => {
       value = String(value);
       if (validSelectors.has(value)) return value;
       if (!(value.length <= 256 && plainSelector.test(value)) &&
@@ -466,7 +457,7 @@
       },
       invalidElement = (element) => {
         const internals =
-          globalThis.__tilefinchElementInternalsFor?.(element);
+          __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(element);
         if (internals)
           try {
             return internals.willValidate && !internals.validity.valid;
@@ -483,7 +474,7 @@
         if (/^(?:fieldset|form)$/.test(String(element.localName || "")))
           return Array.from(element.querySelectorAll("*")).some((control) => {
             const custom =
-              globalThis.__tilefinchElementInternalsFor?.(control);
+              __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control);
             if (custom)
               try {
                 return custom.willValidate && !custom.validity.valid;
@@ -500,7 +491,7 @@
           });
         return false;
       },
-      customControlDisabled = globalThis.__tilefinchFormAssociatedCustomDisabled,
+      customControlDisabled = __tilefinchRealmGlobal.__tilefinchFormAssociatedCustomDisabled,
       wrappedElementMatches = function matches(value) {
         value = __tilefinchAssertSelector(value);
         return matchesValidSelector(
@@ -514,13 +505,13 @@
           compact === ":not(:defined)"
         ) {
           const defined =
-            globalThis.__tilefinchCustomElementIsDefined?.(element) ?? true;
+            __tilefinchRealmGlobal.__tilefinchCustomElementIsDefined?.(element) ?? true;
           return compact === ":defined" ? defined : !defined;
         }
         if (trimmed === ":invalid") return invalidElement(element);
         if (trimmed === ":valid") {
           const internals =
-            globalThis.__tilefinchElementInternalsFor?.(element);
+            __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(element);
           return (
               !!internals ||
               /^(?:button|fieldset|form|input|select|textarea)$/.test(
@@ -571,15 +562,15 @@
           !scoped &&
           !scriptMatchedSelectors.has(compact) &&
           !scriptMatchedSelectors.has(trimmed) &&
-          !globalThis.__tilefinchHasRemoteNodeWriter &&
+          !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
           !this.__tilefinchDetachedParent &&
           Number(this.__handle) > 0 &&
-          !globalThis.__tilefinchIsVirtualRemote?.(this)
+          !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(this)
         ) {
           const found = Number(__tilefinchClosest(this.__handle, value));
           if (found === Number(this.__handle)) return this;
           if (found > 0)
-            return globalThis.__tilefinchCanonicalElement(wrap(found));
+            return __tilefinchRealmGlobal.__tilefinchCanonicalElement(wrap(found));
           if (found === 0) return null;
           /* A parentless native root: continue through its script-side
              detached parent, as parentElement would. */
@@ -600,9 +591,9 @@
             return at;
         return null;
       };
-    globalThis.__tilefinchElementMatches = (element, value) =>
+    __tilefinchRealmGlobal.__tilefinchElementMatches = (element, value) =>
       wrappedElementMatches.call(element, value);
-    globalThis.__tilefinchElementClosest = (element, value) =>
+    __tilefinchRealmGlobal.__tilefinchElementClosest = (element, value) =>
       wrappedElementClosest.call(element, value);
     Object.defineProperties(Document.prototype, {
       querySelector: {
@@ -656,17 +647,12 @@
           : functionToString.call(this);
       };
     nativeMethodSet.add(nativeAwareToString);
-    globalThis.__tilefinchMarkNativeFunction = (value) => {
+    __tilefinchRealmGlobal.__tilefinchMarkNativeFunction = (value) => {
       if (typeof value === "function") nativeMethodSet.add(value);
       return value;
     };
-    Object.defineProperty(globalThis, "__tilefinchIsNativeFunction", {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: (value) =>
-        typeof value === "function" && nativeMethodSet.has(value),
-    });
+    isNativeFunction = (value) =>
+      typeof value === "function" && nativeMethodSet.has(value);
     Object.defineProperty(Function.prototype, "toString", {
       configurable: true,
       writable: true,
@@ -700,7 +686,7 @@
         return kept.join("\n");
       },
       installPublicError = (name) => {
-        const NativeError = globalThis[name];
+        const NativeError = __tilefinchRealmGlobal[name];
         if (typeof NativeError !== "function" || !NativeError.prototype)
           return;
         const PublicError = {
@@ -742,7 +728,7 @@
           if (descriptor) Object.defineProperty(PublicError, key, descriptor);
         }
         nativeMethodSet.add(PublicError);
-        globalThis[name] = PublicError;
+        __tilefinchRealmGlobal[name] = PublicError;
       };
     /* Explicit Resource Management: this QuickJS has neither the syntax
        nor these intrinsics. The well-known symbols and SuppressedError are
@@ -752,7 +738,7 @@
     for (const name of ["dispose", "asyncDispose", "metadata"])
       if (!(name in Symbol))
         Object.defineProperty(Symbol, name, { value: Symbol("Symbol." + name) });
-    if (typeof globalThis.SuppressedError !== "function") {
+    if (typeof __tilefinchRealmGlobal.SuppressedError !== "function") {
       const NativeError = Error,
         SuppressedError = function SuppressedError(error, suppressed, message) {
           const value = Reflect.construct(
@@ -777,7 +763,7 @@
           message: { configurable: true, writable: true, value: "" },
         }),
       });
-      Object.defineProperty(globalThis, "SuppressedError", {
+      Object.defineProperty(__tilefinchRealmGlobal, "SuppressedError", {
         configurable: true, writable: true, value: SuppressedError,
       });
     }
@@ -889,7 +875,7 @@
         this.cssRules.splice(index, 1);
       }
     }
-    Object.assign(globalThis, { CSSStyleRule, CSSStyleSheet });
+    Object.assign(__tilefinchRealmGlobal, { CSSStyleRule, CSSStyleSheet });
     Object.defineProperty(HTMLStyleElement.prototype, "sheet", Object.getOwnPropertyDescriptor({
       get sheet() {
         if (!this.isConnected) return null;
@@ -902,14 +888,14 @@
       },
     }, "sheet"));
   }
-  globalThis.__tilefinchRefreshNamedProperties = () => {
+  __tilefinchRealmGlobal.__tilefinchRefreshNamedProperties = () => {
     const names = __tilefinchNamedElementIds();
     for (let index = 0; index < names.length; index++)
-      globalThis.__tilefinchExposeNamedProperty(names[index]);
+      __tilefinchRealmGlobal.__tilefinchExposeNamedProperty(names[index]);
     /* Parser-inserted frames: their indices and target names. */
-    globalThis.__tilefinchChildNavigablesChanged?.(null);
+    __tilefinchRealmGlobal.__tilefinchChildNavigablesChanged?.(null);
   };
-  globalThis.__tilefinchRefreshNamedProperties();
+  __tilefinchRealmGlobal.__tilefinchRefreshNamedProperties();
   const urlSearchParamLimit = 8192,
     /* Web IDL USVString: lone surrogates become U+FFFD, pairs are kept.
        The intrinsic scans natively and returns a well-formed (or 8-bit)
@@ -1219,7 +1205,7 @@
         text,
         base === undefined
           ? tilefinchURLInput(
-              globalThis.__tilefinchLocationHref || "https://example.invalid/",
+              __tilefinchRealmGlobal.__tilefinchLocationHref || "https://example.invalid/",
             )
           : tilefinchURLInput(base),
       );
@@ -1416,10 +1402,10 @@
       return parseURL(url, base);
     },
   }));
-  globalThis.URL = TilefinchURL;
-  globalThis.URLSearchParams = TilefinchURLSearchParams;
-  if (globalThis.TextEncoder === undefined)
-    globalThis.TextEncoder = class TextEncoder {
+  __tilefinchRealmGlobal.URL = TilefinchURL;
+  __tilefinchRealmGlobal.URLSearchParams = TilefinchURLSearchParams;
+  if (__tilefinchRealmGlobal.TextEncoder === undefined)
+    __tilefinchRealmGlobal.TextEncoder = class TextEncoder {
       get encoding() {
         return "utf-8";
       }
@@ -1480,7 +1466,7 @@
         return { read, written };
       }
     };
-  if (globalThis.TextDecoder === undefined) {
+  if (__tilefinchRealmGlobal.TextDecoder === undefined) {
     /* Matches js_utf8_decode_valid() and the buffered fetch/XHR response
        ceiling. Keeping one bound lets admitted complete responses use the
        native validation/string-construction path instead of an O(n) series
@@ -1508,7 +1494,7 @@
       }
       return 0;
     };
-    globalThis.TextDecoder = class TextDecoder {
+    __tilefinchRealmGlobal.TextDecoder = class TextDecoder {
       constructor(label = "utf-8", options = {}) {
         /* The Encoding Standard's labels and single-byte tables are the
            ones the document parser uses (text_encoding.c). */
@@ -1674,7 +1660,9 @@
       }
     };
   }
-  const blobURLs = new Map(),
+  const BlobTextDecoder = TextDecoder,
+    decodeBlobText = TextDecoder.prototype.decode,
+    blobURLs = new Map(),
     blobStates = new WeakMap(),
     fileStates = new WeakMap(),
     blobBytes = (blob) => {
@@ -1730,10 +1718,11 @@
             part.buffer, part.byteOffset, part.byteLength);
           byteLength = bytes.byteLength;
         } else {
-          bytes = new TextEncoder().encode(String(part));
+          bytes = encodeUtf8Native(
+            trustedStringToWellFormed(String(part)), blobURLByteLimit - size);
           byteLength = bytes.byteLength;
         }
-        if (byteLength > 256 * 1024 - size)
+        if (byteLength > blobURLByteLimit - size)
           throw new RangeError("Blob exceeds bounded size");
         chunks[chunks.length] = { bytes, length: byteLength };
         size += byteLength;
@@ -1764,7 +1753,8 @@
       return Promise.resolve(blobBytesCopy(this).buffer);
     }
     text() {
-      return Promise.resolve(new TextDecoder().decode(blobBytesCopy(this)));
+      return Promise.resolve(trustedFunctionApply(
+        decodeBlobText, new BlobTextDecoder(), [blobBytes(this)]));
     }
     bytes() {
       return Promise.resolve(blobBytesCopy(this));
@@ -1804,9 +1794,9 @@
       return new TilefinchBlob([blobBytesCopy(this).slice(from, to)], { type });
     }
   };
-  globalThis.Blob = TilefinchBlob;
-  globalThis.__tilefinchBlobBytes = blobBytesCopy;
-  const TilefinchFile = globalThis.File = class File extends TilefinchBlob {
+  __tilefinchRealmGlobal.Blob = TilefinchBlob;
+  __tilefinchRealmGlobal.__tilefinchBlobBytes = blobBytesCopy;
+  const TilefinchFile = __tilefinchRealmGlobal.File = class File extends TilefinchBlob {
     constructor(parts, name, options = {}) {
       if (arguments.length < 2)
         throw new TypeError("File requires parts and a name");
@@ -1826,7 +1816,7 @@
       });
     }
   };
-  globalThis.FileList = class FileList {
+  __tilefinchRealmGlobal.FileList = class FileList {
     constructor(files = []) {
       const retained = Array.from(files).slice(0, 32);
       this.length = retained.length;
@@ -1863,10 +1853,10 @@
       inputFileLists.set(this, value || new FileList());
     },
   });
-  const nativeParserFormOwner = globalThis.__tilefinchParserFormOwner,
+  const nativeParserFormOwner = __tilefinchRealmGlobal.__tilefinchParserFormOwner,
     nativeHasParserFormOwners =
-      globalThis.__tilefinchHasParserFormOwners,
-    nativeDomVersion = globalThis.__tilefinchDomVersion,
+      __tilefinchRealmGlobal.__tilefinchHasParserFormOwners,
+    nativeDomVersion = __tilefinchRealmGlobal.__tilefinchDomVersion,
     formControlCache = new WeakMap(),
     parserFormOwner = (control) => {
       if (!control?.isConnected || control.__handle === undefined)
@@ -1874,7 +1864,7 @@
       const handle = nativeParserFormOwner?.(control.__handle);
       return handle === null || handle === undefined
         ? null
-        : globalThis.__tilefinchWrap?.(handle) || null;
+        : __tilefinchRealmGlobal.__tilefinchWrap?.(handle) || null;
     },
     nativeFormOwner = (control) => {
       const explicit = control?.getAttribute?.("form");
@@ -1896,10 +1886,10 @@
       seen = new Set(),
       fieldsetOwner = form instanceof HTMLFieldSetElement,
       customSelector =
-        globalThis.__tilefinchFormAssociatedSelector?.() || "",
+        __tilefinchRealmGlobal.__tilefinchFormAssociatedSelector?.() || "",
       ownerOf = (child) => {
         const internals =
-          globalThis.__tilefinchElementInternalsFor?.(child);
+          __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(child);
         if (internals) {
           try {
             return internals.form;
@@ -1907,7 +1897,7 @@
             return null;
           }
         }
-        if (globalThis.__tilefinchFormAssociatedCustomElement?.(child)) {
+        if (__tilefinchRealmGlobal.__tilefinchFormAssociatedCustomElement?.(child)) {
           const formAttribute = child.getAttribute?.("form");
           return formAttribute
             ? document.getElementById(formAttribute)
@@ -1922,7 +1912,7 @@
             "image";
         return tag === "button" || tag === "fieldset" || tag === "object" ||
           tag === "output" || tag === "select" || tag === "textarea" ||
-          !!globalThis.__tilefinchFormAssociatedCustomElement?.(child);
+          !!__tilefinchRealmGlobal.__tilefinchFormAssociatedCustomElement?.(child);
       },
       append = (child) => {
         if (seen.has(child) || !listed(child)) return false;
@@ -1969,7 +1959,7 @@
        be modified by the page. */
     cachedFormControls = (form) => {
       const version = nativeDomVersion?.(true),
-        custom = globalThis.__tilefinchFormAssociatedSelector?.() || "";
+        custom = __tilefinchRealmGlobal.__tilefinchFormAssociatedSelector?.() || "";
       if (typeof version !== "number" || version < 0)
         return formControls(form);
       const cached = formControlCache.get(form);
@@ -2099,13 +2089,13 @@
       selected ? "true" : "false",
     );
   };
-  globalThis.__tilefinchOptionSelected = (option) => {
+  __tilefinchRealmGlobal.__tilefinchOptionSelected = (option) => {
     const select = optionOwner(option);
     return select instanceof HTMLSelectElement
       ? selectedOptionSet(select).includes(option)
       : rawOptionSelected(option);
   };
-  globalThis.__tilefinchSetOptionSelected = (option, selected) => {
+  __tilefinchRealmGlobal.__tilefinchSetOptionSelected = (option, selected) => {
     selected = !!selected;
     const select = optionOwner(option);
     if (selected && select instanceof HTMLSelectElement && !select.multiple)
@@ -2114,11 +2104,11 @@
     markOptionSelected(option, selected);
     if (select instanceof HTMLSelectElement) syncSelectedContent(select);
   };
-  globalThis.__tilefinchSelectValue = (select) => {
+  __tilefinchRealmGlobal.__tilefinchSelectValue = (select) => {
     const option = selectedOptionSet(select)[0];
     return option ? option.value : "";
   };
-  globalThis.__tilefinchSetSelectValue = (select, value) => {
+  __tilefinchRealmGlobal.__tilefinchSetSelectValue = (select, value) => {
     const options = selectOptions(select),
       chosen = options.find((option) => option.value === String(value)) || null;
     for (const peer of options) markOptionSelected(peer, peer === chosen);
@@ -2263,7 +2253,7 @@
       },
     },
   });
-  globalThis.Option = function Option(
+  __tilefinchRealmGlobal.Option = function Option(
     text = "",
     value,
     defaultSelected = false,
@@ -2284,13 +2274,13 @@
         .map((node) => node.data)
         .join(""),
     normalizeLineBreaks = (value) => String(value).replace(/\r\n?/g, "\n");
-  globalThis.__tilefinchTextAreaValue = (textarea) =>
+  __tilefinchRealmGlobal.__tilefinchTextAreaValue = (textarea) =>
     normalizeLineBreaks(
       controlStateHas(textareaValues, textarea)
         ? controlStateGet(textareaValues, textarea)
         : textareaDefaultValue(textarea),
     );
-  globalThis.__tilefinchSetTextAreaValue = (textarea, value) => {
+  __tilefinchRealmGlobal.__tilefinchSetTextAreaValue = (textarea, value) => {
     const text = value === null ? "" : String(value);
     controlStateSet(textareaValues, textarea, text);
     __tilefinchSetControlValue(textarea.__handle, text);
@@ -2343,7 +2333,7 @@
       time: /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/,
       "datetime-local": /^\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/,
     };
-  globalThis.__tilefinchControlType = (control) => {
+  __tilefinchRealmGlobal.__tilefinchControlType = (control) => {
     const tag = String(control.tagName).toLowerCase(),
       raw = String(control.getAttribute("type") || "").toLowerCase();
     if (tag === "button")
@@ -2360,7 +2350,7 @@
       if (id && id !== stable) keys.push(id);
       return keys;
     };
-  globalThis.__tilefinchInputValue = (input) => {
+  __tilefinchRealmGlobal.__tilefinchInputValue = (input) => {
     const type = __tilefinchControlType(input),
       attribute = input.getAttribute("value");
     if (type === "file") return "";
@@ -2372,7 +2362,7 @@
     if (type === "color" && attribute === null) return "#000000";
     return attribute || "";
   };
-  globalThis.__tilefinchSetInputValue = (input, value) => {
+  __tilefinchRealmGlobal.__tilefinchSetInputValue = (input, value) => {
     const type = __tilefinchControlType(input);
     if (type === "checkbox" || type === "radio") {
       input.setAttribute("value", value === null ? "" : String(value));
@@ -2417,11 +2407,11 @@
     controlStateSet(inputValues, input, text);
     __tilefinchSetControlValue(input.__handle, text);
   };
-  globalThis.__tilefinchResetInputValue = (input) => {
+  const resetInputValue = (input) => {
     controlStateDelete(inputValues, input);
     __tilefinchSetControlValue(input.__handle, __tilefinchInputValue(input));
   };
-  globalThis.__tilefinchSyncNativeControlValue = (control, value) => {
+  __tilefinchRealmGlobal.__tilefinchSyncNativeControlValue = (control, value) => {
     const tag = String(control?.localName || control?.tagName).toLowerCase();
     for (const key of nativeControlKeys(control)) {
       if (nativeControlValues.has(key)) nativeControlValues.delete(key);
@@ -2503,14 +2493,14 @@
     webkitExitFullscreen = () => exitFullscreen();
   document.exitFullscreen = exitFullscreen;
   document.webkitExitFullscreen = webkitExitFullscreen;
-  globalThis.__tilefinchExitFullscreenFromHost = () => leaveFullscreen(true);
-  globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
+  __tilefinchRealmGlobal.__tilefinchExitFullscreenFromHost = () => leaveFullscreen(true);
+  __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
     if (fullscreenElement?.__handle === Number(handle)) leaveFullscreen(true);
   });
 
   const indeterminateState = new Map(),
     checkedDefaultState = new Map();
-  globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
+  __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
     handle = Number(handle);
     optionSelectedState.delete(handle);
     selectedCollections.delete(handle);
@@ -2519,7 +2509,7 @@
     indeterminateState.delete(handle);
     checkedDefaultState.delete(handle);
   });
-  delete globalThis.__tilefinchRegisterNativeNodeStateCleanup;
+  delete __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup;
   Object.defineProperty(HTMLInputElement.prototype, "indeterminate", {
     configurable: true,
     get() {
@@ -2531,7 +2521,7 @@
       this.toggleAttribute("data-tilefinch-indeterminate", value);
     },
   });
-  globalThis.__tilefinchCopyFormCloneState = (source, clone, deep = false) => {
+  __tilefinchRealmGlobal.__tilefinchCopyFormCloneState = (source, clone, deep = false) => {
     const copyControl = (from, to) => {
       if (!from || !to) return;
       const tag = String(from.localName || "").toLowerCase();
@@ -2555,7 +2545,7 @@
         copyControl(fromControls[index], toControls[index]);
     }
   };
-  globalThis.__tilefinchSetChecked = (input, checked) => {
+  __tilefinchRealmGlobal.__tilefinchSetChecked = (input, checked) => {
     if (!(input instanceof HTMLInputElement)) {
       input.toggleAttribute("checked", checked);
       return;
@@ -2586,14 +2576,14 @@
     }
     input.toggleAttribute("checked", checked);
   };
-  globalThis.__tilefinchResetChecked = (input) => {
+  const resetChecked = (input) => {
     const checked = controlStateHas(checkedDefaultState, input)
       ? !!controlStateGet(checkedDefaultState, input)
       : input.hasAttribute("checked");
     input.checked = checked;
     controlStateDelete(checkedDefaultState, input);
   };
-  globalThis.ValidityState = class ValidityState {
+  __tilefinchRealmGlobal.ValidityState = class ValidityState {
     constructor(fields) {
       Object.assign(this, fields);
     }
@@ -2862,10 +2852,10 @@
     )
       return true;
     const internals =
-      globalThis.__tilefinchElementInternalsFor?.(element);
+      __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(element);
     if (
       !internals &&
-      !globalThis.__tilefinchFormAssociatedCustomElement?.(element)
+      !__tilefinchRealmGlobal.__tilefinchFormAssociatedCustomElement?.(element)
     )
       return false;
     if (!internals) return true;
@@ -2902,7 +2892,7 @@
         if (!control) return null;
         if ("form" in control) return control.form;
         try {
-          return globalThis.__tilefinchElementInternalsFor?.(control)?.form ||
+          return __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control)?.form ||
             null;
         } catch (_) {
           return null;
@@ -3125,7 +3115,7 @@
     let valid = true;
     for (const control of formControls(this)) {
       const internals =
-        globalThis.__tilefinchElementInternalsFor?.(control);
+        __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control);
       if (
         (typeof control.checkValidity === "function" &&
           !control.checkValidity()) ||
@@ -3145,9 +3135,9 @@
     const resetCallbacks = [];
     for (const control of formControls(form)) {
       if (control instanceof HTMLInputElement) {
-        __tilefinchResetInputValue(control);
+        resetInputValue(control);
         if (["checkbox", "radio"].includes(control.type))
-          __tilefinchResetChecked(control);
+          resetChecked(control);
       } else if (control instanceof HTMLTextAreaElement)
         control.value = control.defaultValue;
       else if (control instanceof HTMLSelectElement) {
@@ -3169,7 +3159,7 @@
     const invokeCustomCallbacks = () => {
       for (const [control, callback] of resetCallbacks)
         try {
-          globalThis.__tilefinchRunTask(
+          __tilefinchRealmGlobal.__tilefinchRunTask(
             "custom-element:formResetCallback",
             callback,
             control,
@@ -3187,7 +3177,7 @@
   HTMLFormElement.prototype.reset = function reset() {
     resetForm(this);
   };
-  globalThis.__tilefinchResetFormFromActivation = (form) =>
+  __tilefinchRealmGlobal.__tilefinchResetFormFromActivation = (form) =>
     resetForm(form, true);
   Object.defineProperties(HTMLButtonElement.prototype, {
     form: {
@@ -3204,7 +3194,7 @@
     reflectBoolean("formNoValidate"),
   );
   const constructingFormData = new WeakSet();
-  globalThis.FormData = class FormData {
+  __tilefinchRealmGlobal.FormData = class FormData {
     constructor(form) {
       this.items = [];
       if (form !== undefined) {
@@ -3221,7 +3211,7 @@
           )
             continue;
           const internals =
-            globalThis.__tilefinchElementInternalsFor?.(control);
+            __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control);
           if (internals) {
             const value = internals.__formValue;
             if (value instanceof FormData)
@@ -3368,7 +3358,7 @@
   /* The url-encoded entry list a script-initiated submission sends, after
      `formdata` listeners; null for multipart/file forms, which the native
      serializer handles. */
-  globalThis.__tilefinchSubmissionBody = (form, submitter) => {
+  __tilefinchRealmGlobal.__tilefinchSubmissionBody = (form, submitter) => {
     const enctype = String(
       submitter?.getAttribute?.("formenctype") ??
         form.getAttribute("enctype") ??
@@ -3386,7 +3376,7 @@
     }
     return params.toString();
   };
-  globalThis.__tilefinchQueueFormSubmission = (form, submitter) => {
+  __tilefinchRealmGlobal.__tilefinchQueueFormSubmission = (form, submitter) => {
     if (!(form instanceof HTMLFormElement)) return false;
     const target = String(
       submitter?.getAttribute?.("formtarget") ??
@@ -3450,7 +3440,7 @@
       if (!state) throw new TypeError("Blob required");
       if (
         trustedMapSize(blobURLs) >= blobURLLimit ||
-        blobURLBytes + state.bytes.byteLength > blobURLByteLimit
+        state.bytes.byteLength > blobURLByteLimit - blobURLBytes
       )
         throw new RangeError("blob URL quota exceeded");
       const url = "blob:" + location.origin + "/" + blobURLIdentifier();
@@ -3473,49 +3463,17 @@
   /* Worker binds policy and retained source to one WebIDL conversion. Keep
      the conversion intrinsic private and make lookup accept only its already
      converted primitive so author String replacement cannot split identity. */
-  globalThis.__tilefinchTrustedString = (value) => trustedString(value);
-  globalThis.__tilefinchBlobForURL = (url) =>
+  __tilefinchRealmGlobal.__tilefinchTrustedString = (value) => trustedString(value);
+  __tilefinchRealmGlobal.__tilefinchBlobForURL = (url) =>
     typeof url === "string" ? trustedMapGet(blobURLs, url) || null : null;
   const workerSourceForBlob = (blob) => {
-    const state = trustedWeakMapGet(blobStates, blob);
-    if (!state) throw new TypeError("Blob required");
-    const bytes = state.bytes, length = state.length;
-    let out = "", i = 0;
-    while (i < length) {
-      const a = bytes[i++];
-      let cp, need = 0, minimum = 0;
-      if (a <= 127) cp = a;
-      else if (a >= 194 && a <= 223) {
-        cp = a & 31; need = 1; minimum = 128;
-      } else if (a >= 224 && a <= 239) {
-        cp = a & 15; need = 2; minimum = 2048;
-      } else if (a >= 240 && a <= 244) {
-        cp = a & 7; need = 3; minimum = 65536;
-      } else {
-        out += trustedStringFromCodePoint(null, 65533);
-        continue;
-      }
-      if (i + need > length) {
-        out += trustedStringFromCodePoint(null, 65533);
-        break;
-      }
-      let valid = true;
-      for (let j = 0; j < need; j++) {
-        const b = bytes[i + j];
-        if ((b & 192) !== 128) { valid = false; break; }
-        cp = (cp << 6) | (b & 63);
-      }
-      if (!valid || cp < minimum || cp > 1114111
-          || (cp >= 55296 && cp <= 57343)) {
-        out += trustedStringFromCodePoint(null, 65533);
-        continue;
-      }
-      i += need;
-      out += trustedStringFromCodePoint(null, cp);
-    }
-    return out;
+    /* Private immutable bytes need no copy. The shared decoder handles valid
+       text natively and malformed sequences with the Encoding rules, rather
+       than concatenating every worker source character in JavaScript. */
+    return trustedFunctionApply(decodeBlobText,
+      new BlobTextDecoder("utf-8", { ignoreBOM: true }), [blobBytes(blob)]);
   };
-  Object.defineProperty(globalThis, "__tilefinchWorkerIntrinsics", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchWorkerIntrinsics", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -3541,7 +3499,7 @@
      objects, so a wide shallow message and a deep narrow one both fail
      predictably instead of exhausting the 5 MiB realm. */
   const cloneError = (message) => {
-    const DOMExceptionType = globalThis.DOMException;
+    const DOMExceptionType = __tilefinchRealmGlobal.DOMException;
     return typeof DOMExceptionType === "function"
       ? new DOMExceptionType(message, "DataCloneError")
       : new TypeError(message);
@@ -3561,8 +3519,8 @@
         if (typeof realm[name] === "function") intrinsics[name] = realm[name];
       return Object.freeze(intrinsics);
     },
-    ownerWorkerCloneIntrinsics = captureWorkerCloneIntrinsics(globalThis);
-  Object.defineProperty(globalThis, "__tilefinchWorkerCloneIntrinsics", {
+    ownerWorkerCloneIntrinsics = captureWorkerCloneIntrinsics(__tilefinchRealmGlobal);
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchWorkerCloneIntrinsics", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -3587,7 +3545,7 @@
         const tag = trustedObjectDescriptor(at, Symbol.toStringTag);
         if (tag) {
           const constructor = trustedObjectDescriptor(at, "constructor");
-          if (globalThis.__tilefinchIsNativeFunction?.(constructor?.value))
+          if (isNativeFunction(constructor?.value))
             return 0;
           userTag = true;
         }
@@ -3612,7 +3570,7 @@
     /* Proxy is never structured-cloneable. Reject by native brand before
        prototype/key inspection so no getPrototypeOf, ownKeys, get or getter
        trap can run as a side effect of postMessage/structuredClone. */
-    if (globalThis.__tilefinchIsProxy(value))
+    if (__tilefinchRealmGlobal.__tilefinchIsProxy(value))
       throw cloneError("Proxy values could not be cloned");
     const memory = state.memory;
     if (memory.has(value)) return memory.get(value);
@@ -3675,7 +3633,7 @@
         ),
       );
     }
-    const cloneWasmModule = globalThis.__tilefinchCloneWasmModule;
+    const cloneWasmModule = __tilefinchRealmGlobal.__tilefinchCloneWasmModule;
     if (typeof cloneWasmModule === "function") {
       const module = cloneWasmModule(value);
       if (module !== null) return remember(module);
@@ -3783,7 +3741,7 @@
     }
     throw cloneError("unsupported worker message value");
   };
-  const detachArrayBuffer = globalThis.__tilefinchDetachArrayBuffer,
+  const detachArrayBuffer = __tilefinchRealmGlobal.__tilefinchDetachArrayBuffer,
     collectWorkerTransferList = (sequence) => {
       if (sequence === undefined) return [];
       let values;
@@ -3802,7 +3760,7 @@
         } catch (_) {
           kind = 1;
         }
-        if (kind === 1 && typeof globalThis
+        if (kind === 1 && typeof __tilefinchRealmGlobal
             .__tilefinchPrepareMessagePortTransfer !== "function")
           throw cloneError("unsupported transferable object");
         if (seen.has(value))
@@ -3820,7 +3778,7 @@
         preparedPorts = [];
       for (const entry of transferList) {
         if (entry.kind !== 1) continue;
-        const prepared = globalThis.__tilefinchPrepareMessagePortTransfer(
+        const prepared = __tilefinchRealmGlobal.__tilefinchPrepareMessagePortTransfer(
           entry.value, intrinsics.MessagePort?.prototype);
         if (!prepared) throw cloneError("unsupported transferable object");
         if (preparedPorts.some((item) =>
@@ -3847,19 +3805,19 @@
       }
       return copy;
     };
-  globalThis.__tilefinchCloneWorkerValue = cloneWorkerValue;
-  if (globalThis.structuredClone === undefined)
-    globalThis.structuredClone = {
+  __tilefinchRealmGlobal.__tilefinchCloneWorkerValue = cloneWorkerValue;
+  if (__tilefinchRealmGlobal.structuredClone === undefined)
+    __tilefinchRealmGlobal.structuredClone = {
       structuredClone: (value, options = undefined) =>
         cloneWorkerValue(value, ownerWorkerCloneIntrinsics, options?.transfer),
     }.structuredClone;
   const tilefinchCurrentDocumentURL =
-      globalThis.__tilefinchCurrentDocumentURL,
+      __tilefinchRealmGlobal.__tilefinchCurrentDocumentURL,
     tilefinchDocumentURLRevision =
-      globalThis.__tilefinchDocumentURLRevision,
+      __tilefinchRealmGlobal.__tilefinchDocumentURLRevision,
     /* The document's URL as script sees it; Location reads through it. */
     locationURL = new TilefinchURL(
-      String(globalThis.__tilefinchLocationHref || "https://example.invalid/"),
+      String(__tilefinchRealmGlobal.__tilefinchLocationHref || "https://example.invalid/"),
     ),
     locationPartNames = [
       "protocol",
@@ -3918,7 +3876,7 @@
      host setup flips this once (event_loop.inc), since the unforgeable
      members cannot be redefined. */
   let locationOpaqueOrigin = false;
-  Object.defineProperty(globalThis, "__tilefinchMarkLocationOpaque", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchMarkLocationOpaque", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -3988,7 +3946,7 @@
     if ("value" in descriptor) descriptor.writable = false;
     Object.defineProperty(location, key, descriptor);
   }
-  globalThis.Location = Location;
+  __tilefinchRealmGlobal.Location = Location;
   Object.defineProperty(document, "forms", {
     configurable: true,
     enumerable: true,
@@ -3996,7 +3954,7 @@
       return document.querySelectorAll("form");
     },
   });
-  globalThis.__tilefinchQualifiedElementName = (namespace, qualifiedName) => {
+  const qualifiedElementName = (namespace, qualifiedName) => {
     const namespaceURI =
         namespace === null || namespace === undefined || namespace === ""
           ? null
@@ -4026,8 +3984,8 @@
   {
     const htmlNamespace = "http://www.w3.org/1999/xhtml",
       detachedPrototypes = new Map(),
-      adoptAttributeObjects = globalThis.__tilefinchAdoptAttributeObjects,
-      setNodeOwner = globalThis.__tilefinchSetNodeOwner,
+      adoptAttributeObjects = __tilefinchRealmGlobal.__tilefinchAdoptAttributeObjects,
+      setNodeOwner = __tilefinchRealmGlobal.__tilefinchSetNodeOwner,
       collectAdoption = (node, owner, records) => {
         if (!node || node.nodeType === Node.DOCUMENT_NODE) return;
         const previousOwner = node.ownerDocument || null;
@@ -4040,7 +3998,7 @@
             attribute.__tilefinchAttributeOwnerDocument = owner;
         if (previousOwner && previousOwner !== owner)
           records.push({ node, oldDocument: previousOwner, newDocument: owner });
-        const shadow = globalThis.__tilefinchShadowRootForHost?.(node);
+        const shadow = __tilefinchRealmGlobal.__tilefinchShadowRootForHost?.(node);
         if (shadow) {
           if ("__detachedOwner" in shadow) shadow.__detachedOwner = owner;
           else setNodeOwner(shadow, owner);
@@ -4058,16 +4016,16 @@
         if (node?.ownerDocument === owner) return;
         const records = [];
         collectAdoption(node, owner, records);
-        globalThis.__tilefinchPrepareCustomElementAdoptions?.(records);
+        __tilefinchRealmGlobal.__tilefinchPrepareCustomElementAdoptions?.(records);
         try {
           for (const record of records)
-            globalThis.__tilefinchCustomElementAdopted?.(
+            __tilefinchRealmGlobal.__tilefinchCustomElementAdopted?.(
               record.node,
               record.oldDocument,
               record.newDocument,
             );
         } finally {
-          globalThis.__tilefinchFinishCustomElementAdoptions?.();
+          __tilefinchRealmGlobal.__tilefinchFinishCustomElementAdoptions?.();
         }
       },
       detach = (node) => {
@@ -4086,9 +4044,9 @@
           node.__detachedParent = null;
           node.__tilefinchDetachedParent = null;
           if (connected)
-            globalThis.__tilefinchCustomElementDisconnected?.(node);
+            __tilefinchRealmGlobal.__tilefinchCustomElementDisconnected?.(node);
           else
-            globalThis.__tilefinchResyncCustomElementFormState?.(node);
+            __tilefinchRealmGlobal.__tilefinchResyncCustomElementFormState?.(node);
         }
         return node;
       },
@@ -4123,7 +4081,7 @@
             : parent.ownerDocument,
         );
         if (node instanceof HTMLIFrameElement)
-          globalThis.__tilefinchLoadLocalFrame?.(node);
+          __tilefinchRealmGlobal.__tilefinchLoadLocalFrame?.(node);
         let connected = !!parent.isConnected;
         for (let at = parent, steps = 0; at && steps < 64; steps++) {
           if (at.nodeType === Node.DOCUMENT_NODE) {
@@ -4133,9 +4091,9 @@
           at = at.__detachedParent;
         }
         if (connected)
-          globalThis.__tilefinchCustomElementConnected?.(node, true);
+          __tilefinchRealmGlobal.__tilefinchCustomElementConnected?.(node, true);
         else
-          globalThis.__tilefinchResyncCustomElementFormState?.(node);
+          __tilefinchRealmGlobal.__tilefinchResyncCustomElementFormState?.(node);
         return node;
       },
       sibling = (node, step) => {
@@ -4264,7 +4222,7 @@
           },
           attributes: {
             get() {
-              return globalThis.__tilefinchNamedNodeMapFor(
+              return __tilefinchRealmGlobal.__tilefinchNamedNodeMapFor(
                 this,
                 () => this.__detachedAttributeNodes.slice(),
               );
@@ -4343,27 +4301,27 @@
               this,
               (at) => at.__tilefinchDetachedParent || at.parentNode,
             );
-            globalThis.__tilefinchPrepareEvent(event, this, path);
+            __tilefinchRealmGlobal.__tilefinchPrepareEvent(event, this, path);
             for (
               let at = path.length - 1;
               at >= 1 && !event.__stopped;
               at--
             )
-              globalThis.__tilefinchInvokeEventTarget(
+              __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                 path[at],
                 event,
                 true,
                 Event.CAPTURING_PHASE,
               );
             if (!event.__stopped) {
-              globalThis.__tilefinchInvokeEventTarget(
+              __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                 this,
                 event,
                 true,
                 Event.AT_TARGET,
               );
               if (!event.__stopped)
-                globalThis.__tilefinchInvokeEventTarget(
+                __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                   this,
                   event,
                   false,
@@ -4372,13 +4330,13 @@
             }
             if (event.bubbles && !event.__stopped)
               for (let at = 1; at < path.length && !event.__stopped; at++)
-                globalThis.__tilefinchInvokeEventTarget(
+                __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                   path[at],
                   event,
                   false,
                   Event.BUBBLING_PHASE,
                 );
-            globalThis.__tilefinchFinishEventDispatch(event);
+            __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(event);
             return !event.defaultPrevented;
           },
           appendChild(node) {
@@ -4443,7 +4401,7 @@
             ),
               oldValue = attribute?.value ?? null;
             if (!attribute) {
-              attribute = globalThis.__tilefinchCreateAttribute(
+              attribute = __tilefinchRealmGlobal.__tilefinchCreateAttribute(
                 this.ownerDocument,
                 name,
               );
@@ -4452,8 +4410,8 @@
             }
             attribute.__tilefinchAttributeValue = String(value);
             if (name === "style")
-              globalThis.__tilefinchInvalidateDetachedStyle?.(this);
-            globalThis.__tilefinchCustomElementAttributeChanged?.(
+              __tilefinchRealmGlobal.__tilefinchInvalidateDetachedStyle?.(this);
+            __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
               this,
               name,
               oldValue,
@@ -4491,7 +4449,7 @@
             ),
               oldValue = attribute?.value ?? null;
             if (!attribute) {
-              attribute = globalThis.__tilefinchCreateAttribute(
+              attribute = __tilefinchRealmGlobal.__tilefinchCreateAttribute(
                 this.ownerDocument,
                 qualifiedName,
                 namespace,
@@ -4504,8 +4462,8 @@
             attribute.__tilefinchAttributePrefix = prefix;
             attribute.__tilefinchAttributeValue = String(value);
             if (namespace === null && localName === "style")
-              globalThis.__tilefinchInvalidateDetachedStyle?.(this);
-            globalThis.__tilefinchCustomElementAttributeChanged?.(
+              __tilefinchRealmGlobal.__tilefinchInvalidateDetachedStyle?.(this);
+            __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
               this,
               localName,
               oldValue,
@@ -4533,8 +4491,8 @@
               const [attribute] = this.__detachedAttributeNodes.splice(at, 1);
               attribute.__tilefinchAttributeOwner = null;
               if (name === "style")
-                globalThis.__tilefinchInvalidateDetachedStyle?.(this);
-              globalThis.__tilefinchCustomElementAttributeChanged?.(
+                __tilefinchRealmGlobal.__tilefinchInvalidateDetachedStyle?.(this);
+              __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
                 this,
                 attribute.localName,
                 attribute.value,
@@ -4558,8 +4516,8 @@
               const [attribute] = this.__detachedAttributeNodes.splice(at, 1);
               attribute.__tilefinchAttributeOwner = null;
               if (namespace === null && localName === "style")
-                globalThis.__tilefinchInvalidateDetachedStyle?.(this);
-              globalThis.__tilefinchCustomElementAttributeChanged?.(
+                __tilefinchRealmGlobal.__tilefinchInvalidateDetachedStyle?.(this);
+              __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
                 this,
                 attribute.localName,
                 attribute.value,
@@ -4626,7 +4584,7 @@
         };
         return proto;
       })();
-    globalThis.__tilefinchBindDetachedAttributeMethods?.((name) =>
+    __tilefinchRealmGlobal.__tilefinchBindDetachedAttributeMethods?.((name) =>
       Object.getOwnPropertyDescriptor(elementPrototype(Element.prototype),
                                       name)?.value);
     const detachedDocument = (
@@ -4865,7 +4823,7 @@
       });
       doc.createElement = (tag) => makeElement(tag);
       doc.createElementNS = (namespace, tag) => {
-        const qualified = globalThis.__tilefinchQualifiedElementName(
+        const qualified = qualifiedElementName(
           namespace,
           tag,
         );
@@ -5010,7 +4968,7 @@
       }
       return doc;
     };
-    globalThis.__tilefinchCreateFrameDocument = (standards = true) =>
+    __tilefinchRealmGlobal.__tilefinchCreateFrameDocument = (standards = true) =>
       detachedDocument(
         undefined,
         false,
@@ -5020,9 +4978,9 @@
         true,
         standards ? "CSS1Compat" : "BackCompat",
       );
-    globalThis.__tilefinchNewDocument = () =>
+    __tilefinchRealmGlobal.__tilefinchNewDocument = () =>
       detachedDocument(undefined, false, null, null, "", false);
-    globalThis.DOMImplementation = class DOMImplementation {
+    __tilefinchRealmGlobal.DOMImplementation = class DOMImplementation {
       constructor(token) {
         if (token !== implementationToken)
           throw new TypeError("Illegal constructor");
@@ -5057,14 +5015,14 @@
         if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
         let value = implementations.get(this);
         if (!value) {
-          value = new globalThis.DOMImplementation(implementationToken);
+          value = new __tilefinchRealmGlobal.DOMImplementation(implementationToken);
           implementations.set(this, value);
         }
         return value;
       },
     }, "implementation"));
-    globalThis.__tilefinchAdoptNodeOwner = adoptOwner;
-    globalThis.__tilefinchDetachNode = detach;
+    __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner = adoptOwner;
+    detachNode = detach;
   }
   document.adoptNode = (node) => {
     if (node instanceof Document)
@@ -5073,7 +5031,7 @@
     if (node === document.doctype && "__detachedParent" in node)
       node.__detachedParent = null;
     else if (node.parentNode?.removeChild) node.parentNode.removeChild(node);
-    else __tilefinchDetachNode(node);
+    else detachNode(node);
     __tilefinchAdoptNodeOwner(node, document);
     return node;
   };
@@ -5085,7 +5043,7 @@
         "NotSupportedError",
       );
     const clone = node.cloneNode(!!deep);
-    globalThis.__tilefinchAdoptNodeOwner?.(clone, this);
+    __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner?.(clone, this);
     return clone;
   };
   Object.defineProperties(document, {
@@ -5094,7 +5052,7 @@
     ownerDocument: { configurable: true, enumerable: true, value: null },
     contentType: { configurable: true, enumerable: true, value: "text/html" },
     compatMode: { configurable: true, enumerable: true, value: "CSS1Compat" },
-    defaultView: { configurable: true, enumerable: true, value: globalThis },
+    defaultView: { configurable: true, enumerable: true, value: __tilefinchRealmGlobal },
   });
   /* [LegacyUnforgeable]: document.location is the document's only own
      property in browsers, an accessor onto window.location. */
@@ -5112,7 +5070,7 @@
     get images() {
       let collection = imagesCollections.get(this);
       if (!collection) {
-        collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+        collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
           Array.from(this.querySelectorAll("img")),
         );
         imagesCollections.set(this, collection);
@@ -5129,7 +5087,7 @@
       get links() {
         let collection = linksCollections.get(this);
         if (!collection) {
-          collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+          collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
             Array.from(this.querySelectorAll("a[href],area[href]")),
           );
           linksCollections.set(this, collection);
@@ -5141,7 +5099,7 @@
       get anchors() {
         let collection = anchorsCollections.get(this);
         if (!collection) {
-          collection = globalThis.__tilefinchLiveHTMLCollection(() =>
+          collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
             Array.from(this.querySelectorAll("a[name]")),
           );
           anchorsCollections.set(this, collection);
@@ -5205,7 +5163,7 @@
   });
   {
     const stats = { writes: 0, text: "" };
-    globalThis.__tilefinchClipboardStats = stats;
+    __tilefinchRealmGlobal.__tilefinchClipboardStats = stats;
     const write = (value) => {
       value = String(value);
       if (value.length > 16384)
@@ -5217,7 +5175,7 @@
     document.execCommand = (command) => {
       command = String(command).toLowerCase();
       if (command !== "copy" && command !== "cut") return false;
-      const control = globalThis.__tilefinchSelectedControl;
+      const control = __tilefinchRealmGlobal.__tilefinchSelectedControl;
       if (!control || control.selectionStart === null) return false;
       write(
         String(control.value).slice(
@@ -5236,7 +5194,7 @@
       queryCommandEnabled = (command) => queryCommandSupported(command);
     document.queryCommandSupported = queryCommandSupported;
     document.queryCommandEnabled = queryCommandEnabled;
-    globalThis.__tilefinchClipboardWrite = write;
+    __tilefinchRealmGlobal.__tilefinchClipboardWrite = write;
   }
   Object.defineProperty(document, "lang", {
     configurable: true,
@@ -5370,7 +5328,7 @@
     activeElementValue = document.body;
   /* The focused element is browser state, kept off the document object
      (pages see it only through document.activeElement). */
-  Object.defineProperty(globalThis, "__tilefinchActiveElement", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchActiveElement", {
     configurable: false,
     enumerable: false,
     get() {
@@ -5387,7 +5345,7 @@
       activeElementHandle = Number(activeElementValue?.__handle) || 0;
     },
   });
-  globalThis.__tilefinchSetFocusHandle = (handle) => {
+  __tilefinchRealmGlobal.__tilefinchSetFocusHandle = (handle) => {
     handle = Number(handle) || 0;
     if (!handle) return false;
     if (activeElementHandle && activeElementHandle !== handle)
@@ -5404,9 +5362,9 @@
     configurable: true,
     enumerable: true,
     get() {
-      const active = globalThis.__tilefinchActiveElement || document.body;
+      const active = __tilefinchRealmGlobal.__tilefinchActiveElement || document.body;
       return (
-        globalThis.__tilefinchRetargetShadowEvent?.(active, document) ||
+        __tilefinchRealmGlobal.__tilefinchRetargetShadowEvent?.(active, document) ||
         active
       );
     },
@@ -5555,7 +5513,7 @@
       }
       return fragment;
     };
-  globalThis.Range = class Range {
+  __tilefinchRealmGlobal.Range = class Range {
     constructor() {
       this.startContainer = document;
       this.startOffset = 0;
@@ -5883,11 +5841,11 @@
   };
   const selectionChanged = () =>
     document.dispatchEvent(new Event("selectionchange"));
-  globalThis.__tilefinchSelectionChanged = selectionChanged;
+  __tilefinchRealmGlobal.__tilefinchSelectionChanged = selectionChanged;
   const createRange = () => new Range();
   document.createRange = createRange;
   /* Window and Document each expose their own getSelection function. */
-  globalThis.getSelection = { getSelection: () => selection }.getSelection;
+  __tilefinchRealmGlobal.getSelection = { getSelection: () => selection }.getSelection;
   document.getSelection = { getSelection: () => selection }.getSelection;
   Object.setPrototypeOf(document, HTMLDocument.prototype);
   document.createElement = (tag) => {
@@ -5899,9 +5857,9 @@
      * their DOM identity in the bounded detached-node implementation even
      * though such names cannot participate in native layout.
      */
-    if (!node && globalThis.__tilefinchNewDocument) {
-      node = globalThis.__tilefinchNewDocument().createElement(tag);
-      globalThis.__tilefinchAdoptNodeOwner?.(node, document);
+    if (!node && __tilefinchRealmGlobal.__tilefinchNewDocument) {
+      node = __tilefinchRealmGlobal.__tilefinchNewDocument().createElement(tag);
+      __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner?.(node, document);
     }
     if (node) node.__tilefinchProgrammatic = true;
     return node;
@@ -5913,7 +5871,7 @@
     return image;
   }
   Image.prototype = HTMLImageElement.prototype;
-  globalThis.Image = Image;
+  __tilefinchRealmGlobal.Image = Image;
   {
     Object.defineProperties(HTMLImageElement.prototype, {
       srcset: reflectString("srcset"),
@@ -6049,7 +6007,7 @@
        play() method. The runtime captures and removes this bootstrap bridge
        before author code runs, so native state delivery can still obtain the
        same WeakMap record without trusting a mutable Window property. */
-    globalThis.__tilefinchMediaStateFor = (node) => {
+    __tilefinchRealmGlobal.__tilefinchMediaStateFor = (node) => {
       if (!(node instanceof HTMLMediaElement)) return null;
       return stateFor(node);
     };
@@ -6313,7 +6271,7 @@
       return audio;
     }
     Audio.prototype = HTMLAudioElement.prototype;
-    globalThis.Audio = Audio;
+    __tilefinchRealmGlobal.Audio = Audio;
   }
   document.createDocumentFragment = () => {
     const node = wrap(__tilefinchCreateFragment());
@@ -6338,7 +6296,7 @@
       namespace === null ? null : String(namespace),
     );
   document.createElementNS = (namespace, tag) => {
-    const qualified = globalThis.__tilefinchQualifiedElementName(namespace, tag);
+    const qualified = qualifiedElementName(namespace, tag);
     const node = wrap(
       __tilefinchCreate(qualified.name, qualified.namespaceURI),
     );
@@ -6348,7 +6306,7 @@
     }
     return node;
   };
-  globalThis.__tilefinchMaterializeDetachedNode = (node) => {
+  __tilefinchRealmGlobal.__tilefinchMaterializeDetachedNode = (node) => {
     if (!node || node.__handle !== undefined) return node;
     const owner = node.ownerDocument,
       parent = node.parentNode,
@@ -6378,15 +6336,17 @@
         },
       });
     if (node.nodeType === Node.ELEMENT_NODE) {
-      for (const [name, value] of node.__detachedAttributes || [])
-        connected.setAttribute(name, value);
+      /* Attr nodes are the authoritative detached representation; the
+         legacy attribute Map is no longer populated by the setters. */
+      for (const attribute of node.attributes || [])
+        connected.setAttributeNS(attribute.namespaceURI, attribute.name, attribute.value);
       for (const child of [...(node.childNodes || [])])
         connected.appendChild(__tilefinchMaterializeDetachedNode(child));
     }
     if (parent?.removeChild) parent.removeChild(node);
     // Detached shim nodes have own accessors. Materialize the native receiver
     // descriptors before copying so those accessors cannot shadow native state.
-    globalThis.__tilefinchPrepareNativePrototype?.(connected);
+    __tilefinchRealmGlobal.__tilefinchPrepareNativePrototype?.(connected);
     for (const [key, descriptor] of Object.entries(
       Object.getOwnPropertyDescriptors(connected),
     )) {
@@ -6395,10 +6355,10 @@
         Object.defineProperty(node, key, descriptor);
     }
     Object.setPrototypeOf(node, Object.getPrototypeOf(connected));
-    globalThis.__tilefinchSetNodeOwner(node, document);
+    __tilefinchRealmGlobal.__tilefinchSetNodeOwner(node, document);
     return node;
   };
-  globalThis.DOMParser = class DOMParser {
+  __tilefinchRealmGlobal.DOMParser = class DOMParser {
     parseFromString(input, type) {
       const source = String(input),
         mime = String(type).trim().toLowerCase();
@@ -6497,7 +6457,7 @@
   let focusObserverCount = 0,
     pointerMoveObserverCount = 0,
     pointerHoverObserverCount = 0;
-  globalThis.__tilefinchEventObserverDelta = (type, delta) => {
+  __tilefinchRealmGlobal.__tilefinchEventObserverDelta = (type, delta) => {
     const key = String(type),
       amount = Number(delta || 0);
     if (focusEventTypes.has(key))
@@ -6513,12 +6473,12 @@
         pointerHoverObserverCount + amount,
       );
   };
-  globalThis.__tilefinchFocusEventsObserved = () => focusObserverCount !== 0;
-  globalThis.__tilefinchPointerMoveEventsObserved = () =>
+  __tilefinchRealmGlobal.__tilefinchFocusEventsObserved = () => focusObserverCount !== 0;
+  __tilefinchRealmGlobal.__tilefinchPointerMoveEventsObserved = () =>
     pointerMoveObserverCount !== 0;
-  globalThis.__tilefinchPointerHoverEventsObserved = () =>
+  __tilefinchRealmGlobal.__tilefinchPointerHoverEventsObserved = () =>
     pointerHoverObserverCount !== 0;
-  globalThis.__tilefinchAddEventListener = (
+  __tilefinchRealmGlobal.__tilefinchAddEventListener = (
     map,
     type,
     callback,
@@ -6531,19 +6491,41 @@
       signal = typeof options === "object" ? options?.signal : null;
     if (!listenerCallable(callback)) return;
     if (signal !== null && signal !== undefined) {
-      const inspectSignal = globalThis.__tilefinchAbortSignalBrand;
+      const inspectSignal = __tilefinchRealmGlobal.__tilefinchAbortSignalBrand;
       if (typeof inspectSignal !== "function")
         throw new TypeError("AbortSignal required");
       if (inspectSignal(signal)) return;
     }
     if (!map.has(key)) map.set(key, []);
     const list = map.get(key);
-    if (
-      list.some(
-        (item) => item.callback === callback && item.capture === capture,
-      )
-    )
-      return;
+    /* Large lists occur on application message buses. Keep the optional
+       index on the owning list, not a global map that roots callback cycles.
+       Refusal or excessive cardinality falls back to the existing scan. */
+    if (list.length === 32 && list.listenerIndex === undefined) {
+      try {
+        const index = new Map();
+        for (let i = 0; i < list.length; i++) {
+          const registered = list[i], bit = registered.capture ? 2 : 1;
+          index.set(registered.callback,
+            (index.get(registered.callback) || 0) | bit);
+        }
+        list.listenerIndex = index;
+      } catch (_) {
+        list.listenerIndex = null;
+      }
+    }
+    const identity = capture ? 2 : 1;
+    let index = list.listenerIndex;
+    if (index && (index.get(callback) || 0) & identity) return;
+    /* This is internal identity lookup, not an author Array operation.
+       Avoid allocating/calling a predicate for every existing listener. */
+    if (!index) {
+      for (let at = 0; at < list.length; at++) {
+        const registered = list[at];
+        if (registered.callback === callback && registered.capture === capture)
+          return;
+      }
+    }
     const item = {
       callback,
       capture,
@@ -6555,13 +6537,22 @@
     };
     if (signal && typeof signal.addEventListener === "function") {
       item.abort = () =>
-        globalThis.__tilefinchRemoveEventListener(map, key, callback, capture);
-      globalThis.__tilefinchAddAbortAlgorithm(signal, item.abort);
+        __tilefinchRealmGlobal.__tilefinchRemoveEventListener(map, key, callback, capture);
+      __tilefinchRealmGlobal.__tilefinchAddAbortAlgorithm(signal, item.abort);
     }
     list.push(item);
-    globalThis.__tilefinchEventObserverDelta(key, 1);
+    if (index) {
+      try {
+        if (index.size >= 4096 && !index.has(callback))
+          list.listenerIndex = null;
+        else index.set(callback, (index.get(callback) || 0) | identity);
+      } catch (_) {
+        list.listenerIndex = null;
+      }
+    }
+    __tilefinchRealmGlobal.__tilefinchEventObserverDelta(key, 1);
   };
-  globalThis.__tilefinchRemoveEventListener = (
+  __tilefinchRealmGlobal.__tilefinchRemoveEventListener = (
     map,
     type,
     callback,
@@ -6575,15 +6566,20 @@
       );
     if (at < 0) return;
     const [item] = list.splice(at, 1);
+    if (list.listenerIndex) {
+      const bits = (list.listenerIndex.get(callback) || 0) & ~(capture ? 2 : 1);
+      if (bits) list.listenerIndex.set(callback, bits);
+      else list.listenerIndex.delete(callback);
+    }
     /* The DOM dispatch algorithm marks a removed listener before continuing
        the current event's cloned listener list.  Without this retained bit a
        listener removed by an earlier callback still runs once from our
        snapshot, which is observably wrong and can call stale teardown state. */
     item.active = false;
-    globalThis.__tilefinchEventObserverDelta(type, -1);
+    __tilefinchRealmGlobal.__tilefinchEventObserverDelta(type, -1);
     if (item.signal && item.abort)
       try {
-        globalThis.__tilefinchRemoveAbortAlgorithm(item.signal, item.abort);
+        __tilefinchRealmGlobal.__tilefinchRemoveAbortAlgorithm(item.signal, item.abort);
       } catch (_) {}
   };
   const invokeListenerItem = (
@@ -6600,7 +6596,7 @@
        registration belongs to the next event and must not be removed by
        cleanup for the current invocation. */
     if (item.once)
-      globalThis.__tilefinchRemoveEventListener(
+      __tilefinchRealmGlobal.__tilefinchRemoveEventListener(
         map,
         event.type,
         item.callback,
@@ -6609,8 +6605,8 @@
     event.__passive = item.passive;
     try {
       if (typeof item.callback === "function") {
-        globalThis.__tilefinchRecordEventHandler();
-        globalThis.__tilefinchRunTask(
+        __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
+        __tilefinchRealmGlobal.__tilefinchRunTask(
           "event:" + String(event.type),
           item.callback,
           target,
@@ -6623,8 +6619,8 @@
         const handleEvent = item.callback.handleEvent;
         if (typeof handleEvent !== "function")
           throw new TypeError("event listener handleEvent is not callable");
-        globalThis.__tilefinchRecordEventHandler();
-        globalThis.__tilefinchRunTask(
+        __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
+        __tilefinchRealmGlobal.__tilefinchRunTask(
           "event-object:" + String(event.type),
           handleEvent,
           item.callback,
@@ -6653,7 +6649,7 @@
     if (!observed)
       __tilefinchReportUncaught(pending.error, "event " + event.type);
   };
-  globalThis.__tilefinchInvokeListenerList = (
+  __tilefinchRealmGlobal.__tilefinchInvokeListenerList = (
     map,
     target,
     event,
@@ -6670,7 +6666,7 @@
       if (event.__immediateStopped) break;
     }
   };
-  globalThis.__tilefinchPrepareEvent = (event, target, path) => {
+  __tilefinchRealmGlobal.__tilefinchPrepareEvent = (event, target, path) => {
     if (!(event instanceof Event)) throw new TypeError("Event required");
     if (!event.__initialized || !String(event.type))
       throw new DOMException("Event is not initialized", "InvalidStateError");
@@ -6684,7 +6680,7 @@
     event.__passive = false;
     event.__path = path;
   };
-  globalThis.__tilefinchFinishEventDispatch = (event) => {
+  __tilefinchRealmGlobal.__tilefinchFinishEventDispatch = (event) => {
     event.currentTarget = null;
     event.eventPhase = Event.NONE;
     event.__dispatching = false;
@@ -6694,10 +6690,10 @@
     event.__immediateStopped = false;
     event.__passive = false;
   };
-  globalThis.__tilefinchInvokeDocumentEvent = (event, capture) => {
+  __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent = (event, capture) => {
     event.currentTarget = document;
     event.eventPhase = document === event.target ? 2 : capture ? 1 : 3;
-    globalThis.__tilefinchInvokeListenerList(
+    __tilefinchRealmGlobal.__tilefinchInvokeListenerList(
       documentListeners,
       document,
       event,
@@ -6706,18 +6702,18 @@
   };
   document.dispatchEvent = (event) => {
     const value = event,
-      path = [document, globalThis];
-    globalThis.__tilefinchPrepareEvent(value, document, path);
+      path = [document, __tilefinchRealmGlobal];
+    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, document, path);
     if (!value.__stopped)
-      globalThis.__tilefinchInvokeWindowEvent?.(value, true);
+      __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent?.(value, true);
     if (!value.__stopped) {
-      globalThis.__tilefinchInvokeDocumentEvent(value, true);
+      __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent(value, true);
       if (!value.__stopped)
-        globalThis.__tilefinchInvokeDocumentEvent(value, false);
+        __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent(value, false);
     }
     if (value.bubbles && !value.__stopped)
-      globalThis.__tilefinchInvokeWindowEvent?.(value, false);
-    globalThis.__tilefinchFinishEventDispatch(value);
+      __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent?.(value, false);
+    __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
@@ -6728,23 +6724,14 @@
     /* Listener callbacks often capture their target. A global WeakMap would
        root that cycle in our collector, which marks weak-map values. Keep
        the list on its owner, including frozen targets, without exposing an
-       author-mutable property. Small realms pay for the stamper lazily. */
-    let ListenerOwner;
+       author-mutable property. Small realms pay for the slot lazily. */
+    let listenerSlot = null;
     const mapFor = (target) => {
       if (target === document) return documentListeners;
-      if (!ListenerOwner) {
-        class OwnerBase { constructor(owner) { return owner; } }
-        ListenerOwner = class extends OwnerBase {
-          #listeners = new Map();
-          static get(owner) {
-            if (!(#listeners in owner)) new ListenerOwner(owner);
-            return owner.#listeners;
-          }
-        };
-      }
-      return ListenerOwner.get(target);
+      listenerSlot ||= createPrivateSlot();
+      return listenerSlot.get(target) ?? listenerSlot.set(target, new Map());
     };
-    globalThis.__tilefinchInvokeEventTarget = (
+    __tilefinchRealmGlobal.__tilefinchInvokeEventTarget = (
       target,
       event,
       capture,
@@ -6753,7 +6740,7 @@
     ) => {
       event.currentTarget = target;
       event.eventPhase = phase;
-      globalThis.__tilefinchInvokeListenerList(
+      __tilefinchRealmGlobal.__tilefinchInvokeListenerList(
         mapFor(target),
         target,
         event,
@@ -6767,7 +6754,7 @@
        synchronous because its caller is still on the stack. Continue native
        delivery through the host's bounded checkpoint queue so long promise
        chains can yield without changing either ordering or event lifetime. */
-    globalThis.__tilefinchInvokeEventTargetCheckpointed = (
+    __tilefinchRealmGlobal.__tilefinchInvokeEventTargetCheckpointed = (
       target,
       event,
       phase,
@@ -6873,25 +6860,25 @@
         throw error;
       }
     };
-    globalThis.__tilefinchDispatchEventTargetCheckpointed = (
+    __tilefinchRealmGlobal.__tilefinchDispatchEventTargetCheckpointed = (
       target,
       event,
       complete = null,
       errorObserver = null,
     ) => {
       const value = event;
-      globalThis.__tilefinchPrepareEvent(value, target, [target]);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, target, [target]);
       let finished = false;
       const finish = () => {
         if (finished) return;
         finished = true;
-        globalThis.__tilefinchFinishEventDispatch(value);
+        __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
         __tilefinchRecordEvent();
         if (typeof complete === "function") complete();
       };
       try {
         if (value.__stopped) finish();
-        else globalThis.__tilefinchInvokeEventTargetCheckpointed(
+        else __tilefinchRealmGlobal.__tilefinchInvokeEventTargetCheckpointed(
           target,
           value,
           Event.AT_TARGET,
@@ -6909,7 +6896,7 @@
       callback,
       options = false,
     ) {
-      return globalThis.__tilefinchAddEventListener(
+      return __tilefinchRealmGlobal.__tilefinchAddEventListener(
         mapFor(this),
         type,
         callback,
@@ -6921,7 +6908,7 @@
       callback,
       options = false,
     ) {
-      return globalThis.__tilefinchRemoveEventListener(
+      return __tilefinchRealmGlobal.__tilefinchRemoveEventListener(
         mapFor(this),
         type,
         callback,
@@ -6929,18 +6916,18 @@
       );
     };
     EventTarget.prototype.dispatchEvent = function dispatchEvent(event) {
-      if (this === globalThis) return dispatchWindowEvent(event);
+      if (this === __tilefinchRealmGlobal) return dispatchWindowEvent(event);
       const value = event,
         map = mapFor(this);
-      globalThis.__tilefinchPrepareEvent(value, this, [this]);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, this, [this]);
       if (!value.__stopped) {
         value.currentTarget = this;
         value.eventPhase = 2;
-        globalThis.__tilefinchInvokeListenerList(map, this, value, true);
+        __tilefinchRealmGlobal.__tilefinchInvokeListenerList(map, this, value, true);
         if (!value.__stopped)
-          globalThis.__tilefinchInvokeListenerList(map, this, value, false);
+          __tilefinchRealmGlobal.__tilefinchInvokeListenerList(map, this, value, false);
       }
-      globalThis.__tilefinchFinishEventDispatch(value);
+      __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
       __tilefinchRecordEvent();
       return !value.defaultPrevented;
     };
@@ -6951,23 +6938,23 @@
         this,
         (at) => at.__tilefinchDetachedParent || at.parentNode,
       );
-      globalThis.__tilefinchPrepareEvent(event, this, path);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(event, this, path);
       for (let at = path.length - 1; at >= 1 && !event.__stopped; at--)
-        globalThis.__tilefinchInvokeEventTarget(
+        __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
           path[at],
           event,
           true,
           Event.CAPTURING_PHASE,
         );
       if (!event.__stopped) {
-        globalThis.__tilefinchInvokeEventTarget(
+        __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
           this,
           event,
           true,
           Event.AT_TARGET,
         );
         if (!event.__stopped)
-          globalThis.__tilefinchInvokeEventTarget(
+          __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
             this,
             event,
             false,
@@ -6976,19 +6963,19 @@
       }
       if (event.bubbles && !event.__stopped)
         for (let at = 1; at < path.length && !event.__stopped; at++)
-          globalThis.__tilefinchInvokeEventTarget(
+          __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
             path[at],
             event,
             false,
             Event.BUBBLING_PHASE,
           );
-      globalThis.__tilefinchFinishEventDispatch(event);
+      __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(event);
       return !event.defaultPrevented;
     };
   }
   headWrapper = wrap(__tilefinchQuery("head"));
-  globalThis.__tilefinchRebindDocument = () => {
-    globalThis.__tilefinchClearNodeCache();
+  __tilefinchRealmGlobal.__tilefinchRebindDocument = () => {
+    __tilefinchRealmGlobal.__tilefinchClearNodeCache();
     __tilefinchSuppressRemoteLookup(true);
     try {
       /* Re-pin the root wrappers of the new document. Rebinding
@@ -7001,8 +6988,8 @@
     } finally {
       __tilefinchSuppressRemoteLookup(false);
     }
-    globalThis.__tilefinchRebindStableNodes();
-    globalThis.__tilefinchActiveElement = document.body;
+    __tilefinchRealmGlobal.__tilefinchRebindStableNodes();
+    __tilefinchRealmGlobal.__tilefinchActiveElement = document.body;
     selection._range = null;
   };
   {
@@ -7064,9 +7051,9 @@
         __tilefinchSuppressRemoteLookup(false);
       }
     };
-    globalThis.__tilefinchDirtyNodeIds = dirtyIds;
-    globalThis.__tilefinchRestoringSection = false;
-    globalThis.__tilefinchSaveSectionState = (key) => {
+    __tilefinchRealmGlobal.__tilefinchDirtyNodeIds = dirtyIds;
+    __tilefinchRealmGlobal.__tilefinchRestoringSection = false;
+    __tilefinchRealmGlobal.__tilefinchSaveSectionState = (key) => {
       key = Number(key);
       const list = controls(),
         saved = [];
@@ -7132,10 +7119,10 @@
       nativeControlValues.clear();
       return saved.length + nodes.length;
     };
-    globalThis.__tilefinchRestoreSectionState = (key) => {
+    __tilefinchRealmGlobal.__tilefinchRestoreSectionState = (key) => {
       const state = states.get(Number(key));
       if (!state) return 0;
-      globalThis.__tilefinchRestoringSection = true;
+      __tilefinchRealmGlobal.__tilefinchRestoringSection = true;
       let restored = 0;
       try {
         for (const saved of state.nodes || []) {
@@ -7180,7 +7167,7 @@
           restored++;
         }
       } finally {
-        globalThis.__tilefinchRestoringSection = false;
+        __tilefinchRealmGlobal.__tilefinchRestoringSection = false;
         dirtyIds.clear();
       }
       return restored;
@@ -7263,7 +7250,7 @@
         writable: true,
         value: function open(...args) {
           if (args.length >= 3)
-            return globalThis.open(args[0], args[1], args[2]);
+            return __tilefinchRealmGlobal.open(args[0], args[1], args[2]);
           const state = stateFor(this);
           if (this instanceof XMLDocument ||
               (this.contentType && this.contentType !== "text/html"))
@@ -7302,7 +7289,7 @@
     enumerable: true,
     get() {
       const generation = Number(
-        globalThis.__tilefinchStyleSheetGeneration?.() || 0,
+        __tilefinchRealmGlobal.__tilefinchStyleSheetGeneration?.() || 0,
       );
       if (
         cachedDocumentStyleSheets &&
@@ -7324,28 +7311,28 @@
     },
   });
   const documentReferrer = String(
-    globalThis.__tilefinchDocumentReferrer || "",
+    __tilefinchRealmGlobal.__tilefinchDocumentReferrer || "",
   );
-  delete globalThis.__tilefinchDocumentReferrer;
+  delete __tilefinchRealmGlobal.__tilefinchDocumentReferrer;
   Object.defineProperty(Document.prototype, "referrer", Object.getOwnPropertyDescriptor({
     get referrer() {
       if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
       return this === document ? documentReferrer : "";
     },
   }, "referrer"));
-  globalThis.window = globalThis;
-  globalThis.self = globalThis;
-  globalThis.top = globalThis;
-  globalThis.parent = globalThis;
-  globalThis.frames = globalThis;
-  Object.defineProperty(globalThis, "frameElement", {
+  __tilefinchRealmGlobal.window = __tilefinchRealmGlobal;
+  __tilefinchRealmGlobal.self = __tilefinchRealmGlobal;
+  __tilefinchRealmGlobal.top = __tilefinchRealmGlobal;
+  __tilefinchRealmGlobal.parent = __tilefinchRealmGlobal;
+  __tilefinchRealmGlobal.frames = __tilefinchRealmGlobal;
+  Object.defineProperty(__tilefinchRealmGlobal, "frameElement", {
     configurable: false,
     enumerable: true,
     get() {
       return null;
     },
   });
-  Object.defineProperty(globalThis, "opener", {
+  Object.defineProperty(__tilefinchRealmGlobal, "opener", {
     configurable: false,
     enumerable: true,
     writable: false,
@@ -7354,13 +7341,13 @@
   /* Tilefinch does not create auxiliary browsing contexts. Explicitly
      returning null keeps links/forms from acquiring an opener relationship
      through a partial window.open implementation. */
-  Object.defineProperty(globalThis, "open", {
+  Object.defineProperty(__tilefinchRealmGlobal, "open", {
     configurable: false,
     enumerable: false,
     writable: false,
     value: { open: (url = undefined, target = undefined) => null }.open,
   });
-  Object.defineProperty(globalThis, "location", Object.getOwnPropertyDescriptor({
+  Object.defineProperty(__tilefinchRealmGlobal, "location", Object.getOwnPropertyDescriptor({
     get location() {
       return location;
     },
@@ -7369,14 +7356,14 @@
       location.href = value;
     },
   }, "location"));
-  Object.defineProperty(globalThis, "location", { configurable: false });
+  Object.defineProperty(__tilefinchRealmGlobal, "location", { configurable: false });
   /* [Replaceable] window.origin: the origin of the document's location. */
-  Object.defineProperty(globalThis, "origin", Object.getOwnPropertyDescriptor({
+  Object.defineProperty(__tilefinchRealmGlobal, "origin", Object.getOwnPropertyDescriptor({
     get origin() {
       return location.origin;
     },
     set origin(value) {
-      Object.defineProperty(globalThis, "origin", {
+      Object.defineProperty(__tilefinchRealmGlobal, "origin", {
         value,
         writable: true,
         enumerable: true,
@@ -7384,16 +7371,16 @@
       });
     },
   }, "origin"));
-  const diagnosticMobileSafari = !!globalThis.__tilefinchDiagnosticMobileSafari,
-    tilefinchInnerWidth = Number(globalThis.__tilefinchViewportWidth) || 480,
-    tilefinchInnerHeight = Number(globalThis.__tilefinchViewportHeight) || 272,
-    tilefinchDeviceWidth = Number(globalThis.__tilefinchDeviceWidth) || 480,
-    tilefinchDeviceHeight = Number(globalThis.__tilefinchDeviceHeight) || 272;
-  globalThis.innerWidth = diagnosticMobileSafari ? 390 : tilefinchInnerWidth;
-  globalThis.innerHeight = diagnosticMobileSafari ? 844 : tilefinchInnerHeight;
-  globalThis.outerWidth = diagnosticMobileSafari ? 390 : tilefinchDeviceWidth;
-  globalThis.outerHeight = diagnosticMobileSafari ? 844 : tilefinchDeviceHeight;
-  globalThis.devicePixelRatio = diagnosticMobileSafari ? 3 : 1;
+  const diagnosticMobileSafari = !!__tilefinchRealmGlobal.__tilefinchDiagnosticMobileSafari,
+    tilefinchInnerWidth = Number(__tilefinchRealmGlobal.__tilefinchViewportWidth) || 480,
+    tilefinchInnerHeight = Number(__tilefinchRealmGlobal.__tilefinchViewportHeight) || 272,
+    tilefinchDeviceWidth = Number(__tilefinchRealmGlobal.__tilefinchDeviceWidth) || 480,
+    tilefinchDeviceHeight = Number(__tilefinchRealmGlobal.__tilefinchDeviceHeight) || 272;
+  __tilefinchRealmGlobal.innerWidth = diagnosticMobileSafari ? 390 : tilefinchInnerWidth;
+  __tilefinchRealmGlobal.innerHeight = diagnosticMobileSafari ? 844 : tilefinchInnerHeight;
+  __tilefinchRealmGlobal.outerWidth = diagnosticMobileSafari ? 390 : tilefinchDeviceWidth;
+  __tilefinchRealmGlobal.outerHeight = diagnosticMobileSafari ? 844 : tilefinchDeviceHeight;
+  __tilefinchRealmGlobal.devicePixelRatio = diagnosticMobileSafari ? 3 : 1;
   const orientationLandscape = innerWidth >= innerHeight,
     screenToken = {},
     screenOrientationToken = {};
@@ -7459,16 +7446,16 @@
   enumerateInterfaceMembers(Screen);
   enumerateInterfaceMembers(ScreenOrientation);
   const screenValue = new Screen(screenToken);
-  globalThis.Screen = Screen;
-  globalThis.ScreenOrientation = ScreenOrientation;
+  __tilefinchRealmGlobal.Screen = Screen;
+  __tilefinchRealmGlobal.ScreenOrientation = ScreenOrientation;
   /* `screen` is a [Replaceable] Window attribute: assigning shadows the
      getter with an ordinary own data property for that realm. */
-  Object.defineProperty(globalThis, "screen", {
+  Object.defineProperty(__tilefinchRealmGlobal, "screen", {
     configurable: true,
     enumerable: true,
     get() { return screenValue; },
     set(value) {
-      Object.defineProperty(globalThis, "screen", {
+      Object.defineProperty(__tilefinchRealmGlobal, "screen", {
         configurable: true,
         enumerable: true,
         writable: true,
@@ -7476,9 +7463,8 @@
       });
     },
   });
-  globalThis.scrollX = globalThis.pageXOffset = 0;
-  globalThis.scrollY = globalThis.pageYOffset = 0;
-  globalThis.__tilefinchFrameEvalTelemetry = "none";
+  __tilefinchRealmGlobal.scrollX = __tilefinchRealmGlobal.pageXOffset = 0;
+  __tilefinchRealmGlobal.scrollY = __tilefinchRealmGlobal.pageYOffset = 0;
   /* Cross-document postMessage crosses independent QuickJS runtimes. JSON is
      not a structured-clone transport: it drops undefined and non-finite
      numbers, destroys aliases/cycles, and turns typed arrays into records.
@@ -7494,8 +7480,8 @@
     frameCloneViewTypes = Object.freeze({
       Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
       Int32Array, Uint32Array, Float32Array, Float64Array,
-      BigInt64Array: globalThis.BigInt64Array,
-      BigUint64Array: globalThis.BigUint64Array,
+      BigInt64Array: __tilefinchRealmGlobal.BigInt64Array,
+      BigUint64Array: __tilefinchRealmGlobal.BigUint64Array,
       DataView,
     }),
     frameCloneError = (message) =>
@@ -7538,7 +7524,7 @@
         /* A Proxy is never structured-cloneable. Reject it before tag,
            prototype, or key inspection so page traps cannot run as a side
            effect of cross-realm postMessage. */
-        if (globalThis.__tilefinchIsProxy(item))
+        if (__tilefinchRealmGlobal.__tilefinchIsProxy(item))
           throw frameCloneError("Proxy values could not be cloned");
         if (memory.has(item)) return ["r", memory.get(item)];
         if (nodes.length >= frameCloneObjectLimit)
@@ -7782,7 +7768,7 @@
         throw new DOMException("Invalid target origin", "SyntaxError");
       return parsed.origin;
     };
-  Object.defineProperty(globalThis, "__tilefinchPostParentMessage", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchPostParentMessage", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -7796,12 +7782,12 @@
         0,
         wire,
         normalizedTarget,
-        globalThis.__tilefinchActiveTaskKind,
-        globalThis.__tilefinchActiveTaskSequence,
+        __tilefinchRealmGlobal.__tilefinchActiveTaskKind,
+        __tilefinchRealmGlobal.__tilefinchActiveTaskSequence,
       );
     },
   });
-  Object.defineProperty(globalThis, "__tilefinchPostTopMessage", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchPostTopMessage", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -7815,8 +7801,8 @@
         -1,
         wire,
         normalizedTarget,
-        globalThis.__tilefinchActiveTaskKind,
-        globalThis.__tilefinchActiveTaskSequence,
+        __tilefinchRealmGlobal.__tilefinchActiveTaskKind,
+        __tilefinchRealmGlobal.__tilefinchActiveTaskSequence,
       );
     },
   });
@@ -7824,7 +7810,7 @@
      first-use-free eager module installed here with this module's private
      helpers; the installer is removed so no privileged bridge remains on
      the global object. */
-  const frames = globalThis.__tilefinchInstallFrames({
+  const frames = __tilefinchRealmGlobal.__tilefinchInstallFrames({
     wrap,
     encodeFrameMessage,
     decodeFrameMessage,
@@ -7836,10 +7822,10 @@
     normalizePostMessageTarget,
     location,
   });
-  delete globalThis.__tilefinchInstallFrames;
+  delete __tilefinchRealmGlobal.__tilefinchInstallFrames;
   let historyState = null,
     historyLength = 1;
-  globalThis.history = {
+  __tilefinchRealmGlobal.history = {
     get state() {
       return historyState;
     },
@@ -7867,23 +7853,23 @@
     forward() {},
     go(delta = 0) {},
   };
-  globalThis.__tilefinchCommitSameDocument = (url, oldURL) => {
+  __tilefinchRealmGlobal.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     historyLength++;
     const event = new Event("hashchange");
     event.oldURL = String(oldURL);
     event.newURL = location.href;
-    globalThis.dispatchEvent(event);
+    __tilefinchRealmGlobal.dispatchEvent(event);
   };
-  globalThis.__tilefinchRestoreSameDocument = (url, oldURL) => {
+  __tilefinchRealmGlobal.__tilefinchRestoreSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     const pop = new Event("popstate");
     pop.state = historyState;
-    globalThis.dispatchEvent(pop);
+    __tilefinchRealmGlobal.dispatchEvent(pop);
     const event = new Event("hashchange");
     event.oldURL = String(oldURL);
     event.newURL = location.href;
-    globalThis.dispatchEvent(event);
+    __tilefinchRealmGlobal.dispatchEvent(event);
   };
   const windowMessageHandlers = new Map(),
     setWindowMessageHandler = (type, value) => {
@@ -7905,25 +7891,25 @@
             return trustedFunctionApply(current, this, [event]);
         };
         EventTarget.prototype.addEventListener.call(
-          globalThis, type, slot.wrapper, false);
+          __tilefinchRealmGlobal, type, slot.wrapper, false);
       } else if (callback === null && slot.wrapper !== null) {
         EventTarget.prototype.removeEventListener.call(
-          globalThis, type, slot.wrapper, false);
+          __tilefinchRealmGlobal, type, slot.wrapper, false);
         slot.wrapper = null;
       }
     };
   for (const type of ["message", "messageerror"])
-    Object.defineProperty(globalThis, "on" + type, {
+    Object.defineProperty(__tilefinchRealmGlobal, "on" + type, {
       configurable: true,
       enumerable: true,
       get() { return windowMessageHandlers.get(type)?.value || null; },
       set(value) { setWindowMessageHandler(type, value); },
     });
-  globalThis.__tilefinchInvokeWindowEvent = (event, capture) => {
-    event.currentTarget = globalThis;
-    event.eventPhase = globalThis === event.target ? 2 : capture ? 1 : 3;
-    globalThis.__tilefinchInvokeEventTarget(
-      globalThis,
+  __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent = (event, capture) => {
+    event.currentTarget = __tilefinchRealmGlobal;
+    event.eventPhase = __tilefinchRealmGlobal === event.target ? 2 : capture ? 1 : 3;
+    __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
+      __tilefinchRealmGlobal,
       event,
       capture,
       event.eventPhase,
@@ -7933,37 +7919,37 @@
      routes the Window target here, as browsers expose it. */
   const dispatchWindowEvent = (event) => {
     const value = event,
-      path = [globalThis];
-    globalThis.__tilefinchPrepareEvent(value, globalThis, path);
+      path = [__tilefinchRealmGlobal];
+    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, __tilefinchRealmGlobal, path);
     if (!value.__stopped) {
-      globalThis.__tilefinchInvokeWindowEvent(value, true);
+      __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent(value, true);
       if (!value.__stopped)
-        globalThis.__tilefinchInvokeWindowEvent(value, false);
+        __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent(value, false);
     }
-    globalThis.__tilefinchFinishEventDispatch(value);
+    __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
-  globalThis.__tilefinchDispatchWindowEventCheckpointed = (event) => {
+  __tilefinchRealmGlobal.__tilefinchDispatchWindowEventCheckpointed = (event) => {
     const value = event,
-      path = [globalThis];
-    globalThis.__tilefinchPrepareEvent(value, globalThis, path);
+      path = [__tilefinchRealmGlobal];
+    __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, __tilefinchRealmGlobal, path);
     const finish = () => {
-        globalThis.__tilefinchFinishEventDispatch(value);
+        __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
         __tilefinchRecordEvent();
       },
       invokeHandler = () => {
         if (windowMessageHandlers.has(String(value.type))) return;
-        const handler = globalThis["on" + value.type];
+        const handler = __tilefinchRealmGlobal["on" + value.type];
         if (typeof handler !== "function") return;
-        value.currentTarget = globalThis;
+        value.currentTarget = __tilefinchRealmGlobal;
         value.eventPhase = Event.AT_TARGET;
         try {
-          globalThis.__tilefinchRecordEventHandler();
-          globalThis.__tilefinchRunTask(
+          __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
+          __tilefinchRealmGlobal.__tilefinchRunTask(
             "window-handler:" + String(value.type),
             handler,
-            globalThis,
+            __tilefinchRealmGlobal,
             [value],
           );
         } catch (error) {
@@ -7971,8 +7957,8 @@
         }
       };
     if (value.__stopped) finish();
-    else globalThis.__tilefinchInvokeEventTargetCheckpointed(
-      globalThis,
+    else __tilefinchRealmGlobal.__tilefinchInvokeEventTargetCheckpointed(
+      __tilefinchRealmGlobal,
       value,
       Event.AT_TARGET,
       null,
@@ -7994,18 +7980,18 @@
       pluginToken = {},
       mimeTypeToken = {},
       languages = Object.freeze(["en-US", "en"]),
-      readUserActivationState = globalThis.__tilefinchUserActivationState,
+      readUserActivationState = __tilefinchRealmGlobal.__tilefinchUserActivationState,
       brands = Object.freeze([
         Object.freeze({
-          brand: String(globalThis.__tilefinchBrowserBrand),
-          version: String(globalThis.__tilefinchBrowserBrandVersion),
+          brand: String(__tilefinchRealmGlobal.__tilefinchBrowserBrand),
+          version: String(__tilefinchRealmGlobal.__tilefinchBrowserBrandVersion),
         }),
         Object.freeze({ brand: "Not.A/Brand", version: "99" }),
       ]),
       fullVersionList = Object.freeze([
         Object.freeze({
-          brand: String(globalThis.__tilefinchBrowserBrand),
-          version: String(globalThis.__tilefinchBrowserFullVersion),
+          brand: String(__tilefinchRealmGlobal.__tilefinchBrowserBrand),
+          version: String(__tilefinchRealmGlobal.__tilefinchBrowserFullVersion),
         }),
         Object.freeze({ brand: "Not.A/Brand", version: "99.0.0.0" }),
       ]);
@@ -8017,7 +8003,7 @@
     };
     const queuePlatformTask = (operation, quotaLabel = "Platform") =>
       new Promise((resolve, reject) => {
-        const task = globalThis.__tilefinchScheduleTask(() => {
+        const task = __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
           try { resolve(operation()); }
           catch (error) { reject(error); }
         });
@@ -8251,7 +8237,7 @@
             model: "PSP-3000",
             platform: "PlayStation Portable",
             platformVersion: "6.61",
-            uaFullVersion: String(globalThis.__tilefinchBrowserFullVersion),
+            uaFullVersion: String(__tilefinchRealmGlobal.__tilefinchBrowserFullVersion),
             fullVersionList,
             wow64: false,
           }),
@@ -8289,7 +8275,7 @@
             deviceMemory: undefined,
           }
         : {
-            userAgent: String(globalThis.__tilefinchBrowserUserAgent),
+            userAgent: String(__tilefinchRealmGlobal.__tilefinchBrowserUserAgent),
             platform: "PSP",
             maxTouchPoints: 0,
             hardwareConcurrency: 1,
@@ -8376,7 +8362,7 @@
       }
       get gpu() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
-        return globalThis.isSecureContext ? gpu : undefined;
+        return __tilefinchRealmGlobal.isSecureContext ? gpu : undefined;
       }
       get plugins() {
         if (!platformNavigatorBrand(this)) throw new TypeError("Illegal invocation");
@@ -8422,24 +8408,24 @@
       MimeType,
     ])
       enumerateInterfaceMembers(constructor);
-    globalThis.Navigator = Navigator;
-    globalThis.NavigatorUAData = NavigatorUAData;
-    globalThis.UserActivation = UserActivation;
-    globalThis.GPU = GPU;
-    globalThis.WGSLLanguageFeatures = WGSLLanguageFeatures;
-    globalThis.PluginArray = PluginArray;
-    globalThis.MimeTypeArray = MimeTypeArray;
-    globalThis.Plugin = Plugin;
-    globalThis.MimeType = MimeType;
+    __tilefinchRealmGlobal.Navigator = Navigator;
+    __tilefinchRealmGlobal.NavigatorUAData = NavigatorUAData;
+    __tilefinchRealmGlobal.UserActivation = UserActivation;
+    __tilefinchRealmGlobal.GPU = GPU;
+    __tilefinchRealmGlobal.WGSLLanguageFeatures = WGSLLanguageFeatures;
+    __tilefinchRealmGlobal.PluginArray = PluginArray;
+    __tilefinchRealmGlobal.MimeTypeArray = MimeTypeArray;
+    __tilefinchRealmGlobal.Plugin = Plugin;
+    __tilefinchRealmGlobal.MimeType = MimeType;
     platformNavigator = new Navigator(navigatorToken);
-    Object.defineProperty(globalThis, "navigator", {
+    Object.defineProperty(__tilefinchRealmGlobal, "navigator", {
       configurable: true,
       enumerable: true,
       writable: false,
       value: platformNavigator,
     });
-    globalThis.__tilefinchNavigatorBrand = platformNavigatorBrand;
-    Object.defineProperty(globalThis, "clientInformation", {
+    __tilefinchRealmGlobal.__tilefinchNavigatorBrand = platformNavigatorBrand;
+    Object.defineProperty(__tilefinchRealmGlobal, "clientInformation", {
       configurable: true,
       enumerable: true,
       /* Window's two Navigator attributes expose the same associated
@@ -8460,7 +8446,7 @@
         if (!storageManagerBrand(this))
           return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
-          const values = globalThis.__tilefinchStorageEstimate();
+          const values = __tilefinchRealmGlobal.__tilefinchStorageEstimate();
           if (!values)
             throw new TypeError("Storage is unavailable for this origin");
           return {
@@ -8473,7 +8459,7 @@
         if (!storageManagerBrand(this))
           return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
-          if (!globalThis.__tilefinchStorageAvailable())
+          if (!__tilefinchRealmGlobal.__tilefinchStorageAvailable())
             throw new TypeError("Storage is unavailable for this origin");
           return false;
         }, "Storage");
@@ -8482,7 +8468,7 @@
         if (!storageManagerBrand(this))
           return Promise.reject(new TypeError("Illegal invocation"));
         return queuePlatformTask(() => {
-          if (!globalThis.__tilefinchStorageAvailable())
+          if (!__tilefinchRealmGlobal.__tilefinchStorageAvailable())
             throw new TypeError("Storage is unavailable for this origin");
           return false;
         }, "Storage");
@@ -8504,7 +8490,7 @@
         return storageManager;
       },
     }, "storage"));
-    globalThis.StorageManager = StorageManager;
+    __tilefinchRealmGlobal.StorageManager = StorageManager;
 
     /* The Keyboard Map API is exposed by Chromium even when the platform
        cannot disclose a layout: getLayoutMap() resolves to a stable empty
@@ -8610,8 +8596,8 @@
         return keyboard;
       },
     }, "keyboard"));
-    globalThis.Keyboard = Keyboard;
-    globalThis.KeyboardLayoutMap = KeyboardLayoutMap;
+    __tilefinchRealmGlobal.Keyboard = Keyboard;
+    __tilefinchRealmGlobal.KeyboardLayoutMap = KeyboardLayoutMap;
 
   }
   {
@@ -8674,8 +8660,8 @@
            publication begins only after the complete bootstrap, so resolve
            it at construction time rather than making platform.js depend on
            source ordering. */
-        if (typeof globalThis.Event === "function") {
-          const event = new globalThis.Event(type, init);
+        if (typeof __tilefinchRealmGlobal.Event === "function") {
+          const event = new __tilefinchRealmGlobal.Event(type, init);
           Object.setPrototypeOf(GamepadEvent.prototype, Event.prototype);
           Object.setPrototypeOf(event, GamepadEvent.prototype);
           event.gamepad = init.gamepad || null;
@@ -8685,7 +8671,7 @@
         this.gamepad = init.gamepad || null;
       }
     }
-    globalThis.GamepadEvent = GamepadEvent;
+    __tilefinchRealmGlobal.GamepadEvent = GamepadEvent;
     Object.defineProperty(Navigator.prototype, "getGamepads", {
       configurable: true,
       enumerable: true,
@@ -8699,7 +8685,7 @@
         return [connected ? gamepad : null, null, null, null];
       },
     });
-    globalThis.__tilefinchUpdateGamepad = (
+    __tilefinchRealmGlobal.__tilefinchUpdateGamepad = (
       nextConnected,
       buttonBits,
       axisX,
@@ -8737,7 +8723,7 @@
       if (this !== clipboard)
         return Promise.reject(new TypeError("Illegal invocation"));
       try {
-        globalThis.__tilefinchClipboardWrite(value);
+        __tilefinchRealmGlobal.__tilefinchClipboardWrite(value);
         return Promise.resolve();
       } catch (error) {
         return Promise.reject(error);
@@ -8746,7 +8732,7 @@
       readText() {
         if (this !== clipboard)
           return Promise.reject(new TypeError("Illegal invocation"));
-        return Promise.resolve(globalThis.__tilefinchClipboardStats.text);
+        return Promise.resolve(__tilefinchRealmGlobal.__tilefinchClipboardStats.text);
       }
     }
     Object.defineProperty(Clipboard.prototype, Symbol.toStringTag, {
@@ -8765,17 +8751,14 @@
         return clipboard;
       },
     }, "clipboard"));
-    globalThis.Clipboard = Clipboard;
+    __tilefinchRealmGlobal.Clipboard = Clipboard;
   }
   {
-    const invalidBase64 = (detail) => {
-      detail = String(detail);
-      globalThis.__tilefinchBase64Error = detail;
-      const message = "The string is not correctly encoded. [" + detail + "]",
-        error = globalThis.DOMException
-          ? new DOMException(message, "InvalidCharacterError")
-          : new TypeError("InvalidCharacterError: " + message);
-      throw error;
+    /* The browser's wording: the message carries no input details. */
+    const invalidBase64 = (message) => {
+      throw __tilefinchRealmGlobal.DOMException
+        ? new DOMException(message, "InvalidCharacterError")
+        : new TypeError("InvalidCharacterError: " + message);
     };
     const btoa = (input) => {
       const text = String(input);
@@ -8786,11 +8769,10 @@
       const encoded = __tilefinchBase64EncodeLatin1(text);
       if (typeof encoded === "string") return encoded;
       invalidBase64(
-        "btoa length=" + text.length + " index=" + encoded + " code=" +
-          text.charCodeAt(encoded),
+        "The string to be encoded contains characters outside of the Latin1 range.",
       );
     };
-    globalThis.btoa = btoa;
+    __tilefinchRealmGlobal.btoa = btoa;
     const atob = (input) => {
       const text = String(input);
       if (text.length > 1024 * 1024)
@@ -8803,20 +8785,12 @@
           String(error.message || error) !== "invalid base64 input"
         )
           throw error;
-        const bad = text.search(/[^A-Za-z0-9+/=\t\n\f\r ]/);
-        invalidBase64(
-          "atob length=" +
-            text.length +
-            " bad-index=" +
-            bad +
-            " bad-code=" +
-            (bad < 0 ? -1 : text.charCodeAt(bad)),
-        );
+        invalidBase64("The string to be decoded is not correctly encoded.");
       }
     };
-    globalThis.atob = atob;
+    __tilefinchRealmGlobal.atob = atob;
   }
-  globalThis.DOMRect = class DOMRect {
+  __tilefinchRealmGlobal.DOMRect = class DOMRect {
     constructor(x = 0, y = 0, width = 0, height = 0) {
       this.x = Number(x);
       this.y = Number(y);
@@ -9002,7 +8976,7 @@
     configurable: true,
     value: "CSSStyleDeclaration",
   });
-  globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+  __tilefinchRealmGlobal.CSSStyleDeclaration = CSSStyleDeclaration;
   /* A declaration's state already lives in the private WeakMap. Share the
      traps instead of allocating six closures for every style wrapper. */
   const computedStyleHandler = {
@@ -9066,9 +9040,9 @@
     computedStyleStates.set(proxy, state);
     return proxy;
   };
-  globalThis.getComputedStyle = getComputedStyle;
+  __tilefinchRealmGlobal.getComputedStyle = getComputedStyle;
   {
-    const nativeMediaMatches = globalThis.__tilefinchMediaMatches,
+    const nativeMediaMatches = __tilefinchRealmGlobal.__tilefinchMediaMatches,
       canonicalCalc = (text) =>
         text
           .replace(
@@ -9133,11 +9107,11 @@
       };
     class MediaQueryListEvent {
       constructor(type, init = {}) {
-        if (typeof globalThis.Event === "function") {
-          const event = new globalThis.Event(type, init);
+        if (typeof __tilefinchRealmGlobal.Event === "function") {
+          const event = new __tilefinchRealmGlobal.Event(type, init);
           Object.setPrototypeOf(
             MediaQueryListEvent.prototype,
-            globalThis.Event.prototype,
+            __tilefinchRealmGlobal.Event.prototype,
           );
           Object.setPrototypeOf(event, MediaQueryListEvent.prototype);
           event.media = String(init.media ?? "");
@@ -9168,13 +9142,13 @@
     class MediaQueryList {
       constructor(query) {
         if (
-          globalThis.EventTarget &&
+          __tilefinchRealmGlobal.EventTarget &&
           Object.getPrototypeOf(MediaQueryList.prototype) !==
-            globalThis.EventTarget.prototype
+            __tilefinchRealmGlobal.EventTarget.prototype
         )
           Object.setPrototypeOf(
             MediaQueryList.prototype,
-            globalThis.EventTarget.prototype,
+            __tilefinchRealmGlobal.EventTarget.prototype,
           );
         this.media = canonicalMediaQuery(query);
         this._listeners = new Set();
@@ -9222,14 +9196,14 @@
         for (const callback of this._listeners)
           try {
             if (typeof callback === "function")
-              globalThis.__tilefinchRunTask(
+              __tilefinchRealmGlobal.__tilefinchRunTask(
                 "media-query-change",
                 callback,
                 this,
                 [event],
               );
             else
-              globalThis.__tilefinchRunTask(
+              __tilefinchRealmGlobal.__tilefinchRunTask(
                 "media-query-change-object",
                 callback.handleEvent,
                 callback,
@@ -9240,7 +9214,7 @@
           }
         if (this._onchange)
           try {
-            globalThis.__tilefinchRunTask(
+            __tilefinchRealmGlobal.__tilefinchRunTask(
               "media-query-onchange",
               this._onchange,
               this,
@@ -9252,7 +9226,7 @@
         return !event.defaultPrevented;
       }
     }
-    globalThis.__tilefinchMediaRecheck = () => {
+    __tilefinchRealmGlobal.__tilefinchMediaRecheck = () => {
       for (const query of liveMediaQueries) {
         const matches = query.matches;
         if (matches === query._lastMatch) continue;
@@ -9265,10 +9239,10 @@
         );
       }
     };
-    globalThis.MediaQueryList = MediaQueryList;
-    globalThis.MediaQueryListEvent = MediaQueryListEvent;
+    __tilefinchRealmGlobal.MediaQueryList = MediaQueryList;
+    __tilefinchRealmGlobal.MediaQueryListEvent = MediaQueryListEvent;
     const matchMedia = (query) => new MediaQueryList(query);
-    globalThis.matchMedia = matchMedia;
+    __tilefinchRealmGlobal.matchMedia = matchMedia;
   }
   const performanceEntryState = new WeakMap(),
     requirePerformanceEntryState = (value) => {
@@ -9589,7 +9563,7 @@
           (type === undefined || entry.entryType === type)));
     }
   }
-  Object.assign(globalThis, {
+  Object.assign(__tilefinchRealmGlobal, {
     PerformanceEntry,
     PerformanceMark,
     PerformanceMeasure,
@@ -9598,8 +9572,8 @@
     PerformanceTimingConfidence,
     PerformanceObserverEntryList,
   });
-  globalThis.VisibilityStateEntry = VisibilityStateEntry;
-  if (globalThis.__tilefinchDeterministicDateFacade !== Date)
+  __tilefinchRealmGlobal.VisibilityStateEntry = VisibilityStateEntry;
+  if (__tilefinchRealmGlobal.__tilefinchDeterministicDateFacade !== Date)
     Date.now = () => __tilefinchDateNow(0);
   const performanceObserverState = new WeakMap(),
     performanceObservers = new Set(),
@@ -9616,7 +9590,7 @@
     schedulePerformanceObserver = (observer, state) => {
       if (state.pending || state.records.length === 0) return;
       state.pending = true;
-      globalThis.__tilefinchScheduleTask(() => {
+      __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
         state.pending = false;
         if (!performanceObservers.has(observer) || state.records.length === 0)
           return;
@@ -9627,7 +9601,7 @@
             droppedEntriesCount: state.dropped,
           });
         } catch (error) {
-          globalThis.__tilefinchReportUncaught?.(
+          __tilefinchRealmGlobal.__tilefinchReportUncaught?.(
             error,
             "PerformanceObserver",
           );
@@ -9691,7 +9665,7 @@
     },
     performanceTimestamp = (value) =>
       typeof value === "string" ? performanceMarkTime(value) : Number(value);
-  globalThis.__tilefinchRecordResourceTiming = (
+  __tilefinchRealmGlobal.__tilefinchRecordResourceTiming = (
     name,
     initiatorType,
     nameLookupUs = 0,
@@ -9758,7 +9732,7 @@
       ),
     );
   };
-  globalThis.__tilefinchRecordNavigationTiming = (
+  __tilefinchRealmGlobal.__tilefinchRecordNavigationTiming = (
     nameLookupUs = 0,
     connectUs = 0,
     appconnectUs = 0,
@@ -9835,7 +9809,7 @@
       performanceTimingState.responseEnd = epoch + resource.responseEnd;
     return navigationPerformanceEntry;
   };
-  globalThis.__tilefinchRecordVisibilityPerformance = state =>
+  __tilefinchRealmGlobal.__tilefinchRecordVisibilityPerformance = state =>
     appendPerformanceEntry(
       new VisibilityStateEntry(
         visibilityStateEntryToken,
@@ -9844,9 +9818,9 @@
       ),
     );
   const performanceTimeOrigin = Number(
-    globalThis.__tilefinchPerformanceTimeOrigin,
+    __tilefinchRealmGlobal.__tilefinchPerformanceTimeOrigin,
   );
-  delete globalThis.__tilefinchPerformanceTimeOrigin;
+  delete __tilefinchRealmGlobal.__tilefinchPerformanceTimeOrigin;
   const performanceValueState = new WeakMap();
   class Performance extends EventTarget {
     constructor() {
@@ -9867,7 +9841,7 @@
      exposes the reduced-resolution timing surface.  Keep the capability fact
      explicit instead of leaving feature detection to infer it from missing
      SharedArrayBuffer APIs. */
-  Object.defineProperty(globalThis, "crossOriginIsolated", {
+  Object.defineProperty(__tilefinchRealmGlobal, "crossOriginIsolated", {
     value: false,
     writable: false,
     enumerable: true,
@@ -10026,13 +10000,13 @@
   performanceValueState.set(performanceValue, {
     timeOrigin: performanceTimeOrigin,
   });
-  globalThis.Performance = Performance;
-  globalThis.performance = performanceValue;
+  __tilefinchRealmGlobal.Performance = Performance;
+  __tilefinchRealmGlobal.performance = performanceValue;
   /* A dedicated worker has its own performance time origin and monotonic zero.
      Keep the implementation bounded by sharing the immutable interface shape,
      while rebasing now() for the worker lifetime.  The lazy Worker bootstrap
      wraps this timing source in its own Worker-realm Performance prototype. */
-  globalThis.__tilefinchCreateWorkerPerformance = () => {
+  __tilefinchRealmGlobal.__tilefinchCreateWorkerPerformance = () => {
     const monotonicOrigin = __tilefinchPerformanceNow(3);
     return {
       timeOrigin: Date.now(),
@@ -10070,11 +10044,11 @@
       value: "MemoryInfo",
     },
   });
-  Object.defineProperty(globalThis.performance, "memory", {
+  Object.defineProperty(__tilefinchRealmGlobal.performance, "memory", {
     configurable: true,
     enumerable: true,
     get() {
-      const values = globalThis.__tilefinchHeapMemorySnapshot();
+      const values = __tilefinchRealmGlobal.__tilefinchHeapMemorySnapshot();
       const object = Object.create(memoryInfoPrototype);
       memoryInfoState.set(object, [
         Math.max(0, Number(values?.[0]) || 0),
@@ -10084,7 +10058,7 @@
       return object;
     },
   });
-  globalThis.PerformanceObserver = class PerformanceObserver {
+  __tilefinchRealmGlobal.PerformanceObserver = class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function")
         throw new TypeError("callback required");
@@ -10155,7 +10129,7 @@
     }
   };
   Object.defineProperty(
-    globalThis.PerformanceObserver.prototype,
+    __tilefinchRealmGlobal.PerformanceObserver.prototype,
     Symbol.toStringTag,
     { configurable: true, value: "PerformanceObserver" },
   );
@@ -10165,7 +10139,7 @@
     enumerable: true,
     configurable: true,
   });
-  globalThis.__tilefinchDispatchDOMContentLoaded = () => {
+  __tilefinchRealmGlobal.__tilefinchDispatchDOMContentLoaded = () => {
     if (document.readyState === "complete") return;
     const navigationState =
       requirePerformanceEntryState(navigationPerformanceEntry),
@@ -10181,7 +10155,7 @@
     performanceTimingState.domContentLoadedEventStart =
       performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
-    globalThis.__tilefinchMaybeStartMotion?.();
+    __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.();
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     documentReadyState = "complete";
     document.dispatchEvent(new Event("readystatechange"));
@@ -10206,11 +10180,11 @@
     const bodyOnload = document.body?.onload;
     if (typeof bodyOnload === "function")
       try {
-        bodyOnload.call(globalThis, loadEvent);
+        bodyOnload.call(__tilefinchRealmGlobal, loadEvent);
       } catch (error) {
         __tilefinchReportUncaught(error, "body onload");
       }
-    globalThis.dispatchEvent(loadEvent);
+    __tilefinchRealmGlobal.dispatchEvent(loadEvent);
     const loadEventEnd = __tilefinchPerformanceNow(3);
     navigationState.base[3] = Math.max(
       0, loadEventEnd - navigationPerformanceEntry.startTime);
@@ -10221,7 +10195,8 @@
        document was loading therefore receive exactly one finalized record. */
     notifyPerformanceObservers(navigationPerformanceEntry);
   };
-  Object.defineProperty(globalThis.__tilefinchRootCensus, "frameWindows", {
-    get: () => frames.frameWindowCount(),
-  });
+  if (__tilefinchRealmGlobal.__tilefinchRootCensus)
+    Object.defineProperty(__tilefinchRealmGlobal.__tilefinchRootCensus, "frameWindows", {
+      get: () => frames.frameWindowCount(),
+    });
 })();

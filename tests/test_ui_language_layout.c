@@ -28,6 +28,8 @@ static bool run_overflow;
 /* The rotated player paints in a 272x480 logical viewport. */
 static uint16_t storage[STRIDE * WIDTH + 32];
 static char catalog[TILEFINCH_UI_TRANSLATION_BYTES + 1];
+/* The authored source holds every language's column. */
+static char source_text[1024 * 1024];
 static char *keys[TILEFINCH_UI_TRANSLATION_ROWS], *values[TILEFINCH_UI_TRANSLATION_ROWS];
 static size_t key_count, checked_frames, checked_labels;
 static const char *language_code;
@@ -68,6 +70,9 @@ static bool catalog_text(const char *text)
     return false;
 }
 
+/* The downloaded catalog holds no English keys, so they come from the
+   authored source's English column. Every key must find its row: the
+   generator's hash and the runtime's agree. */
 static bool load_catalog(Budget *budget, unsigned language, TilefinchUiTranslation **translation)
 {
     unsigned source_language = language == 0 ? 1 : language;
@@ -82,8 +87,14 @@ static bool load_catalog(Budget *budget, unsigned language, TilefinchUiTranslati
     *translation = language == 0 ? NULL
         : tilefinch_ui_translation_create(budget, language, catalog, length);
     CHECK(language == 0 || *translation);
-    catalog[length] = 0;
-    char *cursor = strchr(catalog, '\n');
+    snprintf(path, sizeof(path), "%s/translations/ui/v%u/source.tsv",
+        TILEFINCH_TEST_ROOT, spec->version);
+    file = fopen(path, "rb");
+    CHECK(file);
+    length = fread(source_text, 1, sizeof(source_text), file);
+    CHECK(!ferror(file) && fclose(file) == 0 && length < sizeof(source_text));
+    source_text[length] = 0;
+    char *cursor = strchr(source_text, '\n');
     CHECK(cursor);
     cursor++;
     key_count = 0;
@@ -93,8 +104,12 @@ static bool load_catalog(Budget *budget, unsigned language, TilefinchUiTranslati
         char *tab = strchr(cursor, '\t'), *end = strchr(cursor, '\n');
         CHECK(tab && end && tab < end);
         *tab = 0; *end = 0;
-        values[key_count] = language == 0 ? tab + 1
+        values[key_count] = language == 0 ? keys[key_count]
             : (char *)tilefinch_ui_translation_text(*translation, keys[key_count]);
+        if (values[key_count] == keys[key_count] && language != 0) {
+            fprintf(stderr, "locale=%s key has no row: '%s'\n", spec->code, keys[key_count]);
+            CHECK(false);
+        }
         key_count++;
         cursor = end + 1;
     }
@@ -263,8 +278,13 @@ static bool validate_frame_geometry(const PspUiState *ui, int width, int height,
                 return false;
             }
             /* Same-row label/value pairs and breadcrumbs retain a readable gap. */
-            if (y_overlap && a->right <= b->left) CHECK(b->left - a->right >= 5);
-            if (y_overlap && b->right <= a->left) CHECK(a->left - b->right >= 5);
+            if (y_overlap && ((a->right <= b->left && b->left - a->right < 5)
+                              || (b->right <= a->left && a->left - b->right < 5))) {
+                fprintf(stderr, "locale=%s screen=%u too close '%s' (%d..%d) and '%s' (%d..%d)\n",
+                    language_code, ui->screen, a->text, a->left, a->right,
+                    b->text, b->left, b->right);
+                return false;
+            }
         }
     }
     for (size_t at = 0; at < 16; at++) CHECK(storage[at] == 0xa55a && storage[16 + stride * height + at] == 0xa55a);
@@ -363,16 +383,22 @@ static bool queue_cache_matches_full(PspUiMediaState *media)
     unsigned old_selection = p->track_menu_selection;
     bool old_auto = p->automatic_next;
     PspUiMediaTrackMenuCache cache = {0};
+    /* Writing a slot directly bypasses the paths that announce it, so each
+       write here announces itself. */
     uint8_t saved_glyph_state = chrome_font_cache.loaded[0][0][0];
     chrome_font_cache.loaded[0][0][0] = UI_CHROME_GLYPH_PENDING;
+    chrome_glyph_state_changed();
     CHECK(!psp_ui_media_raster_queue_update(media, old_selection, old_auto,
         menu, 352, 208, 352));
     chrome_font_cache.loaded[0][0][0] = saved_glyph_state;
+    chrome_glyph_state_changed();
     saved_glyph_state = chrome_font_cache.unicode[0].loaded;
     chrome_font_cache.unicode[0].loaded = UI_CHROME_GLYPH_REFUSED_FIRST;
+    chrome_glyph_state_changed();
     CHECK(!psp_ui_media_raster_queue_update(media, old_selection, old_auto,
         menu, 352, 208, 352));
     chrome_font_cache.unicode[0].loaded = saved_glyph_state;
+    chrome_glyph_state_changed();
     for (unsigned step = 0; step < 16; step++) {
         for (unsigned at = 0; at < WIDTH * HEIGHT; at++)
             cached[at] = expected[at] = UINT32_C(0xff6284a6);
@@ -628,6 +654,673 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
     return true;
 }
 
+/* Every status toast stores an English key and is translated at paint time.
+   The longest translations (Bengali, Hindi, Assamese, then French and
+   Portuguese) must arrive whole at both chrome scales: wrapped at a space
+   onto the second line when needed, never cut mid-codepoint, ellipsized,
+   or garbled by sentence casing. */
+static bool test_status_toasts(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const long_literals[] = {
+        "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK",
+        "YOUTUBE SIGN-IN NOT CONFIRMED - TRY SIGN IN AGAIN",
+        "WI-FI DETAILS IN RAM - RETRY, THEN DIAGNOSTIC QR",
+        "SIGN-IN COUNTS IN RAM - RETRY, THEN DIAGNOSTIC QR",
+        "COOKIES CLEARED - SAVED LOGIN NOT REMOVED",
+        "SIGNED OUT - SAVED LOGIN COULD NOT BE REMOVED",
+    };
+    size_t literal_count = sizeof(long_literals) / sizeof(long_literals[0]);
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    ui->chrome_visible = false;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui->browser_ui_scale = scale;
+        for (size_t row = 0; row < key_count + literal_count; row++) {
+            const char *key = row < key_count ? keys[row] : long_literals[row - key_count];
+            bool status_key = strlen(key) < PSP_UI_STATUS_CAPACITY;
+            for (const char *c = key; *c && status_key; c++)
+                if (*c >= 'a' && *c <= 'z') status_key = false;
+            if (!status_key) continue;
+            psp_ui_show_status(ui, key, 60);
+            CHECK(!strcmp(ui->status, key));
+            ui->toast_entry_frames = 0;
+            char expected[257];
+            snprintf(expected, sizeof(expected), "%s", tilefinch_ui_text(key));
+            psp_ui_status_sentence_case(expected);
+            CHECK(paint(ui, provider));
+            char joined[600];
+            if (run_count == 1)
+                snprintf(joined, sizeof(joined), "%s", runs[0].text);
+            /* Arabic catalog text is visual order: its first line is the
+               right part of the string. */
+            else if (run_count == 2 && !strcmp(language_code, "ar")
+                     && tilefinch_ui_text(key) != key)
+                snprintf(joined, sizeof(joined), "%s %s", runs[1].text, runs[0].text);
+            else if (run_count == 2)
+                snprintf(joined, sizeof(joined), "%s %s", runs[0].text, runs[1].text);
+            else joined[0] = '\0';
+            bool whole = !strcmp(joined, expected);
+            for (size_t r = 0; r < run_count; r++) {
+                if (runs[r].truncated || runs[r].missing_glyph
+                    || runs[r].left < 12 || runs[r].right > WIDTH - 12) whole = false;
+                for (const unsigned char *c = (const unsigned char *) runs[r].text; *c; c++)
+                    if (*c == 0xc3u && c[1] >= 0x80u && c[1] <= 0x9eu && c > (const unsigned char *) runs[r].text
+                        && (c[-1] & 0xc0u) != 0x80u && c[-1] >= 'a' && c[-1] <= 'z') whole = false;
+            }
+            if (!whole) {
+                fprintf(stderr, "toast locale=%s scale=%u key='%s' expected '%s'\n",
+                        language_code, scale, key, expected);
+                for (size_t r = 0; r < run_count; r++)
+                    fprintf(stderr, "  '%s' %d..%d truncated=%u missing=%u\n", runs[r].text,
+                            runs[r].left, runs[r].right, runs[r].truncated, runs[r].missing_glyph);
+                CHECK(false);
+            }
+        }
+    }
+    ui->toast_frames = 0;
+    ui->status[0] = '\0';
+    ui->browser_ui_scale = 1;
+    return true;
+}
+
+/* A toast line's expected text, written independently of the painter: its
+   catalog value, or the value of the text before a trailing " NN%" with
+   that count kept. True when the line came from the catalog. */
+static bool expected_toast_line(const char *line, char *output, size_t size)
+{
+    const char *value = tilefinch_ui_text(line);
+    const char *space = strrchr(line, ' ');
+    if (value == line && space != NULL && space[1] >= '0' && space[1] <= '9'
+        && line[strlen(line) - 1] == '%') {
+        char head[128];
+        snprintf(head, sizeof(head), "%.*s", (int) (space - line), line);
+        if (tilefinch_ui_text(head) != head) {
+            snprintf(output, size, "%s%s", tilefinch_ui_text(head), space);
+            return true;
+        }
+    }
+    snprintf(output, size, "%s", value);
+    return value != line;
+}
+
+/* A run showing exactly TEXT, whole. */
+static bool shown_whole(const char *text)
+{
+    for (size_t at = 0; at < run_count; at++)
+        if (!strcmp(runs[at].text, text) && !runs[at].truncated
+            && !runs[at].missing_glyph && runs[at].left >= 0
+            && runs[at].right <= WIDTH) return true;
+    fprintf(stderr, "missing or clipped: locale=%s '%s'\n", language_code, text);
+    for (size_t r = 0; r < run_count; r++)
+        fprintf(stderr, "  '%s' %d..%d truncated=%u\n", runs[r].text,
+                runs[r].left, runs[r].right, runs[r].truncated);
+    return false;
+}
+
+static bool paint_media(PspUiMediaState *media, TilefinchGlyphProvider *provider)
+{
+    for (unsigned pass = 0; pass < 64; pass++) {
+        run_count = 0; run_overflow = false;
+        for (size_t at = 0; at < sizeof(storage) / sizeof(storage[0]); at++)
+            storage[at] = 0xa55a;
+        psp_ui_media_composite(media, storage + 16, WIDTH, HEIGHT, STRIDE);
+        bool changed = false;
+        size_t read = 0;
+        CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+        if (!read) return true;
+    }
+    CHECK(false);
+}
+
+/* The Update screen, the video player's headlines and the font-pack
+   offer's confirmation box show catalog text from state: every status,
+   button and headline arrives translated and whole at both chrome scales. */
+static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const statuses[] = {
+        "PRESS X TO CHECK FOR UPDATES", "CONNECTING...", "CHECKING...",
+        "UP TO DATE", "UPDATE AVAILABLE", "UPDATE CHECK FAILED",
+        "DOWNLOADING...", "STOPPING...", "CANCELLED", "DOWNLOAD VERIFIED",
+        "UNSIGNED DOWNLOAD HASHED", "DOWNLOAD FAILED",
+        "DOWNLOADED FILE DID NOT VERIFY", "NOT ENOUGH FREE SPACE FOR UPDATE",
+        "DEVELOPER UPDATE URL HAS NO DIRECTORY", "UPDATE URL IS TOO LONG",
+        "UPDATE FILE COULD NOT BE CREATED", "NOT ENOUGH MEMORY FOR METADATA",
+        "PREPARING UPDATE...", "VERIFYING DOWNLOAD...", "INSTALLING...",
+        "HASHING FAILED", "PACKAGE VERIFICATION FAILED",
+        "PACKAGE TABLE IS INVALID", "NOT ENOUGH FREE SPACE TO INSTALL",
+        "STAGING DIRECTORY IS NOT CLEAN", "UPDATE EXTRACTION FAILED",
+        "AN UPDATE FILE DID NOT VERIFY", "UPDATE METADATA COULD NOT BE SAVED",
+        "ACTIVATING UPDATE...", "UPDATE COULD NOT BE ACTIVATED",
+        "READY TO RESTART", "SIGNED UPDATES ARE NOT CONFIGURED",
+        "BETA CHANNEL - SIGNED", "STABLE CHANNEL - SIGNED",
+        "DEVELOPER URL - UNSIGNED TRIAL",
+    };
+    static const char *const labels[] = {
+        "CHECK NOW", "CHECK AGAIN", "DOWNLOAD UPDATE", "INSTALL UPDATE",
+        "RESTART TO UPDATE", "TRY INSTALL AGAIN",
+    };
+    static const char *const headlines[] = {
+        "PLAYLIST VIDEO COULD NOT OPEN", "VIDEO DECODER NEEDS APP RESTART",
+        "VIDEO DECODER MADE NO PROGRESS", "VIDEO DECODER RESET FAILED",
+        "VIDEO ENDED AFTER DECODER RECOVERY", "VIDEO FIRST FRAME TIMED OUT",
+        "VIDEO SEEK TIMED OUT", "VIDEO STAGING TRANSFER DID NOT COMPLETE",
+        "VIDEO START CANCELLED", "VIDEO UNAVAILABLE", "VIDEO COULD NOT RESTART",
+        "SEEK FRAME UNAVAILABLE", "SEEK SOURCE COULD NOT PRIME",
+        "media open failed", "media seek failed",
+        "could not produce bounded preview frame",
+    };
+    static const char *const progress[] = {
+        "STARTING VIDEO", "RESTARTING VIDEO", "Restarting decoder",
+        "Seeking...", "Buffering after seek",
+    };
+    bool english = !strcmp(language_code, "en");
+    size_t status_count = sizeof(statuses) / sizeof(statuses[0]);
+    size_t label_count = sizeof(labels) / sizeof(labels[0]);
+    ui->screen = PSP_UI_SCREEN_UPDATE;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui->browser_ui_scale = scale;
+        for (size_t at = 0; at < status_count; at++) {
+            const char *label = labels[at % label_count];
+            bool cancel = at % 3u == 1u;
+            ui->update_channel = at % 2u ? BROWSER_UPDATE_CHANNEL_BETA
+                                         : BROWSER_UPDATE_CHANNEL_STABLE;
+            psp_ui_set_update(ui, at % 4u ? "0.1.30" : "", statuses[at],
+                at % 5u ? "" : "Decoder rebuild needed", at % 2u ? 500 : -1,
+                label, true, cancel);
+            CHECK(paint(ui, provider));
+            char current[160];
+            snprintf(current, sizeof(current), "%s  %s",
+                tilefinch_ui_text("Current version"),
+                at % 4u ? "0.1.30" : tilefinch_ui_text("Unknown"));
+            CHECK(shown_whole(tilefinch_ui_text("Tilefinch update"))
+                  && shown_whole(current)
+                  && shown_whole(tilefinch_ui_text(statuses[at]))
+                  && shown_whole(tilefinch_ui_text(label)));
+            if (at % 5u == 0u)
+                CHECK(shown_whole(tilefinch_ui_text("Decoder rebuild needed")));
+            CHECK(shown_whole(tilefinch_ui_text(
+                cancel ? "O Stop"
+                : ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE
+                    ? "Square Versions   O Back" : "O Back")));
+        }
+    }
+    ui->update_channel = BROWSER_UPDATE_CHANNEL_STABLE;
+    ui->browser_ui_scale = 1;
+
+    PspUiMediaState media = {.visible = true, .controls_visible = true};
+    for (size_t at = 0; at < sizeof(headlines) / sizeof(headlines[0]); at++) {
+        psp_ui_media_set_error(&media, headlines[at]);
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        /* English keeps folding a long headline onto the second row. */
+        if (!english || strlen(headlines[at]) <= 32u)
+            CHECK(shown_whole(tilefinch_ui_text(headlines[at])));
+    }
+    for (size_t at = 0; at < sizeof(progress) / sizeof(progress[0]); at++) {
+        media = (PspUiMediaState) {.visible = true, .controls_visible = true,
+                                   .resolving = true};
+        psp_ui_media_set_resolving_progress(&media, progress[at], 450u);
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        CHECK(shown_whole(tilefinch_ui_text(progress[at])));
+    }
+
+    /* The font-pack offer: checking, the signed size, and failures. */
+    ui->screen = PSP_UI_SCREEN_GLYPH_OFFER;
+    for (unsigned pack = 0; pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
+        const char *label = tilefinch_ui_text(
+            tilefinch_glyph_pack_spec((TilefinchGlyphPack) pack)->label);
+        ui->glyph_confirm_pack = (uint8_t) pack;
+        ui->glyph_confirm_phase = PSP_UI_GLYPH_CONFIRM_CHECKING;
+        CHECK(paint(ui, provider));
+        CHECK(shown_whole(label) && shown_whole(tilefinch_ui_text("Checking size..."))
+              && shown_whole(tilefinch_ui_text("O Cancel")));
+        psp_ui_set_glyph_offer_size(ui, (uint8_t) pack, 41u * 1024u * 1024u / 10u);
+        CHECK(paint(ui, provider));
+        char title[160];
+        snprintf(title, sizeof(title), "%s  (4.1 MB)", label);
+        CHECK(shown_whole(title)
+              && shown_whole(tilefinch_ui_text("Install this font pack?"))
+              && shown_whole(tilefinch_ui_text("Signed, verified, kept on the Memory Stick."))
+              && shown_whole(tilefinch_ui_text("X Install   O Cancel")));
+        static const char *const failures[] = {
+            "SIGNED PACK DOWNLOAD UNAVAILABLE", "NETWORK NOT READY FOR FONT PACK"};
+        psp_ui_set_glyph_offer_error(ui, (uint8_t) pack, failures[pack % 2u]);
+        CHECK(paint(ui, provider));
+        char failure[128];
+        snprintf(failure, sizeof(failure), "%s", failures[pack % 2u]);
+        psp_ui_status_sentence_case(failure);
+        CHECK(shown_whole(english ? failure : tilefinch_ui_text(failures[pack % 2u]))
+              && shown_whole(tilefinch_ui_text("O Close")));
+    }
+
+    /* The font-pack row's hints: no pack for the page language, an
+       installed pack, and its removal confirmation. */
+    ui->screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
+    ui->glyph_options_selection = 2;
+    ui->glyph_component_phase = PSP_UI_GLYPH_COMPONENT_READY;
+    ui->glyph_language = BROWSER_GLYPH_LANGUAGE_EMBEDDED;
+    CHECK(paint(ui, provider)
+          && shown_whole(tilefinch_ui_text("Choose a language above   O Back")));
+    ui->glyph_language = BROWSER_GLYPH_LANGUAGE_JAPANESE;
+    ui->glyph_installed_mask = 1u << TILEFINCH_GLYPH_PACK_JAPANESE;
+    ui->glyph_component_remove_confirmation = false;
+    CHECK(paint(ui, provider)
+          && shown_whole(tilefinch_ui_text("X Check update   Square remove")));
+    ui->glyph_component_remove_confirmation = true;
+    CHECK(paint(ui, provider)
+          && shown_whole(tilefinch_ui_text("Square remove   O Cancel")));
+    ui->glyph_component_remove_confirmation = false;
+    ui->glyph_installed_mask = 0;
+    ui->glyph_options_selection = 0;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* A run showing exactly TEXT, whole, without reporting a miss. */
+static bool has_whole_run(const char *text)
+{
+    for (size_t at = 0; at < run_count; at++)
+        if (!strcmp(runs[at].text, text) && !runs[at].truncated
+            && !runs[at].missing_glyph && runs[at].left >= 0
+            && runs[at].right <= WIDTH) return true;
+    return false;
+}
+
+/* The run showing exactly TEXT lies inside RECT. */
+static bool run_inside(const char *text, UiRect rect)
+{
+    for (size_t at = 0; at < run_count; at++)
+        if (!strcmp(runs[at].text, text))
+            return runs[at].left >= rect.x
+                && runs[at].right <= rect.x + rect.width
+                && runs[at].top >= rect.y
+                && runs[at].bottom <= rect.y + rect.height;
+    return false;
+}
+
+/* Site information: the title, each connection state, the issuer
+   placeholders, the cookies and storage line, every action and its armed
+   confirmation, each place a site's storage can be (beside Site storage),
+   and the hint.
+   The site name, TLS version and a server's issuer stay as sent. */
+static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const states[4] = {
+        "Secure", "TLS status unavailable", "Certificate warning", "Not secure"};
+    static const char *const actions[UI_SITE_INFO_ACTION_COUNT] = {
+        "Permissions & controls", "Site storage",
+        "Clear data for this site", "Reset permissions"};
+    bool arabic = tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ARABIC;
+    unsigned session_both = 0;
+    snprintf(ui->url, sizeof(ui->url), "https://www.example.org/news/today");
+    char domain[64], detail[128];
+    ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
+    CHECK(domain[0] != 0);
+    ui->screen = PSP_UI_SCREEN_PAGE_INFORMATION;
+    ui->site_cookie_count = 120;
+    ui->site_storage_count = 2048;
+    ui->site_data_bytes = 12u * 1024u * 1024u;
+    for (unsigned state = 0; state < 4; state++) {
+        ui->secure = state != 3;
+        ui->site_tls_verify_result_available = state != 1;
+        ui->site_tls_verify_result = state == 2 ? 9 : 0;
+        snprintf(ui->site_tls_version, sizeof(ui->site_tls_version), "%s",
+                 state == 3 ? "HTTP" : "TLS 1.3");
+        /* As psp_app_input.c fills it when the server sent no issuer. */
+        const char *issuer = tilefinch_ui_text(
+            ui->secure ? "Certificate issuer unavailable" : "No TLS certificate");
+        CHECK(strlen(issuer) < sizeof(ui->site_tls_issuer));
+        snprintf(ui->site_tls_issuer, sizeof(ui->site_tls_issuer), "%s", issuer);
+        char connection[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 24];
+        snprintf(connection, sizeof(connection), "%s  |  %s",
+                 tilefinch_ui_text(states[state]), ui->site_tls_version);
+        for (unsigned place = 0; place < 4; place++) {
+            ui->site_storage_state = (uint8_t) place;
+            /* The Site data & storage list's words for the place; a
+               this-session grant names the Memory Stick too where the
+               row has room. */
+            static const char *const places[4] = {
+                "RAM", "Memory Stick", "RAM only", "This session"};
+            char where[2 * TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4], both[sizeof(where)];
+            snprintf(where, sizeof(where), "%s",
+                     place == 0 ? "RAM" : tilefinch_ui_text(places[place]));
+            snprintf(both, sizeof(both), "%s (%s)", tilefinch_ui_text("Memory Stick"),
+                     tilefinch_ui_text("This session"));
+            char data[2 * TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 48];
+            if (arabic)
+                snprintf(data, sizeof(data), "120 %s  |  2048 %s  |  12288 KB",
+                         tilefinch_ui_text("Cookies:"), tilefinch_ui_text("Storage:"));
+            else
+                snprintf(data, sizeof(data), "%s 120  |  %s 2048  |  12288 KB",
+                         tilefinch_ui_text("Cookies:"), tilefinch_ui_text("Storage:"));
+            for (unsigned row = 0; row < UI_SITE_INFO_ACTION_COUNT; row++) {
+                ui->menu_selection = (uint8_t) row;
+                for (unsigned armed = 0; armed < (row >= 2 ? 2u : 1u); armed++) {
+                    ui->data_clear_confirmation = armed ? (uint8_t) (row + 1) : 0;
+                    CHECK(paint(ui, provider));
+                    CHECK(shown_whole(tilefinch_ui_text("Site information"))
+                          && shown_whole(domain)
+                          && shown_whole(connection) && shown_whole(issuer)
+                          && shown_whole(data)
+                          && (place == 3 && has_whole_run(both) ? (session_both++, true)
+                              : shown_whole(where))
+                          && shown_whole(tilefinch_ui_text("X Open / confirm   O Back")));
+                    for (unsigned at = 0; at < UI_SITE_INFO_ACTION_COUNT; at++)
+                        CHECK(shown_whole(tilefinch_ui_text(
+                            armed && at == row ? "Press X again to confirm" : actions[at])));
+                }
+            }
+        }
+    }
+    fprintf(stderr, "site information locale=%s scale=%u: Memory Stick (This session) "
+            "in %u of %u session frames\n", language_code, ui->browser_ui_scale,
+            session_both, 4u * (UI_SITE_INFO_ACTION_COUNT + 2u));
+    if (!strcmp(language_code, "en")) CHECK(session_both > 0);
+    /* A server's issuer is shown as sent, never looked up. */
+    snprintf(ui->site_tls_issuer, sizeof(ui->site_tls_issuer), "Secure");
+    ui->secure = true;
+    ui->site_tls_verify_result_available = true;
+    ui->site_tls_verify_result = 0;
+    ui->data_clear_confirmation = 0;
+    CHECK(paint(ui, provider) && shown_whole("Secure"));
+    memset(ui->url, 0, sizeof(ui->url));
+    ui->site_tls_issuer[0] = ui->site_tls_version[0] = 0;
+    ui->site_cookie_count = ui->site_storage_count = 0;
+    ui->site_data_bytes = 0;
+    ui->site_storage_state = 0;
+    ui->secure = false;
+    ui->site_tls_verify_result_available = false;
+    ui->menu_selection = 0;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* The failed-video panel, the Help details and the Site data & storage
+   screens: every line arrives translated and whole at both chrome scales.
+   The Retry chip shows the X button and the shared "Retry" word and grows
+   to fit it; English keeps its 132 px chip in the 324 px panel. */
+static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    bool english = !strcmp(language_code, "en");
+    char retry[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
+    snprintf(retry, sizeof(retry), "X %s", tilefinch_ui_text("Retry"));
+    char audio[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 16], both[600];
+    snprintf(audio, sizeof(audio), "%s %s", english ? "Triangle" : "TRI",
+             tilefinch_ui_text("Audio-only"));
+    const char *lower = english ? "Square 240p" : "\xe2\x96\xa1 240p";
+    snprintf(both, sizeof(both), "%s   %s", audio, lower);
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui->browser_ui_scale = scale;
+        PspUiMediaState media = {.visible = true, .controls_visible = true};
+        psp_ui_media_set_error_reason(&media, "VIDEO UNAVAILABLE",
+                                      "Connection timed out");
+        media.failed = true;
+        for (unsigned recovery = 0; recovery < 3; recovery++) {
+            media.audio_only_recovery_available = recovery != 1;
+            media.lower_quality_recovery_available = recovery != 0;
+            CHECK(paint_media(&media, provider) && validate_frame(ui));
+            UiRect panel = media_failed_panel_rect(WIDTH, HEIGHT);
+            UiRect chip = media_failed_retry_rect(panel);
+            UiRect back = media_failed_back_rect(panel, false);
+            CHECK(panel.x >= 16 && panel.x + panel.width <= WIDTH - 16
+                  && chip.x + chip.width + 8 <= back.x);
+            if (english)
+                CHECK(panel.width == 324 && chip.width == 132);
+            CHECK(shown_whole(retry) && run_inside(retry, chip)
+                  && shown_whole(tilefinch_ui_text("O Back"))
+                  && run_inside(tilefinch_ui_text("O Back"), back));
+            CHECK(shown_whole(recovery == 0 ? audio
+                              : recovery == 1 ? lower : both));
+            /* The pointer finds both chips where they are drawn. */
+            CHECK(psp_ui_media_activate_at(&media, chip.x + chip.width - 2,
+                      chip.y + chip.height / 2, WIDTH, HEIGHT).action
+                  == PSP_UI_MEDIA_ACTION_RETRY);
+            CHECK(psp_ui_media_activate_at(&media, back.x + 2,
+                      back.y + back.height / 2, WIDTH, HEIGHT).action
+                  == PSP_UI_MEDIA_ACTION_CLOSE);
+        }
+        media.retry_unavailable = true;
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        CHECK(shown_whole(tilefinch_ui_text("Restart Tilefinch to use video"))
+              && !has_whole_run(retry));
+
+        /* Help: the last error, version and licence details. */
+        static const struct { unsigned item; const char *lines[3]; } help[] = {
+            {2, {"Last error summary", "Included first in Diagnostic QR",
+                 "Photograph every part to keep the full report."}},
+            {4, {"Version & system", "Sony PSP release build",
+                 "480 x 272  |  333 MHz"}},
+            {5, {"Licences", "Tilefinch is MIT licensed.",
+                 "Third-party and font licences are included."}},
+        };
+        ui->screen = PSP_UI_SCREEN_HELP_DETAIL;
+        for (size_t at = 0; at < sizeof(help) / sizeof(help[0]); at++) {
+            ui->menu_selection = help[at].item;
+            CHECK(paint(ui, provider));
+            for (size_t line = 0; line < 3; line++)
+                CHECK(shown_whole(tilefinch_ui_text(help[at].lines[line])));
+            CHECK(shown_whole(tilefinch_ui_text("O Back")));
+        }
+
+        /* Site data & storage, with each place a site can be kept. The
+           view is filled as psp_app_storage.c fills it. */
+        static const char *const places[4] = {
+            "Memory Stick", "This session", "RAM only", "RAM"};
+        PspUiSiteStorageView sites = {.count = 4};
+        snprintf(sites.stick_free, sizeof(sites.stick_free), "%s 1.2 GB",
+                 tilefinch_ui_text("Free space:"));
+        for (unsigned site = 0; site < 4; site++) {
+            snprintf(sites.rows[site].origin, sizeof(sites.rows[site].origin),
+                     "site%u.example.org", site);
+            snprintf(sites.rows[site].detail, sizeof(sites.rows[site].detail),
+                     "1.4 MB  %s", tilefinch_ui_text(places[site]));
+            sites.rows[site].state = (uint8_t) (site == 1 ? 3u : site);
+        }
+        ui->site_storage = &sites;
+        ui->screen = PSP_UI_SCREEN_DATA_OPTIONS;
+        static const char *const expected[] = {
+            "Site data & storage", "SITES", "MEMORY STICK", "CACHES",
+            "CLEAR ALL SITES", "Offer Memory Stick", "Save RAM storage at exit",
+            "Memory cache", "Disk cache", "Keep compiled scripts",
+            "Clear HTTP caches", "Clear compiled scripts", "Clear cookies",
+            "Clear local storage", "Clear session storage",
+            "Faster revisits; uses Memory Stick space",
+        };
+        bool seen[sizeof(expected) / sizeof(expected[0])] = {false};
+        bool seen_free = false, seen_details = true;
+        for (unsigned row = 0; row < 4 + UI_SITE_DATA_FIXED_ROWS; row++) {
+            ui->data_options_selection = row;
+            ui->keep_compiled_scripts = row % 2u != 0;
+            ui->persistent_cache_mb = row % 3u ? 0 : 8;
+            CHECK(paint(ui, provider));
+            for (size_t at = 0; at < sizeof(expected) / sizeof(expected[0]); at++)
+                seen[at] |= has_whole_run(tilefinch_ui_text(expected[at]));
+            seen_free |= has_whole_run(sites.stick_free);
+            if (row < 4) seen_details &= has_whole_run(sites.rows[row].detail);
+            if (row >= 4 + UI_SITE_DATA_CLEAR_CACHE) {
+                ui->data_clear_confirmation = (uint8_t) (row + 1);
+                CHECK(paint(ui, provider)
+                      && shown_whole(tilefinch_ui_text("Press X again to confirm")));
+                ui->data_clear_confirmation = 0;
+            }
+        }
+        for (size_t at = 0; at < sizeof(expected) / sizeof(expected[0]); at++)
+            if (!seen[at]) {
+                fprintf(stderr, "never shown whole: locale=%s '%s'\n",
+                        language_code, expected[at]);
+                CHECK(false);
+            }
+        CHECK(seen_free && seen_details);
+        sites.count = 0;
+        ui->data_options_selection = 0;
+        CHECK(paint(ui, provider)
+              && shown_whole(tilefinch_ui_text("No site is storing data")));
+        sites.count = 4;
+
+        /* One site's storage: its place, the choice and its explanation. */
+        static const char *const explanations[4] = {
+            "Offers the Memory Stick when RAM runs out.",
+            "Kept on the Memory Stick across restarts.",
+            "Stays in RAM; the Memory Stick is never offered.",
+            "On the Memory Stick until you exit."};
+        static const char *const states[4] = {
+            "Ask", "Memory Stick", "RAM only", "This session"};
+        ui->screen = PSP_UI_SCREEN_STORAGE_SITE;
+        for (unsigned site = 0; site < 4; site++) {
+            ui->data_options_selection = site;
+            unsigned state = sites.rows[site].state;
+            for (unsigned focus = 0; focus < 3; focus++) {
+                ui->data_clear_confirmation = (uint8_t) focus;
+                CHECK(paint(ui, provider));
+                CHECK(shown_whole(sites.rows[site].detail)
+                      && shown_whole(tilefinch_ui_text("Site storage"))
+                      && shown_whole(tilefinch_ui_text(states[state]))
+                      && shown_whole(tilefinch_ui_text(explanations[state]))
+                      && shown_whole(tilefinch_ui_text(
+                             focus == 2 ? "Press X again to confirm"
+                                        : "Delete its data")));
+            }
+        }
+        ui->data_clear_confirmation = 0;
+        ui->data_options_selection = 0;
+        ui->site_storage = NULL;
+
+        /* The same choice in Permissions & controls. */
+        ui->screen = PSP_UI_SCREEN_SITE_CONTROLS;
+        for (unsigned state = 0; state < 4; state++) {
+            ui->site_storage_state = (uint8_t) state;
+            ui->menu_selection = UI_SITE_CONTROLS_ITEM_COUNT - 1u;
+            CHECK(paint(ui, provider)
+                  && shown_whole(tilefinch_ui_text(states[state])));
+        }
+        ui->site_storage_state = 0;
+        ui->menu_selection = 0;
+
+        CHECK(test_site_information(ui, provider));
+    }
+    ui->browser_ui_scale = 1;
+    ui->keep_compiled_scripts = false;
+    ui->persistent_cache_mb = 0;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* Statuses built from two catalog lines (pack name and state, a notice and
+   its menu path), a trailing progress count, mixed-case keys and the
+   second-line suggestions: every line arrives translated and whole at both
+   chrome scales. */
+static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const statuses[] = {
+        "Cyrillic\nDownloading 45%", "Japanese\nInstalling 7%",
+        "Devanagari (Hindi)\nChecking...", "Simplified Chinese\nDownloading...",
+        "Traditional Chinese\nLanguage pack installed",
+        "Color Emoji\nInstalled. Reload the page to redraw it",
+        "Color Emoji\nInstalled",
+        "Bengali-Assamese\nLanguage pack installed",
+        "Won't ask again. Install it later from:\n"
+            "Settings > Appearance > Language & emoji",
+        "CONTENT BLOCKER IS OFF\nSETTINGS > PRIVACY & SECURITY",
+        "JAVASCRIPT IS OFF FOR ALL SITES\nSETTINGS > BROWSING & INPUT",
+        "PAGE CONTROLS ON\nSTART+SELECT EXITS",
+        "SAVING SCREENSHOT 45%", "Homepage unavailable", "Nothing to retry",
+        /* Long enough to wrap at a space in most languages. */
+        "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK",
+        "YOUTUBE SIGN-IN NOT CONFIRMED - TRY SIGN IN AGAIN",
+    };
+    enum { KINDS = 7 };
+    size_t count = sizeof(statuses) / sizeof(statuses[0]);
+    bool english = !strcmp(language_code, "en");
+    for (unsigned pack = 0; pack < TILEFINCH_GLYPH_PACK_COUNT && !english; pack++) {
+        const char *label = tilefinch_glyph_pack_spec((TilefinchGlyphPack) pack)->label;
+        if (tilefinch_ui_text(label) == label) {
+            fprintf(stderr, "untranslated pack label locale=%s '%s'\n", language_code, label);
+            CHECK(false);
+        }
+    }
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    ui->chrome_visible = false;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        ui->browser_ui_scale = scale;
+        for (size_t row = 0; row < count + KINDS; row++) {
+            char first[300], second[300] = "";
+            bool first_translated = false;
+            if (row < count) {
+                char english_lines[PSP_UI_STATUS_CAPACITY];
+                snprintf(english_lines, sizeof(english_lines), "%s", statuses[row]);
+                char *next = strchr(english_lines, '\n');
+                if (next != NULL) *next++ = '\0';
+                char joined_expected[600];
+                first_translated = expected_toast_line(english_lines, first, sizeof(first));
+                if (next != NULL) expected_toast_line(next, second, sizeof(second));
+                snprintf(joined_expected, sizeof(joined_expected), "%s%s%s",
+                         first, next != NULL ? "\n" : "", second);
+                psp_ui_status_sentence_case(joined_expected);
+                char *split = strchr(joined_expected, '\n');
+                if (split != NULL) *split++ = '\0';
+                snprintf(first, sizeof(first), "%s", joined_expected);
+                snprintf(second, sizeof(second), "%s", split != NULL ? split : "");
+                psp_ui_show_status(ui, statuses[row], 60);
+            } else {
+                const char *headline = "PAGE SCRIPTS ARE RUNNING LOW ON MEMORY";
+                unsigned kind = (unsigned) (row - count);
+                if (kind == 0) {
+                    psp_ui_show_wifi_sign_in_status(ui, "THIS WI-FI MAY REQUIRE SIGN-IN", 60);
+                    headline = "THIS WI-FI MAY REQUIRE SIGN-IN";
+                    snprintf(second, sizeof(second), "%s",
+                             tilefinch_ui_text("X Open Wi-Fi sign-in  O Cancel"));
+                } else if (kind == 1) {
+                    psp_ui_show_heavy_scripts_status(ui, headline, 60);
+                    snprintf(second, sizeof(second), "%s",
+                             tilefinch_ui_text("X Stop page scripts  O Keep reading"));
+                } else {
+                    headline = "PAGE UNAVAILABLE";
+                    psp_ui_show_tls_status(ui, headline, (TilefinchTlsGuidance) (kind - 1u), 60);
+                    static const char *const guidance[] = {
+                        "Make sure date/time in XMB Settings is correct",
+                        "Try another Wi-Fi or update Tilefinch",
+                        "Secure connection was redirected. Try another Wi-Fi network",
+                        "Secure connection unsupported. Update Tilefinch",
+                        "Open Help & diagnostics for details"
+                    };
+                    snprintf(second, sizeof(second), "%s", tilefinch_ui_text(guidance[kind - 2u]));
+                    CHECK(english || strcmp(second, guidance[kind - 2u]) != 0);
+                }
+                snprintf(first, sizeof(first), "%s", tilefinch_ui_text(headline));
+                psp_ui_status_sentence_case(first);
+            }
+            ui->toast_entry_frames = 0;
+            CHECK(paint(ui, provider));
+            /* A long single line may wrap at a space; rejoined it must be
+               the expected text. Arabic catalog text is visual order, so
+               its first painted line is the right part of the string. */
+            char rejoined[600] = "";
+            if (run_count == 2 && !strcmp(language_code, "ar") && first_translated)
+                snprintf(rejoined, sizeof(rejoined), "%s %s", runs[1].text, runs[0].text);
+            else if (run_count == 2)
+                snprintf(rejoined, sizeof(rejoined), "%s %s", runs[0].text, runs[1].text);
+            bool whole = second[0] == '\0'
+                ? (run_count == 1 && !strcmp(runs[0].text, first))
+                  || (run_count == 2 && !strcmp(rejoined, first))
+                : run_count == 2 && !strcmp(runs[0].text, first) && !strcmp(runs[1].text, second);
+            for (size_t r = 0; r < run_count; r++)
+                if (runs[r].truncated || runs[r].missing_glyph
+                    || runs[r].left < 12 || runs[r].right > WIDTH - 12) whole = false;
+            if (!whole) {
+                fprintf(stderr, "composed toast locale=%s scale=%u row=%zu expected '%s' / '%s'\n",
+                        language_code, scale, row, first, second);
+                for (size_t r = 0; r < run_count; r++)
+                    fprintf(stderr, "  '%s' %d..%d truncated=%u missing=%u\n", runs[r].text,
+                            runs[r].left, runs[r].right, runs[r].truncated, runs[r].missing_glyph);
+                CHECK(false);
+            }
+        }
+    }
+    ui->toast_frames = 0;
+    ui->status[0] = '\0';
+    ui->toast_kind = PSP_UI_TOAST_PLAIN;
+    ui->browser_ui_scale = 1;
+    return true;
+}
+
 static bool test_square_button_symbol(void)
 {
     for (int scale = 1; scale <= 2; scale++) {
@@ -697,9 +1390,8 @@ static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
             fprintf(stderr, "text bounds x=%d width=%d text=%.*s\n", command->x,
                 command->width, (int)command->text_length, command->text);
         CHECK(command->x >= 0 && command->x + command->width <= WIDTH);
-        bool bold = draw_command_font_weight_code(command) >= 65u;
-        const FontFace *face = font_context_face_variant(layout->fonts, layout->web_fonts,
-            draw_command_font_family(command), draw_command_font_italic(command), bold);
+        bool bold = draw_uses_bold_face(command);
+        const FontFace *face = draw_command_face(layout, command);
         int width = (font_text_width_for_family_at_size_fixed(face,
             font_context_metric_family(layout->web_fonts, draw_command_font_family(command), face), command->text,
             command->text_length, draw_command_text_font_size_fixed(command), false,
@@ -977,6 +1669,82 @@ static bool test_real_bengali_coverage(Budget *budget, const FontSet *fonts)
     return true;
 }
 
+/* Loads a chrome glyph the way the painter does, finishing queued pack
+   payloads first so a pending page cannot stand in for the answer. */
+static const FontGlyph *settled_chrome_glyph(TilefinchGlyphProvider *provider,
+                                             unsigned key)
+{
+    const FontGlyph *glyph = NULL;
+    for (unsigned pass = 0; pass < 64; pass++) {
+        bool missing = false;
+        glyph = chrome_font_glyph(key, 1, false, &missing);
+        if (glyph != NULL || provider == NULL) return glyph;
+        bool changed = false;
+        size_t read = 0;
+        if (!tilefinch_glyph_provider_pump(provider, 65536, &changed, &read) || !read)
+            return glyph;
+    }
+    return glyph;
+}
+
+/* A page title in Devanagari drawn before its pack exists caches misses;
+   attaching the pack must let the chrome draw it, and a re-arranged
+   provider must not serve a cluster key cached under the old one. */
+static bool test_chrome_cache_follows_packs(void)
+{
+    char hindi[64], bengali[64];
+    CHECK(make_metric_pack(hindi, false) && make_metric_pack(bengali, true));
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget,
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 2u * 1024u * 1024u));
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
+        font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
+    const unsigned ka = 0x0915u;
+    CHECK(settled_chrome_glyph(NULL, ka) == NULL);
+    uint32_t epoch = chrome_font_epoch;
+
+    /* The lazy path binds an empty provider, then attaches the pack. */
+    TilefinchGlyphProvider *first = tilefinch_glyph_provider_create(&budget);
+    CHECK(first && font_optional_glyph_provider_install(first));
+    CHECK(settled_chrome_glyph(first, ka) == NULL);
+    CHECK(tilefinch_glyph_provider_attach(first, hindi, "glyph-ui-test")
+          && tilefinch_glyph_provider_attach(first, bengali, "glyph-ui-bn-test"));
+    CHECK(settled_chrome_glyph(first, ka) != NULL);
+    /* The cached chrome bars and media rasters are keyed by this epoch. */
+    CHECK(chrome_font_epoch != epoch);
+    unsigned cluster = 0;
+    size_t characters = 0;
+    CHECK(ui_text_next_glyph("कि", strlen("कि"), &cluster, &characters)
+              == strlen("कि") && cluster > 0x10ffffu);
+    CHECK(settled_chrome_glyph(first, cluster) != NULL);
+    CHECK(font_optional_glyph_provider_uninstall(first));
+    tilefinch_glyph_provider_destroy(first);
+
+    /* A replacement provider: nothing loaded under the old arrangement,
+       neither a codepoint nor an opaque cluster key, may still be served. */
+    TilefinchGlyphProvider *second = tilefinch_glyph_provider_create(&budget);
+    CHECK(second && font_optional_glyph_provider_install(second));
+    CHECK(settled_chrome_glyph(second, ka) == NULL);
+    CHECK(settled_chrome_glyph(second, cluster) == NULL);
+    CHECK(tilefinch_glyph_provider_attach(second, bengali, "glyph-ui-bn-test"));
+    CHECK(settled_chrome_glyph(second, ka) != NULL);
+    CHECK(font_optional_glyph_provider_uninstall(second));
+    tilefinch_glyph_provider_destroy(second);
+    CHECK(settled_chrome_glyph(NULL, ka) == NULL);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(unlink(hindi) == 0 && unlink(bengali) == 0 && budget.current == 0);
+    return true;
+}
+
 static bool test_all_languages(void)
 {
     char path[64], bengali_path[64] = {0};
@@ -1056,6 +1824,10 @@ static bool test_all_languages(void)
             ui.ui_language = language;
             CHECK(test_player_language(&ui, provider));
             CHECK(test_download_language(&ui, provider));
+            if (theme == 0) CHECK(test_status_toasts(&ui, provider));
+            if (theme == 0) CHECK(test_composed_toasts(&ui, provider));
+            if (theme == 0) CHECK(test_state_text(&ui, provider));
+            if (theme == 0) CHECK(test_remaining_screens(&ui, provider));
             ui.screen = PSP_UI_SCREEN_PAGE;
             ui.chrome_visible = true;
             ui.focus_label_valid = true;
@@ -1095,11 +1867,43 @@ static bool test_all_languages(void)
                 ui.options_group_selection = group;
                 CHECK(paint(&ui, provider));
             }
+            if (theme == 0) {
+                /* Warm settings frames: how often a retained Unicode glyph
+                   is found without scanning the whole table. */
+                TilefinchTestFaults *faults = tilefinch_test_faults();
+                faults->chrome_unicode_lookups = faults->chrome_unicode_scans
+                    = faults->chrome_unicode_scan_hits = 0;
+                for (unsigned group = 0; group < UI_SETTINGS_GROUP_COUNT; group++) {
+                    ui.options_group_selection = group;
+                    CHECK(paint(&ui, provider));
+                }
+                fprintf(stderr, "chrome unicode lookups: locale=%s settings frames=%u "
+                        "lookups=%lu scans=%lu scan-hits=%lu\n", language_code,
+                        (unsigned) UI_SETTINGS_GROUP_COUNT, faults->chrome_unicode_lookups,
+                        faults->chrome_unicode_scans, faults->chrome_unicode_scan_hits);
+            }
             CHECK(snapshot(theme ? "settings-light" : "settings-dark"));
             ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
             for (unsigned option = 0; option < UI_OPTIONS_ITEM_COUNT; option++) {
                 ui.options_selection = option;
                 CHECK(paint(&ui, provider));
+            }
+            if (theme == 0) {
+                TilefinchTestFaults *faults = tilefinch_test_faults();
+                faults->chrome_unicode_lookups = faults->chrome_unicode_scans
+                    = faults->chrome_unicode_scan_hits = 0;
+                for (unsigned option = 0; option < UI_OPTIONS_ITEM_COUNT; option++) {
+                    ui.options_selection = option;
+                    CHECK(paint(&ui, provider));
+                }
+                fprintf(stderr, "chrome unicode lookups: locale=%s option-item frames=%u "
+                        "lookups=%lu scans=%lu scan-hits=%lu\n", language_code,
+                        (unsigned) UI_OPTIONS_ITEM_COUNT, faults->chrome_unicode_lookups,
+                        faults->chrome_unicode_scans, faults->chrome_unicode_scan_hits);
+                /* The two-way hint finds a retained glyph without a scan
+                   (a direct-mapped one rescanned up to 8% of lookups). */
+                CHECK(faults->chrome_unicode_scan_hits * 33u
+                      <= faults->chrome_unicode_lookups);
             }
             ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
             for (unsigned selected = 0; selected < TILEFINCH_UI_LANGUAGE_COUNT; selected++) {
@@ -1124,6 +1928,22 @@ static bool test_all_languages(void)
                             | (1u << TILEFINCH_GLYPH_PACK_COLOR_EMOJI) : 0;
                     ui.glyph_component_remove_confirmation = phase == PSP_UI_GLYPH_COMPONENT_READY;
                     CHECK(paint(&ui, provider));
+                    /* The translated phase keeps its percentage in every
+                       language (the Indic phases are 31-35 bytes). */
+                    if ((selected == 2 || selected == 3)
+                        && (phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING
+                            || phase == PSP_UI_GLYPH_COMPONENT_INSTALLING)) {
+                        char progress[96];
+                        snprintf(progress, sizeof(progress), "%s 100%%", tilefinch_ui_text(
+                            phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING ? "Downloading" : "Installing"));
+                        bool shown = false;
+                        for (size_t r = 0; r < run_count; r++)
+                            shown |= !strcmp(runs[r].text, progress) && !runs[r].truncated;
+                        if (!shown)
+                            fprintf(stderr, "pack progress locale=%s phase=%u missing '%s'\n",
+                                    language_code, phase, progress);
+                        CHECK(shown);
+                    }
                     ui.glyph_component_progress_plus_one = 0;
                     CHECK(paint(&ui, provider));
                 }
@@ -1379,5 +2199,6 @@ int main(int argc, char **argv)
     if (argc > 3 && argv[3][0]) real_arabic_pack = argv[3];
     if (argc > 4 && argv[4][0]) real_bengali_pack = argv[4];
     return test_opaque_panel_row_copy() && test_menu_metadata_equivalence()
-        && test_square_button_symbol() && test_all_languages() ? 0 : 1;
+        && test_square_button_symbol() && test_chrome_cache_follows_packs()
+        && test_all_languages() ? 0 : 1;
 }

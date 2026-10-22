@@ -1,3 +1,76 @@
+    puts("test: attribute replacement releases superseded native text");
+    size_t attribute_text_baseline = budget.current;
+    PocDocument attribute_text_document = {0};
+    static const char attribute_text_page[] =
+        "<!doctype html><div id=target data-state=original></div>";
+    CHECK(document_parse(&attribute_text_document, &budget, attribute_text_page,
+                         sizeof(attribute_text_page) - 1u, 17));
+    lxb_dom_node_t *attribute_text_target = find_id(
+        lxb_dom_interface_node(attribute_text_document.html), "target");
+    CHECK(attribute_text_target != NULL);
+    lxb_dom_element_t *attribute_text_element =
+        lxb_dom_interface_element(attribute_text_target);
+    lxb_dom_document_t *attribute_text_owner = attribute_text_target->owner_document;
+    CHECK(attribute_text_owner->attr_mutation->change != NULL);
+    size_t attribute_text_refs = attribute_text_owner->text->ref_count;
+    uint64_t attribute_text_generation = document_style_generation();
+    for (size_t i = 0; i < 2048u; i++) {
+        const char *value = i % 2u == 0 ? "changed" : "original";
+        CHECK(lxb_dom_element_set_attribute(attribute_text_element,
+            (const lxb_char_t *) "data-state", 10,
+            (const lxb_char_t *) value, strlen(value)) != NULL);
+    }
+    CHECK(document_style_generation() != attribute_text_generation);
+    printf("attribute native text refs=%zu->%zu\n", attribute_text_refs,
+           attribute_text_owner->text->ref_count);
+    CHECK(attribute_text_owner->text->ref_count == attribute_text_refs);
+    /* A large replacement needs a fresh pool chunk. A refusal must leave
+       both the linked attribute identity and its old value intact. */
+    char refused_attribute_text[65536];
+    memset(refused_attribute_text, 'x', sizeof(refused_attribute_text));
+    lxb_dom_attr_t *attribute_text_attr = lxb_dom_element_attr_by_name(
+        attribute_text_element, (const lxb_char_t *) "data-state", 10);
+    budget_inject_failure_after(&budget, 0);
+    lxb_dom_attr_t *attribute_text_refused = lxb_dom_element_set_attribute(
+        attribute_text_element, (const lxb_char_t *) "data-state", 10,
+        (const lxb_char_t *) refused_attribute_text, sizeof(refused_attribute_text));
+    budget_clear_failure_injection(&budget);
+    CHECK(attribute_text_refused == NULL);
+    CHECK(lxb_dom_element_attr_by_name(attribute_text_element,
+        (const lxb_char_t *) "data-state", 10) == attribute_text_attr);
+    size_t attribute_text_length = 0;
+    const lxb_char_t *attribute_text_value = lxb_dom_element_get_attribute(
+        attribute_text_element, (const lxb_char_t *) "data-state", 10,
+        &attribute_text_length);
+    CHECK(attribute_text_value != NULL && attribute_text_length == 8u
+          && memcmp(attribute_text_value, "original", 8u) == 0
+          && attribute_text_owner->text->ref_count == attribute_text_refs);
+    const lxb_dom_document_attr_mutation_cb_t *attribute_text_callbacks =
+        attribute_text_owner->attr_mutation;
+    lxb_dom_document_attr_mutation_cb_t attribute_text_custom_callbacks =
+        *attribute_text_callbacks;
+    attribute_text_custom_callbacks.change = test_attribute_value_change;
+    TestAttributeValueLifetime attribute_text_probe = {
+        .attribute = attribute_text_attr, .valid = true
+    };
+    test_attribute_value_lifetime = &attribute_text_probe;
+    attribute_text_owner->attr_mutation = &attribute_text_custom_callbacks;
+    CHECK(lxb_dom_attr_set_value(attribute_text_attr,
+        (const lxb_char_t *) "outer", 5) == LXB_STATUS_OK);
+    CHECK(attribute_text_probe.calls == 2u && attribute_text_probe.valid
+          && attribute_text_attr->value->length == 5u
+          && memcmp(attribute_text_attr->value->data, "inner", 5u) == 0
+          && attribute_text_owner->text->ref_count == attribute_text_refs);
+    attribute_text_probe.fail = true;
+    CHECK(lxb_dom_attr_set_value(attribute_text_attr,
+        (const lxb_char_t *) "failed", 6) == LXB_STATUS_ERROR);
+    CHECK(attribute_text_probe.calls == 3u
+          && attribute_text_owner->text->ref_count == attribute_text_refs);
+    attribute_text_owner->attr_mutation = attribute_text_callbacks;
+    test_attribute_value_lifetime = NULL;
+    document_destroy(&attribute_text_document);
+    CHECK(budget.current == attribute_text_baseline);
+
     puts("test: fragment clones retain their complete native interface");
     size_t fragment_clone_baseline = budget.current;
     static const char fragment_clone_page[] =
@@ -296,7 +369,7 @@
         "btoa('\\u00e9\\u00ff')==='6f8=',"
         "(()=>{try{btoa('a\\u0100');return false}catch(e){"
         "return e.name==='InvalidCharacterError'"
-        "&&String(e.message).includes('index=1 code=256')}})(),"
+        "&&!/index=|code=/.test(String(e.message))}})(),"
         "(()=>{const q=document.createElement('div');d.append(q);"
         "q.setAttribute('a','1');q.setAttribute('b','2');"
         "const m=q.attributes,n0=m.length,first=m[0];"
@@ -2879,6 +2952,12 @@
         "&&implicit===explicit&&implicit==='11/14/2023'"
         "&&parts.map(part=>part.type+':'+part.value).join(',')"
         "==='month:11,literal:/,day:14,literal:/,year:2023'"
+        "&&new Intl.DateTimeFormat('en-US',{year:'numeric',month:'2-digit',"
+        "day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',"
+        "hour12:false,timeZone:'UTC'}).format(new Date(0))"
+        "==='01/01/1970, 00:00:00'"
+        "&&new Intl.DateTimeFormat('en-US',{weekday:'long',timeZone:'UTC'})"
+        ".formatToParts(new Date(0)).some(p=>p.type==='weekday'&&p.value==='Thursday')"
         "&&formatter.resolvedOptions().locale==='en-US'"
         "&&formatter.resolvedOptions().timeZone==='UTC'"
         "&&numberText==='1,234.5'&&percentText==='25%'"
@@ -3488,6 +3567,27 @@
     CHECK(stylesheet_add_css(&refused_motion_sheet,
         "#fade{color:#123456}", sizeof("#fade{color:#123456}") - 1u));
     stylesheet_destroy(&refused_motion_sheet);
+    /* A rule whose animation declarations overflow the per-rule bound is
+       left out of the source, which must then say it is incomplete. */
+    Stylesheet overflow_motion_sheet = {0};
+    CHECK(stylesheet_build(&overflow_motion_sheet, &budget,
+                           &external_motion_document, 480));
+    char overflow_motion_css[6000];
+    int overflow_motion_used = snprintf(overflow_motion_css,
+        sizeof(overflow_motion_css), "#fade{animation-name:");
+    while (overflow_motion_used < 5000)
+        overflow_motion_used += snprintf(
+            overflow_motion_css + overflow_motion_used,
+            sizeof(overflow_motion_css) - (size_t) overflow_motion_used,
+            "long-motion-name-%d,", overflow_motion_used);
+    overflow_motion_used += snprintf(
+        overflow_motion_css + overflow_motion_used,
+        sizeof(overflow_motion_css) - (size_t) overflow_motion_used,
+        "last;animation-duration:1s}");
+    CHECK(stylesheet_add_css(&overflow_motion_sheet, overflow_motion_css,
+                             (size_t) overflow_motion_used)
+          && overflow_motion_sheet.motion_css_bounded_out);
+    stylesheet_destroy(&overflow_motion_sheet);
     puts("test: bounded native motion source falls back to inline styles");
     Stylesheet bounded_motion_sheet = {0};
     CHECK(stylesheet_build(&bounded_motion_sheet, &budget,
@@ -4280,9 +4380,15 @@
             "+[prefix,utf8.length].join('|');"
             "document.body.setAttribute('style','color:black');"
             "__tilefinchMaybeStartMotion();})()";
-        CHECK(script_runtime_evaluate_diagnostic(
+        bool oversized_inline_started = script_runtime_evaluate_diagnostic(
             oversized_inline_runtime, oversized_inline_start,
-            "<oversized-inline-start>", &oversized_inline_result)
+            "<oversized-inline-start>", &oversized_inline_result);
+        if (!oversized_inline_started || !oversized_inline_result.success)
+            fprintf(stderr, "oversized inline start interrupted=%u watchdog-ms=%lu error=%s\n",
+                oversized_inline_result.interrupted,
+                oversized_inline_result.watchdog_elapsed_ms,
+                oversized_inline_result.error);
+        CHECK(oversized_inline_started
               && oversized_inline_result.success
               && strcmp(oversized_inline_result.summary,
                         "OVERSIZED-INLINE-PENDING") == 0);

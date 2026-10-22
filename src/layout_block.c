@@ -34,7 +34,8 @@ static bool layout_command_is_fixed_descendant(
 /* CSS 2.1 10.3.4: a block-level replaced element with width:auto takes the
    width an inline replaced element would, from its intrinsic size and
    ratio, instead of filling the line. Returns the border-box width, or 0
-   when the element has no intrinsic size yet (it then fills as before). */
+   when the element has no intrinsic size yet (it then fills the line like
+   any other auto-width block). */
 static int layout_block_replaced_auto_width(LayoutContext *context,
                                             lxb_dom_node_t *node,
                                             const ComputedStyle *style,
@@ -119,6 +120,31 @@ static int content_visibility_intrinsic_height(
    are `static inline` in layout_block_internal.h. */
 
 #include "layout_block/multicolumn.inc"
+
+/* Empty portal containers after a flexible main pane do not consume its
+   remaining main size. Require a provable zero box, including pseudo content;
+   unknown/automatic content keeps the general conservative path. */
+static bool column_item_definitely_empty(LayoutContext *context,
+                                         const FlatItem *item)
+{
+    const ComputedStyle *s = &item->style;
+    if (item->anonymous_text || item->generated_pseudo != PSEUDO_NONE
+        || item->node == NULL || item->node->first_child != NULL
+        || s->display != DISPLAY_BLOCK || s->min_height != 0
+        || (s->has_height && (s->height != 0 || s->height_percent))
+        || s->aspect_height > 0 || s->padding.top || s->padding.bottom
+        || s->border.top || s->border.bottom || s->margin.top || s->margin.bottom
+        || s->margin_top_auto || s->margin_bottom_auto || s->generated_image)
+        return false;
+    if (style_node_pseudo_rules_may_affect_discovery(context->sheet, item->node)) {
+        for (unsigned i = 0; i < 2; i++) {
+            ComputedStyle pseudo = style_for_pseudo(context->sheet, item->node,
+                i == 0 ? PSEUDO_BEFORE : PSEUDO_AFTER, s);
+            if (pseudo.generated_content || pseudo.generated_image) return false;
+        }
+    }
+    return true;
+}
 
 
 /* Margin collapsing, its cache, and the list-item probes live in
@@ -564,6 +590,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                ? positioned_box->fixed_height : viewport_height)
         : (positioned_box->height > 0 ? positioned_box->height
                                       : viewport_height);
+    /* Percentage sizes of positioned boxes use their positioned containing
+       block, not the normal-flow height passed through intermediate nodes.
+       Flex-assigned parents can have a definite used height without an
+       authored height on those intermediate flow paths. */
+    if (positioned) containing_height = positioning_height;
     int resolved_left = layout_block_resolve_positioned_inset(
         context->sheet, style->left, style->inset_percent_mask,
         STYLE_INSET_LEFT_PERCENT, positioning_width);
@@ -718,7 +749,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             layout_scale_range(context->layout, node_command_start,
                         node_link_start, node_control_start, node_box_start,
                         origin_x_twice, origin_y_twice,
-                        style->transform_scale_q6, node);
+                        style->transform_scale_q14, node);
             layout_rotate_range_quadrants(
                 context->layout, node_command_start, node_link_start,
                 node_control_start, node_box_start,
@@ -761,11 +792,22 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         - content_border_right
                         - style->padding.left - style->padding.right;
     if (content_width < 0) content_width = 0;
+    /* An auto block size laid out without the box's children: what a
+       `size` container's queries read (size containment). -1: definite. */
+    int contained_height = -1;
+    if ((context->container_live || context->layout->retain_container_padding)
+        && !opposing_height
+        && !(style->has_height && style->height != STYLE_LENGTH_NONE
+             && (!style->height_percent || containing_height > 0))) {
+        contained_height = style_content_height(
+            context->sheet, style, content_width, containing_height);
+    }
     /* Before any descendant is styled: its container queries then answer
        against this box, not the previous pass's (style.h). */
     if (context->container_live) {
         style_container_live_update(
-            (Stylesheet *) context->sheet, node, content_width, -1);
+            (Stylesheet *) context->sheet, node, content_width,
+            contained_height);
     }
     MulticolumnLayout multicolumn = multicolumn_prepare(
         context, node, style, content_width);
@@ -1610,6 +1652,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         return false;
     }
     size_t column_in_flow_count = 0;
+    size_t column_growing_count = 0;
+    lxb_dom_node_t *column_growing_tail = NULL;
     if (column_flex) {
         FlexItemIterator count_iterator;
         FlatItem count_item;
@@ -1619,6 +1663,13 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (!count_item.style.out_of_flow
                 && !count_item.style.fixed_position) {
                 column_in_flow_count++;
+                if (count_item.style.flex_grow > 0) {
+                    column_growing_count++;
+                    column_growing_tail = count_item.node;
+                } else if (column_growing_tail != NULL
+                    && !column_item_definitely_empty(context, &count_item)) {
+                    column_growing_tail = NULL;
+                }
             }
         }
     }
@@ -1954,10 +2005,20 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         && flow_item->style.flex_grow > 0
                         && definite_height
                         && declared_content_height > 0;
+                    bool growing_tail_item = column_growing_count == 1
+                        && flow_item->node == column_growing_tail
+                        && flow_item->style.flex_grow > 0 && definite_height
+                        && (!flow_item->style.min_height_auto
+                            || (flow_item->style.overflow_y_scroll
+                                && !flow_item->style.overflow_y_clip_only));
                     bool definite_minimum =
                         !flow_item->style.has_height
                         && flow_item->style.min_height > 0;
-                    int assigned_main = growing_single_item
+                    int assigned_main = growing_tail_item
+                        ? declared_content_height - (child_y - column_flow_top)
+                          - flow_item->style.margin.top
+                          - flow_item->style.margin.bottom
+                        : growing_single_item
                         ? declared_content_height
                           - flow_item->style.margin.top
                           - flow_item->style.margin.bottom
@@ -1966,11 +2027,31 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                                context->sheet, &flow_item->style,
                                child_width, child_containing_height)
                            : 0);
+                    if (growing_tail_item
+                        && column_item_count < column_in_flow_count
+                        && column_in_flow_count - column_item_count > 1u) {
+                        size_t trailing = column_in_flow_count - column_item_count - 1u;
+                        assigned_main = layout_subtract_coordinate(assigned_main,
+                            tilefinch_mul_div_int(style->row_gap,
+                                trailing > INT_MAX ? INT_MAX : (int) trailing, 1));
+                    }
+                    if (growing_tail_item && !flow_item->style.box_sizing_border_box) {
+                        resolve_padding(context->sheet, &flow_item->style, content_width);
+                        assigned_main -= flow_item->style.padding.top
+                            + flow_item->style.padding.bottom
+                            + flow_item->style.border.top
+                            + flow_item->style.border.bottom;
+                    }
+                    trace_flex_sizing(context, "column-main", node,
+                        flow_item->node, &flow_item->style,
+                        declared_content_height, (int) column_in_flow_count,
+                        (int) column_growing_count, (int) column_item_count,
+                        flow_item->style.min_height_auto, assigned_main);
                     if (assigned_main > 0) {
                         context->assigned_flex_node = flow_item->node;
                         context->assigned_flex_height = assigned_main;
                         context->assigned_flex_minimum = definite_minimum
-                            && !growing_single_item;
+                            && !growing_single_item && !growing_tail_item;
                     }
                 }
                 bool child_ok = layout_block_with_float_output(
@@ -2009,8 +2090,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                     const LayoutNodeBox *child_box = layout_box_for_node(
                         context->layout, flow_item->node);
                     if (child_box != NULL) {
-                        line->first_baseline = line->last_baseline =
-                            layout_box_first_text_baseline(context->layout, child_box);
+                        int baseline = child_box->y + child_box->height;
+                        (void) layout_box_first_text_baseline(
+                            context->layout, child_box, &baseline);
+                        line->first_baseline = line->last_baseline = baseline;
                         line->has_baseline = true;
                     }
                 }
@@ -2203,6 +2286,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             collapsed_margin_reset(&trailing_margin,
                                    after_pseudo_flow.margin_bottom);
         }
+    }
+    if (column_flex && definite_height && column_item_count != 0) {
+        line->y = layout_add_coordinate(line->y,
+            layout_fit_column_scroller(context, node, style, column_order,
+                                       content_width, declared_content_height));
     }
     /* CSS 2.1 10.6.7: an auto-height formatting context root extends to
        the bottom margin edge of the floats placed inside it. Floats the
@@ -2478,6 +2566,11 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         || layout_node_name_is(node, "body");
     bool synthetic_motion_scene = context->sheet != NULL
         && context->sheet->has_motion_keyframes
+        /* Out-of-flow spacers establish virtual scroll ranges without
+           pushing later document content away. Unrelated keyframes do not
+           make those ranges unsupported motion scenes. Saturation below
+           still bounds genuinely unrepresentable coordinates. */
+        && !positioned
         && declared_height > scene_limit
         && natural_content_height < viewport_height * 4;
     /* A clipped descendant can still have commands at its pre-containment
@@ -2899,6 +2992,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                       node_control_start, context->layout->control_count)) {
         return false;
     }
+    layout_note_contained_height(context->layout, node, contained_height);
     for (size_t i = 0; i < context->bottom_fixup_count;) {
         if (context->bottom_fixups[i].containing_node != node) {
             i++;
@@ -2981,7 +3075,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         layout_scale_range(context->layout, node_command_start, node_link_start,
                     node_control_start, node_box_start,
                     origin_x_twice, origin_y_twice,
-                    style->transform_scale_q6, node);
+                    style->transform_scale_q14, node);
         layout_rotate_range_quadrants(
             context->layout, node_command_start, node_link_start,
             node_control_start, node_box_start,

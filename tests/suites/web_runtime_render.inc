@@ -542,10 +542,12 @@ static int test_web_runtime(void)
           && section_short_ok);
     CHECK(script_runtime_evaluate_diagnostic(section_state_runtime,
         "(()=>{const a=document.createElement('div'),b=document.createElement('div');"
+        "const datasetDescriptor=node=>{for(let p=Object.getPrototypeOf(node);p;"
+        "p=Object.getPrototypeOf(p)){const d=Object.getOwnPropertyDescriptor(p,'dataset');"
+        "if(d)return d;}throw Error('dataset descriptor missing')};"
         "if(a.getBoundingClientRect!==b.getBoundingClientRect||"
         "a.scrollIntoView!==b.scrollIntoView||a.dispatchEvent!==b.dispatchEvent||"
-        "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'dataset').get!=="
-        "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(b),'dataset').get)throw Error('wrapper closures');"
+        "datasetDescriptor(a).get!==datasetDescriptor(b).get)throw Error('wrapper closures');"
         "if(Object.getOwnPropertyDescriptor(a,'style').get!=="
         "Object.getOwnPropertyDescriptor(b,'style').get)throw Error('style closures');"
         "const savedStyle=a.style;a.style='color:red';b.style='color:blue';"
@@ -2439,10 +2441,10 @@ static int test_web_runtime(void)
                       &geometry_navigation.page.layout, i, clip_probes[p]));
         }
     }
-    /* Deterministic work ceiling: do not scan every ordinary box for each
-       command/clip pair. Reverting to the exhaustive path fails this. */
+    /* A command's positioned owner is independent of which clipping ancestor
+       asks: find it once, not once per command/clip pair. */
     CHECK(clip_index.candidates_visited
-          == clip_index.count * geometry_navigation.page.layout.count * 3u);
+          == clip_index.count * geometry_navigation.page.layout.count);
     LayoutNodeBox excess_positioned[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u];
     for (size_t i = 0; i < LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u; i++) {
         excess_positioned[i] = (LayoutNodeBox) {
@@ -2464,6 +2466,14 @@ static int test_web_runtime(void)
     CHECK(!clip_index.complete
           && layout_positioned_command_escapes_clip_indexed(
               &excess_layout, 0, sibling_clip_box, &clip_index));
+    size_t exhaustive_visits = clip_index.candidates_visited;
+    for (size_t p = 0; p < sizeof(clip_probes) / sizeof(clip_probes[0]); p++) {
+        CHECK(layout_positioned_command_escapes_clip_indexed(
+                  &excess_layout, 0, clip_probes[p], &clip_index)
+              == layout_positioned_command_escapes_clip(
+                  &excess_layout, 0, clip_probes[p]));
+    }
+    CHECK(clip_index.candidates_visited == exhaustive_visits);
     excess_layout.node_box_count--;
     layout_positioned_clip_index_prepare(&excess_layout, &clip_index);
     CHECK(clip_index.complete
@@ -2473,6 +2483,29 @@ static int test_web_runtime(void)
     excess_layout.node_box_count++;
     CHECK(layout_positioned_command_escapes_clip_indexed(
         &excess_layout, 0, sibling_clip_box, &clip_index));
+    /* When the fixed index fills, skip ordinary boxes in its bitmap prefix
+       but still examine every box beyond that prefix. The winning owner is
+       deliberately in the exhaustive tail. */
+    const size_t tail_count = 2600u;
+    LayoutNodeBox *tail_boxes = budget_calloc(&budget, tail_count, sizeof(*tail_boxes));
+    CHECK(tail_boxes != NULL);
+    for (size_t i = 0; i < LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u; i++) {
+        tail_boxes[i] = (LayoutNodeBox) {.node = sibling_clip_box->node,
+            .command_start = 0, .command_end = 4, .positioned_ancestor_distance = 1};
+    }
+    tail_boxes[tail_count - 1u] = excess_positioned[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT];
+    LayoutDocument tail_layout = {.node_boxes = tail_boxes, .node_box_count = tail_count};
+    layout_positioned_clip_index_prepare(&tail_layout, &clip_index);
+    CHECK(!clip_index.complete && clip_index.bitmap_prefix
+        && layout_positioned_command_escapes_clip_indexed(
+            &tail_layout, 0, sibling_clip_box, &clip_index)
+        && clip_index.candidates_visited == LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u
+            + tail_count - LAYOUT_POSITIONED_CLIP_INDEX_LIMIT * 32u);
+    tail_boxes[tail_count - 1u].positioned_ancestor_distance = 0;
+    layout_positioned_clip_index_prepare(&tail_layout, &clip_index);
+    CHECK(!layout_positioned_command_escapes_clip_indexed(
+        &tail_layout, 0, sibling_clip_box, &clip_index));
+    budget_free(&budget, tail_boxes);
     CHECK(shell_box != NULL && second_box != NULL
           && shell_box->width == 248 && shell_box->height >= 90
           && shell_box->content_height > shell_box->height
@@ -2581,6 +2614,18 @@ static int test_web_runtime(void)
           && memcmp(overflow_fallback_frame, overflow_frame,
                     480u * 272u * sizeof(*overflow_frame)) == 0);
     budget_clear_failure_injection(&budget);
+    /* Stationary boxes must not affect fallback origins; scrolled ancestors
+       still must. Compare both paths as nested scroll offsets change and
+       return to zero, rather than checking only the final offset. */
+    const int fallback_offsets[] = {0, nested_maximum / 2, nested_maximum, 0};
+    for (size_t i = 0; i < sizeof(fallback_offsets) / sizeof(fallback_offsets[0]); i++) {
+        CHECK(layout_scroll_node(&geometry_navigation.page.layout, shell, 0,
+                                  fallback_offsets[i])
+            && tile_cache_render_frame(&overflow_cache, 0, 480, 272, NULL)
+            && tile_cache_render_frame(&overflow_fallback_cache, 0, 480, 272, NULL)
+            && memcmp(overflow_fallback_frame, overflow_frame,
+                      480u * 272u * sizeof(*overflow_frame)) == 0);
+    }
     tile_cache_destroy(&overflow_fallback_cache);
     budget_free(&budget, overflow_fallback_frame);
     tile_cache_destroy(&overflow_cache);
@@ -2589,30 +2634,45 @@ static int test_web_runtime(void)
     const size_t oversized_node_box_count = 22000;
     LayoutNodeBox *oversized_node_boxes = budget_calloc(
         &budget, oversized_node_box_count, sizeof(*oversized_node_boxes));
-    uint8_t oversized_overflow_flag = LAYOUT_COMMAND_OVERFLOW;
+    uint8_t oversized_overflow_flags[2] = {
+        LAYOUT_COMMAND_OVERFLOW, LAYOUT_COMMAND_OVERFLOW};
     DrawCommand oversized_overflow_command = {
         .x = 0, .y = 0, .width = 16, .height = 16,
         .color = 0x00aa00, .opacity_scale = 256,
         .type = DRAW_FILL_RECT
     };
+    DrawCommand oversized_overflow_commands[2] = {
+        oversized_overflow_command, oversized_overflow_command};
+    oversized_overflow_commands[0].color = 0xaa0000;
     CHECK(oversized_node_boxes != NULL);
-    oversized_node_boxes[0] = (LayoutNodeBox) {
-        .x = 0, .y = 0, .width = 16, .height = 16,
-        .client_width = 16, .client_height = 16,
+    /* More clip origins than the frame-local hint retains must recompute
+       exactly on eviction, without allocating a larger fallback table. */
+    for (size_t i = 0; i < 65u; i++) {
+        int x = (int) (i % 3u), y = (int) (i % 2u);
+        oversized_node_boxes[i] = (LayoutNodeBox) {
+            .x = x, .y = y, .width = 16 - x, .height = 16 - y,
+            .client_width = 16 - x, .client_height = 16 - y,
+            .clips_x = true, .clips_y = true,
+            .scroll_command_start = 0, .scroll_command_end = 2
+        };
+    }
+    oversized_node_boxes[oversized_node_box_count - 1u] = (LayoutNodeBox) {
+        .x = 3, .y = 2, .width = 13, .height = 14,
+        .client_width = 13, .client_height = 14,
         .clips_x = true, .clips_y = true,
-        .scroll_command_start = 0, .scroll_command_end = 1
+        .scroll_command_start = 0, .scroll_command_end = 2
     };
     LayoutDocument oversized_overflow_layout = {
         .budget = &budget,
-        .commands = &oversized_overflow_command,
-        .count = 1,
+        .commands = oversized_overflow_commands,
+        .count = 2,
         .width = 16,
         .scroll_width = 16,
         .height = 16,
         .page_background = 0xffffff,
         .node_boxes = oversized_node_boxes,
         .node_box_count = oversized_node_box_count,
-        .command_flags = &oversized_overflow_flag
+        .command_flags = oversized_overflow_flags
     };
     TileCache oversized_overflow_cache;
     uint16_t *oversized_overflow_frame = budget_malloc(
@@ -2628,8 +2688,12 @@ static int test_web_runtime(void)
           && oversized_overflow_cache.overflow_cache_bytes == 0
           && oversized_overflow_cache.overflow_cache_builds == 0
           && oversized_overflow_cache.overflow_cache_fallbacks == 1
-          && oversized_overflow_cache.overflow_direct_commands == 1
-          && oversized_overflow_frame[0] == test_rgb565(0x00aa00));
+          && oversized_overflow_cache.overflow_direct_commands == 2
+          && oversized_overflow_frame[0] == test_rgb565(0xffffff)
+          && oversized_overflow_frame[16u + 1u] == test_rgb565(0xffffff)
+          && oversized_overflow_frame[16u + 3u] == test_rgb565(0xffffff)
+          && oversized_overflow_frame[32u + 2u] == test_rgb565(0xffffff)
+          && oversized_overflow_frame[32u + 3u] == test_rgb565(0x00aa00));
     tile_cache_destroy(&oversized_overflow_cache);
     budget_free(&budget, oversized_overflow_frame);
     budget_free(&budget, oversized_node_boxes);

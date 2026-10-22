@@ -31,6 +31,7 @@
 #include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_media_present.h"
 #include "tilefinch/render.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/section_pager.h"
@@ -63,6 +64,12 @@
 #endif
 #ifndef TILEFINCH_SERIF_FONT
 #define TILEFINCH_SERIF_FONT ""
+#endif
+#ifndef TILEFINCH_PSP_SANS_FONT
+#define TILEFINCH_PSP_SANS_FONT ""
+#endif
+#ifndef TILEFINCH_PSP_SERIF_FONT
+#define TILEFINCH_PSP_SERIF_FONT ""
 #endif
 #ifndef TILEFINCH_SANS_ITALIC_FONT
 #define TILEFINCH_SANS_ITALIC_FONT ""
@@ -482,6 +489,7 @@ int main(int argc, char **argv)
     bool platform_sim = false;
     bool external_resources = true;
     bool web_fonts_enabled = true;
+    bool psp_fonts = false;
     WebFontMode web_font_mode = WEB_FONTS_SMART;
     bool forced_dark = false;
     bool progressive_first_paint = true;
@@ -496,6 +504,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fetch-scripts") == 0) fetch_scripts = true;
         else if (strcmp(argv[i], "--no-web-fonts") == 0) web_fonts_enabled = false;
+        else if (strcmp(argv[i], "--psp-fonts") == 0) psp_fonts = true;
         else if (strcmp(argv[i], "--web-font-mode") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
             if (strcmp(mode, "on") == 0) web_font_mode = WEB_FONTS_ON;
@@ -503,8 +512,6 @@ int main(int argc, char **argv)
             else if (strcmp(mode, "off") == 0) web_font_mode = WEB_FONTS_OFF;
             else { fprintf(stderr, "invalid website font mode\n"); return 2; }
         }
-        else if (strcmp(argv[i], "--legacy-web-font-work") == 0)
-            tilefinch_test_faults()->legacy_web_font_work = true;
         else if (strcmp(argv[i], "--no-javascript") == 0) no_javascript = true;
         else if (strcmp(argv[i], "--pace-real-time") == 0) {
             pace_real_time = true;
@@ -1170,8 +1177,10 @@ int main(int argc, char **argv)
            engine_config->resources.maximum_stylesheets,
            engine_config->resources.maximum_stylesheet_bytes,
            engine_config->resources.maximum_stylesheet_file_bytes);
-    bool configured_fonts = TILEFINCH_SANS_FONT[0] != '\0'
-        || TILEFINCH_SERIF_FONT[0] != '\0'
+    const char *sans_font = psp_fonts ? TILEFINCH_PSP_SANS_FONT : TILEFINCH_SANS_FONT;
+    const char *serif_font = psp_fonts ? TILEFINCH_PSP_SERIF_FONT : TILEFINCH_SERIF_FONT;
+    bool configured_fonts = sans_font[0] != '\0'
+        || serif_font[0] != '\0'
         || TILEFINCH_SANS_ITALIC_FONT[0] != '\0'
         || TILEFINCH_SANS_BOLD_FONT[0] != '\0'
         || TILEFINCH_SERIF_BOLD_FONT[0] != '\0'
@@ -1179,7 +1188,7 @@ int main(int argc, char **argv)
         || TILEFINCH_METRIC_SANS_BOLD_FONT[0] != '\0';
     if (configured_fonts
         && !browser_config_set_font_paths(
-               engine_config, TILEFINCH_SANS_FONT, TILEFINCH_SERIF_FONT,
+               engine_config, sans_font, serif_font,
                TILEFINCH_SANS_ITALIC_FONT, TILEFINCH_SANS_BOLD_FONT,
                TILEFINCH_SERIF_BOLD_FONT, TILEFINCH_METRIC_SANS_FONT,
                TILEFINCH_METRIC_SANS_BOLD_FONT, 1536 * KIB)) {
@@ -1203,6 +1212,9 @@ int main(int argc, char **argv)
         }
         return 1;
     }
+    printf("runtime-fonts mode=%s loaded-bytes=%zu\n",
+           psp_fonts ? "shipping" : "desktop",
+           font_set_loaded_bytes(browser_engine_fonts(engine)));
     browser_engine_set_heavy_page_policy(engine, heavy_policy);
     if (forced_dark && !browser_engine_set_forced_dark(engine, true)) {
         fprintf(stderr, "forced-dark setup failed\n");
@@ -1397,7 +1409,7 @@ int main(int argc, char **argv)
             .top_level_navigation = true,
             .user_activated = true
         };
-        char section_cookies[4096] = {0};
+        char section_cookies[BROWSER_COOKIE_HEADER_CAPACITY] = {0};
         (void) browser_session_cookie_header_context(
             &session, &section_context,
             section_cookies, sizeof(section_cookies));
@@ -1776,6 +1788,7 @@ int main(int argc, char **argv)
             "get(object,key,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key);seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.get(object,key,receiver);},"
             "set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.set(object,key,value,receiver);},"
             "construct(target,args,newTarget){seen.set(label+'.construct',(seen.get(label+'.construct')||0)+1);return globalThis.__tilefinchTraceObject(Reflect.construct(target,args,newTarget),label+'.instance');}});"
+            "globalThis.__tilefinchSetWrapperTrace?.(globalThis.__tilefinchTraceObject);"
             "globalThis.__tilefinchGlobalProxy=__tilefinchTraceObject(globalThis,'global');"
             "globalThis.document=__tilefinchTraceObject(document,'document');"
             "globalThis.navigator=__tilefinchTraceObject(navigator,'navigator');"
@@ -1850,8 +1863,10 @@ int main(int argc, char **argv)
         }
     }
     if (!reader_mode
-        && script_runtime_has_pending_author_work(navigation.page.runtime)
-        && browser_engine_page_is_visually_blank(engine)) {
+        && (navigation.page.script_memory_limited
+            || navigation.page.script_result.host_compile_memory_refusals != 0u
+            || (script_runtime_has_pending_author_work(navigation.page.runtime)
+                && browser_engine_page_is_visually_blank(engine)))) {
         blank_reader_recovery_seeded =
             interactive_seed_extracted_recovery(engine);
     }
@@ -1886,9 +1901,11 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         if (!reader_mode && !blank_reader_recovery_seeded
-            && script_runtime_has_pending_author_work(
-                   navigation.page.runtime)
-            && browser_engine_page_is_visually_blank(engine)) {
+            && (navigation.page.script_memory_limited
+                || navigation.page.script_result.host_compile_memory_refusals != 0u
+                || (script_runtime_has_pending_author_work(
+                        navigation.page.runtime)
+                    && browser_engine_page_is_visually_blank(engine)))) {
             blank_reader_recovery_seeded =
                 interactive_seed_extracted_recovery(engine);
         }

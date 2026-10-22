@@ -23,43 +23,6 @@ static int transition_declaration_kind(const char *name, size_t length)
     return -1;
 }
 
-/* The next top-level comma-separated item, trimmed. *at moves past its
-   comma; an item ending the text leaves *at beyond length. */
-static void transition_list_item(const char *text, size_t length,
-                                 size_t *at, const char **item,
-                                 size_t *item_length)
-{
-    size_t start = *at, depth = 0, end = start;
-    for (; end < length; end++) {
-        if (text[end] == '(') depth++;
-        else if (text[end] == ')' && depth != 0) depth--;
-        else if (text[end] == ',' && depth == 0) break;
-    }
-    *item = text + start;
-    *item_length = end - start;
-    trim(item, item_length);
-    *at = end + 1;
-}
-
-/* The next whitespace-separated token of an item; functions stay whole. */
-static bool transition_token(const char *text, size_t length, size_t *at,
-                             const char **token, size_t *token_length)
-{
-    size_t start = *at;
-    while (start < length && isspace((unsigned char) text[start])) start++;
-    if (start >= length) return false;
-    size_t end = start, depth = 0;
-    for (; end < length; end++) {
-        if (text[end] == '(') depth++;
-        else if (text[end] == ')' && depth != 0) depth--;
-        else if (depth == 0 && isspace((unsigned char) text[end])) break;
-    }
-    *token = text + start;
-    *token_length = end - start;
-    *at = end;
-    return true;
-}
-
 static bool transition_time_ms(const char *text, size_t length, double *ms)
 {
     char buffer[32];
@@ -75,66 +38,198 @@ static bool transition_time_ms(const char *text, size_t length, double *ms)
     return true;
 }
 
-/* A timing function, normalized as computed values serialize it: keywords
-   lower-case, a function's arguments separated by ", ". */
-static bool transition_timing(const char *text, size_t length,
-                              char *output, size_t output_size)
+/* A CSS <number> (or, when `integer`, an <integer>: no fraction or
+   exponent), the whole span; a math function resolving to a number is
+   accepted too. *number receives its value. */
+static bool timing_number(const char *text, size_t length, bool integer,
+                          double *number)
+{
+    if (length == 0) return false;
+    if (text[length - 1] == ')') {
+        /* Not capped at +/-10: steps(calc(12)) and cubic-bezier(0.3,
+           calc(-12), 0.7, 1) are as valid as their literal forms. */
+        int64_t thousandths = 0;
+        if (!style_math_resolve_number_thousandths_wide(
+                NULL, text, length, &thousandths))
+            return false;
+        /* An <integer> position rounds a math result to the nearest
+           integer, as CSS Values requires. */
+        *number = integer ? round((double) thousandths / 1000.0)
+                          : (double) thousandths / 1000.0;
+        return true;
+    }
+    size_t at = text[0] == '+' || text[0] == '-' ? 1u : 0u;
+    size_t digits = 0, fraction = 0;
+    while (at < length && isdigit((unsigned char) text[at])) at++, digits++;
+    if (at < length && text[at] == '.') {
+        if (integer) return false;
+        at++;
+        while (at < length && isdigit((unsigned char) text[at]))
+            at++, fraction++;
+        if (fraction == 0) return false;
+    }
+    if (digits + fraction == 0) return false;
+    if (at < length && (text[at] == 'e' || text[at] == 'E')) {
+        if (integer) return false;
+        at++;
+        if (at < length && (text[at] == '+' || text[at] == '-')) at++;
+        size_t exponent = at;
+        while (at < length && isdigit((unsigned char) text[at])) at++;
+        if (at == exponent) return false;
+    }
+    char copy[40];
+    if (at != length || length >= sizeof(copy)) return false;
+    memcpy(copy, text, length);
+    copy[length] = '\0';
+    *number = strtod(copy, NULL);
+    return isfinite(*number);
+}
+
+/* Appends `text` to the serialization, false when it does not fit. */
+static bool timing_append(char *output, size_t output_size, size_t *used,
+                          const char *text, size_t length)
+{
+    if (length >= output_size - *used) return false;
+    memcpy(output + *used, text, length);
+    *used += length;
+    output[*used] = '\0';
+    return true;
+}
+
+static bool timing_append_number(char *output, size_t output_size,
+                                 size_t *used, double number,
+                                 const char *suffix)
+{
+    char text[40];
+    int written = snprintf(text, sizeof(text), "%g%s", number, suffix);
+    return written > 0 && (size_t) written < sizeof(text)
+        && timing_append(output, output_size, used, text, (size_t) written);
+}
+
+/* One linear() stop: a <number> and zero to two adjacent <percentage>s,
+   in either order (`<number> && <percentage>{1,2}`). */
+static bool timing_linear_stop(const char *text, size_t length,
+                               char *output, size_t output_size,
+                               size_t *used)
+{
+    size_t cursor = 0, at = 0, end = 0;
+    unsigned tokens = 0, percentages = 0;
+    bool number_seen = false, percentage_after_number = false;
+    while (style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        if (++tokens > 3u) return false;
+        double value = 0.0;
+        bool percentage = end > at && text[end - 1] == '%';
+        if (!timing_number(text + at, end - at - (percentage ? 1u : 0u),
+                           false, &value)) return false;
+        if (percentage) {
+            /* Two percentages must be adjacent. */
+            if (percentages == 1u && number_seen
+                && !percentage_after_number) return false;
+            percentage_after_number = number_seen;
+            percentages++;
+        } else {
+            if (number_seen) return false;
+            number_seen = true;
+        }
+        if ((tokens > 1u && !timing_append(output, output_size, used, " ", 1))
+            || !timing_append_number(output, output_size, used, value,
+                                     percentage ? "%" : "")) return false;
+    }
+    return number_seen;
+}
+
+bool style_timing_function(const char *text, size_t length,
+                           char *output, size_t output_size)
 {
     static const char *const keywords[] = {
         "ease", "linear", "ease-in", "ease-out", "ease-in-out",
         "step-start", "step-end"
     };
+    static const char *const step_positions[] = {
+        "jump-start", "jump-end", "jump-none", "jump-both", "start", "end"
+    };
+    if (text == NULL || output == NULL || output_size == 0) return false;
+    trim(&text, &length);
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
         if (span_case_equal(text, length, keywords[i])) {
             snprintf(output, output_size, "%s", keywords[i]);
             return true;
         }
     }
-    static const char *const functions[] = {
-        "cubic-bezier", "steps", "linear"
-    };
     size_t open = 0;
     while (open < length && text[open] != '(') open++;
     if (open == length || text[length - 1] != ')') return false;
-    const char *name = NULL;
-    for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
-        if (span_case_equal(text, open, functions[i])) name = functions[i];
+    const char *arguments = text + open + 1;
+    size_t arguments_length = length - open - 2u;
+    /* The parenthesis that opens the arguments must be the one the final
+       parenthesis closes (quoted parentheses do not count). */
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = open; i + 1u < length; i++) {
+        char c = text[i];
+        if (quote != 0) { if (c == quote) quote = 0; continue; }
+        if (c == '\'' || c == '"') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')' && --depth == 0) return false;
     }
-    if (name == NULL) return false;
-    size_t used = (size_t) snprintf(output, output_size, "%s(", name);
-    size_t arguments_end = length - 1;
-    for (size_t at = open + 1; at <= arguments_end;) {
-        const char *argument = NULL;
-        size_t argument_length = 0;
-        transition_list_item(text, arguments_end, &at, &argument,
-                             &argument_length);
-        if (argument_length == 0) return false;
-        /* Numbers serialize canonically (.2 is 0.2); keywords as written. */
-        char number_text[32] = "";
-        double number = 0.0;
-        if (argument_length < sizeof(number_text)) {
-            char copy[32];
-            memcpy(copy, argument, argument_length);
-            copy[argument_length] = '\0';
-            char *end = NULL;
-            number = strtod(copy, &end);
-            if (end != copy && *end == '\0' && isfinite(number))
-                snprintf(number_text, sizeof(number_text), "%g", number);
-        }
-        int written = number_text[0] != '\0'
-            ? snprintf(output + used, output_size - used, "%s%s",
-                       used > strlen(name) + 1u ? ", " : "", number_text)
-            : snprintf(output + used, output_size - used, "%s%.*s",
-                       used > strlen(name) + 1u ? ", " : "",
-                       (int) argument_length, argument);
-        if (written < 0 || (size_t) written >= output_size - used)
+    if (quote != 0 || depth != 1) return false;
+    enum { CUBIC_BEZIER, STEPS, LINEAR } kind;
+    if (span_case_equal(text, open, "cubic-bezier")) kind = CUBIC_BEZIER;
+    else if (span_case_equal(text, open, "steps")) kind = STEPS;
+    else if (span_case_equal(text, open, "linear")) kind = LINEAR;
+    else return false;
+    static const char *const names[] = {
+        "cubic-bezier(", "steps(", "linear("
+    };
+    size_t used = 0;
+    output[0] = '\0';
+    if (!timing_append(output, output_size, &used, names[kind],
+                       strlen(names[kind]))) return false;
+    size_t count = 0, cursor = 0, at = 0, end = 0;
+    double steps = 0.0;
+    while (style_next_top_level(arguments, arguments_length, ',', &cursor,
+                                &at, &end)) {
+        const char *argument = arguments + at;
+        size_t argument_length = end - at;
+        if (argument_length == 0
+            || (count != 0
+                && !timing_append(output, output_size, &used, ", ", 2)))
             return false;
-        used += (size_t) written;
+        if (kind == LINEAR) {
+            if (!timing_linear_stop(argument, argument_length, output,
+                                    output_size, &used)) return false;
+        } else if (kind == STEPS && count == 1u) {
+            size_t position = 0;
+            while (position < sizeof(step_positions) / sizeof(step_positions[0])
+                   && !span_case_equal(argument, argument_length,
+                                       step_positions[position])) position++;
+            if (position == sizeof(step_positions) / sizeof(step_positions[0])
+                /* jump-none needs two or more steps. */
+                || (position == 2u && steps < 2.0)
+                || !timing_append(output, output_size, &used,
+                                  step_positions[position],
+                                  strlen(step_positions[position])))
+                return false;
+        } else {
+            double number = 0.0;
+            if ((kind == CUBIC_BEZIER && count >= 4u)
+                || (kind == STEPS && count >= 2u)
+                || !timing_number(argument, argument_length, kind == STEPS,
+                                  &number)
+                /* x1 and x2 are progress values in [0, 1]. */
+                || (kind == CUBIC_BEZIER && (count & 1u) == 0
+                    && (number < 0.0 || number > 1.0))
+                || (kind == STEPS && number < 1.0)
+                || !timing_append_number(output, output_size, &used,
+                                         number, "")) return false;
+            steps = number;
+        }
+        count++;
     }
-    if (used + 2u > output_size) return false;
-    output[used++] = ')';
-    output[used] = '\0';
-    return true;
+    if ((kind == CUBIC_BEZIER && count != 4u)
+        || (kind == STEPS && count == 0u)
+        || (kind == LINEAR && count < 2u)) return false;
+    return timing_append(output, output_size, &used, ")", 1);
 }
 
 static bool transition_property_name(const char *text, size_t length,
@@ -153,28 +248,86 @@ static bool transition_property_name(const char *text, size_t length,
     return true;
 }
 
+/* The initial timing, `ease`, sits at offset 0 of every list's text. */
+static const char transition_initial_timing[] = "ease";
+
 static void transition_initial(StyleTransitionComputed *output)
 {
-    memset(output, 0, sizeof(*output));
+    /* The timing text past what is used is never read: leave it. */
+    memset(output, 0, offsetof(StyleTransitionComputed, timing_text));
     output->property_count = output->duration_count = 1;
     output->delay_count = output->timing_count = 1;
     snprintf(output->properties[0], sizeof(output->properties[0]), "all");
-    snprintf(output->timings[0], sizeof(output->timings[0]), "ease");
+    memcpy(output->timing_text, transition_initial_timing,
+           sizeof(transition_initial_timing));
+    output->timing_text_used = (uint16_t) sizeof(transition_initial_timing);
+}
+
+/* Serializes the easing `text` as timing item `slot` of `output`, in the
+   text its list shares: 1 when it is stored, 0 when it is not a valid
+   easing and -1 when it is one but the list's text has no room for it. */
+static int transition_set_timing(StyleTransitionComputed *output,
+                                 size_t slot, const char *text,
+                                 size_t length)
+{
+    char serialized[STYLE_TIMING_FUNCTION_CAPACITY];
+    if (!style_timing_function(text, length, serialized,
+                               sizeof(serialized))) return 0;
+    size_t size = strlen(serialized) + 1u;
+    if (size > sizeof(output->timing_text) - output->timing_text_used)
+        return -1;
+    memcpy(output->timing_text + output->timing_text_used, serialized, size);
+    output->timing_offsets[slot] = output->timing_text_used;
+    output->timing_text_used = (uint16_t) (output->timing_text_used + size);
+    return 1;
+}
+
+/* Copies the timing list of `from` over that of `to`. */
+static void transition_copy_timings(StyleTransitionComputed *to,
+                                    const StyleTransitionComputed *from)
+{
+    memcpy(to->timing_offsets, from->timing_offsets,
+           sizeof(to->timing_offsets));
+    memcpy(to->timing_text, from->timing_text, from->timing_text_used);
+    to->timing_text_used = from->timing_text_used;
+    to->timing_count = from->timing_count;
+}
+
+/* Whether a token of a declaration the stylesheet already validated is its
+   easing: an easing keyword or a function, since no other shorthand
+   component holds a parenthesis. Only valid for validated text, where the
+   token is then a valid easing. */
+static bool transition_validated_timing_token(const char *text, size_t length)
+{
+    static const char *const keywords[] = {
+        "ease", "linear", "ease-in", "ease-out", "ease-in-out",
+        "step-start", "step-end"
+    };
+    if (memchr(text, '(', length) != NULL) return true;
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (span_case_equal(text, length, keywords[i])) return true;
+    }
+    return false;
 }
 
 /* Parses one declaration's value into the lists it sets: all four for the
-   shorthand, one for a longhand. False for an invalid value. */
-static bool transition_parse(StyleTransitionKind kind, const char *text,
-                             size_t length, StyleTransitionComputed *output)
+   shorthand, one for a longhand. False for an invalid value. Without
+   `timings` the value must be one the stylesheet validated: its easings
+   are recognized but not validated or serialized, and the timing list is
+   left as it was. */
+static bool transition_parse_lists(StyleTransitionKind kind, const char *text,
+                                   size_t length, bool timings,
+                                   StyleTransitionComputed *output)
 {
     StyleTransitionComputed parsed;
     transition_initial(&parsed);
     size_t items = 0;
     bool none = false;
-    for (size_t at = 0; at <= length;) {
-        const char *item = NULL;
-        size_t item_length = 0;
-        transition_list_item(text, length, &at, &item, &item_length);
+    size_t cursor = 0, item_start = 0, item_end = 0;
+    while (style_next_top_level(text, length, ',', &cursor, &item_start,
+                                &item_end)) {
+        const char *item = text + item_start;
+        size_t item_length = item_end - item_start;
         if (item_length == 0) return false;
         if (items == STYLE_TRANSITION_LIST_LIMIT) continue;
         size_t slot = items++;
@@ -195,8 +348,7 @@ static bool transition_parse(StyleTransitionKind kind, const char *text,
             continue;
         }
         if (kind == STYLE_TRANSITION_TIMING) {
-            if (!transition_timing(item, item_length, parsed.timings[slot],
-                                   sizeof(parsed.timings[slot])))
+            if (transition_set_timing(&parsed, slot, item, item_length) != 1)
                 return false;
             continue;
         }
@@ -204,16 +356,18 @@ static bool transition_parse(StyleTransitionKind kind, const char *text,
            any order, the first time being the duration. */
         snprintf(parsed.properties[slot], sizeof(parsed.properties[slot]),
                  "all");
-        snprintf(parsed.timings[slot], sizeof(parsed.timings[slot]), "ease");
+        parsed.timing_offsets[slot] = 0; /* the initial ease */
         parsed.duration_ms[slot] = parsed.delay_ms[slot] = 0.0;
         bool have_property = false, have_timing = false;
         bool have_behavior = false;
         unsigned times = 0;
-        const char *token = NULL;
-        size_t token_length = 0;
-        for (size_t cursor = 0; transition_token(
-                 item, item_length, &cursor, &token, &token_length);) {
+        size_t token_cursor = 0, token_start = 0, token_end = 0;
+        while (style_next_top_level_token(item, item_length, &token_cursor,
+                                          &token_start, &token_end)) {
+            const char *token = item + token_start;
+            size_t token_length = token_end - token_start;
             double time = 0.0;
+            int timing = 0;
             if (transition_time_ms(token, token_length, &time)) {
                 if (times == 2u) return false;
                 if (times++ == 0u) {
@@ -222,10 +376,12 @@ static bool transition_parse(StyleTransitionKind kind, const char *text,
                 } else {
                     parsed.delay_ms[slot] = time;
                 }
-            } else if (transition_timing(
-                           token, token_length, parsed.timings[slot],
-                           sizeof(parsed.timings[slot]))) {
-                if (have_timing) return false;
+            } else if (timings
+                       ? (timing = transition_set_timing(
+                              &parsed, slot, token, token_length)) != 0
+                       : transition_validated_timing_token(
+                             token, token_length)) {
+                if (timing < 0 || have_timing) return false;
                 have_timing = true;
             } else if (span_case_equal(token, token_length, "normal")
                        || span_case_equal(token, token_length,
@@ -258,11 +414,18 @@ static bool transition_parse(StyleTransitionKind kind, const char *text,
         memcpy(output->delay_ms, parsed.delay_ms, sizeof(output->delay_ms));
         output->delay_count = (uint8_t) items;
     }
-    if (kind == STYLE_TRANSITION_SHORTHAND || kind == STYLE_TRANSITION_TIMING) {
-        memcpy(output->timings, parsed.timings, sizeof(output->timings));
-        output->timing_count = (uint8_t) items;
+    if (timings && (kind == STYLE_TRANSITION_SHORTHAND
+                    || kind == STYLE_TRANSITION_TIMING)) {
+        parsed.timing_count = (uint8_t) items;
+        transition_copy_timings(output, &parsed);
     }
     return true;
+}
+
+static bool transition_parse(StyleTransitionKind kind, const char *text,
+                             size_t length, StyleTransitionComputed *output)
+{
+    return transition_parse_lists(kind, text, length, true, output);
 }
 
 static bool transition_value_is_css_wide(const char *text, size_t length)
@@ -293,7 +456,7 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
                                 PseudoElement pseudo)
 {
     if (selector_length >= STYLE_SELECTOR_TEXT_CAPACITY
-        || value_length >= STYLE_SELECTOR_CAPACITY) return true;
+        || value_length >= STYLE_TRANSITION_VALUE_CAPACITY) return true;
     if (!transition_value_is_css_wide(value, value_length)
         && !transition_value_has_var(value, value_length)) {
         StyleTransitionComputed parsed;
@@ -310,19 +473,21 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
         sheet->transition_rules = rules;
         sheet->transition_rule_capacity = capacity;
     }
+    /* A long value (a linear() easing of many stops) draws on the sheet's
+       long-value allowance; past it the declaration is dropped. */
+    bool long_value = value_length >= STYLE_TRANSITION_SHORT_VALUE_CAPACITY;
+    if (long_value && value_length + 1u > STYLE_CUSTOM_LONG_VALUE_BYTES
+                                          - sheet->custom_value_long_bytes)
+        return true;
     const char *stored_selector = stylesheet_store_selector(
         sheet, selector, selector_length);
-    const char *stored_value = stylesheet_store_selector(
+    const char *stored_value = stylesheet_store_text(
         sheet, value, value_length);
     if (stored_selector == NULL || stored_value == NULL) return false;
-    StyleRule selector_metadata = {
-        .selector = stored_selector,
-        .selector_length = (uint16_t) selector_length
-    };
-    selector_assign_fast_key(&selector_metadata, stored_selector,
-                             selector_length);
-    size_t suffix_bytes = selector_length - selector_metadata.fast_key_offset
-        - selector_metadata.fast_key_length;
+    if (long_value) sheet->custom_value_long_bytes += value_length + 1u;
+    uint8_t fast_key_length = 0;
+    uint8_t fast_key_suffix = selector_fast_key_suffix(
+        stored_selector, selector_length, &fast_key_length);
     sheet->transition_rules[sheet->transition_rule_count++] =
         (StyleTransitionRule) {
             .selector = stored_selector,
@@ -333,10 +498,8 @@ static bool add_transition_rule(Stylesheet *sheet, const char *selector,
             .pseudo = (uint8_t) pseudo,
             .container_query = sheet->current_container_query,
             .important = important,
-            .fast_key_suffix_bytes = selector_metadata.has_fast_key
-                    && suffix_bytes < UINT8_MAX
-                ? (uint8_t) suffix_bytes : UINT8_MAX,
-            .fast_key_length = selector_metadata.fast_key_length,
+            .fast_key_suffix_bytes = fast_key_suffix,
+            .fast_key_length = fast_key_length,
             .origin = sheet->current_origin,
             .layer = sheet->current_layer,
             .specificity = specificity,
@@ -379,9 +542,9 @@ static void transition_consider(const StyleTransitionRule *rule,
     }
 }
 
-bool style_transition_computed(
+static bool transition_computed(
     const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
-    StyleTransitionComputed *output)
+    bool timings, StyleTransitionComputed *output)
 {
     if (output == NULL) return false;
     transition_initial(output);
@@ -459,15 +622,26 @@ bool style_transition_computed(
         }
         at = end + (end < attribute_length);
     }
-    for (unsigned longhand = 0; longhand < 4u; longhand++) {
+    /* One shorthand commonly wins all four longhands: parse each distinct
+       winner once and take every longhand it won from that parse. */
+    unsigned longhands = timings ? 4u : 3u;
+    for (unsigned longhand = 0; longhand < longhands; longhand++) {
         const StyleTransitionRule *rule = winners[longhand];
-        if (rule == NULL
+        bool parsed_already = false;
+        for (unsigned earlier = 0; earlier < longhand; earlier++)
+            parsed_already |= winners[earlier] == rule;
+        if (rule == NULL || parsed_already
             || transition_value_is_css_wide(rule->value, rule->value_length))
             continue;
         const char *value = rule->value;
         size_t value_length = rule->value_length;
         char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
-        if (transition_value_has_var(value, value_length)) {
+        bool has_var = transition_value_has_var(value, value_length);
+        /* Sheet rules without var() were validated when they were added
+           (add_transition_rule); style-attribute and var() values were
+           not, so they still validate their easings. */
+        bool validated = rule->selector != NULL && !has_var;
+        if (has_var) {
             StyleResolveScratch *scratch = sheet->resolve_scratch;
             if (scratch == NULL) continue;
             StyleResolveScratch saved = *scratch;
@@ -482,29 +656,46 @@ bool style_transition_computed(
         }
         StyleTransitionComputed parsed;
         transition_initial(&parsed);
-        if (!transition_parse((StyleTransitionKind) rule->kind, value,
-                              value_length, &parsed)) continue;
-        switch (longhand) {
-        case 0:
-            memcpy(output->properties, parsed.properties,
-                   sizeof(output->properties));
-            output->property_count = parsed.property_count;
-            break;
-        case 1:
-            memcpy(output->duration_ms, parsed.duration_ms,
-                   sizeof(output->duration_ms));
-            output->duration_count = parsed.duration_count;
-            break;
-        case 2:
-            memcpy(output->delay_ms, parsed.delay_ms,
-                   sizeof(output->delay_ms));
-            output->delay_count = parsed.delay_count;
-            break;
-        default:
-            memcpy(output->timings, parsed.timings, sizeof(output->timings));
-            output->timing_count = parsed.timing_count;
-            break;
+        if (!transition_parse_lists((StyleTransitionKind) rule->kind, value,
+                                    value_length, timings || !validated,
+                                    &parsed)) continue;
+        for (unsigned target = longhand; target < longhands; target++) {
+            if (winners[target] != rule) continue;
+            switch (target) {
+            case 0:
+                memcpy(output->properties, parsed.properties,
+                       sizeof(output->properties));
+                output->property_count = parsed.property_count;
+                break;
+            case 1:
+                memcpy(output->duration_ms, parsed.duration_ms,
+                       sizeof(output->duration_ms));
+                output->duration_count = parsed.duration_count;
+                break;
+            case 2:
+                memcpy(output->delay_ms, parsed.delay_ms,
+                       sizeof(output->delay_ms));
+                output->delay_count = parsed.delay_count;
+                break;
+            default:
+                transition_copy_timings(output, &parsed);
+                break;
+            }
         }
     }
     return true;
+}
+
+bool style_transition_computed(
+    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    StyleTransitionComputed *output)
+{
+    return transition_computed(sheet, node, pseudo, true, output);
+}
+
+bool style_transition_computed_untimed(
+    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    StyleTransitionComputed *output)
+{
+    return transition_computed(sheet, node, pseudo, false, output);
 }

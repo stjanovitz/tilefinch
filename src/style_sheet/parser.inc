@@ -290,6 +290,81 @@ static bool web_font_referrer_policy_normalize(
     return true;
 }
 
+/* This bloom is an admission hint, not a character-coverage test. Collisions
+   and unknown/malformed descriptors stay conservative. Do not discard a
+   subset solely because the current document has not used it yet. */
+static uint64_t web_font_unicode_pages(const char *text, size_t length)
+{
+    if (length > 2048u) return UINT64_MAX;
+    uint64_t pages = 0;
+    size_t at = 0;
+    for (unsigned item = 0; item < 64u; item++) {
+        at = skip_css_space_and_comments(text, length, at);
+        if (at >= length || length - at < 3u || (text[at] != 'U' && text[at] != 'u')
+            || text[at + 1u] != '+') return UINT64_MAX;
+        at += 2;
+        unsigned first = 0, last = 0, digits = 0, wildcards = 0, digit = 0;
+        while (at < length && digits < 6u
+               && style_css_hex_digit((unsigned char) text[at], &digit)) {
+            first = first * 16u + digit;
+            at++; digits++;
+        }
+        while (at < length && text[at] == '?' && digits < 6u) {
+            first *= 16u;
+            at++; digits++; wildcards++;
+        }
+        if (digits == 0) return UINT64_MAX;
+        last = first + (wildcards == 0 ? 0u : (1u << (4u * wildcards)) - 1u);
+        if (wildcards == 0 && at < length && text[at] == '-') {
+            at++; digits = 0; last = 0;
+            while (at < length && digits < 6u
+                   && style_css_hex_digit((unsigned char) text[at], &digit)) {
+                last = last * 16u + digit;
+                at++; digits++;
+            }
+            if (digits == 0) return UINT64_MAX;
+        }
+        if (last < first || last > 0x10ffffu) return UINT64_MAX;
+        unsigned begin = first >> 8u, end = last >> 8u;
+        if (end - begin >= 63u) return UINT64_MAX;
+        for (unsigned page = begin; page <= end; page++)
+            pages |= UINT64_C(1) << (page & 63u);
+        at = skip_css_space_and_comments(text, length, at);
+        if (at == length) return pages;
+        if (at > length) return UINT64_MAX;
+        if (text[at++] != ',') return UINT64_MAX;
+    }
+    return UINT64_MAX;
+}
+
+static bool web_font_normal_style(const char *text, size_t length)
+{
+    if (span_case_equal(text, length, "normal")) return true;
+    size_t at = 0;
+    while (at < length && !isspace((unsigned char) text[at])
+           && !(text[at] == '/' && at + 1u < length && text[at + 1u] == '*')) at++;
+    if (!span_case_equal(text, at, "oblique")) return false;
+    double angles[2] = {0};
+    unsigned count = 0;
+    while (count < 2u) {
+        at = skip_css_space_and_comments(text, length, at);
+        if (at >= length) break;
+        size_t end = at;
+        while (end < length && !isspace((unsigned char) text[end])
+               && !(text[end] == '/' && end + 1u < length
+                    && text[end + 1u] == '*')) end++;
+        double angle = 0.0;
+        if (!style_parse_angle_degrees(text + at, end - at, false, &angle)
+            || angle < -90.0 || angle > 90.0) return false;
+        angles[count++] = angle;
+        at = end;
+    }
+    if (skip_css_space_and_comments(text, length, at) != length || count == 0)
+        return false;
+    if (count == 1) return angles[0] == 0.0;
+    return angles[0] <= 0.0 && angles[1] >= 0.0;
+}
+
 static void register_font_face(Stylesheet *sheet, const char *declarations,
                                size_t length, const char *source_base_url,
                                const char *source_referrer_policy)
@@ -303,6 +378,7 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
     size_t source_length = 0;
     uint16_t weight = 400, weight_max = 0;
     bool normal_style = true;
+    uint64_t unicode_pages = UINT64_MAX;
     for (size_t at = 0; at < length;) {
         at = skip_css_space_and_comments(declarations, length, at);
         if (at >= length) break;
@@ -316,13 +392,15 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
             size_t value_length = end - colon - 1;
             trim(&name, &name_length);
             trim(&value, &value_length);
-            if (style_font_span_equal(name, name_length, "font-family")) {
+            if (span_case_equal(name, name_length, "font-family")) {
                 family_value = value;
                 family_length = value_length;
-            } else if (style_font_span_equal(name, name_length, "src")) {
+            } else if (span_case_equal(name, name_length, "src")) {
                 source_value = value;
                 source_length = value_length;
-            } else if (style_font_span_equal(name, name_length, "font-weight")) {
+            } else if (span_case_equal(name, name_length, "unicode-range")) {
+                unicode_pages = web_font_unicode_pages(value, value_length);
+            } else if (span_case_equal(name, name_length, "font-weight")) {
                 size_t start = skip_css_space_and_comments(value, value_length, 0), split = start;
                 while (split < value_length && !isspace((unsigned char)value[split])
                     && !(value[split] == '/' && split+1 < value_length && value[split+1] == '*')) split++;
@@ -335,9 +413,8 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
                     && (!style_parse_font_weight_component(value+start, split-start, &weight_max)
                         || weight_max < weight
                         || skip_css_space_and_comments(value,value_length,split) != value_length)) normal_style = false;
-            } else if (style_font_span_equal(name, name_length, "font-style")
-                       && !style_font_span_equal(value, value_length, "normal")) {
-                normal_style = false;
+            } else if (span_case_equal(name, name_length, "font-style")) {
+                normal_style = normal_style && web_font_normal_style(value, value_length);
             }
         }
         at = end + (end < length);
@@ -391,6 +468,14 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
     maxima[face_slot] = weight_max;
     StyleWebFontFaceSource *destination =
         &fonts->families[family_slot].faces[face_slot];
+    /* Head-time streaming discovery can precede the text census. Give the
+       common Latin subset priority then, but keep other sources as ordinary
+       fallbacks. A known non-Latin document uses its actual page bloom. */
+    uint64_t demanded_pages = sheet->font_text_pages != 0
+        ? sheet->font_text_pages : UINT64_C(1);
+    uint8_t text_priority = 0;
+    for (uint64_t shared = unicode_pages & demanded_pages; shared != 0;
+         shared &= shared - 1u) text_priority++;
     for (size_t source = 0; source < source_count; source++) {
         bool duplicate = false;
         for (size_t i = 0; i < destination->source_count; i++) {
@@ -416,9 +501,21 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
             fonts->stats.duplicate_sources++;
             continue;
         }
-        if (destination->source_count == STYLE_WEB_FONT_SOURCE_LIMIT
-            || stylesheet_web_font_source_count(sheet)
-                >= STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT) {
+        size_t replace = destination->source_count;
+        if (text_priority && destination->source_count == STYLE_WEB_FONT_SOURCE_LIMIT
+            && !fonts->loaded.families[family_slot].faces[face_slot].loaded) {
+            uint8_t lowest = text_priority;
+            for (size_t i = 0; i < destination->source_count; i++) {
+                if (destination->text_priority[i] < lowest) {
+                    replace = i;
+                    lowest = destination->text_priority[i];
+                }
+            }
+        }
+        if (replace == destination->source_count
+            && (destination->source_count == STYLE_WEB_FONT_SOURCE_LIMIT
+                || stylesheet_web_font_source_count(sheet)
+                    >= STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT)) {
             fonts->stats.skipped_source_limit++;
             continue;
         }
@@ -447,7 +544,20 @@ static void register_font_face(Stylesheet *sheet, const char *declarations,
             fonts->stats.skipped_source_limit++;
             continue;
         }
-        size_t index = destination->source_count++;
+        size_t index = replace;
+        if (index == destination->source_count) destination->source_count++;
+        else {
+            fonts->retained_source_bytes -= budget_usable_size(destination->references[index]);
+            budget_free(sheet->budget, destination->references[index]);
+            if (destination->source_bases[index] != NULL) {
+                fonts->retained_source_bytes -= budget_usable_size(destination->source_bases[index]);
+                budget_free(sheet->budget, destination->source_bases[index]);
+            }
+            memset(destination->source_referrer_policies[index], 0,
+                   sizeof(destination->source_referrer_policies[index]));
+            fonts->stats.skipped_source_limit++;
+        }
+        destination->text_priority[index] = text_priority;
         destination->references[index] = reference;
         references[source] = NULL;
         destination->source_bases[index] = base;
@@ -595,6 +705,32 @@ static bool nested_selector_expand_one(const char *parent,
     return quote == 0 && square == 0;
 }
 
+static bool css_header_is_keyframes(const char *header, size_t length)
+{
+    const char *name = NULL;
+    size_t name_length = 0;
+    return css_header_rule(header, length, "@keyframes", &name, &name_length)
+        || css_header_rule(header, length, "@-webkit-keyframes",
+                           &name, &name_length);
+}
+
+/* A @keyframes block feeds only the motion scheduler's source (the
+   bootstrap runs keyframe animations) and the parsed IR, which replays it
+   into that source. */
+static bool parse_keyframes_block(StyleCssParseContext *context,
+                                  const char *header, size_t header_length,
+                                  const char *body, size_t body_length)
+{
+    Stylesheet *sheet = context->sheet;
+    if (context->parsed_ir != NULL)
+        context->parsed_ir->has_motion_keyframes = true;
+    sheet->has_motion_keyframes = true;
+    stylesheet_note_motion_source(sheet, header, header_length,
+                                  body, body_length, true);
+    return style_parsed_ir_builder_append(context, STYLE_PARSED_IR_KEYFRAMES,
+        header, header_length, body, body_length);
+}
+
 static bool parse_nested_style_block(StyleCssParseContext *context,
                                      const char *css,
                                      size_t begin, size_t end,
@@ -659,18 +795,8 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
         trim(&header, &header_length);
         const char *condition = NULL;
         size_t condition_length = 0;
-        if (css_header_rule(header, header_length, "@keyframes",
-                            &condition, &condition_length)
-            || css_header_rule(header, header_length, "@-webkit-keyframes",
-                               &condition, &condition_length)) {
-            if (context->parsed_ir != NULL) {
-                context->parsed_ir->has_motion_keyframes = true;
-            }
-            sheet->has_motion_keyframes = true;
-            stylesheet_note_motion_source(sheet, header, header_length,
-                css + delimiter + 1, close - delimiter - 1, true);
-            if (!style_parsed_ir_builder_append(context,
-                    STYLE_PARSED_IR_KEYFRAMES, header, header_length,
+        if (css_header_is_keyframes(header, header_length)) {
+            if (!parse_keyframes_block(context, header, header_length,
                     css + delimiter + 1, close - delimiter - 1)) return false;
         } else if (css_header_rule(header, header_length, "@media",
                             &condition, &condition_length)) {
@@ -683,8 +809,7 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
             bool supported = supports_matches(
                 sheet, condition, condition_length);
             if (!supported) {
-                diagnostic_saturating_add(
-                    &sheet->diagnostic_supports_false_queries, 1);
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_supports_false_queries);
             }
             if (supported
                 && !parse_nested_style_block(
@@ -730,8 +855,7 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
                         header, header_length, child_at);
                     char one[STYLE_SELECTOR_CAPACITY];
                     if (++combinations > 32) {
-                        diagnostic_saturating_add(
-                            &sheet->diagnostic_selector_drops, 1);
+                        STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_selector_drops);
                         combination_limit = true;
                         break;
                     }
@@ -893,18 +1017,8 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                     sheet, condition, condition_length, css + brace + 1,
                     close - brace - 1)) return false;
         } else if (parse_style_rules
-            && (css_header_rule(header, header_length, "@keyframes",
-                            &condition, &condition_length)
-            || css_header_rule(header, header_length, "@-webkit-keyframes",
-                               &condition, &condition_length))) {
-            if (context->parsed_ir != NULL) {
-                context->parsed_ir->has_motion_keyframes = true;
-            }
-            sheet->has_motion_keyframes = true;
-            stylesheet_note_motion_source(sheet, header, header_length,
-                css + brace + 1, close - brace - 1, true);
-            if (!style_parsed_ir_builder_append(context,
-                    STYLE_PARSED_IR_KEYFRAMES, header, header_length,
+                   && css_header_is_keyframes(header, header_length)) {
+            if (!parse_keyframes_block(context, header, header_length,
                     css + brace + 1, close - brace - 1)) return false;
         } else if (css_header_rule(header, header_length, "@media",
                             &condition, &condition_length)) {
@@ -917,8 +1031,7 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             bool supported = supports_matches(
                 sheet, condition, condition_length);
             if (parse_style_rules && !supported) {
-                diagnostic_saturating_add(
-                    &sheet->diagnostic_supports_false_queries, 1);
+                STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_supports_false_queries);
             }
             if (supported
                 && !parse_css_range_nested(
@@ -1006,7 +1119,7 @@ static void style_css_font_fixup_property(
     FontFamily family = FONT_SANS;
     bool parsed = false;
     if (span_case_equal(name, name_length, "font-family")) {
-        char resolved[160];
+        char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         parsed = style_resolve_value(
             sheet, value, value_length, resolved, sizeof(resolved), 0);
         if (parsed) {
@@ -1201,6 +1314,48 @@ static bool style_css_parse_context_finish(StyleCssParseContext *context)
     return completed;
 }
 
+/* One <style> element, for a full build and for an appended batch alike:
+   it is recorded as a style source, then, when the policy allows inline
+   style, its CSSOM override (if script set one) or else its Text children
+   are parsed, confined to its shadow tree when it is inside one. False
+   only when parsing fails. */
+static bool stylesheet_parse_style_element(
+    StyleCssParseContext *context, lxb_dom_node_t *element,
+    const TilefinchContentSecurityPolicy *content_security_policy)
+{
+    Stylesheet *sheet = context->sheet;
+    size_t override_length = 0;
+    const char *override = document_cssom_sheet_text(element, &override_length);
+    stylesheet_note_style_source(sheet, element);
+    if (!tilefinch_csp_allows_inline_style(content_security_policy, element))
+        return true;
+    unsigned scope_begin = sheet->next_order;
+    bool scoped = document_shadow_carrier_containing(element) != NULL;
+    /* Do not parse a confined source unless its order range can be
+       recorded. Otherwise an allocation refusal makes it global. */
+    if (scoped && !stylesheet_reserve_shadow_scope(sheet)) return true;
+    sheet->parsing_scoped_source = scoped;
+    bool parsed = true;
+    if (override != NULL) {
+        TILEFINCH_WORK_ADD(css_bytes, override_length);
+        parsed = parse_css_range(context, override, 0, override_length);
+    }
+    for (lxb_dom_node_t *child = override == NULL ? element->first_child : NULL;
+         parsed && child != NULL; child = child->next) {
+        size_t length = 0;
+        const char *css = document_text_data(child, &length);
+        if (css == NULL) continue;
+        TILEFINCH_WORK_ADD(css_bytes, length);
+        parsed = parse_css_range(context, css, 0, length);
+    }
+    sheet->parsing_scoped_source = false;
+    /* Whatever a failed parse appended stays confined too. */
+    if (scoped)
+        stylesheet_note_shadow_scope(sheet, element, scope_begin,
+                                     sheet->next_order);
+    return parsed;
+}
+
 static bool collect_styles(
     StyleCssParseContext *context, lxb_dom_node_t *node,
     const TilefinchContentSecurityPolicy *content_security_policy)
@@ -1208,44 +1363,9 @@ static bool collect_styles(
     for (; node != NULL; node = node->next) {
         size_t name_length = 0;
         const char *name = document_element_name(node, &name_length);
-        bool inline_style = name != NULL && span_equal(name, name_length, "style");
-        size_t override_length = 0;
-        const char *override = inline_style
-            ? document_cssom_sheet_text(node, &override_length) : NULL;
-        if (inline_style) {
-            stylesheet_note_style_source(context->sheet, node);
-        }
-        if (inline_style && tilefinch_csp_allows_inline_style(
-                   content_security_policy, node)) {
-            Stylesheet *sheet = context->sheet;
-            unsigned scope_begin = sheet->next_order;
-            bool scoped = document_shadow_carrier_containing(node) != NULL;
-            /* Do not parse a confined source unless its order range can be
-               recorded. Otherwise an allocation refusal makes it global. */
-            bool admitted = !scoped || stylesheet_reserve_shadow_scope(sheet);
-            sheet->parsing_scoped_source = scoped && admitted;
-            if (admitted && override != NULL && !parse_css_range(
-                    context, override, 0, override_length)) {
-                sheet->parsing_scoped_source = false;
-                return false;
-            }
-            for (lxb_dom_node_t *child = admitted && override == NULL
-                     ? node->first_child : NULL;
-                 child != NULL; child = child->next) {
-                size_t length = 0;
-                const char *css = document_text_data(child, &length);
-                if (css != NULL
-                    && !parse_css_range(context, css, 0, length)) {
-                    sheet->parsing_scoped_source = false;
-                    return false;
-                }
-            }
-            sheet->parsing_scoped_source = false;
-            if (scoped && admitted) {
-                stylesheet_note_shadow_scope(sheet, node, scope_begin,
-                                             sheet->next_order);
-            }
-        }
+        if (name != NULL && span_equal(name, name_length, "style")
+            && !stylesheet_parse_style_element(
+                   context, node, content_security_policy)) return false;
         if (node->first_child != NULL
             && !collect_styles(context, node->first_child,
                                content_security_policy)) return false;

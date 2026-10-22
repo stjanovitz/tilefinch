@@ -1,29 +1,30 @@
 (() => {
   /* See dom.js: the timer clock mirror is written on the first pump, which
      is well after hardening.js has taken its snapshot. */
-  Object.defineProperty(globalThis, "__tilefinchNow", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchNow", {
     enumerable: false,
     configurable: false,
     writable: true,
     value: 0,
   });
-  const trustedWrap = globalThis.__tilefinchWrap,
-    pageVisible = globalThis.__tilefinchPageVisible,
-    schedulerNow = globalThis.__tilefinchSchedulerNow,
-    createMessageEvent = globalThis.__tilefinchCreateMessageEvent,
+  const trustedWrap = __tilefinchRealmGlobal.__tilefinchWrap,
+    pageVisible = __tilefinchRealmGlobal.__tilefinchPageVisible,
+    schedulerNow = __tilefinchRealmGlobal.__tilefinchSchedulerNow,
+    createMessageEvent = __tilefinchRealmGlobal.__tilefinchCreateMessageEvent,
     diagnosticString = String,
     diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor,
     timerApply = Reflect.apply;
   /* Native memory the event loop reads every turn instead of calling into
      JS (ScriptRuntime.host_state; slot order is ScriptHostStateSlot). */
-  const hostState = globalThis.__tilefinchHostChannel.state,
+  const hostState = __tilefinchRealmGlobal.__tilefinchHostChannel.state,
     HOST_TIMERS = 0,
     HOST_EARLIEST_DUE = 1,
     HOST_NOW = 2,
     HOST_SAMPLED_CLOCK = 3,
     HOST_SCROLL_PENDING = 4,
     HOST_EARLIEST_KIND = 5,
-    HOST_EARLIEST_TASK_DUE = 6;
+    HOST_EARLIEST_TASK_DUE = 6,
+    HOST_TIMER_EXCEPTIONS = 7;
   /* ScriptHostTimerKind: the native loop tells frame callbacks, which run
      at a rendering opportunity, from tasks, which run once due. */
   const TIMER_KIND_CODES = Object.freeze({
@@ -37,20 +38,23 @@
     "platform-task": 7,
     idle: 8,
   });
-  Object.defineProperty(globalThis, "__tilefinchDiagnosticLookup", {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value(name) {
-      const descriptor = diagnosticOwnDescriptor(
-        globalThis,
-        diagnosticString(name),
-      );
-      if (!descriptor || typeof descriptor.value !== "function")
-        throw new ReferenceError("diagnostic function is not a global export");
-      return descriptor.value;
-    },
-  });
+  /* Lab capability traces decode generated functions by name; host and
+     validation realms only. */
+  if (__tilefinchRealmGlobal.__tilefinchTestProbes)
+    Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchDiagnosticLookup", {
+      enumerable: false,
+      configurable: false,
+      writable: false,
+      value(name) {
+        const descriptor = diagnosticOwnDescriptor(
+          __tilefinchRealmGlobal,
+          diagnosticString(name),
+        );
+        if (!descriptor || typeof descriptor.value !== "function")
+          throw new ReferenceError("diagnostic function is not a global export");
+        return descriptor.value;
+      },
+    });
   const initialSchedulerSample = Number(schedulerNow()),
     usesSampledClock = Number.isFinite(initialSchedulerSample) &&
       initialSchedulerSample >= 0;
@@ -105,7 +109,7 @@
     const signed = Number(value) >> 0;
     return signed > 0 ? signed : 0;
   };
-  globalThis.__tilefinchNormalizeTimerDelay = normalizeTimerDelay;
+  __tilefinchRealmGlobal.__tilefinchNormalizeTimerDelay = normalizeTimerDelay;
   const currentSchedulerTime = () => {
     if (usesSampledClock) {
       const sampled = Number(schedulerNow());
@@ -113,9 +117,10 @@
     }
     return now;
   };
-  Object.defineProperty(globalThis.__tilefinchRootCensus, "timers", {
-    get: () => timers.length,
-  });
+  if (__tilefinchRealmGlobal.__tilefinchRootCensus)
+    Object.defineProperty(__tilefinchRealmGlobal.__tilefinchRootCensus, "timers", {
+      get: () => timers.length,
+    });
   function schedule(callback, delay, repeat, args, kind = "timeout",
                     reserved = false) {
     if (typeof callback !== "function" ||
@@ -211,8 +216,9 @@
          functions; strict functions observe undefined and real-world state
          machines use that distinction.  Keep animation-frame's existing
          callback contract separate. */
-      else timerApply(callback, globalThis, this.args);
+      else timerApply(callback, __tilefinchRealmGlobal, this.args);
     } catch (error) {
+      hostState[HOST_TIMER_EXCEPTIONS]++;
       __tilefinchReportUncaught(error, "timer callback");
     }
   }
@@ -224,15 +230,15 @@
      public timer names. Keep the browser-owned scheduler capabilities under
      hardening-protected names so Worker/FileReader lifetime cleanup cannot be
      redirected through author code. */
-  globalThis.__tilefinchScheduleTimeout = scheduleTimeout;
-  globalThis.__tilefinchScheduleInterval = scheduleInterval;
-  globalThis.__tilefinchScheduleTask = (callback) =>
+  __tilefinchRealmGlobal.__tilefinchScheduleTimeout = scheduleTimeout;
+  __tilefinchRealmGlobal.__tilefinchScheduleInterval = scheduleInterval;
+  __tilefinchRealmGlobal.__tilefinchScheduleTask = (callback) =>
     schedule(callback, 0, false, EMPTY_TIMER_ARGS, "platform-task");
-  globalThis.__tilefinchCancelTimer = clear;
-  globalThis.__tilefinchSchedulerTime = currentSchedulerTime;
-  globalThis.__tilefinchScheduleReservedTask = (callback, delay) =>
+  __tilefinchRealmGlobal.__tilefinchCancelTimer = clear;
+  __tilefinchRealmGlobal.__tilefinchSchedulerTime = currentSchedulerTime;
+  __tilefinchRealmGlobal.__tilefinchScheduleReservedTask = (callback, delay) =>
     schedule(callback, delay, false, EMPTY_TIMER_ARGS, "platform-task", true);
-  globalThis.__tilefinchScheduleReservedFrame = (callback) =>
+  __tilefinchRealmGlobal.__tilefinchScheduleReservedFrame = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame", true);
   /* The public timer functions are distinct objects whose name and length
      match WebIDL (the optional timeout/handle arguments do not count), as
@@ -251,15 +257,15 @@
       return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
     },
     cancelAnimationFrame = (handle) => clear(handle);
-  globalThis.setTimeout = setTimeout;
-  globalThis.setInterval = setInterval;
-  globalThis.clearTimeout = clearTimeout;
-  globalThis.clearInterval = clearInterval;
-  globalThis.requestAnimationFrame = requestAnimationFrame;
-  globalThis.cancelAnimationFrame = cancelAnimationFrame;
-  globalThis.__tilefinchScheduleRenderObserver = (callback) =>
+  __tilefinchRealmGlobal.setTimeout = setTimeout;
+  __tilefinchRealmGlobal.setInterval = setInterval;
+  __tilefinchRealmGlobal.clearTimeout = clearTimeout;
+  __tilefinchRealmGlobal.clearInterval = clearInterval;
+  __tilefinchRealmGlobal.requestAnimationFrame = requestAnimationFrame;
+  __tilefinchRealmGlobal.cancelAnimationFrame = cancelAnimationFrame;
+  __tilefinchRealmGlobal.__tilefinchScheduleRenderObserver = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-observer");
-  globalThis.__tilefinchScheduleRenderFixup = (callback) =>
+  __tilefinchRealmGlobal.__tilefinchScheduleRenderFixup = (callback) =>
     schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-fixup");
   {
     const token = {},
@@ -391,14 +397,14 @@
         }
         const event = trusted(createMessageEvent(
           "message", data, "", null, ports));
-        globalThis.__tilefinchDispatchEventTargetCheckpointed(
+        __tilefinchRealmGlobal.__tilefinchDispatchEventTargetCheckpointed(
           this, event, complete);
       }
       postMessage(value, transfer = []) {
         if (this._closed) return;
         const ports = [],
-          copied = globalThis.__tilefinchCloneWorkerValue(
-            value, globalThis.__tilefinchWorkerCloneIntrinsics.owner,
+          copied = __tilefinchRealmGlobal.__tilefinchCloneWorkerValue(
+            value, __tilefinchRealmGlobal.__tilefinchWorkerCloneIntrinsics.owner,
             transfer, ports),
           target = this._peer;
         if (target && !target._closed) target._enqueue(copied, ports);
@@ -416,12 +422,12 @@
         this.port2._peer = this.port1;
       }
     }
-    globalThis.MessagePort = MessagePort;
-    globalThis.MessageChannel = MessageChannel;
+    __tilefinchRealmGlobal.MessagePort = MessagePort;
+    __tilefinchRealmGlobal.MessageChannel = MessageChannel;
     /* Structured clone prepares a replacement endpoint first and commits the
        move only after the entire message has cloned successfully. This keeps
        transfer-list failures transactional. */
-    Object.defineProperty(globalThis, "__tilefinchPrepareMessagePortTransfer", {
+    Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchPrepareMessagePortTransfer", {
       configurable: false,
       enumerable: false,
       writable: false,
@@ -523,10 +529,10 @@
                 if (target.__closed) return;
                 const event = trusted(createMessageEvent(
                   "message", data,
-                  String(globalThis.location?.origin || ""), null, []));
+                  String(__tilefinchRealmGlobal.location?.origin || ""), null, []));
                 if (typeof target.onmessage === "function")
                   try {
-                    globalThis.__tilefinchRunTask(
+                    __tilefinchRealmGlobal.__tilefinchRunTask(
                       "broadcast-channel-handler",
                       target.onmessage,
                       target,
@@ -558,10 +564,7 @@
         channelCount--;
       }
     }
-    Object.defineProperty(globalThis.__tilefinchRootCensus, "broadcastChannels", {
-      get: () => channelCount,
-    });
-    globalThis.BroadcastChannel = BroadcastChannel;
+    __tilefinchRealmGlobal.BroadcastChannel = BroadcastChannel;
   }
   const requestIdleCallback = (callback, options = {}) => {
     if (typeof callback !== "function")
@@ -574,10 +577,10 @@
     return schedule(
       () => {
         const started = __tilefinchPerformanceSample(11);
-        globalThis.__tilefinchRunTask(
+        __tilefinchRealmGlobal.__tilefinchRunTask(
           "idle-callback",
           callback,
-          globalThis,
+          __tilefinchRealmGlobal,
           [
             {
               didTimeout: now - requested >= timeout,
@@ -598,8 +601,8 @@
     );
   };
   const cancelIdleCallback = (handle) => clear(handle);
-  globalThis.requestIdleCallback = requestIdleCallback;
-  globalThis.cancelIdleCallback = cancelIdleCallback;
+  __tilefinchRealmGlobal.requestIdleCallback = requestIdleCallback;
+  __tilefinchRealmGlobal.cancelIdleCallback = cancelIdleCallback;
   {
     const listeners = new Map();
     const viewport = {
@@ -609,9 +612,9 @@
       offsetTop: 0,
       pageLeft: 0,
       pageTop: 0,
-      scale: globalThis.__tilefinchDiagnosticMobileSafari
+      scale: __tilefinchRealmGlobal.__tilefinchDiagnosticMobileSafari
         ? 1
-        : Number(globalThis.__tilefinchViewportScale) || 1,
+        : Number(__tilefinchRealmGlobal.__tilefinchViewportScale) || 1,
       onresize: null,
       onscroll: null,
       addEventListener(type, callback) {
@@ -632,7 +635,7 @@
         const type = String(event.type);
         for (const callback of [...(listeners.get(type) || [])])
           try {
-            globalThis.__tilefinchRunTask(
+            __tilefinchRealmGlobal.__tilefinchRunTask(
               "visual-viewport:" + type,
               callback,
               viewport,
@@ -644,7 +647,7 @@
         const handler = viewport["on" + type];
         if (typeof handler === "function")
           try {
-            globalThis.__tilefinchRunTask(
+            __tilefinchRealmGlobal.__tilefinchRunTask(
               "visual-viewport-handler:" + type,
               handler,
               viewport,
@@ -656,7 +659,7 @@
         return !event.defaultPrevented;
       },
     };
-    globalThis.visualViewport = viewport;
+    __tilefinchRealmGlobal.visualViewport = viewport;
   }
   {
     let pageTop = 0,
@@ -674,7 +677,7 @@
       }
       return true;
     };
-    Object.defineProperties(globalThis, {
+    Object.defineProperties(__tilefinchRealmGlobal, {
       scrollX: {
         configurable: true,
         enumerable: true,
@@ -704,9 +707,9 @@
         },
       },
     });
-    globalThis.__tilefinchApplyPageScroll = apply;
+    __tilefinchRealmGlobal.__tilefinchApplyPageScroll = apply;
     /* The native loop calls this only while HOST_SCROLL_PENDING is set. */
-    globalThis.__tilefinchFlushPageScroll = () => {
+    __tilefinchRealmGlobal.__tilefinchFlushPageScroll = () => {
       if (!pending) return false;
       pending = false;
       hostState[HOST_SCROLL_PENDING] = 0;
@@ -729,7 +732,7 @@
         behavior =
           requestedBehavior === "auto" &&
           scrollingElement &&
-          globalThis.getComputedStyle &&
+          __tilefinchRealmGlobal.getComputedStyle &&
           getComputedStyle(scrollingElement).scrollBehavior === "smooth"
             ? "smooth"
             : requestedBehavior,
@@ -754,22 +757,22 @@
       };
       requestAnimationFrame(step);
     };
-    const scroll = (...args) => globalThis.scrollTo(...args),
+    const scroll = (...args) => __tilefinchRealmGlobal.scrollTo(...args),
       scrollBy = (xOrOptions = undefined, y = undefined) => {
         const delta =
           typeof xOrOptions === "object" && xOrOptions !== null
             ? Number(xOrOptions.top) || 0
             : Number(y) || 0;
-        globalThis.scrollTo({ top: pageTop + delta });
+        __tilefinchRealmGlobal.scrollTo({ top: pageTop + delta });
       };
-    globalThis.scrollTo = scrollTo;
-    globalThis.scroll = scroll;
-    globalThis.scrollBy = scrollBy;
+    __tilefinchRealmGlobal.scrollTo = scrollTo;
+    __tilefinchRealmGlobal.scroll = scroll;
+    __tilefinchRealmGlobal.scrollBy = scrollBy;
   }
-  globalThis.__tilefinchPumpTimers = (elapsed, maxCallbacks) => {
+  __tilefinchRealmGlobal.__tilefinchPumpTimers = (elapsed, maxCallbacks, tasksOnly) => {
     if (usesSampledClock) currentSchedulerTime();
     else now += Math.max(0, Number(elapsed) || 0);
-    globalThis.__tilefinchNow = now;
+    __tilefinchRealmGlobal.__tilefinchNow = now;
     hostState[HOST_NOW] = now;
     let ran = 0,
       visible;
@@ -779,7 +782,7 @@
          is, whatever the visibility, so the query waits for a due head. */
       if (!(timers[0]?.due <= now)) break;
       if (visible === undefined) visible = pageVisible();
-      const timerIndex = visible
+      const timerIndex = visible && !tasksOnly
           ? (timers[0]?.due <= now ? 0 : -1)
           : timers.findIndex((candidate) =>
             candidate.due <= now && candidate.kind !== "animation-frame" &&
@@ -800,7 +803,7 @@
             : "timer:" + String(timer.kind) + ":id=" + String(timer.id);
       activeTimer = timer;
       try {
-        globalThis.__tilefinchRunTask(label, invokeTimer, timer);
+        __tilefinchRealmGlobal.__tilefinchRunTask(label, invokeTimer, timer);
       } finally {
         activeTimer = null;
       }
@@ -826,7 +829,7 @@
   /* Source-free native/lab liveness snapshot. Keep the returned tuple numeric
      and bounded so diagnostics never serialize callbacks, arguments, URLs, or
      challenge payloads. This is called only by the native diagnostic seam. */
-  globalThis.__tilefinchSchedulerSnapshot = () => {
+  __tilefinchRealmGlobal.__tilefinchSchedulerSnapshot = () => {
     let due = 0, oldestOverdue = 0, nearestFuture = Infinity;
     for (const timer of timers) {
       const remaining = timer.due - now;
@@ -850,7 +853,7 @@
     ];
   };
   const createBootstrapEvent = Document.prototype.createEvent;
-  const trusted = globalThis.__tilefinchTrustedEvent,
+  const trusted = __tilefinchRealmGlobal.__tilefinchTrustedEvent,
     nonBubblingEventTypes = new Set([
       "focus", "blur", "load", "error", "scroll", "mouseenter",
       "mouseleave", "pointerenter", "pointerleave",
@@ -918,7 +921,7 @@
     else event = new Event(name, options);
     return trusted(event);
   };
-  globalThis.__tilefinchDispatchAt = (selector, type) => {
+  __tilefinchRealmGlobal.__tilefinchDispatchAt = (selector, type) => {
     const target = selector
         ? document.querySelector(String(selector))
         : document,
@@ -934,12 +937,12 @@
     }
     return target.dispatchEvent(tilefinchEvent(name));
   };
-  globalThis.__tilefinchDispatchHandle = (handle, type) => {
+  __tilefinchRealmGlobal.__tilefinchDispatchHandle = (handle, type) => {
     const name = String(type);
     if (
       name === "focus" &&
-      !globalThis.__tilefinchFocusEventsObserved?.() &&
-      globalThis.__tilefinchSetFocusHandle?.(handle)
+      !__tilefinchRealmGlobal.__tilefinchFocusEventsObserved?.() &&
+      __tilefinchRealmGlobal.__tilefinchSetFocusHandle?.(handle)
     )
       return true;
     const target = trustedWrap(Number(handle));
@@ -954,7 +957,7 @@
     }
     return target.dispatchEvent(tilefinchEvent(name));
   };
-  globalThis.__tilefinchLabelDefault = (target, native = false) => {
+  __tilefinchRealmGlobal.__tilefinchLabelDefault = (target, native = false) => {
     if (!(target instanceof HTMLLabelElement)) return false;
     const control = target.control;
     if (!control || control.disabled) return false;
@@ -964,18 +967,18 @@
       return true;
     }
     const state =
-        globalThis.__tilefinchBeginControlDefault?.(control, true) || null,
+        __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(control, true) || null,
       clickEvent = tilefinchEvent("click");
     clickEvent.__tilefinchControlDefaultPrepared = true;
     const accepted = control.dispatchEvent(clickEvent);
-    globalThis.__tilefinchFinishControlDefault?.(state, accepted);
+    __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(state, accepted);
     return true;
   };
   let pointerHoverTarget = null,
     pointerMoveProbeTarget = null,
     pointerCaptureTarget = null,
     pointerMarkupPossible =
-      !!globalThis.__tilefinchPointerMarkupInitiallyPresent;
+      !!__tilefinchRealmGlobal.__tilefinchPointerMarkupInitiallyPresent;
   Element.prototype.setPointerCapture = function setPointerCapture(pointerId) {
     if (Number(pointerId) !== 1)
       throw new DOMException("Unknown pointer", "NotFoundError");
@@ -995,14 +998,14 @@
   Element.prototype.hasPointerCapture = function hasPointerCapture(pointerId) {
     return Number(pointerId) === 1 && pointerCaptureTarget === this;
   };
-  globalThis.__tilefinchPointerMarkupChanged = () => {
+  __tilefinchRealmGlobal.__tilefinchPointerMarkupChanged = () => {
     pointerMarkupPossible = true;
     pointerMoveProbeTarget = null;
   };
   const dispatchHoverTransition = (next, point) => {
     const previous = pointerHoverTarget;
     if (previous === next) return true;
-    const eventPath = globalThis.__tilefinchShadowEventPath,
+    const eventPath = __tilefinchRealmGlobal.__tilefinchShadowEventPath,
       previousPath = previous ? eventPath(previous, true) : [],
       nextPath = next ? eventPath(next, true) : [];
     let shared = 0;
@@ -1034,7 +1037,7 @@
     pointerHoverTarget = next;
     return accepted;
   };
-  globalThis.__tilefinchDispatchActivationHandle = (
+  __tilefinchRealmGlobal.__tilefinchDispatchActivationHandle = (
     handle,
     phase = 0,
     clientX = 0,
@@ -1052,9 +1055,9 @@
     if (phase === 1) {
       const sameTarget = target === pointerHoverTarget,
         moveObserved =
-          !!globalThis.__tilefinchPointerMoveEventsObserved?.(),
+          !!__tilefinchRealmGlobal.__tilefinchPointerMoveEventsObserved?.(),
         hoverObserved =
-          !!globalThis.__tilefinchPointerHoverEventsObserved?.();
+          !!__tilefinchRealmGlobal.__tilefinchPointerHoverEventsObserved?.();
       if (
         sameTarget &&
         pointerMoveProbeTarget === target &&
@@ -1079,8 +1082,8 @@
       point = {
         clientX,
         clientY,
-        pageX: clientX + Number(globalThis.scrollX || 0),
-        pageY: clientY + Number(globalThis.scrollY || 0),
+        pageX: clientX + Number(__tilefinchRealmGlobal.scrollX || 0),
+        pageY: clientY + Number(__tilefinchRealmGlobal.scrollY || 0),
         offsetX: Number(offsetX) || 0,
         offsetY: Number(offsetY) || 0,
         button: phase === 1 ? -1 : 0,
@@ -1093,7 +1096,7 @@
     if (phase === 1) {
       const hoverAccepted =
         target === pointerHoverTarget ||
-        (!globalThis.__tilefinchPointerHoverEventsObserved?.() &&
+        (!__tilefinchRealmGlobal.__tilefinchPointerHoverEventsObserved?.() &&
           !pointerMarkupPossible)
           ? true
           : dispatchHoverTransition(target, point);
@@ -1105,7 +1108,7 @@
       let pointerAccepted = true,
         mouseAccepted = true;
       if (
-        globalThis.__tilefinchPointerMoveEventsObserved?.() ||
+        __tilefinchRealmGlobal.__tilefinchPointerMoveEventsObserved?.() ||
         pointerMarkupPossible
       ) {
         pointerAccepted = fire("pointermove");
@@ -1150,7 +1153,7 @@
     }
     const clickDefault = () => {
       const controlState =
-          globalThis.__tilefinchBeginControlDefault?.(target, true) || null,
+          __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(target, true) || null,
         clickEvent = tilefinchEvent("click", point);
       clickEvent.__tilefinchControlDefaultPrepared = true;
       let accepted = false,
@@ -1161,9 +1164,9 @@
         if (
           accepted &&
           !controlState &&
-          !globalThis.__tilefinchDetailsDefault?.(target)
+          !__tilefinchRealmGlobal.__tilefinchDetailsDefault?.(target)
         )
-          globalThis.__tilefinchLabelDefault(target, true);
+          __tilefinchRealmGlobal.__tilefinchLabelDefault(target, true);
         return accepted;
       } finally {
         /* A watchdog can interrupt an author handler after the bootstrap has
@@ -1171,7 +1174,7 @@
            returns its cancellation bit. Roll the staged default back on
            every incomplete dispatch; C then classifies the admitted handler
            as RUNTIME_FAILED and must not replay it. */
-        globalThis.__tilefinchFinishControlDefault?.(
+        __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(
           controlState,
           completed && accepted,
         );
@@ -1194,7 +1197,7 @@
     fire("mouseup");
     return clickDefault();
   };
-  globalThis.__tilefinchDispatchInputHandle = (
+  __tilefinchRealmGlobal.__tilefinchDispatchInputHandle = (
     handle,
     type,
     data,
@@ -1205,14 +1208,14 @@
     if (!target) return false;
     const name = String(type);
     if (name === "input" && currentValue !== null) {
-      globalThis.__tilefinchSyncNativeControlValue?.(target, currentValue);
+      __tilefinchRealmGlobal.__tilefinchSyncNativeControlValue?.(target, currentValue);
     }
     /* Typed text first fires a cancelable textInput TextEvent, as in
        Chrome; cancelling it cancels the insertion like beforeinput. */
     if (name === "beforeinput" && String(inputType) === "insertText" &&
         data !== null && String(data) !== "") {
       const text = createBootstrapEvent.call(document, "TextEvent");
-      text.initTextEvent("textInput", true, true, globalThis, String(data));
+      text.initTextEvent("textInput", true, true, __tilefinchRealmGlobal, String(data));
       if (!target.dispatchEvent(trusted(text))) return false;
     }
     return target.dispatchEvent(
@@ -1226,7 +1229,7 @@
       ),
     );
   };
-  globalThis.__tilefinchDispatchSubmitHandle = (formHandle, submitterHandle) => {
+  __tilefinchRealmGlobal.__tilefinchDispatchSubmitHandle = (formHandle, submitterHandle) => {
     const form = trustedWrap(Number(formHandle)),
       submitter = trustedWrap(Number(submitterHandle));
     if (!form) return false;

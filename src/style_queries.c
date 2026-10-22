@@ -8,14 +8,6 @@
 #include "style_internal.h"
 
 #include <stdlib.h>
-#include <strings.h>
-
-typedef struct {
-    const char *text;
-    size_t length;
-    const StyleContainerState *state;
-    bool valid;
-} ContainerConditionParser;
 
 /* Geometry table for a first pass with nothing measured yet (the measured
    collection sizes its own from the boxes). */
@@ -23,30 +15,6 @@ typedef struct {
 /* Evaluations one pass may log before it is declared unverifiable. */
 #define STYLE_CONTAINER_LOG_INITIAL 256u
 #define STYLE_CONTAINER_LOG_LIMIT 16384u
-
-static void query_trim(const char **text, size_t *length)
-{
-    while (*length != 0 && isspace((unsigned char) (*text)[0])) {
-        (*text)++;
-        (*length)--;
-    }
-    while (*length != 0
-           && isspace((unsigned char) (*text)[*length - 1])) {
-        (*length)--;
-    }
-}
-
-static bool query_span_case_equal(const char *text, size_t length,
-                                  const char *wanted)
-{
-    size_t wanted_length = strlen(wanted);
-    if (length != wanted_length) return false;
-    for (size_t i = 0; i < length; i++) {
-        if (tolower((unsigned char) text[i])
-            != tolower((unsigned char) wanted[i])) return false;
-    }
-    return true;
-}
 
 static uint32_t query_name_bit(Stylesheet *sheet, const char *name,
                                size_t length)
@@ -75,6 +43,61 @@ static bool query_identifier_character(char value)
     return isalnum(c) || value == '-' || value == '_';
 }
 
+/* The axes a condition's size features need a container to answer on (CSS
+   Containment 3 size features): width and inline-size need the inline axis,
+   height and block-size the block axis, and aspect-ratio and orientation,
+   which relate the two, need both. min-/max- prefixes and range forms query
+   the same features. False when the condition names a style() or
+   scroll-state() query: this engine evaluates neither, so such a rule is
+   dropped on purpose rather than retained to evaluate as unknown. */
+static bool container_condition_axes(const char *condition, size_t length,
+                                     uint8_t *needs_inline_size,
+                                     uint8_t *needs_block_size)
+{
+    for (size_t at = 0; at < length;) {
+        if (!query_identifier_character(condition[at])
+            || isdigit((unsigned char) condition[at])) {
+            at++;
+            continue;
+        }
+        /* A whole word that does not start with a digit: `10px` is one
+           dimension, never the identifier `px`. */
+        size_t end = at;
+        while (end < length && query_identifier_character(condition[end])) {
+            end++;
+        }
+        const char *word = condition + at;
+        size_t word_length = end - at;
+        at = end;
+        if (end < length && condition[end] == '(') {
+            if (span_case_equal(word, word_length, "style")
+                || span_case_equal(word, word_length, "scroll-state")) {
+                return false;
+            }
+            continue;
+        }
+        if (span_case_equal(word, word_length, "orientation")) {
+            *needs_inline_size = *needs_block_size = 1;
+            continue;
+        }
+        if (word_length > 4 && (span_case_equal(word, 4, "min-")
+                                || span_case_equal(word, 4, "max-"))) {
+            word += 4;
+            word_length -= 4;
+        }
+        if (span_case_equal(word, word_length, "width")
+            || span_case_equal(word, word_length, "inline-size")) {
+            *needs_inline_size = 1;
+        } else if (span_case_equal(word, word_length, "height")
+                   || span_case_equal(word, word_length, "block-size")) {
+            *needs_block_size = 1;
+        } else if (span_case_equal(word, word_length, "aspect-ratio")) {
+            *needs_inline_size = *needs_block_size = 1;
+        }
+    }
+    return true;
+}
+
 bool style_register_container_query(Stylesheet *sheet,
                                     const char *prelude, size_t length,
                                     uint8_t parent_query,
@@ -85,7 +108,7 @@ bool style_register_container_query(Stylesheet *sheet,
     if (sheet == NULL || sheet->budget == NULL || prelude == NULL) {
         return true;
     }
-    query_trim(&prelude, &length);
+    trim(&prelude, &length);
     if (length == 0 || length >= STYLE_CONTAINER_QUERY_TEXT_CAPACITY) {
         return true;
     }
@@ -95,25 +118,47 @@ bool style_register_container_query(Stylesheet *sheet,
         if (sheet->conditional_queries == NULL) return false;
     }
     StyleConditionalQueries *queries = sheet->conditional_queries;
-    if (queries->query_count >= STYLE_CONTAINER_QUERY_LIMIT) return true;
 
-    size_t condition_at = 0;
-    while (condition_at < length && prelude[condition_at] != '(') {
+    /* The prelude is [ <container-name> ]? <container-query>. A name is a
+       <custom-ident> other than none, and, not and or (CSS Containment 3),
+       so a leading `not` opens the condition instead of naming a
+       container. An identifier directly followed by '(' is a function
+       (style(), scroll-state()), which this engine does not query. */
+    const char *name = prelude;
+    size_t name_length = 0;
+    while (name_length < length
+           && query_identifier_character(prelude[name_length])) {
+        name_length++;
+    }
+    if (name_length < length && prelude[name_length] == '(') {
+        if (name_length != 0) return true;
+    } else if (name_length != 0 && name_length < length
+               && !isspace((unsigned char) prelude[name_length])) {
+        return true;
+    }
+    if (span_case_equal(name, name_length, "not")) name_length = 0;
+    else if (span_case_equal(name, name_length, "and")
+             || span_case_equal(name, name_length, "or")
+             || span_case_equal(name, name_length, "none")) return true;
+    size_t condition_at = name_length;
+    while (condition_at < length
+           && isspace((unsigned char) prelude[condition_at])) {
         condition_at++;
     }
-    const char *name = prelude;
-    size_t name_length = condition_at;
-    query_trim(&name, &name_length);
     if (condition_at == length) {
         /* A name-only query selects a named ancestor without requiring size
            containment. */
         if (name_length == 0) return true;
-        for (size_t i = 0; i < name_length; i++) {
-            if (!query_identifier_character(name[i])) return true;
+    } else if (prelude[condition_at] != '('
+               && !(name_length == 0 && condition_at == 0)) {
+        /* After a name, the condition starts with '(' or `not`. */
+        size_t keyword = 0;
+        while (condition_at + keyword < length
+               && query_identifier_character(prelude[condition_at + keyword])) {
+            keyword++;
         }
-    } else if (name_length != 0) {
-        for (size_t i = 0; i < name_length; i++) {
-            if (!query_identifier_character(name[i])) return true;
+        if (!span_case_equal(prelude + condition_at, keyword, "not")) {
+            return true;
         }
     }
 
@@ -126,32 +171,35 @@ bool style_register_container_query(Stylesheet *sheet,
     if (condition_at < length) {
         const char *condition = prelude + condition_at;
         size_t condition_length = length - condition_at;
-        query_trim(&condition, &condition_length);
+        trim(&condition, &condition_length);
         if (condition_length == 0
             || condition_length >= sizeof(query.condition)) return true;
         memcpy(query.condition, condition, condition_length);
         query.condition[condition_length] = '\0';
         query.condition_length = (uint8_t) condition_length;
-        for (size_t i = 0; i < condition_length; i++) {
-            if (i + 5 <= condition_length
-                && strncasecmp(condition + i, "width", 5) == 0) {
-                query.needs_inline_size = 1;
-            }
-            if (i + 11 <= condition_length
-                && strncasecmp(condition + i, "inline-size", 11) == 0) {
-                query.needs_inline_size = 1;
-            }
-            if (i + 6 <= condition_length
-                && strncasecmp(condition + i, "height", 6) == 0) {
-                query.needs_block_size = 1;
-            }
-            if (i + 10 <= condition_length
-                && strncasecmp(condition + i, "block-size", 10) == 0) {
-                query.needs_block_size = 1;
-            }
+        /* A condition without any size feature (a media-only feature, say)
+           can never match a container, so it is not retained. */
+        if (!container_condition_axes(condition, condition_length,
+                                      &query.needs_inline_size,
+                                      &query.needs_block_size)
+            || (!query.needs_inline_size && !query.needs_block_size)) {
+            return true;
         }
-        if (!query.needs_inline_size && !query.needs_block_size) return true;
     }
+    /* Utility CSS repeats one prelude per class: identical queries share an
+       id, so the 63 ids are spent on distinct conditions. */
+    for (size_t i = 0; i < queries->query_count; i++) {
+        const StyleContainerQuery *known = &queries->queries[i];
+        if (known->name_bit == query.name_bit
+            && known->parent == query.parent
+            && known->condition_length == query.condition_length
+            && memcmp(known->condition, query.condition,
+                      query.condition_length) == 0) {
+            *query_id = (uint8_t) (i + 1u);
+            return true;
+        }
+    }
+    if (queries->query_count >= STYLE_CONTAINER_QUERY_LIMIT) return true;
     queries->queries[queries->query_count++] = query;
     *query_id = queries->query_count;
     return true;
@@ -189,16 +237,16 @@ static StyleContainerState *container_state_find(
 static bool parse_container_type_value(const char *value, size_t length,
                                        uint8_t *type)
 {
-    query_trim(&value, &length);
-    if (query_span_case_equal(value, length, "size")) {
+    trim(&value, &length);
+    if (span_case_equal(value, length, "size")) {
         *type = STYLE_CONTAINER_TYPE_SIZE;
         return true;
     }
-    if (query_span_case_equal(value, length, "inline-size")) {
+    if (span_case_equal(value, length, "inline-size")) {
         *type = STYLE_CONTAINER_TYPE_INLINE_SIZE;
         return true;
     }
-    if (query_span_case_equal(value, length, "normal")) {
+    if (span_case_equal(value, length, "normal")) {
         *type = STYLE_CONTAINER_TYPE_NONE;
         return true;
     }
@@ -215,7 +263,7 @@ static uint32_t container_name_bits(Stylesheet *sheet, const char *value,
         size_t end = at;
         while (end < length && !isspace((unsigned char) value[end])) end++;
         if (end == at) break;
-        if (!query_span_case_equal(value + at, end - at, "none")) {
+        if (!span_case_equal(value + at, end - at, "none")) {
             for (size_t i = 0;
                  i < sheet->conditional_queries->name_count; i++) {
                 const char *known = sheet->conditional_queries->names[i];
@@ -351,15 +399,15 @@ static void container_establishment(Stylesheet *sheet, lxb_dom_node_t *node,
             size_t name_length = (size_t) (slash - shorthand);
             const char *type_text = slash + 1;
             size_t type_length = strlen(type_text);
-            query_trim(&name, &name_length);
-            query_trim(&type_text, &type_length);
+            trim(&name, &name_length);
+            trim(&type_text, &type_length);
             (void) parse_container_type_value(type_text, type_length, type);
             *names = container_name_bits(sheet, name, name_length);
         } else {
             const char *value = shorthand;
             size_t value_length = strlen(shorthand);
-            query_trim(&value, &value_length);
-            if (!query_span_case_equal(value, value_length, "none")
+            trim(&value, &value_length);
+            if (!span_case_equal(value, value_length, "none")
                 && !parse_container_type_value(
                     value, value_length, type)) {
                 /* A recognized type may stand alone. Any other non-none
@@ -385,6 +433,19 @@ bool style_container_layout_state_add(Stylesheet *sheet,
                                       int padding_horizontal,
                                       int padding_vertical)
 {
+    return style_container_layout_state_add_contained(
+        sheet, node, content_width, content_height, padding_horizontal,
+        padding_vertical, -1);
+}
+
+bool style_container_layout_state_add_contained(Stylesheet *sheet,
+                                                lxb_dom_node_t *node,
+                                                int content_width,
+                                                int content_height,
+                                                int padding_horizontal,
+                                                int padding_vertical,
+                                                int size_contained_height)
+{
     if (sheet == NULL || sheet->resolve_scratch == NULL || node == NULL) {
         return false;
     }
@@ -402,6 +463,11 @@ bool style_container_layout_state_add(Stylesheet *sheet,
        actual container does not trigger a second ancestor/cascade walk. */
     content_width -= padding_horizontal;
     content_height -= padding_vertical;
+    /* Size containment: the layout still sizes the box by its content, but
+       its block-axis queries answer as browsers do, and never against
+       content their own rules resize. */
+    if (type == STYLE_CONTAINER_TYPE_SIZE && size_contained_height >= 0)
+        content_height = size_contained_height;
 
     container_state_store(sheet, node, names, type, content_width,
                           content_height);
@@ -418,10 +484,13 @@ void style_container_live_update(Stylesheet *sheet, lxb_dom_node_t *node,
     uint32_t names = 0;
     container_establishment(sheet, node, &type, &names);
     if (type == STYLE_CONTAINER_TYPE_NONE && names == 0) return;
-    if (content_height < 0) {
-        const StyleContainerState *known = container_state_find(sheet, node);
-        content_height = known == NULL ? 0 : known->content_height;
-    }
+    /* The height the last measured pass recorded stands (it knows, say,
+       a flex item's stretched size, which this box cannot yet). A size
+       container's contained height is the first guess without one. */
+    const StyleContainerState *known = container_state_find(sheet, node);
+    if (known != NULL) content_height = known->content_height;
+    else if (content_height < 0 || type != STYLE_CONTAINER_TYPE_SIZE)
+        content_height = 0;
     container_state_store(sheet, node, names, type, content_width,
                           content_height);
 }
@@ -582,243 +651,7 @@ uint64_t style_container_layout_state_signature(const Stylesheet *sheet)
     return scratch->container_state_count == 0 ? 0 : hash;
 }
 
-static bool query_number_px(const char *text, size_t length, double *value)
-{
-    query_trim(&text, &length);
-    if (length == 0 || length >= 48) return false;
-    char copy[48];
-    memcpy(copy, text, length);
-    copy[length] = '\0';
-    char *end = NULL;
-    double parsed = strtod(copy, &end);
-    if (end == copy) return false;
-    double scale = 1.0;
-    if (*end == '\0' || strcmp(end, "px") == 0) {
-        scale = 1.0;
-    } else if (strcmp(end, "em") == 0 || strcmp(end, "rem") == 0) {
-        scale = STYLE_DEFAULT_FONT_PX;
-    } else {
-        return false;
-    }
-    *value = parsed * scale;
-    return true;
-}
-
-static bool query_compare(double actual, const char *op, size_t op_length,
-                          double expected)
-{
-    if (op_length == 1 && op[0] == '<') return actual < expected;
-    if (op_length == 2 && op[0] == '<' && op[1] == '=') {
-        return actual <= expected;
-    }
-    if (op_length == 1 && op[0] == '>') return actual > expected;
-    if (op_length == 2 && op[0] == '>' && op[1] == '=') {
-        return actual >= expected;
-    }
-    if ((op_length == 1 && (op[0] == '=' || op[0] == ':'))
-        || (op_length == 2 && op[0] == '=' && op[1] == '=')) {
-        return actual == expected;
-    }
-    return false;
-}
-
-static bool query_feature_value(const StyleContainerState *state,
-                                const char *text, size_t length,
-                                bool *valid)
-{
-    query_trim(&text, &length);
-    char compact[STYLE_CONTAINER_QUERY_TEXT_CAPACITY];
-    size_t used = 0;
-    for (size_t i = 0; i < length && used + 1 < sizeof(compact); i++) {
-        if (!isspace((unsigned char) text[i])) {
-            compact[used++] = (char) tolower((unsigned char) text[i]);
-        }
-    }
-    compact[used] = '\0';
-    bool minimum = strncmp(compact, "min-width:", 10) == 0
-        || strncmp(compact, "min-height:", 11) == 0
-        || strncmp(compact, "min-inline-size:", 16) == 0
-        || strncmp(compact, "min-block-size:", 15) == 0;
-    bool maximum = strncmp(compact, "max-width:", 10) == 0
-        || strncmp(compact, "max-height:", 11) == 0
-        || strncmp(compact, "max-inline-size:", 16) == 0
-        || strncmp(compact, "max-block-size:", 15) == 0;
-    const char *feature = strstr(compact, "inline-size");
-    size_t feature_length = 11;
-    bool block = false;
-    if (feature == NULL) {
-        feature = strstr(compact, "block-size");
-        feature_length = 10;
-        block = feature != NULL;
-    }
-    if (feature == NULL) {
-        feature = strstr(compact, "width");
-        feature_length = 5;
-    }
-    if (feature == NULL) {
-        feature = strstr(compact, "height");
-        feature_length = 6;
-        block = feature != NULL;
-    }
-    if (feature == NULL) {
-        *valid = false;
-        return false;
-    }
-    double actual = block ? state->content_height : state->content_width;
-
-    if (minimum || maximum) {
-        const char *colon = strchr(compact, ':');
-        double expected = 0;
-        if (colon == NULL
-            || !query_number_px(colon + 1, strlen(colon + 1), &expected)) {
-            *valid = false;
-            return false;
-        }
-        return minimum ? actual >= expected : actual <= expected;
-    }
-
-    if (feature == compact && used == feature_length) {
-        return actual != 0;
-    }
-
-    size_t feature_at = (size_t) (feature - compact);
-    if (feature_at == 0) {
-        size_t op_at = feature_length;
-        size_t op_length = compact[op_at] == '<' || compact[op_at] == '>'
-            ? (compact[op_at + 1] == '=' ? 2u : 1u) : 1u;
-        double expected = 0;
-        if (op_at >= used
-            || !query_number_px(
-                compact + op_at + op_length,
-                used - op_at - op_length, &expected)) {
-            *valid = false;
-            return false;
-        }
-        return query_compare(
-            actual, compact + op_at, op_length, expected);
-    }
-
-    /* Range syntax: 75px <= width <= 150px. */
-    size_t left_op_end = feature_at;
-    size_t left_op_start = left_op_end;
-    while (left_op_start != 0
-           && (compact[left_op_start - 1] == '<'
-               || compact[left_op_start - 1] == '>'
-               || compact[left_op_start - 1] == '=')) left_op_start--;
-    double left = 0;
-    if (left_op_start == left_op_end
-        || !query_number_px(compact, left_op_start, &left)) {
-        *valid = false;
-        return false;
-    }
-    bool left_match = query_compare(
-        left, compact + left_op_start, left_op_end - left_op_start, actual);
-    size_t right_op = feature_at + feature_length;
-    if (right_op >= used) return left_match;
-    size_t right_op_length = compact[right_op + 1] == '=' ? 2u : 1u;
-    double right = 0;
-    if (!query_number_px(
-            compact + right_op + right_op_length,
-            used - right_op - right_op_length, &right)) {
-        *valid = false;
-        return false;
-    }
-    return left_match && query_compare(
-        actual, compact + right_op, right_op_length, right);
-}
-
-static bool query_outer_wrapped(const char *text, size_t length)
-{
-    if (length < 2 || text[0] != '(' || text[length - 1] != ')') {
-        return false;
-    }
-    unsigned depth = 0;
-    for (size_t i = 0; i < length; i++) {
-        if (text[i] == '(') depth++;
-        else if (text[i] == ')') {
-            if (depth == 0) return false;
-            depth--;
-            if (depth == 0 && i + 1 != length) return false;
-        }
-    }
-    return depth == 0;
-}
-
-static bool query_word_at(const char *text, size_t length, size_t at,
-                          const char *word)
-{
-    size_t word_length = strlen(word);
-    if (at + word_length > length
-        || strncasecmp(text + at, word, word_length) != 0) return false;
-    bool left = at == 0
-        || !query_identifier_character(text[at - 1]);
-    bool right = at + word_length == length
-        || !query_identifier_character(text[at + word_length]);
-    return left && right;
-}
-
-static bool query_eval_expression(const StyleContainerState *state,
-                                  const char *text, size_t length,
-                                  unsigned depth, bool *valid)
-{
-    if (depth > 8) {
-        *valid = false;
-        return false;
-    }
-    query_trim(&text, &length);
-    while (query_outer_wrapped(text, length)) {
-        text++;
-        length -= 2;
-        query_trim(&text, &length);
-    }
-    if (length == 0) {
-        *valid = false;
-        return false;
-    }
-
-    unsigned nesting = 0;
-    for (size_t i = 0; i < length; i++) {
-        if (text[i] == '(') nesting++;
-        else if (text[i] == ')' && nesting != 0) nesting--;
-        else if (nesting == 0
-                 && (text[i] == ',' || query_word_at(text, length, i, "or"))) {
-            size_t skip = text[i] == ',' ? 1u : 2u;
-            bool left_valid = true, right_valid = true;
-            bool left = query_eval_expression(
-                state, text, i, depth + 1, &left_valid);
-            bool right = query_eval_expression(
-                state, text + i + skip, length - i - skip,
-                depth + 1, &right_valid);
-            *valid = left_valid && right_valid;
-            return *valid && (left || right);
-        }
-    }
-    nesting = 0;
-    for (size_t i = 0; i < length; i++) {
-        if (text[i] == '(') nesting++;
-        else if (text[i] == ')' && nesting != 0) nesting--;
-        else if (nesting == 0 && query_word_at(text, length, i, "and")) {
-            bool left_valid = true, right_valid = true;
-            bool left = query_eval_expression(
-                state, text, i, depth + 1, &left_valid);
-            bool right = query_eval_expression(
-                state, text + i + 3, length - i - 3,
-                depth + 1, &right_valid);
-            *valid = left_valid && right_valid;
-            return *valid && left && right;
-        }
-    }
-    if (query_word_at(text, length, 0, "not")) {
-        bool child_valid = true;
-        bool child = query_eval_expression(
-            state, text + 3, length - 3, depth + 1, &child_valid);
-        *valid = child_valid;
-        return child_valid && !child;
-    }
-    return query_feature_value(state, text, length, valid);
-}
-
-static bool query_matches_one(const Stylesheet *sheet,
+static bool query_matches_one(const Stylesheet *sheet, uint8_t query_id,
                               const StyleContainerQuery *query,
                               lxb_dom_node_t *node)
 {
@@ -837,12 +670,18 @@ static bool query_matches_one(const Stylesheet *sheet,
         if (query->needs_inline_size
             && state->type != STYLE_CONTAINER_TYPE_INLINE_SIZE
             && state->type != STYLE_CONTAINER_TYPE_SIZE) continue;
-        bool valid = true;
-        bool matches = query_eval_expression(
-            state, query->condition, query->condition_length, 0, &valid);
         /* Container selection stops at the first eligible ancestor even
            when its query evaluates false. */
-        return valid && matches;
+        uint64_t bit = UINT64_C(1) << (query_id - 1u);
+        if ((state->conditions_evaluated & bit) != 0)
+            return (state->conditions_matched & bit) != 0;
+        bool matched = style_container_condition_matches(
+            query->condition, query->condition_length,
+            state->content_width, state->content_height,
+            sheet->viewport_width, sheet->viewport_height);
+        state->conditions_evaluated |= bit;
+        if (matched) state->conditions_matched |= bit;
+        return matched;
     }
     return false;
 }
@@ -856,7 +695,7 @@ static bool container_query_evaluate(const Stylesheet *sheet,
         &sheet->conditional_queries->queries[query_id - 1u];
     return (query->parent == 0
             || container_query_evaluate(sheet, query->parent, node))
-        && query_matches_one(sheet, query, node);
+        && query_matches_one(sheet, query_id, query, node);
 }
 
 bool style_container_log_verified(const Stylesheet *sheet)
@@ -897,7 +736,7 @@ bool style_container_query_matches(const Stylesheet *sheet, uint8_t query_id,
         &sheet->conditional_queries->queries[query_id - 1u];
     bool matched = query->parent == 0
         || style_container_query_matches(sheet, query->parent, node);
-    if (matched) matched = query_matches_one(sheet, query, node);
+    if (matched) matched = query_matches_one(sheet, query_id, query, node);
     if (scratch->container_log != NULL && scratch->container_log->active)
         container_log_note((Stylesheet *) sheet, scratch->container_log,
                            node, query_id, matched);

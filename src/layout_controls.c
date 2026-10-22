@@ -22,7 +22,7 @@ bool layout_control_text_style(LayoutContext *context, lxb_dom_node_t *node,
     text->scale = style->font_scale;
     text->font_size = style->font_size;
     draw_command_set_text_font_family(text, style->font_family);
-    text->font_weight = draw_font_weight(style);
+    text->font_weight = draw_font_weight_code_for_style(style);
     text->font_italic = style->font_italic;
     draw_command_set_text_letter_spacing_fixed(text, style->letter_spacing_fixed);
     text->radius |= (int) style->font_size_fraction << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT

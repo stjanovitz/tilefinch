@@ -2885,159 +2885,75 @@ int main(void)
           && !psp_kernel_callable_address(UINT32_C(0xffffffff))
           && !psp_kernel_callable_address(0));
     CHECK(psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 640, 360, true, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 640, 360, true,
               &decoder_policy)
           && decoder_policy.mpeg_mode == 5
           && decoder_policy.me_boot_type == 1
           && psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 21, 426, 240, false, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 21, 426, 240, false,
               &decoder_policy)
           && decoder_policy.mpeg_mode == 4
           && decoder_policy.me_boot_type == 3
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 640, 360, true, false,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 640, 360, true,
               &decoder_policy)
           && !psp_media_decoder_policy(
-              0x64, 30, 640, 360, true, false, &decoder_policy)
+              0x64, 30, 640, 360, true, &decoder_policy)
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 31, 640, 360, true, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 31, 640, 360, true,
               &decoder_policy));
     CHECK(psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, true, false,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, true,
               &decoder_policy)
           && decoder_policy.mpeg_mode == 5
           && decoder_policy.me_boot_type == 1
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, false, false,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, false,
               &decoder_policy));
     /*
-     * Baseline that fits the screen now defaults to the program which makes
-     * no Media Engine boot call at all (create mode 4 / boot type 3). Three
-     * device runs rejected every program that did make the call, including
-     * this stream's historical type 4; type 3 is the one never attempted.
-     * The `boot4` knob restores type 4 for the A/B, and changes nothing else
-     * -- small Main profile keeps type 3 either way, and a wide picture stays
-     * inadmissible because `boot4` does not enable the wide program.
+     * Baseline that fits the screen runs on the Main-profile program (create
+     * mode 4 / boot type 3), exactly like small Main profile; a wide picture
+     * stays inadmissible unless the wide program is enabled.
      */
     CHECK(psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 480, 272, false, false,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 480, 272, false,
               &decoder_policy)
           && decoder_policy.mpeg_mode == 4
           && decoder_policy.me_boot_type == 3
           && psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 426, 240, false, false,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 426, 240, false,
               &decoder_policy)
           && decoder_policy.mpeg_mode == 4
           && decoder_policy.me_boot_type
                  == PSP_MEDIA_DEFAULT_ME_BOOT_TYPE
-          && psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 426, 240, false, true,
-              &decoder_policy)
-          && decoder_policy.mpeg_mode == 4
-          && decoder_policy.me_boot_type == 4
-          && psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 21, 426, 240, false, true,
-              &decoder_policy)
-          && decoder_policy.mpeg_mode == 4
-          && decoder_policy.me_boot_type == 3
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 640, 360, false, true,
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 21, 640, 360, false,
               &decoder_policy)
-          && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 640, 360, false, true,
-              &decoder_policy));
-    /* The knob spellings, and which decision each one moves. Only `boot4`
-       restores the Baseline boot call, and only the two wide spellings admit
-       the wide program; neither leaks into the other. */
-    CHECK(psp_media_wide_program_from_name("boot4")
-              == PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4
-          && psp_media_wide_program_name_valid("boot4")
-          && !psp_media_wide_program_name_valid("boot3")
-          && !psp_media_wide_program_name_valid("Boot4")
-          && strcmp(psp_media_wide_program_name(
-                        PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4),
-                    "boot4") == 0
-          && !psp_media_wide_program_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)
-          && !psp_media_wide_program_annexb(
-                 PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)
-          && psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)
-          && !psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_OFF)
-          && !psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE)
-          && !psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB)
           /* A Baseline attempt on either program is not evidence about the
              wide one, so neither may trip the wide latch. */
           && !psp_media_wide_program_rejected_by(4, 4, true, false)
-          && !psp_media_wide_program_rejected_by(4, 3, true, false)
-          /* `boot4` leaves the wide clamp exactly where the default has it. */
-          && psp_media_admitted_quality(
-                 360u, false,
-                 psp_media_wide_program_enabled(
-                     PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)) == 240u);
+          && !psp_media_wide_program_rejected_by(4, 3, true, false));
     /*
-     * The two PMPlayer-faithful defaults and the spellings that restore what
-     * they replaced. `edram-real` puts the firmware EDRAM grant back;
-     * `no-boot` puts back the assumption that the Media Engine is already
-     * running program type 3 at process start. Each moves exactly one
-     * decision, and neither is a wide or Baseline program selection.
+     * The retired device A/B spellings still pass the boot config gate, so
+     * an old boot.cfg keeps booting, and the configured value is the
+     * promoted default. A bare parse of one still fails closed to off.
      */
-    CHECK(psp_media_wide_program_from_name("edram-real")
-              == PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL
-          && psp_media_wide_program_from_name("no-boot")
-              == PSP_MEDIA_WIDE_PROGRAM_NO_BOOT
-          && strcmp(psp_media_wide_program_name(
-                        PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL),
-                    "edram-real") == 0
-          && strcmp(psp_media_wide_program_name(
-                        PSP_MEDIA_WIDE_PROGRAM_NO_BOOT),
-                    "no-boot") == 0
-          && psp_media_wide_program_name_valid("edram-real")
-          && psp_media_wide_program_name_valid("no-boot")
-          /* Typos near the new spellings must halt, not read as off. */
-          && !psp_media_wide_program_name_valid("edram")
-          && !psp_media_wide_program_name_valid("edram-fake")
-          && !psp_media_wide_program_name_valid("noboot")
-          && !psp_media_wide_program_name_valid("no-boot4")
-          && psp_media_wide_program_from_name("edram")
-                 == PSP_MEDIA_WIDE_PROGRAM_OFF
-          /* The pool-backed AAC work buffer is the default: only the one
-             spelling asks firmware for the real grant. */
-          && psp_media_real_edram_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL)
-          && !psp_media_real_edram_enabled(PSP_MEDIA_WIDE_PROGRAM_OFF)
-          && !psp_media_real_edram_enabled(PSP_MEDIA_WIDE_PROGRAM_WIDE)
-          && !psp_media_real_edram_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB)
-          && !psp_media_real_edram_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)
-          && !psp_media_real_edram_enabled(PSP_MEDIA_WIDE_PROGRAM_NO_BOOT)
-          /* And the first open of a process really boots the engine unless
-             exactly that one spelling says not to. */
-          && psp_media_cold_boot_call_enabled(PSP_MEDIA_WIDE_PROGRAM_OFF)
-          && psp_media_cold_boot_call_enabled(PSP_MEDIA_WIDE_PROGRAM_WIDE)
-          && psp_media_cold_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB)
-          && psp_media_cold_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4)
-          && psp_media_cold_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL)
-          && !psp_media_cold_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_NO_BOOT)
-          /* Neither spelling drags a program selection along with it. */
-          && !psp_media_wide_program_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL)
-          && !psp_media_wide_program_enabled(PSP_MEDIA_WIDE_PROGRAM_NO_BOOT)
-          && !psp_media_wide_program_annexb(
-                 PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL)
-          && !psp_media_wide_program_annexb(PSP_MEDIA_WIDE_PROGRAM_NO_BOOT)
-          && !psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL)
-          && !psp_media_baseline_boot_call_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_NO_BOOT));
+    static const char *const retired[] = {
+        "wide-annexb", "boot4", "edram-real", "no-boot"
+    };
+    for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); i++) {
+        CHECK(psp_media_wide_program_name_valid(retired[i])
+              && psp_media_wide_program_retired(retired[i])
+              && psp_media_wide_program_configured(retired[i])
+                     == PSP_MEDIA_WIDE_PROGRAM_WIDE
+              && psp_media_wide_program_from_name(retired[i])
+                     == PSP_MEDIA_WIDE_PROGRAM_OFF
+              && psp_media_wide_program_choice_index(retired[i]) == 1u);
+    }
+    CHECK(!psp_media_wide_program_retired("wide")
+          && !psp_media_wide_program_retired("Boot4")
+          && !psp_media_wide_program_retired("")
+          && !psp_media_wide_program_retired(NULL));
     /*
      * The in-app picker's table. Every spelling it can offer must be one the
      * boot config gate accepts, or the UI could write a value that halts the
@@ -3054,28 +2970,27 @@ int main(void)
                             (int) psp_media_wide_program_from_name(name)),
                         name) == 0);
     }
-    CHECK(PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT == 6u
+    CHECK(PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT == 2u
           && psp_media_wide_program_choice(
                  PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT) == NULL
           && strcmp(psp_media_wide_program_choice(0), "off") == 0
+          && strcmp(psp_media_wide_program_choice(1), "wide") == 0
           /* An absent setting opens on the promoted wide default; malformed
              input still fails closed to the explicit compatibility row. */
           && psp_media_wide_program_choice_index("") == 1u
           && psp_media_wide_program_choice_index(NULL) == 1u
-          && psp_media_wide_program_choice_index("boot3") == 0u
-          && psp_media_wide_program_choice_index("edram-real") == 4u
-          && psp_media_wide_program_choice_index("no-boot") == 5u);
+          && psp_media_wide_program_choice_index("boot3") == 0u);
     /* The admission primitive still requires an enabled wide program. Boot
        configuration now supplies that for an absent setting; explicit off
        keeps this compatibility behavior. */
     CHECK(!psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 640, 360, false, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 640, 360, false,
               &decoder_policy)
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 426, 273, false, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 426, 273, false,
               &decoder_policy)
           && !psp_media_decoder_policy(
-              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 481, 240, false, false,
+              PSP_MEDIA_AVC_PROFILE_MAIN, 30, 481, 240, false,
               &decoder_policy)
           && psp_media_wide_program_required(640, 360)
           && psp_media_wide_program_required(481, 240)
@@ -3099,85 +3014,18 @@ int main(void)
                  == PSP_MEDIA_WIDE_PROGRAM_OFF
           && psp_media_wide_program_from_name("wide")
                  == PSP_MEDIA_WIDE_PROGRAM_WIDE
-          && psp_media_wide_program_from_name("wide-annexb")
-                 == PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB
           && psp_media_wide_program_enabled(PSP_MEDIA_WIDE_PROGRAM_WIDE)
-          && psp_media_wide_program_enabled(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB)
           && !psp_media_wide_program_enabled(PSP_MEDIA_WIDE_PROGRAM_OFF)
-          && psp_media_wide_program_annexb(
-                 PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB)
-          && !psp_media_wide_program_annexb(PSP_MEDIA_WIDE_PROGRAM_WIDE)
           && psp_media_wide_program_name_valid("")
           && psp_media_wide_program_name_valid("off")
           && psp_media_wide_program_name_valid("wide")
-          && psp_media_wide_program_name_valid("wide-annexb")
           && !psp_media_wide_program_name_valid("annexb")
+          && !psp_media_wide_program_name_valid("Wide")
           && !psp_media_wide_program_name_valid(NULL)
           && strcmp(psp_media_wide_program_name(
                         PSP_MEDIA_WIDE_PROGRAM_OFF), "off") == 0
           && strcmp(psp_media_wide_program_name(
-                        PSP_MEDIA_WIDE_PROGRAM_WIDE), "wide") == 0
-          && strcmp(psp_media_wide_program_name(
-                        PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB),
-                    "wide-annexb") == 0);
-    /*
-     * The Annex-B experiment rewrites the staging copy of an access unit in
-     * place: every four-byte AVCC length becomes 00 00 00 01 and the buffer
-     * keeps its size. Malformed framing must be refused, because the walk
-     * cannot know where the next unit starts; the caller fails the submission
-     * so a partially rewritten buffer never reaches firmware.
-     */
-    {
-        unsigned char unit[] = {
-            0x00, 0x00, 0x00, 0x03, 0x65, 0xb8, 0x40,
-            0x00, 0x00, 0x00, 0x02, 0x41, 0x9a
-        };
-        static const unsigned char expected[] = {
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x40,
-            0x00, 0x00, 0x00, 0x01, 0x41, 0x9a
-        };
-        unsigned nals = 99u;
-        CHECK(psp_media_annexb_rewrite(
-                  unit, sizeof(unit), 4u, &nals)
-              && nals == 2u
-              && memcmp(unit, expected, sizeof(unit)) == 0);
-        /* The conversion is one-way: its own output is no longer AVCC, so a
-           second pass must refuse rather than corrupt an already converted
-           buffer. Only the submission path calls this, exactly once per
-           access unit, but the property is worth pinning. */
-        CHECK(!psp_media_annexb_rewrite(unit, sizeof(unit), 4u, &nals)
-              && nals == 0u);
-
-        unsigned char single[] = {0x00, 0x00, 0x00, 0x01, 0x67};
-        CHECK(psp_media_annexb_rewrite(single, sizeof(single), 4u, NULL)
-              && single[3] == 0x01 && single[4] == 0x67);
-
-        /* A length that runs past the end of the sample. */
-        unsigned char overrun[] = {0x00, 0x00, 0x00, 0x09, 0x65, 0xb8};
-        nals = 99u;
-        CHECK(!psp_media_annexb_rewrite(
-                  overrun, sizeof(overrun), 4u, &nals)
-              && nals == 0u
-              && overrun[3] == 0x09);
-
-        /* A zero-length unit, and a tail too short to hold another prefix. */
-        unsigned char empty[] = {0x00, 0x00, 0x00, 0x00, 0x65};
-        unsigned char tail[] = {
-            0x00, 0x00, 0x00, 0x01, 0x65, 0x00, 0x00
-        };
-        CHECK(!psp_media_annexb_rewrite(empty, sizeof(empty), 4u, NULL)
-              && !psp_media_annexb_rewrite(tail, sizeof(tail), 4u, NULL));
-
-        /* Only a four-byte prefix can be replaced without moving bytes, and
-           there is nothing to convert in an absent or empty sample. */
-        unsigned char two_byte[] = {0x00, 0x01, 0x65};
-        CHECK(!psp_media_annexb_rewrite(two_byte, sizeof(two_byte), 2u, NULL)
-              && !psp_media_annexb_rewrite(two_byte, sizeof(two_byte), 1u,
-                                           NULL)
-              && !psp_media_annexb_rewrite(NULL, 4u, 4u, NULL)
-              && !psp_media_annexb_rewrite(two_byte, 0, 4u, NULL));
-    }
+                        PSP_MEDIA_WIDE_PROGRAM_WIDE), "wide") == 0);
     /* YouTube's AVC renditions use exact recovery points carried by a
        non-IDR I picture. The PSP decoder accepts that picture and fatally
        rejects its first dependent reference picture. Normalize the recovery

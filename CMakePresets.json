@@ -14,7 +14,6 @@
         "PSP_BROWSER_BUILD_TESTS": "ON",
         "PSP_BROWSER_BUILD_JSC_SPIKE": "OFF",
         "PSP_BROWSER_USE_BELLARD_QUICKJS": "ON",
-        "PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH": "OFF",
         "PSP_BROWSER_USE_COMPILER_CACHE": "ON",
         "PSP_BROWSER_ENABLE_GIF": "ON"
       }
@@ -35,16 +34,6 @@
       "binaryDir": "${sourceDir}/build-preset-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
-      }
-    },
-    {
-      "name": "native-tier-lab",
-      "displayName": "Isolated native-tier whole-page A/B (static host core)",
-      "inherits": "release",
-      "binaryDir": "${sourceDir}/build-preset-native-tier",
-      "cacheVariables": {
-        "TILEFINCH_NATIVE_TIER_STATIC_CORE": "ON",
-        "PSP_BROWSER_BUILD_TESTS": "OFF"
       }
     },
     {
@@ -122,6 +111,7 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "PSP_BROWSER_QUICKJS_OPT_FLAGS": "-O1",
         "PSP_BROWSER_BUILD_HOST_MEDIA_LAB": "ON",
         "PSP_BROWSER_ENABLE_HOST_MEDIA_AUDIO": "OFF"
       }

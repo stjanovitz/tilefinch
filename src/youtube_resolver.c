@@ -1689,17 +1689,14 @@ bool youtube_watch_url_video_id(
             if (!url.has_query) return false;
             const char *query = url.value + url.query_offset;
             const char *query_end = query + url.query_length;
-            while (query < query_end) {
-                const char *field_end = memchr(
-                    query, '&', (size_t) (query_end - query));
-                if (field_end == NULL) field_end = query_end;
-                if ((size_t) (field_end - query) > 2u
-                    && query[0] == 'v' && query[1] == '=') {
-                    start = query + 2;
-                    end = field_end;
+            YoutubeQueryField field;
+            while (youtube_query_next(&query, query_end, &field)) {
+                if (youtube_query_field_is(&field, "v")
+                    && field.value_end > field.value) {
+                    start = field.value;
+                    end = field.value_end;
                     break;
                 }
-                query = field_end < query_end ? field_end + 1 : query_end;
             }
         }
     }
@@ -1723,17 +1720,69 @@ bool youtube_watch_url_supported(const char *url)
     if (!tilefinch_url_parse(url, &parsed) || !parsed.has_query) return true;
     const char *at = parsed.value + parsed.query_offset;
     const char *end = at + parsed.query_length;
-    static const char internal_view[] = "tilefinch_view=";
-    while (at < end) {
-        const char *field_end = memchr(at, '&', (size_t) (end - at));
-        if (field_end == NULL) field_end = end;
-        if ((size_t) (field_end - at) > sizeof(internal_view) - 1u
-            && memcmp(at, internal_view, sizeof(internal_view) - 1u) == 0) {
-            return false;
-        }
-        at = field_end < end ? field_end + 1 : end;
+    YoutubeQueryField field;
+    while (youtube_query_next(&at, end, &field)) {
+        if (youtube_query_field_is(&field, "tilefinch_view")
+            && field.value_end > field.value) return false;
     }
     return true;
+}
+
+/* Units in h, m, s order and each at most once. Every number is at most six
+   digits, so the sum cannot overflow before the one-week ceiling. */
+bool youtube_start_seconds_parse(const char *value, const char *end,
+                                 unsigned *seconds)
+{
+    static const char units[] = "hms";
+    static const uint32_t unit_seconds[] = {3600u, 60u, 1u};
+    uint64_t total = 0;
+    size_t next_unit = 0;
+    if (value == NULL || end <= value || end - value > 24) return false;
+    for (const char *at = value; at < end;) {
+        const char *digits = at;
+        uint64_t number = 0;
+        while (at < end && at - digits < 6 && *at >= '0' && *at <= '9')
+            number = number * 10u + (unsigned) (*at++ - '0');
+        if (at == digits) return false;
+        if (at == end) {
+            /* A unitless number is the whole value or nothing. */
+            if (digits != value) return false;
+            total = number;
+            break;
+        }
+        size_t unit = next_unit;
+        while (unit < sizeof(unit_seconds) / sizeof(unit_seconds[0])
+               && units[unit] != *at) unit++;
+        if (unit == sizeof(unit_seconds) / sizeof(unit_seconds[0]))
+            return false;
+        total += number * unit_seconds[unit];
+        next_unit = unit + 1u;
+        at++;
+    }
+    if (total > YOUTUBE_START_MAXIMUM_SECONDS) return false;
+    *seconds = (unsigned) total;
+    return true;
+}
+
+/* The first non-empty t= or start= field in one '&'-separated component
+   decides; a malformed one reads as zero. */
+static bool youtube_start_field_us(const char *at, const char *end,
+                                   uint64_t *start_us)
+{
+    YoutubeQueryField field;
+    for (unsigned fields = 0;
+         fields < 128u && youtube_query_next(&at, end, &field); fields++) {
+        if ((youtube_query_field_is(&field, "t")
+             || youtube_query_field_is(&field, "start"))
+            && field.value_end > field.value) {
+            unsigned seconds = 0;
+            *start_us = youtube_start_seconds_parse(
+                    field.value, field.value_end, &seconds)
+                ? seconds * UINT64_C(1000000) : 0;
+            return true;
+        }
+    }
+    return false;
 }
 
 uint64_t youtube_watch_url_start_time_us(const char *source)
@@ -1741,27 +1790,17 @@ uint64_t youtube_watch_url_start_time_us(const char *source)
     char id[YOUTUBE_VIDEO_ID_CAPACITY];
     TilefinchUrl url;
     if (!youtube_watch_url_video_id(source, id)
-        || !tilefinch_url_parse(source, &url) || !url.has_query) return 0;
-    const char *at = url.value + url.query_offset;
-    const char *end = at + url.query_length;
-    for (unsigned fields = 0; at < end && fields < 128u; fields++) {
-        const char *next = memchr(at, '&', (size_t) (end - at));
-        if (next == NULL) next = end;
-        const char *value = NULL;
-        if (next - at > 2 && memcmp(at, "t=", 2) == 0) value = at + 2;
-        else if (next - at > 6 && memcmp(at, "start=", 6) == 0) value = at + 6;
-        if (value != NULL) {
-            uint64_t seconds = 0;
-            if (next - value > 6) return 0;
-            for (; value < next; value++) {
-                if (*value < '0' || *value > '9') return 0;
-                seconds = seconds * 10u + (unsigned) (*value - '0');
-            }
-            return seconds <= 604800u ? seconds * UINT64_C(1000000) : 0;
-        }
-        at = next < end ? next + 1 : end;
-    }
-    return 0;
+        || !tilefinch_url_parse(source, &url)) return 0;
+    uint64_t start_us = 0;
+    if (url.has_query
+        && youtube_start_field_us(url.value + url.query_offset,
+               url.value + url.query_offset + url.query_length, &start_us))
+        return start_us;
+    /* The older share form carries the time in the fragment (#t=1m30s). */
+    if (url.has_fragment)
+        (void) youtube_start_field_us(url.value + url.fragment_offset,
+            url.value + url.fragment_offset + url.fragment_length, &start_us);
+    return start_us;
 }
 
 static bool youtube_watch_string(const char *html, size_t length,
@@ -1837,7 +1876,7 @@ typedef struct {
     char body[8192];
     char url[512];
     char extra_headers[1536];
-    char cookies[4096];
+    char cookies[BROWSER_COOKIE_HEADER_CAPACITY];
     TilefinchRequestContext context;
     FetchRequest request;
 } YoutubePreparedPlayerRequest;
@@ -2125,7 +2164,7 @@ struct YoutubeResolveJob {
     bool watch_have_api_key;
     bool watch_have_signature_timestamp;
     TilefinchRequestContext watch_context;
-    char watch_cookies[4096];
+    char watch_cookies[BROWSER_COOKIE_HEADER_CAPACITY];
     char last_error[256];
     char actionable_error[256];
     char error[256];
@@ -3127,7 +3166,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
         .top_level_navigation = true,
         .user_activated = true
     };
-    char watch_cookies[4096] = {0};
+    char watch_cookies[BROWSER_COOKIE_HEADER_CAPACITY] = {0};
     (void) browser_session_cookie_header_context(
         session, &watch_context, watch_cookies, sizeof(watch_cookies));
     FetchRequest watch_request = {

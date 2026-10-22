@@ -971,10 +971,49 @@ static bool test_parser_reentrant_inner_html(Budget *budget)
     bool ok = parsed && probe.mutated && probe.parser_preserved
         && find_id(root, "nested") != NULL
         && find_id(root, "after") != NULL;
+    if (!ok) fprintf(stderr, "parser reentrancy parsed=%u mutated=%u preserved=%u runtime=%u error=%s\n",
+        parsed, probe.mutated, probe.parser_preserved, probe.runtime != NULL, probe.result.error);
     script_runtime_destroy(probe.runtime);
     document_parser_abort(&parser);
     document_destroy(&document);
     return ok;
+}
+
+typedef struct {
+    lxb_dom_attr_t *attribute;
+    size_t calls;
+    bool valid;
+    bool fail;
+} TestAttributeValueLifetime;
+
+static TestAttributeValueLifetime *test_attribute_value_lifetime;
+
+static lxb_status_t test_attribute_value_change(
+    lxb_dom_element_t *element, lxb_dom_attr_id_t name,
+    const lxb_char_t *old_value, size_t old_length,
+    const lxb_char_t *value, size_t length, lxb_ns_id_t ns)
+{
+    (void) element;
+    (void) name;
+    (void) ns;
+    TestAttributeValueLifetime *probe = test_attribute_value_lifetime;
+    if (probe == NULL) return LXB_STATUS_ERROR;
+    probe->calls++;
+    if (probe->calls == 1) {
+        probe->valid = probe->valid && old_value != NULL && old_length == 8u
+            && memcmp(old_value, "original", 8u) == 0
+            && length == 5u && memcmp(value, "outer", 5u) == 0;
+        lxb_status_t status = lxb_dom_attr_set_value(
+            probe->attribute, (const lxb_char_t *) "inner", 5);
+        /* A nested replacement must not release the outer old-value snapshot. */
+        probe->valid = probe->valid && status == LXB_STATUS_OK
+            && memcmp(old_value, "original", 8u) == 0;
+    } else if (probe->calls == 2) {
+        probe->valid = probe->valid && old_length == 5u
+            && memcmp(old_value, "outer", 5u) == 0
+            && length == 5u && memcmp(value, "inner", 5u) == 0;
+    }
+    return probe->fail ? LXB_STATUS_ERROR : LXB_STATUS_OK;
 }
 
 typedef struct {
@@ -1233,6 +1272,37 @@ static bool test_response_keyed_visual_replay(Budget *budget)
 {
     size_t baseline = budget->current;
     char error[256] = {0};
+    /* Distinct API bodies must be separate routes before occurrence ranking,
+       even if the caller issues them in a different order from the capture. */
+    bool bodies = fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-response-key-body", error, sizeof(error));
+    static const char *queries[] = {"query-b", "query-a", "query-a", "query-b"};
+    static const char *answers[] = {"bravo\n", "alpha-one\n", "alpha-two\n", "bravo\n"};
+    for (size_t i = 0; bodies && i < 4u; i++) {
+        FetchRequest query = {.method = "POST", .body = queries[i], .body_length = 7};
+        FetchResult fetched = {.budget = budget};
+        bodies = fetch_request_cancelable(budget, "https://visual-body.test/query",
+            &query, 4096, 1000, NULL, NULL, &fetched)
+            && fetched.data != NULL && strcmp(fetched.data, answers[i]) == 0;
+        fetch_result_destroy(&fetched);
+    }
+    for (unsigned i = 0; bodies && i < 2u; i++) {
+        FetchRequest query = {.method = "POST", .body = i ? "query-c" : "query-a", .body_length = 7};
+        FetchResult fetched = {.budget = budget};
+        bodies = !fetch_request_cancelable(budget, "https://visual-body.test/query",
+            &query, 4096, 1000, NULL, NULL, &fetched) && fetched.data == NULL;
+        fetch_result_destroy(&fetched);
+    }
+    FetchTraceReplayStats body_stats = {0};
+    bodies = bodies && fetch_trace_replay_stats(&body_stats)
+        && body_stats.served_request_count == 4 && body_stats.claimed_record_count == 3
+        && body_stats.occurrence_exhausted_count == 1
+        && body_stats.unmatched_request_count == 1 && body_stats.invalid_route_request_count == 0;
+    fetch_trace_end();
+    if (!bodies || budget->current != baseline) {
+        fprintf(stderr, "response-keyed request-body routing failed: %s\n", error);
+        return false;
+    }
     FetchRequest changed_shape = {
         .method = "GET",
         /* fixtures/http-stream retained the historical value true. */
@@ -2151,6 +2221,50 @@ static bool test_decoded_media_surface_ownership(Budget *budget)
     images_destroy(&images);
     document_destroy(&document);
     return ok && budget->current == baseline;
+}
+
+static bool test_decoded_media_surface_refresh(Budget *budget)
+{
+    static const char html[] = "<!doctype html><body>"
+        "<video id=player style='display:none' width=4 height=3></video>";
+    size_t baseline = budget->current;
+    for (size_t failure = 0; failure <= 48; failure++) {
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        ImageResources images = {0};
+        bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+            && stylesheet_build(&stylesheet, budget, &document, 480);
+        lxb_dom_node_t *video = ok ? find_id(
+            lxb_dom_interface_node(document.html), "player") : NULL;
+        unsigned char *surface = video == NULL ? NULL
+            : budget_malloc_category(budget, BUDGET_CATEGORY_RESOURCE, 48);
+        bool adopted = surface != NULL && images_adopt_decoded_surface(
+            &images, budget, video, surface, 4, 3);
+        ok = ok && adopted;
+        if (adopted) {
+            memset(surface, 0x5a, 48);
+            images_prepare_external_rebuild(&images);
+            ok = images.count == 1 && images.items[0].pixels == surface;
+            if (failure < 48) budget_inject_failure_after(budget, failure);
+            bool rebuilt = images_rebuild_external_reusing_rasters(
+                &document, &stylesheet, &images, budget,
+                "https://media.test/", "https://media.test/", NULL,
+                8, 1024, 512, 1024, 1000, NULL, NULL, NULL, NULL,
+                480, NULL, 0);
+            budget_clear_failure_injection(budget);
+            if (rebuilt) {
+                const ImageResource *image = images_find_node(&images, video);
+                ok = ok && image != NULL && image->pixels == surface
+                    && image->owns_pixels && image->pixels[0] == 0x5a
+                    && images.stats.decoded_bytes == 48;
+            } else if (failure == 48) ok = false;
+        } else budget_free(budget, surface);
+        images_destroy(&images);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+        if (!ok || budget->current != baseline) return false;
+    }
+    return true;
 }
 
 static bool test_decoded_media_surface_replaces_poster(Budget *budget)
@@ -4174,12 +4288,73 @@ static bool test_inline_svg_symbol_use_resource(Budget *budget)
     return ok && budget->current == 0;
 }
 
+static bool test_compact_adopted_sheet_indices(Budget *budget)
+{
+    const char *html = "<!doctype html><style id=a></style>"
+        "<style id=b></style><style id=c></style><body>content";
+    PocDocument document = {0};
+    bool ok = document_parse(&document, budget, html, strlen(html), 17);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b"),
+                   *c = find_id(root, "c");
+    size_t before = budget->current;
+    bool active = false;
+    ok = ok && document_constructed_sheet_note_text(&document, a, 0, &active)
+        && budget->current - before <= 16u * 1024u
+        && document_constructed_sheet_note_text(&document, b, 0, &active)
+        && document_constructed_sheet_note_text(&document, c, 0, &active);
+    lxb_dom_node_t *adopted[2] = {b, c};
+    ok = ok && document_adoption_set(&document, NULL, adopted, 2, NULL, NULL);
+    uint64_t signature = document_adopted_sheets_signature(&document);
+    (void) document_adoptions_discard_subtree(&document, a, NULL, 0);
+    lxb_dom_node_t *copied[DOCUMENT_ADOPTED_SHEETS_PER_ROOT] = {0};
+    const lxb_dom_node_t *adopter = NULL;
+    size_t count = 0;
+    ok = ok && document_adoption_list_at(&document, 0, &adopter, copied,
+        &count, &active) && adopter == NULL && active && count == 2
+        && copied[0] == b && copied[1] == c
+        && signature == document_adopted_sheets_signature(&document);
+    (void) document_adoptions_discard_subtree(&document, b, NULL, 0);
+    ok = ok && document_adoption_list_at(&document, 0, &adopter, copied,
+        &count, &active) && count == 1 && copied[0] == c;
+    /* Exercise every list/index growth and its rollback, including byte
+       index 255. A refused grow must not publish a partial adoption. */
+    for (size_t i = 1; ok && i < DOCUMENT_ADOPTION_ROOT_LIMIT; i++) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, (const lxb_char_t *) "div", 3, NULL);
+        lxb_dom_node_t *node = element == NULL ? NULL
+            : lxb_dom_interface_node(element);
+        ok = node != NULL && lxb_dom_node_append_child(
+            document_body_node(&document), node) == LXB_DOM_EXCEPTION_OK;
+        if (!ok) break;
+        if (i >= 8 && (i & (i - 1u)) == 0) {
+            uint64_t before_refusal = document_adopted_sheets_signature(&document);
+            budget_inject_failure_after(budget, 0);
+            bool accepted = document_adoption_set(&document, node, &c, 1, NULL, NULL);
+            budget_clear_failure_injection(budget);
+            ok = !accepted && before_refusal
+                == document_adopted_sheets_signature(&document);
+        }
+        ok = ok && document_adoption_set(&document, node, &c, 1, NULL, NULL);
+    }
+    ok = ok && !document_adoption_set(&document, root, &c, 1, NULL, NULL)
+        && document_adoption_list_at(&document, DOCUMENT_ADOPTION_ROOT_LIMIT - 1u,
+            &adopter, copied, &count, &active) && count == 1 && copied[0] == c;
+    document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
 static bool test_external_svg_symbol_use_resource(Budget *budget)
 {
     static const char html[] =
-        "<!doctype html><style>body{margin:0}#icon{color:#12ab34}</style>"
+        "<!doctype html><style>body{margin:0}#icon{color:#12ab34}"
+        "#second{color:#cd3456}</style>"
         "<body><svg id=icon width=16 height=16>"
-        "<use href='icons.svg#solid'/></svg></body>";
+        "<use href='icons.svg#solid'/></svg>"
+        "<svg id=second width=16 height=16><use href='icons.svg#solid'/></svg>"
+        "<svg id=empty width=16 height=16><use href='icons.svg#unused'/></svg>"
+        "<div hidden><svg id=hidden width=16 height=16>"
+        "<use href='icons.svg#solid'/></svg></div></body>";
     PocDocument document = {0};
     Stylesheet stylesheet = {0};
     ImageResources images = {0};
@@ -4202,14 +4377,97 @@ static bool test_external_svg_symbol_use_resource(Budget *budget)
         && resource->pixels[0] >= 0x10 && resource->pixels[0] <= 0x14
         && resource->pixels[1] >= 0xa8 && resource->pixels[1] <= 0xae
         && resource->pixels[2] >= 0x31 && resource->pixels[2] <= 0x37
-        && resource->pixels[3] > 240 && images.stats.loaded == 1;
+        && resource->pixels[3] > 240;
+    const ImageResource *second = images_find_node(&images,
+        find_id(lxb_dom_interface_node(document.html), "second"));
+    const ImageResource *empty = images_find_node(&images,
+        find_id(lxb_dom_interface_node(document.html), "empty"));
+    FetchTraceReplayStats replay = {0};
+    ok = ok && second != NULL && image_resource_available(second)
+        && second->pixels[0] >= 0xca && second->pixels[0] <= 0xd0
+        && second->pixels[1] >= 0x31 && second->pixels[1] <= 0x37
+        && empty != NULL && image_resource_available(empty)
+        && empty->pixels[3] == 0 && images.stats.loaded == 3
+        && images_find_node(&images,
+            find_id(lxb_dom_interface_node(document.html), "hidden")) == NULL
+        && fetch_trace_replay_stats(&replay) && replay.request_count == 1;
     fetch_trace_end();
     images_destroy(&images);
+    size_t baseline = budget->current;
+    for (size_t refused_after = 0; ok && refused_after < 96u; refused_after++) {
+        ok = fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-svg-sprite",
+            error, sizeof(error));
+        budget_inject_failure_after(budget, refused_after);
+        (void) images_load_external(
+            &document, &stylesheet, &images, budget,
+            "https://svg-sprite.test/", "https://svg-sprite.test/", NULL,
+            4, 64 * 1024, 32 * 1024, 128 * 1024, 1000, NULL, NULL);
+        budget_clear_failure_injection(budget);
+        fetch_trace_end();
+        images_destroy(&images);
+        ok = ok && budget->current == baseline;
+    }
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
     if (!ok && error[0] != '\0') {
         fprintf(stderr, "external SVG sprite replay: %s\n", error);
     }
+    return ok && budget->current == 0;
+}
+
+/* Icon-sprite pages reference many symbols of one response. The sprite is
+   indexed once, so materializing every sibling icon visits the sprite bytes
+   a bounded number of times instead of once per icon. */
+static bool test_external_svg_sprite_indexed_once(Budget *budget)
+{
+    enum { ICONS = 40, SPRITE_BYTES = 27537 };
+    char html[ICONS * 96 + 256];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}svg{color:#12ab34}"
+        "#i270{color:#cd3456}</style><body>");
+    for (int i = 0; i < ICONS && used > 0 && (size_t) used < sizeof(html); i++)
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+            "<svg id=i%d width=16 height=16><use href='icons.svg#i%d'/></svg>",
+            299 - i, 299 - i);
+    if (used <= 0 || (size_t) used >= sizeof(html) - 16u) return false;
+    used += snprintf(html + used, sizeof(html) - (size_t) used, "</body>");
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    char error[256] = {0};
+    tilefinch_test_faults()->external_svg_symbol_scan_bytes = 0;
+    bool ok = document_parse(&document, budget, html, (size_t) used, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-svg-sprite-index",
+            error, sizeof(error))
+        && images_load_external(
+            &document, &stylesheet, &images, budget,
+            "https://svg-sprite-index.test/", "https://svg-sprite-index.test/",
+            NULL, 64, 64 * 1024, 32 * 1024, 256 * 1024, 1000, NULL, NULL);
+    unsigned long scanned = tilefinch_test_faults()->external_svg_symbol_scan_bytes;
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    const ImageResource *first = ok ? images_find_node(&images, find_id(root, "i299")) : NULL;
+    const ImageResource *colored = ok ? images_find_node(&images, find_id(root, "i270")) : NULL;
+    const ImageResource *last = ok ? images_find_node(&images, find_id(root, "i260")) : NULL;
+    FetchTraceReplayStats replay = {0};
+    ok = ok && first != NULL && colored != NULL && last != NULL
+        && image_resource_available(first) && image_resource_available(last)
+        && image_resource_available(colored)
+        && last->width == 16 && last->pixels[1] >= 0xa8 && last->pixels[3] > 240
+        && colored->pixels[0] >= 0xca && colored->pixels[0] <= 0xd0
+        && images.stats.loaded == ICONS
+        && fetch_trace_replay_stats(&replay) && replay.request_count == 1;
+    if (!ok || scanned > 3u * SPRITE_BYTES) {
+        fprintf(stderr, "external SVG sprite index: ok=%d loaded=%zu "
+            "scanned=%lu %s\n", ok, images.stats.loaded, scanned, error);
+        ok = false;
+    }
+    fetch_trace_end();
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
     return ok && budget->current == 0;
 }
 
@@ -4823,14 +5081,14 @@ static bool test_generated_literal_storage_bounds(Budget *budget)
         && sheet.generated_text_bytes == 4096u;
     stylesheet_destroy(&sheet);
 
-    /* Distinct three-byte codepoints exhaust the finite entry quota first.
+    /* Distinct three-byte strings exhaust the finite entry quota first.
        Deduplication remains usable even after either quota is full. */
     if (!ok) goto done;
     ok = ok && stylesheet_build(&sheet, budget, &document, 480);
     if (!ok) goto done;
     for (unsigned i = 0; ok && i < STYLE_GENERATED_TEXT_LIMIT; i++) {
         int count = snprintf(css, sizeof(css),
-            ".icon%u:before{content:'\\%x'}", i, 0xe000u + i);
+            ".literal%u:before{content:'%03x'}", i, i);
         ok = count > 0 && stylesheet_add_css(&sheet, css, (size_t) count);
     }
     ok = ok && sheet.generated_text_count == STYLE_GENERATED_TEXT_LIMIT
@@ -4839,11 +5097,13 @@ static bool test_generated_literal_storage_bounds(Budget *budget)
     parent = style_for_node(&sheet, target, NULL);
     pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
     ok = ok && pseudo.generated_text == NULL;
-    static const char first[] = "#target:before{content:'\\e000'}";
+    static const char first[] = "#target:before{content:'000'}";
     ok = ok && stylesheet_add_css(&sheet, first, sizeof(first) - 1);
     parent = style_for_node(&sheet, target, NULL);
     pseudo = style_for_pseudo(&sheet, target, PSEUDO_BEFORE, &parent);
     ok = ok && pseudo.generated_text_length == 3
+        && pseudo.generated_text != NULL
+        && memcmp(pseudo.generated_text, "000", 3) == 0
         && sheet.generated_text_count == STYLE_GENERATED_TEXT_LIMIT;
     stylesheet_destroy(&sheet);
 
@@ -5722,6 +5982,60 @@ static bool test_constructed_sheet_shared_by_roots(Budget *budget)
     return ok && budget->current == baseline;
 }
 
+/* The registry admits DOCUMENT_ADOPTION_ROOT_LIMIT adopting roots, the
+   document's included, and the style root table must hold all of them: a
+   byte-wide count wrapped a full table to zero, so every shadow-confined
+   rule (one Lit class sheet shared by each instance's root) stopped
+   applying. */
+static bool test_constructed_sheet_full_root_table(Budget *budget)
+{
+    size_t baseline = budget->current;
+    /* The bridge admits one shared shadow root per 128 KiB of page limit. */
+    size_t limit = budget->limit;
+    if (budget->limit < 32u * MIB) budget->limit = 32u * MIB;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<span class=part>LIGHTPART</span><span class=doc>DOCTEXT</span>");
+    char script[1024];
+    snprintf(script, sizeof(script),
+        "(()=>{const doc=new CSSStyleSheet(),part=new CSSStyleSheet();"
+        "doc.replaceSync('.doc{color:#00ff00}');"
+        "part.replaceSync(':host{color:#ff0000}.part{color:#0000ff}');"
+        "document.adoptedStyleSheets=[doc];"
+        "for(let i=0;i<%u;i++){const host=document.createElement('x-host');"
+        "document.body.appendChild(host);"
+        "const root=host.attachShadow({mode:'open'});"
+        "root.innerHTML='<span>HOST'+i+'</span><span class=part>PART'+i"
+        "+'</span>';root.adoptedStyleSheets=[part]}"
+        "globalThis.pocSummary='FULL-READY'})()",
+        (unsigned) (DOCUMENT_ADOPTION_ROOT_LIMIT - 1u));
+    ok = ok && constructed_sheet_step(&navigation, script, "FULL-READY");
+    const LayoutDocument *layout = &navigation.page.layout;
+    char last[32];
+    snprintf(last, sizeof(last), "PART%u",
+             (unsigned) (DOCUMENT_ADOPTION_ROOT_LIMIT - 2u));
+    ok = ok && constructed_sheet_colours(layout, "HOST", 4, 0xff0000)
+        && constructed_sheet_colours(layout, "PART", 4, 0x0000ff)
+        && late_init_text_color(layout, last) == 0x0000ff
+        && late_init_text_color(layout, "DOCTEXT") == 0x00ff00;
+    uint32_t light = late_init_text_color(layout, "LIGHTPART");
+    if (ok && (light == 0x0000ff || light == UINT32_MAX)) {
+        fprintf(stderr, "confined rule escaped a full root table: %06x\n",
+                (unsigned) light);
+        ok = false;
+    }
+    const Stylesheet *sheet = &navigation.page.stylesheet;
+    if (ok && sheet->adopted_scope_root_count != DOCUMENT_ADOPTION_ROOT_LIMIT) {
+        fprintf(stderr, "full adopted root table count=%u, want %u\n",
+                (unsigned) sheet->adopted_scope_root_count,
+                (unsigned) DOCUMENT_ADOPTION_ROOT_LIMIT);
+        ok = false;
+    }
+    constructed_sheet_close(&navigation);
+    budget->limit = limit;
+    return ok && budget->current == baseline;
+}
+
 /* Adopted sheets follow the root's own sheets in array order, leave the
    cascade when dropped or when their shadow root leaves the page, and
    never appear in the document tree. A sheet only shadow roots adopt
@@ -5803,6 +6117,34 @@ static bool test_constructed_sheet_order_and_removal(Budget *budget)
 
 /* Dense shared sheets exercise the span fallback while root-local order
    and allocation refusal preserve the committed confinement metadata. */
+static bool test_constructed_sheet_nested_scope(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, "<x-host id=outer></x-host>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const outer=document.getElementById('outer').attachShadow({mode:'open'});"
+        "outer.innerHTML='<p class=part>OUTER</p><x-inner id=inner></x-inner>';"
+        "const sheet=new CSSStyleSheet();sheet.replaceSync("
+        "'.part{color:#ff0000;display:block}');outer.adoptedStyleSheets=[sheet];"
+        "const inner=outer.getElementById('inner').attachShadow({mode:'open'});"
+        "inner.innerHTML='<p class=part>INNER</p>';"
+        "const local=new CSSStyleSheet();local.replaceSync(':host{display:block}'"
+        "+'.part{color:#0000ff}');inner.adoptedStyleSheets=[local];"
+        "globalThis.localRoot=inner;globalThis.pocSummary='NESTED-OK'})()", "NESTED-OK");
+    ok = ok && late_init_text_color(&navigation.page.layout, "OUTER") == 0xff0000
+        && late_init_text_color(&navigation.page.layout, "INNER") == 0x0000ff;
+    /* A boundary without its own adopted list must still stop outer rules. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "localRoot.adoptedStyleSheets=[];"
+        "localRoot.innerHTML='<style>.part{color:#00ff00}</style>'"
+        "+'<p class=part>INNER</p>';globalThis.pocSummary='LOCAL-OK'", "LOCAL-OK");
+    ok = ok && late_init_text_color(&navigation.page.layout, "INNER") == 0x00ff00;
+    if (!ok) fprintf(stderr, "nested adopted stylesheet crossed a shadow boundary\n");
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
 static bool test_constructed_sheet_root_order_and_refusal(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -5830,15 +6172,28 @@ static bool test_constructed_sheet_root_order_and_refusal(Budget *budget)
     ok = ok && data_attribute_step_matches_full(&navigation,
         "b.adoptedStyleSheets=[red,blue]", NULL);
     ok = ok && late_init_text_color(&navigation.page.layout, "PARTB") == 0x0000ff;
+    /* Native presentation CSS is appended after constructed sheets. It
+       must not inherit the confinement of the last shadow-only source. */
+    static const char user_css[] =
+        "body>p{--reader-ink:#123456;color:var(--reader-ink)!important}";
+    NavigationUserCssTransaction *override = navigation_apply_user_css_begin(
+        &navigation, user_css, sizeof(user_css) - 1u);
+    ok = ok && override != NULL;
+    if (override != NULL)
+        navigation_apply_user_css_commit(&navigation, override);
+    ok = ok && late_init_text_color(&navigation.page.layout, "LIGHT") == 0x123456
+        && late_init_text_color(&navigation.page.layout, "PARTA") == 0x0000ff
+        && late_init_text_color(&navigation.page.layout, "PARTB") == 0x0000ff;
+    if (!ok) fprintf(stderr, "native CSS inherited adopted confinement\n");
     Stylesheet *sheet = &navigation.page.stylesheet;
     const lxb_dom_node_t *root = NULL;
-    lxb_dom_node_t *const *list = NULL;
+    lxb_dom_node_t *list[DOCUMENT_ADOPTED_SHEETS_PER_ROOT] = {0};
     size_t length = 0;
     bool active = false;
     /* Drop one root without rebuilding. Refusing the replacement metadata
        must leave the old confinement intact, not publish global rules. */
     ok = ok && document_adoption_list_at(&navigation.page.document, 1,
-        &root, &list, &length, &active) && root != NULL;
+        &root, list, &length, &active) && root != NULL;
     ok = ok && document_adoption_set(&navigation.page.document,
         (lxb_dom_node_t *) root, NULL, 0, NULL, NULL);
     const void *old_roots = sheet->adopted_scope_roots;
@@ -5903,15 +6258,15 @@ static bool test_constructed_sheet_scope_refusal_keeps_document(Budget *budget)
         /* A formerly confined sheet gaining document scope must not be
            hidden by the old index partition during another refusal. */
         const lxb_dom_node_t *adopter = NULL;
-        lxb_dom_node_t *const *list = NULL;
+        lxb_dom_node_t *list[DOCUMENT_ADOPTED_SHEETS_PER_ROOT] = {0};
         size_t count = 0;
         bool active = false;
         lxb_dom_node_t *global_sheets[2] = {0};
         ok = ok && document_adoption_list_at(&navigation.page.document, 0,
-            &adopter, &list, &count, &active) && adopter == NULL && count == 1;
+            &adopter, list, &count, &active) && adopter == NULL && count == 1;
         if (ok) global_sheets[0] = list[0];
         ok = ok && document_adoption_list_at(&navigation.page.document, 1,
-            &adopter, &list, &count, &active) && adopter == carrier && count == 1;
+            &adopter, list, &count, &active) && adopter == carrier && count == 1;
         if (ok) global_sheets[1] = list[0];
         ok = ok && document_adoption_set(&navigation.page.document, NULL,
             global_sheets, 2, NULL, NULL)
@@ -6075,13 +6430,19 @@ static bool test_constructed_sheet_parse_cache(Budget *budget)
         "document.adoptedStyleSheets=[s];"
         "globalThis.pocSummary='CACHE-ADOPT'})()", "CACHE-ADOPT");
     size_t rules = navigation.page.stylesheet.count;
-    /* Parsed once, nothing is cached; a document <style> change rebuilds
-       the whole sheet, the second parse, which keeps the form. */
+    /* Replacing identical text needs no reparse or second cached form. */
+    size_t full_before_noop = navigation.performance.full_relayouts;
+    ok = ok && constructed_sheet_step(&navigation,
+        "document.getElementById('own').textContent="
+        "'.own{color:#ff0000}';globalThis.pocSummary='NOOP'", "NOOP");
+    ok = ok && navigation.performance.full_relayouts == full_before_noop;
+    /* Parsed once, nothing is cached; an actual document <style> change
+       rebuilds the whole sheet, the second parse, which keeps the form. */
     bool uncached = document_constructed_sheet_cache_bytes(
         &navigation.page.document) == 0;
     ok = ok && constructed_sheet_step(&navigation,
         "document.getElementById('own').textContent="
-        "'.own{color:#ff0000}';globalThis.pocSummary='FIRST'", "FIRST");
+        "'.own{color:#fe0000}';globalThis.pocSummary='FIRST'", "FIRST");
     size_t cached_bytes = document_constructed_sheet_cache_bytes(
         &navigation.page.document);
     if (ok && (!uncached || cached_bytes == 0
@@ -6569,6 +6930,8 @@ static int test_tile_placeholder_frame(void)
 
 #include "suites/web_runtime_hidden_mutations.inc"
 #include "suites/web_runtime_relayout_reuse.inc"
+#include "suites/opfs_sync.inc"
+#include "suites/image_rebuild_pressure.inc"
 #include "suites/web_runtime_render.inc"
 #include "suites/web_runtime_navigation.inc"
 #include "suites/web_runtime_forms.inc"
@@ -6592,6 +6955,16 @@ typedef struct {
 } TilefinchTestSuite;
 
 static const TilefinchTestSuite tilefinch_test_suites[] = {
+    {
+        "image-rebuild-pressure",
+        "bounded cascade and image recovery with retained focus and scroll",
+        test_image_rebuild_pressure
+    },
+    {
+        "opfs-sync",
+        "bounded worker synchronous file I/O and realm adaptation",
+        test_opfs_sync_access
+    },
     {
         "foundation",
         "allocator, parser, fetch, platform, navigation, and basic rendering",

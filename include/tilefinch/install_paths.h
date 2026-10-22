@@ -37,4 +37,24 @@ bool tilefinch_install_advisory_matches(
     const TilefinchInstallPaths *paths,
     const char *slot_name, const char *data_dir);
 
+/* Flushes the Memory Stick file system: sceIoSync on "ms0:", then on
+   "msfat0:" when the first name is refused. Some real firmware and
+   storage-driver combinations reject both even though every checked write,
+   close and rename before the call succeeded (PPSSPP accepts them), so
+   callers must not treat REJECTED as the failure of work that already
+   completed. A host build has no device to flush and reports SKIPPED. */
+typedef enum {
+    TILEFINCH_MEMORY_STICK_SYNCED = 0,
+    TILEFINCH_MEMORY_STICK_SYNC_REJECTED,
+    TILEFINCH_MEMORY_STICK_SYNC_SKIPPED
+} TilefinchMemoryStickSync;
+
+TilefinchMemoryStickSync tilefinch_memory_stick_sync(void);
+#ifndef __PSP__
+/* Host tests only: the result every later tilefinch_memory_stick_sync()
+   reports, so callers' handling of a rejecting device can run off-device. */
+void tilefinch_memory_stick_sync_set_host_result(
+    TilefinchMemoryStickSync result);
+#endif
+
 #endif

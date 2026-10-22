@@ -6,6 +6,7 @@ void script_runtime_detach_document(ScriptRuntime *runtime,
     DomBridge *bridge = &runtime->bridge;
 
     if (runtime->document == document) {
+        image_preloads_destroy(runtime);
         /* The realm may outlive this tree, but page-authorized requests may
            not. Reject JS fetch promises while the CSP/budget authority is
            still live, then cancel every native request before clearing the
@@ -149,6 +150,7 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
                                               PocDocument *document)
 {
     if (runtime == NULL || document == NULL) return;
+    image_preload_cancel_job(runtime);
     runtime->document = document;
     runtime->bridge.document = document;
     runtime->bridge.document_base_dirty = true;

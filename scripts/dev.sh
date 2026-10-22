@@ -72,7 +72,6 @@ find_dependency_source() {
 configure_common() {
     set -- "$@" \
         -DPSP_BROWSER_USE_BELLARD_QUICKJS=ON \
-        -DPSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH=OFF \
         -DPSP_BROWSER_QUICKJS_FUNCTION_RECYCLE=ON \
         -DPSP_BROWSER_QUICKJS_PORTABLE_REGION=ON \
         -DPSP_BROWSER_BUILD_JSC_SPIKE=OFF \

@@ -283,18 +283,19 @@ static size_t bridge_first_reusable_slot(const DomBridge *bridge)
 }
 
 static void bridge_notify_node_state_retired(DomBridge *bridge,
-                                             int64_t handle)
+                                             int64_t handle, bool wrapper_only)
 {
     if (bridge == NULL || bridge->host == NULL
         || bridge->host->context == NULL || handle <= 0) return;
     JSContext *context = bridge->host->context;
     if (JS_IsFunction(
             context, bridge->trusted_retire_native_node_state)) {
-        JSValue argument = JS_NewInt64(context, handle);
+        JSValue arguments[2] = {JS_NewInt64(context, handle),
+                               JS_NewBool(context, wrapper_only)};
         JSValue result = JS_Call(
             context, bridge->trusted_retire_native_node_state,
-            JS_UNDEFINED, 1, &argument);
-        JS_FreeValue(context, argument);
+            JS_UNDEFINED, 2, arguments);
+        JS_FreeValue(context, arguments[0]);
         if (JS_IsException(result)) {
             JSValue exception = JS_GetException(context);
             JS_FreeValue(context, exception);
@@ -349,6 +350,10 @@ static bool bridge_query_node_hidden_by_shadow(
     return false;
 }
 
+static void bridge_reclaim_node_slots(DomBridge *bridge,
+                                      const lxb_dom_node_t *keep,
+                                      bool shadow_pressure);
+
 JSValue js_dom_register_shadow_root(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv)
@@ -363,7 +368,10 @@ JSValue js_dom_register_shadow_root(JSContext *context,
         || bridge->nodes[slot]->type != LXB_DOM_NODE_TYPE_ELEMENT) {
         return JS_FALSE;
     }
+    bool reclaim = argc > 1 && JS_ToBool(context, argv[1]) > 0;
     size_t write = 0;
+retry:
+    write = 0;
     for (size_t read = 0; read < bridge->shadow_root_count; read++) {
         size_t existing_slot = 0;
         uint32_t existing = bridge->shadow_root_handles[read];
@@ -376,23 +384,49 @@ JSValue js_dom_register_shadow_root(JSContext *context,
     size_t admitted = DOM_BRIDGE_SHADOW_ROOT_BASE;
     if (bridge->budget != NULL) {
         size_t by_budget = bridge->budget->limit
-                           / DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES;
+            / (argc > 2 && JS_ToBool(context, argv[2]) > 0
+               ? DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES
+               : DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES);
         if (by_budget > admitted) admitted = by_budget;
     }
     if (admitted > DOM_BRIDGE_SHADOW_ROOT_LIMIT)
         admitted = DOM_BRIDGE_SHADOW_ROOT_LIMIT;
-    if (write >= admitted) return JS_FALSE;
+    if (write >= admitted) {
+        if (reclaim) {
+            reclaim = false;
+            /* The bootstrap has released only disconnected cache ownership.
+               Reuse the handle-table sweep and its unproductive-GC backoff;
+               author-held roots and connected wrappers remain live. */
+            bridge_reclaim_node_slots(bridge, bridge->nodes[slot], true);
+            goto retry;
+        }
+        return JS_FALSE;
+    }
     /* Style resolution recognises the carrier by this native-only mark
        (shadow composition, document.h). */
     if (!document_mark_shadow_carrier(bridge->nodes[slot])) return JS_FALSE;
     bridge->shadow_root_handles[write] = (uint32_t) handle;
     bridge->shadow_root_count = write + 1u;
+    bridge->shadow_reclaim_gc_skip = 0;
+    bridge->shadow_reclaim_gc_backoff = 0;
     return JS_TRUE;
 }
 
 static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot);
-static void bridge_reclaim_node_slots(DomBridge *bridge,
-                                      const lxb_dom_node_t *keep);
+static void bridge_set_event_state(DomBridge *bridge, size_t slot,
+                                   unsigned char event, bool stuck);
+
+/* Restarts the owner-turn wrapper sweep over the whole table. */
+static void bridge_arm_wrapper_sweep(DomBridge *bridge)
+{
+    if (bridge->wrapper_refs != NULL)
+        bridge->node_wrapper_sweep_remaining = bridge->node_count;
+}
+
+static void bridge_hold_detached_event_state(DomBridge *bridge, size_t slot);
+static void bridge_reopen_stuck_tree(DomBridge *bridge, lxb_dom_node_t *root);
+static bool bridge_event_retry_open(const DomBridge *bridge);
+static TILEFINCH_COLD_PATH void bridge_retry_event_releases(DomBridge *bridge);
 
 static int64_t bridge_invalidate_node_slot_impl(
     DomBridge *bridge, size_t slot, bool notify)
@@ -423,13 +457,15 @@ static int64_t bridge_invalidate_node_slot_impl(
     bridge_node_set_reusable(
         bridge, slot,
         bridge->node_generations[slot] < DOM_BRIDGE_NODE_GENERATION_MAX);
+    bridge_set_event_state(bridge, slot, 0, false);
+    bridge->event_holder_epoch++;
     bridge->node_retention_flags[slot] =
         notify ? 0 : BRIDGE_NODE_PENDING_RETIRE_NOTIFY;
     if (bridge->result != NULL
         && bridge->result->dom_handle_slots_live != 0) {
         bridge->result->dom_handle_slots_live--;
     }
-    if (notify) bridge_notify_node_state_retired(bridge, retired_handle);
+    if (notify) bridge_notify_node_state_retired(bridge, retired_handle, false);
     return retired_handle;
 }
 
@@ -804,7 +840,7 @@ static void bridge_notify_pending_node_retirements(
             int64_t handle = (int64_t) (
                 ((generation - 1u) << DOM_BRIDGE_NODE_INDEX_BITS)
                 | (uint32_t) (slot + 1u));
-            bridge_notify_node_state_retired(bridge, handle);
+            bridge_notify_node_state_retired(bridge, handle, false);
         }
     }
 }
@@ -833,6 +869,18 @@ static unsigned char bridge_node_owner_tag_inherited(
             return bridge->node_owner_tags[slot];
     }
     return 1;
+}
+
+int64_t js_rt_bridge_find_node_handle(const DomBridge *bridge,
+                                      const lxb_dom_node_t *node)
+{
+    if (bridge == NULL || node == NULL || bridge->nodes == NULL) return 0;
+    size_t slot = bridge_node_index_find(bridge, node);
+    /* A slot captured for another document's node at this address is not
+       this node's handle; registration replaces it. */
+    if (slot == SIZE_MAX || bridge->node_owner_document_identities[slot]
+            != js_rt_node_owner_identity(node)) return 0;
+    return bridge_node_handle(bridge, slot);
 }
 
 int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
@@ -868,7 +916,7 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
         && bridge->node_count == bridge->node_capacity) {
         /* Dead wrappers are reclaimed first, exactly as at a fixed-size
            table; only a table that is genuinely live grows. */
-        bridge_reclaim_node_slots(bridge, node);
+        bridge_reclaim_node_slots(bridge, node, false);
         /* Reclamation runs retirement callbacks, which may have registered
            this node meanwhile. */
         size_t again = bridge_node_index_find(bridge, node);
@@ -953,6 +1001,10 @@ static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot)
 {
     if (bridge == NULL || bridge->wrapper_refs == NULL
         || bridge->host == NULL || bridge->host->runtime == NULL) return;
+    /* A kept wrapper's reference ends with its slot's WeakRef (only a
+       rebind replaces that while the wrapper lives). */
+    if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_KEPT) != 0)
+        bridge_set_event_state(bridge, slot, 0, false);
     JSValue *ref = &bridge->wrapper_refs[slot];
     if (JS_IsObject(*ref)) JS_FreeValueRT(bridge->host->runtime, *ref);
     *ref = JS_UNDEFINED;
@@ -985,13 +1037,9 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
         /* At this practically unreachable boundary, retain the native handle
            permanently rather than wrap a lease and let an ancient finalizer
            invalidate a current wrapper. */
-        bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+        bridge_pin_node_slot(bridge, slot);
         return JS_NewInt32(context, 0);
     }
-    lease++;
-    if (lease == 0) lease = 1;
-    bridge->node_wrapper_leases[slot] = lease;
-    bridge->node_retention_flags[slot] |= BRIDGE_NODE_LIVE_WRAPPER;
     /* The wrapper cache's WeakRef for this lease, for native getters. */
     if (argc > 1 && JS_IsObject(argv[1])) {
         if (bridge->wrapper_refs == NULL) {
@@ -1001,13 +1049,23 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
                 for (size_t at = 0; at < bridge->node_capacity; at++)
                     bridge->wrapper_refs[at] = JS_UNDEFINED;
         }
-        if (bridge->wrapper_refs != NULL) {
-            bridge_wrapper_ref_clear(bridge, slot);
-            bridge->wrapper_refs[slot] = JS_DupValue(context, argv[1]);
+        if (bridge->wrapper_refs == NULL) {
+            /* Rebinding can be materializing an author-held secondary node.
+               Keep its native lifetime safe even when tracking refuses, but
+               do not publish an untrackable lease as a successful cache. */
+            bridge_pin_node_slot(bridge, slot);
+            return JS_ThrowOutOfMemory(context);
         }
+        bridge_wrapper_ref_clear(bridge, slot);
+        bridge->wrapper_refs[slot] = JS_DupValue(context, argv[1]);
     } else {
         bridge_wrapper_ref_clear(bridge, slot);
     }
+    lease++;
+    if (lease == 0) lease = 1;
+    bridge->node_wrapper_leases[slot] = lease;
+    bridge->node_retention_flags[slot] |= BRIDGE_NODE_LIVE_WRAPPER;
+    bridge->node_wrapper_sweep_remaining = bridge->node_count;
     return JS_NewInt64(context, lease);
 }
 
@@ -1025,24 +1083,74 @@ static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node);
 static bool bridge_subtree_may_contain(lxb_dom_node_t *root,
                                        const lxb_dom_node_t *node);
 
+/* Wrapper-only retirements a sweep hands to the bootstrap in one call,
+   instead of one JavaScript call per released wrapper. */
+typedef struct {
+    int64_t handles[64];
+    size_t count;
+} BridgeRetiredWrappers;
+
+static void bridge_retired_wrappers_flush(DomBridge *bridge,
+                                          BridgeRetiredWrappers *batch)
+{
+    if (batch == NULL || batch->count == 0) return;
+    size_t count = batch->count;
+    batch->count = 0;
+    JSContext *context = bridge->host == NULL ? NULL : bridge->host->context;
+    JSValue list = JS_UNDEFINED;
+    if (count > 1 && context != NULL
+        && JS_IsFunction(context, bridge->trusted_retire_native_node_state)) {
+        /* Handles are below 2^53, so a Float64Array carries them exactly. */
+        double values[sizeof(batch->handles) / sizeof(batch->handles[0])];
+        for (size_t i = 0; i < count; i++) values[i] = (double) batch->handles[i];
+        JSValue buffer = JS_NewArrayBufferCopy(
+            context, (const uint8_t *) values, count * sizeof(values[0]));
+        /* The constructor reads (buffer, byteOffset, length) unpadded. */
+        JSValueConst view[3] = {buffer, JS_UNDEFINED, JS_UNDEFINED};
+        if (!JS_IsException(buffer))
+            list = JS_NewTypedArray(context, 3, view, JS_TYPED_ARRAY_FLOAT64);
+        JS_FreeValue(context, buffer);
+    }
+    bool listed = JS_IsObject(list);
+    if (!listed) {
+        /* A refused list falls back to the per-handle notice. */
+        JS_FreeValue(context, list);
+        if (context != NULL && JS_HasException(context))
+            JS_FreeValue(context, JS_GetException(context));
+        for (size_t i = 0; i < count; i++)
+            bridge_notify_node_state_retired(bridge, batch->handles[i], true);
+        return;
+    }
+    JSValue arguments[2] = {list, JS_TRUE};
+    JSValue result = JS_Call(context, bridge->trusted_retire_native_node_state,
+                             JS_UNDEFINED, 2, arguments);
+    JS_FreeValue(context, list);
+    if (JS_IsException(result)) JS_FreeValue(context, JS_GetException(context));
+    JS_FreeValue(context, result);
+}
+
 /* Ends the live wrapper identity of `slot` and reclaims its detached
    lifetime tree unless something else retains it. A tree that may contain
    `keep` (a node native code is still using) is left for the wrapper's own
-   finalizer. Returns the handle slots released. */
+   finalizer. With `batch`, the wrapper-only notice joins it instead of
+   calling into JavaScript now. Returns the handle slots released. */
 static size_t bridge_release_wrapper_slot(DomBridge *bridge, size_t slot,
-                                          const lxb_dom_node_t *keep)
+                                          const lxb_dom_node_t *keep,
+                                          BridgeRetiredWrappers *batch)
 {
     lxb_dom_node_t *node = bridge->nodes[slot];
+    int64_t handle = bridge_node_handle(bridge, slot);
+    if (batch == NULL) {
+        bridge_notify_node_state_retired(bridge, handle, true);
+    } else if (handle > 0) {
+        if (batch->count == sizeof(batch->handles) / sizeof(batch->handles[0]))
+            bridge_retired_wrappers_flush(bridge, batch);
+        batch->handles[batch->count++] = handle;
+    }
     bridge_wrapper_ref_clear(bridge, slot);
     bridge->node_retention_flags[slot] &=
         (unsigned char) ~BRIDGE_NODE_LIVE_WRAPPER;
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_NATIVE_PIN) != 0
-        /* Parentless fragments can still be owned by a template element,
-           and Lexbor retains ordinary detached fragments in the document's
-           arena. Keep both until document retirement instead of letting a
-           JavaScript wrapper finalizer guess at native ownership. */
-        || (node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
-            && node->parent == NULL)
         || bridge_node_is_connected(node)) {
         if (bridge->result != NULL
             && bridge->result->dom_handle_connected_preserves != SIZE_MAX) {
@@ -1050,7 +1158,23 @@ static size_t bridge_release_wrapper_slot(DomBridge *bridge, size_t slot,
         }
         return 0;
     }
+    /* A discard below sends full retirements; this wrapper's notice (and
+       the batch before it) goes first, as without batching. That is
+       JavaScript, so read the slot's node again afterwards. */
+    if (batch != NULL && batch->count != 0) {
+        bridge_retired_wrappers_flush(bridge, batch);
+        node = bridge->nodes[slot];
+        if (node == NULL) return 0;
+    }
     lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
+    /* Template contents have no DOM parent but do have an explicit native
+       host. Follow that ownership before deciding: a connected or retained
+       template must survive, while an independent discarded fragment must
+       not wait forever for another descendant wrapper to die. */
+    if (root == NULL || bridge_node_is_connected(root)) return 0;
+    /* A detached tree lost a wrapper: perhaps the frozen one that kept it
+       from being held. Let the sweep try that tree again. */
+    if (bridge->event_stuck_slots != 0) bridge_reopen_stuck_tree(bridge, root);
     if (keep != NULL && bridge_subtree_may_contain(root, keep)) return 0;
     size_t released = bridge_discard_unretained_detached_subtree(
         bridge, root);
@@ -1082,19 +1206,15 @@ JSValue js_dom_release_node_wrapper(JSContext *context,
         }
         return JS_FALSE;
     }
-    return bridge_release_wrapper_slot(bridge, slot, NULL) != 0
+    return bridge_release_wrapper_slot(bridge, slot, NULL, NULL) != 0
         ? JS_TRUE : JS_FALSE;
 }
 
-/* Handle slots are released by the wrapper cache's FinalizationRegistry,
-   whose cleanup runs only as a job between tasks. One long synchronous
-   script can therefore fill the table with wrappers that have died but not
-   been finalized. When registration finds the table full, do the release
-   those cleanup jobs would do for every wrapper whose WeakRef has cleared,
-   collecting first when that alone frees too little (a wrapper in a cycle
-   clears only at a collection). The queued cleanup job later finds a
-   retired handle or an ended lease and does nothing. The sweep is linear in
-   the table; a collection that frees little backs off exponentially within
+/* Owner turns release cleared wrapper WeakRefs in bounded slices. A long
+   synchronous task can still fill the table before its next owner turn.
+   Registration then sweeps the whole table, collecting first when that alone
+   frees too little (a wrapper cycle clears only at a collection). The sweep
+   is linear in the table; a collection that frees little backs off within
    one entry into JavaScript, so a genuinely full table cannot turn every
    refused registration into a collection. */
 #define BRIDGE_RECLAIM_ENOUGH(bridge) ((bridge)->node_capacity / 64u)
@@ -1105,6 +1225,7 @@ static size_t bridge_release_dead_wrappers(DomBridge *bridge,
 {
     JSContext *context = bridge->host->context;
     size_t released = 0;
+    BridgeRetiredWrappers batch = {.count = 0};
     /* Release callbacks are JavaScript and may grow the table. */
     for (size_t slot = 0; slot < bridge->node_count; slot++) {
         if (bridge->wrapper_refs == NULL) break;
@@ -1115,41 +1236,111 @@ static size_t bridge_release_dead_wrappers(DomBridge *bridge,
         JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
         bool live = JS_IsObject(wrapper);
         JS_FreeValue(context, wrapper);
-        if (!live) released += bridge_release_wrapper_slot(bridge, slot, keep);
+        if (!live)
+            released += bridge_release_wrapper_slot(bridge, slot, keep, &batch);
     }
+    bridge_retired_wrappers_flush(bridge, &batch);
     return released;
 }
 
+void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->host == NULL || bridge->host->context == NULL
+        || bridge->node_reclaim_active) return;
+    if (bridge->wrapper_refs == NULL || bridge->node_count == 0) {
+        bridge->node_wrapper_sweep_remaining = 0;
+        return;
+    }
+    bridge->node_reclaim_active = true;
+    bool holds_open = bridge_event_retry_open(bridge);
+    if (bridge->event_release_pending && holds_open) {
+        bridge_retry_event_releases(bridge);
+        holds_open = bridge_event_retry_open(bridge);
+    }
+    BridgeRetiredWrappers batch = {.count = 0};
+    /* Detached nodes whose event state is still rooted. */
+    size_t holds[64], hold_count = 0;
+    for (size_t work = 0; work < 64 && bridge->node_wrapper_sweep_remaining != 0;
+         work++) {
+        if (bridge->node_wrapper_sweep_cursor >= bridge->node_count)
+            bridge->node_wrapper_sweep_cursor = 0;
+        size_t slot = bridge->node_wrapper_sweep_cursor++;
+        bridge->node_wrapper_sweep_remaining--;
+        if ((bridge->node_retention_flags[slot]
+             & (BRIDGE_NODE_EVENT_ROOTED | BRIDGE_NODE_EVENT_KEPT)) != 0
+            && (bridge->node_retention_flags[slot]
+                & BRIDGE_NODE_EVENT_STUCK) == 0
+            && holds_open
+            && hold_count < sizeof(holds) / sizeof(holds[0])
+            && bridge->nodes[slot] != NULL
+            && !bridge_node_is_connected(bridge->nodes[slot]))
+            holds[hold_count++] = slot;
+        if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
+            || bridge->nodes[slot] == NULL
+            || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
+        JSValue wrapper = JS_WeakRefDeref(bridge->host->context,
+                                         bridge->wrapper_refs[slot]);
+        bool live = JS_IsObject(wrapper);
+        JS_FreeValue(bridge->host->context, wrapper);
+        if (!live) (void) bridge_release_wrapper_slot(bridge, slot, NULL, &batch);
+    }
+    bridge_retired_wrappers_flush(bridge, &batch);
+    /* After the releases: a tree they discarded needs no holder. */
+    for (size_t i = 0; i < hold_count; i++)
+        bridge_hold_detached_event_state(bridge, holds[i]);
+    bridge->node_reclaim_active = false;
+}
+
+static bool bridge_shadow_slot_reclaimed(const DomBridge *bridge)
+{
+    for (size_t i = 0; i < bridge->shadow_root_count; i++)
+        if (!js_rt_bridge_node_slot_for_handle(
+                bridge, bridge->shadow_root_handles[i], NULL)) return true;
+    return false;
+}
+
 static void bridge_reclaim_node_slots(DomBridge *bridge,
-                                      const lxb_dom_node_t *keep)
+                                      const lxb_dom_node_t *keep,
+                                      bool shadow_pressure)
 {
     if (bridge->host == NULL || bridge->host->runtime == NULL
         || bridge->host->context == NULL || bridge->wrapper_refs == NULL
         || bridge->node_reclaim_active) return;
     bridge->node_reclaim_active = true;
+    /* A full shadow registry needs one root, not a fraction of the much
+       larger handle table. Its fruitless-collection backoff is independent
+       so ordinary handle pressure cannot veto its first useful collection. */
+    uint16_t *skip = shadow_pressure ? &bridge->shadow_reclaim_gc_skip
+                                    : &bridge->node_reclaim_gc_skip;
+    uint16_t *backoff_state = shadow_pressure ? &bridge->shadow_reclaim_gc_backoff
+                                            : &bridge->node_reclaim_gc_backoff;
     size_t released = bridge_release_dead_wrappers(bridge, keep);
-    if (released < BRIDGE_RECLAIM_ENOUGH(bridge)) {
-        if (bridge->node_reclaim_gc_skip != 0) {
-            bridge->node_reclaim_gc_skip--;
+    bool enough = shadow_pressure ? bridge_shadow_slot_reclaimed(bridge)
+        : released >= BRIDGE_RECLAIM_ENOUGH(bridge);
+    if (!enough) {
+        if (*skip != 0) {
+            (*skip)--;
         } else {
             /* As at every explicit full collection: one pass breaks a
                wrapper self-cycle and the next clears its WeakRef. */
             JS_RunGC(bridge->host->runtime);
             JS_RunGC(bridge->host->runtime);
             released += bridge_release_dead_wrappers(bridge, keep);
-            if (released < BRIDGE_RECLAIM_ENOUGH(bridge)) {
-                uint32_t backoff = bridge->node_reclaim_gc_backoff == 0
-                    ? 8u : 2u * (uint32_t) bridge->node_reclaim_gc_backoff;
+            enough = shadow_pressure ? bridge_shadow_slot_reclaimed(bridge)
+                : released >= BRIDGE_RECLAIM_ENOUGH(bridge);
+            if (!enough) {
+                uint32_t backoff = *backoff_state == 0
+                    ? 8u : 2u * (uint32_t) *backoff_state;
                 if (backoff > BRIDGE_RECLAIM_BACKOFF_MAX)
                     backoff = BRIDGE_RECLAIM_BACKOFF_MAX;
-                bridge->node_reclaim_gc_backoff = (uint16_t) backoff;
-                bridge->node_reclaim_gc_skip = (uint16_t) backoff;
+                *backoff_state = (uint16_t) backoff;
+                *skip = (uint16_t) backoff;
             }
         }
     }
-    if (released >= BRIDGE_RECLAIM_ENOUGH(bridge)) {
-        bridge->node_reclaim_gc_skip = 0;
-        bridge->node_reclaim_gc_backoff = 0;
+    if (enough) {
+        *skip = 0;
+        *backoff_state = 0;
     }
     bridge->node_reclaim_active = false;
 }
@@ -1249,6 +1440,607 @@ static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node)
     return root;
 }
 
+static bool bridge_unstick_visit(void *opaque, lxb_dom_node_t *node)
+{
+    DomBridge *bridge = opaque;
+    size_t slot = bridge_node_index_find(bridge, node);
+    if (slot != SIZE_MAX
+        && (bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_STUCK)
+               != 0) {
+        bridge->node_retention_flags[slot] &=
+            (unsigned char) ~BRIDGE_NODE_EVENT_STUCK;
+        if (bridge->event_stuck_slots != 0) bridge->event_stuck_slots--;
+    }
+    return bridge->event_stuck_slots == 0;
+}
+
+/* Clears STUCK in `root`'s lifetime tree and arms the sweep when it was
+   there. Other stuck trees wait for a change of their own: retrying them
+   all here cost a table scan, a full sweep and a refused hold on every
+   detached wrapper release. A walk a bound cut short reopens them all. */
+static void bridge_reopen_stuck_tree(DomBridge *bridge, lxb_dom_node_t *root)
+{
+    size_t stuck = bridge->event_stuck_slots;
+    if (bridge_live_subtree_visit(root, 0, bridge_unstick_visit, bridge)
+        == BRIDGE_SUBTREE_INDETERMINATE) {
+        for (size_t at = 0; at < bridge->node_count; at++)
+            bridge->node_retention_flags[at] &=
+                (unsigned char) ~BRIDGE_NODE_EVENT_STUCK;
+        bridge->event_stuck_slots = 0;
+    }
+    if (bridge->event_stuck_slots == stuck) return;
+#ifdef JS_RT_TEST_INSTRUMENTS
+    bridge->event_stuck_reopens++;
+#endif
+    bridge_arm_wrapper_sweep(bridge);
+}
+
+/* Event state (see BRIDGE_NODE_EVENT_ROOTED and dom.js). A detached tree
+   whose state stays rooted can never be collected when a handler closes
+   over its element, so the wrapper sweep hands each detached, unpinned
+   tree's state to a holder only its live wrappers reference. Whatever could
+   let the tree outlive those wrappers roots it again first: an insertion of
+   or into it (bridge_event_state_joining) or a pin (bridge_pin_node_slot).
+   A wrapper made later in the tree joins its holder
+   (bridge_wrapper_event_holder). */
+typedef struct {
+    double *items;
+    size_t count;
+    size_t capacity;
+} BridgeHandleList;
+
+static bool bridge_handle_list_push(DomBridge *bridge, BridgeHandleList *list,
+                                    int64_t handle)
+{
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity == 0 ? 16u : list->capacity * 2u;
+        double *items = budget_realloc(bridge->budget, list->items,
+                                       capacity * sizeof(*items));
+        if (items == NULL) return false;
+        list->items = items;
+        list->capacity = capacity;
+    }
+    /* Handles are below 2^53, so a Float64Array carries them exactly. */
+    list->items[list->count++] = (double) handle;
+    return true;
+}
+
+static JSValue bridge_handle_list_value(JSContext *context,
+                                        const BridgeHandleList *list)
+{
+    JSValue buffer = JS_NewArrayBufferCopy(
+        context, (const uint8_t *) list->items,
+        list->count * sizeof(*list->items));
+    if (JS_IsException(buffer)) return buffer;
+    JSValueConst view[3] = {buffer, JS_UNDEFINED, JS_UNDEFINED};
+    JSValue array = JS_NewTypedArray(context, 3, view, JS_TYPED_ARRAY_FLOAT64);
+    JS_FreeValue(context, buffer);
+    return array;
+}
+
+/* What a trusted event-state hook answered when it threw: the realm's
+   heap refused an allocation. The bootstrap then left every node's state
+   where it was (dom.js), except that an unfinished release keeps its
+   holders for a later one. */
+#define BRIDGE_EVENT_HOOK_THREW (-1)
+
+/* Whether holds, and retries of unfinished releases, may run: nothing
+   failed, or the heap has collected enough times since. */
+static bool bridge_event_retry_open(const DomBridge *bridge)
+{
+    return bridge->event_retry_backoff == 0
+        || bridge->host->heap_collections - bridge->event_retry_collection
+               >= bridge->event_retry_backoff;
+}
+
+/* Records a hook's answer: a throw closes holds and release retries until
+   more collections ran (doubling the wait while they keep failing); a
+   finished release finished every unfinished one before it. */
+static void bridge_event_hook_answered(DomBridge *bridge, int answer,
+                                       bool release)
+{
+    if (answer != BRIDGE_EVENT_HOOK_THREW) {
+        if (release) bridge->event_release_pending = false;
+        if (!bridge->event_release_pending) bridge->event_retry_backoff = 0;
+        return;
+    }
+#ifdef JS_RT_TEST_INSTRUMENTS
+    bridge->event_hook_failures++;
+#endif
+    if (release) bridge->event_release_pending = true;
+    bridge->event_retry_backoff = bridge->event_retry_backoff == 0 ? 1u
+        : bridge->event_retry_backoff >= 32u ? 64u
+        : (uint8_t) (bridge->event_retry_backoff * 2u);
+    bridge->event_retry_collection = bridge->host->heap_collections;
+}
+
+/* Calls a trusted event-state hook with one Float64Array per list: 1 when
+   it returned true, 0 otherwise, BRIDGE_EVENT_HOOK_THREW when it threw.
+   A release whose lists could not be made hands the bootstrap each
+   handle as a number instead, which needs no allocation to reach it, so
+   it can at least keep their holders for a later release. */
+static int bridge_event_state_call(DomBridge *bridge, JSValueConst hook,
+                                   const BridgeHandleList *lists,
+                                   int count)
+{
+    JSContext *context = bridge->host == NULL ? NULL : bridge->host->context;
+    if (context == NULL || !JS_IsFunction(context, hook)) return 0;
+    bool release = JS_VALUE_GET_PTR(hook)
+        == JS_VALUE_GET_PTR(bridge->trusted_release_event_holders);
+    JSValue arguments[2] = {JS_UNDEFINED, JS_UNDEFINED};
+    bool ready = true;
+    for (int i = 0; i < count && ready; i++) {
+        arguments[i] = bridge_handle_list_value(context, &lists[i]);
+        ready = !JS_IsException(arguments[i]);
+    }
+#ifdef JS_RT_TEST_INSTRUMENTS
+    bridge->event_state_hook_calls++;
+#endif
+#if !defined(__PSP__)
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    unsigned *refuse = release ? &faults->event_release_refuse_allocation
+                               : &faults->event_hold_refuse_allocation;
+    bool armed = ready && *refuse != 0;
+    if (armed) {
+        JS_TestRefuseAllocation(*refuse);
+        *refuse = 0;
+    }
+#endif
+    JSValue result = ready
+        ? JS_Call(context, hook, JS_UNDEFINED, count, arguments)
+        : JS_EXCEPTION;
+#if !defined(__PSP__)
+    if (armed) {
+        faults->event_hook_refused = !JS_TestRefusalPending();
+        JS_TestRefuseAllocation(0);
+    }
+#endif
+    int answer = JS_IsException(result) ? BRIDGE_EVENT_HOOK_THREW
+        : JS_IsBool(result) && JS_ToBool(context, result) > 0;
+    if (JS_IsException(result)) JS_FreeValue(context, JS_GetException(context));
+    JS_FreeValue(context, result);
+    for (int i = 0; i < count; i++) JS_FreeValue(context, arguments[i]);
+    if (!ready && release) {
+        for (size_t i = 0; i < lists[0].count; i++) {
+            JSValue handle = JS_NewFloat64(context, lists[0].items[i]);
+            result = JS_Call(context, hook, JS_UNDEFINED, 1, &handle);
+            if (JS_IsException(result))
+                JS_FreeValue(context, JS_GetException(context));
+            JS_FreeValue(context, result);
+        }
+    }
+    return answer;
+}
+
+static bool bridge_wrapper_slot_live(DomBridge *bridge, size_t slot)
+{
+    if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
+        || bridge->wrapper_refs == NULL
+        || !JS_IsObject(bridge->wrapper_refs[slot])) return false;
+    JSValue wrapper = JS_WeakRefDeref(bridge->host->context,
+                                      bridge->wrapper_refs[slot]);
+    bool live = JS_IsObject(wrapper);
+    JS_FreeValue(bridge->host->context, wrapper);
+    return live;
+}
+
+typedef struct {
+    DomBridge *bridge;
+    /* Holding: handles with event state, then those of live wrappers.
+       Otherwise: handles with held state only. */
+    BridgeHandleList lists[2];
+    bool holding;
+    bool refused;
+    /* Joining (bridge_event_state_joining): whether the moving subtree can
+       join the holder of the tree it moves into. */
+    bool joinable;
+    /* bridge_tree_held_handle: the first HELD handle found. */
+    int64_t found;
+} BridgeEventStateScan;
+
+static bool bridge_event_state_visit(void *opaque, lxb_dom_node_t *node)
+{
+    BridgeEventStateScan *scan = opaque;
+    DomBridge *bridge = scan->bridge;
+    size_t slot = bridge_node_index_find(bridge, node);
+    if (slot == SIZE_MAX) return false;
+    unsigned char flags = bridge->node_retention_flags[slot];
+    int64_t handle = bridge_node_handle(bridge, slot);
+    if (!scan->holding) {
+        if ((flags & BRIDGE_NODE_EVENT_HELD) != 0
+            && !bridge_handle_list_push(bridge, &scan->lists[0], handle))
+            scan->refused = true;
+        return scan->refused;
+    }
+    bridge->node_retention_flags[slot] |= BRIDGE_NODE_EVENT_IN_HELD_TREE;
+    /* A pinned node outlives every wrapper: its tree stays rooted. */
+    if ((flags & BRIDGE_NODE_NATIVE_PIN) != 0
+        || ((flags & BRIDGE_NODE_EVENT_STATE) != 0
+            && !bridge_handle_list_push(bridge, &scan->lists[0], handle))
+        || (bridge_wrapper_slot_live(bridge, slot)
+            && !bridge_handle_list_push(bridge, &scan->lists[1], handle)))
+        scan->refused = true;
+    return scan->refused;
+}
+
+/* Walks `root`'s lifetime tree; false when a bound or a refused list cut
+   it short. */
+static bool bridge_event_state_scan(DomBridge *bridge, lxb_dom_node_t *root,
+                                    bool holding, BridgeEventStateScan *scan)
+{
+    *scan = (BridgeEventStateScan) {.bridge = bridge, .holding = holding};
+    return bridge_live_subtree_visit(root, 0, bridge_event_state_visit, scan)
+               == BRIDGE_SUBTREE_NOT_FOUND
+        && !scan->refused;
+}
+
+static void bridge_event_state_scan_free(BridgeEventStateScan *scan)
+{
+    for (size_t i = 0; i < 2; i++)
+        budget_free(scan->bridge->budget, scan->lists[i].items);
+}
+
+/* Roots again the held event state found in `root`'s subtree. */
+static void bridge_release_event_state(DomBridge *bridge,
+                                       lxb_dom_node_t *root)
+{
+    if (bridge->event_held_slots == 0) return;
+    BridgeEventStateScan scan;
+    (void) bridge_event_state_scan(bridge, root, false, &scan);
+    if (scan.lists[0].count != 0)
+        bridge_event_hook_answered(
+            bridge,
+            bridge_event_state_call(
+                bridge, bridge->trusted_release_event_holders, scan.lists, 1),
+            true);
+    bridge_event_state_scan_free(&scan);
+}
+
+static bool bridge_first_held_visit(void *opaque, lxb_dom_node_t *node)
+{
+    BridgeEventStateScan *scan = opaque;
+    DomBridge *bridge = scan->bridge;
+    size_t slot = bridge_node_index_find(bridge, node);
+    if (slot == SIZE_MAX
+        || (bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_HELD) == 0)
+        return false;
+    scan->found = bridge_node_handle(bridge, slot);
+    return true;
+}
+
+/* A handle HELD in detached `root`'s lifetime tree, or 0; a repeat query
+   on an unchanged tree reuses the last answer without the walk. */
+static int64_t bridge_tree_held_handle(DomBridge *bridge, lxb_dom_node_t *root)
+{
+    if (root != bridge->event_holder_probe_root
+        || bridge->event_holder_epoch != bridge->event_holder_probe_epoch) {
+        BridgeEventStateScan scan = {.bridge = bridge};
+        bool found = bridge_live_subtree_visit(
+            root, 0, bridge_first_held_visit, &scan)
+            == BRIDGE_SUBTREE_FOUND;
+        bridge->event_holder_probe_root = root;
+        bridge->event_holder_probe_epoch = bridge->event_holder_epoch;
+        bridge->event_holder_probe_handle = found ? scan.found : 0;
+    }
+    return bridge->event_holder_probe_handle;
+}
+
+/* Joining: the held handles moving and, when it may join a holder, the
+   moving subtree's live wrappers (marking its nodes as in a held tree); a
+   pinned node refuses the join, as it refuses a hold. */
+static bool bridge_event_state_join_visit(void *opaque, lxb_dom_node_t *node)
+{
+    BridgeEventStateScan *scan = opaque;
+    DomBridge *bridge = scan->bridge;
+    size_t slot = bridge_node_index_find(bridge, node);
+    if (slot == SIZE_MAX) return false;
+    unsigned char flags = bridge->node_retention_flags[slot];
+    int64_t handle = bridge_node_handle(bridge, slot);
+    if ((flags & BRIDGE_NODE_EVENT_HELD) != 0
+        && !bridge_handle_list_push(bridge, &scan->lists[0], handle))
+        scan->refused = true;
+    if (scan->holding) {
+        bridge->node_retention_flags[slot] |= BRIDGE_NODE_EVENT_IN_HELD_TREE;
+        if ((flags & BRIDGE_NODE_NATIVE_PIN) != 0
+            || (bridge_wrapper_slot_live(bridge, slot)
+                && !bridge_handle_list_push(bridge, &scan->lists[1],
+                                            handle)))
+            scan->joinable = false;
+    }
+    return scan->refused;
+}
+
+/* Before `node` moves under `parent`: the held state moving with it, and
+   that of the tree it joins, must not depend on the wrappers of only one
+   side. Nothing to do unless one side may hold state: the moving subtree
+   has held nodes, or `parent` is marked BRIDGE_NODE_EVENT_IN_HELD_TREE (a
+   connected tree's state is never held). Into a held tree, the moving
+   subtree's wrappers join its holder, so a tree built step by step is not
+   rooted again on every insertion only for the next sweep to hold it
+   again. Otherwise, or when they cannot join, both sides' holders are
+   released (__tilefinchReleaseEventHolders, which gets the parent's
+   handle, then the moving held handles, and the wrappers to join). */
+static void bridge_event_state_joining(DomBridge *bridge,
+                                       lxb_dom_node_t *parent,
+                                       lxb_dom_node_t *node)
+{
+    if (bridge->event_held_slots == 0) return;
+    size_t slot = bridge_node_index_find(bridge, parent);
+    bool held_tree = slot != SIZE_MAX
+        && (bridge->node_retention_flags[slot]
+            & BRIDGE_NODE_EVENT_IN_HELD_TREE) != 0;
+    if (held_tree && bridge_node_is_connected(parent)) {
+        bridge->node_retention_flags[slot] &=
+            (unsigned char) ~BRIDGE_NODE_EVENT_IN_HELD_TREE;
+        held_tree = false;
+    }
+    bool moving = !bridge_node_is_connected(node);
+    BridgeEventStateScan scan = {.bridge = bridge};
+    scan.holding = held_tree && moving;
+    scan.joinable = scan.holding;
+    if (moving
+        && bridge_live_subtree_visit(
+               node, 0, bridge_event_state_join_visit, &scan)
+               != BRIDGE_SUBTREE_NOT_FOUND)
+        scan.joinable = false;
+    size_t moved = scan.lists[0].count;
+    if (held_tree || moved != 0) {
+        /* Held state changes trees: no probe may answer from before. */
+        if (moved != 0) bridge->event_holder_epoch++;
+        BridgeHandleList call[2] = {{0}, scan.lists[1]};
+        bool listed = bridge_handle_list_push(
+            bridge, &call[0],
+            slot == SIZE_MAX ? 0 : bridge_node_handle(bridge, slot));
+        for (size_t i = 0; listed && i < moved; i++)
+            listed = bridge_handle_list_push(
+                bridge, &call[0], (int64_t) scan.lists[0].items[i]);
+        /* A list cut short releases what it has, as before. A release
+           that threw may have left the parent's holder: keep the mark. */
+        int answer = bridge_event_state_call(
+            bridge, bridge->trusted_release_event_holders, call,
+            listed && scan.joinable ? 2 : 1);
+        bridge_event_hook_answered(bridge, answer, true);
+        bool parent_held = answer != 0;
+        budget_free(bridge->budget, call[0].items);
+        /* The mark outlived the parent's holder. */
+        slot = bridge_node_index_find(bridge, parent);
+        if (!parent_held && slot != SIZE_MAX)
+            bridge->node_retention_flags[slot] &=
+                (unsigned char) ~BRIDGE_NODE_EVENT_IN_HELD_TREE;
+    }
+    bridge_event_state_scan_free(&scan);
+}
+
+void bridge_pin_node_slot(DomBridge *bridge, size_t slot)
+{
+    bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+    if (bridge->event_held_slots == 0) return;
+    lxb_dom_node_t *root = bridge_owned_lifetime_root(bridge->nodes[slot]);
+    if (root != NULL && !bridge_node_is_connected(root))
+        bridge_release_event_state(bridge, root);
+}
+
+/* A hold refused by a wrapper the page made non-extensible: the tree's
+   rooted and kept nodes, whose state stayed where it was, are STUCK until
+   the tree changes. */
+static TILEFINCH_COLD_PATH void bridge_mark_stuck(DomBridge *bridge,
+                                                const BridgeHandleList *list)
+{
+    for (size_t i = 0; i < list->count; i++) {
+        size_t slot = 0;
+        if (!js_rt_bridge_node_slot_for_handle(
+                bridge, (int64_t) list->items[i], &slot)) continue;
+        unsigned char event = bridge->node_retention_flags[slot]
+            & (BRIDGE_NODE_EVENT_ROOTED | BRIDGE_NODE_EVENT_KEPT);
+        if (event != 0) bridge_set_event_state(bridge, slot, event, true);
+    }
+}
+
+/* Retries the releases the bootstrap could not finish (a number as the
+   handle list: no allocation reaches it). */
+static TILEFINCH_COLD_PATH void bridge_retry_event_releases(DomBridge *bridge)
+{
+    JSContext *context = bridge->host->context;
+    JSValueConst hook = bridge->trusted_release_event_holders;
+    if (context == NULL || !JS_IsFunction(context, hook)) return;
+#ifdef JS_RT_TEST_INSTRUMENTS
+    bridge->event_release_retries++;
+#endif
+    JSValue none = JS_NewInt32(context, 0);
+    JSValue result = JS_Call(context, hook, JS_UNDEFINED, 1, &none);
+    bool threw = JS_IsException(result);
+    if (threw) JS_FreeValue(context, JS_GetException(context));
+    JS_FreeValue(context, result);
+    bridge_event_hook_answered(bridge, threw ? BRIDGE_EVENT_HOOK_THREW : 0,
+                               true);
+}
+
+static void bridge_hold_detached_event_state(DomBridge *bridge, size_t slot)
+{
+    lxb_dom_node_t *node = bridge->nodes[slot];
+    if (!bridge_event_retry_open(bridge)) return;
+    if (node == NULL
+        || (bridge->node_retention_flags[slot]
+            & (BRIDGE_NODE_EVENT_ROOTED | BRIDGE_NODE_EVENT_KEPT)) == 0
+        || (bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_STUCK) != 0)
+        return;
+    lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
+    if (root == NULL || bridge_node_is_connected(root)) return;
+    BridgeEventStateScan scan;
+    /* A tree without a live wrapper is about to be discarded, or is kept
+       by native work that may still dispatch to it: leave it rooted. */
+    if (bridge_event_state_scan(bridge, root, true, &scan)
+        && scan.lists[1].count != 0) {
+        int answer = bridge_event_state_call(
+            bridge, bridge->trusted_hold_event_state, scan.lists, 2);
+        if (answer == 0) bridge_mark_stuck(bridge, &scan.lists[0]);
+        bridge_event_hook_answered(bridge, answer, false);
+    }
+    bridge_event_state_scan_free(&scan);
+}
+
+/* Moves `slot`'s event state bits to `event` (one of the
+   BRIDGE_NODE_EVENT_STATE bits, or 0) and STUCK to `stuck`, keeping the
+   held and stuck counts, and releasing a kept wrapper's reference when the
+   state leaves it. Taking that reference is js_dom_note_event_state's. */
+static void bridge_set_event_state(DomBridge *bridge, size_t slot,
+                                   unsigned char event, bool stuck)
+{
+    unsigned char flags = bridge->node_retention_flags[slot];
+    stuck = stuck && (event == BRIDGE_NODE_EVENT_ROOTED
+                      || event == BRIDGE_NODE_EVENT_KEPT);
+    bool was_held = (flags & BRIDGE_NODE_EVENT_HELD) != 0;
+    if (was_held != (event == BRIDGE_NODE_EVENT_HELD)) {
+        if (!was_held) bridge->event_held_slots++;
+        else if (bridge->event_held_slots != 0) bridge->event_held_slots--;
+#ifdef JS_RT_TEST_INSTRUMENTS
+        if (was_held) bridge->event_held_releases++;
+#endif
+        bridge->event_holder_epoch++;
+    }
+    bool was_stuck = (flags & BRIDGE_NODE_EVENT_STUCK) != 0;
+    if (was_stuck != stuck) {
+        if (!was_stuck) bridge->event_stuck_slots++;
+        else if (bridge->event_stuck_slots != 0) bridge->event_stuck_slots--;
+    }
+    bridge->node_retention_flags[slot] = (unsigned char) (
+        (flags & ~(BRIDGE_NODE_EVENT_STATE | BRIDGE_NODE_EVENT_STUCK))
+        | event | (stuck ? BRIDGE_NODE_EVENT_STUCK : 0u));
+    if ((flags & BRIDGE_NODE_EVENT_KEPT) == 0
+        || event == BRIDGE_NODE_EVENT_KEPT) return;
+    /* The reference js_dom_note_event_state took: the wrapper is alive
+       while it is held, so its WeakRef still answers. */
+    JSContext *context = bridge->host == NULL ? NULL : bridge->host->context;
+    if (context == NULL || bridge->wrapper_refs == NULL
+        || !JS_IsObject(bridge->wrapper_refs[slot])) return;
+    JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+    if (!JS_IsObject(wrapper)) return;
+    JS_FreeValue(context, wrapper);
+    JS_FreeValue(context, wrapper);
+}
+
+/* Native: where the node of handle argv[0] keeps its event state, argv[1]:
+   0 nowhere, 1 rooted, 2 held, 3 kept on its wrapper argv[2]. A note ends
+   STUCK (bridge_mark_stuck). False when the wrapper cannot be kept (it is
+   not the node's live wrapper). */
+JSValue js_dom_note_event_state(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    int32_t state = 0;
+    size_t slot = 0;
+    if (argc < 2 || JS_ToInt64(context, &handle, argv[0]) < 0
+        || JS_ToInt32(context, &state, argv[1]) < 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return JS_FALSE;
+    int32_t where = state & 3;
+    unsigned char event = where == 1 ? BRIDGE_NODE_EVENT_ROOTED
+        : where == 2 ? BRIDGE_NODE_EVENT_HELD
+        : where == 3 ? BRIDGE_NODE_EVENT_KEPT : 0;
+    if (event == BRIDGE_NODE_EVENT_KEPT
+        && (bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_KEPT) == 0) {
+        /* Hold one reference to the node's live wrapper, the one carrying
+           the state, until the state leaves it. */
+        if (argc < 3 || !JS_IsObject(argv[2])
+            || (bridge->node_retention_flags[slot]
+                & BRIDGE_NODE_LIVE_WRAPPER) == 0
+            || bridge->wrapper_refs == NULL
+            || !JS_IsObject(bridge->wrapper_refs[slot]))
+            return JS_FALSE;
+        JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+        if (!JS_IsObject(wrapper)
+            || JS_VALUE_GET_PTR(wrapper) != JS_VALUE_GET_PTR(argv[2])) {
+            JS_FreeValue(context, wrapper);
+            return JS_FALSE;
+        }
+        /* `wrapper` is the kept reference. */
+    }
+    bridge_set_event_state(bridge, slot, event, false);
+    if ((event == BRIDGE_NODE_EVENT_ROOTED || event == BRIDGE_NODE_EVENT_KEPT)
+        && !bridge_node_is_connected(bridge->nodes[slot]))
+        bridge_arm_wrapper_sweep(bridge);
+    return JS_TRUE;
+}
+
+/* Event targets: the bootstrap's listener and handler maps (dom.js), one
+   pair keyed by node handle and, on a section-paged page, one keyed by
+   stable key, start at 128 targets per map and double, up to the limit,
+   while the realm's heap can take both maps' growth and still keep the
+   execution reserve every script admission keeps free
+   (script_runtime_heap_available, script_admission.h). Each pair asks for
+   its own growth here. A target costs one Map record per map (key and
+   value JSValues, list links, hash chain), its allocation header and its
+   share of the hash table: 80.6 bytes measured on the 64-bit host (4,096
+   entries), about 52 on the PSP (a 40-byte record with NaN-boxed values
+   and 4-byte pointers). A stable-key target also keeps its key string
+   alive, which both maps share: up to argv[1] characters plus a string
+   header. A full per-handle pair costs about 416 KiB on the PSP; every
+   doubling of either pair is admitted against the heap as it is then, so
+   the two together never pass the reserve. 4,096 targets is half the
+   base handle table. */
+#define BRIDGE_EVENT_TARGET_LIMIT 4096u
+#define BRIDGE_EVENT_TARGET_ENTRY_BYTES (sizeof(void *) == 4u ? 52u : 81u)
+/* The largest key length argv[1] may claim, and a key string's header. */
+#define BRIDGE_EVENT_TARGET_KEY_LIMIT 1024u
+#define BRIDGE_EVENT_TARGET_KEY_HEADER_BYTES 16u
+
+/* Native: the capacity a pair of maps holding argv[0] targets each may
+   grow to, each target keeping a key of up to argv[1] characters (0 for
+   handle keys); argv[0] itself when growth is refused. */
+JSValue js_dom_grow_event_targets(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t current = 0, key_length = 0;
+    if (argc < 1 || JS_ToInt64(context, &current, argv[0]) < 0
+        || current <= 0 || bridge == NULL || bridge->host == NULL)
+        return JS_NewInt64(context, current);
+    if ((uint64_t) current >= BRIDGE_EVENT_TARGET_LIMIT)
+        return JS_NewInt64(context, current);
+    if (argc > 1 && (JS_ToInt64(context, &key_length, argv[1]) < 0
+                     || key_length < 0
+                     || key_length > BRIDGE_EVENT_TARGET_KEY_LIMIT))
+        return JS_NewInt64(context, current);
+    size_t next = (size_t) current * 2u;
+    if (next > BRIDGE_EVENT_TARGET_LIMIT) next = BRIDGE_EVENT_TARGET_LIMIT;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->refuse_event_target_growth)
+        return JS_NewInt64(context, current);
+#endif
+    size_t per_target = 2u * BRIDGE_EVENT_TARGET_ENTRY_BYTES
+        + (key_length == 0 ? 0u
+           : (size_t) key_length + BRIDGE_EVENT_TARGET_KEY_HEADER_BYTES);
+    size_t step = (next - (size_t) current) * per_target;
+    size_t available = script_runtime_heap_available(bridge->host);
+    if (step > available
+        || SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES > available - step)
+        return JS_NewInt64(context, current);
+    return JS_NewInt64(context, (int64_t) next);
+}
+
+/* The handle whose held state a new wrapper for slot `slot` joins: one
+   HELD in the node's detached tree, or 0. */
+static int64_t bridge_wrapper_event_holder(DomBridge *bridge, size_t slot)
+{
+    if (bridge->event_held_slots == 0) return 0;
+    int64_t held = (bridge->node_retention_flags[slot]
+                    & BRIDGE_NODE_EVENT_HELD) != 0
+        ? bridge_node_handle(bridge, slot) : 0;
+    if (held == 0) {
+        lxb_dom_node_t *root = bridge_owned_lifetime_root(bridge->nodes[slot]);
+        if (root == NULL || bridge_node_is_connected(root)) return 0;
+        held = bridge_tree_held_handle(bridge, root);
+    }
+    /* An insertion under the node must now consider that holder. */
+    if (held != 0)
+        bridge->node_retention_flags[slot] |= BRIDGE_NODE_EVENT_IN_HELD_TREE;
+    return held;
+}
+
 typedef struct {
     const DomBridge *bridge;
     unsigned char *retire_slots;
@@ -1264,7 +2056,8 @@ static bool bridge_subtree_visit_handles(void *opaque, lxb_dom_node_t *node)
     BridgeSubtreeHandleScan *scan = opaque;
     size_t slot = bridge_node_index_find(scan->bridge, node);
     if (slot == SIZE_MAX) return false;
-    if (scan->bridge->node_retention_flags[slot] != 0) return true;
+    if ((scan->bridge->node_retention_flags[slot] & BRIDGE_NODE_RETAINING)
+        != 0) return true;
     scan->retire_slots[slot / 8u] |= (unsigned char) (1u << (slot % 8u));
     if (slot < scan->first_slot) scan->first_slot = slot;
     if (slot > scan->last_slot) scan->last_slot = slot;
@@ -1273,6 +2066,49 @@ static bool bridge_subtree_visit_handles(void *opaque, lxb_dom_node_t *node)
 
 static void bridge_adopted_sheet_unpin(DomBridge *bridge,
                                        lxb_dom_node_t *sheet);
+
+/* The preflight walk below proves the depth/visit bounds before teardown.
+   HTML-specific Lexbor destructors free their element record, but not its
+   attributes. Deep destroy also follows child links, not template.content;
+   the template destructor frees the fragment itself but not its children. */
+static void bridge_prepare_owned_tree_destroy(DomBridge *bridge,
+                                               lxb_dom_node_t *root,
+                                               size_t ownership_depth)
+{
+    if (root == NULL || ownership_depth >= 8) return;
+    DomDocumentOrderTraversal traversal = {.next = root, .boundary = root};
+    for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
+         at != NULL; at = dom_document_order_next(&traversal)) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT || at->ns != LXB_NS_HTML)
+            continue;
+        lxb_dom_element_t *html = lxb_dom_interface_element(at);
+        for (size_t count = 0; html->first_attr != NULL
+             && count < DOM_TRAVERSAL_VISIT_LIMIT; count++) {
+            lxb_dom_attr_t *attr = html->first_attr;
+            (void) lxb_dom_element_attr_remove(html, attr);
+            lxb_dom_attr_interface_destroy(attr);
+        }
+        size_t length = 0;
+        const char *name = document_element_name(at, &length);
+        if (name == NULL || length != 8 || strncasecmp(name, "template", 8) != 0)
+            continue;
+        lxb_html_template_element_t *element = lxb_html_interface_template(at);
+        lxb_dom_node_t *content = element->content == NULL ? NULL
+            : lxb_dom_interface_node(element->content);
+        if (content == NULL) continue;
+        /* Child-link retirement does not cross template.content. Announce
+           each owned fragment while all its nodes still exist, so native
+           image/style/layout consumers cannot retain freed descendants. */
+        images_retire_subtree(bridge->images, content);
+        if (bridge->node_retirement != NULL)
+            bridge->node_retirement(bridge->node_retirement_opaque, content);
+        document_parser_insertions_discard_subtree(bridge->document, content);
+        bridge_prepare_owned_tree_destroy(bridge, content, ownership_depth + 1u);
+        for (size_t count = 0; content->first_child != NULL
+             && count < DOM_TRAVERSAL_VISIT_LIMIT; count++)
+            lxb_dom_node_destroy_deep(content->first_child);
+    }
+}
 static void bridge_mutation_journal_append(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length,
@@ -1412,6 +2248,10 @@ static size_t bridge_discard_unretained_detached_subtree(
             released++;
         }
     }
+    images_retire_subtree(bridge->images, root);
+    /* Every handle in the subtree, template contents included, is retired
+       above. */
+    js_rt_image_preload_forget_released(bridge);
     if (bridge->node_retirement != NULL) {
         bridge->node_retirement(bridge->node_retirement_opaque, root);
     }
@@ -1423,6 +2263,7 @@ static size_t bridge_discard_unretained_detached_subtree(
         bridge->document, root, unadopted, DOCUMENT_CONSTRUCTED_SHEET_LIMIT);
     /* Detached: no style can change, and the removal walk is wasted. */
     document_style_quiet_begin();
+    bridge_prepare_owned_tree_destroy(bridge, root, 0);
     lxb_dom_node_destroy_deep(root);
     document_style_quiet_end();
     for (size_t i = 0; i < unadopted_count; i++)
@@ -1443,6 +2284,8 @@ void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle)
     bridge->node_retention_flags[slot] &=
         (unsigned char) ~BRIDGE_NODE_NATIVE_PIN;
     if (node == NULL || bridge_node_is_connected(node)) return;
+    /* Its tree's rooted event state may now move to its wrappers. */
+    bridge_arm_wrapper_sweep(bridge);
     lxb_dom_node_t *root = bridge_owned_lifetime_root(node);
     (void) bridge_discard_unretained_detached_subtree(bridge, root);
 }
@@ -1495,6 +2338,135 @@ static void bridge_note_adopted_styles_changed(DomBridge *bridge,
     bridge->mutations.stylesheet_rebuild_required = true;
 }
 
+static JSValue registered_property_result(JSContext *context, int status)
+{
+    if (status == 0) return JS_UNDEFINED;
+    if (status < 0) return JS_ThrowOutOfMemory(context);
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue constructor = JS_GetPropertyStr(context, global, "DOMException");
+    JS_FreeValue(context, global);
+    if (JS_IsException(constructor)) return constructor;
+    const char *name = status == 1 ? "InvalidModificationError"
+        : status == 2 ? "SyntaxError" : "QuotaExceededError";
+    JSValue arguments[2] = {
+        JS_NewString(context, "Property registration failed"),
+        JS_NewString(context, name)
+    };
+    JSValue error = JS_IsException(arguments[0]) || JS_IsException(arguments[1])
+        ? JS_EXCEPTION : JS_CallConstructor(context, constructor, 2, arguments);
+    JS_FreeValue(context, arguments[0]);
+    JS_FreeValue(context, arguments[1]);
+    JS_FreeValue(context, constructor);
+    return JS_IsException(error) ? error : JS_Throw(context, error);
+}
+
+/* Allocate the document record before changing the live cascade:
+   an allocation refusal must not leave a ghost duplicate registration. */
+JSValue js_css_register_property(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->document == NULL)
+        return registered_property_result(context, 3);
+    if (argc < 1 || !JS_IsObject(argv[0]))
+        return JS_ThrowTypeError(context, "Property definition required");
+    /* Read Web IDL dictionary members once in lexicographic order. */
+    JSValue member = JS_GetPropertyStr(context, argv[0], "inherits");
+    if (JS_IsException(member)) return member;
+    if (JS_IsUndefined(member))
+        return JS_ThrowTypeError(context, "inherits required");
+    bool inherits = JS_ToBool(context, member) != 0;
+    JS_FreeValue(context, member);
+    size_t name_length = 0, initial_length = 0, syntax_length = 1;
+    const char *name = NULL, *initial = NULL, *syntax = NULL;
+    member = JS_GetPropertyStr(context, argv[0], "initialValue");
+    if (JS_IsException(member)) goto exception;
+    if (!JS_IsUndefined(member)) {
+        initial = JS_ToCStringLen(context, &initial_length, member);
+        JS_FreeValue(context, member);
+        if (initial == NULL) goto exception;
+    }
+    member = JS_GetPropertyStr(context, argv[0], "name");
+    if (JS_IsException(member)) goto exception;
+    if (JS_IsUndefined(member)) {
+        JS_ThrowTypeError(context, "name required");
+        goto exception;
+    }
+    name = JS_ToCStringLen(context, &name_length, member);
+    JS_FreeValue(context, member);
+    if (name == NULL) goto exception;
+    member = JS_GetPropertyStr(context, argv[0], "syntax");
+    if (JS_IsException(member)) goto exception;
+    if (!JS_IsUndefined(member)) {
+        syntax = JS_ToCStringLen(context, &syntax_length, member);
+        JS_FreeValue(context, member);
+        if (syntax == NULL) goto exception;
+    }
+    int status = 0;
+    PocDocument *document = bridge->document;
+    /* The dictionary's syntax defaults to "*". */
+    const char *syntax_text = syntax == NULL ? "*" : syntax;
+    if (strlen(syntax_text) != syntax_length
+        || strlen(name) != name_length
+        || (initial != NULL && (initial_length >= STYLE_CUSTOM_VALUE_CAPACITY
+                                || strlen(initial) != initial_length)))
+        status = 2;
+    StyleRegistrationSyntax kind = status != 0 ? STYLE_REGISTRATION_INVALID
+        : style_registered_property_check(name, name_length, syntax_text,
+                                          syntax_length, initial,
+                                          initial_length);
+    if (kind == STYLE_REGISTRATION_INVALID) status = 2;
+    bool length_syntax = kind == STYLE_REGISTRATION_LENGTH;
+    for (DocumentRegisteredProperty *p = document->registered_properties;
+         status == 0 && p != NULL; p = p->next)
+        if (strcmp(name, p->name) == 0) status = 1;
+    if (status == 0 && document->registered_property_count
+                       >= STYLE_REGISTERED_PROPERTY_LIMIT) status = 3;
+    if (status == 0) {
+        BudgetAllocationOwner owner = document_allocation_owner_enter(document);
+        DocumentRegisteredProperty *p = budget_malloc(document->budget,
+            sizeof(*p) + name_length + 1u
+            + (initial == NULL ? 0 : initial_length + 1u));
+        document_allocation_owner_leave(document, owner);
+        if (p == NULL) status = -1;
+        else {
+            char *storage = (char *) (p + 1);
+            memcpy(storage, name, name_length + 1u);
+            *p = (DocumentRegisteredProperty) {
+                .name = storage,
+                .initial_value = initial == NULL ? NULL : storage + name_length + 1u,
+                .inherits = inherits,
+                .length_syntax = length_syntax
+            };
+            if (initial != NULL)
+                memcpy(storage + name_length + 1u, initial, initial_length + 1u);
+            if (bridge->stylesheet != NULL
+                && !stylesheet_register_api_property(
+                    (Stylesheet *) bridge->stylesheet, p)) {
+                budget_free(document->budget, p);
+                status = -1;
+            } else {
+                p->next = document->registered_properties;
+                document->registered_properties = p;
+                document->registered_property_count++;
+                if (bridge->stylesheet != NULL)
+                    ((Stylesheet *) bridge->stylesheet)->api_registrations = p;
+                bridge_note_adopted_styles_changed(bridge, NULL);
+            }
+        }
+    }
+    JS_FreeCString(context, initial);
+    JS_FreeCString(context, name);
+    JS_FreeCString(context, syntax);
+    return registered_property_result(context, status);
+exception:
+    JS_FreeCString(context, initial);
+    JS_FreeCString(context, name);
+    JS_FreeCString(context, syntax);
+    return JS_EXCEPTION;
+}
+
 /* CSSOM native text is independent of the owner's DOM children. */
 JSValue js_dom_constructed_sheet_text(JSContext *context,
                                       JSValueConst this_value,
@@ -1502,7 +2474,7 @@ JSValue js_dom_constructed_sheet_text(JSContext *context,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    lxb_dom_node_t *node = argc > 1
+    lxb_dom_node_t *node = argc > 0
         ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
     if (node == NULL || bridge->document == NULL
         || bridge->document->html == NULL
@@ -1510,6 +2482,11 @@ JSValue js_dom_constructed_sheet_text(JSContext *context,
         || node->local_name != LXB_TAG_STYLE
         || node->ns != LXB_NS_HTML)
         return JS_FALSE;
+    if (argc == 1) {
+        size_t length = 0;
+        const char *text = document_cssom_sheet_text(node, &length);
+        return text == NULL ? JS_NULL : JS_NewStringLen(context, text, length);
+    }
     bool constructed = argc < 3 || JS_ToBool(context, argv[2]);
     if (constructed && (node->parent != NULL || node->local_name != LXB_TAG_STYLE))
         return JS_FALSE;
@@ -1652,8 +2629,7 @@ JSValue js_dom_set_adopted_sheets(JSContext *context,
         return JS_FALSE;
     for (int64_t i = 0; i < length; i++) {
         size_t slot = bridge_node_index_find(bridge, sheets[i]);
-        if (slot != SIZE_MAX)
-            bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+        if (slot != SIZE_MAX) bridge_pin_node_slot(bridge, slot);
     }
     if (document_adopted_sheets_signature(bridge->document) != before)
         bridge_note_adopted_styles_changed(bridge, root);
@@ -1667,6 +2643,9 @@ static void bridge_detach_and_discard_children(
 {
     if (bridge == NULL || parent == NULL) return;
     bool trace = tilefinch_trace_script_failures();
+    /* A removed subtree a wrapper keeps may hold rooted event state that
+       must move to its wrappers, as for bridge_note_removal. */
+    if (parent->first_child != NULL) bridge_arm_wrapper_sweep(bridge);
     while (parent->first_child != NULL) {
         lxb_dom_node_t *child = parent->first_child;
         unsigned child_type = (unsigned) child->type;
@@ -2035,8 +3014,13 @@ static bool bridge_query_selector_matches(const BridgeQuerySelector *query,
 lxb_dom_node_t *dom_document_order_next(
     DomDocumentOrderTraversal *traversal)
 {
-    if (traversal == NULL || traversal->next == NULL
-        || traversal->visited >= DOM_TRAVERSAL_VISIT_LIMIT) return NULL;
+    if (traversal == NULL || traversal->next == NULL) return NULL;
+    size_t limit = traversal->visit_limit == 0
+        ? DOM_TRAVERSAL_VISIT_LIMIT : traversal->visit_limit;
+    if (traversal->visited >= limit) {
+        traversal->exhausted = true;
+        return NULL;
+    }
     lxb_dom_node_t *node = traversal->next;
     traversal->visited++;
     traversal->current_depth = traversal->next_depth;
@@ -2061,11 +3045,12 @@ lxb_dom_node_t *dom_document_order_next(
     size_t climbed = 0;
     while (at != NULL && at != traversal->boundary
            && at->next == NULL
-           && climbed++ < DOM_TRAVERSAL_VISIT_LIMIT) {
+           && climbed++ < limit) {
         at = at->parent;
     }
+    if (climbed >= limit) traversal->exhausted = true;
     traversal->next = at == NULL || at == traversal->boundary
-        || climbed >= DOM_TRAVERSAL_VISIT_LIMIT ? NULL : at->next;
+        || climbed >= limit ? NULL : at->next;
     traversal->next_depth = climbed > traversal->current_depth
         ? 0 : traversal->current_depth - climbed;
     return node;
@@ -2185,7 +3170,7 @@ static bool script_element_states_clone_subtree(
     bool recorded = script_element_states_clone_pass(
         bridge, source, clone, deep, &started, &unstarted);
     if (!recorded) {
-        bridge_reclaim_node_slots(bridge, source);
+        bridge_reclaim_node_slots(bridge, source, false);
         started = unstarted = 0;
         recorded = script_element_states_clone_pass(
             bridge, source, clone, deep, &started, &unstarted);
@@ -4308,18 +5293,25 @@ static JSValue bridge_interned_string(JSContext *context, const char *chars,
     return value;
 }
 
-/* __tilefinchNodeIdentity(handle[, array]): a new wrapper's identity in
-   one call, [tagName, nodeType, namespaceURI, section identity], each as
-   __tilefinchTagName (|| ""), __tilefinchNodeType, __tilefinchNamespaceURI
-   and __tilefinchSectionIdentity report it. */
+/* __tilefinchNodeIdentity(handle[, array[, held]]): a new wrapper's
+   identity in one call, [tagName, nodeType, namespaceURI, section
+   identity], each as __tilefinchTagName (|| ""), __tilefinchNodeType,
+   __tilefinchNamespaceURI and __tilefinchSectionIdentity report it. When
+   `held` (the bootstrap holds some detached tree's event state), a fifth
+   entry: the handle whose holder the wrapper joins, or 0
+   (bridge_wrapper_event_holder), so a wrapper needs no second call. */
 JSValue js_dom_node_identity(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv)
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    lxb_dom_node_t *node = argc > 0
-        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    int64_t handle = 0;
+    size_t slot = 0;
+    lxb_dom_node_t *node = argc > 0 && bridge != NULL
+        && JS_ToInt64(context, &handle, argv[0]) >= 0 && handle > 0
+        && js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+        ? bridge->nodes[slot] : NULL;
     bool element = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT;
     size_t length = 0;
     const char *name = element
@@ -4368,6 +5360,14 @@ JSValue js_dom_node_identity(JSContext *context,
                context, identity, 3,
                JS_NewInt64(context, bridge == NULL
                            ? 0 : (int64_t) bridge->section_identity)) < 0) {
+        JS_FreeValue(context, identity);
+        return JS_EXCEPTION;
+    }
+    if (argc > 2 && JS_ToBool(context, argv[2]) > 0
+        && JS_SetPropertyUint32(
+               context, identity, 4,
+               JS_NewInt64(context, node == NULL ? 0
+                           : bridge_wrapper_event_holder(bridge, slot))) < 0) {
         JS_FreeValue(context, identity);
         return JS_EXCEPTION;
     }
@@ -5328,19 +6328,14 @@ JSValue js_dom_get_custom_state(JSContext *context,
 #define DOM_TEXT_CONTENT_NODE_LIMIT 200000u
 #define DOM_TEXT_CONTENT_BYTE_LIMIT (8u * 1024u * 1024u)
 
-/* The selector traversal has a smaller, silently terminating quota. Text
-   reads need their own complete walk: the caller checks the visited count
-   and throws rather than publishing a prefix. Parent links are native-owned. */
-static lxb_dom_node_t *bridge_text_content_next(lxb_dom_node_t *at,
-                                               const lxb_dom_node_t *root)
+/* Text reads walk the whole subtree under their own, larger quota and
+   throw rather than publish a prefix when they reach it. */
+static DomDocumentOrderTraversal bridge_text_content_walk(lxb_dom_node_t *root)
 {
-    if (at->first_child != NULL) return at->first_child;
-    for (size_t climbed = 0; at != root && at->next == NULL
-         && climbed < DOM_TEXT_CONTENT_NODE_LIMIT; climbed++) {
-        at = at->parent;
-        if (at == NULL) return NULL;
-    }
-    return at == root ? NULL : at->next;
+    return (DomDocumentOrderTraversal) {
+        .next = root, .boundary = root,
+        .visit_limit = DOM_TEXT_CONTENT_NODE_LIMIT,
+    };
 }
 
 static JSValue bridge_text_string(JSContext *context, const char *text, size_t length)
@@ -5419,24 +6414,26 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
     /* Complete results or an explicit quota error, never a silent prefix.
        These bounds cover the admitted document and the existing rendered-text
        traversal ceiling while keeping hostile script-built trees bounded. */
-    size_t length = 0, visited = 0;
-    for (lxb_dom_node_t *at = node; at != NULL;
-         at = bridge_text_content_next(at, node)) {
-        if (++visited > DOM_TEXT_CONTENT_NODE_LIMIT)
-            return JS_ThrowRangeError(context, "textContent node quota exceeded");
+    size_t length = 0;
+    DomDocumentOrderTraversal walk = bridge_text_content_walk(node);
+    for (lxb_dom_node_t *at = dom_document_order_next(&walk); at != NULL;
+         at = dom_document_order_next(&walk)) {
         if (at->type != LXB_DOM_NODE_TYPE_TEXT) continue;
         size_t bytes = lxb_dom_interface_text(at)->char_data.data.length;
         if (bytes > DOM_TEXT_CONTENT_BYTE_LIMIT - length)
             return JS_ThrowRangeError(context, "textContent byte quota exceeded");
         length += bytes;
     }
+    if (walk.exhausted)
+        return JS_ThrowRangeError(context, "textContent node quota exceeded");
     char local[512];
     char *text = length <= sizeof(local) ? local
         : budget_malloc(bridge->budget, length);
     if (text == NULL) return JS_ThrowOutOfMemory(context);
     size_t used = 0;
-    for (lxb_dom_node_t *at = node; at != NULL;
-         at = bridge_text_content_next(at, node)) {
+    walk = bridge_text_content_walk(node);
+    for (lxb_dom_node_t *at = dom_document_order_next(&walk); at != NULL;
+         at = dom_document_order_next(&walk)) {
         if (at->type != LXB_DOM_NODE_TYPE_TEXT) continue;
         const lexbor_str_t *data = &lxb_dom_interface_text(at)->char_data.data;
         if (data->length != 0) memcpy(text + used, data->data, data->length);
@@ -5631,6 +6628,9 @@ JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
         if (length != 0 && replacement == NULL) {
             status = LXB_STATUS_ERROR_MEMORY_ALLOCATION;
         } else {
+            /* As bridge_detach_and_discard_children: the sweep hands the
+               event state of a retained removed subtree to its wrappers. */
+            if (node->first_child != NULL) bridge_arm_wrapper_sweep(bridge);
             while (node->first_child != NULL) {
                 lxb_dom_node_t *removed = node->first_child;
                 document_style_quiet_begin();
@@ -5895,6 +6895,7 @@ JSValue js_dom_image_property(JSContext *context,
                               : JS_NewStringLen(context, source, length);
     }
     const ImageResource *image = images_find_node(bridge->images, node);
+    if (!image_resource_available(image)) image = js_rt_image_preload_find(bridge, node);
     bool available = image_resource_available(image);
     if (property == 1) {
         return JS_NewInt32(context, available ? image->source_width : 0);
@@ -5907,7 +6908,9 @@ JSValue js_dom_image_property(JSContext *context,
         const char *source = image_select_source(
             bridge->stylesheet, node, &length);
         return JS_NewBool(context,
-                          source == NULL || length == 0 || available);
+                          source == NULL || length == 0 || available
+                          || js_rt_image_preload_status(bridge, node) == 2
+                          || js_rt_image_preload_broken(bridge, node));
     }
     return JS_NewInt32(context, 0);
 }
@@ -6049,6 +7052,7 @@ JSValue js_dom_set_attribute(JSContext *context,
         && strncasecmp(name, "async", 5) == 0;
     bool source_attribute = name_length == 3
         && strncasecmp(name, "src", 3) == 0;
+    bool preload_ok = true;
     if (attribute != NULL) {
         if (name_length == 5 && strncasecmp(name, "style", 5) == 0) {
             document_style_attribute_set_cssom_authorized(node, false);
@@ -6068,6 +7072,11 @@ JSValue js_dom_set_attribute(JSContext *context,
         if (source_attribute) {
             (void) js_rt_dynamic_prepare_subtree(context, node);
         }
+        if (node->local_name == LXB_TAG_IMG && (source_attribute
+            || (name_length == 6 && strncasecmp(name, "srcset", 6) == 0)
+            || (name_length == 5 && strncasecmp(name, "sizes", 5) == 0)
+            || (name_length == 11 && strncasecmp(name, "crossorigin", 11) == 0)))
+            preload_ok = js_rt_image_preload_changed(bridge, node);
     }
     JS_FreeCString(context, value);
     JS_FreeCString(context, name);
@@ -6076,7 +7085,7 @@ JSValue js_dom_set_attribute(JSContext *context,
         if (finished_ns > write_started_ns)
             bridge->attribute_write_ns += finished_ns - write_started_ns;
     }
-    return JS_NewBool(context, attribute != NULL);
+    return preload_ok ? JS_NewBool(context, attribute != NULL) : JS_EXCEPTION;
 }
 
 JSValue js_dom_set_control_value(JSContext *context,
@@ -6230,15 +7239,22 @@ JSValue js_dom_remove_attribute(JSContext *context,
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length);
     document_style_quiet_end();
+    bool preload_ok = true;
     if (existed && status == LXB_STATUS_OK) {
         bridge_mutated_with_relational(
             bridge, SCRIPT_MUTATION_ATTRIBUTE, node,
             name, name_length, relational_selector_sensitive,
             changed_tokens_exact ? changed_tokens : NULL,
             changed_token_count);
+        if (node->local_name == LXB_TAG_IMG
+            && (bridge_mutation_name_equal(name, name_length, "src")
+                || bridge_mutation_name_equal(name, name_length, "srcset")
+                || bridge_mutation_name_equal(name, name_length, "sizes")
+                || bridge_mutation_name_equal(name, name_length, "crossorigin")))
+            preload_ok = js_rt_image_preload_changed(bridge, node);
     }
     JS_FreeCString(context, name);
-    return JS_NewBool(context, status == LXB_STATUS_OK);
+    return preload_ok ? JS_NewBool(context, status == LXB_STATUS_OK) : JS_EXCEPTION;
 }
 
 static bool property_equal(const char *first, size_t first_length,
@@ -7081,6 +8097,8 @@ static void bridge_computed_style_node_removed(void *opaque,
     DomBridge *bridge = opaque;
     if (bridge->computed_style_memo.node == node)
         bridge->computed_style_memo.node = NULL;
+    if (bridge->transition_ancestors_memo.parent == node)
+        bridge->transition_ancestors_memo.parent = NULL;
     __typeof__(bridge->computed_style_cache) *cache =
         &bridge->computed_style_cache;
     if (cache->entries == NULL) return;
@@ -7206,6 +8224,7 @@ void js_rt_bridge_computed_style_cache_free(DomBridge *bridge)
     budget_free(bridge->budget, bridge->computed_style_cache.entries);
     bridge->computed_style_cache.entries = NULL;
     bridge->computed_style_memo.node = NULL;
+    bridge->transition_ancestors_memo.parent = NULL;
 }
 
 /* A document is leaving the bridge (script_runtime_detach_document): its
@@ -7217,6 +8236,7 @@ void js_rt_bridge_computed_style_cache_forget(DomBridge *bridge)
 {
     if (bridge == NULL) return;
     bridge->computed_style_memo.node = NULL;
+    bridge->transition_ancestors_memo.parent = NULL;
     __typeof__(bridge->computed_style_cache) *cache =
         &bridge->computed_style_cache;
     if (cache->entries == NULL) return;
@@ -7618,7 +8638,7 @@ enum {
     X(FONT_WEIGHT, "font-weight", true, CSP_STYLE_ONLY) \
     X(GAP, "gap", false, 0) \
     X(GRID_TEMPLATE_AREAS, "grid-template-areas", true, 0) \
-    X(GRID_TEMPLATE_COLUMNS, "grid-template-columns", true, 0) \
+    X(GRID_TEMPLATE_COLUMNS, "grid-template-columns", true, CSP_USED_GEOMETRY) \
     X(GRID_TEMPLATE_ROWS, "grid-template-rows", true, 0) \
     X(HEIGHT, "height", true, CSP_USED_GEOMETRY) \
     X(HYPHENS, "hyphens", true, CSP_SPARSE_MODERN) \
@@ -7785,43 +8805,67 @@ static size_t computed_transition_time(double ms, char *output, size_t size)
     return written < 0 ? 0 : (size_t) written;
 }
 
-static void computed_transition_value(ComputedStylePropertyId id,
-                                      const StyleTransitionComputed *t,
-                                      char *output, size_t size)
+/* Appends `text` to the transition value being built, counting bytes past
+   `size` so a first pass can measure the whole value. */
+static void computed_transition_append(char *output, size_t size,
+                                       size_t *used, const char *text)
+{
+    size_t length = strlen(text);
+    if (*used < size) {
+        size_t copied = length < size - *used ? length : size - *used - 1u;
+        memcpy(output + *used, text, copied);
+        output[*used + copied] = '\0';
+    }
+    *used += length;
+}
+
+/* Serializes transition longhand or shorthand `id` into `output` (which
+   may be NULL when `size` is 0) and returns its length, as snprintf does:
+   a value with long linear() easings is measured, then built in full. */
+static size_t computed_transition_value(ComputedStylePropertyId id,
+                                        const StyleTransitionComputed *t,
+                                        char *output, size_t size)
 {
     size_t used = 0;
-    output[0] = '\0';
+    if (size != 0) output[0] = '\0';
     unsigned count = id == CSP_TRANSITION_DELAY ? t->delay_count
         : id == CSP_TRANSITION_DURATION ? t->duration_count
         : id == CSP_TRANSITION_TIMING_FUNCTION ? t->timing_count
         : t->property_count;
-    for (unsigned i = 0; i < count && used + 1u < size; i++) {
-        char item[160];
+    for (unsigned i = 0; i < count; i++) {
+        char time[40];
+        if (i != 0) computed_transition_append(output, size, &used, ", ");
         if (id == CSP_TRANSITION_DELAY) {
-            computed_transition_time(t->delay_ms[i], item, sizeof(item));
+            computed_transition_time(t->delay_ms[i], time, sizeof(time));
+            computed_transition_append(output, size, &used, time);
         } else if (id == CSP_TRANSITION_DURATION) {
-            computed_transition_time(t->duration_ms[i], item, sizeof(item));
+            computed_transition_time(t->duration_ms[i], time, sizeof(time));
+            computed_transition_append(output, size, &used, time);
         } else if (id == CSP_TRANSITION_TIMING_FUNCTION) {
-            snprintf(item, sizeof(item), "%s", t->timings[i]);
+            computed_transition_append(output, size, &used,
+                                       style_transition_timing(t, i));
         } else if (id == CSP_TRANSITION_PROPERTY) {
-            snprintf(item, sizeof(item), "%s", t->properties[i]);
+            computed_transition_append(output, size, &used,
+                                       t->properties[i]);
         } else {
             /* The shorthand pairs each property with the other lists,
                which repeat to its length. */
-            char duration[40], delay[40];
+            computed_transition_append(output, size, &used,
+                                       t->properties[i]);
+            computed_transition_append(output, size, &used, " ");
             computed_transition_time(
-                t->duration_ms[i % t->duration_count], duration,
-                sizeof(duration));
+                t->duration_ms[i % t->duration_count], time, sizeof(time));
+            computed_transition_append(output, size, &used, time);
+            computed_transition_append(output, size, &used, " ");
+            computed_transition_append(output, size, &used,
+                style_transition_timing(t, i % t->timing_count));
+            computed_transition_append(output, size, &used, " ");
             computed_transition_time(
-                t->delay_ms[i % t->delay_count], delay, sizeof(delay));
-            snprintf(item, sizeof(item), "%s %s %s %s", t->properties[i],
-                     duration, t->timings[i % t->timing_count], delay);
+                t->delay_ms[i % t->delay_count], time, sizeof(time));
+            computed_transition_append(output, size, &used, time);
         }
-        int written = snprintf(output + used, size - used, "%s%s",
-                               i == 0 ? "" : ", ", item);
-        if (written < 0 || (size_t) written >= size - used) break;
-        used += (size_t) written;
     }
+    return used;
 }
 
 /* __tilefinchTransitionSnapshot(handle, names) ->
@@ -7830,6 +8874,24 @@ static void computed_transition_value(ComputedStylePropertyId id,
    values of names, resolved without a synchronous layout. The watcher needs
    those values while no transition applies too: a class can bring the
    transition and the new value together. */
+/* Whether `at` resolves display:none (*hidden). A style the cache already
+   validated in this epoch is read in place; a miss resolves and caches the
+   chain above it. False when the cascade was interrupted. */
+static bool bridge_transition_display_none(DomBridge *bridge, bool style_cache,
+                                           lxb_dom_node_t *at, bool *hidden)
+{
+    const struct ComputedStyleCacheEntry *hit = style_cache
+        ? computed_style_cache_find(bridge, at) : NULL;
+    if (hit != NULL && hit->stamp == bridge->computed_style_cache.epoch) {
+        *hidden = hit->style.display == DISPLAY_NONE;
+        return true;
+    }
+    ComputedStyle style;
+    if (!bridge_computed_style(bridge, at, &style, NULL, NULL)) return false;
+    *hidden = style.display == DISPLAY_NONE;
+    return true;
+}
+
 JSValue js_transition_snapshot(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv)
@@ -7840,9 +8902,11 @@ JSValue js_transition_snapshot(JSContext *context,
         ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
     if (bridge == NULL || bridge->stylesheet == NULL || node == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return JS_NULL;
+    /* The snapshot reads properties, durations and delays, never the
+       easings, so they are not validated again or serialized. */
     StyleTransitionComputed transition;
-    (void) style_transition_computed(bridge->stylesheet, node, PSEUDO_NONE,
-                                     &transition);
+    (void) style_transition_computed_untimed(bridge->stylesheet, node,
+                                             PSEUDO_NONE, &transition);
     bool animated = false;
     for (unsigned i = 0; i < transition.property_count && !animated; i++) {
         double duration = transition.duration_ms[i % transition.duration_count];
@@ -7884,26 +8948,54 @@ JSValue js_transition_snapshot(JSContext *context,
         JS_FreeValue(context, length_value);
     }
     if (name_count > 32) name_count = 32;
-    bool rendered = true;
-    unsigned ancestors = 0;
-    lxb_dom_node_t *at = node;
-    for (; ok && at != NULL && ancestors < DOM_ROOT_NODE_ANCESTOR_LIMIT;
-         at = at->parent, ancestors++) {
-        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        ComputedStyle style;
-        if (!bridge_computed_style(bridge, at, &style, NULL, NULL)) {
-            JS_FreeValue(context, result);
-            JS_FreeValue(context, properties);
-            JS_FreeValue(context, durations);
-            JS_FreeValue(context, delays);
-            JS_FreeValue(context, values);
-            return js_rt_throw_task_interruption(
-                context, "transition style interrupted");
+    /* Applies pending drops, so a stamp of this epoch is current. */
+    const bool style_cache = ok && bridge_computed_style_cache(bridge) != NULL;
+    bool hidden = false;
+    bool interrupted = ok
+        && !bridge_transition_display_none(bridge, style_cache, node, &hidden);
+    bool rendered = !hidden;
+    __typeof__(bridge->transition_ancestors_memo) *memo =
+        &bridge->transition_ancestors_memo;
+    uint64_t content_generation = bridge->document == NULL
+        ? 0 : bridge->document->content_generation;
+    if (ok && !interrupted && rendered && node->parent != NULL) {
+        if (memo->parent == node->parent
+            && memo->content_generation == content_generation
+            && computed_style_inputs_hold(bridge, &memo->inputs)) {
+            rendered = memo->rendered;
+        } else {
+            unsigned ancestors = 1;
+            lxb_dom_node_t *at = node->parent;
+            for (; at != NULL && ancestors < DOM_ROOT_NODE_ANCESTOR_LIMIT;
+                 at = at->parent, ancestors++) {
+                if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+                if (!bridge_transition_display_none(bridge, style_cache, at,
+                                                    &hidden)) {
+                    interrupted = true;
+                    break;
+                }
+                if (hidden) { rendered = false; break; }
+            }
+            if (at != NULL && ancestors == DOM_ROOT_NODE_ANCESTOR_LIMIT)
+                rendered = false;
+            memo->parent = NULL;
+            if (!interrupted && style_cache) {
+                memo->parent = node->parent;
+                computed_style_inputs_capture(bridge, &memo->inputs);
+                memo->content_generation = content_generation;
+                memo->rendered = rendered;
+            }
         }
-        if (style.display == DISPLAY_NONE) { rendered = false; break; }
     }
-    if (at != NULL && ancestors == DOM_ROOT_NODE_ANCESTOR_LIMIT)
-        rendered = false;
+    if (interrupted) {
+        JS_FreeValue(context, result);
+        JS_FreeValue(context, properties);
+        JS_FreeValue(context, durations);
+        JS_FreeValue(context, delays);
+        JS_FreeValue(context, values);
+        return js_rt_throw_task_interruption(
+            context, "transition style interrupted");
+    }
     bool saved = bridge->computed_style_without_layout;
     bridge->computed_style_without_layout = true;
     for (uint32_t i = 0; ok && i < name_count; i++) {
@@ -8014,6 +9106,25 @@ JSValue js_style_reach(JSContext *context, JSValueConst this_value,
         if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) return JS_FALSE;
     }
     return JS_TRUE;
+}
+
+/* __tilefinchTimingFunction(text) -> the <easing-function> serialized as a
+   computed value, or null when it is invalid. CSS animations (motion.js)
+   and Element.animate() validate through it, so they accept exactly what
+   transition-timing-function accepts. */
+JSValue js_timing_function(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) return JS_NULL;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(context, &length, argv[0]);
+    if (text == NULL) return JS_EXCEPTION;
+    char computed[STYLE_TIMING_FUNCTION_CAPACITY];
+    bool valid = style_timing_function(text, length, computed,
+                                       sizeof(computed));
+    JS_FreeCString(context, text);
+    return valid ? JS_NewString(context, computed) : JS_NULL;
 }
 
 /* __tilefinchComputedStyleSupport(name) -> whether the declaration has that
@@ -8475,10 +9586,20 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
         StyleTransitionComputed transition;
         (void) style_transition_computed(bridge->stylesheet, node,
                                          transition_pseudo, &transition);
+        /* Keyword lists fit the stack buffer; long linear() easings are
+           measured and built on the JS heap. */
         char transition_value[640];
-        computed_transition_value(id, &transition, transition_value,
-                                  sizeof(transition_value));
-        return computed_style_string(context, transition_value, empty);
+        size_t length = computed_transition_value(
+            id, &transition, transition_value, sizeof(transition_value));
+        if (length < sizeof(transition_value))
+            return computed_style_string(context, transition_value, empty);
+        char *long_value = js_malloc(context, length + 1u);
+        if (long_value == NULL) return JS_EXCEPTION;
+        (void) computed_transition_value(id, &transition, long_value,
+                                         length + 1u);
+        JSValue value = computed_style_string(context, long_value, empty);
+        js_free(context, long_value);
+        return value;
     }
     ComputedStyle style;
     bool padding_geometry = id == CSP_WIDTH || id == CSP_HEIGHT
@@ -9613,8 +10734,21 @@ static JSValue computed_style_value(JSContext *context, DomBridge *bridge,
         (void) stylesheet_serialize_grid_template_areas(
             bridge->stylesheet, &style, value, sizeof(value));
     } else if (id == CSP_GRID_TEMPLATE_COLUMNS) {
-        (void) stylesheet_serialize_grid_template_tracks(
-            bridge->stylesheet, &style, false, value, sizeof(value));
+        const int *widths = NULL;
+        unsigned origin = 0;
+        size_t count = pseudo == PSEUDO_NONE
+            && (style.display == DISPLAY_GRID
+                || style.display == DISPLAY_INLINE_GRID)
+            && layout_box_for_node(bridge->layout, node) != NULL
+            ? layout_grid_columns_for_node(bridge->layout, node, &widths, &origin)
+            : 0;
+        if (count != 0) {
+            (void) stylesheet_serialize_used_grid_columns(bridge->stylesheet,
+                &style, widths, (unsigned) count, origin, value, sizeof(value));
+        } else {
+            (void) stylesheet_serialize_grid_template_tracks(
+                bridge->stylesheet, &style, false, value, sizeof(value));
+        }
     } else if (id == CSP_GRID_TEMPLATE_ROWS) {
         (void) stylesheet_serialize_grid_template_tracks(
             bridge->stylesheet, &style, true, value, sizeof(value));
@@ -10213,6 +11347,8 @@ static bool bridge_node_is_last_element(const lxb_dom_node_t *node)
    detached construction trees). */
 static void bridge_note_removal(DomBridge *bridge, lxb_dom_node_t *node)
 {
+    /* The removed tree's rooted event state may move to its wrappers. */
+    bridge_arm_wrapper_sweep(bridge);
     BridgeMutationResourceFlags removed_resources =
         bridge_mutation_resource_subtree(bridge->document, node);
     ScriptMutationKind removal_kind =
@@ -10341,6 +11477,7 @@ JSValue js_dom_append(JSContext *context, JSValueConst this_value,
     bool was_detached = !bridge_node_is_connected(child);
     lxb_dom_node_t *old_parent = child->parent;
     BridgeDeparture departure = bridge_note_departure(bridge, parent, child);
+    bridge_event_state_joining(bridge, parent, child);
     document_style_quiet_begin();
     lxb_dom_exception_code_t status = lxb_dom_node_append_child(parent, child);
     document_style_quiet_end();
@@ -10409,6 +11546,7 @@ JSValue js_dom_append_many(JSContext *context,
         lxb_dom_node_t *old_parent = nodes[index]->parent;
         BridgeDeparture departure =
             bridge_note_departure(bridge, parent, nodes[index]);
+        bridge_event_state_joining(bridge, parent, nodes[index]);
         document_style_quiet_begin();
         lxb_dom_exception_code_t appended =
             lxb_dom_node_append_child(parent, nodes[index]);
@@ -10452,6 +11590,7 @@ JSValue js_dom_insert_before(JSContext *context,
     bool was_detached = !bridge_node_is_connected(node);
     lxb_dom_node_t *old_parent = node->parent;
     BridgeDeparture departure = bridge_note_departure(bridge, parent, node);
+    bridge_event_state_joining(bridge, parent, node);
     document_style_quiet_begin();
     lxb_dom_exception_code_t status = lxb_dom_node_insert_before_spec(
         parent, node, child);

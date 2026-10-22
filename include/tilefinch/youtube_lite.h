@@ -9,12 +9,26 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_chapters.h"
 #include "tilefinch/session.h"
+#include "tilefinch/youtube_resolver.h"
 
 #define YOUTUBE_LITE_MAXIMUM_RESULTS 12
 #define YOUTUBE_LITE_MAXIMUM_COMMENTS 8
 #define YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES (2u * 1024u * 1024u)
 #define YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES (256u * 1024u)
 #define YOUTUBE_LITE_MAXIMUM_HTML_BYTES (96u * 1024u)
+
+/* The provider's sign-in and account-switch entry points, both returning
+   to the YouTube home page. Markup links to the sign-in entry through its
+   HTML-escaped spelling. */
+#define YOUTUBE_LITE_SIGNIN_CONTINUE "continue=https%3A%2F%2Fwww.youtube.com%2F"
+#define YOUTUBE_LITE_SIGNIN_URL \
+    "https://accounts.google.com/ServiceLogin?service=youtube&" \
+    YOUTUBE_LITE_SIGNIN_CONTINUE
+#define YOUTUBE_LITE_SIGNIN_HTML_URL \
+    "https://accounts.google.com/ServiceLogin?service=youtube&amp;" \
+    YOUTUBE_LITE_SIGNIN_CONTINUE
+#define YOUTUBE_LITE_ACCOUNT_CHOOSER_URL \
+    "https://accounts.google.com/AccountChooser?" YOUTUBE_LITE_SIGNIN_CONTINUE
 
 typedef enum {
     YOUTUBE_LITE_ROUTE_NONE = 0,
@@ -28,7 +42,7 @@ typedef enum {
 
 #define YOUTUBE_PLAYLIST_TITLE_BYTES 128u
 typedef struct {
-    char video_id[32];
+    char video_id[YOUTUBE_VIDEO_ID_CAPACITY];
     char title[YOUTUBE_PLAYLIST_TITLE_BYTES];
 } YoutubePlaylistEntry;
 typedef struct {
@@ -55,7 +69,7 @@ typedef struct {
    Cache access uses the same cookie/request authority as the provider. */
 bool youtube_lite_copy_playlist(BrowserSession *, const char *url,
                                YoutubePlaylistPage *page);
-/* Explicit Retry discards only this playlist page's cached document/facts. */
+/* Explicit Retry discards only this playlist page's cached facts. */
 void youtube_lite_forget_playlist_page(BrowserSession *, const char *url);
 bool youtube_lite_playlist_selection(const char *url, size_t *index,
                                     bool *all);
@@ -239,6 +253,10 @@ bool youtube_lite_home_rebuild_header(Budget *, bool signed_in, bool compact,
 bool youtube_lite_session_signed_in(BrowserSession *session);
 /* Opaque RAM-only identity for native login transitions. Never log it. */
 uint64_t youtube_lite_session_login_identity(BrowserSession *session);
+/* Registers the account cookies YouTube needs to authenticate, so an
+   over-long youtube.com Cookie header keeps them (see
+   browser_session_set_credential_cookies). */
+void youtube_lite_session_register_credentials(BrowserSession *session);
 YoutubeLiteFeedJob *youtube_lite_feed_begin(Budget *budget,
     BrowserSession *session, bool subscriptions, bool compact, long timeout_ms);
 YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
@@ -294,35 +312,14 @@ typedef struct YoutubeLiteAccountDiagnostics {
 /* Fixed numeric schema/transport evidence only, never response content. */
 bool youtube_lite_account_diagnostics(const YoutubeLiteFeedJob *job,
                                      YoutubeLiteAccountDiagnostics *result);
-/* Host-only, data-only qualification boundary. No credential, URL, response
-   text or video metadata crosses this result; the existing session owns all
-   authentication and transport policy. It does not execute page scripts. */
-typedef struct {
-    long bootstrap_status;
-    long api_status;
-    size_t bootstrap_bytes;
-    size_t api_bytes;
-    size_t result_count;
-    unsigned bootstrap_destination; /* 0 unknown, 1 same origin, 2 accounts,
-                                       3 support, 4 other YouTube, 5 other */
-    bool bootstrap_same_origin;
-    bool login_known;
-    bool logged_in;
-    bool authorization_present;
-    bool api_json;
-    bool api_error;
-    bool api_login_known;
-    bool api_logged_out;
-    bool api_message;
-    bool api_signin_required;
-} YoutubeLiteFeedProbe;
-bool youtube_lite_probe_feed(Budget *budget, BrowserSession *session,
-                            bool subscriptions, YoutubeLiteFeedProbe *result);
-bool youtube_lite_feed_probe_classify(Budget *budget, const char *json,
-                                    size_t length, YoutubeLiteFeedProbe *result);
-/* Native request construction only: never expose this result in diagnostics,
-   JavaScript, files or the private control channel. */
-bool youtube_lite_feed_probe_authorization(BrowserSession *session,
+/* Host-only test entry points into the shipping feed sign-in checks.
+   Authentication answers 1 signed in, -1 signed out, 0 unknown for a feed
+   API response, read from its top-level responseContext the way the feed
+   job reads it. Authorization builds the native SAPISIDHASH header value;
+   never expose it in diagnostics, JavaScript, files or the private control
+   channel. */
+int youtube_lite_test_feed_authentication(const char *json, size_t length);
+bool youtube_lite_test_feed_authorization(BrowserSession *session,
     const TilefinchRequestContext *context, uint64_t seconds,
     char *output, size_t capacity);
 #endif

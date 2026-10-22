@@ -68,6 +68,23 @@ static bool reattach_install_through_session(
     return true;
 }
 
+/* The line under the pack's name once an install completes. The color
+   emoji pack is not a language pack and must not say it is (review 1021b
+   F8); every line is a catalog key (tests/test_ui_toast_catalog.py). */
+static bool test_glyph_session_installed_status(void)
+{
+    for (unsigned pack = 0; pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
+        bool emoji = pack == TILEFINCH_GLYPH_PACK_COLOR_EMOJI;
+        const char *relaid = psp_glyph_component_installed_status(
+            (TilefinchGlyphPack) pack, true);
+        CHECK(strcmp(relaid, emoji ? "Installed" : "Language pack installed") == 0);
+        CHECK(strcmp(psp_glyph_component_installed_status(
+                  (TilefinchGlyphPack) pack, false),
+              "Installed. Reload the page to redraw it") == 0);
+    }
+    return true;
+}
+
 static bool test_glyph_session_install_reattaches(void)
 {
     char root[] = "/tmp/tilefinch-glyph-reattach-XXXXXX";
@@ -87,7 +104,7 @@ static bool test_glyph_session_install_reattaches(void)
                                   TILEFINCH_GLYPH_PACK_CYRILLIC, false));
     CHECK(psp_glyph_component_session_attach_selected(
               &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
-              false)
+              BROWSER_GLYPH_LANGUAGE_EMBEDDED, false)
           && session.attached_mask == cyrillic);
 
     /* A menu install of another pack detaches everything; finishing it
@@ -97,11 +114,12 @@ static bool test_glyph_session_install_reattaches(void)
     CHECK(session.attached_mask == 0);
     CHECK(psp_glyph_component_session_reattach(
               &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
-              false, 0, NULL)
+              BROWSER_GLYPH_LANGUAGE_EMBEDDED, false, 0, NULL)
           && session.attached_mask == cyrillic && session.provider != NULL);
     /* Only once per completed install. */
     CHECK(!psp_glyph_component_session_reattach(
-        &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC, false,
+        &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+        BROWSER_GLYPH_LANGUAGE_EMBEDDED, false,
         DOCUMENT_GLYPH_SCRIPT_HEBREW, NULL));
 
     /* The offer's install also attaches the new pack for the page's
@@ -110,8 +128,39 @@ static bool test_glyph_session_install_reattaches(void)
         &session, &paths, TILEFINCH_GLYPH_PACK_HEBREW));
     CHECK(psp_glyph_component_session_reattach(
               &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
-              false, DOCUMENT_GLYPH_SCRIPT_HEBREW, NULL)
+              BROWSER_GLYPH_LANGUAGE_EMBEDDED, false,
+              DOCUMENT_GLYPH_SCRIPT_HEBREW, NULL)
           && session.attached_mask == (cyrillic | hebrew));
+
+    /* A non-Latin interface language attaches its pack beside the page
+       selection instead of replacing it, at boot and after an install;
+       one language serving both attaches once. */
+    psp_glyph_component_session_destroy(&session);
+    memset(&session, 0, sizeof(session));
+    CHECK(psp_glyph_component_session_attach_selected(
+              &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_HEBREW,
+              BROWSER_GLYPH_LANGUAGE_CYRILLIC, false)
+          && session.attached_mask == (cyrillic | hebrew)
+          && tilefinch_glyph_provider_pack_count(session.provider) == 2u);
+    CHECK(reattach_install_through_session(
+        &session, &paths, TILEFINCH_GLYPH_PACK_HEBREW));
+    CHECK(psp_glyph_component_session_reattach(
+              &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_HEBREW,
+              BROWSER_GLYPH_LANGUAGE_CYRILLIC, false, 0, NULL)
+          && session.attached_mask == (cyrillic | hebrew));
+    psp_glyph_component_session_destroy(&session);
+    memset(&session, 0, sizeof(session));
+    CHECK(psp_glyph_component_session_attach_selected(
+              &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+              BROWSER_GLYPH_LANGUAGE_CYRILLIC, false)
+          && session.attached_mask == cyrillic
+          && tilefinch_glyph_provider_pack_count(session.provider) == 1u);
+    psp_glyph_component_session_destroy(&session);
+    memset(&session, 0, sizeof(session));
+    CHECK(psp_glyph_component_session_attach_selected(
+              &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_EMBEDDED,
+              BROWSER_GLYPH_LANGUAGE_CYRILLIC, false)
+          && session.attached_mask == cyrillic);
 
     psp_glyph_component_session_destroy(&session);
     psp_glyph_component_session_test_identity = NULL;

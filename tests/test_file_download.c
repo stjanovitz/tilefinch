@@ -8,13 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); return false; } } while (0)
 #define URL "https://downloads.example.test/releases/homebrew.zip"
 static const char *trace_url = URL;
 
-static unsigned char byte_at(size_t index) { return (unsigned char) (index * 37u + 11u); }
+/* Distinguishes two entities served at the same URL. */
+static unsigned entity_salt;
+static unsigned char byte_at(size_t index) { return (unsigned char) (index * 37u + 11u + entity_salt); }
 
 /* Synthetic response corpus, never an account or a live download. */
 static bool trace(const char *directory, size_t total, size_t offset,
@@ -209,6 +212,84 @@ static bool transfers(const char *directory, const char *corpus)
     CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
     CHECK(exact_file(&library, id, 42) && offline_library_remove(&library, id));
 
+    /* Every byte reached the partial file but the item was never published
+       (power loss before the READY save). The resume is answered 416 with
+       the same validator and exactly the partial length: finish it. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes) break;
+    }
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    CHECK(offline_library_item_path(&library, id, ".file.part", part, sizeof(part)));
+    {
+        struct stat status; CHECK(stat(part, &status) == 0 && status.st_size > 0);
+        FILE *rest = fopen(part, "ab"); CHECK(rest != NULL);
+        for (size_t i = (size_t) status.st_size; i < 262144u; i++) CHECK(fputc(byte_at(i), rest) != EOF);
+        CHECK(fclose(rest) == 0);
+    }
+    CHECK(trace(corpus, 262144, 262144, 416, "\"one\"", "content-range: bytes */262144", true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    CHECK(offline_library_find(&library, id)->content_bytes == 262144u);
+    CHECK(exact_file(&library, id, 262144) && access(part, F_OK) != 0);
+    CHECK(offline_library_remove(&library, id));
+
+    /* A 416 naming another length (or validator) restarts from zero. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes) break;
+    }
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    CHECK(trace(corpus, 17, 17, 416, "\"one\"", "content-range: bytes */17", true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    CHECK(trace(corpus, 42, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    CHECK(exact_file(&library, id, 42) && offline_library_remove(&library, id));
+
+    /* The entity changed (200 with a new validator) but the partial file of
+       the old one could not be reopened. The new validator must not be
+       persisted over the old bytes, or a later resume splices the two. */
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    for (unsigned i = 0; i < 20; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+        if (snapshot.downloaded_bytes) break;
+    }
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    CHECK(offline_library_item_path(&library, id, ".file.part", part, sizeof(part)));
+    struct stat partial; CHECK(stat(part, &partial) == 0 && partial.st_size > 0);
+    offset = (size_t) partial.st_size;
+    CHECK(chmod(part, 0444) == 0);
+    entity_salt = 1;
+    CHECK(trace(corpus, 262144, 0, 200, "\"two\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    /* The open failure is named, not reported as an interrupted transfer. */
+    CHECK(!strcmp(offline_library_find(&library, id)->failure_reason,
+                  "Download file could not be opened on the Memory Stick"));
+    CHECK(chmod(part, 0644) == 0);
+    snprintf(range, sizeof(range), "content-range: bytes %zu-262143/262144", offset);
+    CHECK(trace(corpus, 262144, offset, 206, "\"two\"", range, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_PAUSED);
+    CHECK(trace(corpus, 262144, 0, 200, "\"two\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    CHECK(exact_file(&library, id, 262144) && offline_library_remove(&library, id));
+    entity_salt = 0;
+
     /* Reject an unsolicited/incorrect partial response, HTML, and HTTP errors. */
     static const struct { unsigned status; const char *extra; } bad[] = {
         {206, "content-range: bytes 1-16/17"},
@@ -271,6 +352,65 @@ static bool transfers(const char *directory, const char *corpus)
         CHECK(offline_library_remove(&library, id));
     }
     browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    return true;
+}
+
+/* A clock the test moves on by hand, so a rate sample is due every pump. */
+static uint64_t clock_skew_us;
+static uint64_t skewed_clock_us(void *context)
+{
+    (void) context;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * UINT64_C(1000000)
+        + (uint64_t) now.tv_nsec / 1000u + clock_skew_us;
+}
+
+/* A resume answered with a fresh 200 restarts the byte count from zero. The
+   transfer rate restarts with it: a sample against the abandoned partial
+   length must not wrap into a 4 GiB/s reading. */
+static bool restart_speed(const char *directory, const char *corpus)
+{
+    Budget budget; budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserSession session; CHECK(browser_session_init(&session, &budget, 65536));
+    OfflineLibrary library; offline_library_init(&library, &budget, directory);
+    CHECK(offline_library_load(&library));
+    OfflineDownloadManager manager;
+    offline_download_manager_init(&manager, &budget, &session, &library);
+    char error[128] = {0}; uint32_t id = 0;
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 262144, 0, 200, "\"one\"", NULL, true));
+    CHECK(offline_download_manager_start(&manager, id));
+    OfflineDownloadSnapshot snapshot = {0};
+    /* Keep more than one restarted pump's worth of bytes. */
+    for (unsigned i = 0; i < 40 && snapshot.downloaded_bytes < 131072; i++) {
+        (void) offline_download_manager_pump(&manager);
+        CHECK(offline_download_manager_snapshot(&manager, id, &snapshot));
+    }
+    CHECK(snapshot.downloaded_bytes >= 131072 && snapshot.downloaded_bytes < 262144);
+    CHECK(offline_download_manager_pause(&manager, id)); fetch_trace_end();
+    TilefinchPlatformServices services = {.monotonic_time_us = skewed_clock_us};
+    tilefinch_platform_set_services(&services);
+    CHECK(trace(corpus, 262144, 0, 200, "\"two\"", NULL, true));
+    bool started = offline_download_manager_start(&manager, id);
+    uint32_t fastest = 0;
+    for (unsigned i = 0; started && i < 64 && snapshot.downloaded_bytes < 262144; i++) {
+        clock_skew_us += 300000u;
+        (void) offline_download_manager_pump(&manager);
+        if (!offline_download_manager_snapshot(&manager, id, &snapshot)
+            || !snapshot.active) break;
+        if (snapshot.bytes_per_second > fastest) fastest = snapshot.bytes_per_second;
+    }
+    tilefinch_platform_set_services(NULL);
+    CHECK(started && complete(&manager));
+    CHECK(offline_library_find(&library, id)->state == OFFLINE_ITEM_READY);
+    if (fastest == 0 || fastest > 262144u * 4u)
+        fprintf(stderr, "Restarted download rate: %u bytes/s\n", (unsigned) fastest);
+    /* At most 262,144 bytes arrive in 300 ms steps. */
+    CHECK(fastest != 0 && fastest <= 262144u * 4u);
+    CHECK(exact_file(&library, id, 262144) && offline_library_remove(&library, id));
+    offline_download_manager_destroy(&manager); browser_session_destroy(&session);
     CHECK(budget.current == 0);
     return true;
 }
@@ -517,7 +657,8 @@ int main(int argc, char **argv)
         ? live_download(directory, argv[2], argv[3], argc == 5 ? argv[4] : NULL)
         : argc == 5 && !strcmp(argv[1], "--source-journey")
         ? live_source_journey(directory, argv[2], argv[3], argv[4])
-        : argc == 1 && filenames() && transfers(directory, corpus) && confirmation(directory, corpus)
+        : argc == 1 && filenames() && transfers(directory, corpus)
+            && restart_speed(directory, corpus) && confirmation(directory, corpus)
             && extensionless_navigation(corpus);
     fetch_trace_end(); clean(directory); clean(corpus);
     return okay ? 0 : 1;

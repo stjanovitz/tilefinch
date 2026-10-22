@@ -13,11 +13,13 @@ static void js_rt_runtime_finish_slice_state(ScriptRuntime *runtime)
         : (unsigned long) (watchdog_now - runtime->watchdog.started_ms);
 }
 
-/* What the page loop acts on: the form submission request, uncaught
-   callback errors (which become the page error), and the lab summary. Cheap
-   enough for every frame: a handful of global lookups. */
-static void js_rt_runtime_update_core(ScriptRuntime *runtime, JSValue global)
+/* Host tests, labs and validation input scripts report through the
+   page-writable `pocSummary` global. The shipping build never reads it, so
+   ScriptResult.summary there holds only engine-authored status. */
+static void js_rt_runtime_read_lab_summary(ScriptRuntime *runtime,
+                                           JSValue global)
 {
+#ifdef JS_RT_TEST_INSTRUMENTS
     JSValue summary = JS_GetPropertyStr(runtime->context, global,
                                         "pocSummary");
     if (!JS_IsUndefined(summary)) {
@@ -29,6 +31,18 @@ static void js_rt_runtime_update_core(ScriptRuntime *runtime, JSValue global)
         }
     }
     JS_FreeValue(runtime->context, summary);
+#else
+    (void) runtime;
+    (void) global;
+#endif
+}
+
+/* What the page loop acts on: the form submission request, uncaught
+   callback errors (which become the page error), and the lab summary. Cheap
+   enough for every frame: a handful of global lookups. */
+static void js_rt_runtime_update_core(ScriptRuntime *runtime, JSValue global)
+{
+    js_rt_runtime_read_lab_summary(runtime, global);
     JSValue submitted = JS_GetPropertyStr(runtime->context, global,
                                           "__tilefinchSubmitted");
     runtime->result.form_submission_requested =

@@ -15,9 +15,14 @@ Devanagari, Arabic uses the Arabic pack, and Bengali and Assamese share the
 Bengali-Assamese pack. Spanish, French, German and Portuguese use the built-in font. Page fonts, preferred video
 languages and HTTP language preferences remain independent.
 
-Common native navigation, settings labels and controls are translated. Advanced
-diagnostics and messages not yet translated remain in English. Missing or
+Common native navigation, settings labels, controls and status messages are
+translated. Advanced diagnostics and messages not yet translated remain in
+English. Missing or
 damaged translation/font files fall back to English without blocking startup.
+Once per boot, when Home or a page is idle, an English notice then names the
+language and what it needs (its interface text, or a font pack update); X
+opens Interface language on that language, where one more X downloads it,
+and O dismisses the notice until the next boot.
 Arabic labels are contextually shaped and ordered right-to-left once when the
 catalog loads; ASCII hints and digits retain their order. This does not mirror
 the browser's panel geometry. Hindi consumes pre-shaped syllable clusters from
@@ -44,8 +49,20 @@ Sources and generation tools remain in the browser repository. Host builds
 generate test resources in their build directory; public-clone tests need no
 network or optional-download checkout. The generated-file test checks their
 exact identity. The browser accepts only
-the SHA-256-pinned bytes, with a 32 KiB / 400-row limit. Values are display text,
+the SHA-256-pinned bytes, with a 64 KiB / 2,048-row limit (v1–v11 files stay
+within the earlier 32 KiB / 400 rows). Values are display text,
 not executable code or formatting programs.
+
+V1–v11 files are text: a `TFUI1` header line, then one `English\tvalue` row
+per line. From v12 a file stores no English keys (`TFUI2`, described in
+`src/ui_language.c`): after its header line come the big-endian row count,
+each row's 32-bit FNV-1a hash of its ASCII-lowercased English key in
+increasing order, each key's byte length, then the values in that order, one
+per line. A lookup hashes the English string the same way, so it matches
+exactly what the earlier case-insensitive key search matched, and a row is
+used only when the key length also agrees, so an unrelated string whose hash
+happens to collide stays English. The generator refuses a version whose keys
+collide.
 
 Downloads use tilefinch-models' `main` branch and versioned
 `translations/ui/vN/` path.
@@ -64,8 +81,14 @@ loading incompatible translations. Released browsers use the models repository;
 keep its published version directories immutable.
 New translations require a new version and matching browser catalog/URLs.
 
-One active file and one temporary file per language live in `data/ui-language/`.
-Only explicit installation writes them. Startup reads just the selected file;
+Each installed language keeps its current-version file
+(`data/ui-language/<code>-vN.tful`) and, only while an install is writing,
+one temporary file. Only explicit installation writes them. A successful
+install also removes that language's files from older catalog versions,
+which this build never reads (exact `<code>-vN.tful` names with a lower N,
+regular files only, never through a symlink); other languages' files and
+any other names stay. Files an older build left for a language that is not
+reinstalled stay until it is. Startup reads just the selected file;
 painting performs bounded in-memory lookups, with no filesystem access.
 
 ## Layout regression tests
@@ -110,3 +133,35 @@ The native layout gate covers Save, Install, Remove, Downloads, and the ZIP
 deletion confirmation. Filenames, application names, paths and links remain
 unchanged. Generated HTML uses logical translations and escapes them; native
 chrome uses the pre-shaped display labels.
+
+V12 adds the status notices (toasts). `tilefinch-ui-toast-catalog-tests`
+fails when a literal status has no key or when the catalog keeps a key nothing
+looks up. It sees literals passed to the status calls, returned by status
+helpers (including the acknowledgement shown when an action starts), written
+to a status buffer, set as a font-pack install's failure message, or routed
+to any of these through a local variable. The same lookup translates text the
+painter draws from state, and the test sees those sources too: a setting's
+reloading, saved and reload-failed notices, a theme file's errors, the video
+player's headline, the Update screen's status, notes and button (with its
+download and install messages), the font-pack offer's confirmation box, and
+the static tables and section headings of the Site data & storage screens.
+The failed-video panel, the Help details, both Site data & storage
+screens and Site information are translated too. On Site information the
+site name, the TLS version and a server's certificate issuer stay as sent;
+"RAM" and "KB" are the same in every language. A button shows its glyph beside a shared word
+("X" and the catalog's "Retry") rather than a key of its own, and the Retry
+chip grows to fit the word. Statuses built from runtime text (engine and
+download errors, names, counts, a version or a release's notes) stay English,
+as do the version string, the screen size and clock, and "MIT". A notice is translated a line
+at a time, and a trailing progress count (" 45%") is kept after the
+translated text, so composed notices are whole catalog lines: a pack's name
+above its state, a message above its Settings path. V12 retires the keys
+listed in `RETIRED_KEYS` of the generator. Its hashed format drops the 19 KB
+of English keys every file used to repeat (Bengali, the longest, is 59,823
+of the 65,535 bytes, with 1,030 rows). The runtime accepts 2,048 rows and
+sizes a loaded catalog to the rows it has, so the byte cap binds first; a
+new key should still reuse an existing word where one fits. Arabic's shaped
+display copy has 16-bit offsets too and is 53,661 of its 65,535 bytes. V12 requires
+Devanagari revision 7 and Bengali-Assamese revision 3, rebuilt from the v12
+`hi.sequences` and `bengali-assamese.sequences`; publish those packs and the
+v12 `.tful` files before shipping an app that pins v12.

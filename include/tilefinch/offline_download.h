@@ -13,6 +13,8 @@
 #define OFFLINE_DOWNLOAD_CHUNK_BYTES (256u * 1024u)
 #define OFFLINE_DOWNLOAD_STREAM_LIMIT (512u * 1024u * 1024u)
 #define OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE (8u * 1024u * 1024u)
+/* The transfer rate is re-sampled at most this often. */
+#define OFFLINE_DOWNLOAD_SPEED_SAMPLE_US UINT64_C(250000)
 
 typedef enum {
     OFFLINE_DOWNLOAD_IDLE = 0,
@@ -32,6 +34,13 @@ typedef struct {
     bool active;
     char failure_reason[OFFLINE_LIBRARY_FAILURE_LIMIT];
 } OfflineDownloadSnapshot;
+
+/* Transfer-rate sampler shared by the video and file lanes. */
+typedef struct {
+    uint64_t time_us;
+    uint64_t bytes;
+    uint32_t bytes_per_second;
+} OfflineDownloadSpeed;
 
 typedef struct {
     Budget *budget;
@@ -57,10 +66,28 @@ typedef struct {
     void *cancel_opaque;
     int maximum_height;
     uint64_t available_bytes;
-    uint64_t speed_sample_us;
-    uint64_t speed_sample_bytes;
-    uint32_t bytes_per_second;
+    OfflineDownloadSpeed speed;
 } OfflineDownloadManager;
+
+/* Rules shared by every download lane (video, file and ZIP install), so a
+   tuning change reaches all of them. */
+/* Strict unsigned decimal: digits only, no sign or space, no overflow. */
+bool offline_download_parse_decimal(const char *text, uint64_t *value);
+/* "bytes FIRST-LAST/COMPLETE" and nothing after it. */
+bool offline_download_parse_content_range(
+    const char *text, uint64_t *first, uint64_t *last, uint64_t *complete);
+/* True when BYTES more still leave the free-space reserve on the stick. */
+bool offline_download_space_admits(uint64_t available, uint64_t bytes);
+/* Starts a rate sample at BYTES already present. */
+void offline_download_speed_reset(OfflineDownloadSpeed *speed,
+                                  uint64_t bytes);
+/* Records BYTES present now. A count below the sample base (a transfer that
+   restarted from zero) starts a new sample instead of a rate. */
+void offline_download_speed_sample(OfflineDownloadSpeed *speed,
+                                   uint64_t bytes);
+/* One bounded owner-thread pump of a download scheduler: at most two body
+   callbacks, 32 KiB or 2 ms per call. */
+void offline_download_pump_transfer(FetchScheduler *scheduler);
 
 void offline_download_manager_init(
     OfflineDownloadManager *manager, Budget *budget,
@@ -86,6 +113,7 @@ bool offline_download_manager_pause(
     OfflineDownloadManager *manager, uint32_t id);
 bool offline_download_manager_active(
     const OfflineDownloadManager *manager, uint32_t *id);
+/* The only producer of download snapshots, for video and file items. */
 bool offline_download_manager_snapshot(
     const OfflineDownloadManager *manager, uint32_t id,
     OfflineDownloadSnapshot *snapshot);

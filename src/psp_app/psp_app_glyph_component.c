@@ -260,9 +260,10 @@ static void glyph_offer_answer(PspApp *app,
             session->offer_size_pending = false;
             session->offer_install_pending = true;
             session->offer_install_pack = pack;
+            /* Pack name, then state: two whole catalog lines. */
             char status[PSP_UI_STATUS_CAPACITY];
-            snprintf(status, sizeof(status), "%s pack: downloading...",
-                     spec->label);
+            snprintf(status, sizeof(status), "%s\n%s", spec->label,
+                     "Downloading...");
             psp_ui_show_status(ui, status, 240);
             break;
         }
@@ -274,7 +275,7 @@ static void glyph_offer_answer(PspApp *app,
                             | (1u << (unsigned) pack)));
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, now_us);
-            psp_ui_show_status(ui, "Won't ask again. Install it later in\n"
+            psp_ui_show_status(ui, "Won't ask again. Install it later from:\n"
                                    "Settings > Appearance > Language & emoji",
                                300);
             break;
@@ -300,6 +301,7 @@ static void glyph_install_finish(PspApp *app,
     if (from_offer && spec != NULL) scripts = spec->page_scripts;
     (void) psp_glyph_component_session_reattach(
         session, app->browser->budget, &app->process->install_paths,
+        browser_profile_glyph_language(app->browser->profile),
         psp_ui_language_glyphs(app->browser->profile),
         browser_profile_color_emoji(app->browser->profile), scripts,
         engine);
@@ -316,10 +318,8 @@ static void glyph_install_finish(PspApp *app,
             ui->reader_mode || ui->basic_mode, entry->url,
             ui->page_font_percent, true);
         if (relaid) (void) psp_engine_views_refresh(app->views, engine);
-        snprintf(status, sizeof(status),
-                 relaid ? "%s pack installed"
-                        : "%s pack installed\nReload the page to redraw it",
-                 spec->label);
+        snprintf(status, sizeof(status), "%s\n%s", spec->label,
+                 psp_glyph_component_installed_status(pack, relaid));
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     printf("tilefinch-glyph-component: installed pack=%u offer=%u "
@@ -345,8 +345,10 @@ static bool glyph_offer_track(PspGlyphComponentSession *session,
         session->offer_install_pending = false;
         return false;
     }
+    /* Pack name, then the menu row's own words: "Downloading 45%" is the
+       catalog's "Downloading" with its count kept (psp_ui.c draw_toast). */
     char status[PSP_UI_STATUS_CAPACITY];
-    int family = snprintf(status, sizeof(status), "%s pack:", spec->label);
+    int family = snprintf(status, sizeof(status), "%s\n", spec->label);
     if (psp_glyph_component_session_active(session)) {
         /* glyph_refresh_ui() has already published phase and per-mille
            progress for the menu row; the toast reads the same state. */
@@ -355,15 +357,15 @@ static bool glyph_offer_track(PspGlyphComponentSession *session,
         switch ((PspUiGlyphComponentPhase) ui->glyph_component_phase) {
             case PSP_UI_GLYPH_COMPONENT_DOWNLOADING:
                 snprintf(status + family, sizeof(status) - (size_t) family,
-                         " downloading %u%%", progress);
+                         "%s %u%%", "Downloading", progress);
                 break;
             case PSP_UI_GLYPH_COMPONENT_INSTALLING:
                 snprintf(status + family, sizeof(status) - (size_t) family,
-                         " installing %u%%", progress);
+                         "%s %u%%", "Installing", progress);
                 break;
             default:
                 snprintf(status + family, sizeof(status) - (size_t) family,
-                         " checking...");
+                         "%s", "Checking...");
                 break;
         }
         psp_ui_keep_progress_status(ui, status, (size_t) family, 240);
@@ -437,14 +439,13 @@ bool psp_glyph_component_handle_frame(
         ? (TilefinchGlyphPack) intent->glyph_component_pack
         : TILEFINCH_GLYPH_PACK_JAPANESE;
     if (intent->glyph_component_remove_requested) {
+        /* The saved and the running interface language both keep theirs. */
         TilefinchGlyphPack ui_pack;
-        const TilefinchUiLanguageSpec *locale = tilefinch_ui_language_spec(
-            browser_profile_ui_language(app->browser->profile));
-        const TilefinchUiLanguageSpec *active_locale = tilefinch_ui_language_spec(
-            tilefinch_ui_translation_bound_language());
-        bool needed = locale && tilefinch_glyph_pack_for_language(locale->glyphs, &ui_pack)
+        bool needed = psp_ui_language_pack(
+                browser_profile_ui_language(app->browser->profile), &ui_pack)
             && requested == ui_pack;
-        needed |= active_locale && tilefinch_glyph_pack_for_language(active_locale->glyphs, &ui_pack)
+        needed |= psp_ui_language_pack(
+                tilefinch_ui_translation_bound_language(), &ui_pack)
             && requested == ui_pack;
         if (needed) {
             psp_ui_show_status(ui, "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK", 240);
@@ -493,6 +494,7 @@ bool psp_glyph_component_handle_frame(
             (void) psp_glyph_component_session_attach_selected(
                 session, app->browser->budget,
                 &app->process->install_paths,
+                browser_profile_glyph_language(app->browser->profile),
                 psp_ui_language_glyphs(app->browser->profile),
                 browser_profile_color_emoji(app->browser->profile));
         }

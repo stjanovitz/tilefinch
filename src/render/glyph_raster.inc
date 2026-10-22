@@ -143,12 +143,11 @@ static bool glyph_prefilter(TileCache *cache, const FontFace *face,
     return true;
 }
 
-/* Out of line, as it has always been compiled: with the lab-only idle glyph
-   prewarm compiled out, rasterize_truetype_text is its sole caller and GCC
-   would otherwise fold this cache path into the text rasterizer. */
 #include "humanist_ink_membership.inc"
 
-
+/* Out of line: with the lab-only idle glyph prewarm compiled out,
+   rasterize_truetype_text is its sole caller and GCC would otherwise fold
+   this cache path into the text rasterizer. */
 static __attribute__((noinline)) const FontGlyph *glyph_cache_acquire(
                                             TileCache *cache,
                                             const FontFace *face,
@@ -386,29 +385,44 @@ static unsigned glyph_humanist_profile(const FontSet *fonts,
     return metric_bold ? 2u : (italic ? 3u : 1u);
 }
 
+/* The face state one text command rasterizes with. The rasterizer and the
+   idle glyph prewarm both resolve it here, so prewarmed glyphs are the ones
+   paint looks up. An italic command whose resolved face is also the upright
+   face has no italic face and is slanted synthetically. */
+typedef struct {
+    DrawTextFace text;
+    bool synthetic_italic;
+    unsigned humanist_profile;
+} GlyphTextFace;
+
+static bool glyph_text_face(const LayoutDocument *layout,
+                            const DrawCommand *command, GlyphTextFace *out)
+{
+    out->text = draw_command_text_face(layout, command);
+    if (out->text.face == NULL) return false;
+    out->synthetic_italic = draw_command_font_italic(command)
+        && out->text.face == font_context_face_at_weight(
+            layout->fonts, layout->web_fonts,
+            draw_command_font_family(command), false, out->text.bold_face,
+            out->text.weight);
+    out->humanist_profile = glyph_humanist_profile(
+        layout->fonts, out->text.face, out->text.metric_family,
+        out->text.bold_face, draw_command_font_italic(command),
+        out->text.synthetic_bold, out->synthetic_italic);
+    return true;
+}
+
 static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                     const DrawCommand *command)
 {
-    bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_at_weight(
-        cache->layout->fonts, cache->layout->web_fonts,
-        draw_command_font_family(command), draw_command_font_italic(command),
-        bold_face, draw_command_font_weight(command));
-    if (face == NULL) return;
-    bool synthetic_italic = draw_command_font_italic(command)
-        && face == font_context_face_at_weight(
-            cache->layout->fonts, cache->layout->web_fonts,
-            draw_command_font_family(command), false, bold_face, draw_command_font_weight(command));
-    unsigned weight = draw_font_weight(command);
-    bool synthetic_bold = font_face_needs_synthetic_bold(
-        cache->layout->fonts, cache->layout->web_fonts, face, weight);
-    bool metric_bold = bold_face;
-    FontFamily metric_family = font_context_metric_family(
-        cache->layout->web_fonts, draw_command_font_family(command), face);
-    unsigned humanist_profile = glyph_humanist_profile(
-        cache->layout->fonts, face, metric_family, metric_bold,
-        draw_command_font_italic(command),
-        synthetic_bold, synthetic_italic);
+    GlyphTextFace state;
+    if (!glyph_text_face(cache->layout, command, &state)) return;
+    const FontFace *face = state.text.face;
+    bool synthetic_italic = state.synthetic_italic;
+    bool synthetic_bold = state.text.synthetic_bold;
+    bool metric_bold = state.text.bold_face;
+    FontFamily metric_family = state.text.metric_family;
+    unsigned humanist_profile = state.humanist_profile;
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
@@ -732,10 +746,7 @@ static void rasterize_text_underline(TileCache *cache, RasterTarget *target,
 {
     if (!draw_command_text_has_underline(command)
         || command->width <= 0 || command->height <= 0) return;
-    const FontFace *face = font_context_face_at_weight(
-        cache->layout->fonts, cache->layout->web_fonts,
-        draw_command_font_family(command), draw_command_font_italic(command),
-        draw_uses_bold_face(command), draw_command_font_weight(command));
+    const FontFace *face = draw_command_face(cache->layout, command);
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;

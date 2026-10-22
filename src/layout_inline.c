@@ -1531,7 +1531,7 @@ static bool paint_pseudo_internal(LayoutContext *context, lxb_dom_node_t *node,
             .text_length = style.generated_text_length,
             .scale = style.font_scale,
             .font_size = style.font_size,
-            .font_weight = draw_font_weight(&style),
+            .font_weight = draw_font_weight_code_for_style(&style),
             .font_italic = style.font_italic,
             .radius = (int) style.font_size_fraction
                       << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
@@ -1545,6 +1545,8 @@ static bool paint_pseudo_internal(LayoutContext *context, lxb_dom_node_t *node,
         /* Absolute generated ink has already been positioned. It neither
            aligns to the surrounding line nor contributes to its height. */
         if (style.out_of_flow) text.radius |= LAYOUT_TEXT_BASELINE_ALIGNED;
+        if (style.out_of_flow || style.fixed_position)
+            text.radius |= LAYOUT_TEXT_OUT_OF_FLOW;
         if (focus_visibility) {
             text.image = (const ImageResource *) node;
             text.image_fit |= (uint8_t) pseudo;
@@ -1597,7 +1599,7 @@ static bool paint_pseudo_internal(LayoutContext *context, lxb_dom_node_t *node,
         layout_transform_command_span(
             context->layout, pseudo_command_start,
             visual_end,
-            origin_x_twice, origin_y_twice, style.transform_scale_q6,
+            origin_x_twice, origin_y_twice, style.transform_scale_q14,
             style.individual_rotate_quadrants, dx, dy);
     }
     return apply_pseudo_visual_range(context, node, pseudo_command_start,
@@ -1819,6 +1821,7 @@ bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
                      lxb_dom_node_t *node)
 {
     if (url == NULL || url_length == 0) return true;
+    if (document_node_is_inert(node)) return true;
     if (url_length > LAYOUT_LINK_URL_LENGTH_MASK) return false;
     if (layout->link_count == layout->link_capacity) {
         size_t capacity = layout->link_capacity == 0 ? 64
@@ -1854,6 +1857,7 @@ bool layout_add_control(LayoutDocument *layout, int x, int y,
                         int width, int height, ControlType type,
                         lxb_dom_node_t *node)
 {
+    if (document_node_is_inert(node)) return true;
     if (!layout_node_name_is(node, "label") && node_effectively_disabled(node)) {
         return true;
     }
@@ -1879,9 +1883,7 @@ static int line_text_baseline(const LayoutDocument *layout,
     if (layout == NULL || command == NULL || command->type != DRAW_TEXT) {
         return -1;
     }
-    const FontFace *face = font_context_face_at_weight(
-        layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), draw_uses_bold_face(command), draw_command_font_weight(command));
+    const FontFace *face = draw_command_face(layout, command);
     int baseline = font_line_baseline_at_size(
         face, draw_command_text_font_size_fixed(command), command->height);
     if (baseline < 0) {
@@ -1896,18 +1898,144 @@ static int line_text_baseline(const LayoutDocument *layout,
 static int inline_style_line_height_fixed(
     LayoutContext *context, const ComputedStyle *style);
 
-int layout_box_first_text_baseline(const LayoutDocument *layout,
-                                   const LayoutNodeBox *box)
+/* Bounds of the first-baseline scan's descendant walk: it visits at most
+   as many node boxes as atomic_block_baseline does, keeps at most this many
+   out-of-flow command ranges, and looks at most this many commands between
+   two ranges to join them. The walk starts at the earliest descendant,
+   whose text the scan reaches first; past these bounds later out-of-flow
+   text counts, as it did before the walk existed. */
+#define BASELINE_DESCENDANT_VISIT_LIMIT 256u
+#define BASELINE_OUT_OF_FLOW_RANGE_LIMIT 32u
+#define BASELINE_RANGE_JOIN_GAP_LIMIT 64u
+
+typedef struct {
+    uint32_t start;
+    uint32_t end;
+} BaselineCommandRange;
+
+/* The node_boxes index of box, or SIZE_MAX when box is not in that array:
+   a generated flex item's box lives in its FlexOrderPlan and has no
+   descendant boxes. Compared as integers, since relational operators on
+   pointers into different objects are undefined. */
+static size_t layout_node_box_index(const LayoutDocument *layout,
+                                    const LayoutNodeBox *box)
 {
+    if (layout->node_boxes == NULL || box == NULL) return SIZE_MAX;
+    uintptr_t base = (uintptr_t) layout->node_boxes;
+    uintptr_t at = (uintptr_t) box;
+    if (at < base) return SIZE_MAX;
+    uintptr_t offset = at - base;
+    if (offset % sizeof(*box) != 0
+        || offset / sizeof(*box) >= layout->node_box_count) return SIZE_MAX;
+    return (size_t) (offset / sizeof(*box));
+}
+
+/* True when commands [start, end) hold no text, so joining the ranges on
+   either side cannot change which text the baseline scan counts. */
+static bool baseline_gap_without_text(const LayoutDocument *layout,
+                                      size_t start, size_t end)
+{
+    if (end < start || end - start > BASELINE_RANGE_JOIN_GAP_LIMIT
+        || end > layout->count) return false;
+    for (size_t i = start; i < end; i++) {
+        if (layout->commands[i].type == DRAW_TEXT
+            && layout->commands[i].text_length != 0) return false;
+    }
+    return true;
+}
+
+/* One bounded pass over box's descendant boxes collecting the command
+   ranges of its out-of-flow (absolute or fixed) descendants, in command
+   order. Node boxes are appended in post-order, so the descendants' boxes
+   directly precede the container's own, and every box before them was
+   finished before the container began (command_start below the
+   container's); a binary search finds the first descendant, and the walk
+   goes forward from there. A descendant's range comes before its
+   ancestor's, which replaces it; a range separated from the previous one
+   by no text joins it, so a run of out-of-flow siblings (stacked slides)
+   takes one entry. Returns the range count. */
+static size_t out_of_flow_descendant_ranges(const LayoutDocument *layout,
+                                            const LayoutNodeBox *box,
+                                            BaselineCommandRange *ranges)
+{
+    size_t box_index = layout_node_box_index(layout, box);
+    if (box_index == SIZE_MAX) return 0;
+    size_t low = 0, high = box_index;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (layout->node_boxes[middle].command_start < box->command_start)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    size_t count = 0;
+    unsigned visited = 0;
+    for (size_t i = low; i < box_index
+         && visited < BASELINE_DESCENDANT_VISIT_LIMIT; i++, visited++) {
+        const LayoutNodeBox *descendant = &layout->node_boxes[i];
+        if (descendant->positioned_ancestor_distance == 0
+            || descendant->command_start < box->command_start
+            || descendant->command_end <= descendant->command_start) continue;
+        BaselineCommandRange range = {
+            descendant->command_start, descendant->command_end
+        };
+        while (count != 0 && ranges[count - 1].start >= range.start
+               && ranges[count - 1].end <= range.end) count--;
+        if (count != 0) {
+            BaselineCommandRange *last = &ranges[count - 1];
+            if (range.start >= last->start && range.end <= last->end)
+                continue;
+            if (range.start >= last->end
+                && baseline_gap_without_text(layout, last->end,
+                                             range.start)) {
+                last->end = range.end;
+                continue;
+            }
+        }
+        if (count == BASELINE_OUT_OF_FLOW_RANGE_LIMIT) break;
+        ranges[count++] = range;
+    }
+    return count;
+}
+
+bool layout_box_first_text_baseline(const LayoutDocument *layout,
+                                    const LayoutNodeBox *box, int *baseline)
+{
+    BaselineCommandRange ranges[BASELINE_OUT_OF_FLOW_RANGE_LIMIT];
+    size_t range_count = 0;
+    bool ranges_collected = false;
     size_t end = box->command_end < layout->count ? box->command_end : layout->count;
     for (size_t i = box->command_start; i < end; i++) {
         const DrawCommand *command = &layout->commands[i];
-        if (command->type != DRAW_TEXT || command->text_length == 0
-            || draw_command_has_positioned_phase(command)) continue;
-        int baseline = line_text_baseline(layout, command);
-        if (baseline >= 0) return command->y + baseline;
+        if (command->type != DRAW_TEXT || command->text_length == 0) continue;
+        /* Out-of-flow text is in the positioned paint phase, as is the
+           in-flow text of relative, sticky and z-indexed boxes. Generated
+           out-of-flow text carries its own bit; an element's lies inside
+           an out-of-flow descendant box. */
+        if (draw_command_text_out_of_flow(command)) continue;
+        if (draw_command_has_positioned_phase(command)) {
+            if (!ranges_collected) {
+                range_count = out_of_flow_descendant_ranges(
+                    layout, box, ranges);
+                ranges_collected = true;
+            }
+            size_t skip = i;
+            for (size_t r = 0; r < range_count; r++) {
+                if (ranges[r].start <= i && i < ranges[r].end
+                    && ranges[r].end > skip) skip = ranges[r].end;
+            }
+            if (skip > i) {
+                i = skip - 1;
+                continue;
+            }
+        }
+        int text = line_text_baseline(layout, command);
+        if (text >= 0) {
+            *baseline = command->y + text;
+            return true;
+        }
     }
-    return box->y + box->height;
+    return false;
 }
 
 /* Moves one atomic inline box, its descendants and the interaction
@@ -2087,6 +2215,7 @@ static void align_line_text_baselines(LineState *line)
         }
         for (size_t i = atomic_first; i < atomic_last; i++) {
             const LineAtomic *atomic = &stack->entries[i];
+            if (atomic->mode == LINE_ATOMIC_FLOAT) continue;
             int top = atomic->top - line->y;
             if (atomic->mode == LINE_ATOMIC_BASELINE) {
                 int dy = line_baseline - (top + atomic->baseline);
@@ -2311,19 +2440,12 @@ static int line_clamp_measure_text(const LayoutDocument *layout,
     if (layout == NULL || command == NULL || text == NULL || length == 0) {
         return 0;
     }
-    bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_at_weight(
-        layout->fonts, layout->web_fonts, draw_command_font_family(command),
-        draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
-    FontFamily family = font_context_metric_family(
-        layout->web_fonts, draw_command_font_family(command), face);
-    unsigned weight = (unsigned) draw_command_font_weight_code(command) * 10u;
-    bool synthetic_bold = font_face_needs_synthetic_bold(
-        layout->fonts, layout->web_fonts, face, weight);
+    DrawTextFace resolved = draw_command_text_face(layout, command);
     return measured_flow_text_width_fixed(
-        face, family, text, length,
+        resolved.face, resolved.metric_family, text, length,
         draw_command_text_font_size_fixed(command),
-        synthetic_bold, bold_face, draw_command_text_scale(command),
+        resolved.synthetic_bold, resolved.bold_face,
+        draw_command_text_scale(command),
         draw_command_text_letter_spacing_fixed(command), transform,
         !draw_command_text_kerning_none(command));
 }
@@ -2352,19 +2474,11 @@ static bool line_ellipsis_marker(LayoutDocument *layout,
     if (marker_width < 1) marker_width = 1;
     int available = right - last->x - marker_width;
     if (available < 0) available = 0;
-    bool bold_face = draw_uses_bold_face(last);
-    const FontFace *face = font_context_face_at_weight(
-        layout->fonts, layout->web_fonts,
-        draw_command_font_family(last), draw_command_font_italic(last),
-        bold_face, draw_command_font_weight(last));
-    FontFamily family = font_context_metric_family(
-        layout->web_fonts, draw_command_font_family(last), face);
-    unsigned weight = (unsigned) draw_command_font_weight_code(last) * 10u;
-    bool synthetic_bold = font_face_needs_synthetic_bold(
-        layout->fonts, layout->web_fonts, face, weight);
+    DrawTextFace resolved = draw_command_text_face(layout, last);
     size_t prefix = available <= 0 ? 0 : fitting_text_prefix(
-        face, family, last->text, last->text_length,
-        draw_command_text_font_size_fixed(last), synthetic_bold, bold_face,
+        resolved.face, resolved.metric_family, last->text, last->text_length,
+        draw_command_text_font_size_fixed(last), resolved.synthetic_bold,
+        resolved.bold_face,
         draw_command_text_scale(last), draw_command_text_letter_spacing_fixed(last),
         layout_fixed_from_integer(available),
         draw_command_text_transform(last),
@@ -3341,6 +3455,72 @@ static int measured_balanced_text_width_fixed(
         kerning);
 }
 
+static unsigned balanced_word_lines(const int *words, size_t count,
+                                    int separator, int width)
+{
+    int used = 0;
+    unsigned lines = 1;
+    for (size_t i = 0; i < count; i++) {
+        int64_t next = (int64_t) used + separator + words[i];
+        if (used != 0 && next > width) {
+            if (++lines > 6u) return lines;
+            used = words[i];
+        } else {
+            used = used == 0 ? words[i] : (int) next;
+        }
+    }
+    return lines;
+}
+
+/* The ideal width can fall inside a word and manufacture a third line in
+   a two-line heading. Widen it only as far as the original line count needs.
+   Short, collapsed text gets one metric pass, then integer-only partitions. */
+__attribute__((noinline))
+static int balanced_text_target_width(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    int space_width_fixed, TextTransformMode transform, bool kerning,
+    int available_fixed, int target_fixed)
+{
+    int words[256];
+    size_t count = 0;
+    int separator = layout_fixed_add(space_width_fixed,
+                                    layout_fixed_add(letter_spacing,
+                                                     letter_spacing));
+    size_t at = 0;
+    while (at < length) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        size_t begin = at;
+        while (at < length && !isspace((unsigned char) text[at])) at++;
+        if (begin == at) break;
+        int word = measured_line_text_width_fixed(
+            line, face, metric_family, text + begin, at - begin,
+            font_size_fixed, synthetic_bold, metric_bold, scale,
+            letter_spacing, transform, kerning);
+        /* Emergency word splitting and invalid metrics keep normal flow. */
+        if (word < 0 || word > available_fixed
+            || count == sizeof(words) / sizeof(words[0]))
+            return layout_fixed_ceil(available_fixed);
+        words[count++] = word;
+        if (word > target_fixed) target_fixed = word;
+    }
+    unsigned lines = balanced_word_lines(words, count, separator,
+                                         available_fixed);
+    int low = layout_fixed_ceil(target_fixed);
+    int high = layout_fixed_ceil(available_fixed);
+    if (lines > 6u) return high;
+    /* At most 16 integer partitions; ordinary 480px headings need nine. */
+    for (unsigned step = 0; low < high && step < 16u; step++) {
+        int middle = low + (high - low) / 2;
+        if (balanced_word_lines(words, count, separator,
+                                layout_fixed_from_integer(middle)) <= lines)
+            high = middle;
+        else low = middle + 1;
+    }
+    return high;
+}
+
 static size_t fitting_line_text_prefix(
     LineState *line, const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
@@ -3433,7 +3613,7 @@ bool layout_add_replaced_alt_text(
         .text_length = prefix > UINT32_MAX ? UINT32_MAX : (uint32_t) prefix,
         .scale = style->font_scale,
         .font_size = style->font_size,
-        .font_weight = draw_font_weight(style),
+        .font_weight = draw_font_weight_code_for_style(style),
         .font_italic = style->font_italic,
         .radius = LAYOUT_TEXT_IMAGE_ALT | (int) style->font_size_fraction
                   << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
@@ -3545,7 +3725,16 @@ bool flow_text(LayoutContext *context, LineState *line,
                 }
                 int target = layout_fixed_ceil(target_fixed);
                 if (target >= available_pixels / 2
-                    && target < available_pixels) {
+                    && target < available_pixels
+                    && style->white_space_mode == WHITE_SPACE_NORMAL
+                    && computed_style_word_break(style) != WORD_BREAK_ALL) {
+                    target = balanced_text_target_width(
+                        line, face, metric_family, text, length,
+                        font_size_fixed, synthetic_bold, metric_bold, scale,
+                        style->letter_spacing_fixed, space_width_fixed,
+                        style->text_transform,
+                        !computed_style_kerning_none(style), available_fixed,
+                        layout_fixed_from_integer(target));
                     wrap_right = line->start_x + target;
                 }
             }
@@ -3953,7 +4142,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                 .text_length = (uint32_t) (piece_end - piece_at),
                 .scale = scale,
                 .font_size = style->font_size,
-                .font_weight = draw_font_weight(style),
+                .font_weight = draw_font_weight_code_for_style(style),
                 .font_italic = style->font_italic,
                 .radius = layout_fixed_fraction(command_x_fixed)
                     | ((int) style->font_size_fraction

@@ -272,8 +272,9 @@ bool style_uses_synthetic_weight(const FontSet *fonts,
 
 /* DrawCommand is deliberately compact on PSP. Store CSS weights in ten-unit
    increments (600 becomes 60), which preserves the face-selection boundary
-   without growing the display-list record. */
-uint8_t draw_font_weight(const ComputedStyle *style)
+   without growing the display-list record; draw_command_font_weight()
+   decodes it. */
+uint8_t draw_font_weight_code_for_style(const ComputedStyle *style)
 {
     unsigned encoded = (style_font_weight(style) + 5u) / 10u;
     return (uint8_t) (encoded > 100u ? 100u : encoded);
@@ -292,11 +293,27 @@ uint8_t text_decoration_bits(const ComputedStyle *style)
     return bits;
 }
 
-bool draw_uses_bold_face(const DrawCommand *command)
+const FontFace *draw_command_face(const LayoutDocument *layout,
+                                  const DrawCommand *command)
 {
-    return command != NULL
-           && draw_command_font_weight_code(command)
-              >= LAYOUT_BOLD_FACE_WEIGHT / 10;
+    return font_context_face_at_weight(
+        layout->fonts, layout->web_fonts, draw_command_font_family(command),
+        draw_command_font_italic(command), draw_uses_bold_face(command),
+        draw_command_font_weight(command));
+}
+
+DrawTextFace draw_command_text_face(const LayoutDocument *layout,
+                                    const DrawCommand *command)
+{
+    DrawTextFace result;
+    result.face = draw_command_face(layout, command);
+    result.metric_family = font_context_metric_family(
+        layout->web_fonts, draw_command_font_family(command), result.face);
+    result.weight = draw_command_font_weight(command);
+    result.bold_face = draw_uses_bold_face(command);
+    result.synthetic_bold = font_face_needs_synthetic_bold(
+        layout->fonts, layout->web_fonts, result.face, result.weight);
+    return result;
 }
 
 void layout_finish_work_slice(LayoutContext *context)
@@ -513,6 +530,13 @@ static bool layout_reuse_admit_payload(LayoutReuseCache *cache,
     size_t page = *index / LAYOUT_REUSE_STYLE_PAGE_SIZE;
     if (cache->style_pages[page] == NULL) {
         if (cache->style_payload_refused) return false;
+        /* Optional style payloads share the eviction policy's workspace
+           reserve. A build can start roomy and consume that reserve midway;
+           don't let caching its answers cause the required flow to refuse. */
+        if (budget_pressure_required(cache->budget,
+                LAYOUT_REUSE_STYLE_PAGE_SIZE * sizeof(LayoutReuseStylePayload),
+                LAYOUT_REUSE_STYLE_WORKING_BYTES
+                    + LAYOUT_REUSE_STYLE_RESERVE_BYTES)) return false;
         cache->style_pages[page] = budget_malloc(cache->budget,
             LAYOUT_REUSE_STYLE_PAGE_SIZE * sizeof(LayoutReuseStylePayload));
         if (cache->style_pages[page] == NULL) {
@@ -620,7 +644,7 @@ static void layout_reuse_fit_styles(LayoutReuseCache *cache)
     if (grown == capacity
         || budget_pressure_required(cache->budget,
                                     grown * sizeof(*cache->styles),
-                                    2048u * 1024u)) return;
+                                    LAYOUT_REUSE_STYLE_GROWTH_RESERVE_BYTES)) return;
     LayoutReuseStyleEntry *styles =
         budget_calloc(cache->budget, grown, sizeof(*styles));
     if (styles == NULL) return;
@@ -2731,7 +2755,8 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     layout_reuse_cache_flush_invalidations(cache);
     if (cache->style_pressure_trimmed
         && !budget_pressure_required(cache->budget,
-                                     384u * 1024u, 512u * 1024u))
+                                     LAYOUT_REUSE_STYLE_WORKING_BYTES,
+                                     LAYOUT_REUSE_STYLE_RESERVE_BYTES))
         cache->style_pressure_trimmed = false;
     /* A few probe collisions are not a walk longer than the table. */
     if (cache->style_shortfall > (cache->style_mask + 1u) / 16u
@@ -3449,6 +3474,41 @@ static void layout_build_focus_index(LayoutDocument *layout)
     layout->focus_index_capacity = capacity;
 }
 
+static bool focus_pseudo_text_command(const DrawCommand *command)
+{
+    unsigned pseudo = command->image_fit & LAYOUT_TEXT_FOCUS_PSEUDO_MASK;
+    return command->type == DRAW_TEXT && command->image != NULL
+        && (pseudo == PSEUDO_BEFORE || pseudo == PSEUDO_AFTER);
+}
+
+/* Inline layout gives at most 64 generated boxes per build focus
+   visibility identity (focus_pseudo_visibility_slots); a box can still emit
+   several text commands, so count before allocating. */
+static void layout_index_focus_pseudo_texts(LayoutDocument *layout,
+                                            bool any)
+{
+    layout->focus_pseudo_texts_indexed = false;
+    if (!any) {
+        layout->focus_pseudo_text_count = 0;
+        layout->focus_pseudo_texts_indexed = true;
+        return;
+    }
+    if (layout->count > UINT32_MAX) return;
+    size_t count = 0;
+    for (size_t i = 0; i < layout->count; i++)
+        if (focus_pseudo_text_command(&layout->commands[i])) count++;
+    uint32_t *indices = count == 0 ? NULL
+        : budget_malloc(layout->budget, count * sizeof(*indices));
+    if (count != 0 && indices == NULL) return;
+    size_t at = 0;
+    for (size_t i = 0; i < layout->count && at < count; i++)
+        if (focus_pseudo_text_command(&layout->commands[i]))
+            indices[at++] = (uint32_t) i;
+    layout->focus_pseudo_texts = indices;
+    layout->focus_pseudo_text_count = (uint32_t) count;
+    layout->focus_pseudo_texts_indexed = true;
+}
+
 bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
                          int x, int y, int width, int height,
                          int client_width, int client_height,
@@ -3572,6 +3632,11 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
                    (capacity - layout->node_container_padding_capacity)
                        * sizeof(*padding_sums));
             layout->node_container_padding_sums = padding_sums;
+            int32_t *contained = budget_realloc(
+                layout->budget, layout->node_container_contained_heights,
+                capacity * sizeof(*contained));
+            if (contained == NULL) return false;
+            layout->node_container_contained_heights = contained;
             layout->node_container_padding_capacity = capacity;
         }
         LayoutNodeBox *boxes = budget_realloc(
@@ -3591,6 +3656,7 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
     }
     size_t index = layout->node_box_count++;
     if (layout->retain_container_padding) {
+        layout->node_container_contained_heights[index] = -1;
         unsigned horizontal = padding_horizontal < 0 ? 0u
             : (padding_horizontal > UINT16_MAX
                ? UINT16_MAX : (unsigned) padding_horizontal);
@@ -3888,6 +3954,8 @@ typedef enum {
     LAYOUT_JOB_DONE,
     LAYOUT_JOB_ERROR
 } LayoutJobPhase;
+_Static_assert(LAYOUT_JOB_ERROR + 1 < LAYOUT_BUILD_FAILED_AT_STARTUP,
+               "startup failures must not alias a one-based job phase");
 
 struct LayoutBuildJob {
     Budget *budget;
@@ -4531,6 +4599,8 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
     case LAYOUT_JOB_VISIBILITY:
         okay = layout_resolve_visibility(job->context);
         if (okay) layout_build_focus_index(&job->layout);
+        if (okay) layout_index_focus_pseudo_texts(
+            &job->layout, job->context->focus_pseudo_visibility_slots != 0);
         if (okay) {
             job->layout.performance.focus_index_us =
                 layout_performance_now_us() - started_us;
@@ -4718,7 +4788,7 @@ static bool layout_build_context_resumable_sync(
     LayoutBuildJob *job = layout_build_job_begin(
         budget, document, stylesheet, fonts, images, viewport, reuse);
     if (job == NULL) {
-        layout->performance.failed_phase = 11;
+        layout->performance.failed_phase = LAYOUT_BUILD_FAILED_AT_STARTUP;
         return false;
     }
     job->preview_y_limit = preview_y_limit;
@@ -4740,6 +4810,17 @@ static bool layout_build_context_resumable_sync(
     return okay;
 }
 
+void layout_note_contained_height(LayoutDocument *layout,
+                                  const lxb_dom_node_t *node, int height)
+{
+    if (layout == NULL || !layout->retain_container_padding
+        || layout->node_container_contained_heights == NULL) return;
+    size_t index = layout_node_box_index(layout, node);
+    if (index < layout->node_container_padding_capacity)
+        layout->node_container_contained_heights[index] =
+            height < 0 ? -1 : height;
+}
+
 static bool layout_collect_container_state(Stylesheet *stylesheet,
                                            Budget *budget,
                                            const LayoutDocument *layout)
@@ -4755,13 +4836,16 @@ static bool layout_collect_container_state(Stylesheet *stylesheet,
             return false;
         }
         const LayoutNodeBox *box = &layout->node_boxes[i];
-        uint32_t padding = layout->node_container_padding_sums == NULL
-            || i >= layout->node_container_padding_capacity
-            ? 0 : layout->node_container_padding_sums[i];
-        if (!style_container_layout_state_add(
+        bool sidecar = layout->node_container_padding_sums != NULL
+            && i < layout->node_container_padding_capacity;
+        uint32_t padding = sidecar ? layout->node_container_padding_sums[i]
+                                   : 0;
+        int contained = sidecar ? layout->node_container_contained_heights[i]
+                                : -1;
+        if (!style_container_layout_state_add_contained(
                 stylesheet, box->node, box->client_width,
                 box->client_height, (int) (padding & UINT16_MAX),
-                (int) (padding >> 16))) {
+                (int) (padding >> 16), contained)) {
             style_container_layout_state_clear(stylesheet);
             return false;
         }
@@ -5137,12 +5221,14 @@ bool layout_clone_visual(LayoutDocument *visual,
                 command->radius, numerator, denominator);
         } else if (command->type == DRAW_ROTATED_FILL) {
             unsigned w = (unsigned) viewport_scale_ceil(
-                (int) (command->text_length & 65535u), numerator, denominator);
+                (int) draw_command_rotated_width(command),
+                numerator, denominator);
             unsigned h = (unsigned) viewport_scale_ceil(
-                (int) (command->text_length >> 16), numerator, denominator);
+                (int) draw_command_rotated_height(command),
+                numerator, denominator);
             if (w > 65535u) w = 65535u;
             if (h > 65535u) h = 65535u;
-            command->text_length = w | (h << 16);
+            draw_command_set_rotated_extent(command, w, h);
             command->radius = viewport_scale_floor(
                 command->radius, numerator, denominator);
             command->scale = viewport_scale_floor(
@@ -5278,6 +5364,60 @@ bool layout_clone_visual(LayoutDocument *visual,
     return true;
 }
 
+struct LayoutGridColumns {
+    const lxb_dom_node_t *node;
+    int widths[GRID_TRACK_REPEAT_LIMIT];
+    uint8_t count;
+    uint8_t origin;
+};
+
+void layout_record_grid_columns(LayoutDocument *layout,
+    lxb_dom_node_t *node, const int *widths, unsigned count, unsigned origin)
+{
+    enum { GRID_GEOMETRY_LIMIT = 128 };
+    if (count == 0 || count > GRID_TRACK_REPEAT_LIMIT || node == NULL) return;
+    size_t at = 0;
+    for (; at < layout->grid_column_count; at++)
+        if (layout->grid_columns[at].node == node) break;
+    if (at == layout->grid_column_count) {
+        if (layout->grid_columns_refused || at == GRID_GEOMETRY_LIMIT) return;
+        if (at == layout->grid_column_capacity) {
+            size_t capacity = at == 0 ? 8u : at * 2u;
+            if (capacity > GRID_GEOMETRY_LIMIT) capacity = GRID_GEOMETRY_LIMIT;
+            LayoutGridColumns *columns = budget_realloc(layout->budget,
+                layout->grid_columns, capacity * sizeof(*columns));
+            if (columns == NULL) {
+                layout->grid_columns_refused = true;
+                return;
+            }
+            layout->grid_columns = columns;
+            layout->grid_column_capacity = capacity;
+        }
+        layout->grid_column_count++;
+    }
+    LayoutGridColumns *columns = &layout->grid_columns[at];
+    columns->node = node;
+    columns->count = (uint8_t) count;
+    columns->origin = (uint8_t) origin;
+    memcpy(columns->widths, widths, count * sizeof(*widths));
+}
+
+size_t layout_grid_columns_for_node(const LayoutDocument *layout,
+    const lxb_dom_node_t *node, const int **widths, unsigned *origin)
+{
+    if (widths != NULL) *widths = NULL;
+    if (origin != NULL) *origin = 0;
+    if (layout == NULL || node == NULL) return 0;
+    for (size_t i = 0; i < layout->grid_column_count; i++) {
+        const LayoutGridColumns *columns = &layout->grid_columns[i];
+        if (columns->node != node) continue;
+        if (widths != NULL) *widths = columns->widths;
+        if (origin != NULL) *origin = columns->origin;
+        return columns->count;
+    }
+    return 0;
+}
+
 void layout_destroy(LayoutDocument *layout)
 {
     if (layout == NULL) return;
@@ -5292,13 +5432,16 @@ void layout_destroy(LayoutDocument *layout)
         budget_free(layout->budget, layout->sticky_ranges);
         budget_free(layout->budget, layout->fixed_ranges);
         budget_free(layout->budget, layout->node_boxes);
+        budget_free(layout->budget, layout->grid_columns);
         budget_free(layout->budget, layout->scroll_containers);
         budget_free(layout->budget, layout->scroll_snap_candidates);
         budget_free(layout->budget, layout->node_container_padding_sums);
+        budget_free(layout->budget, layout->node_container_contained_heights);
         budget_free(layout->budget, layout->node_clip_radius_codes);
         budget_free(layout->budget, layout->visual_priority_targets);
         budget_free(layout->budget, layout->node_index);
         budget_free(layout->budget, layout->focus_index);
+        budget_free(layout->budget, layout->focus_pseudo_texts);
         budget_free(layout->budget, layout->paint_order);
         budget_free(layout->budget, layout->command_flags);
         budget_free(layout->budget, layout->spatial_band_offsets);
@@ -5632,9 +5775,9 @@ bool layout_apply_focus_pseudo_translation(
     size_t slots[2] = {SIZE_MAX, SIZE_MAX};
     for (size_t i = box->command_start; i < box->command_end; i++) {
         const DrawCommand *c = &layout->commands[i];
-        if (c->type != DRAW_FILL_RECT || c->text != (const char *) node
-            || c->text_length < PSEUDO_BEFORE || c->text_length > PSEUDO_AFTER) continue;
-        unsigned p = c->text_length - PSEUDO_BEFORE;
+        unsigned pseudo = draw_command_focus_pseudo(c, node);
+        if (c->type != DRAW_FILL_RECT || pseudo == PSEUDO_NONE) continue;
+        unsigned p = pseudo - PSEUDO_BEFORE;
         if (slots[p] != SIZE_MAX) return false;
         slots[p] = i;
     }
@@ -5704,12 +5847,16 @@ bool layout_apply_focus_pseudo_visibility(
     size_t slots[2] = {SIZE_MAX, SIZE_MAX};
     int bounds[4] = {INT_MAX, INT_MAX, INT_MIN, INT_MIN};
     /* Ordinary inline links need not own a LayoutNodeBox. Their absolute
-       decorations retain native identity in the bounded display list. */
-    for (size_t i = 0; i < layout->count; i++) {
+       decorations retain native identity in the bounded display list, and
+       the build indexes them. */
+    bool indexed = layout->focus_pseudo_texts_indexed;
+    size_t visits = indexed ? layout->focus_pseudo_text_count : layout->count;
+    for (size_t at = 0; at < visits; at++) {
+        size_t i = indexed ? layout->focus_pseudo_texts[at] : at;
+        if (i >= layout->count) return false;
         const DrawCommand *c = &layout->commands[i];
-        unsigned pseudo = c->image_fit & LAYOUT_TEXT_FOCUS_PSEUDO_MASK;
-        if (c->type != DRAW_TEXT || c->image != (const ImageResource *) node
-            || pseudo < PSEUDO_BEFORE || pseudo > PSEUDO_AFTER) continue;
+        unsigned pseudo = draw_command_focus_pseudo(c, node);
+        if (c->type != DRAW_TEXT || pseudo == PSEUDO_NONE) continue;
         unsigned p = pseudo - PSEUDO_BEFORE;
         if (!(change->visibility_changed & (1u << p))) continue;
         if (slots[p] != SIZE_MAX || c->width <= 0 || c->height <= 0

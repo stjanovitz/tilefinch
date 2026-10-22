@@ -233,6 +233,190 @@ static int run_interrupt_stop(void)
     return failed;
 }
 
+/* Single-capture closures should need only their object and property table,
+   not a separately allocated one-pointer vector. Precompile and warm the
+   factory so this checks live function storage, not parser work or timings.
+   The shared bytecode is already resident; only one captured variable is new. */
+static int run_single_capture_storage(void)
+{
+    Realm realm;
+    if (!realm_open(&realm)) return 1;
+    static const char source[] =
+        "(function(n){let x=7;const a=new Array(n);"
+        "for(let i=0;i<n;i++)a[i]=()=>x;x++;return a})";
+    JSValue factory = JS_Eval(realm.ctx, source, sizeof(source)-1,
+                             "<capture-storage>", JS_EVAL_TYPE_GLOBAL);
+    JSValue n = JS_NewInt32(realm.ctx, 1);
+    JSValue warm = JS_Call(realm.ctx, factory, JS_UNDEFINED, 1, &n);
+    int failed = JS_IsException(factory) || JS_IsException(warm);
+    JS_FreeValue(realm.ctx, warm);
+    JS_RunGC(realm.rt);
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(realm.rt, &before);
+    n = JS_NewInt32(realm.ctx, 512);
+    JSValue closures = JS_Call(realm.ctx, factory, JS_UNDEFINED, 1, &n);
+    JS_ComputeMemoryUsage(realm.rt, &after);
+    int64_t storage = after.malloc_arena_used - before.malloc_arena_used;
+    int64_t reported = after.js_func_size - before.js_func_size;
+    static const char plain_source[] =
+        "(function(n){const a=new Array(n);"
+        "for(let i=0;i<n;i++)a[i]=()=>8;return a})";
+    JSValue plain_factory = JS_Eval(realm.ctx, plain_source,
+        sizeof(plain_source)-1, "<plain-storage>", JS_EVAL_TYPE_GLOBAL);
+    n = JS_NewInt32(realm.ctx, 1);
+    warm = JS_Call(realm.ctx, plain_factory, JS_UNDEFINED, 1, &n);
+    JS_FreeValue(realm.ctx, warm);
+    JS_RunGC(realm.rt);
+    JS_ComputeMemoryUsage(realm.rt, &before);
+    n = JS_NewInt32(realm.ctx, 512);
+    JSValue plain = JS_Call(realm.ctx, plain_factory, JS_UNDEFINED, 1, &n);
+    JS_ComputeMemoryUsage(realm.rt, &after);
+    storage -= after.malloc_arena_used - before.malloc_arena_used;
+    if (JS_IsException(closures) || JS_IsException(plain) || storage > 1024
+        || reported < (int64_t) sizeof(JSValue)) {
+        fprintf(stderr, "single captures: %lld extra function bytes, exception=%d\n",
+                (long long) storage, JS_IsException(closures));
+        failed = 1;
+    }
+    JS_RunGC(realm.rt);
+    JSValue closure = JS_IsException(closures) ? JS_UNDEFINED
+        : JS_GetPropertyUint32(realm.ctx, closures, 511);
+    JSValue value = JS_IsFunction(realm.ctx, closure)
+        ? JS_Call(realm.ctx, closure, JS_UNDEFINED, 0, NULL) : JS_UNDEFINED;
+    int32_t actual = 0;
+    failed |= JS_ToInt32(realm.ctx, &actual, value) < 0 || actual != 8;
+    JS_FreeValue(realm.ctx, value);
+    JS_FreeValue(realm.ctx, closure);
+    JS_FreeValue(realm.ctx, closures);
+    JS_FreeValue(realm.ctx, factory);
+    JS_FreeValue(realm.ctx, plain);
+    JS_FreeValue(realm.ctx, plain_factory);
+    failed |= expect_ok(realm.ctx, "<capture-semantics>",
+        "(()=>{let x=1;const get=()=>x,set=v=>x=v;set(9);"
+        "if(get()!==9)throw Error('shared capture');"
+        "const pair=(a,b)=>()=>a+b;if(pair(2,3)()!==5)throw Error('two');"
+        "function maker(v){return function C(){this.v=v}}"
+        "if(new (maker(19))().v!==19)throw Error('constructor');"
+        "const base={get v(){return 4}};"
+        "const obj={__proto__:base,m(){return super.v+x}};"
+        "if(obj.m()!==13)throw Error('home object');"
+        "class C{#v=11;read(){return ()=>this.#v}}"
+        "if(new C().read()()!==11)throw Error('private brand');"
+        "function outer(a){return eval('()=>a')}"
+        "if(outer(6)()!==6)throw Error('eval');"
+        "function make(a){return function*(){yield a}}"
+        "if(make(12)().next().value!==12)throw Error('generator');"
+        "const cycle=(()=>{let f=()=>f;return f})();"
+        "if(cycle()!==cycle)throw Error('cycle');return 'ok'})()");
+    failed |= expect_ok(realm.ctx, "<async-capture>",
+        "globalThis.asyncCapture=0;(()=>{let x=23;"
+        "async function f(){await 0;return x}"
+        "f().then(v=>globalThis.asyncCapture=v)})();'ok'");
+    JSContext *job_context = NULL;
+    for (unsigned job = 0; job < 32 && JS_IsJobPending(realm.rt); job++) {
+        if (JS_ExecutePendingJob(realm.rt, &job_context) < 0) {
+            failed = 1;
+            break;
+        }
+        JS_RunGC(realm.rt);
+    }
+    failed |= expect_ok(realm.ctx, "<async-capture-result>",
+                        "asyncCapture===23?'ok':'bad async capture'");
+    if (!realm_close(&realm)) failed = 1;
+    return failed;
+}
+
+static int run_shared_function_metadata(void)
+{
+    Realm realm;
+    if (!realm_open(&realm)) return 1;
+    const char source[] =
+        "(function(n){const a=new Array(n);"
+        "for(let i=0;i<n;i++)a[i]={get:()=>1}.get;return a})";
+    JSValue factory = JS_Eval(realm.ctx, source, sizeof(source)-1,
+                             "<metadata-factory>", JS_EVAL_TYPE_GLOBAL);
+    JSValue count = JS_NewInt32(realm.ctx, 1);
+    JSValue warm = JS_Call(realm.ctx, factory, JS_UNDEFINED, 1, &count);
+    int failed = JS_IsException(factory) || JS_IsException(warm);
+    JS_FreeValue(realm.ctx, warm);
+    JS_RunGC(realm.rt);
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(realm.rt, &before);
+    count = JS_NewInt32(realm.ctx, 512);
+    JSValue functions = JS_Call(realm.ctx, factory, JS_UNDEFINED, 1, &count);
+    JS_RunGC(realm.rt);
+    JS_ComputeMemoryUsage(realm.rt, &after);
+    int64_t properties = after.prop_size - before.prop_size;
+    if (JS_IsException(functions) || properties >= 4096) {
+        fprintf(stderr, "function metadata: %lld extra property bytes\n",
+                (long long) properties);
+        failed = 1;
+    }
+    JSValue global = JS_GetGlobalObject(realm.ctx);
+    if (JS_SetPropertyStr(realm.ctx, global, "metadataFunctions", functions) < 0)
+        failed = 1;
+    JS_FreeValue(realm.ctx, global);
+    JS_FreeValue(realm.ctx, factory);
+    failed |= expect_ok(realm.ctx, "<metadata-mutations>",
+        "(()=>{const a=metadataFunctions;const ok=(v,m)=>{if(!v)throw Error(m)};"
+        "for(const f of a){const d=Object.getOwnPropertyDescriptors(f);"
+        "ok(f.name==='get'&&f.length===0&&f()===1,'initial');"
+        "ok(Reflect.ownKeys(f).join()==='length,name','keys');"
+        "ok(d.name.configurable&&!d.name.writable&&!d.name.enumerable,'name flags');"
+        "ok(d.length.configurable&&!d.length.writable&&!d.length.enumerable,'length flags')}"
+        "Object.defineProperty(a[0],'name',{value:'changed',writable:true});"
+        "a[0].name='second';ok(a[0].name==='second'&&a[1].name==='get','value copy');"
+        "Object.defineProperty(a[0],'length',{value:2,writable:true});"
+        "a[0].length=3;ok(a[0].length===3&&a[1].length===0,'length copy');"
+        "delete a[2].name;ok(!Object.hasOwn(a[2],'name')&&a[3].name==='get','delete');"
+        "a[3].extra=17;ok(a[3].extra===17&&!Object.hasOwn(a[4],'extra'),'add');"
+        "Object.preventExtensions(a[4]);"
+        "Object.defineProperty(a[4],'name',{value:'closed'});"
+        "ok(a[4].name==='closed'&&!Reflect.defineProperty(a[4],'x',{value:1}),'closed');"
+        "Object.freeze(a[5]);ok(Object.isFrozen(a[5])&&a[5].name==='get','freeze');"
+        "const proto={custom:19};Object.setPrototypeOf(a[6],proto);"
+        "ok(a[6].custom===19&&a[6].name==='get'&&a[6]()===1,'prototype');"
+        "const key=Symbol();a[7][key]=23;ok(a[7][key]===23&&a[8][key]===undefined,'symbol');"
+        "Object.defineProperty(a[8],'name',{get(){return 'accessor'}});"
+        "ok(a[8].name==='accessor'&&a[9].name==='get','accessor');"
+        "Object.defineProperty(a[9],'name',{value:{owner:a[9]}});"
+        "ok(a[9].name.owner===a[9]&&a[10].name==='get','object value');"
+        "const proxy=new Proxy(a[10],{});"
+        "Object.defineProperty(proxy,'length',{value:99});"
+        "ok(a[10].length===99&&a[11].length===0,'proxy');"
+        "const b={get:(x)=>x,set:(x)=>x};"
+        "ok(b.get.length===1&&b.get.name==='get'&&b.set.name==='set','arity');"
+        "const g={get(){return 7},set(x){return x}};"
+        "ok(g.get()===7&&g.set(8)===8,'methods');"
+        "const h={__proto__:{v:11},get(){return super.v}},"
+        "j={__proto__:{v:13},get(){return super.v}};"
+        "Object.defineProperty(h.get,'name',{value:'other'});"
+        "ok(h.get()===11&&j.get()===13&&j.get.name==='get','home objects');"
+        "metadataFunctions=null;return 'ok'})()");
+    JSContext *foreign = JS_NewContext(realm.rt);
+    if (!foreign) failed = 1;
+    if (foreign) {
+        const char foreign_source[] = "({get:()=>42}).get";
+        JSValue exported = JS_Eval(foreign, foreign_source,
+            sizeof(foreign_source)-1, "<metadata-realm>", JS_EVAL_TYPE_GLOBAL);
+        global = JS_GetGlobalObject(realm.ctx);
+        if (JS_SetPropertyStr(realm.ctx, global, "foreignMetadata", exported) < 0)
+            failed = 1;
+        JS_FreeValue(realm.ctx, global);
+        JS_FreeContext(foreign);
+        JS_RunGC(realm.rt);
+        failed |= expect_ok(realm.ctx, "<metadata-realm-lifetime>",
+            "(()=>{const f=foreignMetadata;"
+            "if(f()!==42||f.name!=='get')throw Error('foreign lifetime');"
+            "Object.defineProperty(f,'name',{value:'renamed'});"
+            "if(f()!==42||f.name!=='renamed')throw Error('foreign mutation');"
+            "delete globalThis.foreignMetadata;return 'ok'})()");
+    }
+    JS_RunGC(realm.rt);
+    if (!realm_close(&realm)) failed = 1;
+    return failed;
+}
+
 int main(void)
 {
     int failed = 0;
@@ -245,6 +429,8 @@ int main(void)
     }
     failed |= run_interrupt_budget();
     failed |= run_interrupt_stop();
+    failed |= run_single_capture_storage();
+    failed |= run_shared_function_metadata();
     puts(failed ? "QuickJS native calls: FAIL" : "QuickJS native calls: PASS");
     return failed;
 }

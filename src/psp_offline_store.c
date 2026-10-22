@@ -44,6 +44,10 @@ static void offline_status(PspOfflineStore *store, const char *text)
              text == NULL ? "OFFLINE LIBRARY ERROR" : text);
 }
 
+static const char offline_homebrew_route[] = OFFLINE_ROOT "/homebrew";
+static const char offline_remove_homebrew_prefix[] =
+    OFFLINE_ROOT "/remove-homebrew?name=";
+
 static bool offline_route_id(
     const char *url, const char *route, uint32_t *id)
 {
@@ -779,6 +783,18 @@ static PspOfflineRouteResult offline_enqueue_video(
     return PSP_OFFLINE_ROUTE_STATE_CHANGED;
 }
 
+const char *psp_offline_store_route_cancel_status(const char *url)
+{
+    uint32_t id;
+    if (url == NULL) return NULL;
+    if (!strcmp(url, offline_homebrew_route)) return "STOPPING...";
+    if (!strncmp(url, offline_remove_homebrew_prefix,
+                 sizeof(offline_remove_homebrew_prefix) - 1u)
+        || offline_route_id(url, "extract", &id))
+        return "STOPPING ZIP CHECK...";
+    return NULL;
+}
+
 PspOfflineRouteResult psp_offline_store_handle_url(
     PspOfflineStore *store, BrowserEngine *engine,
     const BrowserProfile *profile, const char *url, const char *source_title,
@@ -816,25 +832,18 @@ PspOfflineRouteResult psp_offline_store_handle_url(
             store, engine, video_id, source_title, record_history);
     }
     uint32_t id = 0;
-    if (!strcmp(url, OFFLINE_ROOT "/homebrew")) {
+    if (!strcmp(url, offline_homebrew_route)) {
         char *html = NULL; size_t length = 0;
         bool okay = offline_library_build_homebrew_page(browser_engine_budget(engine), store->game_directory, &html, &length)
             && offline_commit(engine, url, html, length, record_history);
         offline_status(store, okay ? "INSTALLED HOMEBREW" : "HOMEBREW LIST UNAVAILABLE OR TOO LARGE");
         return okay ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
     }
-    static const char remove_prefix[] = OFFLINE_ROOT "/remove-homebrew?name=";
-    if (!strncmp(url, remove_prefix, sizeof(remove_prefix)-1)) {
-        const char *hex = url + sizeof(remove_prefix)-1; size_t bytes = strlen(hex);
-        char name[64] = {0};
-        if (!bytes || bytes > 126 || bytes % 2) return PSP_OFFLINE_ROUTE_ERROR;
-        for (size_t i = 0; i < bytes; i++) {
-            unsigned char c = (unsigned char) hex[i];
-            int value = c >= '0' && c <= '9' ? c-'0' : c >= 'a' && c <= 'f' ? c-'a'+10 : -1;
-            if (value < 0) return PSP_OFFLINE_ROUTE_ERROR;
-            name[i/2] |= (char)(value << (i%2 ? 0 : 4));
-        }
-        if (strlen(name) != bytes/2) return PSP_OFFLINE_ROUTE_ERROR;
+    if (!strncmp(url, offline_remove_homebrew_prefix,
+                 sizeof(offline_remove_homebrew_prefix) - 1u)) {
+        char name[ZIP_INSTALL_FOLDER_NAME_LIMIT];
+        if (!zip_install_decode_folder_name(url + sizeof(offline_remove_homebrew_prefix) - 1u, name))
+            return PSP_OFFLINE_ROUTE_ERROR;
         psp_offline_store_discard_zip(store);
         char error[128] = {0};
         store->zip_install = zip_install_prepare_removal(store->library.budget,
@@ -844,7 +853,7 @@ PspOfflineRouteResult psp_offline_store_handle_url(
     }
     if (offline_route_id(url, "extract", &id)) {
         const OfflineLibraryItem *item = offline_library_find(&store->library, id);
-        char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + FILE_DOWNLOAD_FILENAME_LIMIT + 24u];
+        char path[FILE_DOWNLOAD_PATH_LIMIT];
         psp_offline_store_discard_zip(store);
         if (item == NULL || item->state != OFFLINE_ITEM_READY || store->game_directory == NULL
             || !file_download_path(&store->library, id, path, sizeof(path))) {

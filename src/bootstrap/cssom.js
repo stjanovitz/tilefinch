@@ -33,6 +33,11 @@
     iterationLimit = 8,
     frameLimit = 240,
     longEffectFrameInterval = 32;
+  /* CSS motion (the lazy motion.js) clamps parsed timings to the same caps
+     the effect scheduler applies. */
+  Object.defineProperty(globalThis, "__tilefinchEffectLimits", {
+    value: Object.freeze({ duration: durationLimit, iterations: iterationLimit }),
+  });
   let effectFramePending = false;
   /* A declaration block is a list of property names: length, style[i],
      item(i) and iteration ([...element.style]) all expose them in order.
@@ -103,35 +108,26 @@
       return answer;
     };
   const effectKey = (handle, property) => String(handle) + ":" + property;
-  const colorValue = (value) => {
-    const text = String(value).trim().toLowerCase();
-    let match = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
-    if (match) {
-      let hex = match[1];
-      if (hex.length === 3)
-        hex = hex
-          .split("")
-          .map((part) => part + part)
-          .join("");
+  /* The style engine's colour grammar (named colours, #rgb[a], #rrggbb[aa],
+     rgb()/rgba(), hsl()/hsla()...), packed as alpha << 24 | rgb. Alpha
+     keeps the shortest of two decimals that maps to the same byte, as
+     computed colours serialize. Captured before author code runs. */
+  const parseColorNative = globalThis.__tilefinchParseColor,
+    colorValue = (value) => {
+      const packed = parseColorNative(String(value));
+      if (packed === null) return null;
+      const bits = Number(packed) >>> 0,
+        alphaByte = bits >>> 24,
+        alpha = Math.round((alphaByte / 255) * 100) / 100;
       return [
-        parseInt(hex.slice(0, 2), 16),
-        parseInt(hex.slice(2, 4), 16),
-        parseInt(hex.slice(4, 6), 16),
-        1,
+        (bits >>> 16) & 255,
+        (bits >>> 8) & 255,
+        bits & 255,
+        Math.round(alpha * 255) === alphaByte
+          ? alpha
+          : Math.round((alphaByte / 255) * 1000) / 1000,
       ];
-    }
-    match = text.match(
-      /^rgba?\(\s*([0-9.]+)\s*[, ]\s*([0-9.]+)\s*[, ]\s*([0-9.]+)(?:\s*[,/]\s*([0-9.]+))?\s*\)$/,
-    );
-    return match
-      ? [
-          Math.min(255, Number(match[1])),
-          Math.min(255, Number(match[2])),
-          Math.min(255, Number(match[3])),
-          match[4] === undefined ? 1 : Math.min(1, Number(match[4])),
-        ]
-      : null;
-  };
+    };
   const interpolatorFor = (from, to) => {
     const fromColor = colorValue(from),
       toColor = colorValue(to);
@@ -471,10 +467,13 @@
       (effect.direction === "alternate-reverse" && cycle % 2 === 0)
     )
       directed = 1 - directed;
-    const eased =
-      effect.easing === "linear"
-        ? directed
-        : directed * directed * (3 - 2 * directed);
+    /* The effect's easing shapes the iteration's progress, then the
+       starting keyframe's easing its interval (the only one: an effect
+       interpolates its first and last keyframes). */
+    const eased = easeProgress(
+      effect.keyframeEasing,
+      easeProgress(effect.easing, directed),
+    );
     effect.writeRaw(effect.property, effect.interpolate(eased));
     effect.frames++;
     effect.lastPresented = now;
@@ -483,6 +482,12 @@
       effect.transition?.ended();
     }
     return true;
+  }
+  /* Every easing but linear is drawn as smoothstep, which ease resembles. */
+  function easeProgress(easing, progress) {
+    return easing === "linear"
+      ? progress
+      : progress * progress * (3 - 2 * progress);
   }
   /* Writes an effect's end value and retires it. */
   function completeEffect(key, effect) {
@@ -520,6 +525,7 @@
     iterations = 1,
     direction = "normal",
     easing = "ease",
+    keyframeEasing = "linear",
     writeRaw,
     restore,
   }) => {
@@ -545,6 +551,7 @@
       duration,
       direction,
       easing,
+      keyframeEasing,
       iterations,
       interpolate,
       started: undefined,
@@ -564,6 +571,16 @@
     for (const [animation, target] of liveAnimations)
       if (node === null || target === node) listed.push(animation);
     return listed;
+  };
+  const keyframeMembers = new Set(["offset", "easing", "composite"]);
+  /* A validated easing option, linear when absent; throws on an invalid
+     one. */
+  const timingOption = (value) => {
+    const easing = __tilefinchTimingFunction(
+      value === undefined ? "linear" : String(value),
+    );
+    if (easing === null) throw new TypeError("Invalid easing");
+    return easing;
   };
   globalThis.__tilefinchAnimateElement = (node, keyframes, options = {}) => {
     options = options == null ? {} : options;
@@ -595,8 +612,20 @@
       ].includes(String(options.direction))
         ? String(options.direction)
         : "normal",
-      easing = String(options.easing || "ease"),
-      properties = Object.keys(last).slice(0, 8),
+      /* The native validator transition-timing-function uses, so script
+         and stylesheet accept the same easings; an invalid one throws. An
+         effect's easing defaults to linear (Web Animations); a CSS
+         animation passes its own, ease by default. */
+      easing = timingOption(options.easing),
+      /* A keyframe's easing applies to the interval it starts. */
+      keyframeEasing = timingOption(
+        Array.isArray(first.easing) ? first.easing[0] : first.easing,
+      ),
+      /* offset, easing and composite are keyframe members, not
+         properties to animate. */
+      properties = Object.keys(last)
+        .filter((name) => !keyframeMembers.has(name))
+        .slice(0, 8),
       effects = [];
     if (!node || !node.style || !duration) properties.length = 0;
     for (const authoredName of properties) {
@@ -616,6 +645,7 @@
           iterations,
           direction,
           easing,
+          keyframeEasing,
           writeRaw: (name, value) =>
             __tilefinchStyleSet(node.__handle, name, value),
           restore: old,

@@ -30,6 +30,7 @@ route open. It does not request video bytes and does not construct the video
 range, H.264 demux/decoder, or picture surfaces; it reuses the same bounded
 audio transport, buffering, pause, and seek machinery. The setting is sampled
 once per new YouTube route so changing Settings cannot mutate a live pipeline.
+Page `<video>` and saved media are deliberately unaffected by it.
 
 ## Provider document
 
@@ -64,6 +65,33 @@ HTML generation advance in bounded slices, remain cancellable, and preserve
 the incumbent page until the replacement commits. A validated mobile API
 identity occupies one fixed 1.4 KiB session slot for at most 30 minutes and is
 invalidated when the cookie jar changes.
+
+### Provider caches
+
+The provider keeps at most two generated Home or first-search documents for
+two minutes in the session Budget. Keys include the exact URL, the
+presentation variant, and the cookie authority visible to the request;
+eviction is least-recently-used. This cache is optional session memory: it
+takes part in ordinary cache reclaim, **Clear HTTP caches**, and site-data
+clearing, so a generated provider page cannot outlive the user's clear action
+or crowd out an authoritative navigation under pressure. Raw provider
+responses and decoded images are not kept. Result cards commit with fixed
+thumbnail geometry, and their explicitly lazy images join the ordinary
+post-paint resource queue.
+
+Details and their expansions share this cache for a parsed snapshot of watch
+facts (at most 16 KiB per entry, never the raw response). The key is the
+mapped watch URL, and the request-cookie fingerprint, language, date format,
+two-minute age limit, and captive-portal exclusion must all match. Returning
+to details can reuse these facts; an explicit Reload fetches fresh data.
+Description can reuse the parsed description with no network job, while
+Comments fetches only its fresh API response. The comments token is
+discovered in bounded steps alongside the original build; unfinished
+discovery never delays that build and instead sends a later Comments request
+down the ordinary path, as does a cache or allocation miss. A rejected cached
+continuation invalidates only its matching facts entry and uses the existing
+single full-watch retry. Jobs copy facts before yielding and never borrow a
+cache entry across a pump or keep DOM pointers.
 
 ## Resolver and admission policy
 
@@ -151,6 +179,32 @@ Every range-read failure remains distinguishable from structural MP4 failure;
 logs include the failing offset and transport status rather than collapsing
 both classes into “fragment plan failed.”
 
+## HLS sources
+
+HLS masters are parsed exactly, and large live media playlists
+incrementally, keeping only the newest twelve complete segment records
+rather than a DVR-sized response. Demuxed masters keep at most one video and
+one audio source, and each source streams one MPEG-TS segment at a time
+through the shared worker.
+
+A live source starts from the last three advertised segments, refreshes the
+rolling media playlist at half its target duration, maps media-sequence
+changes onto one continuous local clock, and records any skipped window as a
+discontinuity. One of the two request slots stays free for a near-edge
+playlist refresh. Stale snapshots, temporary refresh failures, signed-URL
+replacement, and an eventual `ENDLIST` are all bounded transitions, and a
+playlist that makes no progress for 60 seconds fails visibly instead of
+spinning.
+
+HLS queues at most 64 samples and 576 KiB of payload, and it rejects
+encrypted, fragmented-MP4, byte-range, and explicitly non-AVC variants.
+Neither MP4 nor HLS writes media bytes to the Memory Stick. A finite HLS seek
+resets only the selected segment and preserves an untouched in-flight request
+across repeated cooperative readiness probes; rolling live playback
+deliberately has no scrubber. Video-only variants may start priming as soon as
+their PMT and first video sample are known instead of filling the whole first
+segment.
+
 ## PSP decode and presentation
 
 The PSP backend uses the firmware AVC raw-NAL bridge and AAC-LC decoder. The
@@ -167,7 +221,8 @@ FREE -> ME_WRITING -> READY -> READING -> FREE
 Slots carry session epochs and picture identities. Codec and DMA completions
 carry the same tuple; stale completions after seek, reset, quarantine, or
 teardown are discarded. A slot never returns to `FREE` until its real reader
-has completed. Pixel signatures and canary rows make silent substitution and
+has completed; a timed-out reader quarantines its surface rather than
+returning memory to a writer. Video is staged in EDRAM and scaled by the GE. Pixel signatures and canary rows make silent substitution and
 short writes visible in validation builds.
 
 The 240p path uses a 512-pixel CSC stride. The 360p path keeps firmware decode
@@ -178,6 +233,61 @@ The media-session state machine owns opening, priming, playing, paused,
 buffering, seeking, recovery, and quiescing. See
 [PSP media session state](PSP_MEDIA_SESSION_STATE.md). It is the only
 authority that may decide when a pipeline can be replaced or destroyed.
+
+Fullscreen video keeps the decoder's 8888 scanout rather than narrowing the
+whole picture to the page renderer's RGB565 format. The native player projects
+its overlay into at most 16 clipped, disjoint rectangles. Opaque title and
+control bars start from cleared RGB565 scratch and so never import the moving
+picture; only translucent badges, previews, and panels import their bounded
+backdrop before the ordinary chrome compositor runs. The result is widened
+only inside those rectangles, and every pixel outside them is the decoder's
+original output, byte for byte. Fixed player shapes use precomputed coverage
+from the same bounded antialiasing sampler as the generic path.
+
+### Choosing a decoder
+
+The actual Annex-B SPS decides the backend before any decoder is built.
+Baseline and Main streams within PSP bounds go to the firmware bridge (unless
+the software decoder has already taken over, below), converted on the codec
+worker to its bounded length-prefixed input; in-band parameter-set changes
+are rejected unless they preserve the firmware configuration exactly.
+Compatible High-profile streams use the optional software decoder. WebM and
+unsupported HLS forms fail as unsupported formats rather than being
+misreported as firmware failures.
+
+### Optional software decoder
+
+H.264 High at up to 432×240 can use a replaceable, user-built software-decoder
+PRX. Official releases contain the loader but no custom H.264 or AAC decoder
+binary. The component lives outside the A/B slots, carries a small ABI record,
+and survives ordinary app updates; if it is missing or incompatible, this
+route fails with an actionable player message while firmware-compatible video
+keeps working. Building and installing it is described in
+[Development](../DEVELOPMENT.md#optional-psp-software-decoder).
+
+The decoder keeps FFmpeg's allocations inside one admitted arena, runs CABAC,
+deblocking, AAC, and most RGB565 conversion on the Media Engine, reconstructs
+rows on the CPU, and publishes into a 25-slot generation-tagged ring. The
+display clock slips forward instead of racing when a frame is more than 8 ms
+late, quality rungs depend only on ring occupancy, and audio may not run more
+than 80 ms ahead of the displayed picture. Once this path owns the Media
+Engine, every later AVC or AAC route stays on it until suspend or process
+exit. Suspend detaches and restores the firmware's ME state before the power
+transition, and resume reattaches before the next software decode.
+
+Every buffer shared with the Media Engine sits on an isolated 64-byte cache
+line with tail padding, so range cache maintenance cannot touch Budget
+metadata or a neighboring object. CPU-written AAC packets are written back
+before submission, completed RGB surfaces are invalidated before the browser
+reads them, and reordered pictures recover their presentation timestamps from
+the source-AU mapping rather than the decoder's completion order. Each Annex-B
+access unit revalidates any in-band SPS against the admitted geometry, the
+decoder independently bounds the pictures it returns, and color conversion
+receives the exact byte capacity of its destination slot. AAC output is
+admitted only when its channel count fits the component's fixed two-plane
+ABI. After a software takeover, later Baseline and Main streams must also fit
+the software route's 432×240 bound; larger streams fail admission instead of
+reaching an incompatible backend.
 
 ## Buffering and player behavior
 
@@ -199,6 +309,31 @@ The native player is provider-neutral:
   bounded teardown continues through the session machine.
 - Controls auto-hide during playback and are composited without sampling a
   mutable decoded surface after its lease ends.
+
+## Media found in page data
+
+Visible posterless videos inside same-origin HTTPS article links may obtain
+the linked article's declared Open Graph/Twitter image during idle work.
+This is an article preview, not a decoded video frame. The page permits two
+lookups, each limited to 512 KiB of streamed head data, 4 KiB tags, and a
+five-second overall job lifetime. Raw script/style text is discarded and no
+linked document is installed or executed. Metadata requests omit credentials;
+normal request policy, CSP, redirect rules, image limits and cancellation still
+apply. Authored posters win, and hidden/offscreen videos are not looked up.
+This path does not add a decoder or change native playback admission.
+
+When a server-rendered `<video>` has no `src`, activating it may perform one
+bounded, allocation-free scan of retained data scripts and generic media
+attributes for direct MP4, HLS, or WebM references. Candidate selection
+ignores hostnames, prefers the lowest direct MP4 quality at or above 240p, and
+still passes URL resolution, CSP, request authority, and media probing. The
+same retained-data seam recognizes schema-scoped `AudioObject` and
+`MusicRecording.audio` sources, indexing at most twelve compact spans rather
+than copying a JSON object graph. An otherwise inert Play or Preview button
+may open the audio-only player only when one candidate exists, or when nearby
+title or URL metadata identifies exactly one. Authored media elements,
+JavaScript handlers, navigation, cancellation, and ambiguous matches always
+take precedence.
 
 ## Host qualification
 

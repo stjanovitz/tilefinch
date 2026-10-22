@@ -356,6 +356,62 @@ static int test_engine_lifecycle(void)
               reclaim_reference, browser_engine_framebuffer(engine, NULL),
               frame_pixels * sizeof(*reclaim_reference)) == 0);
     free(reclaim_reference);
+    /* An accelerator must not prevent a required allocation. Reclaim only
+       unborrowed decoded pixels, never invalidate borrowed response metadata
+       or a surface currently held by the page. */
+    {
+        Budget *owner = browser_engine_budget(engine);
+        BrowserSession *session = browser_engine_session(engine);
+        static const unsigned char encoded[] = {1, 2, 3, 4};
+        const char *url = "https://pixel-reclaim.test/image";
+        TilefinchRequestContext context = {
+            .target_url = url, .initiator_url = url, .top_level_url = url,
+            .method = "GET", .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+            .destination = TILEFINCH_DESTINATION_IMAGE
+        };
+        TilefinchResourceGrant grant = {
+            .destination = TILEFINCH_DESTINATION_IMAGE,
+            .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+            .final_same_origin = true, .final_same_site = true
+        };
+        unsigned char *source = budget_malloc(owner, sizeof(encoded));
+        CHECK(source != NULL);
+        memcpy(source, encoded, sizeof(encoded));
+        BrowserSharedBody *body = browser_shared_body_take(owner, source, sizeof(encoded));
+        CHECK(body != NULL && browser_session_cache_put_http_shared_resource(
+            session, url, body, NULL, NULL, "image/png", "immutable", NULL,
+            0, &context, &grant));
+        browser_shared_body_release(body);
+        const BrowserCacheEntry *cached = NULL;
+        CHECK(browser_session_cache_match_resource(session, url, &context,
+            tilefinch_platform_monotonic_time_ns(), &cached) == BROWSER_CACHE_FRESH);
+        const unsigned char *borrowed = cached->data;
+        unsigned char *rgba = budget_calloc(owner, 128u * 64u, 4u);
+        CHECK(rgba != NULL);
+        BrowserSharedBody *pixels = browser_shared_body_take(owner, rgba, 128u * 64u * 4u);
+        CHECK(pixels != NULL && browser_session_decoded_image_put(session, url,
+            &context, cached->data, cached->length, pixels, 128, 64, 128, 64));
+        size_t limit = owner->limit;
+        owner->limit = owner->current + 64u;
+        void *allocation = budget_malloc(owner, 16384u);
+        owner->limit = limit;
+        CHECK(allocation == NULL && cached->decoded_image_pixels == pixels
+              && pixels->references == 2u && cached->data == borrowed);
+        browser_shared_body_release(pixels);
+        budget_inject_failure_after(owner, 0);
+        allocation = budget_malloc(owner, 16384u);
+        budget_clear_failure_injection(owner);
+        CHECK(allocation == NULL && cached->decoded_image_pixels != NULL);
+        owner->limit = owner->current + 64u;
+        allocation = budget_malloc(owner, 16384u);
+        owner->limit = limit;
+        CHECK(allocation != NULL && cached->decoded_image_pixels == NULL
+              && cached->data == borrowed && cached->length == sizeof(encoded)
+              && memcmp(borrowed, encoded, sizeof(encoded)) == 0);
+        budget_free(owner, allocation);
+    }
     size_t incumbent_history_count =
         browser_engine_navigation(engine)->history_count;
     BrowserController *incumbent_controller =
@@ -1130,6 +1186,10 @@ static int test_focus_paint_geometry_reuse(void)
     NavigationSession *navigation = browser_engine_navigation(engine);
     size_t snapshots = navigation->page.script_result.geometry_snapshot_builds;
     size_t relayouts = navigation->incremental_relayouts;
+    /* Optional images waiting for admission have not changed the currently
+       published dimensions. They must not disable a focus-only geometry
+       proof; actual image publication remains independently guarded. */
+    navigation->page.image_continuation_pending = true;
     ScriptResult result = {0};
     CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
         "globalThis.paint=document.getElementById('paint');"
@@ -1141,6 +1201,7 @@ static int test_focus_paint_geometry_reuse(void)
         && result.geometry_snapshot_hits >= 40u
         && navigation->incremental_relayouts == relayouts
         && script_runtime_has_pending_mutations(navigation->page.runtime));
+    navigation->page.image_continuation_pending = false;
     CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
     bool red_border = false;
     for (size_t i = 0; i < navigation->page.layout.count; i++) {
@@ -1148,6 +1209,16 @@ static int test_focus_paint_geometry_reuse(void)
         red_border |= command->type == DRAW_STROKE_RECT && command->color == 0xff0000;
     }
     CHECK(red_border);
+    /* This is different from an unadmitted optional image: a ready image
+       publication can change dimensions and must retain the snapshot path. */
+    navigation->page.visual_image_publication_pending = true;
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "paint.blur();paint.focus();paint.getBoundingClientRect();",
+        "<focus-pending-image-publication>", &result) && result.success
+        && result.geometry_snapshot_builds > snapshots);
+    navigation->page.visual_image_publication_pending = false;
+    CHECK(browser_engine_advance_runtime(engine, 16, 16, NULL));
+    snapshots = navigation->page.script_result.geometry_snapshot_builds;
     CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
         "const size=document.getElementById('size');"
         "const old=size.getBoundingClientRect().width;size.focus();"
@@ -1412,6 +1483,31 @@ static int test_opacity_geometry_snapshot_reuse(void)
         CHECK(after.full_resets == before.full_resets);
         CHECK(after.style_hits >= before.style_hits + 7u);
         CHECK(navigation_relayout(nav));
+        /* Geometry reads need the same workspace policy as owner-driven
+           publication. Optional cached styles must yield before its scratch
+           build, without retiring the realm or losing the viewport. */
+        layout_reuse_cache_stats(nav->page.layout_reuse, &before);
+        CHECK(before.retained_bytes > 48u * 1024u);
+        uint64_t fingerprint = nav->page.layout.text_fingerprint;
+        int height = nav->page.layout.height;
+        CHECK(navigation_set_scroll(nav, 123));
+        size_t remaining = budget_remaining(nav->budget);
+        CHECK(remaining > 600u * 1024u);
+        void *pressure = budget_malloc(nav->budget, remaining - 600u * 1024u);
+        CHECK(pressure != NULL);
+        CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+            "(()=>{const n=document.getElementById('first');"
+            "n.style.width='170px';const a=n.offsetWidth;n.style.width='160px';"
+            "globalThis.pocSummary=[a,n.offsetWidth].join(',')})()",
+            "<geometry-pressure-workspace>", &result));
+        CHECK(strcmp(result.summary, "170,160") == 0);
+        layout_reuse_cache_stats(nav->page.layout_reuse, &after);
+        CHECK(after.retained_bytes < before.retained_bytes);
+        CHECK(navigation_relayout(nav) && nav->page.runtime != NULL
+            && nav->page.loaded && nav->page.layout.height == height
+            && nav->page.layout.text_fingerprint == fingerprint
+            && navigation_current(nav)->scroll_y == 123);
+        budget_free(nav->budget, pressure);
         CHECK(browser_engine_shutdown(engine));
         browser_engine_destroy(engine);
     }
@@ -1485,6 +1581,66 @@ static int test_computed_style_tracks_container_geometry(void)
    the engine supports. Every expectation here is an exact value: a test that
    merely required "not empty" would pass on a table of initial values while
    the cascade, inheritance and used sizes were all wrong. */
+static int test_computed_grid_columns(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] = "<!doctype html><style>body{margin:0}"
+        "#g{display:grid;width:480px;gap:20px;grid-template-columns:"
+        "repeat(auto-fill,minmax(200px,1fr))}"
+        "#named{display:grid;width:480px;grid-template-columns:"
+        "[first] 1fr [middle] 2fr [last]}"
+        "#inline{display:inline-grid;width:480px;grid-template-columns:1fr 2fr}"
+        "#sub{display:grid;grid-column:span 2;grid-template-columns:subgrid [local]}"
+        "</style><div id=g><b>A</b><b>B</b><b>C</b></div>"
+        "<div id=named><b>A</b><b>B</b></div>"
+        "<div id=inline><b>A</b><b>B</b></div>"
+        "<div style='display:grid;width:480px;grid-template-columns:1fr 2fr'>"
+        "<div id=sub><b>A</b><b>B</b></div></div>";
+    CHECK(browser_engine_commit_html(engine, "https://grid-values.test/",
+                                     page, sizeof(page) - 1, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "globalThis.g=document.getElementById('g');"
+        "pocSummary=getComputedStyle(g).gridTemplateColumns",
+        "<used-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "230px 230px") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "g.style.width='310px';pocSummary=getComputedStyle(g).gridTemplateColumns",
+        "<resized-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "310px") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "g.style.width='550px';pocSummary=getComputedStyle(g).gridTemplateColumns",
+        "<resized-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "265px 265px") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "pocSummary=getComputedStyle(document.getElementById('named')).gridTemplateColumns",
+        "<named-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "[first] 160px [middle] 320px [last]") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "pocSummary=getComputedStyle(document.getElementById('inline')).gridTemplateColumns",
+        "<inline-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "160px 320px") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "pocSummary=getComputedStyle(document.getElementById('sub')).gridTemplateColumns",
+        "<subgrid-columns>", &result));
+    CHECK(strcmp(result.summary, "subgrid [local] [] []") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "g.style.display='none';pocSummary=getComputedStyle(g).gridTemplateColumns",
+        "<hidden-grid-columns>", &result));
+    CHECK(strcmp(result.summary, "none") == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_computed_style_resolved_values(void)
 {
     BrowserDeviceProfile profile;
@@ -2226,6 +2382,186 @@ static bool transition_expect(TransitionPage *page, const char *label,
     return true;
 }
 
+/* CSS animations, Element.animate() and KeyframeEffect validate easings
+   through the native validator behind transition-timing-function, so all
+   of them accept exactly the same values: an invalid easing drops an
+   animation shorthand or longhand and makes the script APIs throw, and a
+   valid one serializes the way getComputedStyle reports a transition's. */
+static int test_easing_validation_agreement(void)
+{
+    static const char *const easings[] = {
+        "EASE-IN", "step-end", "cubic-bezier(.2,.8,.2,1)", "steps(4, END)",
+        "steps(2, jump-none)", "linear(0, .25 50%, 1)", "steps(foo)",
+        "cubic-bezier(a,b,c,d)", "cubic-bezier(1.5, 0, 0, 1)", "steps(0)",
+        "steps(1, jump-none)", "linear(1)", "bounce", "",
+    };
+    enum { EASINGS = sizeof(easings) / sizeof(easings[0]) };
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html), "%s",
+        /* The PSP profile prefers reduced motion, which shows CSS
+           animations as a static frame with no easing to read. Answer
+           matchMedia the other way before motion.js reads it. */
+        "<!doctype html><script>const mm=matchMedia;window.matchMedia=q=>"
+        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q)</script>"
+        "<style>@keyframes p{from{opacity:0}to{opacity:1}}"
+        "#bad{animation:p 1s steps(foo)}"
+        "#fn{animation:p 1s cubic-bezier(.2,.8,.2,1)}"
+        "#keep{animation:p 1s linear;"
+        "animation-timing-function:cubic-bezier(2,0,0,1)}"
+        "#long{animation:p 1s;"
+        "animation-timing-function:STEPS(2, jump-none),ease}"
+        "#list{animation:p 1s linear;"
+        "animation-timing-function:ease-in,steps(foo)}"
+        "#plain{animation:p 1s}");
+    for (size_t i = 0; i < EASINGS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "#t%zu{transition-timing-function:ease-out;"
+            "transition-timing-function:%s}", i, easings[i]);
+    used += (size_t) snprintf(html + used, sizeof(html) - used, "%s",
+        "</style><body><div id=bad>a</div><div id=fn>b</div>"
+        "<div id=keep>c</div><div id=long>d</div><div id=list>e</div>"
+        "<div id=plain>f</div>");
+    for (size_t i = 0; i < EASINGS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<i id=t%zu>x</i>", i);
+    CHECK(used < sizeof(html) - 16u);
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, used));
+    CHECK(transition_expect(&page, "<css-animation-easing>",
+        "(()=>{__tilefinchMaybeStartMotion();globalThis.pocSummary='';"
+        "globalThis.__easingProbe=()=>{const e=id=>{const a=document."
+        "getElementById(id).getAnimations();return a.length?a[0].effect."
+        "getTiming().easing:'none'};globalThis.pocSummary=['bad','fn',"
+        "'keep','long','list','plain'].map(e).join('|')};"
+        "__easingProbe();setInterval(__easingProbe,16)})()", 16, 24,
+        "none|cubic-bezier(0.2, 0.8, 0.2, 1)|linear|steps(2, jump-none)"
+        "|linear|ease"));
+    /* Each easing: what a transition computes, what Element.animate()
+       and KeyframeEffect make of it. A dropped transition declaration
+       leaves ease-out, and then both script APIs must throw. */
+    char probe[2048];
+    used = (size_t) snprintf(probe, sizeof(probe),
+        "(()=>{const easings=[");
+    for (size_t i = 0; i < EASINGS; i++)
+        used += (size_t) snprintf(probe + used, sizeof(probe) - used,
+                                  "%s'%s'", i ? "," : "", easings[i]);
+    used += (size_t) snprintf(probe + used, sizeof(probe) - used, "%s",
+        "],out=[],box=document.getElementById('plain');"
+        "const t=f=>{try{return f()}catch(e){return e instanceof TypeError?"
+        "'TypeError':'other'}};"
+        "easings.forEach((easing,i)=>{const computed=getComputedStyle("
+        "document.getElementById('t'+i)).transitionTimingFunction;"
+        "const effect=t(()=>new KeyframeEffect(null,[],{easing})"
+        ".getTiming().easing);"
+        "const animate=t(()=>{const a=box.animate([{opacity:0},"
+        "{opacity:1}],{duration:10,easing});const v=a.effect"
+        ".getTiming().easing;a.cancel();return v});"
+        "const want=computed==='ease-out'?'TypeError':computed;"
+        "if(effect!==want||animate!==want)out.push(easing+':'+computed+'/'"
+        "+effect+'/'+animate)});"
+        "globalThis.pocSummary=out.length?out.join(';'):'agree'})()");
+    CHECK(used < sizeof(probe));
+    CHECK(transition_expect(&page, "<easing-agreement>", probe, 16, 1,
+                            "agree"));
+    CHECK(transition_page_close(&page));
+    return 0;
+}
+
+/* Element.animate() eases linearly unless told otherwise, as Web
+   Animations defines an effect's default easing; getTiming() reports what
+   the effect runs with. A keyframe's own easing shapes its interval, and
+   offset and easing are keyframe members, never animated properties. A
+   CSS animation still eases with ease (test_easing_validation_agreement's
+   #plain). Each effect is read once its time passes a fifth of its
+   duration: a linear one shows about that much progress, an eased one
+   (smoothstep, as ease approximates here) about half of it. */
+static int test_animate_default_easing(void)
+{
+    static const char html[] = "<!doctype html><body></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    bool ok = transition_expect(&page, "<animate-default-easing>",
+        "(()=>{const D=4000,runs=[['plain',[{opacity:0},{opacity:1}],{}],"
+        "['effect',[{opacity:0},{opacity:1}],{easing:'ease-in'}],"
+        "['keyframe',[{opacity:0,easing:'ease-in'},{opacity:1}],{}],"
+        "['offset',[{opacity:0,offset:0},{opacity:1,offset:1}],{}]];"
+        "const live=runs.map(([name,frames,options])=>{const el=document."
+        "createElement('div');document.body.appendChild(el);return[name,el,"
+        "el.animate(frames,{duration:D,...options})]});const seen={};"
+        "globalThis.pocSummary='';const probe=()=>{for(const[name,el,a]of "
+        "live){if(name in seen||a.currentTime<D/5)continue;const t=a."
+        "currentTime/D,o=parseFloat(getComputedStyle(el).opacity);seen[name]=name+':'+"
+        "(o>0.8*t?'linear':'eased')+':'+a.effect.getTiming().easing+':'+"
+        "(el.style.getPropertyValue('offset')+el.style.getPropertyValue("
+        "'easing')||'-')}if(Object.keys(seen).length===live.length){"
+        "globalThis.pocSummary=runs.map(([name])=>seen[name]).join(' ');"
+        "clearInterval(timer)}};const timer=setInterval(probe,16)})()",
+        16, 120,
+        "plain:linear:linear:- effect:eased:ease-in:- "
+        "keyframe:eased:linear:- offset:linear:linear:-");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+/* A linear() easing of 60 stops (about 600 bytes serialized) is a valid
+   transition-timing-function: the transition keeps it, reports it and
+   ends with transitionend, and a CSS animation and Element.animate() take
+   it too. It used to overflow the 48-byte computed easing (and the
+   256-byte retained transition value), which dropped the declaration. One
+   whose serialization passes STYLE_TIMING_FUNCTION_CAPACITY is still
+   rejected, alike everywhere. */
+static int test_long_linear_easing(void)
+{
+    char easing[1024], over[2048];
+    size_t used = (size_t) snprintf(easing, sizeof(easing), "linear(0");
+    for (unsigned i = 1; i < 59u; i++)
+        used += (size_t) snprintf(easing + used, sizeof(easing) - used,
+                                  ", %g %g%%", i * 0.0169, i * 1.69);
+    used += (size_t) snprintf(easing + used, sizeof(easing) - used, ", 1)");
+    CHECK(used < sizeof(easing) - 1u && used > 512u);
+    used = (size_t) snprintf(over, sizeof(over), "linear(0");
+    for (unsigned i = 1; i < 99u; i++)
+        used += (size_t) snprintf(over + used, sizeof(over) - used,
+                                  ", %g %g%%", i * 0.0101, i * 1.01);
+    used += (size_t) snprintf(over + used, sizeof(over) - used, ", 1)");
+    CHECK(used < sizeof(over) - 1u && used >= STYLE_TIMING_FUNCTION_CAPACITY);
+    char html[8192];
+    used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><script>const mm=matchMedia;window.matchMedia=q=>"
+        "/reduced-motion/.test(q)?{matches:false,media:q}:mm(q)</script>"
+        "<style>@keyframes p{from{opacity:0}to{opacity:1}}"
+        "#t{opacity:1;transition:opacity 40ms %s}#t.go{opacity:0}"
+        "#o{transition:opacity 40ms ease-out;transition:opacity 40ms %s}"
+        "#a{animation:p 1s %s}</style><body><div id=t>t</div>"
+        "<div id=o>o</div><div id=a>a</div>", easing, over, easing);
+    CHECK(used < sizeof(html));
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, used));
+    char probe[8192];
+    used = (size_t) snprintf(probe, sizeof(probe),
+        "(()=>{__tilefinchMaybeStartMotion();const long='%s',over='%s',"
+        "t=document.getElementById('t'),out=[];"
+        "const timing=id=>getComputedStyle(document.getElementById(id))"
+        ".transitionTimingFunction;"
+        "out.push(timing('t')===long?'kept':'t='+timing('t').slice(0,40),"
+        "timing('o'));"
+        "const animate=easing=>{try{const a=t.animate([{opacity:1},"
+        "{opacity:1}],{duration:10,easing});const v=a.effect.getTiming()"
+        ".easing;a.cancel();return v===long?'long':v.slice(0,40)}catch(e){"
+        "return e instanceof TypeError?'TypeError':'other'}};"
+        "out.push(animate(long),animate(over));globalThis.pocSummary='';"
+        "t.addEventListener('transitionend',()=>{const a=document."
+        "getElementById('a').getAnimations();globalThis.pocSummary=out."
+        "concat('ended',a.length&&a[0].effect.getTiming().easing===long?"
+        "'css-long':'css-'+a.length).join(' ')});"
+        "t.classList.add('go')})()", easing, over);
+    CHECK(used < sizeof(probe));
+    bool ok = transition_expect(&page, "<long-linear-easing>", probe, 16, 40,
+        "kept ease-out long TypeError ended css-long");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
 /* Many simultaneous stylesheet transitions: starting them does not rescan
    the running set, at most 256 run at once, the oldest past that ends early
    rather than never, and every one ends and leaves the set. */
@@ -2602,6 +2938,40 @@ static int test_transition_negative_delay(void)
         10, 30,
         "vp:start@50e0/end@150e0.1 vn:start@10e0.08/end@20e0.1 vx:"
         " op:start@80e0/end@180e0.1 on:start@20e0.08/end@40e0.1 ox:");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+/* An inline colour transition between named colours (and the other colour
+   forms the style engine parses) animates through rgba() values instead of
+   jumping to the end value. It used to interpolate only #rgb, #rrggbb and
+   numeric rgb()/rgba(). */
+static int test_transition_named_colors(void)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<div id=n style='color:red;transition:color 200ms linear'>n</div>"
+        "<div id=h style='color:hsl(0,100%,50%);"
+        "transition:color 200ms linear'>h</div>"
+        "<div id=a style='color:#ff000080;transition:color 200ms linear'>a"
+        "</div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    /* Each element's computed colour must pass through a value between
+       its endpoints (red strictly between 255 and 0) and settle on blue. */
+    static const char check[] =
+        "(()=>{const out=[];for(const id of ['n','h','a']){"
+        "const v=getComputedStyle(document.getElementById(id)).color,"
+        "c=(v.match(/[0-9.]+/g)||[]).map(Number);"
+        "if(c[0]>0&&c[0]<255&&c[2]>0&&c[2]<255)__mid[id]=true;"
+        "out.push(id+':'+(__mid[id]?'mid':'none')+':'+"
+        "(c[0]===0&&c[1]===0&&c[2]===255?'end':'run'))}"
+        "globalThis.pocSummary=out.join(' ')})()";
+    bool ok = transition_poll(&page,
+        "(()=>{globalThis.__mid={};for(const id of ['n','h','a']){"
+        "const el=document.getElementById(id);"
+        "el.style.color=id==='a'?'rgba(0,0,255,0.5)':'blue'}})()",
+        check, 40, "n:mid:end h:mid:end a:mid:end");
     CHECK(transition_page_close(&page) && ok);
     return 0;
 }
@@ -3496,7 +3866,7 @@ static int profile_staged_font_replay(const char *trace, const char *url,
             const DrawCommand *command = &navigation->page.layout.commands[at];
             if (command->type != DRAW_TEXT || command->font_family >= 32) continue;
             unsigned variant = (draw_command_font_italic(command) ? 1u : 0u)
-                | (draw_command_font_weight_code(command) >= 65 ? 2u : 0u);
+                | (draw_uses_bold_face(command) ? 2u : 0u);
             font_requests[command->font_family][variant]++;
         }
         size_t loaded_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
@@ -3560,12 +3930,13 @@ static int profile_staged_font_replay(const char *trace, const char *url,
                 for (unsigned variant = 0; variant < 4; variant++) {
                     size_t count = font_requests[family][variant];
                     if (count == 0) continue;
-                    const FontFace *old_face = font_context_face_variant(
+                    bool bold = (variant & 2u) != 0;
+                    const FontFace *old_face = font_context_face_at_weight(
                         &previous_fonts, web_fonts, (FontFamily) family,
-                        (variant & 1u) != 0, (variant & 2u) != 0);
-                    const FontFace *new_face = font_context_face_variant(
+                        (variant & 1u) != 0, bold, bold ? 700u : 400u);
+                    const FontFace *new_face = font_context_face_at_weight(
                         browser_engine_fonts(engine), web_fonts, (FontFamily) family,
-                        (variant & 1u) != 0, (variant & 2u) != 0);
+                        (variant & 1u) != 0, bold, bold ? 700u : 400u);
                     bool changed_face = (old_face == NULL ? NULL : old_face->data)
                         != (new_face == NULL ? NULL : new_face->data);
                     text_commands += count;
@@ -4255,6 +4626,82 @@ static int test_optional_bold_faces_follow_page_families(void)
               && browser_engine_shutdown(engine));
         browser_engine_destroy(engine);
     }
+    return 0;
+}
+
+/* A deferred image whose request fails fires error (complete true); its
+   one retry then succeeds and that new request fires load, once and
+   after the error, with complete still true. The other images load once
+   each. */
+static int test_deferred_image_retry_fires_load(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-retry",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine,
+                                  "https://interactive-images.test/page",
+                                  true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.image_continuation_pending
+          && nav->page.runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "globalThis.log=[];for(const i of document.images){"
+        "i.onload=()=>log.push(i.id+':load:'+i.complete);"
+        "i.onerror=()=>log.push(i.id+':error:'+i.complete)}",
+        "<deferred-image-retry-listen>", &nav->page.script_result));
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *hero = test_reader_find_id(root, "hero");
+    bool retried = false;
+    for (unsigned pump = 0; nav->page.image_continuation_pending
+                            && pump < 512; pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+        CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+        for (size_t i = 0; nav->page.deferred_image_targets != NULL
+                           && i < nav->page.deferred_image_count; i++)
+            retried |= nav->page.deferred_image_targets[i].node == hero
+                && nav->page.deferred_image_targets[i].retry_count == 1;
+    }
+    for (unsigned turn = 0; turn < 8; turn++)
+        CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "const hero=e=>e.startsWith('hero:');globalThis.pocSummary="
+        "log.filter(hero).join(',')+'|'+log.filter(e=>!hero(e)).sort()"
+        ".join(',')+'|'+document.getElementById('hero').complete",
+        "<deferred-image-retry>", &nav->page.script_result));
+    static const char expected[] =
+        "hero:error:true,hero:load:true|last:load:true,tail:load:true|true";
+    /* The recovered hero no longer holds a failure record (one of the
+       bounded list's slots). */
+    bool recovered = true;
+    for (size_t i = 0; i < nav->page.images.failure_count; i++)
+        recovered = recovered && nav->page.images.failures[i].node != hero;
+    bool ok = retried && !nav->page.image_continuation_pending
+        && image_resource_available(images_find_node(&nav->page.images, hero))
+        && recovered
+        && strcmp(nav->page.script_result.summary, expected) == 0;
+    if (!ok)
+        fprintf(stderr, "deferred-image-retry retried=%d pending=%d "
+                "recovered=%d failures=%zu summary=\"%s\" want \"%s\"\n",
+                retried, nav->page.image_continuation_pending, recovered,
+                nav->page.images.failure_count,
+                nav->page.script_result.summary, expected);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine) && ok);
+    browser_engine_destroy(engine);
     return 0;
 }
 
@@ -5581,6 +6028,81 @@ static int test_history_restores_bounded_form_state(void)
     CHECK(value != NULL && value_length == 8u
           && memcmp(value, "portable", 8u) == 0);
 
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A page with many disclosures (an FAQ, a filter sidebar) must keep the
+   form values typed beside them across Back, and every disclosure's
+   state, not only the first few. */
+static int test_history_disclosures_leave_room_for_form_state(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static char form_page[2048];
+    size_t used = (size_t) snprintf(form_page, sizeof(form_page),
+        "<!doctype html><body><input id=query value=initial>");
+    for (unsigned i = 0; i < 10u; i++)
+        used += (size_t) snprintf(form_page + used, sizeof(form_page) - used,
+            "<details id=d%u><summary>Question %u</summary>"
+            "<p>Answer %u</p></details>", i, i, i);
+    used += (size_t) snprintf(form_page + used, sizeof(form_page) - used,
+                              "</body>");
+    CHECK(used < sizeof(form_page));
+    static const char second_page[] =
+        "<!doctype html><body><p>Second page</p></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/search", form_page, used, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *query = actionable_find_id(
+        &navigation->page.document, "query");
+    CHECK(query != NULL && document_control_value_set(
+              &navigation->page.document, query, "portable", 8u));
+    static const char *const opened[] = {"d3", "d9"};
+    for (size_t i = 0; i < 2u; i++) {
+        lxb_dom_node_t *details = actionable_find_id(
+            &navigation->page.document, opened[i]);
+        CHECK(details != NULL && lxb_dom_element_set_attribute(
+                  lxb_dom_interface_element(details),
+                  (const lxb_char_t *) "open", 4u,
+                  (const lxb_char_t *) "", 0u) != NULL);
+    }
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/results", second_page,
+        sizeof(second_page) - 1u, true));
+    char replay_directory[128] = {0};
+    CHECK(write_history_form_replay(
+              replay_directory, form_page, used,
+              "https://history-form.test/search")
+          && fetch_trace_replay_begin(
+                 replay_directory, error, sizeof(error)));
+    CHECK(browser_engine_history_move(engine, false));
+    fetch_trace_end();
+    remove_large_youtube_replay(replay_directory);
+    navigation = browser_engine_navigation(engine);
+    query = actionable_find_id(&navigation->page.document, "query");
+    size_t value_length = 0u;
+    const char *value = query == NULL ? NULL
+        : document_control_value(query, &value_length);
+    CHECK(value != NULL && value_length == 8u
+          && memcmp(value, "portable", 8u) == 0);
+    for (unsigned i = 0; i < 10u; i++) {
+        char id[8];
+        snprintf(id, sizeof(id), "d%u", i);
+        lxb_dom_node_t *details = actionable_find_id(
+            &navigation->page.document, id);
+        bool open = details != NULL && lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(details), (const lxb_char_t *) "open", 4u);
+        CHECK(details != NULL && open == (i == 3u || i == 9u));
+    }
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;

@@ -898,7 +898,7 @@ static bool experimental_rebuild_failure(const char *reason,
 
 typedef struct {
     char request_url[NAVIGATION_URL_LIMIT];
-    char cookies[4096];
+    char cookies[BROWSER_COOKIE_HEADER_CAPACITY];
     char referer[NAVIGATION_URL_LIMIT];
     char referrer_policy[
         sizeof(((NavigationSession *) 0)->page.referrer_policy)];
@@ -1178,7 +1178,7 @@ static void loop_help(void)
          "until MAX-TURNS MS EXPRESSION, "
          "drain [MAX-TURNS [SETTLE-MS]], "
          "media-status|media-play|media-pause|media-seek SECONDS|"
-         "media-open|media-close|media-run [COUNT [MS]], "
+         "media-open|media-close|media-run [COUNT [MS]]|play-page-media, "
          "reader-on|reader-off, "
          "go URL, reload, "
          "back|circle, forward, mark-steady, script-report, "
@@ -1421,9 +1421,6 @@ static void private_console_wipe(void *memory, size_t length)
     while (length-- != 0) *bytes++ = 0;
 }
 
-static YoutubeLiteFeedProbe private_youtube_feed;
-static bool private_youtube_feed_attempted;
-static bool private_youtube_feed_okay;
 static unsigned private_script_retry_count;
 static bool private_service_entry_attempted;
 #include "private_snapshot.inc"
@@ -2395,6 +2392,22 @@ static bool run_command_loop(FILE *commands, bool interactive,
             }
             ok = loop_drain_until_idle(engine, navigation, media, cache,
                                        maximum, settle_ms);
+        } else if (strcmp(line, "play-page-media") == 0) {
+            memset(&scratch->action, 0, sizeof(scratch->action));
+            ok = controller_build_document_media_action(
+                controller, &scratch->action);
+            if (ok) {
+                char media_error[256] = {0};
+                interactive_media_destroy(media);
+                ok = media != NULL && interactive_media_open(
+                    media, budget, navigation, scratch->action.url, true,
+                    media_error, sizeof(media_error));
+#ifdef TILEFINCH_HAVE_HOST_MEDIA
+                if (ok) host_media_set_playing(media->player, true);
+#endif
+                if (!ok) fprintf(stderr, "page media open failed: %s\n", media_error);
+            }
+            reset_cache = ok;
         } else if (strcmp(line, "media-status") == 0) {
             interactive_media_print_status(media);
             changed = false;
@@ -2812,9 +2825,6 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 && (strcmp(argument, "https://www.youtube.com/feed/recommended") == 0
                     || strcmp(argument, "https://www.youtube.com/feed/subscriptions") == 0);
             if (feed) {
-                private_youtube_feed = (YoutubeLiteFeedProbe) {0};
-                private_youtube_feed_attempted = false;
-                private_youtube_feed_okay = false;
                 /* The incoming sign-in continuation may have shed scripts
                    while the incumbent's large realm was still resident.
                    Once committed, that incumbent is gone. An explicit feed
@@ -2852,7 +2862,7 @@ static bool run_command_loop(FILE *commands, bool interactive,
                        always enter the scriptless provider, never its website. */
                     private_service_entry_attempted = true;
                     ok = loop_load(engine, navigation, controller,
-                        "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F",
+                        YOUTUBE_LITE_SIGNIN_URL,
                         false, 0, user_css);
                     reset_cache = ok;
                     changed = false;

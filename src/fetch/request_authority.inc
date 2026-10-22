@@ -2,7 +2,7 @@ typedef struct {
     uint32_t version;
     TilefinchRequestContext context;
     FetchRequest request;
-    char cookie[4096];
+    char cookie[BROWSER_COOKIE_HEADER_CAPACITY];
     char referrer[TILEFINCH_URL_SERIALIZED_LIMIT];
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
 } PreparedPageRequestStorage;

@@ -616,9 +616,9 @@ static int test_swap_recovery_checks_contents(void)
     (void) always_file(name, sizeof(name));
     snprintf(backup, sizeof(backup), "%s.bak", name);
     for (int round = 0; round < 2; round++) {
-        faults->crash_next_site_storage_compact = true;
+        faults->replace_file_crash_after_backup = true;
         CHECK(rewrite_until_compaction(
-            &session, &faults->crash_next_site_storage_compact));
+            &session, &faults->replace_file_crash_after_backup));
         browser_session_destroy(&session);
         /* The log's name holds the backup's records with one damaged: a
            record's key, then a byte of the last (live) record's value. */
@@ -652,9 +652,9 @@ static int test_compaction_swap_is_crash_safe(void)
           && browser_session_site_storage_set_policy(
                  &session, game, BROWSER_SITE_STORAGE_STICK));
     TilefinchTestFaults *faults = tilefinch_test_faults();
-    faults->crash_next_site_storage_compact = true;
+    faults->replace_file_crash_after_backup = true;
     CHECK(rewrite_until_compaction(
-        &session, &faults->crash_next_site_storage_compact));
+        &session, &faults->replace_file_crash_after_backup));
     char name[64], other[80];
     (void) always_file(name, sizeof(name));
     /* "Power loss": the original is only the backup now. */
@@ -678,9 +678,9 @@ static int test_compaction_swap_is_crash_safe(void)
     CHECK(!file_exists(other));
 
     /* The swap's rename fails: the original is restored and read on. */
-    faults->fail_next_site_storage_compact_rename = true;
+    faults->replace_file_fail_install = true;
     CHECK(rewrite_until_compaction(
-        &session, &faults->fail_next_site_storage_compact_rename));
+        &session, &faults->replace_file_fail_install));
     CHECK(file_exists(name) && !file_exists(other)
           && chunks_readable(&session)
           && browser_session_storage_set(&session, game, true, "after",

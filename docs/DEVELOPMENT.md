@@ -11,7 +11,9 @@ public contributors can request the relevant prior outcomes from a maintainer.
 
 ## Quick start
 
-The first configure downloads hash-pinned dependencies. Host builds also need
+The desktop lab builds and tests the same engine on your computer, at PSP
+screen sizes and memory profiles. The first configure downloads hash-pinned
+dependencies. Host builds also need
 libcurl development headers (with a TLS-capable libcurl) and zlib.
 
 ```sh
@@ -198,12 +200,9 @@ These run one behavior in isolation; they do not replace the complete suite.
   commands selecting each face. Selection is not proof of visible pixel gain;
   backend bytes exclude encoded storage and Budget bookkeeping. The binding
   check confirms the displayed layout uses the current sheet's font set.
-  `--legacy-web-font-work` keeps page fonts enabled but restores the previous
-  publication, family admission, and measurement behavior for host A/B checks.
   Shared faces report their storage only once (`shared=1` on later aliases).
   `tilefinch-web-font-tests --font-perf-only` checks style retention, deferred
-  family activation, shared-face lifetimes and exact cached advances. The
-  `--legacy-font-perf-only` negative control must fail those new expectations.
+  face activation, shared-face lifetimes and exact cached advances.
   `tilefinch-web-font-tests --variations-only` checks authored two-axis
   fixtures, weight/optical metrics, bounded instance reuse, dead-table removal,
   and allocation refusals during opening, coordinate changes and glyph loads.
@@ -398,7 +397,7 @@ Do not infer physical-PSP responsiveness from host elapsed times alone.
 
 The interactive host lab accepts `--stylesheet-count N` for diagnostic
 captures, bounded to 1 through 32. Omitting it preserves the selected profile's
-defaults (24 sheets in the ordinary 24 MiB profile). This changes only the
+defaults (24 sheets at the lab's default 24 MiB limit). This changes only the
 count allowance, not byte, file, time, or Budget admission. A higher-count host
 capture is not evidence that the page fits the production PSP profile.
 
@@ -422,11 +421,23 @@ The presets create `build-preset-dev`, `build-preset-release`, and
 `build-preset-sanitize`. `dev` uses `RelWithDebInfo`; `release` is an optimized
 host build; `sanitize` enables
 AddressSanitizer and UndefinedBehaviorSanitizer with frame pointers. It keeps
+the QuickJS objects at `-O1`: unoptimized, instrumented interpreter frames can
+otherwise consume about 100 KiB per JavaScript call and exhaust the unchanged
+stack guard on small, finite component trees. Both sanitizers remain enabled;
+no stack/heap limits or shipping optimization settings change. The
+`tilefinch-js-responsiveness-tests --component-stack-only` regression checks
+nested component connection and stylesheet adoption, then verifies that truly
+unbounded recursion still reaches the recoverable stack guard. The preset keeps
 the FFmpeg media backend in the gate but disables SDL audio output, avoiding
 SDL's Cocoa/LaunchServices bootstrap in dozens of parallel command-line tests.
 A Release
 configure does not silently select the PSP runtime policy: invoke a frontend
-with `--psp-profile` when that behavior is the subject of a lab run. All
+with `--psp-profile` when that behavior is the subject of a lab run. For
+shipping-shaped memory qualification, also pass `--psp-fonts` to the
+interactive lab: it uses the packaged Latin sans/serif faces instead of the
+larger desktop fallback files. The `runtime-fonts` receipt records the mode
+and loaded bytes. Keep full-font visual-oracle runs separate; neither switch
+changes a heap limit or silently replaces the other qualification lane. All
 presets use the pinned Bellard QuickJS configuration, enable tests, disable the
 unrelated JavaScriptCore spike, and use a compiler cache when available.
 
@@ -499,10 +510,10 @@ already applied, and its two engine files are fingerprint-pinned at configure
 time. Engine edits go directly into that tree and update the pins in
 `cmake/TilefinchDependencies.cmake`; `third_party/quickjs/README.md` lists the
 carried changes and the update procedure. The old experimental VM patch is
-history only, and configure refuses
-`-DPSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH=ON`. Raw CMake defaults to
-QuickJS-NG; the presets and `scripts/dev.sh` select pinned Bellard QuickJS.
-Use a separate raw CMake tree for an upstream, unpatched Bellard comparison.
+history only. Every configure, raw or preset, selects the vendored Bellard
+QuickJS; `-DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF` builds against pinned
+QuickJS-NG instead. Use a separate raw CMake tree for an upstream, unpatched
+Bellard comparison.
 
 The portable Bellard configuration enables one source-neutral interpreter
 shortcut by default: a two-instruction function that only returns one captured
@@ -570,8 +581,16 @@ sharing.
 
 ## Dependencies
 
-The first configure downloads pinned Lexbor, QuickJS, stb, NanoSVG, and DejaVu
-archives and verifies their hashes. `PSP_BROWSER_VENDOR_DIR` can supply the
+The first configure downloads pinned archives and verifies their hashes:
+Lexbor, stb, NanoSVG, DejaVu fonts and libwebp for every build; FreeType and
+brotli while `PSP_BROWSER_ENABLE_WEB_FONTS` is on (the default); WAMR for PSP
+builds and for host builds with `PSP_BROWSER_ENABLE_HOST_WEBASSEMBLY` (the
+default; `PSP_BROWSER_WAMR_SOURCE_DIR` supplies a local tree);
+QuickJS-NG only when `PSP_BROWSER_USE_BELLARD_QUICKJS` is off (the vendored
+Bellard QuickJS in `third_party/quickjs` is the default); and, for the `psp`
+presets, PocketSphinx 5.1.1 for the voice component. The PSP transport
+archives (curl, Mbed TLS, nghttp2) are not fetched by CMake; see
+[PSP transport dependencies](#psp-transport-dependencies). `PSP_BROWSER_VENDOR_DIR` can supply the
 prepared dependencies supported by its documented layout; individual selected
 FetchContent sources can also be supplied with
 `FETCHCONTENT_SOURCE_DIR_<NAME>`. Treat a checksum mismatch as a dependency or
@@ -582,6 +601,13 @@ existing dependency checkouts:
 cmake --preset release \
   -DPSP_BROWSER_VENDOR_DIR=/path/to/vendor
 ```
+
+For an offline configure, populate each tree's `_deps/*-src` from an earlier
+configure and pass `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`. A fresh `psp` tree
+without a populated `_deps/pocketsphinx-src` can instead point
+`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1` at an
+unpacked source tree (the configure applies Tilefinch's patches to it in
+place), or leave voice out with `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF`.
 
 ## Build directories
 
@@ -616,6 +642,38 @@ requires actual compile evidence for edit samples, and keeps full logs. Do not
 run it against a worktree another process is editing or building. See
 [the build-speed experiment](engineering/BUILD_SPEED_EXPERIMENT.md)
 for measured results and remaining costs.
+
+## Evidence gates
+
+Each gate proves a different thing, and a pass on one is never taken for
+another ([device qualification](engineering/DEVICE_QUALIFICATION.md) assigns
+each claim to an environment):
+
+| Gate | What it proves |
+|---|---|
+| focused unit and fault-injection tests | bounds, rollback, parser policy, reducers, allocators |
+| frame-pump policy proof (`tests/test_frame_pumps.c`) | every workload and completion against every distinct refusal set; the pinned set of pumps able to contend for one resource in a frame |
+| ledger owner checks | no thread but its owner mutates a `Budget` (aborting on the host; counted in an opted-in PSP run, where the workers exist) |
+| Canvas/WebGL game lane | animation lifecycle, Gamepad sampling, pixel output, indexed geometry and graphics bounds |
+| selected upstream WPT | web-platform behavior against unchanged tests |
+| response-keyed replay | deterministic network inputs and closed request ledgers |
+| Chrome fidelity scoreboard | structural pixel similarity at the PSP viewport |
+| PSP cross-build ratchets | 32-bit ABI, actual `.text`, `.rodata`, stack and hot-symbol size |
+| work record (`tilefinch-work`) | deterministic operation counts, identical on host, PPSSPP and device, for comparing changes without timing noise |
+| PPSSPP | packaged EBOOT, Allegrex execution, deterministic scripted flows |
+| offline device replay | a recorded journey (for example a chatgpt.com load and send) replayed on the PSP from `host0:`, with responses released on a fixed clock so a faster build cannot fake a faster network |
+| physical PSP | firmware, caches, WLAN, Memory Stick, latency, media and lifecycle truth |
+
+Performance claims come from the device. Any relink moves single code paths by
+up to about 40% and a whole journey by about a second (16 KiB instruction
+cache, code placement), so small engine changes are judged with one binary and
+a runtime switch over alternating runs, and ideas that did not pay off on the
+hardware are recorded as rejected in private investigation records.
+
+Release builds compile logging out, along with HTTP capture and replay (about
+42 KB of code). Validation builds aggregate counters in RAM and normally
+publish one bounded report through PSPLink, avoiding Memory Stick traffic
+during a run; per-event flushing is reserved for localizing crashes.
 
 ## Focused suites
 
@@ -1415,6 +1473,27 @@ cmake --build --preset psp
 `psp-legacy-transport` is an explicit non-release SDK-stack escape hatch.
 See `docs/engineering/PSP_TRANSPORT.md` for provenance and validation.
 
+### PSP validation tree
+
+`build-preset-psp-validation` is not a preset. It is the `psp` preset
+configured into its own allowlisted directory with validation logging, and
+it is what the PPSSPP input-script, device-cost and latency scripts run:
+
+```sh
+export PSPDEV=/path/to/pspdev
+cmake --preset psp -B build-preset-psp-validation \
+  -DTILEFINCH_PSP_VALIDATION_LOG=ON
+cmake --build build-preset-psp-validation --target psp-browser-script
+```
+
+Like every `psp` configure it needs the transport cache above and, because
+`PSP_BROWSER_ENABLE_PSP_VOICE` defaults on, PocketSphinx. In a sandboxed or
+offline tree either add `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF` (the EBOOT then
+has no voice component) or pass
+`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1`; see
+[Dependencies](#dependencies) for the full list. Validation logging is slow
+and raises the `.text` ratchet to its validation limit; never ship this EBOOT.
+
 ### PSP compiler-hardening candidate
 
 The real GCC 15.2.0/newlib PSP toolchain supports both
@@ -1439,7 +1518,7 @@ configuration for every row:
 | combined candidate | 3,730,744 B | +82,132 B (+2.25%) | 1,841,252 B |
 
 The combined image has roughly 2,012 protected return sites and remains below
-the ordinary 4,772,096-byte `.text` ratchet. The hot-function size ratchets
+the ordinary `.text` ratchet. The hot-function size ratchets
 also pass. Newlib initializes one process-wide fixed stack guard
 rather than a random per-process guard, so this is useful corruption detection
 and exploit friction, not a desktop-grade randomized canary.

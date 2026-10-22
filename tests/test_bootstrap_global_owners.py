@@ -15,7 +15,7 @@ def main() -> int:
             continue
         name, expected_file = raw.split("\t")
         pattern = re.compile(
-            rf"(?:globalThis\.{re.escape(name)}\s*=|"
+            rf"(?:(?:globalThis|__tilefinchRealmGlobal)\.{re.escape(name)}\s*=|"
             rf"defineTrustedTypesGlobal\([\"']{re.escape(name)}[\"'])"
         )
         hits: list[tuple[str, int]] = []

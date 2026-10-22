@@ -204,13 +204,7 @@ static int style_math_divide(StyleMathParser *parser, int value,
 }
 
 static int style_math_parse_sum(StyleMathParser *parser);
-
-bool style_math_identifier_equal(const char *text, size_t length,
-                                        const char *wanted)
-{
-    return strlen(wanted) == length
-        && strncasecmp(text, wanted, length) == 0;
-}
+static int style_math_parse_root(StyleMathParser *parser);
 
 /* Some computed properties accept a unitless math result rather than a
    length. Tailwind's typography variables commonly expose line-height as
@@ -225,14 +219,13 @@ bool style_math_resolve_number_thousandths(
         sheet, text, length, 1, 10000, thousandths);
 }
 
-/* The same scalar seam over an explicit inclusive range, in thousandths.
-   opacity needs 0: "calc(1 - var(--progress))" at progress 1 is a fully
-   transparent drawer scrim, not an invalid declaration. */
-bool style_math_resolve_number_thousandths_in(
-    const Stylesheet *sheet, const char *text, size_t length,
-    int minimum, int maximum, int *thousandths)
+/* The folded Q16 number `text` is, over the whole range the math
+   representation holds (folded values stay within int32, so about
+   +/-32768). False when it is not a number. */
+static bool style_math_fold_number(const Stylesheet *sheet, const char *text,
+                                   size_t length, int64_t *q16)
 {
-    if (text == NULL || length == 0 || thousandths == NULL
+    if (text == NULL || length == 0 || q16 == NULL
         || length >= STYLE_MATH_SOURCE_CAPACITY) return false;
     StyleMathParser parser = {
         .sheet = sheet, .text = text, .length = length,
@@ -242,19 +235,53 @@ bool style_math_resolve_number_thousandths_in(
         .rem_basis = STYLE_DEFAULT_FONT_PX,
         .ch_basis = STYLE_DEFAULT_FONT_PX / 2
     };
-    int root = style_math_parse_sum(&parser);
+    int root = style_math_parse_root(&parser);
     style_math_skip_space(&parser);
     if (parser.failed || root < 0 || parser.at != parser.length) return false;
     const StyleMathNode *node = &parser.nodes[root];
     if (node->type != STYLE_MATH_TYPE_NUMBER || !node->folded
-        || node->a < -10 * STYLE_MATH_Q16 || node->a > 10 * STYLE_MATH_Q16)
+        || node->a > INT32_MAX || node->a < INT32_MIN) return false;
+    *q16 = node->a;
+    return true;
+}
+
+static int64_t style_math_q16_thousandths(int64_t q16)
+{
+    int64_t scaled = q16 * 1000;
+    return (scaled + (scaled < 0 ? -STYLE_MATH_Q16 / 2 : STYLE_MATH_Q16 / 2))
+           / STYLE_MATH_Q16;
+}
+
+/* The same scalar seam over an explicit inclusive range, in thousandths,
+   for a value within +/-10.
+   opacity needs 0: "calc(1 - var(--progress))" at progress 1 is a fully
+   transparent drawer scrim, not an invalid declaration. */
+bool style_math_resolve_number_thousandths_in(
+    const Stylesheet *sheet, const char *text, size_t length,
+    int minimum, int maximum, int *thousandths)
+{
+    int64_t q16 = 0;
+    if (thousandths == NULL
+        || !style_math_fold_number(sheet, text, length, &q16)
+        || q16 < -10 * STYLE_MATH_Q16 || q16 > 10 * STYLE_MATH_Q16)
         return false;
-    int64_t scaled = node->a * 1000;
-    int result = (int) ((scaled + (scaled < 0 ? -STYLE_MATH_Q16 / 2
-                                              : STYLE_MATH_Q16 / 2))
-                        / STYLE_MATH_Q16);
+    int result = (int) style_math_q16_thousandths(q16);
     if (result < minimum || result > maximum) return false;
     *thousandths = result;
+    return true;
+}
+
+/* The same scalar seam without the +/-10 bound: easing arguments
+   (steps(calc(12)), a cubic-bezier() y of calc(-12)) take what the math
+   representation holds, in thousandths. */
+bool style_math_resolve_number_thousandths_wide(
+    const Stylesheet *sheet, const char *text, size_t length,
+    int64_t *thousandths)
+{
+    int64_t q16 = 0;
+    if (thousandths == NULL
+        || !style_math_fold_number(sheet, text, length, &q16)) return false;
+    *thousandths = style_math_q16_thousandths(q16);
     return true;
 }
 
@@ -265,7 +292,7 @@ static int style_math_parse_function(StyleMathParser *parser,
         parser->failed = true;
         return -1;
     }
-    if (style_math_identifier_equal(name, name_length, "env")) {
+    if (span_case_equal(name, name_length, "env")) {
         style_math_skip_space(parser);
         size_t environment_start = parser->at;
         while (parser->at < parser->length
@@ -275,16 +302,16 @@ static int style_math_parse_function(StyleMathParser *parser,
         }
         size_t environment_length = parser->at - environment_start;
         bool safe_area =
-            style_math_identifier_equal(
+            span_case_equal(
                 parser->text + environment_start, environment_length,
                 "safe-area-inset-top")
-            || style_math_identifier_equal(
+            || span_case_equal(
                 parser->text + environment_start, environment_length,
                 "safe-area-inset-right")
-            || style_math_identifier_equal(
+            || span_case_equal(
                 parser->text + environment_start, environment_length,
                 "safe-area-inset-bottom")
-            || style_math_identifier_equal(
+            || span_case_equal(
                 parser->text + environment_start, environment_length,
                 "safe-area-inset-left");
         style_math_skip_space(parser);
@@ -308,7 +335,7 @@ static int style_math_parse_function(StyleMathParser *parser,
            four safe-area insets resolve exactly to zero. */
         return safe_area ? style_math_length_node(parser, 0, 0) : fallback;
     }
-    if (style_math_identifier_equal(name, name_length, "calc")) {
+    if (span_case_equal(name, name_length, "calc")) {
         int value = style_math_parse_sum(parser);
         style_math_skip_space(parser);
         if (parser->at >= parser->length || parser->text[parser->at] != ')') {
@@ -320,9 +347,9 @@ static int style_math_parse_function(StyleMathParser *parser,
         parser->nesting--;
         return value;
     }
-    bool minimum = style_math_identifier_equal(name, name_length, "min");
-    bool maximum = style_math_identifier_equal(name, name_length, "max");
-    bool clamp = style_math_identifier_equal(name, name_length, "clamp");
+    bool minimum = span_case_equal(name, name_length, "min");
+    bool maximum = span_case_equal(name, name_length, "max");
+    bool clamp = span_case_equal(name, name_length, "clamp");
     if (!minimum && !maximum && !clamp) {
         parser->failed = true;
         parser->nesting--;
@@ -454,66 +481,66 @@ static int style_math_parse_primary(StyleMathParser *parser)
         return parser->failed ? -1 : style_math_length_node(parser, 0, second);
     }
     double pixels = number;
-    if (style_math_identifier_equal(unit, unit_length, "px")) {
+    if (span_case_equal(unit, unit_length, "px")) {
         /* already CSS pixels */
-    } else if (style_math_identifier_equal(unit, unit_length, "em")) {
+    } else if (span_case_equal(unit, unit_length, "em")) {
         pixels *= parser->em_basis;
-    } else if (style_math_identifier_equal(unit, unit_length, "rem")) {
+    } else if (span_case_equal(unit, unit_length, "rem")) {
         pixels *= parser->rem_basis;
-    } else if (style_math_identifier_equal(unit, unit_length, "ch")) {
+    } else if (span_case_equal(unit, unit_length, "ch")) {
         pixels *= parser->ch_basis;
         if (parser->sheet != NULL
             && parser->sheet->resolve_scratch != NULL
             && !parser->sheet->resolve_scratch->font_ch_basis_active) {
             parser->sheet->resolve_scratch->font_ch_pending = true;
         }
-    } else if (style_math_identifier_equal(unit, unit_length, "pc")) {
+    } else if (span_case_equal(unit, unit_length, "pc")) {
         pixels *= 16.0;
-    } else if (style_math_identifier_equal(unit, unit_length, "pt")) {
+    } else if (span_case_equal(unit, unit_length, "pt")) {
         pixels *= 4.0 / 3.0;
-    } else if (style_math_identifier_equal(unit, unit_length, "in")) {
+    } else if (span_case_equal(unit, unit_length, "in")) {
         pixels *= 96.0;
-    } else if (style_math_identifier_equal(unit, unit_length, "cm")) {
+    } else if (span_case_equal(unit, unit_length, "cm")) {
         pixels *= 96.0 / 2.54;
-    } else if (style_math_identifier_equal(unit, unit_length, "mm")) {
+    } else if (span_case_equal(unit, unit_length, "mm")) {
         pixels *= 96.0 / 25.4;
-    } else if (style_math_identifier_equal(unit, unit_length, "q")) {
+    } else if (span_case_equal(unit, unit_length, "q")) {
         pixels *= 96.0 / 101.6;
     } else if (parser->viewport_width > 0 && parser->viewport_height > 0
-               && (style_math_identifier_equal(unit, unit_length, "vw")
-                   || style_math_identifier_equal(unit, unit_length, "dvw")
-                   || style_math_identifier_equal(unit, unit_length, "svw")
-                   || style_math_identifier_equal(unit, unit_length, "lvw")
-                   || style_math_identifier_equal(unit, unit_length, "vi")
-                   || style_math_identifier_equal(unit, unit_length, "dvi")
-                   || style_math_identifier_equal(unit, unit_length, "svi")
-                   || style_math_identifier_equal(unit, unit_length, "lvi"))) {
+               && (span_case_equal(unit, unit_length, "vw")
+                   || span_case_equal(unit, unit_length, "dvw")
+                   || span_case_equal(unit, unit_length, "svw")
+                   || span_case_equal(unit, unit_length, "lvw")
+                   || span_case_equal(unit, unit_length, "vi")
+                   || span_case_equal(unit, unit_length, "dvi")
+                   || span_case_equal(unit, unit_length, "svi")
+                   || span_case_equal(unit, unit_length, "lvi"))) {
         pixels *= parser->viewport_width / 100.0;
     } else if (parser->viewport_width > 0 && parser->viewport_height > 0
-               && (style_math_identifier_equal(unit, unit_length, "vh")
-                   || style_math_identifier_equal(unit, unit_length, "vb")
-                   || style_math_identifier_equal(unit, unit_length, "dvh")
-                   || style_math_identifier_equal(unit, unit_length, "dvb")
-                   || style_math_identifier_equal(unit, unit_length, "svh")
-                   || style_math_identifier_equal(unit, unit_length, "svb")
-                   || style_math_identifier_equal(unit, unit_length, "lvh")
-                   || style_math_identifier_equal(unit, unit_length, "lvb"))) {
+               && (span_case_equal(unit, unit_length, "vh")
+                   || span_case_equal(unit, unit_length, "vb")
+                   || span_case_equal(unit, unit_length, "dvh")
+                   || span_case_equal(unit, unit_length, "dvb")
+                   || span_case_equal(unit, unit_length, "svh")
+                   || span_case_equal(unit, unit_length, "svb")
+                   || span_case_equal(unit, unit_length, "lvh")
+                   || span_case_equal(unit, unit_length, "lvb"))) {
         pixels *= parser->viewport_height / 100.0;
     } else if (parser->viewport_width > 0 && parser->viewport_height > 0
-               && (style_math_identifier_equal(unit, unit_length, "vmin")
-                   || style_math_identifier_equal(unit, unit_length, "vmax")
-                   || style_math_identifier_equal(unit, unit_length, "dvmin")
-                   || style_math_identifier_equal(unit, unit_length, "dvmax")
-                   || style_math_identifier_equal(unit, unit_length, "svmin")
-                   || style_math_identifier_equal(unit, unit_length, "svmax")
-                   || style_math_identifier_equal(unit, unit_length, "lvmin")
-                   || style_math_identifier_equal(unit, unit_length,
+               && (span_case_equal(unit, unit_length, "vmin")
+                   || span_case_equal(unit, unit_length, "vmax")
+                   || span_case_equal(unit, unit_length, "dvmin")
+                   || span_case_equal(unit, unit_length, "dvmax")
+                   || span_case_equal(unit, unit_length, "svmin")
+                   || span_case_equal(unit, unit_length, "svmax")
+                   || span_case_equal(unit, unit_length, "lvmin")
+                   || span_case_equal(unit, unit_length,
                                                   "lvmax"))) {
         int basis = parser->viewport_width;
-        bool minimum = style_math_identifier_equal(unit, unit_length, "vmin")
-            || style_math_identifier_equal(unit, unit_length, "dvmin")
-            || style_math_identifier_equal(unit, unit_length, "svmin")
-            || style_math_identifier_equal(unit, unit_length, "lvmin");
+        bool minimum = span_case_equal(unit, unit_length, "vmin")
+            || span_case_equal(unit, unit_length, "dvmin")
+            || span_case_equal(unit, unit_length, "svmin")
+            || span_case_equal(unit, unit_length, "lvmin");
         if (minimum) {
             if (parser->viewport_height < basis)
                 basis = parser->viewport_height;
@@ -522,12 +549,12 @@ static int style_math_parse_primary(StyleMathParser *parser)
         }
         pixels *= basis / 100.0;
     } else if (parser->sheet != NULL
-               && (style_math_identifier_equal(unit, unit_length, "cqw")
-                   || style_math_identifier_equal(unit, unit_length, "cqi")
-                   || style_math_identifier_equal(unit, unit_length, "cqh")
-                   || style_math_identifier_equal(unit, unit_length, "cqb")
-                   || style_math_identifier_equal(unit, unit_length, "cqmin")
-                   || style_math_identifier_equal(unit, unit_length,
+               && (span_case_equal(unit, unit_length, "cqw")
+                   || span_case_equal(unit, unit_length, "cqi")
+                   || span_case_equal(unit, unit_length, "cqh")
+                   || span_case_equal(unit, unit_length, "cqb")
+                   || span_case_equal(unit, unit_length, "cqmin")
+                   || span_case_equal(unit, unit_length,
                                                   "cqmax"))) {
         const StyleResolveScratch *scratch =
             parser->sheet->resolve_scratch;
@@ -538,14 +565,14 @@ static int style_math_parse_primary(StyleMathParser *parser)
             ? scratch->container_block_basis
             : parser->sheet->viewport_height;
         int basis = inline_basis;
-        if (style_math_identifier_equal(unit, unit_length, "cqh")
-            || style_math_identifier_equal(unit, unit_length, "cqb")) {
+        if (span_case_equal(unit, unit_length, "cqh")
+            || span_case_equal(unit, unit_length, "cqb")) {
             basis = block_basis;
-        } else if (style_math_identifier_equal(
+        } else if (span_case_equal(
                        unit, unit_length, "cqmin")) {
             basis = inline_basis < block_basis
                 ? inline_basis : block_basis;
-        } else if (style_math_identifier_equal(
+        } else if (span_case_equal(
                        unit, unit_length, "cqmax")) {
             basis = inline_basis > block_basis
                 ? inline_basis : block_basis;
@@ -625,6 +652,20 @@ static int style_math_parse_sum(StyleMathParser *parser)
     }
 }
 
+/* A whole value is one component: a number, a dimension or a math
+   function. Operators and bare parentheses belong inside a math function
+   (`calc((1px + 2px) * 2)`), so `(1px)`, `1px + 2px` and `-(1px)` are
+   not values. */
+static int style_math_parse_root(StyleMathParser *parser)
+{
+    style_math_skip_space(parser);
+    if (parser->at < parser->length && parser->text[parser->at] == '(') {
+        parser->failed = true;
+        return -1;
+    }
+    return style_math_parse_primary(parser);
+}
+
 static bool style_math_emit_node(const StyleMathParser *parser, int index,
                                  StyleMathCandidate *candidate)
 {
@@ -691,7 +732,7 @@ static bool style_math_candidate_context(const Stylesheet *sheet, const char *te
                   : (em_basis > 0 ? (em_basis + 1) / 2 : 8)
     };
     *candidate = (StyleMathCandidate) {0};
-    int root = style_math_parse_sum(parser);
+    int root = style_math_parse_root(parser);
     style_math_skip_space(parser);
     if (parser->failed || root < 0 || parser->at != parser->length) return false;
     StyleMathNode *node = &parser->nodes[root];
@@ -757,14 +798,8 @@ bool style_math_resolve_media_length(const char *text, size_t length,
 static uint32_t style_math_hash(const StyleMathInstruction *instructions,
                                 size_t count)
 {
-    uint32_t hash = UINT32_C(2166136261);
-    const unsigned char *bytes = (const unsigned char *) instructions;
-    size_t length = count * sizeof(*instructions);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= bytes[i];
-        hash *= UINT32_C(16777619);
-    }
-    return hash;
+    return style_fnv1a(STYLE_FNV1A_SEED, instructions,
+                       count * sizeof(*instructions), false);
 }
 
 static __attribute__((noinline)) bool style_parse_letter_spacing_math(
@@ -970,7 +1005,7 @@ void style_math_restore(Stylesheet *sheet, size_t program_count,
 bool style_keyword(const Stylesheet *sheet, const char *text,
                           size_t length, const char *keyword)
 {
-    char resolved[64];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     return style_resolve_value(sheet, text, length, resolved, sizeof(resolved), 0)
            && strcmp(resolved, keyword) == 0;
 }
@@ -1202,15 +1237,51 @@ static bool calc_additive_operator(const char *text, size_t start, size_t at)
     return true;
 }
 
+/* The arguments of env(<name> [, <fallback>]?), without its parentheses,
+   as the math compiler resolves them: the four safe-area insets are 0 on
+   the PSP panel, any other name takes its fallback, and a fallback that
+   is present must itself be a length. */
+static int parse_env_length(const Stylesheet *sheet, const char *text,
+                            size_t length, int fallback, bool *percent,
+                            unsigned depth)
+{
+    size_t at = 0;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    size_t name_start = at;
+    while (at < length && (isalnum((unsigned char) text[at])
+                           || text[at] == '-')) at++;
+    size_t name_length = at - name_start;
+    const char *name = text + name_start;
+    bool safe_area = span_case_equal(name, name_length, "safe-area-inset-top")
+        || span_case_equal(name, name_length, "safe-area-inset-right")
+        || span_case_equal(name, name_length, "safe-area-inset-bottom")
+        || span_case_equal(name, name_length, "safe-area-inset-left");
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (name_length == 0 || (at < length && text[at] != ',')) return fallback;
+    if (at == length) {
+        if (!safe_area) return fallback;
+        if (percent != NULL) *percent = false;
+        return 0;
+    }
+    int parsed = parse_length_depth(sheet, text + at + 1, length - at - 1,
+                                    INT_MIN, percent, depth + 1);
+    if (parsed == INT_MIN) return fallback;
+    if (safe_area) {
+        if (percent != NULL) *percent = false;
+        return 0;
+    }
+    return parsed;
+}
+
 static int parse_length_depth(const Stylesheet *sheet, const char *text,
                               size_t length, int fallback, bool *percent,
                               unsigned depth)
 {
     if (percent != NULL) *percent = false;
-    char value[128];
+    char value[STYLE_MATH_SOURCE_CAPACITY];
     if (!style_resolve_value(sheet, text, length, value, sizeof(value), 0)) return fallback;
     size_t value_length = strlen(value);
-    if (depth < 4 && value_length > 5 && value[value_length - 1] == ')') {
+    if (depth < 4 && value_length > 1 && value[value_length - 1] == ')') {
         enum { LENGTH_NONE, LENGTH_MIN, LENGTH_MAX, LENGTH_CLAMP,
                LENGTH_CALC } function = LENGTH_NONE;
         size_t prefix = 0;
@@ -1222,8 +1293,12 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
             function = LENGTH_CLAMP; prefix = 6;
         } else if (strncmp(value, "calc(", 5) == 0) {
             function = LENGTH_CALC; prefix = 5;
-        } else if (value[0] == '(') {
-            /* A parenthesized calc() term: calc((15rem + 2rem) * 2). */
+        } else if (strncasecmp(value, "env(", 4) == 0) {
+            return parse_env_length(sheet, value + 4, value_length - 5,
+                                    fallback, percent, depth);
+        } else if (value[0] == '(' && depth > 0) {
+            /* A parenthesized term inside a math function:
+               calc((15rem + 2rem) * 2). A whole value is never one. */
             function = LENGTH_CALC; prefix = 1;
         }
         if (function != LENGTH_NONE) {
@@ -1304,17 +1379,17 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
     if (end == value) return fallback;
     while (isspace((unsigned char) *end)) end++;
     if (percent != NULL) *percent = *end == '%';
-    if (strncmp(end, "rem", 3) == 0) {
+    if (strcmp(end, "rem") == 0) {
         const StyleResolveScratch *scratch =
             sheet == NULL ? NULL : sheet->resolve_scratch;
         number *= scratch != NULL && scratch->font_resolution_active
             ? scratch->font_resolution_root : STYLE_DEFAULT_FONT_PX;
-    } else if (strncmp(end, "em", 2) == 0) {
+    } else if (strcmp(end, "em") == 0) {
         const StyleResolveScratch *scratch =
             sheet == NULL ? NULL : sheet->resolve_scratch;
         number *= scratch != NULL && scratch->font_resolution_active
             ? scratch->font_resolution_inherited : STYLE_DEFAULT_FONT_PX;
-    } else if (strncmp(end, "ch", 2) == 0) {
+    } else if (strcmp(end, "ch") == 0) {
         const StyleResolveScratch *scratch =
             sheet == NULL ? NULL : sheet->resolve_scratch;
         int em_basis = scratch != NULL && scratch->font_resolution_active
@@ -1378,6 +1453,8 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
         }
         number *= basis / 100.0;
     }
+    else if (*end != '\0' && strcmp(end, "px") != 0
+             && strcmp(end, "%") != 0) return fallback;
     if (number > 32767.0) number = 32767.0;
     if (number < -32767.0) number = -32767.0;
     return (int) (number < 0.0 ? number - 0.5 : number + 0.5);

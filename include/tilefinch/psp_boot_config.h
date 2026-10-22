@@ -219,10 +219,9 @@ typedef struct {
     /*
      * Historically named decoder override. Empty is the shipping wide
      * program after its PSP-3000 promotion gate; explicit "off" selects the
-     * 240p compatibility program. "wide-annexb" additionally converts
-     * submitted access units to Annex-B start-code framing, and "boot4"
-     * restores the historical Baseline boot type 4 while leaving wide
-     * pictures clamped. Diagnostic spellings remain in validation UI only.
+     * 240p compatibility program. The retired A/B spellings (wide-annexb,
+     * boot4, edram-real, no-boot) read as the default; any other value
+     * fails validation.
      */
     char experimental_wide_video[16];
     /* Names a scripted-input file beside the EBOOT. The input source is

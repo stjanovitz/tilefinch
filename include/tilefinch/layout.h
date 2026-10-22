@@ -114,6 +114,10 @@
 /* A replaced image's fallback text borrows its node identity in image.
    Fixed-box image arrival can retire this ink without rebuilding flow. */
 #define LAYOUT_TEXT_IMAGE_ALT (1 << 29)
+/* Text of an absolutely positioned or fixed ::before/::after. A generated
+   box has no node box to mark it out of flow, so the first-baseline scan
+   reads this bit instead (CSS Flexbox 8.5). */
+#define LAYOUT_TEXT_OUT_OF_FLOW (1 << 30)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
@@ -360,6 +364,44 @@ static inline void draw_command_set_stroke_sides(DrawCommand *command,
     command->font_size = (int) (sides[2] | (sides[3] << 16));
 }
 
+/* DRAW_ROTATED_FILL: the unrotated local width/height (uint16 each, packed
+   in text_length) and the Q14 cosine/sine basis (int16 each, packed in
+   font_size). */
+static inline unsigned draw_command_rotated_width(const DrawCommand *command)
+{
+    return command->text_length & 65535u;
+}
+
+static inline unsigned draw_command_rotated_height(const DrawCommand *command)
+{
+    return command->text_length >> 16;
+}
+
+static inline void draw_command_set_rotated_extent(DrawCommand *command,
+                                                   unsigned width,
+                                                   unsigned height)
+{
+    command->text_length = (uint32_t) (width & 65535u)
+        | ((uint32_t) (height & 65535u) << 16);
+}
+
+static inline int draw_command_rotated_cosine(const DrawCommand *command)
+{
+    return (int16_t) ((uint32_t) command->font_size & 65535u);
+}
+
+static inline int draw_command_rotated_sine(const DrawCommand *command)
+{
+    return (int16_t) ((uint32_t) command->font_size >> 16);
+}
+
+static inline void draw_command_set_rotated_basis(DrawCommand *command,
+                                                  int cosine, int sine)
+{
+    command->font_size = (int32_t) ((uint32_t) (uint16_t) cosine
+        | ((uint32_t) (uint16_t) sine << 16));
+}
+
 static inline unsigned draw_command_blend_mode(const DrawCommand *command)
 {
     return command == NULL ? 0u
@@ -452,6 +494,36 @@ static inline unsigned draw_command_font_weight(const DrawCommand *command)
 {
     unsigned code = draw_command_font_weight_code(command);
     return code == 0 ? 400u : code * 10u;
+}
+
+/* A command whose weight reaches the bold boundary selects the bold face. */
+static inline bool draw_uses_bold_face(const DrawCommand *command)
+{
+    return draw_command_font_weight(command) >= TILEFINCH_FONT_BOLD_FACE_WEIGHT;
+}
+
+/* A retained focus decoration's generated pseudo (PSEUDO_BEFORE or
+   PSEUDO_AFTER) when the command is one owned by node. Two command kinds
+   carry that identity in different borrowed fields, because a text command's
+   text pointer holds its UTF-8: a solid pseudo fill (paint-only focus
+   translation) keeps the owner in text and the pseudo in text_length, and
+   generated pseudo text (paint-only focus visibility) keeps the owner in
+   image and the pseudo in the LAYOUT_TEXT_FOCUS_PSEUDO_MASK bits. */
+static inline unsigned draw_command_focus_pseudo(const DrawCommand *command,
+                                                 const lxb_dom_node_t *node)
+{
+    unsigned pseudo;
+    if (command->type == DRAW_FILL_RECT
+        && command->text == (const char *) node) {
+        pseudo = command->text_length;
+    } else if (command->type == DRAW_TEXT
+               && command->image == (const ImageResource *) node) {
+        pseudo = command->image_fit & LAYOUT_TEXT_FOCUS_PSEUDO_MASK;
+    } else {
+        return PSEUDO_NONE;
+    }
+    return pseudo == PSEUDO_BEFORE || pseudo == PSEUDO_AFTER
+        ? pseudo : PSEUDO_NONE;
 }
 
 static inline bool draw_command_has_positioned_phase(
@@ -630,6 +702,12 @@ static inline bool draw_command_text_baseline_aligned(
 {
     return command != NULL && command->type == DRAW_TEXT
         && (command->radius & LAYOUT_TEXT_BASELINE_ALIGNED) != 0;
+}
+
+static inline bool draw_command_text_out_of_flow(const DrawCommand *command)
+{
+    return command != NULL && command->type == DRAW_TEXT
+        && (command->radius & LAYOUT_TEXT_OUT_OF_FLOW) != 0;
 }
 
 static inline bool draw_command_text_rtl(const DrawCommand *command)
@@ -973,6 +1051,7 @@ static inline void layout_node_box_set_clip_geometry(
 }
 
 typedef struct LayoutNodeIndexEntry LayoutNodeIndexEntry;
+typedef struct LayoutGridColumns LayoutGridColumns;
 typedef struct LayoutFocusIndexEntry LayoutFocusIndexEntry;
 typedef struct LayoutReuseCache LayoutReuseCache;
 
@@ -1103,10 +1182,15 @@ typedef struct {
        continue (or a job was cancelled), not because a resource was refused.
        Owners can retry such a build; a refused build must not be retried. */
     bool cancelled;
-    /* Failed synchronous job phase, one-based; 0 means no failure, 11 means
-       job startup. Retained after the failed job releases its allocations. */
+    /* Failed synchronous job phase, one-based; 0 means no failure and
+       LAYOUT_BUILD_FAILED_AT_STARTUP means the job could not be created.
+       Retained after the failed job releases its allocations. */
     unsigned failed_phase;
 } LayoutPerformance;
+
+/* LayoutPerformance.failed_phase when the build job itself could not be
+   created. It lies above every one-based job phase. */
+#define LAYOUT_BUILD_FAILED_AT_STARTUP 255u
 
 #if UINTPTR_MAX == UINT32_MAX
 _Static_assert(sizeof(LayoutNodeBox) == 68,
@@ -1187,6 +1271,11 @@ typedef struct LayoutDocument {
     LayoutNodeBox *node_boxes;
     size_t node_box_count;
     size_t node_box_capacity;
+    /* Optional, bounded used grid tracks; no per-node/style expansion. */
+    LayoutGridColumns *grid_columns;
+    size_t grid_column_count;
+    size_t grid_column_capacity;
+    bool grid_columns_refused;
     /* Sparse retained scroll metadata. Ordinary pages allocate neither
        table; hostile pages degrade after deterministic hard caps. */
     LayoutScrollContainer *scroll_containers;
@@ -1198,6 +1287,11 @@ typedef struct LayoutDocument {
        when container geometry is being collected, rather than growing every
        PSP LayoutNodeBox. */
     uint32_t *node_container_padding_sums;
+    /* Beside them (same capacity): a box's content height laid out without
+       its children when its block size was auto, the height a `size`
+       container's queries read (style_container_layout_state_add_contained);
+       -1 when the block size was definite or a flex/grid stretch set it. */
+    int32_t *node_container_contained_heights;
     size_t node_container_padding_capacity;
     bool retain_container_padding;
     /* Lazily allocated only when an overflow clip has asymmetric circular
@@ -1217,6 +1311,14 @@ typedef struct LayoutDocument {
     bool node_index_growth_disabled;
     LayoutFocusIndexEntry *focus_index;
     size_t focus_index_capacity;
+    /* Command indices of the generated pseudo text that paint-only focus
+       visibility toggles (draw_command_focus_pseudo on a DRAW_TEXT),
+       recorded once per build so a focus move visits only these instead of
+       the whole display list. Layouts that were not indexed (clones, or a
+       refused allocation) are scanned in full. */
+    uint32_t *focus_pseudo_texts;
+    uint32_t focus_pseudo_text_count;
+    bool focus_pseudo_texts_indexed;
     uint32_t *paint_order;
     size_t paint_order_count;
     uint8_t *command_flags;
@@ -1311,6 +1413,16 @@ LayoutReuseCache *layout_reuse_cache_create(Budget *budget);
 /* Optional slot admission only; off-window focus retains full-flow fallback. */
 void layout_reuse_cache_set_focus_scroll(LayoutReuseCache *cache, int top);
 void layout_reuse_cache_destroy(LayoutReuseCache *cache);
+/* Budget headroom the retained style cache leaves for the layout that
+   uses it: working bytes for the build plus a reserve. Navigation reclaims
+   (and then drops) the cache when less than both remain; layout admits new
+   resolved-value pages, and resumes storing values after a reclaim, only
+   with the same headroom left over, so trimming and resuming agree. Growing
+   the table keeps the larger growth reserve, so a grown table is not
+   immediately trimmed again. */
+#define LAYOUT_REUSE_STYLE_WORKING_BYTES (384u * 1024u)
+#define LAYOUT_REUSE_STYLE_RESERVE_BYTES (512u * 1024u)
+#define LAYOUT_REUSE_STYLE_GROWTH_RESERVE_BYTES (2048u * 1024u)
 /* Release bulky resolved values without discarding exact selector results.
    Resolved-value storage resumes only after layout has working headroom. */
 size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache);
@@ -1569,6 +1681,22 @@ const ControlRegion *layout_control_at(const LayoutDocument *layout,
                                        int x, int y);
 const LayoutNodeBox *layout_box_for_node(const LayoutDocument *layout,
                                          const lxb_dom_node_t *node);
+/* The face a DRAW_TEXT command measures and paints with. Measurement and
+   paint both resolve through here so they always agree on the face. */
+const FontFace *draw_command_face(const LayoutDocument *layout,
+                                  const DrawCommand *command);
+typedef struct {
+    const FontFace *face;
+    FontFamily metric_family;
+    unsigned weight;        /* decoded CSS font-weight */
+    bool bold_face;         /* the weight selects the bold face */
+    bool synthetic_bold;    /* the face lacks the weight: embolden */
+} DrawTextFace;
+DrawTextFace draw_command_text_face(const LayoutDocument *layout,
+                                    const DrawCommand *command);
+/* Exact final column widths, if admitted by the bounded optional sidecar. */
+size_t layout_grid_columns_for_node(const LayoutDocument *layout,
+    const lxb_dom_node_t *node, const int **widths, unsigned *origin);
 bool layout_focus_for_node(const LayoutDocument *layout,
                            const lxb_dom_node_t *node,
                            bool *control, size_t *index);
@@ -1615,14 +1743,21 @@ bool layout_positioned_command_escapes_clip(
     const LayoutDocument *layout, size_t command_index,
     const LayoutNodeBox *clip_box);
 /* Stack-owned snapshot for one immutable layout/overflow preparation pass.
-   Excess positioned boxes use the exhaustive path, never a partial index. */
+   Excess boxes use a bitmap prefix and exhaustive tail, never partial answers. */
 #define LAYOUT_POSITIONED_CLIP_INDEX_LIMIT 64u
 typedef struct {
     const LayoutDocument *layout;
     size_t node_box_count;
     size_t count;
     size_t candidates_visited; /* trace-only hot-loop writes */
+    /* Sorted indices when complete; otherwise membership bits for the
+       first limit*32 boxes. The remaining boxes are always scanned. */
     uint32_t boxes[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT];
+    /* Successive clips of one command share its innermost positioned owner. */
+    const LayoutNodeBox *command_owner;
+    size_t owner_command;
+    bool owner_ready;
+    bool bitmap_prefix;
     bool complete;
 } LayoutPositionedClipIndex;
 _Static_assert(sizeof(LayoutPositionedClipIndex) <= 320u,

@@ -167,7 +167,7 @@ static bool intrinsic_grid_track_widths(
         uint8_t type = column_override > 0
             ? GRID_TRACK_AUTO
             : implicit
-            ? (use_second ? (uint8_t) (second >> 14)
+            ? (use_second ? grid_auto_second_type(second)
                           : (uint8_t) container_style->grid_auto_column_type)
             : stylesheet_grid_track_type(
                 context->sheet, container_style, false,
@@ -175,7 +175,7 @@ static bool intrinsic_grid_track_widths(
         unsigned value = column_override > 0
             ? GRID_TRACK_AUTO_VALUE
             : implicit
-            ? (use_second ? (unsigned) (second & 0x3fffu)
+            ? (use_second ? grid_auto_second_value(second)
                           : (unsigned) container_style->grid_auto_column_value)
             : stylesheet_grid_track_value(
                 context->sheet, container_style, false,
@@ -544,7 +544,40 @@ static int intrinsic_replaced_width(
                     style->aspect_width, height, style->aspect_height)
                 : layout_scale_dimension(
                     natural_width, height, natural_height);
+            natural_height = height;
         }
+    }
+    /* Transfer a definite cross-axis min/max through the intrinsic ratio
+       before flex/grid distributes inline size. Clamping only in the child
+       layout leaves a too-large flex basis, which is then forced back onto
+       the correctly height-constrained replaced element. Percentages remain
+       unresolved here: this intrinsic query has no definite cross size. */
+    if (!fallback_dimensions && !style->has_width
+        && natural_width > 0 && natural_height > 0) {
+        if (!style->has_height && style->aspect_width > 0 && style->aspect_height > 0)
+            natural_height = layout_scale_dimension(
+                style->aspect_height, natural_width, style->aspect_width);
+        int height = natural_height, bound = 0;
+        int edges = style->box_sizing_border_box
+            ? style->padding.top + style->padding.bottom
+                + style->border.top + style->border.bottom : 0;
+        if (!style->max_height_percent
+            && style->max_height != STYLE_LENGTH_NONE
+            && style->max_height != STYLE_LENGTH_MIN_CONTENT
+            && resolve_computed_length(context->sheet, style->max_height,
+                                       false, 0, &bound)) {
+            bound = bound > edges ? bound - edges : 0;
+            if (height > bound) height = bound;
+        }
+        if (!style->min_height_percent
+            && resolve_computed_length(context->sheet, style->min_height,
+                                       false, 0, &bound)) {
+            bound = bound > edges ? bound - edges : 0;
+            if (height < bound) height = bound;
+        }
+        if (height != natural_height)
+            natural_width = layout_scale_dimension(
+                natural_width, height, natural_height);
     }
     return natural_width;
 }
@@ -1865,7 +1898,18 @@ static void stretch_flex_item_cross(LayoutContext *context,
     lxb_dom_node_t *node = item->node;
     LayoutNodeBox *box = item->generated_pseudo != PSEUDO_NONE
         ? item->generated_box : layout_box_for_node_mutable(layout, node);
-    if (box == NULL || target_height <= box->height) return;
+    if (box == NULL || target_height < 0) return;
+    /* A stretched cross size is definite, even when it equals the content
+       height: a `size` container's queries read it, not its contained
+       height. */
+    if (item->generated_pseudo == PSEUDO_NONE)
+        layout_note_contained_height(layout, node, -1);
+    if (target_height == box->height) return;
+    /* A column's flexible scroll viewport may shrink while its retained
+       contents keep their natural extent. Ordinary cross-axis stretching
+       still never shrinks non-scrollable content. */
+    if (target_height < box->height
+        && (!style->overflow_y_scroll || style->overflow_y_clip_only)) return;
     bool generated = item->generated_pseudo != PSEUDO_NONE;
     size_t box_index = generated ? 0 : (size_t) (box - layout->node_boxes);
     if (!generated && (layout->node_interaction_ranges == NULL
@@ -1991,12 +2035,12 @@ static void stretch_flex_item_cross(LayoutContext *context,
     }
 }
 
-/* Final content-sized grid tracks are definite for stretched items. Carry
-   that size through percentage-height descendants, including lifted
-   display:contents children, without laying out the entire row twice. */
 static void translate_flex_item(LayoutDocument *layout, const FlatItem *item,
                                 int dx, int dy);
 
+/* Final content-sized grid tracks are definite for stretched items. Carry
+   that size through percentage-height descendants, including lifted
+   display:contents children, without laying out the entire row twice. */
 static void stretch_grid_item_depth(LayoutContext *context,
                                     const FlatItem *item,
                                     int target_height, unsigned depth)
@@ -2149,6 +2193,63 @@ void layout_stretch_grid_item(LayoutContext *context, const FlatItem *item,
                               int target_height)
 {
     stretch_grid_item_depth(context, item, target_height, 0);
+}
+
+int layout_fit_column_scroller(LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, const FlexOrderPlan *order, int width, int height)
+{
+    if (height <= 0 || style->flex_wrap) return 0;
+    FlexItemIterator iterator;
+    FlatItem item;
+    lxb_dom_node_t *scroller = NULL;
+    int used = 0, old_height = 0;
+    size_t count = 0;
+    flex_iterator_init(&iterator, context, node, style, order);
+    while (flex_iterator_next(&iterator, &item)) {
+        if (item.style.out_of_flow || item.style.fixed_position) continue;
+        const LayoutNodeBox *box = flex_item_box(context->layout, &item);
+        if (box == NULL) return 0;
+        if (count++) used = layout_add_coordinate(used, style->row_gap);
+        used = layout_add_coordinate(used,
+            box->height + item.style.margin.top + item.style.margin.bottom);
+        if (item.style.flex_grow <= 0) {
+            if (item.style.has_height && item.style.flex_shrink > 0) return 0;
+            continue;
+        }
+        /* Other flexible items require full main-axis distribution. This
+           retained fast path has one flexible viewport and content-sized
+           siblings, whose automatic minima remain at their measured sizes. */
+        if (scroller != NULL || item.anonymous_text
+            || item.generated_pseudo != PSEUDO_NONE || item.style.has_height
+            || item.style.min_height > 0
+            || item.style.max_height != STYLE_LENGTH_NONE
+            || !item.style.overflow_y_scroll || item.style.overflow_y_clip_only)
+            return 0;
+        scroller = item.node;
+        old_height = box->height;
+    }
+    if (scroller == NULL) return 0;
+    int target = layout_subtract_coordinate(height, used - old_height);
+    int delta = 0;
+    bool after = false;
+    flex_iterator_init(&iterator, context, node, style, order);
+    while (flex_iterator_next(&iterator, &item)) {
+        if (item.style.out_of_flow || item.style.fixed_position) continue;
+        if (item.node == scroller) {
+            resolve_padding(context->sheet, &item.style, width);
+            int edges = item.style.padding.top + item.style.padding.bottom
+                + item.style.border.top + item.style.border.bottom;
+            if (target < edges) target = edges;
+            stretch_flex_item_cross(context, &item, &item.style, target);
+            const LayoutNodeBox *box = flex_item_box(context->layout, &item);
+            if (box == NULL) return 0;
+            delta = box->height - old_height;
+            after = true;
+        } else if (after && delta != 0) {
+            translate_flex_item(context->layout, &item, 0, delta);
+        }
+    }
+    return delta;
 }
 
 /* Move the in-flow contents of a table cell within its row-height shell.  An
@@ -2842,31 +2943,21 @@ static bool flex_item_cross_metrics(const LayoutDocument *layout,
 }
 
 /* Return the first in-flow text baseline relative to the item's margin-box
-   top. A textless flex item synthesizes its baseline at the margin-box end. */
+   top, measured as inline layout measures it (half-leading included). A
+   textless flex item synthesizes its baseline at the margin-box end. */
 static bool flex_item_baseline(LayoutContext *context, const FlatItem *item,
                                int origin, int height, int *baseline)
 {
     const LayoutNodeBox *box = flex_item_box(context->layout, item);
     if (box == NULL) return false;
-    size_t end = box->command_end < context->layout->count
-                 ? box->command_end : context->layout->count;
-    for (size_t i = box->command_start; i < end; i++) {
-        const DrawCommand *command = &context->layout->commands[i];
-        if (command->type != DRAW_TEXT || command->text_length == 0) continue;
-        const FontFace *face = font_context_face_at_weight(
-            context->fonts, context->web_fonts,
-            draw_command_font_family(command),
-            draw_command_font_italic(command), draw_uses_bold_face(command), draw_command_font_weight(command));
-        int ascent = font_ascent_at_size(
-            face, draw_command_text_font_size_fixed(command));
-        if (ascent < 0) ascent = 6 * (draw_command_text_scale(command) > 0
-            ? draw_command_text_scale(command) : 1);
-        *baseline = command->y + ascent - origin;
-        if (*baseline < 0) *baseline = 0;
-        if (*baseline > height) *baseline = height;
+    int text = 0;
+    if (!layout_box_first_text_baseline(context->layout, box, &text)) {
+        *baseline = height;
         return true;
     }
-    *baseline = height;
+    *baseline = text - origin;
+    if (*baseline < 0) *baseline = 0;
+    if (*baseline > height) *baseline = height;
     return true;
 }
 

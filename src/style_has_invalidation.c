@@ -154,12 +154,8 @@ static uint32_t has_key_hash(unsigned char type, const unsigned char *text,
 {
     /* ASCII case folded, so a tag, or a class in a quirks-mode document,
        never misses; a collision only drops more. */
-    uint32_t hash = (UINT32_C(2166136261) ^ type) * UINT32_C(16777619);
-    for (size_t i = 0; i < length; i++) {
-        unsigned char value = text[i];
-        if (value >= 'A' && value <= 'Z') value = (unsigned char) (value + 32);
-        hash = (hash ^ value) * UINT32_C(16777619);
-    }
+    uint32_t hash = style_fnv1a(
+        style_fnv1a(STYLE_FNV1A_SEED, &type, 1, false), text, length, true);
     return hash == 0 ? 1u : hash;
 }
 
@@ -809,8 +805,6 @@ static void has_add_entry(HasAnalysis *analysis, uint8_t relation,
         (entry->region & STYLE_HAS_REGION_SIBLINGS) != 0, 0);
 }
 
-#define HAS_FOCUS_MARKER "data-tilefinch-focus"
-
 /* One :focus-within of the rule, `relation` to its subject. The answer
    moves when the focus marker enters or leaves the anchor's subtree (the
    anchor included): the walk from the focus change's node visits exactly
@@ -842,8 +836,8 @@ static void has_add_focus_entry(HasAnalysis *analysis, uint8_t relation,
     /* A removed or inserted subtree holding the focused element moves the
        answer too. */
     has_add_feature(plan, has_key_hash(HAS_KEY_ATTRIBUTE,
-                                       (const unsigned char *) HAS_FOCUS_MARKER,
-                                       sizeof(HAS_FOCUS_MARKER) - 1u),
+                                       (const unsigned char *) STYLE_FOCUS_MARKER,
+                                       sizeof(STYLE_FOCUS_MARKER) - 1u),
                     index, HAS_FEATURE_NARROW);
     plan->attribute_keys = true;
 }
@@ -1159,23 +1153,10 @@ static bool has_text_reads_attribute(const char *text, size_t length,
         if (begin + name_length <= length
             && strncasecmp(text + begin, name, name_length) == 0) return true;
     }
-    static const struct { const char *attribute, *pseudo; } pseudos[] = {
-        {"data-tilefinch-focus", ":focus"},
-        {"checked", ":checked"}, {"selected", ":checked"},
-        {"disabled", ":disabled"}, {"disabled", ":enabled"},
-        {"required", ":required"}, {"required", ":optional"},
-        {"readonly", ":read-"}, {"contenteditable", ":read-"},
-        {"href", ":link"}, {"href", ":any-link"},
-        {"open", ":open"}, {"open", ":modal"},
-        {"data-tilefinch-modal", ":modal"},
-        {"data-tilefinch-popover-open", ":popover-open"},
-        {"data-tilefinch-popover-open", ":open"},
-        {"value", ":placeholder-shown"}, {"placeholder", ":placeholder-shown"},
-        {"dir", ":dir("}, {"lang", ":lang("},
-    };
-    for (size_t i = 0; i < sizeof(pseudos) / sizeof(pseudos[0]); i++) {
-        if (strcasecmp(name, pseudos[i].attribute) == 0
-            && has_text_contains(text, 0, length, pseudos[i].pseudo))
+    for (size_t i = 0; i < style_pseudo_attribute_count; i++) {
+        if (strcasecmp(name, style_pseudo_attributes[i].attribute) == 0
+            && has_text_contains(text, 0, length,
+                                 style_pseudo_attributes[i].pseudo))
             return true;
     }
     return false;
@@ -1193,7 +1174,7 @@ static bool has_entry_relevant(const Stylesheet *sheet,
            relational tokens, not this plan. */
         return tokens == NULL
             && (attribute == NULL
-                || strcasecmp(attribute, HAS_FOCUS_MARKER) == 0);
+                || strcasecmp(attribute, STYLE_FOCUS_MARKER) == 0);
     }
     if (tokens != NULL) {
         if (entry->any_identity) return true;

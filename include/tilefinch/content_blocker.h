@@ -81,4 +81,12 @@ bool content_blocker_would_block(
     const char *initiator_url, const char *destination,
     const char *fetch_mode);
 
+#define CONTENT_BLOCKER_INLINE_BYTES_LIMIT (512u * 1024u)
+/* Allocation-free, conservative whole-bundle matching. Never matches modules,
+   external scripts or snippets merely mentioning a tracker property. */
+const char *content_blocker_inline_rule(const ContentBlocker *blocker,
+    const char *document_url, const char *source, size_t length);
+bool content_blocker_should_block_inline(ContentBlocker *blocker,
+    const char *document_url, const char *source, size_t length);
+
 #endif

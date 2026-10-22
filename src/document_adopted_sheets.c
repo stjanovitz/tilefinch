@@ -1,5 +1,4 @@
 #include "tilefinch/document.h"
-#include "tilefinch/js_runtime.h"
 
 #include <string.h>
 
@@ -7,7 +6,6 @@
     budget_calloc_category((b), BUDGET_CATEGORY_DOM, (n), (s))
 
 #define DOCUMENT_CSSOM_ANCESTOR_LIMIT 65536u
-#define DOCUMENT_CSSOM_SHEET_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
 
 /* Constructed stylesheets and adoptedStyleSheets lists (document.h).
 
@@ -16,8 +14,9 @@
    a list's root is the shadow-root carrier element the bridge created. The
    registry records which elements those are, so the stylesheet builders can
    parse each active sheet once, and drops what a destroyed subtree takes
-   with it before the addresses can be reused. One Budget block, allocated
-   on the first adoption and freed with the document. */
+   with it before the addresses can be reused. The bounded list/index block
+   grows only as roots adopt sheets; small component pages do not reserve
+   the maximum root table. Both blocks are freed with the document. */
 
 typedef struct {
     lxb_dom_node_t *node;
@@ -42,18 +41,25 @@ typedef struct {
     /* NULL: the document itself. */
     lxb_dom_node_t *root;
     uint8_t count;
-    lxb_dom_node_t *sheets[DOCUMENT_ADOPTED_SHEETS_PER_ROOT];
+    /* Indices into the bounded shared sheet table, not sixteen pointers
+       duplicated for every component instance. */
+    uint8_t sheets[DOCUMENT_ADOPTED_SHEETS_PER_ROOT];
 } DocumentAdoptionList;
+
+_Static_assert(DOCUMENT_CONSTRUCTED_SHEET_LIMIT <= 256u,
+               "adopted sheet indices must fit one byte");
+_Static_assert(DOCUMENT_ADOPTION_ROOT_LIMIT <= 256u,
+               "sorted root indices must fit one byte");
 
 struct DocumentAdoptedSheets {
     DocumentConstructedSheet sheets[DOCUMENT_CONSTRUCTED_SHEET_LIMIT];
     size_t sheet_count;
     /* In the order each root's list was first set: the cascade order. */
-    DocumentAdoptionList lists[DOCUMENT_ADOPTION_ROOT_LIMIT];
-    size_t list_count;
+    DocumentAdoptionList *lists;
+    size_t list_count, list_capacity;
     /* Indices into `lists` sorted by root address, for the per-node
        carrier lookups mutation classification makes. */
-    uint8_t by_root[DOCUMENT_ADOPTION_ROOT_LIMIT];
+    uint8_t *by_root;
     size_t text_bytes;
     /* Bytes of every sheet's cached parsed form. */
     size_t cache_bytes;
@@ -81,6 +87,34 @@ static DocumentAdoptedSheets *adopted_ensure(PocDocument *document)
         document->budget, 1, sizeof(*document->adopted_sheets));
     document_allocation_owner_leave(document, previous);
     return document->adopted_sheets;
+}
+
+static bool adopted_reserve_list(PocDocument *document,
+                                 DocumentAdoptedSheets *registry)
+{
+    if (registry->list_count < registry->list_capacity) return true;
+    if (registry->list_count == DOCUMENT_ADOPTION_ROOT_LIMIT) return false;
+    size_t capacity = registry->list_capacity == 0 ? 8u
+        : registry->list_capacity * 2u;
+    if (capacity > DOCUMENT_ADOPTION_ROOT_LIMIT)
+        capacity = DOCUMENT_ADOPTION_ROOT_LIMIT;
+    /* At most 256 entries; the byte index follows the aligned list array. */
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    DocumentAdoptionList *lists = budget_calloc(document->budget, capacity,
+        sizeof(*lists) + sizeof(uint8_t));
+    document_allocation_owner_leave(document, previous);
+    if (lists == NULL) return false;
+    uint8_t *by_root = (uint8_t *) (lists + capacity);
+    if (registry->list_count != 0) {
+        memcpy(lists, registry->lists,
+               registry->list_count * sizeof(*lists));
+        memcpy(by_root, registry->by_root, registry->list_count);
+    }
+    budget_free(document->budget, registry->lists);
+    registry->lists = lists;
+    registry->by_root = by_root;
+    registry->list_capacity = capacity;
+    return true;
 }
 
 static DocumentConstructedSheet *adopted_sheet_find(
@@ -295,20 +329,20 @@ bool document_cssom_sheet_set_text(PocDocument *document, lxb_dom_node_t *node,
 
 void document_cssom_sheet_reset(const lxb_dom_node_t *node)
 {
-    if (document_cssom_registry(node) == NULL) return;
-    for (size_t depth = 0; node != NULL
-         && depth < DOCUMENT_CSSOM_ANCESTOR_LIMIT; depth++, node = node->parent) {
-        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || node->local_name != LXB_TAG_STYLE) continue;
-        DocumentCssomSheet *entry = cssom_find(node);
-        if (entry == NULL) return;
-        struct DocumentCssomSheets *registry = document_cssom_registry(node);
-        registry->bytes -= entry->length;
-        entry->length = 0;
-        entry->active = false;
-        entry->revision++;
-        return;
-    }
+    /* A style's sheet is its direct Text children only, so only the style
+       itself or one of its child nodes can change that text. */
+    if (node != NULL && node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        node = node->parent;
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_STYLE
+        || document_cssom_registry(node) == NULL) return;
+    DocumentCssomSheet *entry = cssom_find(node);
+    if (entry == NULL) return;
+    struct DocumentCssomSheets *registry = document_cssom_registry(node);
+    registry->bytes -= entry->length;
+    entry->length = 0;
+    entry->active = false;
+    entry->revision++;
 }
 
 void document_cssom_discard_subtree(PocDocument *document,
@@ -358,11 +392,18 @@ static bool list_active(const DocumentAdoptionList *list)
         && (list->root == NULL || node_connected(list->root));
 }
 
-static bool list_names(const DocumentAdoptionList *list,
+static lxb_dom_node_t *list_sheet(const DocumentAdoptedSheets *registry,
+                                 const DocumentAdoptionList *list, size_t at)
+{
+    return registry->sheets[list->sheets[at]].node;
+}
+
+static bool list_names(const DocumentAdoptedSheets *registry,
+                       const DocumentAdoptionList *list,
                        const lxb_dom_node_t *sheet)
 {
     for (size_t i = 0; i < list->count; i++) {
-        if (list->sheets[i] == sheet) return true;
+        if (list_sheet(registry, list, i) == sheet) return true;
     }
     return false;
 }
@@ -372,7 +413,7 @@ static bool sheet_active(const DocumentAdoptedSheets *registry,
 {
     for (size_t i = 0; i < registry->list_count; i++) {
         const DocumentAdoptionList *list = &registry->lists[i];
-        if (list_names(list, sheet) && list_active(list)) return true;
+        if (list_names(registry, list, sheet) && list_active(list)) return true;
     }
     return false;
 }
@@ -452,9 +493,8 @@ static size_t adopted_release_list(DocumentAdoptedSheets *registry,
 {
     size_t count = 0;
     for (size_t i = 0; i < list->count; i++) {
-        DocumentConstructedSheet *entry =
-            adopted_sheet_find(registry, list->sheets[i]);
-        if (entry == NULL || entry->references == 0) continue;
+        DocumentConstructedSheet *entry = &registry->sheets[list->sheets[i]];
+        if (entry->references == 0) continue;
         entry->references--;
         if (entry->references == 0 && released != NULL && count < capacity)
             released[count++] = entry->node;
@@ -484,7 +524,7 @@ bool document_adoption_set(PocDocument *document, lxb_dom_node_t *root,
     if (!found && count == 0) return true;
     /* An emptied list stays registered until its root is destroyed: the
        registry then vouches that an address it knows is a live node. */
-    if (!found && registry->list_count == DOCUMENT_ADOPTION_ROOT_LIMIT)
+    if (!found && !adopted_reserve_list(document, registry))
         return false;
     /* Reference the new list before releasing the old one, so a sheet both
        name never reaches zero. */
@@ -505,7 +545,8 @@ bool document_adoption_set(PocDocument *document, lxb_dom_node_t *root,
     }
     DocumentAdoptionList *list = &registry->lists[index];
     list->count = (uint8_t) count;
-    for (size_t i = 0; i < count; i++) list->sheets[i] = sheets[i];
+    for (size_t i = 0; i < count; i++)
+        list->sheets[i] = (uint8_t) (adopted_sheet_find(registry, sheets[i]) - registry->sheets);
     return true;
 }
 
@@ -542,7 +583,7 @@ size_t document_adopted_sheets_active(const PocDocument *document,
         const DocumentAdoptionList *list = &registry->lists[i];
         if (!list_active(list)) continue;
         for (size_t j = 0; j < list->count; j++) {
-            lxb_dom_node_t *sheet = list->sheets[j];
+            lxb_dom_node_t *sheet = list_sheet(registry, list, j);
             bool seen = false;
             for (size_t k = 0; k < count && !seen; k++) {
                 seen = sheets[k] == sheet;
@@ -583,9 +624,9 @@ uint64_t document_adopted_sheets_signature(const PocDocument *document)
         hash = document_adopted_tier_hash(hash, list->root, list->count);
         for (size_t j = 0; j < list->count; j++) {
             const DocumentConstructedSheet *entry =
-                adopted_sheet_find(registry, list->sheets[j]);
+                &registry->sheets[list->sheets[j]];
             hash = document_adopted_tier_hash(
-                hash, list->sheets[j], entry == NULL ? 0 : entry->revision);
+                hash, entry->node, entry->revision);
         }
     }
     return hash;
@@ -593,7 +634,7 @@ uint64_t document_adopted_sheets_signature(const PocDocument *document)
 
 bool document_adoption_list_at(const PocDocument *document, size_t index,
                                const lxb_dom_node_t **root,
-                               lxb_dom_node_t *const **sheets, size_t *count,
+                               lxb_dom_node_t **sheets, size_t *count,
                                bool *active)
 {
     const DocumentAdoptedSheets *registry =
@@ -601,7 +642,9 @@ bool document_adoption_list_at(const PocDocument *document, size_t index,
     if (registry == NULL || index >= registry->list_count) return false;
     const DocumentAdoptionList *list = &registry->lists[index];
     if (root != NULL) *root = list->root;
-    if (sheets != NULL) *sheets = list->sheets;
+    if (sheets != NULL)
+        for (size_t i = 0; i < list->count; i++)
+            sheets[i] = list_sheet(registry, list, i);
     if (count != NULL) *count = list->count;
     if (active != NULL) *active = list_active(list);
     return true;
@@ -636,7 +679,7 @@ size_t document_adoptions_discard_subtree(PocDocument *document,
             DocumentAdoptionList *list = &registry->lists[l - 1u];
             size_t write = 0;
             for (size_t s = 0; s < list->count; s++) {
-                if (list->sheets[s] != entry->node)
+                if (list->sheets[s] != i - 1u)
                     list->sheets[write++] = list->sheets[s];
             }
             list->count = (uint8_t) write;
@@ -650,6 +693,14 @@ size_t document_adoptions_discard_subtree(PocDocument *document,
         }
         registry->text_bytes -= entry->text_bytes;
         adopted_cache_release(document, registry, entry);
+        /* Removal swaps the final sheet slot into this one. Repoint every
+           surviving list before the slot's previous index becomes invalid. */
+        if (i - 1u != registry->sheet_count - 1u) {
+            for (size_t l = 0; l < registry->list_count; l++)
+                for (size_t s = 0; s < registry->lists[l].count; s++)
+                    if (registry->lists[l].sheets[s] == registry->sheet_count - 1u)
+                        registry->lists[l].sheets[s] = (uint8_t) (i - 1u);
+        }
         *entry = registry->sheets[--registry->sheet_count];
     }
     return count;
@@ -764,6 +815,7 @@ void document_adopted_sheets_destroy(PocDocument *document)
     for (size_t i = 0; i < document->adopted_sheets->sheet_count; i++)
         adopted_cache_release(document, document->adopted_sheets,
                               &document->adopted_sheets->sheets[i]);
+    budget_free(document->budget, document->adopted_sheets->lists);
     budget_free(document->budget, document->adopted_sheets);
     document->adopted_sheets = NULL;
 }

@@ -187,9 +187,11 @@ void psp_update_session_refresh_ui(
             snprintf(status, sizeof(status),
                      "DEVELOPER URL - UNSIGNED TRIAL");
         } else {
-            snprintf(status, sizeof(status), "%s CHANNEL - SIGNED",
+            /* Whole literals, so the Update screen can translate them. */
+            snprintf(status, sizeof(status), "%s",
                      update->channel == BROWSER_UPDATE_CHANNEL_BETA
-                         ? "BETA" : "STABLE");
+                         ? "BETA CHANNEL - SIGNED"
+                         : "STABLE CHANNEL - SIGNED");
         }
     }
     if (snapshot->phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE) {

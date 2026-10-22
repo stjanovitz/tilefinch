@@ -22,8 +22,9 @@ typedef struct {
     /* The custom properties resolving it read (itself, and those its
        declared value referenced): a hit reports them as read too. */
     uint64_t reads;
-    /* Long authored names remain supported through the indexed cascade;
-       do not enlarge every hot cache slot just to retain rare long keys. */
+    /* A name this long or longer is kept in the cache's spill, and its
+       offset there (a uint32_t) in these bytes: do not enlarge every hot
+       slot for long design-token names (variable_cache_entry_name). */
     char name[48];
     union {
         char text[STYLE_CUSTOM_SHORT_VALUE_CAPACITY];
@@ -35,10 +36,29 @@ typedef struct {
     } value;
 } StyleVariableCacheEntry;
 
+/* Strict ancestors whose computed style a registered font-relative length
+   needed (variable_resolve_at_declaration). The values the cache holds
+   embed those styles, so they share its lifetime: emptied with it. */
+#define STYLE_FONT_CHAIN_ENTRIES 8u
+typedef struct {
+    const lxb_dom_node_t *node;
+    ComputedStyle style;
+} StyleFontChainEntry;
+
 typedef struct StyleVariableCache {
     Budget *budget;
     StyleVariableCacheEntry *entries;
     size_t capacity;
+    /* Spilled long names, shared by the entries that name them. */
+    struct {
+        uint32_t offset;
+        uint16_t length;
+    } long_names[4];
+    uint8_t long_name_next;
+    /* STYLE_FONT_CHAIN_ENTRIES, allocated by the first conversion. */
+    StyleFontChainEntry *font_chain;
+    uint8_t font_chain_next;
+    bool font_chain_refused;
     /* STYLE_VARIABLE_CACHE_SPILL_BYTES, allocated by the first long value.
        Append-only until the table is emptied: an evicted entry's bytes are
        only reclaimed then. */
@@ -54,7 +74,9 @@ static size_t variable_cache_footprint(const StyleVariableCache *cache)
 {
     return cache == NULL ? 0
         : sizeof(*cache) + cache->capacity * sizeof(*cache->entries)
-          + (cache->spill == NULL ? 0 : STYLE_VARIABLE_CACHE_SPILL_BYTES);
+          + (cache->spill == NULL ? 0 : STYLE_VARIABLE_CACHE_SPILL_BYTES)
+          + (cache->font_chain == NULL ? 0
+             : STYLE_FONT_CHAIN_ENTRIES * sizeof(*cache->font_chain));
 }
 
 /* Empties the table, its spill included. */
@@ -63,6 +85,14 @@ static void variable_cache_empty(StyleVariableCache *cache)
     memset(cache->entries, 0, cache->capacity * sizeof(*cache->entries));
     cache->spill_used = 0;
     cache->spill_refused = false;
+    memset(cache->long_names, 0, sizeof(cache->long_names));
+    cache->long_name_next = 0;
+    if (cache->font_chain != NULL) {
+        for (size_t i = 0; i < STYLE_FONT_CHAIN_ENTRIES; i++)
+            cache->font_chain[i].node = NULL;
+    }
+    cache->font_chain_next = 0;
+    cache->font_chain_refused = false;
 }
 
 static size_t variable_cache_capacity(size_t capacity)
@@ -126,6 +156,7 @@ static void variable_cache_destroy(StyleVariableCache *cache)
 {
     if (cache == NULL) return;
     Budget *budget = cache->budget;
+    budget_free(budget, cache->font_chain);
     budget_free(budget, cache->spill);
     budget_free(budget, cache->entries);
     budget_free(budget, cache);
@@ -518,11 +549,7 @@ struct StyleCustomRuleIndexEntry {
 
 static uint32_t custom_rule_name_hash(const char *text, size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) text[i];
-        hash *= UINT32_C(16777619);
-    }
+    uint32_t hash = style_fnv1a(STYLE_FNV1A_SEED, text, length, false);
     return hash == 0 ? UINT32_C(1) : hash;
 }
 
@@ -550,11 +577,138 @@ static const StyleRegisteredProperty *stylesheet_registered_property(
     return NULL;
 }
 
+/* A registered <length> initial value must be computationally independent.
+   The bounded math parser validates the expression; this token pass
+   excludes relative units even when cancellation would hide their
+   dependency. */
+static bool registered_initial_length(const char *text, size_t length)
+{
+    for (size_t at = 0; at < length;) {
+        unsigned char c = (unsigned char) text[at];
+        if (isdigit(c) || c == '.') {
+            char *end;
+            (void) strtod(text + at, &end);
+            if (end == text + at) return false;
+            at = (size_t) (end - text);
+        } else if (isalpha(c)) {
+            size_t begin = at++;
+            while (at < length && isalpha((unsigned char) text[at])) at++;
+            size_t n = at - begin;
+            bool allowed = false;
+            static const char *const tokens[] = {
+                "px", "cm", "mm", "q", "in", "pt", "pc",
+                "calc", "min", "max", "clamp"
+            };
+            for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++)
+                if (strlen(tokens[i]) == n
+                    && strncasecmp(text + begin, tokens[i], n) == 0)
+                    allowed = true;
+            if (!allowed) return false;
+        } else at++;
+    }
+    StyleMathParser parser;
+    StyleMathCandidate candidate;
+    int root = -1;
+    return style_math_candidate(NULL, text, length, &parser, &candidate,
+                               &root, 16, 16, 8)
+        && !candidate.has_percent && parser.nodes[root].folded
+        && parser.nodes[root].type == STYLE_MATH_TYPE_LENGTH;
+}
+
+static bool registered_ident_char(unsigned char c, bool first)
+{
+    return c >= 128 || isalpha(c) || c == '_' || c == '-'
+        || (!first && isdigit(c));
+}
+
+/* A syntax string other than "*" (css-properties-values-api, "Supported
+   syntax strings"): components separated by "|", each a supported data
+   type name or an identifier, optionally followed by "+" or "#". */
+static bool registered_syntax_parses(const char *text, size_t length)
+{
+    static const char *const types[] = {
+        "angle", "color", "custom-ident", "image", "integer", "length",
+        "length-percentage", "number", "percentage", "resolution", "string",
+        "time", "transform-function", "transform-list", "url"
+    };
+    static const char *const reserved[] = {
+        "inherit", "initial", "unset", "revert", "revert-layer", "default"
+    };
+    size_t at = 0;
+    for (;;) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at >= length) return false;
+        size_t begin = at;
+        bool multipliable = true;
+        if (text[at] == '<') {
+            size_t name = ++at;
+            while (at < length && text[at] != '>') at++;
+            if (at >= length) return false;
+            size_t name_length = at - name;
+            bool known = false;
+            for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+                if (span_equal(text + name, name_length, types[i]))
+                    known = true;
+            if (!known) return false;
+            multipliable = !span_equal(text + name, name_length,
+                                       "transform-list");
+            at++;
+        } else {
+            if (!registered_ident_char((unsigned char) text[at], true))
+                return false;
+            while (at < length
+                   && registered_ident_char((unsigned char) text[at], false))
+                at++;
+            for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++)
+                if (span_case_equal(text + begin, at - begin, reserved[i]))
+                    return false;
+        }
+        if (at < length && (text[at] == '+' || text[at] == '#')) {
+            if (!multipliable) return false;
+            at++;
+        }
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        if (at >= length) return true;
+        if (text[at] != '|') return false;
+        at++;
+    }
+}
+
+StyleRegistrationSyntax style_registered_property_check(
+    const char *name, size_t name_length,
+    const char *syntax, size_t syntax_length,
+    const char *initial, size_t initial_length)
+{
+    if (name == NULL || syntax == NULL || name_length < 3
+        || name_length >= STYLE_CUSTOM_NAME_CAPACITY
+        || name[0] != '-' || name[1] != '-')
+        return STYLE_REGISTRATION_INVALID;
+    for (size_t i = 2; i < name_length; i++) {
+        unsigned char c = (unsigned char) name[i];
+        if (!(c >= 128 || isalnum(c) || c == '-' || c == '_'))
+            return STYLE_REGISTRATION_INVALID;
+    }
+    trim(&syntax, &syntax_length);
+    if (syntax_length == 1 && syntax[0] == '*')
+        return STYLE_REGISTRATION_UNIVERSAL;
+    if (!registered_syntax_parses(syntax, syntax_length) || initial == NULL)
+        return STYLE_REGISTRATION_INVALID;
+    if (!span_equal(syntax, syntax_length, "<length>"))
+        return STYLE_REGISTRATION_UNTYPED;
+    return registered_initial_length(initial, initial_length)
+        ? STYLE_REGISTRATION_LENGTH : STYLE_REGISTRATION_INVALID;
+}
+
 /* Records an @property rule: `name` is its prelude, `block` its
-   descriptors. A rule without syntax or inherits, or with a syntax other
-   than "*" and no initial-value, is invalid and ignored; a later valid
-   rule for the same name replaces an earlier one. False only when memory
-   is refused. */
+   descriptors. A rule without syntax or inherits, or that
+   style_registered_property_check() refuses, is invalid and ignored; a
+   later valid rule for the same name replaces an earlier one. False only
+   when memory is refused. */
+static bool stylesheet_store_registered_property(
+    Stylesheet *sheet, const char *name, size_t name_length,
+    const char *initial, size_t initial_length, bool inherits,
+    bool length_syntax, bool from_api);
+
 static bool stylesheet_register_property(Stylesheet *sheet,
                                          const char *name,
                                          size_t name_length,
@@ -562,15 +716,9 @@ static bool stylesheet_register_property(Stylesheet *sheet,
                                          size_t block_length)
 {
     trim(&name, &name_length);
-    if (name_length <= 2 || name_length >= STYLE_CUSTOM_NAME_CAPACITY
-        || name[0] != '-' || name[1] != '-') return true;
-    for (size_t i = 0; i < name_length; i++) {
-        if (isspace((unsigned char) name[i])) return true;
-    }
-    bool has_syntax = false, universal = false, has_inherits = false;
-    bool inherits = false;
-    const char *initial = NULL;
-    size_t initial_length = 0;
+    bool has_inherits = false, inherits = false;
+    const char *syntax = NULL, *initial = NULL;
+    size_t syntax_length = 0, initial_length = 0;
     for (size_t at = 0; at < block_length;) {
         at = skip_css_space_and_comments(block, block_length, at);
         if (at >= block_length) break;
@@ -588,11 +736,8 @@ static bool stylesheet_register_property(Stylesheet *sheet,
                 && value_length >= 2
                 && (value[0] == '"' || value[0] == '\'')
                 && value[value_length - 1] == value[0]) {
-                const char *syntax = value + 1;
-                size_t syntax_length = value_length - 2;
-                trim(&syntax, &syntax_length);
-                has_syntax = true;
-                universal = syntax_length == 1 && syntax[0] == '*';
+                syntax = value + 1;
+                syntax_length = value_length - 2;
             } else if (span_case_equal(descriptor, descriptor_length,
                                        "inherits")) {
                 has_inherits = span_case_equal(value, value_length, "true")
@@ -606,19 +751,31 @@ static bool stylesheet_register_property(Stylesheet *sheet,
         }
         at = end + (end < block_length);
     }
-    if (!has_syntax || !has_inherits || (!universal && initial == NULL))
-        return true;
+    if (!has_inherits) return true;
+    StyleRegistrationSyntax kind = style_registered_property_check(
+        name, name_length, syntax, syntax_length, initial, initial_length);
+    if (kind == STYLE_REGISTRATION_INVALID) return true;
+    return stylesheet_store_registered_property(sheet, name, name_length,
+        initial, initial_length, inherits,
+        kind == STYLE_REGISTRATION_LENGTH, false);
+}
+
+static bool stylesheet_store_registered_property(
+    Stylesheet *sheet, const char *name, size_t name_length,
+    const char *initial, size_t initial_length, bool inherits,
+    bool length_syntax, bool from_api)
+{
     uint32_t hash = custom_rule_name_hash(name, name_length);
     StyleRegisteredProperty *existing = (StyleRegisteredProperty *)
         stylesheet_registered_property(sheet, name, name_length, hash);
+    if (existing != NULL && existing->registered_by_api && !from_api) return true;
     if (existing == NULL && sheet->registered_property_count
-                            >= STYLE_REGISTERED_PROPERTY_LIMIT) return true;
+                            >= STYLE_REGISTERED_PROPERTY_LIMIT) return !from_api;
+    size_t previous_long_bytes = sheet->custom_value_long_bytes;
     if (initial != NULL
         && !stylesheet_admit_custom_value(sheet, initial_length)) {
-        if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
-            sheet->diagnostic_custom_property_drops++;
-        }
-        return true;
+        STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_custom_property_drops);
+        return !from_api;
     }
     if (existing == NULL
         && sheet->registered_property_count
@@ -628,7 +785,10 @@ static bool stylesheet_register_property(Stylesheet *sheet,
         StyleRegisteredProperty *properties = budget_realloc(
             sheet->budget, sheet->registered_properties,
             capacity * sizeof(*properties));
-        if (properties == NULL) return false;
+        if (properties == NULL) {
+            sheet->custom_value_long_bytes = previous_long_bytes;
+            return false;
+        }
         sheet->registered_properties = properties;
         sheet->registered_property_capacity = capacity;
     }
@@ -636,7 +796,10 @@ static bool stylesheet_register_property(Stylesheet *sheet,
     size_t text_length = name_length + 1u
         + (initial == NULL ? 0 : initial_length);
     char *text = stylesheet_reserve_text(sheet, text_length);
-    if (text == NULL) return false;
+    if (text == NULL) {
+        sheet->custom_value_long_bytes = previous_long_bytes;
+        return false;
+    }
     memcpy(text, name, name_length);
     text[name_length] = '\0';
     if (initial != NULL) memcpy(text + name_length + 1u, initial,
@@ -648,7 +811,9 @@ static bool stylesheet_register_property(Stylesheet *sheet,
         .hash = hash,
         .initial_length = (uint16_t) initial_length,
         .name_length = (uint8_t) name_length,
-        .inherits = inherits
+        .inherits = inherits,
+        .length_syntax = length_syntax,
+        .registered_by_api = from_api
     };
     if (existing != NULL) {
         *existing = property;
@@ -663,6 +828,18 @@ static bool stylesheet_register_property(Stylesheet *sheet,
     sheet->registered_properties[at] = property;
     sheet->registered_property_count++;
     return true;
+}
+
+bool stylesheet_register_api_property(Stylesheet *sheet,
+                                      const DocumentRegisteredProperty *property)
+{
+    if (sheet == NULL || sheet->budget == NULL || property == NULL) return false;
+    bool ok = stylesheet_store_registered_property(sheet, property->name,
+        strlen(property->name), property->initial_value,
+        property->initial_value == NULL ? 0 : strlen(property->initial_value),
+        property->inherits, property->length_syntax, true);
+    if (ok) sheet->build_generation = stylesheet_next_generation();
+    return ok;
 }
 
 /* A registered property's initial value into `output`: false when it has
@@ -753,6 +930,43 @@ static size_t variable_cache_home(const StyleVariableCache *cache,
     return (size_t) mixed & (cache->capacity - 1u);
 }
 
+/* An entry's name: inline, or a long one's spilled copy. */
+static const char *variable_cache_entry_name(
+    const StyleVariableCache *cache, const StyleVariableCacheEntry *entry)
+{
+    if (entry->name_length < sizeof(entry->name)) return entry->name;
+    uint32_t offset;
+    memcpy(&offset, entry->name, sizeof(offset));
+    return cache->spill + offset;
+}
+
+static uint32_t variable_cache_spill(Stylesheet *sheet,
+                                     StyleVariableCache *cache,
+                                     const char *value, size_t length);
+
+/* The spill offset of a copy of the long `name`, reusing a recent copy:
+   one token is typically stored for many nodes. UINT32_MAX when it cannot
+   be spilled. */
+static uint32_t variable_cache_spill_name(Stylesheet *sheet,
+                                          StyleVariableCache *cache,
+                                          const char *name,
+                                          size_t name_length)
+{
+    size_t slots = sizeof(cache->long_names) / sizeof(cache->long_names[0]);
+    for (size_t i = 0; cache->spill != NULL && i < slots; i++) {
+        if (cache->long_names[i].length == name_length
+            && memcmp(cache->spill + cache->long_names[i].offset, name,
+                      name_length) == 0)
+            return cache->long_names[i].offset;
+    }
+    uint32_t offset = variable_cache_spill(sheet, cache, name, name_length);
+    if (offset == UINT32_MAX) return offset;
+    cache->long_names[cache->long_name_next].offset = offset;
+    cache->long_names[cache->long_name_next].length = (uint16_t) name_length;
+    cache->long_name_next = (uint8_t) ((cache->long_name_next + 1u) % slots);
+    return offset;
+}
+
 /* -1 means uncached, 0 is a cached miss, and 1 is a cached value. */
 static int variable_cache_lookup(Stylesheet *sheet, lxb_dom_node_t *node,
                                  const char *name, size_t name_length,
@@ -761,9 +975,7 @@ static int variable_cache_lookup(Stylesheet *sheet, lxb_dom_node_t *node,
 {
     StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
     if (cache == NULL) cache = variable_cache_from_lease(sheet);
-    if (cache == NULL || name_length >= sizeof(cache->entries[0].name)) {
-        return -1;
-    }
+    if (cache == NULL || name_length > UINT16_MAX) return -1;
     size_t home = variable_cache_home(cache, node, hash);
     for (size_t probe = 0; probe < STYLE_VARIABLE_CACHE_PROBES; probe++) {
         StyleVariableCacheEntry *entry =
@@ -771,7 +983,8 @@ static int variable_cache_lookup(Stylesheet *sheet, lxb_dom_node_t *node,
         if (!entry->occupied) break;
         if (entry->node != node || entry->hash != hash
             || entry->name_length != name_length
-            || memcmp(entry->name, name, name_length) != 0) continue;
+            || memcmp(variable_cache_entry_name(cache, entry), name,
+                      name_length) != 0) continue;
         entry->stamp = ++cache->clock;
         sheet->variable_read_names |= entry->reads;
         sheet->variable_cache_hits++;
@@ -835,8 +1048,13 @@ static void variable_cache_store_nodes(
     const char *name, size_t name_length, uint32_t hash, const char *value)
 {
     StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
-    if (cache == NULL || node_count == 0
-        || name_length >= sizeof(cache->entries[0].name)) return;
+    if (cache == NULL || node_count == 0 || name_length > UINT16_MAX) return;
+    uint32_t name_spill = UINT32_MAX;
+    if (name_length >= sizeof(cache->entries[0].name)) {
+        name_spill = variable_cache_spill_name(sheet, cache, name,
+                                               name_length);
+        if (name_spill == UINT32_MAX) return;
+    }
     size_t value_length = value == NULL ? 0 : strlen(value);
     uint32_t spill = UINT32_MAX;
     if (value_length >= sizeof(cache->entries[0].value.text)) {
@@ -874,8 +1092,12 @@ static void variable_cache_store_nodes(
                 : VARIABLE_CACHE_INLINE,
             .reads = sheet->variable_read_names
         };
-        memcpy(target->name, name, name_length);
-        target->name[name_length] = '\0';
+        if (name_spill != UINT32_MAX) {
+            memcpy(target->name, &name_spill, sizeof(name_spill));
+        } else {
+            memcpy(target->name, name, name_length);
+            target->name[name_length] = '\0';
+        }
         if (spill != UINT32_MAX) {
             target->value.spill.offset = spill;
             target->value.spill.length = (uint32_t) value_length;
@@ -1061,6 +1283,45 @@ static bool variable_resolving_contains(const StyleResolveScratch *scratch,
     return false;
 }
 
+/* The held style of `node`, a strict ancestor of a declaring element. */
+static const ComputedStyle *variable_font_chain_find(
+    const StyleVariableCache *cache, const lxb_dom_node_t *node)
+{
+    if (cache == NULL || cache->font_chain == NULL) return NULL;
+    for (size_t i = 0; i < STYLE_FONT_CHAIN_ENTRIES; i++) {
+        if (cache->font_chain[i].node == node)
+            return &cache->font_chain[i].style;
+    }
+    return NULL;
+}
+
+static void variable_font_chain_store(Stylesheet *sheet,
+                                      StyleVariableCache *cache,
+                                      const lxb_dom_node_t *node,
+                                      const ComputedStyle *style)
+{
+    if (cache->font_chain == NULL) {
+        if (cache->font_chain_refused) return;
+        cache->font_chain = budget_calloc_category(
+            cache->budget, BUDGET_CATEGORY_LAYOUT, STYLE_FONT_CHAIN_ENTRIES,
+            sizeof(*cache->font_chain));
+        if (cache->font_chain == NULL) {
+            cache->font_chain_refused = true;
+            return;
+        }
+        size_t bytes = variable_cache_footprint(cache);
+        if (bytes > sheet->variable_cache_peak_bytes)
+            sheet->variable_cache_peak_bytes = bytes;
+    }
+    /* A lease is emptied only when it stored something. */
+    cache->stored = true;
+    StyleFontChainEntry *entry = &cache->font_chain[cache->font_chain_next];
+    cache->font_chain_next = (uint8_t) ((cache->font_chain_next + 1u)
+                                        % STYLE_FONT_CHAIN_ENTRIES);
+    entry->node = node;
+    entry->style = *style;
+}
+
 /* Resolves the declared value (`value`, `value_length`) of `name` on the
    element that declares it into `output`. False only when the result does
    not fit `output_size`: a value is never truncated. */
@@ -1070,7 +1331,10 @@ static bool variable_resolve_at_declaration(
     size_t value_length, char *output, size_t output_size)
 {
     StyleResolveScratch *scratch = sheet->resolve_scratch;
-    if (span_contains_text(value, value_length, "var(")
+    const StyleRegisteredProperty *property = stylesheet_registered_property(
+        sheet, name, name_length, custom_rule_name_hash(name, name_length));
+    bool typed_length = property != NULL && property->length_syntax;
+    if ((typed_length || span_contains_text(value, value_length, "var("))
         && scratch->variable_resolving_count
                < STYLE_VARIABLE_RESOLVING_LIMIT) {
         lxb_dom_node_t *saved_node = scratch->resolution_node;
@@ -1084,6 +1348,76 @@ static bool variable_resolve_at_declaration(
         scratch->variable_resolving[slot].name_length = name_length;
         bool resolved = style_resolve_value(sheet, value, value_length,
                                             output, output_size, 0);
+        if (resolved && typed_length && node != NULL
+            && (strstr(output, "em") != NULL || strstr(output, "ch") != NULL)) {
+            /* Registered lengths inherit computed pixels, not tokens that
+               re-evaluate against each descendant's font. Keep this lookup
+               marked resolving while obtaining the declaration's font, so
+               a font/custom-property dependency cycle cannot recurse. */
+            lxb_dom_node_t *ancestors[128];
+            size_t count = 0;
+            lxb_dom_node_t *ancestor = node;
+            for (; ancestor != NULL && count < 128; ancestor = ancestor->parent)
+                if (ancestor->type == LXB_DOM_NODE_TYPE_ELEMENT)
+                    ancestors[count++] = ancestor;
+            if (ancestor == NULL) {
+                ComputedStyle font = {0};
+                bool have_font = false;
+                /* Sibling components share their ancestors: hold those
+                   styles (never the declaring element's own, computed with
+                   this lookup marked resolving) for the cache's lifetime.
+                   A strict ancestor's cascade cannot reach the declaring
+                   element, but its var() work is bounded per outermost
+                   resolution and container state moves during layout, so
+                   only the outermost resolution of a sheet without
+                   container queries or units shares them. */
+                StyleVariableCache *chain = slot == 0
+                    && !sheet->has_container_relative_units
+                    && !stylesheet_has_container_queries(sheet)
+                    ? scratch->variable_cache : NULL;
+                for (size_t i = 1; chain != NULL && i < count; i++) {
+                    const ComputedStyle *held =
+                        variable_font_chain_find(chain, ancestors[i]);
+                    if (held == NULL) continue;
+                    font = *held;
+                    have_font = true;
+                    count = i;
+                    break;
+                }
+                while (count != 0) {
+                    font = style_for_node(sheet, ancestors[--count],
+                                          have_font ? &font : NULL);
+                    have_font = true;
+                    if (count != 0 && chain != NULL)
+                        variable_font_chain_store(sheet, chain,
+                                                  ancestors[count], &font);
+                }
+                StyleMathParser parser;
+                StyleMathCandidate candidate;
+                int root = -1;
+                int em = (computed_style_font_size_fixed(&font) + 32) / 64;
+                int rem = (computed_style_root_font_size_fixed(&font) + 32) / 64;
+                if (style_math_candidate(sheet, output, strlen(output),
+                        &parser, &candidate, &root, em, rem, (em + 1) / 2)
+                    && !candidate.has_percent && parser.nodes[root].folded
+                    && parser.nodes[root].a >= INT32_MIN
+                    && parser.nodes[root].a <= INT32_MAX) {
+                    int32_t fixed = parser.nodes[root].a;
+                    uint32_t magnitude = fixed < 0
+                        ? (uint32_t) (-(int64_t) fixed) : (uint32_t) fixed;
+                    int written = snprintf(output, output_size, "%s%u.%08upx",
+                        fixed < 0 ? "-" : "", magnitude / 256u,
+                        (magnitude % 256u) * 390625u);
+                    resolved = written >= 0 && (size_t) written < output_size;
+                    if (resolved) {
+                        size_t end = (size_t) written - 2u;
+                        while (end != 0 && output[end - 1u] == '0') end--;
+                        if (end != 0 && output[end - 1u] == '.') end--;
+                        memcpy(output + end, "px", 3);
+                    }
+                }
+            }
+        }
         scratch->variable_resolving_count--;
         scratch->resolution_node = saved_node;
         scratch->resolution_pseudo = saved_pseudo;
@@ -1099,11 +1433,8 @@ static bool variable_resolve_at_declaration(
 uint64_t stylesheet_custom_property_name_bits(const char *name,
                                               size_t length)
 {
-    uint32_t hash = UINT32_C(2166136261);
-    for (size_t i = 0; name != NULL && i < length; i++) {
-        hash ^= (unsigned char) tolower((unsigned char) name[i]);
-        hash *= UINT32_C(16777619);
-    }
+    uint32_t hash = name == NULL ? STYLE_FNV1A_SEED
+        : style_fnv1a(STYLE_FNV1A_SEED, name, length, true);
     return (UINT64_C(1) << (hash & 63u))
         | (UINT64_C(1) << ((hash >> 6) & 63u));
 }
@@ -1475,13 +1806,28 @@ static bool selector_fast_key_matches(
     size_t offset = selector_length - suffix_bytes - key_length;
     const char *key = selector + offset;
     char marker = offset == 0 ? '\0' : selector[offset - 1u];
-    if (marker == '#') {
-        return subject->id != NULL && subject->id_length == key_length
-            && memcmp(subject->id, key, key_length) == 0;
-    }
-    if (marker == '.')
-        return style_subject_has_class(sheet, subject, key, key_length);
-    return style_subject_tag_matches(subject, key, key_length);
+    return style_subject_key_matches(sheet, subject,
+        marker == '#' ? SELECTOR_ID
+            : marker == '.' ? SELECTOR_CLASS : SELECTOR_TAG,
+        key, key_length);
+}
+
+/* Custom and transition rules keep their fast key as the bytes after it
+   in the selector (UINT8_MAX: none, or too far from the end) and its
+   length, rather than a StyleRule's offset and type. */
+static uint8_t selector_fast_key_suffix(const char *selector, size_t length,
+                                        uint8_t *key_length)
+{
+    StyleRule metadata = {
+        .selector = selector,
+        .selector_length = (uint16_t) length
+    };
+    selector_assign_fast_key(&metadata, selector, length);
+    size_t suffix = length - metadata.fast_key_offset - metadata.fast_key_length;
+    *key_length = 0;
+    if (!metadata.has_fast_key || suffix >= UINT8_MAX) return UINT8_MAX;
+    *key_length = metadata.fast_key_length;
+    return (uint8_t) suffix;
 }
 
 static bool retained_rule_fast_matches(const Stylesheet *sheet,
@@ -1568,18 +1914,17 @@ static unsigned retained_box_tokens(
     unsigned count = 0;
     size_t length = strlen(value);
     while (count < 4
-           && style_next_top_level(
-               value, length, ' ', &cursor, &start, &end)) {
+           && style_next_top_level_token(
+               value, length, &cursor, &start, &end)) {
         size_t token_length = end - start;
-        if (token_length == 0
-            || token_length >= STYLE_RETAINED_BOX_VALUE_CAPACITY) {
-            return 0;
-        }
+        if (token_length >= STYLE_RETAINED_BOX_VALUE_CAPACITY) return 0;
         memcpy(output[count], value + start, token_length);
         output[count][token_length] = '\0';
         count++;
     }
-    if (count == 0 || cursor < length) return 0;
+    if (count == 0
+        || style_next_top_level_token(value, length, &cursor, &start, &end))
+        return 0;
     if (count == 1) {
         memcpy(output[1], output[0], STYLE_RETAINED_BOX_VALUE_CAPACITY);
         memcpy(output[2], output[0], STYLE_RETAINED_BOX_VALUE_CAPACITY);
@@ -1940,9 +2285,7 @@ bool style_set_variable(Stylesheet *sheet, const char *name,
     }
     if (name_length == 0 || name_length >= STYLE_CUSTOM_NAME_CAPACITY
         || !stylesheet_admit_custom_value(sheet, value_length)) {
-        if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
-            sheet->diagnostic_custom_property_drops++;
-        }
+        STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_custom_property_drops);
         return true;
     }
     if (index == sheet->variable_count
@@ -2357,7 +2700,8 @@ static uint16_t style_declaration_values_summary(const ComputedStyle *values)
     if (computed_style_paint_stack_id(values) != 0) {
         flags |= STYLE_DECLARATION_VALUES_PAINT_STACK;
     }
-    if (values->generated_attr != NULL) {
+    if (values->generated_attr_length != STYLE_GENERATED_SCALAR_LENGTH
+        && values->generated_attr != NULL) {
         flags |= STYLE_DECLARATION_VALUES_GENERATED_ATTR;
     }
     return flags;
@@ -2657,7 +3001,7 @@ void stylesheet_rule_revert_mask(const Stylesheet *sheet,
 bool style_selector_reads_focus(const char *selector)
 {
     return strstr(selector, ":focus") != NULL
-        || strstr(selector, "data-tilefinch-focus") != NULL;
+        || strstr(selector, STYLE_FOCUS_MARKER) != NULL;
 }
 
 bool stylesheet_prepare_focus_rule_index(Stylesheet *sheet)
@@ -2773,9 +3117,7 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
         || (custom_property
             ? !stylesheet_admit_custom_value(sheet, value_length)
             : value_length >= STYLE_RETAINED_VALUE_CAPACITY)) {
-        if (sheet->diagnostic_custom_property_drops != UINT64_MAX) {
-            sheet->diagnostic_custom_property_drops++;
-        }
+        STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_custom_property_drops);
         return true;
     }
     if (sheet->custom_rule_count == sheet->custom_rule_capacity) {
@@ -2808,19 +3150,8 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
     rule->important = important;
     rule->pseudo = (uint8_t) pseudo;
     rule->container_query = sheet->current_container_query;
-    rule->fast_key_suffix_bytes = UINT8_MAX;
-    StyleRule selector_metadata = {
-        .selector = rule->selector,
-        .selector_length = (uint16_t) selector_length
-    };
-    selector_assign_fast_key(
-        &selector_metadata, rule->selector, selector_length);
-    size_t suffix_bytes = selector_length
-        - selector_metadata.fast_key_offset - selector_metadata.fast_key_length;
-    if (selector_metadata.has_fast_key && suffix_bytes < UINT8_MAX) {
-        rule->fast_key_suffix_bytes = (uint8_t) suffix_bytes;
-        rule->fast_key_length = selector_metadata.fast_key_length;
-    }
+    rule->fast_key_suffix_bytes = selector_fast_key_suffix(
+        rule->selector, selector_length, &rule->fast_key_length);
     rule->origin = sheet->current_origin;
     rule->layer = sheet->current_layer;
     rule->specificity = specificity;

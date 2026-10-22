@@ -31,7 +31,8 @@ import sys
 
 FIELD = re.compile(r"([\w-]+)=(\S*)")
 KIB = 1024.0
-# Host -> PSP. QuickJS compile: 108x (PERFORMANCE_LEDGER, compile_peak at
+# Host -> PSP. QuickJS compile: 108x
+# (.private-investigations/PERFORMANCE_LEDGER.md, compile_peak at
 # 111 MHz against the M-series host). Native C code (the planner, LZ store,
 # SHA-256): 90x, inside the 60-110x used for C elsewhere (read planner
 # figures as +-30%); it puts host SHA-256 near the 0.35 s/MiB estimate.

@@ -415,6 +415,9 @@ static bool navigation_stream_stylesheet_fingerprint(
     /* Adopted constructed sheets are sources outside the tree. */
     uint64_t adopted = document_adopted_sheets_signature(document);
     hash = fingerprint_bytes(hash, (const char *) &adopted, sizeof(adopted));
+    hash = fingerprint_bytes(hash,
+        (const char *) &document->registered_property_count,
+        sizeof(document->registered_property_count));
 
     lxb_dom_node_t *node = lxb_dom_interface_node(document->html);
     lxb_dom_node_t *boundary_parent = node->parent;

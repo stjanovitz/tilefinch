@@ -290,16 +290,24 @@ JSValue js_canvas_image_source(JSContext *context,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || bridge->images == NULL || argc < 1) return JS_NULL;
+    if (bridge == NULL || argc < 1) return JS_NULL;
     lxb_dom_node_t *node = js_rt_bridge_node_arg(
         context, bridge, argv[0]);
     const ImageResource *image = node == NULL ? NULL
         : images_find_node(bridge->images, node);
+    ImageResources *owner = bridge->images;
+    if (!image_resource_available(image)) {
+        owner = js_rt_image_preload_resources(bridge);
+        image = js_rt_image_preload_find(bridge, node);
+        if (image_resource_available(image))
+            js_rt_image_preload_prepare_pin(
+                bridge, (size_t) (image - owner->items));
+    }
     /* Script reads these pixels: undo any display retargeting and keep the
        surface at its full decoded size from now on. */
     if (image_resource_available(image)) {
         (void) images_retarget_pin_full(
-            bridge->images, (size_t) (image - bridge->images->items),
+            owner, (size_t) (image - owner->items),
             bridge->session);
     }
     if (!image_resource_available(image) || image->pixels == NULL

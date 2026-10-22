@@ -185,11 +185,9 @@ void psp_media_report_failure_snapshot(
  * a second reason for an already-failed panel has already paid for it, and
  * shipping builds compile psp_log_flush out at the call site entirely.
  */
-void psp_media_raise_error(
-    PspMediaSession *media, const char *message, const char *reason)
+/* Back to landscape, with the rotation offer and its probe forgotten. */
+static void psp_media_reset_rotation(PspMediaSession *media)
 {
-    if (media == NULL) return;
-    bool was_failed = media->ui.failed;
     media->ui_presentation.clockwise = false;
     media->ui_presentation.portrait_crop = false;
     media->ui_presentation.rotation_available = false;
@@ -197,6 +195,25 @@ void psp_media_raise_error(
     media->ui_presentation.rotation_probe_phase = 0;
     media->ui_presentation.rotation_probe_playback_ms = 0;
     media->ui_presentation.rotation_probe_matches = 0;
+}
+
+/* Whether the current picture is one the rotated presentation can draw. */
+static bool psp_media_rotation_supported(const PspMediaSession *media)
+{
+    return media->have_frame
+        && media->frame.format == MEDIA_PIXEL_RGBA8888
+        && media->frame.width > 0
+        && media->frame.width <= PSP_MEDIA_PRESENT_ROTATION_MAX_WIDTH
+        && media->frame.height > 0
+        && media->frame.height <= PSP_MEDIA_PRESENT_ROTATION_MAX_HEIGHT;
+}
+
+void psp_media_raise_error(
+    PspMediaSession *media, const char *message, const char *reason)
+{
+    if (media == NULL) return;
+    bool was_failed = media->ui.failed;
+    psp_media_reset_rotation(media);
     if (reason != NULL) {
         psp_ui_media_set_error_reason(&media->ui, message, reason);
     } else {
@@ -1850,7 +1867,7 @@ static bool psp_media_playlist_tick(PspMediaSession *media)
             /* At the actual end, keep recovery and return discoverable rather
                than leaving a stopped picture with no next video. */
             media->ui_presentation.track_menu_open = true;
-            media->ui_presentation.track_menu_tab = 3;
+            media->ui_presentation.track_menu_tab = PSP_UI_MEDIA_TAB_QUEUE;
             media->ui_presentation.track_menu_selection = 0;
             psp_ui_media_show_controls(&media->ui);
             changed = true;
@@ -1870,7 +1887,19 @@ static bool psp_media_playlist_tick(PspMediaSession *media)
         media->playlist = NULL;
         psp_media_close(media); /* Also handles consecutive duplicate IDs. */
         media->playlist = queue;
-        (void) psp_media_open_provider_route(media, url, media->generation);
+        if (!psp_media_open_provider_route(media, url, media->generation)) {
+            /* The close hid the player. A refused open must not leave a
+               hidden queue owning its page job, which nothing would pump
+               or free; show why the queue stopped instead. */
+            youtube_playlist_destroy(media->playlist);
+            media->playlist = NULL;
+            psp_media_raise_error(media, "PLAYLIST VIDEO COULD NOT OPEN", NULL);
+            /* The close dropped the route's source; there is nothing to
+               retry, so the panel offers only Back. */
+            media->ui.retry_unavailable = true;
+            psp_media_playlist_projection(media);
+            return true;
+        }
         media->playlist_end_handled = false;
         media->ui_presentation.automatic_next = automatic;
         changed = true;
@@ -2055,13 +2084,7 @@ void psp_media_close(PspMediaSession *media)
     psp_media_cancel_decode(media);
     if (recovery_in_flight) media->clock_us = recovery_us;
     media->ui.visible = false;
-    media->ui_presentation.clockwise = false;
-    media->ui_presentation.portrait_crop = false;
-    media->ui_presentation.rotation_available = false;
-    media->ui_presentation.rotation_suggested = false;
-    media->ui_presentation.rotation_probe_phase = 0;
-    media->ui_presentation.rotation_probe_playback_ms = 0;
-    media->ui_presentation.rotation_probe_matches = 0;
+    psp_media_reset_rotation(media);
     /* Hidden retained pipelines consume no transport work. Keeping media
        priority here would permanently reserve two of the six shared worker
        descriptors after Back, including when the next navigation fails and
@@ -2317,10 +2340,10 @@ void psp_media_execute_intent(PspMediaSession *media,
     if (psp_media_playlist_intent(media, intent)) return;
     switch (intent.action) {
         case PSP_UI_MEDIA_ACTION_ROTATE:
+            /* rotation_available is refreshed on every advance; the frame
+               check covers a picture that changed since then. */
             if (media->ui_presentation.rotation_available
-                && media->have_frame && media->frame.width <= 640
-                && media->frame.height <= 512 && media->frame.width > 0
-                && media->frame.height > 0) {
+                && psp_media_rotation_supported(media)) {
                 /* Landscape -> portrait fit -> central portrait crop ->
                    landscape. Native portrait frames need no crop step. */
                 if (!media->ui_presentation.clockwise) {
@@ -2744,14 +2767,32 @@ static bool psp_media_subtitle_update_display(PspMediaSession *media)
 }
 
 /*
- * Re-hash the staged copy at the points the conversion hashed, and hand the
- * verdict to the backend.
+ * Recover a refused access unit by resetting the decoder instead of skipping
+ * it -- on the browser thread, at the point the refusal reaches it.
  *
- * Sampled from the staged bytes rather than from the source, because the
- * staged bytes are what the graphics engine draws: a copy that read the wrong
- * slot differs here and nowhere else. Only when the staged geometry actually
- * contains the sample points -- a strided or truncated stage has nothing to
- * compare and says so with a zero.
+ * Which thread does what is the whole of this design. The refusal is detected
+ * inside psp_media_decode_staged_video, which runs on the codec worker, and the
+ * worker keeps doing exactly what it did before: it counts the refusal, logs
+ * it, retires the unit and returns. It resets nothing, waits on nothing, and
+ * reads no session state -- a worker that reached into a seek would be a second
+ * writer of the demuxer, the clock and the surface. All it publishes is a
+ * number, the backend's running refusal total, and this runs after an advance
+ * has collected the job that incremented it. A total above the one already
+ * accounted for is a refusal this frame owes a recovery to.
+ *
+ * The recovery rebuilds at a later random-access point. Device experiments
+ * proved that continuing, replaying the refused AU, or omitting it while
+ * replaying dependent pictures can all hang firmware. This conservative path
+ * can visibly skip content, but it remains only as a backstop: the ordinary
+ * decode path now completes the firmware's Detail2 transaction after every
+ * successful AU and should prevent the refusal state from arising.
+ *
+ * Returns true when it acted, which ends the caller's frame: the reset
+ * invalidated the borrowed surface, so no picture is left for the rest of the
+ * advance to present. `decision_ready` is distinct: false means the shared
+ * codec slot was still running and the refusal total could not be observed.
+ * That is not "no refusal"; the worker's video hold must stay latched until a
+ * later frame can make the decision from a stable snapshot.
  */
 static bool psp_media_refusal_reset_recover(
     PspMediaSession *media, bool *decision_ready)
@@ -2975,9 +3016,12 @@ bool psp_media_advance(
         psp_media_present_release_claimed_surface(media);
         psp_media_present_emit_after_release(media);
     }
-    bool changed = media->presentation_deferred
-        || (!tilefinch_cancellation_requested(cancellation)
-            && psp_media_playlist_tick(media));
+    /* The playlist tick is unrelated to an audio-deadline deferral and runs
+       on every advance. It goes first: a tick that reopens the pipeline
+       closes it, and that close clears the deferral before it is read. */
+    bool changed = !tilefinch_cancellation_requested(cancellation)
+        && psp_media_playlist_tick(media);
+    changed = media->presentation_deferred || changed;
     uint64_t advance_started_us = psp_media_now_us(media);
     /* A closed player may retain a complete paused pipeline for an immediate
        replay, and an internal provider view may temporarily hide one. Neither
@@ -3867,10 +3911,8 @@ bool psp_media_advance(
             psp_media_duration_us(media),
             media->stream.title);
         media->ui.live = media->stream.live_hls;
-        media->ui_presentation.rotation_available = media->have_frame
-            && media->frame.format == MEDIA_PIXEL_RGBA8888
-            && media->frame.width > 0 && media->frame.width <= 640
-            && media->frame.height > 0 && media->frame.height <= 512;
+        media->ui_presentation.rotation_available =
+            psp_media_rotation_supported(media);
     }
     uint64_t buffered =
         media_playback_buffered_until_us(media->playback);

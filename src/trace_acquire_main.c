@@ -21,12 +21,14 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s --method GET|HEAD|OPTIONS --url HTTPS_URL --output DIR "
             "--max-bytes N --timeout-ms N [--origin HTTPS_ORIGIN] "
+            "[--cache-mode default|no-cache|no-store|reload] "
             "[--headers-file FILE | --preflight-method GET|HEAD "
             "--preflight-headers NAMES]\n",
             program);
 }
 
-static bool read_public_headers(const char *path, char *buffer, size_t capacity)
+static bool read_public_headers(const char *path, char *buffer, size_t capacity,
+                                char *content_type, size_t content_capacity)
 {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return false;
@@ -40,6 +42,7 @@ static bool read_public_headers(const char *path, char *buffer, size_t capacity)
         unsigned char c = (unsigned char) buffer[i];
         if (c != '\n' && c != '\t' && (c < 32 || c > 126)) return false;
     }
+    char *write = buffer;
     for (const char *at = buffer; *at != '\0';) {
         const char *end = strchr(at, '\n');
         if (end == NULL) end = at + strlen(at);
@@ -53,8 +56,26 @@ static bool read_public_headers(const char *path, char *buffer, size_t capacity)
             || strstr(name, "token") || strstr(name, "secret")
             || strstr(name, "credential") || strstr(name, "api-key")
             || strstr(name, "api_key") || strstr(name, "apikey")) return false;
+        if (strcmp(name, "content-type") == 0) {
+            const char *value = colon + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            size_t value_length = (size_t) (end - value);
+            if (content_type[0] != '\0' || value_length == 0
+                || value_length >= content_capacity) return false;
+            /* Fetch owns this header separately; never weaken its prohibition
+               on transport-controlled names in extra_headers. */
+            memcpy(content_type, value, value_length);
+            content_type[value_length] = '\0';
+        } else {
+            size_t line_length = (size_t) (end - at);
+            memmove(write, at, line_length);
+            write += line_length;
+            if (*end != '\0') *write++ = '\n';
+        }
         at = *end == '\0' ? end : end + 1;
     }
+    if (write > buffer && write[-1] == '\n') write--;
+    *write = '\0';
     return true;
 }
 
@@ -170,6 +191,8 @@ int main(int argc, char **argv)
     const char *max_bytes_text = NULL;
     const char *timeout_text = NULL;
     const char *origin = NULL;
+    const char *cache_text = NULL;
+    FetchCacheMode cache_mode = FETCH_CACHE_DEFAULT;
     const char *headers_file = NULL, *preflight_method = NULL, *preflight_headers = NULL;
     for (int i = 1; i < argc; i++) {
         const char *option = argv[i];
@@ -197,6 +220,8 @@ int main(int argc, char **argv)
             timeout_text = value;
         } else if (strcmp(option, "--origin") == 0 && origin == NULL) {
             origin = value;
+        } else if (strcmp(option, "--cache-mode") == 0 && cache_text == NULL) {
+            cache_text = value;
         } else if (strcmp(option, "--headers-file") == 0 && headers_file == NULL) {
             headers_file = value;
         } else if (strcmp(option, "--preflight-method") == 0 && preflight_method == NULL) {
@@ -214,6 +239,16 @@ int main(int argc, char **argv)
     char normalized_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     bool preflight = method != NULL && strcmp(method, "OPTIONS") == 0;
     char extra_headers[8192] = {0};
+    char content_type[256] = {0};
+    if (cache_text != NULL) {
+        if (strcmp(cache_text, "no-cache") == 0) cache_mode = FETCH_CACHE_NO_CACHE;
+        else if (strcmp(cache_text, "no-store") == 0) cache_mode = FETCH_CACHE_NO_STORE;
+        else if (strcmp(cache_text, "reload") == 0) cache_mode = FETCH_CACHE_RELOAD;
+        else if (strcmp(cache_text, "default") != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+    }
     if (method == NULL || url == NULL || output == NULL
         || max_bytes_text == NULL || timeout_text == NULL
         || (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && !preflight)
@@ -242,12 +277,15 @@ int main(int argc, char **argv)
             preflight_headers);
         if (length < 0 || (size_t) length >= sizeof(extra_headers)) return 2;
     } else if (headers_file != NULL
-               && !read_public_headers(headers_file, extra_headers, sizeof(extra_headers))) {
+               && !read_public_headers(headers_file, extra_headers, sizeof(extra_headers),
+                                       content_type, sizeof(content_type))) {
         fprintf(stderr, "trace acquisition refuses invalid or credential-bearing headers\n");
         return 2;
     }
     FetchRequest request = {
         .method = method, .origin = origin, .allow_http_errors = true,
+        .cache_mode = cache_mode,
+        .content_type = content_type[0] ? content_type : NULL,
         .extra_headers = extra_headers[0] ? extra_headers : NULL,
         .cors_preflight = preflight, .enforce_cors = preflight,
         .redirect_same_origin_only = preflight,

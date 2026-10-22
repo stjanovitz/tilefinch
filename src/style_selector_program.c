@@ -790,9 +790,8 @@ static size_t style_selector_intern_slot(const Stylesheet *sheet,
     const StyleRule *rule = &sheet->rules[index];
     *previous = SIZE_MAX;
     if (rule->selector == NULL || rule->selector_length == 0) return 0;
-    uint32_t hash = UINT32_C(2166136261);
-    for (size_t i = 0; i < rule->selector_length; i++)
-        hash = (hash ^ (unsigned char) rule->selector[i]) * UINT32_C(16777619);
+    uint32_t hash = style_fnv1a(STYLE_FNV1A_SEED, rule->selector,
+                                rule->selector_length, false);
     size_t home = hash & (STYLE_SELECTOR_INTERN_CAPACITY - 1u);
     for (size_t probe = 0; probe < STYLE_SELECTOR_INTERN_PROBES; probe++) {
         size_t at = (home + probe) & (STYLE_SELECTOR_INTERN_CAPACITY - 1u);

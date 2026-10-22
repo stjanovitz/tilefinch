@@ -33,6 +33,13 @@
 #define BROWSER_COOKIE_PER_DOMAIN_LIMIT 32
 #define BROWSER_COOKIE_LONG_PATH_LIMIT 2048
 #define BROWSER_COOKIE_LONG_PATH_BYTES (8u * 1024u)
+/* The one bound on a Cookie request header, terminator included, shared by
+   every header builder (provider and page requests) and the transport's
+   fixed request descriptors. The jar holds 4 KiB of cookie values by
+   default and a signed-in YouTube jar sends about 2.6 KB, so ordinary
+   headers fit; one that would not leaves out its lowest-priority cookies
+   instead of going out empty (see browser_session_cookie_header_context). */
+#define BROWSER_COOKIE_HEADER_CAPACITY 4096u
 /* A large article page can cycle ~30 tiny mask/icon responses plus content
    images and stylesheets through this LRU across script-driven re-renders;
    8 slots thrashed before any re-discovered node could reuse its body.
@@ -462,17 +469,30 @@ typedef struct {
 
 /* Opt-in diagnostics. Counts only; never retain cookie names, values,
    targets or credentials. Includes published jar operations, not speculative
-   request-private overlay operations. */
+   request-private overlay operations (header omissions aside, below). */
 typedef struct {
+#ifndef __PSP__
+    /* Host lab snapshot only; the device report has no use for them. */
     size_t http_attempts;
     size_t script_attempts;
+    size_t peak_value_bytes;
+#endif
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* Cookies left out of a Cookie header that would have exceeded
+       BROWSER_COOKIE_HEADER_CAPACITY (host and validation builds only).
+       Counted where the transport builds the header it sends, from a
+       request's private overlay, once per hop. Neither document.cookie
+       nor a header built straight from the jar (a caller's prepared or
+       background-lane request) counts. */
+    size_t header_omissions;
+#endif
     size_t refused;
+    /* A value or long path that would exceed its byte allowance. */
     size_t byte_refusals;
     size_t slot_refusals;
     size_t allocation_refusals;
     size_t policy_ignored;
     size_t evictions;
-    size_t peak_value_bytes;
     bool enabled;
 } BrowserCookieDiagnostics;
 
@@ -522,6 +542,11 @@ typedef struct BrowserSession {
                                         [BROWSER_ORIGIN_LIMIT];
     size_t mixed_content_allowed_site_count;
     size_t third_party_cookie_allowed_site_count;
+    /* The cookies a signed-in site needs to authenticate, registered by its
+       provider (browser_session_set_credential_cookies; static storage). */
+    const char *credential_cookie_site;
+    const char *const *credential_cookie_names;
+    size_t credential_cookie_name_count;
 #define BROWSER_HSTS_ENTRY_LIMIT 16u
     struct {
         char host[BROWSER_ORIGIN_LIMIT];
@@ -769,9 +794,31 @@ bool browser_session_cookie_get(const BrowserSession *session,
 bool browser_session_cookie_header(const BrowserSession *session,
                                    const char *url, char *output,
                                    size_t output_capacity);
+/* With output_capacity >= BROWSER_COOKIE_HEADER_CAPACITY the header is
+   bounded by that constant and always built: when every matching cookie
+   would not fit, the lowest-priority ones are left out, the way a browser
+   bounds what it sends. Kept first are the site's registered credential
+   cookies, then cookies the server marked HttpOnly or __Host-/__Secure-,
+   then the rest; within each rank, Cookie-header order decides, and a
+   cookie that cannot fit is skipped. Kept cookies keep their header order.
+   A smaller buffer gets the whole header or, as before, an empty one and
+   false (never a partial prefix). */
 bool browser_session_cookie_header_context(
     const BrowserSession *session, const TilefinchRequestContext *context,
     char *output, size_t output_capacity);
+/* One named cookie this request would send, read from the jar without
+   building the header, so it never depends on the header's size: the first
+   match in Cookie-header order. The value is not terminated and stays valid
+   until the jar next changes. */
+bool browser_session_cookie_value_context(
+    const BrowserSession *session, const TilefinchRequestContext *context,
+    const char *name, const char **value, size_t *length);
+/* Registers the cookies a signed-in site needs to authenticate: on any host
+   within `site`, an over-long Cookie header keeps these before all others.
+   The strings and the array must have static storage; NULL clears. */
+void browser_session_set_credential_cookies(
+    BrowserSession *session, const char *site,
+    const char *const *names, size_t name_count);
 /* Hashes exactly the Cookie header authority visible to this request context,
    without materializing a potentially multi-kilobyte header. */
 bool browser_session_cookie_header_fingerprint_context(
@@ -903,7 +950,7 @@ bool browser_session_cache_control_no_store(const char *cache_control);
    never held more than 83 entries. The table is optional memory: the
    Budget reclaim hook and the script pressure checks evict it before the
    page needs the room. See docs/STORAGE.md and
-   docs/engineering/MEMORY_EXPERIMENTS.md. */
+   .private-investigations/MEMORY_EXPERIMENTS.md. */
 #define BROWSER_CLASSIC_BYTECODE_CACHE_BYTES (3072u * 1024u)
 #define BROWSER_CLASSIC_BYTECODE_CACHE_STRICT_BYTES (1536u * 1024u)
 
@@ -1213,6 +1260,10 @@ bool browser_session_decoded_image_acquire(
    a surface of another size), so no later page adopts a stale size. */
 void browser_session_decoded_image_forget(BrowserSession *session,
                                           const BrowserSharedBody *pixels);
+/* Allocation-free pressure recovery: drop only cache-exclusive pixel
+   leases, preserving response entries and every borrowed body/surface. */
+size_t browser_session_decoded_image_reclaim(BrowserSession *session,
+                                            size_t target_bytes);
 bool browser_session_decoded_image_put(
     BrowserSession *session, const char *request_url,
     const TilefinchRequestContext *request_context,

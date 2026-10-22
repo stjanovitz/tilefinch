@@ -106,18 +106,25 @@ static bool ensure_provider(PspGlyphComponentSession *session)
 bool psp_glyph_component_session_attach_selected(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
-    bool color_emoji)
+    BrowserGlyphLanguage interface_language, bool color_emoji)
 {
     if (session == NULL || budget == NULL || paths == NULL
         || !paths->slotted || session->provider != NULL) return false;
     session->budget = budget;
     TilefinchGlyphPack regional = TILEFINCH_GLYPH_PACK_JAPANESE;
+    TilefinchGlyphPack interface = TILEFINCH_GLYPH_PACK_JAPANESE;
     bool have_regional = tilefinch_glyph_pack_for_language(
         (unsigned) language, &regional);
-    if (!have_regional && !color_emoji) return true;
+    bool have_interface = tilefinch_glyph_pack_for_language(
+            (unsigned) interface_language, &interface)
+        && !(have_regional && interface == regional);
+    if (!have_regional && !have_interface && !color_emoji) return true;
     session->provider = tilefinch_glyph_provider_create(budget);
     if (session->provider == NULL) return false;
+    /* The page selection precedes the interface language's pack, so a
+       Japanese reader's Han keeps Japanese forms under a Chinese UI. */
     if (have_regional) (void) attach_pack(session, paths, regional);
+    if (have_interface) (void) attach_pack(session, paths, interface);
     if (color_emoji)
         (void) attach_pack(session, paths, TILEFINCH_GLYPH_PACK_COLOR_EMOJI);
     if (tilefinch_glyph_provider_pack_count(session->provider) == 0) {
@@ -340,14 +347,16 @@ static void finish_activated_install(
 bool psp_glyph_component_session_reattach(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
-    bool color_emoji, uint16_t script_mask, BrowserEngine *engine)
+    BrowserGlyphLanguage interface_language, bool color_emoji,
+    uint16_t script_mask, BrowserEngine *engine)
 {
     if (session == NULL || !session->reattach_pending) return false;
     session->reattach_pending = false;
     uint16_t before = session->attached_mask;
     if (session->provider == NULL)
         (void) psp_glyph_component_session_attach_selected(
-            session, budget, paths, language, color_emoji);
+            session, budget, paths, language, interface_language,
+            color_emoji);
     /* At most two lazy additions; each call attempts one pack. */
     for (unsigned attempt = 0;
          script_mask != 0
@@ -597,4 +606,12 @@ bool psp_glyph_component_session_remove(
         psp_glyph_component_session_probe(session, paths);
     }
     return removed;
+}
+
+const char *psp_glyph_component_installed_status(TilefinchGlyphPack pack,
+                                                 bool relaid)
+{
+    if (!relaid) return "Installed. Reload the page to redraw it";
+    return pack == TILEFINCH_GLYPH_PACK_COLOR_EMOJI
+        ? "Installed" : "Language pack installed";
 }

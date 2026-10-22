@@ -170,6 +170,21 @@ static bool native_journey(const char *root, const char *archive, const char *ga
     CHECK(strstr(html, "Install homebrew") != NULL); /* Signature, not filename extension. */
     budget_free(browser_engine_budget(engine), html);
     char url[128]; snprintf(url, sizeof(url), "https://tilefinch.local/offline/extract?id=%u", (unsigned)id);
+    /* Supervision follows the store's own route parse: the ZIP previews and
+       the homebrew list run under a cancellable scope, nothing else does. */
+    CHECK(!strcmp(psp_offline_store_route_cancel_status(url), "STOPPING ZIP CHECK...")
+          && !strcmp(psp_offline_store_route_cancel_status(
+                 "https://tilefinch.local/offline/remove-homebrew?name=54657374"),
+                 "STOPPING ZIP CHECK...")
+          && !strcmp(psp_offline_store_route_cancel_status(
+                 "https://tilefinch.local/offline/homebrew"), "STOPPING...")
+          && !psp_offline_store_route_cancel_status("https://tilefinch.local/offline")
+          && !psp_offline_store_route_cancel_status(
+                 "https://tilefinch.local/offline/extract?id=x")
+          && !psp_offline_store_route_cancel_status(
+                 "https://example.com/offline/homebrew-guide")
+          && !psp_offline_store_route_cancel_status(
+                 "https://tilefinch.local/offline/homebrew?page=2"));
     CHECK(psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true) == PSP_OFFLINE_ROUTE_ZIP_PREVIEW);
     CHECK(store.zip_install && !strcmp(zip_install_preview(store.zip_install)->name, "Test"));
     psp_offline_store_discard_zip(&store); CHECK(!store.zip_install);
@@ -182,8 +197,23 @@ static bool native_journey(const char *root, const char *archive, const char *ga
     CHECK(installed && !store.zip_install && !access(path, F_OK));
     CHECK(offline_library_remove(&store.library, id));
     CHECK(access(path, F_OK)); /* Delete ZIP independently of the installation. */
-    char names[4][64]; size_t installed_count = 0;
+    char names[4][ZIP_INSTALL_FOLDER_NAME_LIMIT]; size_t installed_count = 0;
     CHECK(zip_install_list(games, names, 4, &installed_count) && installed_count == 1 && !strcmp(names[0], "Test"));
+    installed_count = 0; /* Count only. */
+    CHECK(zip_install_list(games, NULL, 4, &installed_count) && installed_count == 1);
+    /* The removal route's folder-name spelling round-trips, and only it. */
+    char hex[ZIP_INSTALL_FOLDER_HEX_LIMIT], decoded[ZIP_INSTALL_FOLDER_NAME_LIMIT], longest[64];
+    zip_install_encode_folder_name("Test", hex);
+    CHECK(!strcmp(hex, "54657374") && zip_install_decode_folder_name(hex, decoded) && !strcmp(decoded, "Test"));
+    memset(longest, 0xe9, sizeof(longest) - 1); longest[sizeof(longest) - 1] = 0;
+    zip_install_encode_folder_name(longest, hex);
+    CHECK(strlen(hex) == 126 && zip_install_decode_folder_name(hex, decoded) && !strcmp(decoded, longest));
+    static const char *const refused[] = {"", "5", "54657", "5465737G", "54004", "540074",
+        "54657A74", "0x", "5465 374"};
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++)
+        CHECK(!zip_install_decode_folder_name(refused[i], decoded));
+    char too_long[130]; memset(too_long, '6', 128); too_long[128] = 0;
+    CHECK(!zip_install_decode_folder_name(too_long, decoded));
     CHECK(psp_offline_store_handle_url(&store, engine, NULL,
         "https://tilefinch.local/offline/homebrew", NULL, true) == PSP_OFFLINE_ROUTE_PAGE);
     CHECK(psp_offline_store_handle_url(&store, engine, NULL,

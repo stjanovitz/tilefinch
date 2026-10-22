@@ -1,4 +1,5 @@
 #include "tilefinch/session_persistence.h"
+#include "tilefinch/platform.h"
 
 #include "tilefinch/url.h"
 #include "session_site_storage.h"
@@ -465,27 +466,6 @@ static void build_header(unsigned char header[PERSIST_HEADER_BYTES],
     put_u32(header + 32, (uint32_t) plan->storage_count);
 }
 
-static bool install_temporary(const char *temporary, const char *path,
-                              const char *backup)
-{
-    /*
-     * Rotate the primary through backup before installing the closed temporary
-     * file. POSIX replaces an older backup atomically. FAT may refuse that
-     * replacement, in which case remove only the older backup while the
-     * primary is still intact and retry.
-     */
-    bool had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) return false;
-    }
-    if (rename(temporary, path) == 0) return true;
-    if (had_previous) (void) rename(backup, path);
-    return false;
-}
-
 BrowserSessionPersistenceStatus browser_session_persistence_save(
     const BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
@@ -526,7 +506,7 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
         (void) remove(temporary);
         return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
     }
-    if (!install_temporary(temporary, path, backup)) {
+    if (!tilefinch_platform_replace_file(temporary, path, backup)) {
         (void) remove(temporary);
         return BROWSER_SESSION_PERSISTENCE_IO_ERROR;
     }

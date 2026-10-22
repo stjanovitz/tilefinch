@@ -1359,6 +1359,22 @@ static void navigation_stream_launch_preloads(
         if (preload->complete || preload->launched || preload->url == NULL) {
             continue;
         }
+        if (!preload->script && preload->render_blocking_style) {
+            /* Only stylesheets in flight are staged like this one, as in the
+               authoritative loader; script preloads do not shrink it. */
+            size_t pending = 0;
+            for (size_t j = 0; j < stream->preload_count; j++) {
+                const NavigationPreload *other = &stream->preloads[j];
+                if (other->launched && !other->complete && !other->script)
+                    pending = stylesheets_in_flight_add(
+                        pending, other->maximum_bytes);
+            }
+            size_t total = session->maximum_stylesheet_bytes;
+            size_t used = stream->blocking_stylesheets.bytes;
+            preload->maximum_bytes = stylesheets_response_byte_limit(
+                session->budget, session->maximum_stylesheet_file_bytes,
+                used < total ? total - used : 0, pending);
+        }
         char initiator_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT] = {0};
         if (preload->cors
             && !url_origin(stream->document_url, initiator_origin,
@@ -1505,7 +1521,10 @@ static void navigation_stream_destroy_staging(
     NavigationDocumentStream *stream)
 {
     if (stream == NULL) return;
-    if (stream->runtime != NULL) {
+    /* Commit already detached staging callbacks before transferring the
+       realm. The page may have retired it after a later allocation refusal;
+       the stream's borrowed identity must never be dereferenced again. */
+    if (stream->runtime != NULL && !stream->runtime_transferred) {
         script_runtime_set_synchronous_layout_callback(
             stream->runtime, NULL, NULL);
         script_runtime_set_layout(

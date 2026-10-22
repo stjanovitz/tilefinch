@@ -28,6 +28,49 @@ static bool scan_case(Budget *budget, const char *html, const char *expected)
     return true;
 }
 
+/* The preview-image rule shared by the linked preview, the page preview and
+   media discovery. */
+static bool meta_image_rule_tests(Budget *budget)
+{
+    static const struct { const char *html; const char *content; } cases[] = {
+        {"<meta property=og:image content=a>", "a"},
+        {"<meta property=OG:IMAGE:SECURE_URL content=b>", "b"},
+        {"<meta name=twitter:image content=c>", "c"},
+        {"<meta property='' name=og:image content=d>", "d"},
+        {"<meta property=og:image>", NULL},
+        {"<meta property=og:image:width content=e>", NULL},
+        {"<meta name=og:title content=f>", NULL},
+        {"<link property=og:image content=g>", NULL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        PocDocument document = {0};
+        size_t length = strlen(cases[i].html);
+        CHECK(document_parse(&document, budget, cases[i].html, length, length));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        const char *found = NULL;
+        size_t found_length = 0;
+        bool element = false;
+        for (lxb_dom_node_t *node = root; node != NULL && found == NULL;) {
+            size_t content_length = 99;
+            const char *content = document_meta_image_content(node, &content_length);
+            CHECK(content != NULL || content_length == 0);
+            if (content != NULL) { found = content; found_length = content_length; }
+            if (node->local_name == LXB_TAG_META || node->local_name == LXB_TAG_LINK)
+                element = true;
+            if (node->first_child != NULL) { node = node->first_child; continue; }
+            while (node != root && node->next == NULL) node = node->parent;
+            if (node == root) break;
+            node = node->next;
+        }
+        bool matched = cases[i].content == NULL ? found == NULL
+            : found != NULL && found_length == strlen(cases[i].content)
+              && memcmp(found, cases[i].content, found_length) == 0;
+        document_destroy(&document);
+        CHECK(element && matched);
+    }
+    return true;
+}
+
 static bool scanner_tests(Budget *budget)
 {
     const char *good = "<meta property='og:image' content='https://preview.test/p.gif?a=1&amp;b=2'>";
@@ -341,7 +384,7 @@ int main(void)
     if (!budget_install_lexbor(&budget)) return 1;
     char dir[] = "/tmp/tilefinch-video-preview-XXXXXX";
     if (mkdtemp(dir) == NULL) return 1;
-    bool ok = scanner_tests(&budget) && make_trace(dir)
+    bool ok = meta_image_rule_tests(&budget) && scanner_tests(&budget) && make_trace(dir)
         && replay_ceiling(&budget, dir, true) && replay_ceiling(&budget, dir, false)
         && navigation_case(&budget, dir, "<a href=/article><video src=/clip.mp4></video></a>", true, 1, false)
         && replacement_releases_active_preview(&budget, dir)

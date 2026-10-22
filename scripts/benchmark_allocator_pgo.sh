@@ -19,10 +19,13 @@ profile_dir="${experiment_dir}/profiles"
 profile_data="${experiment_dir}/allocator.profdata"
 mkdir -p "${profile_dir}"
 
+# The allocator bench is built only for the QuickJS-NG engine; the
+# Bellard engine became the default.
 cmake -S "${root_dir}" -B "${training_build}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DPSP_BROWSER_BUILD_TESTS=OFF \
     -DPSP_BROWSER_BUILD_JSC_SPIKE=OFF \
+    -DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF \
     -DPSP_BROWSER_PGO_GENERATE="${profile_dir}/quickjs-%p.profraw" \
     "$@"
 cmake --build "${training_build}" \
@@ -38,6 +41,7 @@ cmake -S "${root_dir}" -B "${optimized_build}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DPSP_BROWSER_BUILD_TESTS=OFF \
     -DPSP_BROWSER_BUILD_JSC_SPIKE=ON \
+    -DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF \
     -DPSP_BROWSER_PGO_GENERATE= \
     -DPSP_BROWSER_PGO_USE="${profile_data}" \
     "$@"

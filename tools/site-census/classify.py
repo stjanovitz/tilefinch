@@ -196,6 +196,13 @@ def classify(script_url, page_url, kind="external"):
     if any(host == h or host.endswith("." + h) for h in BLOCKER_HOSTS):
         return "ads"
     page_host = _host(page_url)
+    if host == "aax-us-east-retail-direct.amazon.com":
+        return "ads"
+    # Dedicated client-event collectors remain telemetry even on first-party
+    # pages. Match host boundaries, not names in a URL query or CDN filename.
+    if host in ("fls-na.amazon.com", "fls-eu.amazon.com", "fls-fe.amazon.com",
+                "unagi.amazon.com"):
+        return "analytics"
     first = is_first_party(host, page_host)
     for category, needles in RULES:
         if category == "framework":

@@ -10,6 +10,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "../src/tilefinch_test_faults.h"
+
 #define CHECK(value) do { \
     if (!(value)) { \
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #value); \
@@ -1294,6 +1296,67 @@ static bool test_simplified_images_respect_visibility_and_size(void)
     return true;
 }
 
+/* The Basic-view image filter cascades each image's ancestors. Images that
+   share ancestors (a listing of cards) must not re-cascade the shared part,
+   and the memo must classify exactly as the full walk does. */
+static bool test_basic_image_filter_reuses_shared_ancestors(void)
+{
+    enum { IMAGES = 120, WRAPPERS = 20 };
+    static char html[64u * 1024u];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>.gone{display:none}.faint{opacity:0}"
+        ".veil{visibility:hidden}.shown{visibility:visible}</style><body>");
+    for (unsigned i = 0; i < WRAPPERS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "<div class=w%u>", i);
+    for (unsigned i = 0; i < IMAGES; i++) {
+        const char *wrapper = i % 4u == 1u ? "gone" : i % 4u == 2u ? "faint"
+            : i % 4u == 3u ? "veil" : "plain";
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<section class=card><div class=%s><p>Card %u has a useful "
+            "caption for this listing.</p><img class=%s src='/i%u.png' "
+            "alt='Image %u'></div></section>", wrapper, i,
+            i % 8u == 3u ? "shown" : "pic", i, i);
+    }
+    for (unsigned i = 0; i < WRAPPERS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used, "</div>");
+    used += (size_t) snprintf(html + used, sizeof(html) - used, "</body>");
+    CHECK(used < sizeof(html) - 1u);
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(&document, &budget, html, used, 4096u)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    tilefinch_test_faults()->reader_image_style_resolutions = 0;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    CHECK(reader_document_prepare_basic_with_stylesheet(
+        &document, &sheet, &analysis));
+    uint64_t elapsed = tilefinch_platform_monotonic_time_us() - started;
+    unsigned long long resolutions =
+        tilefinch_test_faults()->reader_image_style_resolutions;
+    fprintf(stderr, "basic image filter: %u images at depth %u, %llu "
+            "ancestor cascades, prepare %llu us\n", (unsigned) IMAGES,
+            (unsigned) WRAPPERS + 3u, resolutions,
+            (unsigned long long) elapsed);
+    /* Shared wrappers once, then each card's own section, wrapper and img. */
+    CHECK(resolutions <= WRAPPERS + 3u * IMAGES);
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    CHECK(root != NULL);
+    for (unsigned i = 0; i < IMAGES; i++) {
+        char src[32];
+        snprintf(src, sizeof(src), "/i%u.png", i);
+        bool kept = i % 4u == 0u || (i % 4u == 3u && i % 8u == 3u);
+        CHECK(count_attribute_value_within(root, "src", src) == (kept ? 1u : 0u));
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0);
+    return true;
+}
+
 static bool test_reader_heading_sizes_are_bounded(void)
 {
     char css[SITE_ADAPTER_READER_CSS_LIMIT];
@@ -1958,6 +2021,13 @@ static bool test_basic_navigation_and_link_boundaries(void)
         "<header role=banner><a href='/account'>Account</a></header>"
         "<main><header><a href=/brand-one><img src=/brand-one.png></a>"
         "<a href=/brand-two><img src=/brand-two.png></a></header></main>"
+        "<main><header><button>Open menu</button><a href=/home>Home</a>"
+        "<div><a href=/today>Today</a><a href=/hourly>Hourly</a></div>"
+        "</header><article><header><h1>Article title</h1>"
+        "<a href=/author>Author</a><a href=/category>Category</a>"
+        "</header><p>Useful article body.</p></article>"
+        "<header><a href=/byline>Byline</a><a href=/credit>Credit</a></header>"
+        "</main>"
         "<main><p><span>word</span><span>piece</span> "
         "<a href='/four'>Four</a><a href='/five'>Five</a> "
         "<b><a href='/six'>Six</a></b><a href='/seven'>Seven</a></p>"
@@ -1975,8 +2045,8 @@ static bool test_basic_navigation_and_link_boundaries(void)
     lxb_dom_node_t *root = find_direct_reader_root(&document);
     CHECK(root != NULL && analysis.kind == READER_PAGE_BASIC
           && !analysis.bounded_out && !analysis.extraction_truncated
-          && count_named_within(root, "details") == 4u
-          && count_named_within(root, "summary") == 4u
+          && count_named_within(root, "details") == 5u
+          && count_named_within(root, "summary") == 5u
           && !has_attribute(find_named_within(root, "details"), "open")
           && subtree_contains_text(root, "Browse & explore")
           && subtree_text_contains_words(root, "One Two")
@@ -1987,6 +2057,8 @@ static bool test_basic_navigation_and_link_boundaries(void)
           && count_named_within(root, "option") == 1u
           && find_attribute_value_within(root, "href", "/three") != NULL
           && find_attribute_value_within(root, "href", "/account") != NULL
+          && find_attribute_value_within(root, "href", "/hourly") != NULL
+          && find_named_within(root, "h1") != NULL
           && analysis.retained_forms == 1u);
     document_destroy(&document);
     CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
@@ -2695,6 +2767,7 @@ int main(void)
         || !test_auto_article_requires_semantic_root()
         || !test_basic_images_keep_settled_inline_size()
         || !test_simplified_images_respect_visibility_and_size()
+        || !test_basic_image_filter_reuses_shared_ancestors()
         || !test_reader_heading_sizes_are_bounded()
         || !test_hidden_prose_is_manual_only_evidence()
         || !test_reader_references_remain_inline()

@@ -6,6 +6,25 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--parser-timers-only") == 0) {
+        RUN_TEST(test_parser_timers_progress_before_eof);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--initial-fragment-only") == 0) {
+        RUN_TEST(test_parser_scripts_see_requested_fragment);
+        return 0;
+    }
+    RUN_TEST(test_parser_scripts_see_requested_fragment);
+    if (argc == 2 && strcmp(argv[1], "--retired-staging-only") == 0) {
+        RUN_TEST(test_stream_teardown_after_realm_retirement);
+        return 0;
+    }
+    RUN_TEST(test_stream_teardown_after_realm_retirement);
+    if (argc == 2 && strcmp(argv[1], "--resumable-commit-only") == 0) {
+        RUN_TEST(test_authoritative_layout_resumes_across_finalize_ticks);
+        RUN_TEST(test_resumable_layout_cancel_preserves_incumbent);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--paint-damage-only") == 0) {
         RUN_TEST(test_relayout_damage_skips_unchanged_middle);
         RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
@@ -32,6 +51,16 @@ int main(int argc, char **argv)
         puts("legacy charset tests passed");
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--overflow-styles-only") == 0) {
+        RUN_TEST(test_overflow_preserves_admitted_stylesheet);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--deferred-jpeg-only") == 0) {
+        RUN_TEST(test_deferred_jpeg_decode_publishes_on_later_pump);
+    RUN_TEST(test_deferred_jpeg_decode_failure_is_an_error);
+        RUN_TEST(test_deferred_jpeg_decode_failure_is_an_error);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--static-image-layout-only") == 0) {
         RUN_TEST(test_static_images_retry_after_transient_idle_failure);
         RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
@@ -44,6 +73,9 @@ int main(int argc, char **argv)
         RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
         RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
         RUN_TEST(test_svg_local_clips_preserve_artwork);
+        RUN_TEST(test_svg_solid_luminance_mask);
+        RUN_TEST(test_svg_clip_limits_degrade_unclipped);
+        RUN_TEST(test_svg_clip_masks_rebuild_only_on_change);
         RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
         RUN_TEST(test_display_retarget_follows_painted_size);
         RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
@@ -63,7 +95,11 @@ int main(int argc, char **argv)
         RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
         RUN_TEST(test_stylesheet_sources_insert_in_document_order);
         RUN_TEST(test_adopted_sources_insert_between_existing);
+        RUN_TEST(test_full_relayout_reclaims_owner_caches);
         RUN_TEST(test_confined_style_append_keeps_selector_cache);
+        RUN_TEST(test_style_append_past_source_bound_keeps_confinement);
+        RUN_TEST(test_retired_style_source_keeps_adopted_confinement);
+        RUN_TEST(test_required_style_rebuild_outranks_semantic_skip);
         RUN_TEST(test_stylesheet_completion_waits_for_checkpoint);
         RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
         RUN_TEST(test_image_only_changes_rebuild_images_alone);
@@ -72,12 +108,16 @@ int main(int argc, char **argv)
         return 0;
     }
     RUN_TEST(test_pump_and_cancel);
+    RUN_TEST(test_overflow_preserves_admitted_stylesheet);
     RUN_TEST(test_inline_script_configured_source_allowance);
     RUN_TEST(test_parser_refusal_stops_speculative_preview_retries);
     RUN_TEST(test_display_retarget_follows_painted_size);
     RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
     RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
     RUN_TEST(test_svg_local_clips_preserve_artwork);
+    RUN_TEST(test_svg_solid_luminance_mask);
+    RUN_TEST(test_svg_clip_limits_degrade_unclipped);
+    RUN_TEST(test_svg_clip_masks_rebuild_only_on_change);
     RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
     RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
     RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
@@ -115,6 +155,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_parser_script_mutation_rebinds_live_node);
     RUN_TEST(test_failed_external_parser_source_counts_as_work);
     RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline_counted);
+    RUN_TEST(test_parser_timers_progress_before_eof);
     RUN_TEST(test_parser_script_stage_clock);
     RUN_TEST(test_parser_classic_script_import);
     RUN_TEST(test_parser_insertions_reach_mutation_observers);
@@ -159,7 +200,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
     RUN_TEST(test_stylesheet_sources_insert_in_document_order);
     RUN_TEST(test_adopted_sources_insert_between_existing);
+    RUN_TEST(test_full_relayout_reclaims_owner_caches);
     RUN_TEST(test_confined_style_append_keeps_selector_cache);
+    RUN_TEST(test_style_append_past_source_bound_keeps_confinement);
+    RUN_TEST(test_retired_style_source_keeps_adopted_confinement);
+    RUN_TEST(test_required_style_rebuild_outranks_semantic_skip);
     RUN_TEST(test_stylesheet_completion_waits_for_checkpoint);
     RUN_TEST(test_svg_use_swap_refreshes_without_rebuild);
     RUN_TEST(test_image_only_changes_rebuild_images_alone);

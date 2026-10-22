@@ -83,9 +83,10 @@ content, and the bound scales with the memory the page has left:
   showing any view costs whatever its size (restyling the raw page and
   laying out the view before the page's scripts are retired: about 2 MiB on
   Wikipedia, up to 3.3 MiB on the census) plus a margin.
-- The markup bound follows the node bound at 256 bytes per node, between
-  256 KiB and 1 MiB. The markup buffer starts at 64 KiB and grows only as
-  far as the page needs.
+- The markup bound follows the node bound at 256 bytes per node, from
+  256 KiB up to 1 MiB, which it reaches at 4,096 nodes; above that the
+  markup bound, not the node bound, limits the view. The markup buffer
+  starts at 64 KiB and grows only as far as the page needs.
 
 The node ceiling permits long articles when the existing free-memory rule
 admits them; it does not reserve extra memory or increase the markup ceiling.
@@ -127,9 +128,11 @@ original raw page and JavaScript realm untouched. The configured JavaScript
 policy is unchanged for the next navigation.
 
 Preparation itself does not change pixels. Tilefinch offers Basic view only
-after author work has settled, current-page script degradation is proven, and
-the raw result is blank or has no positive-size action target. A useful raw
-page therefore stays visible until the user explicitly switches views.
+after author work has settled and current-page script degradation is proven.
+The raw result must be blank or have no positive-size action target, unless
+memory admission prevented the page's scripts from initializing. In that case,
+surviving header links do not imply the application works. Ordinary widget
+errors on a useful page still leave it alone.
 
 ## Automatic fallback
 
@@ -144,7 +147,8 @@ does by itself when a page qualifies as above:
   item still works, and the separate blank-page Reader fallback is unchanged.
 
 A page qualifies when its scripts failed or were stopped and it is left blank
-or without a usable action. That covers:
+or without a usable action, or when a measured script-memory refusal prevented
+initialization even though navigation links survived. That covers:
 
 - pages whose scripts were stopped by the parser time limit or by repeated
   failures, or whose realm ran out of memory, including the case where an
@@ -154,6 +158,9 @@ or without a usable action. That covers:
 - scripts that fail after the page was shown: a page is examined at commit,
   and once more when a later runtime turn fails or its realm is retired
   after a script failure;
+- script loading refused under memory pressure or a realm stopped at its
+  memory limit. This uses current-page allocator/admission facts, not a site's
+  name or author-thrown error text, and does not carry over to the next page;
 - large pages, which now get a shortened Basic view instead of none.
 
 Live author work is given a bounded settle window first, so a page that

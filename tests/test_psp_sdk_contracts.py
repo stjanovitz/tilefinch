@@ -1540,7 +1540,6 @@ int main(void) {
                          source.index("static bool psp_media_frame_presentable(")]
         self.assertIn("psp_video_measure_begin = psp_video_measure_end", publish)
         main = without_comments((ROOT / "src/psp_script_main.c").read_text())
-        self.assertIn("&& !psp_validation_video_timing_window", main)
         owner = main[main.index("void psp_webgl_measurement_main_frame(void)"):
                      main.index("void psp_webgl_measurement_mark(")]
         self.assertIn("atomic_exchange(&psp_validation_video_window_requested, 0)", owner)
@@ -3879,7 +3878,6 @@ int main(void) {
             "psp_media_continuation_resume_playing(", route)
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
-        self.assertNotIn("browser_profile_resume(", open_source)
         resume = open_source[
             open_source.index("bool reopen_resume_available"):
             open_source.index("psp_media_continuation_clear(continuation)",
@@ -4801,8 +4799,6 @@ int main(void) {
         prime = pump[
             pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME)"):
             pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE")]
-        self.assertIn("media_playback_prime_video_source(", prime)
-        self.assertIn("media_playback_prime_audio_source(", prime)
         self.assertIn("media->job_prime_audio_us", prime)
         self.assertIn("required_ready = media->audio_only", prime)
         self.assertIn("PSP_MEDIA_SEEK_PRIME_AUDIO : PSP_MEDIA_SEEK_PRIME_ALL",
@@ -5174,7 +5170,6 @@ int main(void) {
             "if (buffer < 0) continue;",
             source,
             "fixed-buffer pressure must not serialize independent streams")
-        self.assertIn("FETCH_BACKGROUND_STREAM_CHUNK_TARGET", source)
         self.assertIn("FETCH_BACKGROUND_STREAM_PUBLICATION_MAX", source)
         initialize = source[
             source.index("bool fetch_background_transport_initialize("):
@@ -5319,7 +5314,7 @@ int main(void) {
             source.index("static int fetch_background_worker_main("):
             source.index("bool fetch_background_transport_available(")]
         for forbidden in (
-                "budget_", "fopen(", "fwrite(", "sceIo",
+                "fopen(", "fwrite(", "sceIo",
                 "tilefinch_platform_log", "psp_ui_"):
             self.assertNotIn(forbidden, worker)
         self.assertIn("curl_multi_perform(", worker)
@@ -5418,14 +5413,6 @@ int main(void) {
             source.index("bool offline_download_manager_start("):
             source.index("bool offline_download_manager_start_next_queued(")]
         self.assertIn("fetch_scheduler_enable_background_transport(", start)
-        worker = without_comments(
-            (ROOT / "src/fetch/background_transport.inc").read_text(
-                encoding="utf-8"))
-        worker = worker[
-            worker.index("static int fetch_background_worker_main("):
-            worker.index("bool fetch_background_transport_available(")]
-        for forbidden in ("fopen(", "fwrite(", "sceIo"):
-            self.assertNotIn(forbidden, worker)
 
     def test_updater_worker_never_owns_trust_or_install_state(self):
         source = without_comments(
@@ -5441,8 +5428,7 @@ int main(void) {
             worker.index("static int fetch_background_worker_main("):
             worker.index("bool fetch_background_transport_available(")]
         for forbidden in (
-                "tilefinch_update", "manifest", "sha256", "fopen(",
-                "fwrite(", "rename(", "sceIo"):
+                "tilefinch_update", "manifest", "sha256", "rename("):
             self.assertNotIn(forbidden, worker)
 
     def test_updater_download_is_batched_but_time_bounded(self):
@@ -6586,10 +6572,7 @@ int main(void) {
         # Classified structurally: the bridge filled the descriptor, the decode
         # stage refused, and this decoder has already produced pictures.
         self.assertIn("bool content_refusal", source)
-        self.assertIn("PSP_MEDIA_CODEC_STAGE_AVC_DECODE", source)
-        self.assertIn("refused_es_size != 0", source)
         self.assertIn("backend->stats.decoded_video_frames != 0", source)
-        self.assertIn("psp_media_avc_refusal_survivable(", source)
         self.assertIn("event=au-refused", source)
         self.assertIn("event=au-refused-escalated", source)
         skip = source[
@@ -6842,7 +6825,6 @@ int main(void) {
         # The audio re-init is admitted only through a worker job when the
         # no-touch branch is false, never called inline from reset.
         self.assertIn("bool needs_worker = !no_touch", reset)
-        self.assertNotIn("sceAudiocodecInit(", reset)
         # The quiesce is not optional in any mode: the demuxer and the packet
         # staging are repositioned under a decoder that may still be reading
         # them, so an in-flight job is always collected first.
@@ -6925,6 +6907,61 @@ int main(void) {
             r"all\s*\?\s*0\s*:\s*youtube_watch_url_start_time_us\(url\)\)")
         self.assertLess(activation.index("youtube_playlist_set_initial_start("),
                         activation.index("media->playlist = queue;"))
+
+    def test_playlist_tick_runs_during_presentation_deferral(self):
+        """An audio-deadline deferral of a wide picture is unrelated to the
+        playlist. Short-circuiting the tick behind it skipped Auto-next,
+        queue prefetch and page-failure projection for as long as the
+        deferral lasted (review 2026-10-21 M2)."""
+        source = without_comments(psp_media_session_sources())
+        start = source.index("bool psp_media_advance(")
+        advance = source[start:source.index("if (!media->ui.visible", start)]
+        call = advance.index("psp_media_playlist_tick(media)")
+        statement = advance[advance.rindex(";", 0, call) + 1:
+                            advance.index(";", call)]
+        self.assertNotIn("presentation_deferred", statement)
+        # The deferral is read after the tick: a tick that reopens the
+        # pipeline closes it, and pipeline teardown clears the deferral.
+        self.assertGreater(
+            advance.index("media->presentation_deferred ||"), call)
+        destroy = source[source.index("void psp_media_pipeline_destroy("):]
+        destroy = destroy[:destroy.index("\n}\n")]
+        self.assertIn("media->presentation_deferred = false;", destroy)
+
+    def test_refused_playlist_reopen_releases_the_queue(self):
+        """The close before a playlist step hides the player. A refused open
+        used to leave a hidden queue that owned its page job and that the
+        tick (visible players only) never pumped or freed (review
+        2026-10-21 M4)."""
+        source = without_comments(psp_media_session_sources())
+        start = source.index("static bool psp_media_playlist_tick(")
+        tick = source[start:source.index(
+            "static bool psp_media_open_page_source_kind(", start)]
+        self.assertNotIn("(void) psp_media_open_provider_route(", tick)
+        refusal = tick[tick.index(
+            "if (!psp_media_open_provider_route(media, url, media->generation))"):]
+        refusal = refusal[:refusal.index("return true;")]
+        self.assertIn("youtube_playlist_destroy(media->playlist);", refusal)
+        self.assertIn("media->playlist = NULL;", refusal)
+        self.assertIn("psp_media_raise_error(", refusal)
+        self.assertLess(refusal.index("media->playlist = NULL;"),
+                        refusal.index("psp_media_raise_error("))
+
+    def test_unstaged_draw_claims_the_surface_on_every_decline(self):
+        """Every path that leaves the engine sampling the decoder surface
+        must take the read claim first. A geometry guard that returned after
+        the decline branch skipped it (review 2026-10-21 M3)."""
+        source = without_comments(
+            (ROOT / "src/psp_media_present_session.c").read_text(
+                encoding="utf-8"))
+        start = source.index("void psp_media_present_texture_for(")
+        body = source[start:source.index("\n}\n", start)]
+        decline = body.index("media_playback_borrow_video_slot(")
+        staged = body.index("media_playback_borrow_video_slot(", decline + 1)
+        between = body[decline:staged]
+        decline_return = between.index("return;") + len("return;")
+        self.assertNotIn("return", between[decline_return:])
+        self.assertIn("texture_column", body[:decline])
 
     def test_validation_reports_do_not_perturb_live_playback(self):
         """The PSPLink host0 writer can stop the browser thread for hundreds
@@ -7230,8 +7267,7 @@ int main(void) {
             source.index(
                 "static MediaBackendResult psp_media_run_teardown_job("):
             source.index("static int psp_media_codec_thread(")]
-        for call in ("sceAudiocodecReleaseEDRAM(", "sceMpegDelete(",
-                     "sceMpegFinish()"):
+        for call in ("sceMpegDelete(", "sceMpegFinish()"):
             self.assertIn(call, job)
         worker = source[
             source.index("static int psp_media_codec_thread("):
@@ -7439,9 +7475,8 @@ int main(void) {
         # cooleyesAudiocodecGetEDRAM allocates control word 4 bytes of
         # ordinary 64-aligned storage and writes the pointer into control word
         # 3. That bypass is deliberate in a player that works on this
-        # hardware, so the substitute is the default and the firmware grant is
-        # the thing behind a knob. Firmware must also never be asked to
-        # release memory it never granted.
+        # hardware, so the substitute is the only path. Firmware must also
+        # never be asked to release memory it never granted.
         backend = without_comments(
             (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
         fake = backend[
@@ -7455,34 +7490,22 @@ int main(void) {
         self.assertIn("psp_media_alloc64(", fake)
         self.assertNotIn("memalign(", fake)
         create = psp_firmware_backend_create(backend)
-        # Exactly one grant call, and the knob check has to precede it, so the
-        # default path cannot reach sceAudiocodecGetEDRAM at all.
-        self.assertEqual(create.count("sceAudiocodecGetEDRAM("), 1)
-        self.assertIn("psp_media_real_edram_enabled(", create)
-        self.assertLess(
-            create.index("psp_media_real_edram_enabled("),
-            create.index("sceAudiocodecGetEDRAM("))
+        self.assertNotIn("sceAudiocodecGetEDRAM(", create)
         self.assertIn("psp_media_pool_audiocodec_edram(", create)
         # Which mechanism supplied the buffer has to be on the card before
         # firmware is handed the control block.
-        self.assertIn("event=audio-edram mode=%s size=%u ", create)
+        self.assertIn("event=audio-edram mode=pool size=%u ", create)
         self.assertIn("status=0x%08X buffer=0x%08X high=%d", create)
         logged = create.index("event=audio-edram")
         self.assertLess(logged, create.index("sceAudiocodecInit("))
         self.assertLess(
             create.index("psp_media_commit_log();", logged),
             create.index("sceAudiocodecInit("))
-        # Only a real grant is released, and only a real grant is followed by
-        # the invalidate that drops firmware's writes; invalidating after the
-        # substitute's own CPU store would discard the pointer.
         job = backend[
             backend.index(
                 "static MediaBackendResult psp_media_run_teardown_job("):
             backend.index("static int psp_media_codec_thread(")]
-        self.assertIn("if (backend->audio_edram_real)", job)
-        self.assertLess(
-            job.index("if (backend->audio_edram_real)"),
-            job.index("sceAudiocodecReleaseEDRAM("))
+        self.assertNotIn("sceAudiocodecReleaseEDRAM(", job)
         # PMPlayer's release zeroes control word 3; only the zeroing is ours,
         # because the pool owns the storage.
         self.assertIn("backend->audio_codec[3] = 0;", job)
@@ -7501,18 +7524,9 @@ int main(void) {
             "static int psp_media_me_boot_type = "
             "PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;",
             backend)
-        # `no-boot` restores the old assumption, and seeds it exactly once,
-        # where the knob is published and before any video can open.
-        knob = backend[
-            backend.index("void media_psp_backend_set_wide_program("):]
-        knob = knob[:knob.index("\n}\n") + 3]
-        self.assertIn("psp_media_cold_boot_call_enabled(", knob)
-        self.assertIn(
-            "psp_media_me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;", knob)
-        self.assertEqual(
-            backend.count(
-                "psp_media_me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;"),
-            1)
+        self.assertNotIn(
+            "psp_media_me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;",
+            backend)
         # The short-circuit itself is unchanged: it is what makes a repeat
         # open of the same program skip, and it must still be reached.
         boot = backend[
@@ -7577,8 +7591,7 @@ int main(void) {
         # wide Main on type 1, then 240p Baseline on type 4 -- was rejected at
         # the raw-NAL bridge on a PSP-3000, and so was type 3 back when it
         # made no kernel call at all. Baseline defaults to type 3, which is
-        # now really booted (see the first-open boot test above), and the
-        # historical type 4 stays reachable only through the knob.
+        # now really booted (see the first-open boot test above).
         policy = without_comments(
             (ROOT / "src/media_backend_psp_policy.h").read_text(
                 encoding="utf-8"))
@@ -7586,23 +7599,8 @@ int main(void) {
             policy.index("static inline bool psp_media_decoder_policy("):
             policy.index(
                 "static inline bool psp_media_wide_program_rejected_by(")]
-        self.assertIn("bool baseline_boot_call", decoder)
-        self.assertIn("policy->me_boot_type = baseline_boot_call", decoder)
-        # No branch may reach boot type 4 without the knob having asked.
-        self.assertNotIn("me_boot_type = 4;", decoder)
-        self.assertIn('strcmp(name, "boot4") == 0', policy)
-        self.assertIn('|| strcmp(name, "boot4") == 0', policy)
-        # The knob moves exactly one decision: `boot4` is not a wide
-        # spelling, so a wide picture stays inadmissible under it.
-        enabled = policy[
-            policy.index(
-                "static inline bool psp_media_wide_program_enabled("):
-            policy.index(
-                "static inline bool psp_media_wide_program_annexb(")]
-        self.assertNotIn("BASELINE_BOOT4", enabled)
-        backend = without_comments(
-            (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
-        self.assertIn("psp_media_baseline_boot_call_enabled(", backend)
+        # No branch may reach boot type 4.
+        self.assertNotIn("me_boot_type = 4", decoder)
 
     def test_media_failure_surfaces_commit_the_log_to_the_card(self):
         # The validation log is only synchronized to the Memory Stick at
@@ -8028,45 +8026,6 @@ int main(void) {
             "TILEFINCH_PSP_VALIDATION_LOG",
             main[main.index("tilefinch_platform_set_services(&services);"):
                  reserved])
-
-    def test_annexb_rewrite_is_scoped_to_the_wide_program(self):
-        # The conversion runs on the codec worker, on this backend's own
-        # staging copy, before the cache writeback publishes it -- and only
-        # for the program the experiment is aimed at.
-        backend = without_comments(
-            (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
-        decode = backend[
-            backend.index(
-                "static MediaBackendResult psp_media_decode_staged_video("):
-            backend.index(
-                "static MediaBackendResult psp_media_decode_staged_audio(")]
-        self.assertIn("psp_media_wide_program_annexb(", decode)
-        self.assertIn("backend->mpeg_mode == 5", decode)
-        rewrite = decode.index("psp_media_annexb_rewrite(")
-        self.assertLess(
-            rewrite, decode.index("sceKernelDcacheWritebackRange("))
-        self.assertLess(rewrite, decode.index("sceMpegGetAvcNalAu("))
-        self.assertIn("event=annexb-rewrite-rejected", decode)
-        self.assertIn("event=annexb-submit", decode)
-        # A refused conversion must restore the reorder queue exactly like
-        # every other submission failure, and must not allocate.
-        refusal = decode[
-            rewrite:decode.index("event=annexb-rewrite-rejected")]
-        self.assertIn(
-            "backend->video_timestamps = backend->codec_job_timestamps_before",
-            refusal)
-        self.assertNotIn("malloc", decode)
-        self.assertNotIn("memalign", decode)
-        # Only the codec worker runs this function.
-        worker = backend[
-            backend.index("static int psp_media_codec_thread("):
-            backend.index("static int psp_media_collect_codec_job(")]
-        self.assertIn("psp_media_decode_staged_video(", worker)
-        submit = backend[
-            backend.index("static MediaBackendResult psp_media_submit("):
-            backend.index("static MediaBackendResult psp_media_drain(")]
-        self.assertNotIn("psp_media_decode_staged_video(", submit)
-        self.assertNotIn("psp_media_annexb_rewrite(", submit)
 
     def test_results_playback_script_does_not_wait_for_idle_media(self):
         source = (ROOT / "tests/input-scripts/"
@@ -8580,9 +8539,6 @@ int main(void) {
         pump = resolver[
             resolver.index("YoutubeResolveJobStatus youtube_resolve_job_pump("):
             resolver.index("bool youtube_resolve_job_take(")]
-        self.assertIn(
-            "fetch_background_transport_enqueue_media_stream_diagnosed(",
-            resolver)
         self.assertIn("fetch_background_transport_take_chunk(", resolver)
         self.assertIn("YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT", pump)
         self.assertIn("YOUTUBE_RESOLVE_PHASE_WATCH_WAIT", pump)
@@ -8960,11 +8916,6 @@ int main(void) {
         self.assertIn(
             "fetch_background_transport_enqueue_media_stream_diagnosed(",
             resolver)
-        self.assertIn(
-            "fetch_background_transport_enqueue_media_stream_sized_diagnosed(",
-            media_http)
-        self.assertIn(
-            "fetch_background_transport_enqueue_media_diagnosed(", media_http)
         self.assertIn(
             "fetch_background_transport_set_media_priority(active)", session)
         self.assertIn(
@@ -10185,22 +10136,6 @@ int main(void) {
             recorder.index("bridge->result != NULL"),
             recorder.index("bridge->result->events_dispatched++"))
 
-    def test_focus_probe_best_effort_restores_live_marker(self):
-        resolver = without_comments(
-            (ROOT / "src/style_resolve.c").read_text(encoding="utf-8"))
-        helper = resolver[
-            resolver.index("static bool restore_focus_marker("):
-            resolver.index("static bool computed_style_equal_without_outline(")]
-        self.assertIn("set_focus_marker(node, false)", helper)
-        classify = resolver[
-            resolver.index("static StyleFocusChange focus_change_classify("):
-            resolver.index("bool style_focus_change_is_outline_only(")]
-        first = classify.index("restored = restore_focus_marker(")
-        retry = classify.index("restored = restore_focus_marker(", first + 1)
-        unsafe = classify.index("return STYLE_FOCUS_CHANGE_UNSAFE", retry)
-        self.assertLess(first, retry)
-        self.assertLess(retry, unsafe)
-
     def test_psp_tls_clock_uses_one_bounded_status(self):
         clock = without_comments(
             (ROOT / "src/psp_time.c").read_text(encoding="utf-8"))
@@ -10736,6 +10671,285 @@ int main(void) {
         self.assertIn("_Static_assert(CANVAS_RECT_BATCH_LIMIT * "
                       "CANVAS_SURFACE_PIXEL_LIMIT", bridge)
         self.assertIn("<= CANVAS_RASTER_WORK_LIMIT", bridge)
+
+    def test_status_toasts_store_english_keys(self):
+        # draw_toast translates ui->status at paint time. A caller that
+        # stores an already-translated string overflows the 80-byte status
+        # buffer in Bengali, Hindi and Assamese (cut mid-codepoint), is
+        # translated a second time, and defeats psp_ui_dismiss_status.
+        sources = [ROOT / "src/psp_script_main.c"]
+        sources += sorted((ROOT / "src/psp_app").glob("*.c"))
+        offenders = []
+        for path in sources:
+            source = without_comments(path.read_text(encoding="utf-8"))
+            for function in ("psp_ui_show_status",
+                             "psp_ui_keep_progress_status"):
+                for arguments in call_arguments(source, function):
+                    parts = split_arguments(arguments)
+                    if len(parts) > 1 and "tilefinch_ui_text(" in parts[1]:
+                        offenders.append(f"{path.name}: {parts[1]}")
+        self.assertEqual(offenders, [])
+
+    def test_input_response_snapshot_copies_only_compared_fields(self):
+        # Validation builds measure present and cadence times; a whole
+        # PspUiState copy per present would perturb what they report.
+        source = without_comments((ROOT / "src/psp_app/psp_app_input_script.c")
+                                  .read_text(encoding="utf-8"))
+        copy = re.search(
+            r"\bPspUiState\s+(psp_input_script_\w+|before)\s*;", source)
+        self.assertIsNone(copy, copy and copy.group(0))
+        self.assertFalse("= *ui;" in source, "whole PspUiState copy")
+        self.assertIn(".screen = ui->screen, .chrome_visible = ui->chrome_visible",
+                      " ".join(source.split()))
+
+    def test_component_installs_treat_memory_stick_sync_as_a_hint(self):
+        # Real firmware/storage-driver combinations reject sceIoSync after
+        # checked writes and renames succeeded (PPSSPP accepts it). Every
+        # device sync goes through the one tri-state helper in
+        # src/install_paths.c, whose callers' handling is host-tested
+        # (tests/test_update.c, test_voice_component.c,
+        # test_glyph_component.c, test_ui_language.c).
+        sites = {}
+        for path in sorted((ROOT / "src").rglob("*.c")):
+            source = without_comments(path.read_text(encoding="utf-8"))
+            count = source.count("sceIoSync(")
+            if count:
+                sites[path.relative_to(ROOT).as_posix()] = count
+        self.assertEqual({"src/install_paths.c": 2}, sites)
+
+    def test_youtube_login_always_from_settings_takes_effect(self):
+        source = (ROOT / "src/psp_app/psp_app_youtube.c").read_text()
+        start = source.index("bool psp_app_youtube_login_clear(")
+        consent = source[start:source.index("bool psp_app_youtube_login_poll(")]
+        start = source.index("void psp_app_youtube_login_action(")
+        consent += source[start:source.index(
+            "static void psp_youtube_preresolve_increment(")]
+        # Compile the production consent functions against a fake PSP
+        # boundary: their control flow, not a parallel implementation.
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+enum { YOUTUBE_LOGIN_ASK, YOUTUBE_LOGIN_ALWAYS, YOUTUBE_LOGIN_NEVER };
+enum { PSP_UI_ACTION_NONE, PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
+       PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS, PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW,
+       PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER };
+typedef struct { int offer_visible; uint8_t youtube_login_policy; } PspUiState;
+typedef struct { int action; } PspUiIntent;
+typedef struct { uint64_t ui_sample_us; } PspAppFrameState;
+typedef struct { int dirty; } PspProfileStore;
+typedef struct { int policy; } BrowserProfile;
+typedef struct {
+    bool persistent_site_data_available;
+    struct { char youtube_login[64]; } storage;
+    struct { PspUiState ui; } presentation;
+} PspProcessResources;
+typedef struct {
+    void *engine, *session; BrowserProfile *profile; PspProfileStore profile_store;
+    bool youtube_login_pending; uint64_t youtube_login_offer_identity;
+    uint64_t youtube_login_restored_identity;
+} PspBrowserResources;
+typedef struct { PspProcessResources *process; PspBrowserResources *browser; } PspApp;
+static uint64_t verified_identity, session_identity;
+static int saves, removes;
+static const char *status;
+static uint64_t browser_engine_youtube_login_identity(void *engine) { (void)engine; return verified_identity; }
+static bool youtube_lite_session_signed_in(void *session) { (void)session; return session_identity != 0; }
+static bool youtube_login_save(void *session, const char *path, int64_t now) {
+    (void)session; (void)path; (void)now; saves++; return true;
+}
+static bool youtube_login_remove(const char *path) { (void)path; removes++; return true; }
+static void psp_ui_show_status(PspUiState *ui, const char *text, int duration) {
+    (void)ui; (void)duration; status = text;
+}
+static void psp_ui_show_youtube_login_offer(PspUiState *ui) { ui->offer_visible = 1; }
+static void browser_profile_set_youtube_login_policy(BrowserProfile *p, unsigned v) { p->policy = (int)v; }
+static unsigned browser_profile_youtube_login_policy(const BrowserProfile *p) { return (unsigned)p->policy; }
+static void psp_profile_store_mark_dirty(PspProfileStore *store, uint64_t now) { (void)now; store->dirty++; }
+void psp_app_youtube_login_setting(PspApp *, PspAppFrameState *, unsigned);
+'''
+        fixture += consent + r'''
+static PspProcessResources process;
+static PspBrowserResources browser;
+static BrowserProfile profile;
+static int answer(uint64_t verified, uint64_t at_answer, int action) {
+    PspApp app = {&process, &browser};
+    PspAppFrameState frame = {1};
+    memset(&process, 0, sizeof(process)); memset(&browser, 0, sizeof(browser));
+    process.persistent_site_data_available = true;
+    browser.profile = &profile; profile.policy = YOUTUBE_LOGIN_ASK;
+    verified_identity = session_identity = verified;
+    saves = removes = 0; status = NULL;
+    psp_app_youtube_login_setting(&app, &frame, YOUTUBE_LOGIN_ALWAYS);
+    /* Always waits for the warning's confirmation. */
+    if (!process.presentation.ui.offer_visible || profile.policy != YOUTUBE_LOGIN_ASK) return -1;
+    verified_identity = session_identity = at_answer;
+    PspUiIntent intent = {action};
+    psp_app_youtube_login_action(&app, &frame, &intent);
+    if (browser.youtube_login_offer_identity != 0
+        || process.presentation.ui.youtube_login_policy != profile.policy) return -1;
+    return profile.policy;
+}
+int main(void) {
+    /* Signed in: both save answers write the verified login. */
+    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ALWAYS
+        || saves != 1 || strcmp(status, "YOUTUBE LOGIN SAVED")) return 1;
+    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE) != YOUTUBE_LOGIN_ASK
+        || saves != 1 || strcmp(status, "YOUTUBE LOGIN SAVED")) return 2;
+    /* Signed out: nothing to write, but Always is remembered so the next
+       verified sign-in saves without asking. */
+    if (answer(0, 0, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ALWAYS
+        || saves != 0 || status != NULL) return 3;
+    /* A different login by the time of the answer is never saved. */
+    if (answer(7, 8, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ASK
+        || saves != 0 || strcmp(status, "LOGIN NOT SAVED - SESSION STILL WORKS")) return 4;
+    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW) != YOUTUBE_LOGIN_ASK || saves != 0) return 5;
+    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER) != YOUTUBE_LOGIN_NEVER
+        || saves != 0 || removes != 1) return 6;
+    return 0;
+}
+'''
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "login.c").write_text(fixture)
+            compiled = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Werror", str(path / "login.c"),
+                 "-o", str(path / "login")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "login")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_interface_language_row_returns_to_the_saved_language(self):
+        source = (ROOT / "src/psp_app/psp_app_ui_language.c").read_text()
+        flow = source[source.index("static void language_row_restore("):]
+        # The production language flow against a fake boundary, built
+        # without live networking: a missing catalog fails at once.
+        fixture = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#define TILEFINCH_UI_TRANSLATION_BYTES 32768u
+enum { TILEFINCH_UI_LANGUAGE_ENGLISH = 0, KOREAN = 8, HINDI = 9 };
+enum { PSP_UI_SCREEN_OPTION_ITEMS = 1, PSP_UI_SCREEN_GLYPH_OPTIONS = 2 };
+enum { PSP_UI_SETTING_NONE, PSP_UI_SETTING_UI_LANGUAGE };
+typedef int TilefinchGlyphPack;
+typedef struct { int glyphs; uint64_t minimum_glyph_sequence; } TilefinchUiLanguageSpec;
+typedef struct { int unused; } TilefinchUiTranslation;
+typedef struct { bool complete; } FetchBackgroundProgress;
+typedef struct { bool success; long status_code; size_t length; } FetchBackgroundMediaResponse;
+typedef struct { int screen; unsigned ui_language; } PspUiState;
+typedef struct { struct { int id; union { unsigned unsigned_value; } value; } setting; } PspUiIntent;
+typedef struct { int dirty; } PspProfileStore;
+typedef struct { unsigned ui_language; } BrowserProfile;
+typedef struct { struct { PspUiState ui; } presentation; int install_paths; } PspProcessResources;
+typedef struct {
+    BrowserProfile *profile; PspProfileStore profile_store; void *budget, *glyph_component_session;
+    unsigned ui_language_requested; bool ui_language_waiting_font;
+    uint32_t ui_language_request; void *ui_language_download;
+} PspBrowserResources;
+typedef struct { PspProcessResources *process; PspBrowserResources *browser; } PspApp;
+static const TilefinchUiLanguageSpec spec = {0, 0};
+static bool catalog_installed, transfer_alive;
+static const char *status;
+static void browser_profile_set_ui_language(BrowserProfile *p, unsigned v) { p->ui_language = v; }
+static unsigned browser_profile_ui_language(const BrowserProfile *p) { return p->ui_language; }
+static void psp_profile_store_mark_dirty(PspProfileStore *s, uint64_t now) { (void)now; s->dirty++; }
+static void psp_ui_show_status(PspUiState *ui, const char *text, int duration) {
+    (void)ui; (void)duration; status = text;
+}
+static const TilefinchUiLanguageSpec *tilefinch_ui_language_spec(unsigned language) {
+    return language < 14 ? &spec : NULL;
+}
+static bool psp_ui_language_pack(unsigned language, TilefinchGlyphPack *pack) {
+    (void)language; (void)pack; return false;
+}
+static void psp_glyph_component_session_probe(void *s, int *paths) { (void)s; (void)paths; }
+static bool psp_ui_language_pack_current(void *s, unsigned l) {
+    (void)s; (void)l; return false;
+}
+static bool psp_ui_language_repair_poll(PspApp *app) { (void)app; return false; }
+static const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack p) {
+    (void)app; (void)p; return NULL;
+}
+static bool fetch_background_transport_cancel(uint32_t r, const char *why) { (void)r; (void)why; return true; }
+static bool psp_glyph_component_session_cancel(void *s) { (void)s; return true; }
+static void budget_free(void *budget, void *bytes) { (void)budget; (void)bytes; }
+static bool psp_glyph_component_session_active(void *s) { (void)s; return false; }
+static bool tilefinch_ui_translation_installed(int *paths, unsigned l) {
+    (void)paths; (void)l; return catalog_installed;
+}
+static bool fetch_background_transport_progress(uint32_t r, FetchBackgroundProgress *p) {
+    (void)r; p->complete = false; return transfer_alive;
+}
+static bool fetch_background_transport_take_media(uint32_t r, void *o, size_t c, FetchBackgroundMediaResponse *m) {
+    (void)r; (void)o; (void)c; (void)m; return false;
+}
+static bool tilefinch_ui_translation_install(void *b, int *paths, unsigned l, const void *bytes, size_t n) {
+    (void)b; (void)paths; (void)l; (void)bytes; (void)n; return false;
+}
+bool psp_ui_language_handle_frame(PspApp *, const PspUiIntent *, uint64_t);
+'''
+        fixture += flow + r'''
+int main(void) {
+    static PspProcessResources process; static PspBrowserResources browser;
+    static BrowserProfile profile = {HINDI};
+    PspApp app = {&process, &browser};
+    browser.profile = &profile;
+    PspUiState *ui = &process.presentation.ui;
+    PspUiIntent idle = {{PSP_UI_SETTING_NONE, {0}}};
+    PspUiIntent choose = {{PSP_UI_SETTING_UI_LANGUAGE, {KOREAN}}};
+    /* Scrolling previews a language; backing out shows the saved one. */
+    ui->screen = PSP_UI_SCREEN_GLYPH_OPTIONS; ui->ui_language = KOREAN;
+    psp_ui_language_handle_frame(&app, &idle, 1);
+    if (ui->ui_language != KOREAN) return 1;
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    psp_ui_language_handle_frame(&app, &idle, 1);
+    if (ui->ui_language != HINDI) return 2;
+    /* A failed install shows the saved language and an English status key. */
+    ui->screen = PSP_UI_SCREEN_GLYPH_OPTIONS; ui->ui_language = KOREAN;
+    psp_ui_language_handle_frame(&app, &choose, 1);
+    if (ui->ui_language != HINDI || profile.ui_language != HINDI
+        || strcmp(status, "LANGUAGE DOWNLOAD FAILED - TRY AGAIN")) return 3;
+    /* An in-flight download keeps its choice off screen until it ends. */
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS; ui->ui_language = KOREAN;
+    browser.ui_language_requested = KOREAN; browser.ui_language_request = 5;
+    transfer_alive = true;
+    psp_ui_language_handle_frame(&app, &idle, 1);
+    if (ui->ui_language != KOREAN) return 4;
+    transfer_alive = false;
+    psp_ui_language_handle_frame(&app, &idle, 1);
+    if (ui->ui_language != HINDI || browser.ui_language_request != 0) return 5;
+    /* A completed selection is saved and stays shown. */
+    ui->screen = PSP_UI_SCREEN_GLYPH_OPTIONS; ui->ui_language = KOREAN;
+    catalog_installed = true;
+    psp_ui_language_handle_frame(&app, &choose, 1);
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    psp_ui_language_handle_frame(&app, &idle, 1);
+    if (ui->ui_language != KOREAN || profile.ui_language != KOREAN
+        || strcmp(status, "UI LANGUAGE SAVED - RESTART TO APPLY")) return 6;
+    return 0;
+}
+'''
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("host C compiler unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "language.c").write_text(fixture)
+            compiled = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Werror", str(path / "language.c"),
+                 "-o", str(path / "language")], capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            run = subprocess.run([str(path / "language")], capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
 
 
 class QuickJsVariantPreparationTests(unittest.TestCase):

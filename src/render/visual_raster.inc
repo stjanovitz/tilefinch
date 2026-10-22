@@ -238,8 +238,9 @@ static void image_linear_pixel(const unsigned char *pixels, int width,
 static const unsigned char *image_pixels_for_command(
     TileCache *cache, const ImageResource *image, const DrawCommand *command,
     int *pixel_width, int *pixel_height,
-    unsigned char **temporary_decoded)
+    unsigned char **temporary_decoded, bool *grayscale)
 {
+    *grayscale = false;
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
     /* Masks/sprites keep their original sampling semantics and cannot borrow
@@ -268,6 +269,10 @@ static const unsigned char *image_pixels_for_command(
     bool direct_scaled = encoded_raster && wants_scaled
         && scaled_width > 0 && scaled_height > 0
         && scaled_width <= image->width && scaled_height <= image->height;
+    bool compact_command = !image->is_mask && !image->is_background
+        && command->image_fit == LAYOUT_IMAGE_FIT_STRETCH
+        && draw_command_rotation_quadrants(command) == 0
+        && draw_command_image_clip_radius(command) == 0;
     if (command->image_fit == LAYOUT_IMAGE_FIT_COVER && encoded_raster
         && command->width > 0 && command->height > 0
         && (size_t) command->width
@@ -302,7 +307,8 @@ static const unsigned char *image_pixels_for_command(
     if (wants_scaled) {
         for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
             ScaledImageCacheEntry *entry = &cache->scaled_images[i];
-            if (!entry->valid || entry->identity != identity
+            if (!entry->valid || (entry->grayscale && !compact_command)
+                || entry->identity != identity
                 || entry->serial != serial
                 || entry->source_width != image->width
                 || entry->source_height != image->height
@@ -316,6 +322,7 @@ static const unsigned char *image_pixels_for_command(
             cache->scaled_image_hits++;
             *pixel_width = entry->width;
             *pixel_height = entry->height;
+            *grayscale = entry->grayscale;
             return entry->pixels;
         }
     }
@@ -325,6 +332,8 @@ static const unsigned char *image_pixels_for_command(
         decode_target.width = scaled_width;
         decode_target.height = scaled_height;
         unsigned char *pixels = NULL;
+        size_t injected_before = cache->budget->injected_failure_count;
+        size_t failures_before = cache->budget->failure_count;
         uint64_t decode_started = render_now_us();
         ImageDecodeStatus decode_status = image_resource_decode_checked(
             &decode_target, cache->budget, &pixels);
@@ -349,6 +358,37 @@ static const unsigned char *image_pixels_for_command(
             return pixels;
         }
         cache->decoded_image_failures++;
+        /* A grayscale photograph has three identical color channels. Under
+           pressure retain those samples once, not a lower-quality image.
+           Restrict this fallback to the exact-size, unrotated stretch path. */
+        bool compact_allowed = decode_status == IMAGE_DECODE_TRANSIENT_FAILURE
+            && compact_command
+            && cache->budget->failure_count != failures_before
+            && cache->budget->injected_failure_count == injected_before;
+        uint64_t compact_started = compact_allowed ? render_now_us() : 0;
+        ImageDecodeStatus compact_status = compact_allowed
+            ? image_resource_decode_gray_checked(&decode_target, cache->budget,
+                                                 &pixels)
+            : IMAGE_DECODE_DETERMINISTIC_FAILURE;
+        if (compact_started != 0) {
+            uint64_t elapsed = render_now_us() - compact_started;
+            cache->decoded_image_us += elapsed;
+            if (elapsed > cache->max_decoded_image_us)
+                cache->max_decoded_image_us = elapsed;
+        }
+        if (compact_status == IMAGE_DECODE_SUCCEEDED) {
+            ScaledImageCacheEntry *entry = scaled_image_insert(cache, identity,
+                serial,image->width,image->height,scaled_width,scaled_height,
+                pixels,false);
+            if (entry != NULL) entry->grayscale = true;
+            else *temporary_decoded = pixels;
+            *pixel_width = scaled_width;
+            *pixel_height = scaled_height;
+            *grayscale = true;
+            cache->decoded_image_builds++;
+            if (entry != NULL) cache->scaled_image_builds++;
+            return pixels;
+        }
         if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
             (void) scaled_image_insert(
                 cache, identity, serial, image->width, image->height,
@@ -519,10 +559,36 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
     }
     int pixel_width = 0, pixel_height = 0;
     unsigned char *temporary_decoded = NULL;
+    bool grayscale = false;
     const unsigned char *pixels = image_pixels_for_command(
         cache, image, command, &pixel_width, &pixel_height,
-        &temporary_decoded);
+        &temporary_decoded, &grayscale);
     if (pixels == NULL) {
+        image_resource_free_decoded(cache->budget, temporary_decoded);
+        return;
+    }
+    if (grayscale) {
+        /* The compact decoder only publishes exact command-sized, opaque
+           grayscale samples. Ancestor clipping, filters and blend modes
+           still pass through the ordinary target/span and blend helpers. */
+        int x0, y0, x1, y1;
+        raster_command_bounds(target, command, &x0, &y0, &x1, &y1);
+        unsigned alpha = 255u * command->opacity_scale / 256u;
+        for (int y = y0; y < y1; y++) {
+            int left = 0, end = 0;
+            size_t index = 0;
+            bool rounded = false;
+            if (!raster_target_span(target, y, x0, x1, &left, &end, &index,
+                                    &rounded))
+                continue;
+            const unsigned char *row = pixels
+                + (size_t) (y - command->y) * pixel_width;
+            for (int x = left; x < end; x++, index++) {
+                uint32_t value = row[x - command->x];
+                blend_at_index(target, index, value * UINT32_C(0x010101),
+                               alpha);
+            }
+        }
         image_resource_free_decoded(cache->budget, temporary_decoded);
         return;
     }
@@ -538,17 +604,9 @@ static void rasterize_image_pixels(TileCache *cache, RasterTarget *target,
     unsigned rotation = draw_command_rotation_quadrants(command);
     if (rotation != 0 && command->image_fit == LAYOUT_IMAGE_FIT_STRETCH) {
         /* Rotated stretch is the one image span this function clamps for
-           itself; the branch below it, and every clamp in
-           rasterize_command(), take the far edge in int64_t for the reason
-           spelled out there.  Narrowing is safe on the same grounds: the
-           cast is reached only where the sum is already inside the target,
-           and rasterize_command() has run intersects() before calling. */
-        int x0 = command->x > target->left ? command->x : target->left;
-        int y0 = command->y > target->top ? command->y : target->top;
-        int64_t right = (int64_t) command->x + command->width;
-        int64_t bottom = (int64_t) command->y + command->height;
-        int x1 = right < target->right ? (int) right : target->right;
-        int y1 = bottom < target->bottom ? (int) bottom : target->bottom;
+           itself; rasterize_command() has run intersects() before calling. */
+        int x0, y0, x1, y1;
+        raster_command_bounds(target, command, &x0, &y0, &x1, &y1);
         int source_box_width = (rotation & 1u) != 0
             ? command->height : command->width;
         int source_box_height = (rotation & 1u) != 0
@@ -1511,7 +1569,8 @@ static void rasterize_shadow(RasterTarget *target, const DrawCommand *command,
        columns where cx <= T one of cy alone. So the core is a constant,
        the left and right edges repeat one row of coverage, the top and
        bottom edges one value per row, and only the corners need the
-       distance per pixel. Each pixel gets the same blend as before. */
+       distance per pixel. Each pixel gets the same blend a per-pixel
+       distance evaluation would give it. */
     bool core = blur > 0;
 #ifndef __PSP__
     core = core && !tilefinch_test_faults()->shadow_reference_raster;
@@ -2027,21 +2086,23 @@ static void rasterize_sheared_fill(RasterTarget *target,
     bool rotated = command->type == DRAW_ROTATED_FILL;
     if (alpha == 0 || (!rotated && (command->font_size <= 0
         || command->text_length > INT_MAX))) return;
-    int left = command->x > target->left ? command->x : target->left;
-    int top = command->y > target->top ? command->y : target->top;
-    int64_t far_x = (int64_t) command->x + command->width;
-    int64_t far_y = (int64_t) command->y + command->height;
-    int right = far_x < target->right ? (int) far_x : target->right;
-    int bottom = far_y < target->bottom ? (int) far_y : target->bottom;
+    int left, top, right, bottom;
+    raster_command_bounds(target, command, &left, &top, &right, &bottom);
     unsigned rotation = draw_command_rotation_quadrants(command);
     int64_t local_width = (int64_t) ((rotation & 1u)
         ? command->height : command->width) * 1024;
     int64_t local_height = rotated
-        ? local_width : (int64_t) command->font_size * 1024;
-    if (rotated) local_height = (int64_t) ((rotation & 1u)
-        ? command->width : command->height) * 1024;
-    int cosine = (int16_t) ((uint32_t) command->font_size & 65535u);
-    int sine = (int16_t) ((uint32_t) command->font_size >> 16);
+        ? (int64_t) ((rotation & 1u) ? command->width : command->height) * 1024
+        : (int64_t) command->font_size * 1024;
+    int cosine = draw_command_rotated_cosine(command);
+    int sine = draw_command_rotated_sine(command);
+    /* The rotated test is u = trunc(pu / 16384) in [0, U * 1024), likewise
+       v. Compare the products directly: trunc(p / 16384) >= 0 exactly when
+       p > -16384, and for a positive bound it stays below U * 1024 exactly
+       when p < U * 16777216. No 64-bit division per sample on the PSP. */
+    int64_t u_limit = (int64_t) draw_command_rotated_width(command) * 16777216;
+    int64_t v_limit = (int64_t) draw_command_rotated_height(command) * 16777216;
+    if (rotated && (u_limit == 0 || v_limit == 0)) return;
     for (int y = top; y < bottom; y++) {
         for (int x = left; x < right; x++) {
             unsigned covered = 0;
@@ -2059,15 +2120,16 @@ static void rasterize_sheared_fill(RasterTarget *target,
                 if (rotated) {
                     int64_t rx = lx - command->radius;
                     int64_t ry = ly - command->scale;
-                    int64_t u = (rx * cosine + ry * sine) / 16384;
-                    int64_t v = (-rx * sine + ry * cosine) / 16384;
-                    if (u >= 0 && v >= 0
-                        && u < (int64_t) (command->text_length & 65535u) * 1024
-                        && v < (int64_t) (command->text_length >> 16) * 1024)
+                    int64_t u = rx * cosine + ry * sine;
+                    int64_t v = -rx * sine + ry * cosine;
+                    if (u > -16384 && v > -16384
+                        && u < u_limit && v < v_limit)
                         covered++;
                 } else {
-                    int64_t edge = command->radius
-                        + (int64_t) command->scale * ly / 1024;
+                    /* Truncating division by 1024, as a shift. */
+                    int64_t sheared = (int64_t) command->scale * ly;
+                    int64_t edge = command->radius + (sheared >= 0
+                        ? sheared >> 10 : -((-sheared) >> 10));
                     if (ly >= 0 && ly < local_height && lx >= edge
                         && lx < edge + (int64_t) command->text_length * 1024)
                         covered++;
@@ -2101,12 +2163,8 @@ static void rasterize_border_triangle(RasterTarget *target,
     int bx = command->image_fit < 2 ? w * 4 : 0;
     int by = command->image_fit == 0 || command->image_fit == 3 ? 0 : h * 4;
     int cx = (int) command->text_length * 4, cy = command->font_size * 4;
-    int x0 = command->x > target->left ? command->x : target->left;
-    int y0 = command->y > target->top ? command->y : target->top;
-    int64_t far_x = (int64_t) command->x + command->width;
-    int64_t far_y = (int64_t) command->y + command->height;
-    int x1 = far_x < target->right ? (int) far_x : target->right;
-    int y1 = far_y < target->bottom ? (int) far_y : target->bottom;
+    int x0, y0, x1, y1;
+    raster_command_bounds(target, command, &x0, &y0, &x1, &y1);
     for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
         unsigned coverage = 0;
         for (unsigned sample = 0; sample < 4; sample++) {
@@ -2168,10 +2226,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
     /*
      * One span clamp for every box-shaped command: the shadow, fill,
      * gradient and stroke arms below all reduce the command box to the tile
-     * with these same four values. command->x and command->width are
-     * retained-layout coordinates with no bound of their own, so their far
-     * edge is widened before comparison and narrowed only after it is known
-     * to sit inside the int-bounded target.
+     * with these same four values (raster_command_bounds).
      *
      * Keep the work behind the type gate. Images and glyphs clamp spans they
      * derive themselves, and text commands dominate article pages; charging
@@ -2182,16 +2237,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         || command->type == DRAW_FILL_RECT
         || command->type == DRAW_STROKE_RECT;
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    if (box_command) {
-        x0 = command->x > target->left ? command->x : target->left;
-        y0 = command->y > target->top ? command->y : target->top;
-        int64_t command_right = (int64_t) command->x + command->width;
-        int64_t command_bottom = (int64_t) command->y + command->height;
-        x1 = command_right < target->right
-             ? (int) command_right : target->right;
-        y1 = command_bottom < target->bottom
-             ? (int) command_bottom : target->bottom;
-    }
+    if (box_command) raster_command_bounds(target, command, &x0, &y0, &x1, &y1);
     if (command->type == DRAW_SHADOW_RECT) {
         unsigned alpha = 255u * command->opacity_scale / 256u;
         if (alpha == 0) return;
@@ -2306,12 +2352,7 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
         rasterize_image(cache, target, command);
         return;
     }
-    if (font_context_face_at_weight(cache->layout->fonts,
-                                  cache->layout->web_fonts,
-                                  draw_command_font_family(command),
-                                  draw_command_font_italic(command),
-                                  draw_uses_bold_face(command),
-                                  draw_command_font_weight(command)) != NULL) {
+    if (draw_command_face(cache->layout, command) != NULL) {
         if (draw_command_text_shadow_blur(command) != 0) {
             rasterize_blurred_text_shadow(cache, target, command);
         } else {

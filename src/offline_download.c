@@ -20,7 +20,7 @@ static uint64_t offline_file_size(const char *path)
         ? (uint64_t) status.st_size : 0;
 }
 
-static bool parse_u64(const char *text, uint64_t *value)
+bool offline_download_parse_decimal(const char *text, uint64_t *value)
 {
     if (text == NULL || text[0] == '\0' || value == NULL) return false;
     uint64_t parsed = 0;
@@ -35,16 +35,58 @@ static bool parse_u64(const char *text, uint64_t *value)
     return true;
 }
 
-static bool parse_content_range(
-    const char *text, uint64_t first, uint64_t last, uint64_t complete)
+bool offline_download_parse_content_range(
+    const char *text, uint64_t *first, uint64_t *last, uint64_t *complete)
 {
     unsigned long long parsed_first = 0, parsed_last = 0, parsed_total = 0;
     char tail = '\0';
-    return text != NULL && sscanf(
-        text, "bytes %llu-%llu/%llu%c",
-        &parsed_first, &parsed_last, &parsed_total, &tail) == 3
-        && parsed_first == first && parsed_last == last
-        && parsed_total == complete;
+    if (text == NULL || sscanf(
+            text, "bytes %llu-%llu/%llu%c",
+            &parsed_first, &parsed_last, &parsed_total, &tail) != 3)
+        return false;
+    *first = parsed_first;
+    *last = parsed_last;
+    *complete = parsed_total;
+    return true;
+}
+
+bool offline_download_space_admits(uint64_t available, uint64_t bytes)
+{
+    return available >= OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
+        && bytes <= available - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE;
+}
+
+void offline_download_speed_reset(OfflineDownloadSpeed *speed, uint64_t bytes)
+{
+    speed->time_us = tilefinch_platform_monotonic_time_us();
+    speed->bytes = bytes;
+    speed->bytes_per_second = 0;
+}
+
+void offline_download_speed_sample(OfflineDownloadSpeed *speed, uint64_t bytes)
+{
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    if (bytes < speed->bytes) {
+        speed->time_us = now;
+        speed->bytes = bytes;
+        return;
+    }
+    uint64_t elapsed = now >= speed->time_us ? now - speed->time_us : 0;
+    if (elapsed < OFFLINE_DOWNLOAD_SPEED_SAMPLE_US) return;
+    uint64_t rate = (bytes - speed->bytes) * UINT64_C(1000000) / elapsed;
+    speed->bytes_per_second = rate > UINT32_MAX ? UINT32_MAX : (uint32_t) rate;
+    speed->time_us = now;
+    speed->bytes = bytes;
+}
+
+void offline_download_pump_transfer(FetchScheduler *scheduler)
+{
+    FetchPumpQuota quota = {
+        .maximum_body_callbacks = 2,
+        .maximum_body_bytes = 32u * 1024u,
+        .maximum_time_us = 2000
+    };
+    (void) fetch_scheduler_pump_bounded(scheduler, 1, 0, &quota, NULL);
 }
 
 static bool download_headers(void *opaque, const FetchResult *metadata)
@@ -56,18 +98,20 @@ static bool download_headers(void *opaque, const FetchResult *metadata)
     bool exact_length = fetch_response_header_value(
             metadata, "content-length", content_length,
             sizeof(content_length))
-        && parse_u64(content_length, &declared)
+        && offline_download_parse_decimal(content_length, &declared)
         && declared == manager->request_length;
     bool valid = false;
     if (metadata->status_code == 206) {
         char content_range[128] = {0};
+        uint64_t first = 0, last = 0, complete = 0;
         valid = exact_length && fetch_response_header_value(
                 metadata, "content-range", content_range,
                 sizeof(content_range))
-            && parse_content_range(
-                content_range, manager->request_first,
-                manager->request_first + manager->request_length - 1u,
-                manager->part_total);
+            && offline_download_parse_content_range(
+                content_range, &first, &last, &complete)
+            && first == manager->request_first
+            && last == manager->request_first + manager->request_length - 1u
+            && complete == manager->part_total;
     } else if (metadata->status_code == 200) {
         /* The provider's range= query convention returns the exact requested
            slice with 200. Requiring its Content-Length before exposing a
@@ -182,9 +226,7 @@ static void download_reset_active(OfflineDownloadManager *manager)
     manager->request_written = 0;
     manager->headers_valid = false;
     manager->available_bytes = 0;
-    manager->speed_sample_us = 0;
-    manager->speed_sample_bytes = 0;
-    manager->bytes_per_second = 0;
+    memset(&manager->speed, 0, sizeof(manager->speed));
     memset(&manager->stream, 0, sizeof(manager->stream));
 }
 
@@ -421,12 +463,9 @@ bool offline_download_manager_adopt_resolved(
         return false;
     }
     manager->available_bytes = available;
-    manager->speed_sample_us = tilefinch_platform_monotonic_time_us();
-    manager->speed_sample_bytes = retained;
-    manager->bytes_per_second = 0;
+    offline_download_speed_reset(&manager->speed, retained);
     uint64_t remaining = required >= retained ? required - retained : required;
-    if (available < OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
-        || remaining > available - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE) {
+    if (!offline_download_space_admits(available, remaining)) {
         download_set_state(manager, OFFLINE_ITEM_PAUSED,
                            "not enough free Memory Stick space");
         download_reset_active(manager);
@@ -535,8 +574,7 @@ static bool download_publish_part(
         || !offline_library_item_path(
             manager->library, manager->active_id, final_suffix,
             final, sizeof(final))) return false;
-    if (rename(part, final) == 0) return true;
-    return remove(final) == 0 && rename(part, final) == 0;
+    return tilefinch_platform_replace_file(part, final, NULL);
 }
 
 static bool download_advance_part(OfflineDownloadManager *manager)
@@ -615,13 +653,7 @@ bool offline_download_manager_pump(OfflineDownloadManager *manager)
         }
         return true;
     }
-    FetchPumpQuota quota = {
-        .maximum_body_callbacks = 2,
-        .maximum_body_bytes = 32u * 1024u,
-        .maximum_time_us = 2000
-    };
-    (void) fetch_scheduler_pump_bounded(
-        manager->scheduler, 1, 0, &quota, NULL);
+    offline_download_pump_transfer(manager->scheduler);
     bool success = false;
     FetchStreamMetrics metrics = {0};
     if (manager->completion == NULL) {
@@ -658,19 +690,7 @@ bool offline_download_manager_pump(OfflineDownloadManager *manager)
         uint64_t video_done = manager->phase == OFFLINE_DOWNLOAD_AUDIO
             ? item->content_bytes : 0;
         item->downloaded_bytes = video_done + manager->part_offset;
-        uint64_t now = tilefinch_platform_monotonic_time_us();
-        uint64_t elapsed = now >= manager->speed_sample_us
-            ? now - manager->speed_sample_us : 0;
-        if (elapsed >= UINT64_C(250000)
-            && item->downloaded_bytes >= manager->speed_sample_bytes) {
-            uint64_t delta = item->downloaded_bytes
-                - manager->speed_sample_bytes;
-            uint64_t rate = delta * UINT64_C(1000000) / elapsed;
-            manager->bytes_per_second = rate > UINT32_MAX
-                ? UINT32_MAX : (uint32_t) rate;
-            manager->speed_sample_us = now;
-            manager->speed_sample_bytes = item->downloaded_bytes;
-        }
+        offline_download_speed_sample(&manager->speed, item->downloaded_bytes);
         manager->available_bytes = manager->available_bytes
                 >= manager->request_length
             ? manager->available_bytes - manager->request_length : 0;
@@ -731,21 +751,28 @@ bool offline_download_manager_snapshot(
         || id == 0) return false;
     const OfflineLibraryItem *item = offline_library_find(
         manager->library, id);
-    if (item != NULL && item->type == OFFLINE_ITEM_FILE && manager->file != NULL)
-        return file_download_snapshot(manager->file, id, snapshot);
     if (item == NULL || (item->type != OFFLINE_ITEM_YOUTUBE && item->type != OFFLINE_ITEM_FILE)) return false;
+    bool active = manager->active_id == id;
     snapshot->id = id;
-    snapshot->phase = manager->active_id == id
-        ? manager->phase : OFFLINE_DOWNLOAD_IDLE;
+    snapshot->phase = active ? manager->phase : OFFLINE_DOWNLOAD_IDLE;
     snapshot->downloaded_bytes = item->downloaded_bytes;
-    snapshot->total_bytes = item->content_bytes + item->audio_bytes;
-    if (item->type == OFFLINE_ITEM_FILE && item->state != OFFLINE_ITEM_READY)
-        snapshot->total_bytes = 0;
-    snapshot->available_bytes = manager->active_id == id
-        ? manager->available_bytes : 0;
-    snapshot->bytes_per_second = manager->active_id == id
-        ? manager->bytes_per_second : 0;
-    snapshot->active = manager->active_id == id;
+    snapshot->active = active;
+    if (item->type == OFFLINE_ITEM_FILE) {
+        /* Until a file is READY its record holds the admission bound, not
+           a length; only its live response may know one. */
+        snapshot->total_bytes = item->state == OFFLINE_ITEM_READY
+            ? item->content_bytes : 0;
+        if (active)
+            (void) file_download_progress(
+                manager->file, id, &snapshot->total_bytes,
+                &snapshot->available_bytes, &snapshot->bytes_per_second);
+    } else {
+        snapshot->total_bytes = item->content_bytes + item->audio_bytes;
+        if (active) {
+            snapshot->available_bytes = manager->available_bytes;
+            snapshot->bytes_per_second = manager->speed.bytes_per_second;
+        }
+    }
     snprintf(snapshot->failure_reason, sizeof(snapshot->failure_reason),
              "%s", item->failure_reason);
     return true;

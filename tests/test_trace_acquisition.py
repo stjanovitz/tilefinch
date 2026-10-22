@@ -8,6 +8,7 @@ import importlib.util
 import json
 import re
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,8 @@ if mode == "fail-head" and args.method == "HEAD":
 
 args.output.mkdir(mode=0o700)
 body = b"decoded response bytes"
+if mode == 'origin-body':
+    body = args.origin.encode('ascii') or body
 if args.method == "HEAD":
     body = b"not allowed" if mode == "head-body" else b""
 
@@ -500,6 +503,18 @@ class TraceAcquisitionTests(unittest.TestCase):
                             "request_origin": request["request_origin"],
                         } for request in requests],
                     }} if mode == ACQUIRE.ORIGIN_PLAN_MODE else {}),
+                    **({"browser_request_origins": {
+                        "version": "unmatched-request-origin-v2", "overflow": False,
+                        "total": len(entries),
+                        "entries": sorted([{
+                            "method": request["method"], "url": request["url"],
+                            "request_origin": request["request_origin"],
+                            "resource_type": resource_type,
+                            "occurrences": sum(1 for i in range(request["occurrences"])
+                                if request["resource_types"][i % len(request["resource_types"])] == resource_type),
+                        } for request in requests for resource_type in request["resource_types"]],
+                            key=lambda row:(row["method"], row["url"], row["request_origin"], row["resource_type"])),
+                    }} if mode == ACQUIRE.VARIANT_PLAN_MODE else {}),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -708,8 +723,8 @@ class TraceAcquisitionTests(unittest.TestCase):
         self.assertEqual(
             published_keys,
             {
-                ("GET", "https://source.example.test/"),
-                *((item["method"], item["url"]) for item in self.requests),
+                ("GET", "https://source.example.test/", ""),
+                *((item["method"], item["url"], "") for item in self.requests),
             },
         )
         info, _raw = ACQUIRE._metadata(output / "trace.meta")
@@ -983,6 +998,112 @@ class TraceAcquisitionTests(unittest.TestCase):
             self.requests, mode=ACQUIRE.ORIGIN_PLAN_MODE
         )
 
+    def _variant_authority(self):
+        self.requests = [{**self._request('GET', 'https://assets.example.test/shared.js', kind),
+            'request_origin': origin, 'occurrences': count}
+            for origin, kind, count in [('', 'script', 2),
+                ('https://other.example.test', 'script', 1),
+                ('https://page.example.test', 'fetch', 3)]]
+        self.diagnostic, self.contract = self._write_authority(
+            self.requests, mode=ACQUIRE.VARIANT_PLAN_MODE)
+
+    def test_origin_variants_are_independently_acquired_and_replayable(self):
+        self._variant_authority()
+        contract = ACQUIRE._validate_contract(self.contract)
+        self.assertEqual(ACQUIRE._validate_plan(self.diagnostic, contract), self.requests)
+        output = self.root / 'variants'
+        completed = self._run(output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.marker.read_text().splitlines(), [
+            'GET https://assets.example.test/shared.js',
+            'GET https://assets.example.test/shared.js Origin=https://other.example.test',
+            'GET https://assets.example.test/shared.js Origin=https://page.example.test'])
+        for i, request in enumerate(self.requests, 1):
+            meta, _ = ACQUIRE._metadata(output / f'{i:04d}.meta')
+            self.assertEqual(meta['request-origin'], request['request_origin'])
+
+    def test_origin_variant_evidence_cannot_be_omitted_duplicated_or_reassigned(self):
+        self._variant_authority()
+        def mutate(diagnostic, case):
+            evidence = diagnostic['browser_request_origins']
+            rows = evidence['entries']
+            if case == 'missing': rows.pop()
+            elif case == 'duplicate': rows.append(dict(rows[0]))
+            elif case == 'order': rows.reverse()
+            elif case == 'count': rows[0]['occurrences'] += 1
+            elif case == 'type': rows[0]['resource_type'] = 'image'
+            elif case == 'origin': rows[0]['request_origin'] = 'https://invented.example.test'
+            elif case == 'opaque': rows[0]['request_origin'] = 'null'
+            elif case == 'overflow': evidence['overflow'] = True
+            elif case == 'total': evidence['total'] += 1
+        for case in ('missing', 'duplicate', 'order', 'count', 'type', 'origin',
+                     'opaque', 'overflow', 'total'):
+            with self.subTest(case=case), self.assertRaises(ACQUIRE.AcquisitionError):
+                self._mutated_validation(lambda d: mutate(d, case), reauthorize_plan=True)
+
+    def test_new_origin_can_extend_retained_url_without_changing_old_variant(self):
+        self.requests = [{**self._request('GET', 'https://source.example.test/', 'fetch'),
+            'request_origin': origin}
+            for origin in ('https://other.example.test', 'https://page.example.test')]
+        self.diagnostic, self.contract = self._write_authority(
+            self.requests, mode=ACQUIRE.VARIANT_PLAN_MODE)
+        output = self.root / 'extended-origin'
+        completed = self._run(output, 'origin-body')
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual((output / '0000.meta').read_bytes(), (self.source / '0000.meta').read_bytes())
+        self.assertEqual((output / '0000.body').read_bytes(), (self.source / '0000.body').read_bytes())
+        for index, request in enumerate(self.requests, 1):
+            self.assertEqual((output / f'{index:04d}.body').read_bytes(),
+                             request['request_origin'].encode('ascii'))
+        self.assertTrue(ACQUIRE._already_retained(self.requests[0],
+            ACQUIRE._trace_inventory(output)[2]))
+        self.assertTrue(ACQUIRE._already_retained({'method':'GET', 'url':'https://source.example.test/'},
+            ACQUIRE._trace_inventory(output)[2]))
+
+    def test_javascript_variant_evidence_matches_python_authority(self):
+        script = r'''
+const c=require(process.argv[1]),a=require(process.argv[2]);
+const d=c.createRequestDiagnostics(),o=a.createOriginEvidence({variants:true});
+for(const [origin,type] of [['','script'],['https://page.example.test','fetch'],['','script']]) {
+ d.record('unmatched','GET',type,'https://assets.example.test/shared.js');
+ o.record('GET','https://assets.example.test/shared.js',origin,type);
+}
+console.log(JSON.stringify({summary:d.summary(),origins:o.summary(),
+ plan:c.buildReadOnlyAcquisitionPlan(d.summary(),o.summary())}));
+'''
+        result = subprocess.run([shutil.which('node'), '-e', script,
+            str(ROOT / 'benchmarks/capture-reference.js'),
+            str(ROOT / 'benchmarks/reference-capture-audit.js')], capture_output=True, text=True, check=True)
+        generated = json.loads(result.stdout)
+        self.requests = generated['plan']['requests']
+        self.diagnostic, self.contract = self._write_authority(self.requests, mode=ACQUIRE.VARIANT_PLAN_MODE)
+        def replace_evidence(diagnostic):
+            diagnostic['browser_request_origins'] = generated['origins']
+            diagnostic['replay_ledger']['unexpected_requests'] = generated['summary']
+        self.assertEqual(self._mutated_validation(replace_evidence), self.requests)
+
+    def test_variant_acquisition_refuses_a_recorder_origin_mismatch(self):
+        self._variant_authority()
+        output = self.root / 'wrong-variant'
+        completed = self._run(output, 'wrong-origin')
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn('request-origin differs', completed.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(len(self.marker.read_text().splitlines()), 1)
+
+    def test_closure_refuses_swapping_origin_record_identity(self):
+        self._variant_authority()
+        output = self.root / 'swapped-origin'
+        completed = self._run(output, 'origin-body')
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        meta = output / '0001.meta'
+        meta.write_text(meta.read_text().replace('request-origin=\n',
+            'request-origin=https://page.example.test\n'))
+        with self.assertRaises(ACQUIRE.AcquisitionError):
+            ACQUIRE._run_route_closure(ACQUIRE._node_executable(), self.source, output,
+                ACQUIRE.trace_digest(self.source, 1024*1024)[0],
+                ACQUIRE.trace_digest(output, 1024*1024)[0], 1, 4, 123456789, self.requests)
+
     def test_origin_plan_is_pinned_and_recorder_sends_only_observed_origin(self) -> None:
         self._origin_authority()
         contract = ACQUIRE._validate_contract(self.contract)
@@ -1169,6 +1290,67 @@ class TraceFormatDriftTests(unittest.TestCase):
 
 
 class RecorderPolicyTests(unittest.TestCase):
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_explicit_cache_mode_is_recorded_without_identity_rewriting(self) -> None:
+        for mode, number in (("default", 0), ("no-cache", 1), ("no-store", 2), ("reload", 3)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                output = Path(root) / "trace"
+                result = subprocess.run([str(RECORDER_BINARY), "--method", "GET",
+                    "--url", "https://example.invalid/", "--cache-mode", mode,
+                    "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                metadata = ACQUIRE._metadata(output / "0000.meta")[0]
+                self.assertEqual(metadata["request-extra-header-shape"], f"@cache={number};")
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "must-not-exist"
+            result = subprocess.run([str(RECORDER_BINARY), "--method", "GET",
+                "--url", "https://example.invalid/", "--cache-mode", "invalid",
+                "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_header_file_content_type_uses_the_typed_request_field(self) -> None:
+        for value in ("Content-Type: application/json",
+                      "X-Test: before\ncOnTeNt-TyPe: application/json\nX-Other: after",
+                      "X-Test: before\nContent-Type:\tapplication/json"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as root:
+                headers = Path(root) / "headers"
+                headers.write_text(value + "\n")
+                output = Path(root) / "trace"
+                result = subprocess.run([str(RECORDER_BINARY), "--method", "GET",
+                    "--url", "https://example.invalid/", "--headers-file", str(headers),
+                    "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                    capture_output=True, timeout=5)
+                # DNS/transport fails, but request-policy admission must succeed.
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue(output.exists())
+                metadata = ACQUIRE._metadata(output / "0000.meta")[0]
+                self.assertEqual(metadata["request-content-type"], "application/json")
+                expected_shape = "@cache=0;"
+                if value.startswith("X-Test:"):
+                    expected_shape += "x-test:7"
+                    if "X-Other:" in value:
+                        expected_shape += ",x-other:6"
+                self.assertEqual(metadata["request-extra-header-shape"], expected_shape)
+
+    @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
+    def test_header_file_rejects_ambiguous_or_invalid_content_type(self) -> None:
+        for value in ("Content-Type: application/json\nContent-Type: text/plain",
+                      "Content-Type:", "Content-Type: " + "x" * 256):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as root:
+                headers = Path(root) / "headers"
+                headers.write_text(value + "\n")
+                output = Path(root) / "must-not-exist"
+                result = subprocess.run([str(RECORDER_BINARY), "--method", "GET",
+                    "--url", "https://example.invalid/", "--headers-file", str(headers),
+                    "--output", str(output), "--max-bytes", "1024", "--timeout-ms", "100"],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(output.exists())
+
     @unittest.skipUnless(RECORDER_BINARY is not None, "recorder binary not supplied")
     def test_preflight_admission_is_read_only_and_explicit(self) -> None:
         for method, origin, names, expected in (

@@ -82,12 +82,17 @@ typedef struct {
 /* Changes when a loaded face is published or retired. */
 uint64_t font_generation(void);
 
-/* Retained allocator payload for the backend, excluding encoded bytes and
-   Budget bookkeeping. Useful for comparing page-font ownership. */
+#ifndef __PSP__
+/* Host-only probes for the lab and tests. Retained allocator payload for the
+   backend, excluding encoded bytes and Budget bookkeeping, for comparing
+   page-font ownership; and the number of exact ASCII advances cached. */
 size_t font_face_backend_bytes(const FontFace *face);
 size_t font_face_cached_ascii_advances(const FontFace *face);
+#endif
 /* Temporary reconstruction is separately bounded; retained backend and page
-   ceilings remain authoritative after opening. */
+   ceilings remain authoritative after opening. An oversized compressed face
+   may temporarily use twice this allowance (at most 2 MiB) to pack its
+   outlines, but its published backend must still fit the retained limit. */
 size_t font_face_load_workspace_limit(size_t retained_limit);
 /* Share an already admitted page face only after the new response has passed
    request policy and its exact bytes and allocator ceiling match. */
@@ -173,6 +178,10 @@ typedef struct {
 bool font_optional_glyph_provider_install(TilefinchGlyphProvider *provider);
 bool font_optional_glyph_provider_uninstall(
     TilefinchGlyphProvider *provider);
+/* Changes whenever the bound provider or the packs attached to it change:
+   what an optional codepoint resolves to, and what an opaque cluster key
+   names. Retained glyph caches outside the font cache compare it. */
+uint64_t font_optional_glyph_generation(void);
 /* Match a multi-codepoint optional glyph. Single-scalar fallback retains the
    normal face-first policy; this path exists so one grapheme is measured and
    rasterized under one opaque cache key. */
@@ -218,17 +227,12 @@ FontFamily font_family_web_fallback(FontFamily family);
    face.  A successfully loaded web face uses its own metrics instead. */
 FontFamily font_context_metric_family(
     const WebFontSet *web_fonts, FontFamily family, const FontFace *face);
-const FontFace *font_context_face_variant(
-    const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
-    bool italic, bool bold);
 const FontFace *font_context_face_at_weight(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family,
     bool italic, bool fallback_bold, unsigned weight);
+/* The upright, normal-weight face of a family. */
 const FontFace *font_context_face(
     const FontSet *fonts, const WebFontSet *web_fonts, FontFamily family);
-bool font_context_face_is_bold(
-    const FontSet *fonts, const WebFontSet *web_fonts,
-    const FontFace *face);
 /* Accepts bounded TrueType-flavoured sfnt or WOFF 1.0 data through the
    size-aware page-font backend and owns an internal encoded copy on success.
    The pinned backend also accepts TrueType-flavored WOFF2, charging Brotli

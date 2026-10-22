@@ -1,5 +1,6 @@
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/controller.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/document.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
@@ -217,6 +218,42 @@ static int test_reduced_dom_event_counter(void)
     JS_SetContextOpaque(context, NULL);
     JS_FreeContext(context);
     JS_FreeRuntime(runtime);
+    return 0;
+}
+
+static int test_inline_tracker_policy(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body><script>"
+        "window.ue_ibe = (window.ue_ibe || 0) + 1;"
+        "/* n.RXVM=function rx.ex64( /rd/uedata */ globalThis.pocSummary='TRACKED';</script>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1, 32));
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 65536));
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    session.content_blocker = blocker;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(&document, &budget,
+        5u*MIB, 4000, "https://www.amazon.com/", &session, &result);
+    CHECK(runtime);
+    lxb_dom_node_t *node = document_body_node(&document)->first_child;
+    CHECK(script_runtime_evaluate_inline(runtime, node, false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "if(typeof ue_ibe!=='undefined')throw Error('tracker ran');globalThis.pocSummary='BLOCKED'",
+        "<inline-policy-check>", &result) && strcmp(result.summary, "BLOCKED") == 0);
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL));
+    CHECK(script_runtime_evaluate_inline(runtime, node, false, &result));
+    CHECK(strcmp(result.summary, "TRACKED") == 0);
+    script_runtime_destroy(runtime);
+    session.content_blocker = NULL;
+    browser_session_destroy(&session);
+    content_blocker_destroy(blocker);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
 
@@ -3350,8 +3387,6 @@ static int test_inline_style_scoped_invalidation(void)
     return 0;
 }
 
-void style_test_inject_focus_marker_remove_failures(size_t count);
-
 /* One read of #id's `property` in its own entry into JavaScript. It must
    print `expected`; `warm` says it must be served from retained styles (no
    cascade miss), 0 that it must cascade again, -1 either. */
@@ -3442,11 +3477,12 @@ static int test_computed_style_host_generation(void)
           == NULL);
     CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
 
-    /* A probe that cannot restore the marker leaves the element focused. */
-    style_test_inject_focus_marker_remove_failures(3);
+    /* A probe that cannot restore the marker (its toggle and its one
+       restoration both fail) leaves the element focused. */
+    tilefinch_test_faults()->focus_marker_remove_failures = 2;
     CHECK(style_focus_change_classify(&sheet, a, NULL, &normal, &focused)
           == STYLE_FOCUS_CHANGE_UNSAFE);
-    style_test_inject_focus_marker_remove_failures(0);
+    CHECK(tilefinch_test_faults()->focus_marker_remove_failures == 0);
     CHECK(host_style_read(runtime, "a", "color", "rgb(7, 7, 7)", false));
     CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(a),
               (const lxb_char_t *) "data-tilefinch-focus",
@@ -4544,6 +4580,76 @@ static int test_synthetic_network_queue(ScriptRuntime *runtime,
     return 0;
 }
 
+static int test_shared_live_collection_state(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptRuntimeOptions options = {.defer_document_scripts = true};
+    ScriptResult result = {0};
+    CHECK(viewport_context_init(&options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 4000, "https://collection-state.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.collectionNodes=[];for(let i=0;i<512;i++){"
+        "const n=document.createElement('div');collectionNodes.push(n);"
+        "document.body.appendChild(n)};document.body.children.length",
+        "<collection-state-warm>", &result));
+    JS_RunGC(runtime->runtime);
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(runtime->runtime, &before);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.liveCollections=collectionNodes.map(n=>n.children);"
+        "const a=collectionNodes[0],b=collectionNodes[1],"
+        "first=document.createElement('i'),second=document.createElement('b');"
+        "first.id='first';second.name='second';a.append(first,second);"
+        "const list=liveCollections[0],item=list.item,iterate=list[Symbol.iterator];"
+        "const correct=HTMLCollection.length===0"
+        "&&Object.getPrototypeOf(list)===HTMLCollection.prototype&&list===a.children"
+        "&&list.length===2&&list[0]===first"
+        "&&list.item(1)===second&&list.namedItem('first')===first"
+        "&&list.namedItem('second')===second&&item(0)===first"
+        "&&iterate().next().value===first&&('1' in list)&&!('2' in list)"
+        "&&Object.keys(list).length===0&&Reflect.ownKeys(list).length===0"
+        "&&list.map(n=>n.localName).join(',')==='i,b';"
+        "b.append(first);pocSummary=correct&&list.length===1&&item(0)===second"
+        "&&liveCollections[1].length===1&&liveCollections[1][0]===first"
+        "?'LIVE-COLLECTION-OK':'LIVE-COLLECTION-BAD'",
+        "<collection-state-many>", &result));
+    CHECK(!strcmp(result.summary, "LIVE-COLLECTION-OK"));
+    JS_RunGC(runtime->runtime);
+    JS_ComputeMemoryUsage(runtime->runtime, &after);
+    printf("live-collection-state collections=512 retained-delta=%lld\n",
+           (long long) (after.memory_used_size - before.memory_used_size));
+    /* One owner reader per collection, not another pair of proxy traps.
+       QuickJS's function counter counts bytecodes, not closure instances. */
+    CHECK(after.memory_used_size - before.memory_used_size < 256 * 1024);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.heldCollection=liveCollections[0];"
+        "collectionNodes.forEach(n=>n.remove());"
+        "globalThis.collectionWeak=new WeakRef(collectionNodes[2]);"
+        "collectionNodes=null;liveCollections=null;",
+        "<collection-state-drop>", &result));
+    for (unsigned i = 0; i < 3; i++) {
+        JS_RunGC(runtime->runtime);
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    }
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "pocSummary=heldCollection.length===1&&heldCollection[0].localName==='b'"
+        "&&collectionWeak.deref()===undefined?'COLLECTION-RECLAIMED':'COLLECTION-LEAK'",
+        "<collection-state-reclaimed>", &result));
+    CHECK(!strcmp(result.summary, "COLLECTION-RECLAIMED"));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_shared_inline_style_state(void)
 {
     Budget budget;
@@ -4619,10 +4725,295 @@ static int test_shared_inline_style_state(void)
     JS_ComputeMemoryUsage(runtime->runtime, &after);
     printf("attribute-map-state nodes=512 retained-delta=%lld\n",
            (long long) (after.memory_used_size - before.memory_used_size));
-    CHECK(after.memory_used_size - before.memory_used_size < 256 * 1024);
+    /* The corrected QuickJS census includes shared closure references that
+       its old total accidentally overwrote. Keep the property-table guard
+       and separately bound the complete, now-accounted wrapper graph. */
+    CHECK(after.prop_size - before.prop_size < 256 * 1024);
+    CHECK(after.memory_used_size - before.memory_used_size < 384 * 1024);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A finite component tree can nest ordinary connection reactions, native
+   wrappers and stylesheet adoption. It must fit the unchanged host stack
+   guard with both sanitizers enabled, not merely in the optimized build. */
+static int test_component_stack_headroom(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "globalThis.connectedLevels=[];globalThis.completedLevels=0;"
+        "class StackCard extends HTMLElement{connectedCallback(){"
+        "const depth=Number(this.getAttribute('data-depth')||0);"
+        "const root=this.attachShadow({mode:'open'}),sheet=new CSSStyleSheet();"
+        "sheet.replaceSync(':host{display:block}b{color:red}');"
+        "root.adoptedStyleSheets=[sheet];root.innerHTML='<b>Level '+depth+'</b>';"
+        "connectedLevels.push(depth);if(depth<12){"
+        "const child=document.createElement('stack-card');"
+        "child.setAttribute('data-depth',depth+1);root.append(child);}"
+        "completedLevels++;}}customElements.define('stack-card',StackCard);"
+        "document.body.append(document.createElement('stack-card'));"
+        "pocSummary=connectedLevels.length===13&&completedLevels===13"
+        "&&connectedLevels.every((n,i)=>n===i)&&__tilefinchUncaughtErrorCount===0"
+        "?'CONNECTED':'INCOMPLETE:'+connectedLevels.length+':'+completedLevels",
+        "CONNECTED"));
+    /* Finite composition needs headroom, but actual unbounded recursion
+       must still reach the same recoverable native-stack guard. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{let guarded=false;try{(function recurse(){return 1+recurse()})()}"
+        "catch(error){guarded=error.name==='InternalError'"
+        "&&error.message==='stack overflow'}"
+        "pocSummary=guarded?'GUARDED':'UNGUARDED'})()", "GUARDED"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_detached_fragment_ownership(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "globalThis.sourceTemplate=document.createElement('template');"
+        "sourceTemplate.innerHTML='<i>one</i><b>two</b><em>three</em>';"
+        "globalThis.keptFragment=sourceTemplate.content.cloneNode(true);"
+        "globalThis.keptFragmentChild=keptFragment.firstChild;"
+        "keptFragmentChild.payload='held';pocSummary='READY'", "READY"));
+    ScriptResult result = {0};
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = 0;
+    size_t native_before = lxb_dom_interface_document(document.html)->mraw->ref_count;
+    for (size_t i = 0; i < runtime->bridge.node_count; i++)
+        before += runtime->bridge.nodes[i] != NULL;
+    CHECK(var_cache_eval(runtime,
+        "globalThis.discardedFragments=[];"
+        "for(let i=0;i<128;i++)discardedFragments.push(sourceTemplate.content.cloneNode(true));"
+        "pocSummary='HELD'", "HELD"));
+    /* Let descendant wrappers die while the fragment itself still owns its
+       native tree, then release the final wrapper in a later owner turn. */
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "globalThis.discardedFragments=null;pocSummary='DROPPED'", "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = 0;
+    for (size_t i = 0; i < runtime->bridge.node_count; i++)
+        after += runtime->bridge.nodes[i] != NULL;
+    printf("detached-fragment-ownership handles=%zu->%zu\n", before, after);
+    CHECK(after <= before + 4u);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<128;i++){const t=document.createElement('template');"
+        "t.innerHTML='<template class=cache><i title=one>one</i>"
+        "<b class=two>two</b></template><em style=color:red>three</em>';"
+        "void t.content;}pocSummary='DROPPED'})()", "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t native_after = lxb_dom_interface_document(document.html)->mraw->ref_count;
+    printf("detached-template-ownership native-refs=%zu->%zu\n", native_before, native_after);
+    CHECK(native_after <= native_before + 16u);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=sourceTemplate.content.textContent==='onetwothree'"
+        "&&keptFragment.firstChild.payload==='held'?'LIVE':'LOST'", "LIVE"));
+    CHECK(var_cache_eval(runtime,
+        "document.body.append(keptFragment);pocSummary=keptFragment.childNodes.length===0"
+        "&&document.body.textContent==='onetwothree'?'MOVED':'LOST'", "MOVED"));
+    ImageResources images = {0};
+    runtime->bridge.images = &images;
+    CHECK(var_cache_eval(runtime,
+        "globalThis.imageTemplate=document.createElement('template');"
+        "imageTemplate.innerHTML='<template><img></template>';"
+        "void imageTemplate.content.firstChild.content.firstChild;"
+        "pocSummary='IMAGE'", "IMAGE"));
+    lxb_dom_node_t *image_node = NULL;
+    for (size_t i = 0; i < runtime->bridge.node_count; i++) {
+        lxb_dom_node_t *node = runtime->bridge.nodes[i];
+        if (node != NULL && node->local_name == LXB_TAG_IMG)
+            image_node = node;
+    }
+    CHECK(image_node != NULL);
+    unsigned char *pixels = budget_malloc(&budget, 16u);
+    CHECK(pixels != NULL);
+    memset(pixels, 0x5a, 16u);
+    CHECK(images_adopt_decoded_surface(&images, &budget, image_node,
+                                      pixels, 2, 2));
+    /* Descendant wrappers die first; the template still holds their native
+       nodes. The final owner disappears in a later maintenance turn. */
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(images.items[0].node == image_node);
+    CHECK(var_cache_eval(runtime,
+        "imageTemplate=null;pocSummary='DROPPED'", "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(images.count == 1 && images.items[0].node == NULL);
+    CHECK(images.items[0].pixels == pixels && pixels[0] == 0x5a);
+    images_prepare_external_rebuild(&images);
+    CHECK(images.count == 0);
+    images_destroy(&images);
+    runtime->bridge.images = NULL;
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_slotless_shadow_mutation_queue(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<32;i++){const h=document.createElement('div');"
+        "document.body.append(h);const r=h.attachShadow({mode:'open'});"
+        "r.append(document.createElement('b'));}"
+        "pocSummary=__tilefinchRootCensus.slotAssignmentRoots===0?'EMPTY':'QUEUED'})()",
+        "EMPTY"));
+    ScriptResult result = {0};
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "globalThis.slotHost=document.createElement('div');document.body.append(slotHost);"
+        "globalThis.testSlot=document.createElement('slot');"
+        "slotHost.attachShadow({mode:'open'}).append(testSlot);"
+        "globalThis.slotChanges=0;testSlot.addEventListener('slotchange',()=>slotChanges++);"
+        "slotHost.append(document.createElement('span'));pocSummary='ASSIGNED'", "ASSIGNED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=slotChanges===1&&testSlot.assignedNodes().length===1?'LIVE':'LOST'",
+        "LIVE"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_wrapper_cleanup_backlog(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.keptNode=document.createElement('section');"
+        "keptNode.payload='held';document.body.append(keptNode);"
+        "pocSummary='HELD'", "HELD"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<512;i++){const n=document.createElement('div');"
+        "n.payload=new Uint8Array(512);n.self=n;"
+        "if(!i)globalThis.deadNode=new WeakRef(n)}pocSummary='DROPPED'})()",
+        "DROPPED"));
+    (void) script_runtime_collect_and_trim(runtime);
+    bool queued = JS_IsCleanupJobPending(runtime->runtime);
+    printf("wrapper-cleanup-backlog queued=%d live-slots=%zu\n", queued,
+        runtime->bridge.node_count);
+    CHECK(!queued);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=!deadNode.deref()&&document.querySelector('section')"
+        "===keptNode&&keptNode.payload==='held'?'LIVE':'LOST'", "LIVE"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_discarded_browser_state_ownership(unsigned kind)
+{
+    static const char *const names[] = {"abort", "indexeddb", "slots"};
+    static const char *const warm[] = {
+        "void new AbortController().signal;pocSummary='WARM'",
+        "void indexedDB;void new IDBRequest();pocSummary='WARM'",
+        "(()=>{const h=document.createElement('div');document.body.appendChild(h);"
+        "const r=h.attachShadow({mode:'open'});r.appendChild(document.createElement('slot'));"
+        "h.appendChild(document.createElement('span'));h.remove();pocSummary='WARM'})()",
+    };
+    static const char *const drop[] = {
+        "(()=>{for(let i=0;i<32;i++){const c=new AbortController(),s=c.signal;"
+        "s.payload=new Uint8Array(8192);s.onabort=()=>s.payload;"
+        "if(!i)globalThis.discardedOwner=new WeakRef(s)}pocSummary='DROPPED'})()",
+        "(()=>{for(let i=0;i<32;i++){const source={payload:new Uint8Array(8192)},"
+        "r=new IDBRequest(source);source.request=r;r.onsuccess=()=>source.payload;"
+        "if(!i)globalThis.discardedOwner=new WeakRef(r)}pocSummary='DROPPED'})()",
+        "(()=>{for(let i=0;i<32;i++){const h=document.createElement('div');"
+        "document.body.appendChild(h);const r=h.attachShadow({mode:'open'});"
+        "h.payload=new Uint8Array(8192);r.appendChild(document.createElement('slot'));"
+        "h.appendChild(document.createElement('span'));h.remove();"
+        "if(!i)globalThis.discardedOwner=new WeakRef(h)}pocSummary='DROPPED'})()",
+    };
+    static const char *const keep[] = {
+        "globalThis.heldController=new AbortController();globalThis.heldSignal=heldController.signal;"
+        "globalThis.abortCalls=0;heldSignal.onabort=()=>abortCalls++;Object.freeze(heldController);"
+        "Object.freeze(heldSignal);pocSummary='HELD'",
+        "globalThis.heldSource={payload:17};globalThis.heldRequest=new IDBRequest(heldSource);"
+        "heldSource.request=heldRequest;globalThis.requestCalls=0;heldRequest.onsuccess=()=>requestCalls++;"
+        "pocSummary='HELD'",
+        "globalThis.heldHost=document.createElement('div');document.body.appendChild(heldHost);"
+        "globalThis.heldRoot=heldHost.attachShadow({mode:'open'});"
+        "globalThis.heldSlot=document.createElement('slot');heldRoot.appendChild(heldSlot);"
+        "globalThis.heldChild=document.createElement('span');heldHost.appendChild(heldChild);"
+        "heldHost.remove();pocSummary='HELD'",
+    };
+    static const char *const verify[] = {
+        "heldController.abort('kept');pocSummary=heldSignal.aborted&&heldSignal.reason==='kept'"
+        "&&heldController.signal===heldSignal&&abortCalls===1?'LIVE':'LOST'",
+        "heldRequest.dispatchEvent(new Event('success'));pocSummary=requestCalls===1"
+        "&&heldRequest.source===heldSource&&heldSource.request===heldRequest?'LIVE':'LOST'",
+        "document.body.appendChild(heldHost);pocSummary=heldHost.shadowRoot===heldRoot"
+        "&&heldSlot.assignedNodes()[0]===heldChild?'LIVE':'LOST'",
+    };
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime, warm[kind], "WARM"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = script_runtime_heap_used(runtime);
+    CHECK(var_cache_eval(runtime, drop[kind], "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = script_runtime_heap_used(runtime);
+    bool released = var_cache_eval(runtime,
+        "pocSummary=discardedOwner.deref()===undefined?'COLLECTED':'RETAINED'",
+        "COLLECTED");
+    printf("discarded-%s owners=32 retained-delta=%lld released=%d\n",
+           names[kind], (long long)after - (long long)before, released);
+    CHECK(var_cache_eval(runtime, keep[kind], "HELD"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime, verify[kind], "LIVE"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    CHECK(released && after < before + 128u * 1024u);
     return 0;
 }
 
@@ -4666,6 +5057,1086 @@ static int test_event_target_listener_ownership(void)
     CHECK(var_cache_eval(runtime,
         "liveEventTarget.dispatchEvent(new Event('probe'));"
         "pocSummary=eventCalls===1?'DELIVERED':'LOST'", "DELIVERED"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+#define EVENT_STATE_SVG "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%223%22 height=%224%22%3E%3Crect width=%223%22 height=%224%22/%3E%3C/svg%3E"
+
+/* A detached element whose event handler closes over it is collected with
+   its handlers once nothing else reaches it, for onX handlers and
+   addEventListener alike, and so is a removed subtree whose listeners
+   reference one another. Handlers stay alive while their element is
+   connected, still reachable through its detached tree (from any of the
+   tree's wrappers, including one made after the tree was last swept), or
+   loading an image. */
+static int test_detached_event_state_collection(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.refs={};globalThis.fin=[];globalThis.hits=[];"
+        "globalThis.reg=new FinalizationRegistry(k=>fin.push(k));"
+        "const mk=(k,e)=>{refs[k]=new WeakRef(e);reg.register(e,k)};"
+        "(()=>{const i=new Image();i.onload=()=>i.width;mk('imgOn',i)})();"
+        "(()=>{const i=new Image();i.addEventListener('load',()=>i.width);"
+        "mk('imgAdd',i)})();"
+        "(()=>{const d=document.createElement('div');d.onclick=()=>d.id;"
+        "mk('divOn',d)})();"
+        "(()=>{const d=document.createElement('div');"
+        "d.addEventListener('click',()=>d.id);mk('divAdd',d)})();"
+        "(()=>{const box=document.createElement('section');"
+        "document.body.appendChild(box);const a=document.createElement('a'),"
+        "b=document.createElement('b'),c=document.createElement('i');"
+        "box.append(a,b,c);a.addEventListener('click',()=>b.id);"
+        "b.onclick=()=>a.id;c.addEventListener('click',()=>c.id);"
+        "mk('removedA',a);mk('removedB',b);mk('removedC',c);box.remove()})();"
+        "(()=>{const d=document.createElement('div');d.id='connected';"
+        "document.body.appendChild(d);"
+        "d.addEventListener('click',()=>hits.push('connectedAdd'));"
+        "d.onclick=()=>hits.push('connectedOn')})();"
+        "(()=>{const root=document.createElement('ul');globalThis.built=root;"
+        "for(let n=0;n<3;n++){const li=document.createElement('li');"
+        "li.id='li'+n;li.addEventListener('click',()=>hits.push('li'+n));"
+        "li.onclick=()=>hits.push('liOn'+n);root.appendChild(li)}})();"
+        "(()=>{const root=document.createElement('div');globalThis.joinRoot=root;"
+        "const mid=document.createElement('p');root.appendChild(mid);"
+        "mid.appendChild(document.createElement('span'));"
+        "mid.addEventListener('click',()=>hits.push('joined'))})();"
+        "(()=>{const i=new Image();i.onload=()=>hits.push('pending'+i.naturalWidth);"
+        "i.src='" EVENT_STATE_SVG "'})();"
+        "pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    /* A wrapper made in a swept detached tree keeps the tree's handlers
+       once the older wrappers are gone. */
+    CHECK(var_cache_eval(runtime,
+        "globalThis.joinSpan=joinRoot.querySelector('span');joinRoot=null;"
+        "document.body.appendChild(built);built=null;pocSummary='MOVED'",
+        "MOVED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=Object.keys(refs).filter(k=>refs[k].deref()||"
+        "!fin.includes(k)).join(',')||'COLLECTED'", "COLLECTED"));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('connected').click();"
+        "for(let n=0;n<3;n++)document.getElementById('li'+n).click();"
+        "joinSpan.click();pocSummary=hits.join(',')",
+        "pending3,connectedAdd,connectedOn,li0,liOn0,li1,liOn1,li2,liOn2,"
+        "joined"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Opens a page for the event-target tests, with growth of the
+   bootstrap's event-target maps refused or not. */
+static ScriptRuntime *event_target_page(Budget *budget, PocDocument *document,
+                                        Stylesheet *sheet, bool refuse_growth)
+{
+    budget_init(budget, 24u * MIB);
+    if (!budget_install_lexbor(budget)) return NULL;
+    tilefinch_test_faults()->refuse_event_target_growth = refuse_growth;
+    return var_cache_runtime(budget, document, sheet,
+                             "<!doctype html><body></body>");
+}
+
+static int event_target_page_close(Budget *budget, PocDocument *document,
+                                   Stylesheet *sheet, ScriptRuntime *runtime)
+{
+    script_runtime_destroy(runtime);
+    tilefinch_test_faults()->refuse_event_target_growth = false;
+    stylesheet_destroy(sheet);
+    document_destroy(document);
+    CHECK(budget->current == 0 && budget_uninstall_lexbor(budget));
+    return 0;
+}
+
+/* Past the 128 targets the listener and handler maps start with, a
+   connected element keeps its listeners and handlers when its wrapper is
+   collected: the maps grow while memory is free, and with growth refused
+   the element's wrapper keeps them, alive while it is connected. */
+static int test_connected_event_targets_past_capacity(bool refuse_growth)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               refuse_growth);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.hits=0;globalThis.ons=0;"
+        "(()=>{for(let i=0;i<200;i++){const p=document.createElement('p');"
+        "document.body.appendChild(p);p.addEventListener('click',()=>hits++);"
+        "p.onclick=()=>{ons++}}})();pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "for(const p of document.querySelectorAll('p'))p.click();"
+        "pocSummary=hits+':'+ons", "200:200"));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=String(__tilefinchRootCensus.eventTargetCapacity)",
+        refuse_growth ? "128" : "256"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* A remote node writer that accepts every write (a section-paged page's
+   backing, which this test has no sections for). */
+static bool accept_remote_node_write(
+    void *opaque, const char *stable_key, size_t stable_key_length,
+    size_t section_index, ScriptRemoteNodeWriteKind kind, const char *name,
+    size_t name_length, const char *value, size_t value_length)
+{
+    (void) opaque; (void) stable_key; (void) stable_key_length;
+    (void) section_index; (void) kind; (void) name; (void) name_length;
+    (void) value; (void) value_length;
+    return true;
+}
+
+/* On a page with a remote node writer, listeners and handlers are kept by
+   stable key, so they carry over to the element a section swap makes for
+   the same id. Past the 128 keys that pair starts with it grows as the
+   per-handle pair does; with growth refused, a node's state takes the
+   per-handle path and still lives as long as the node. Here 300 parsed
+   elements get a listener and a handler, then the body is parsed again
+   from the same markup, which gives the new elements the same
+   (positional) stable keys, as a section swap does: every new element
+   fires both. On the old code the keys past 128 fell to the per-handle
+   maps of the replaced elements, and only those whose wrapper the
+   stable-wrapper cache still held kept anything. */
+static int test_stable_event_targets_past_capacity(bool refuse_growth)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               refuse_growth);
+    CHECK(runtime != NULL);
+    ScriptRemoteDocumentBinding binding = {
+        .node_write = accept_remote_node_write
+    };
+    CHECK(script_runtime_rebind_remote_document(runtime, &binding));
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.hits=0;globalThis.ons=0;"
+        "globalThis.markup='<p>x</p>'.repeat(300);"
+        "document.body.innerHTML=markup;"
+        "for(const p of document.querySelectorAll('p')){"
+        "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
+        "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
+        "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    if (refuse_growth) {
+        /* Refused: the elements themselves keep their state. */
+        CHECK(var_cache_eval(runtime,
+            "for(const p of document.querySelectorAll('p'))p.click();"
+            "pocSummary=hits+':'+ons+':'+"
+            "__tilefinchRootCensus.stableEventTargetCapacity", "300:300:128"));
+    } else {
+        CHECK(var_cache_eval(runtime,
+            "document.body.innerHTML=markup;pocSummary='SWAPPED'",
+            "SWAPPED"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(var_cache_eval(runtime,
+            "for(const p of document.querySelectorAll('p'))p.click();"
+            "pocSummary=hits+':'+ons+':'+"
+            "__tilefinchRootCensus.stableEventTargetCapacity", "300:300:512"));
+    }
+    script_runtime_rebind_remote_document(runtime, NULL);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* With growth refused and the maps full, state past them lives on the
+   wrapper: a detached element whose handler closes over it is collected
+   (the overflow once kept it alive), a kept element removed from the
+   document is collected with its handlers, and one that comes back keeps
+   them even after its own wrapper was collected while it was away. */
+static int test_event_target_overflow_collection(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               true);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.refs={};globalThis.fin=[];globalThis.hits=[];"
+        "globalThis.reg=new FinalizationRegistry(k=>fin.push(k));"
+        "const mk=(k,e)=>{refs[k]=new WeakRef(e);reg.register(e,k)};"
+        "for(let i=0;i<128;i++){const p=document.createElement('p');"
+        "document.body.appendChild(p);p.onclick=()=>0;"
+        "p.addEventListener('click',()=>0)}"
+        "(()=>{const d=document.createElement('div');d.onclick=()=>d.id;"
+        "mk('divOn',d)})();"
+        "(()=>{const d=document.createElement('div');"
+        "d.addEventListener('click',()=>d.id);mk('divAdd',d)})();"
+        "(()=>{const i=new Image();i.onload=()=>i.width;mk('imgOn',i)})();"
+        "(()=>{const p=document.createElement('p');document.body.appendChild(p);"
+        "p.onclick=()=>p.id;p.addEventListener('click',()=>p.id);"
+        "mk('removed',p);p.remove()})();"
+        "(()=>{const p=document.createElement('p');p.id='back';"
+        "document.body.appendChild(p);p.onclick=()=>hits.push('backOn');"
+        "p.addEventListener('click',()=>hits.push('back'));"
+        "globalThis.away=document.createElement('div');away.appendChild(p)})();"
+        "pocSummary=String(__tilefinchRootCensus.nativeHandlerTargets)",
+        "128"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=Object.keys(refs).filter(k=>refs[k].deref()||"
+        "!fin.includes(k)).join(',')||'COLLECTED'", "COLLECTED"));
+    CHECK(var_cache_eval(runtime,
+        "document.body.appendChild(away);away=null;pocSummary='BACK'", "BACK"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "document.getElementById('back').click();pocSummary=hits.join(',')",
+        "backOn,back"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* A native pin (a detached media element's request) roots its tree's
+   held event state again, so the listeners outlive every wrapper of the
+   tree while native code may still dispatch to it. */
+static int test_event_state_rooted_by_pin(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const box=document.createElement('div'),"
+        "v=document.createElement('video');box.appendChild(v);"
+        "v.src='https://media.test/clip.mp4';const f=()=>v.id;"
+        "v.addEventListener('playing',f);globalThis.listener=new WeakRef(f);"
+        "globalThis.pinned=v})();pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=String(__tilefinchRootCensus.heldEventTargets)", "1"));
+    CHECK(var_cache_eval(runtime,
+        "pinned.load();pinned=null;"
+        "pocSummary=String(__tilefinchRootCensus.heldEventTargets)", "0"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=listener.deref()?'ROOTED':'LOST'", "ROOTED"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* A detached tree whose wrapper the page froze cannot be held; the sweep
+   then leaves it alone rather than retrying it on every pass, and the
+   tree keeps its listeners. */
+static int test_frozen_detached_wrapper_settles(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.calls=0;globalThis.frozen=document.createElement('div');"
+        "frozen.addEventListener('click',()=>calls++);Object.freeze(frozen);"
+        "pocSummary='FROZEN'", "FROZEN"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    if (runtime->bridge.node_wrapper_sweep_remaining != 0)
+        fprintf(stderr, "frozen wrapper: sweep still armed (%zu)\n",
+                runtime->bridge.node_wrapper_sweep_remaining);
+    CHECK(runtime->bridge.node_wrapper_sweep_remaining == 0);
+    CHECK(var_cache_eval(runtime,
+        "frozen.click();pocSummary=String(calls)", "1"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* Clearing a list through innerHTML or textContent hands the removed
+   items' event state to the wrapper sweep like any other removal, so
+   items whose handlers close over them become collectable on the next
+   owner turns even when the page makes no wrapper afterwards and no
+   collection runs. On the old code neither path armed the sweep, and the
+   items stayed rooted until something else did (a new wrapper, or a
+   collection, which a quiet page may not run for a long time). */
+static int test_cleared_children_event_state_collection(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.refs={};globalThis.fin=[];"
+        "globalThis.reg=new FinalizationRegistry(k=>fin.push(k));"
+        "const mk=(k,e)=>{refs[k]=new WeakRef(e);reg.register(e,k)};"
+        "globalThis.htmlList=document.createElement('ul');"
+        "globalThis.textList=document.createElement('ol');"
+        "document.body.append(htmlList,textList);"
+        "for(const [name,list] of [['html',htmlList],['text',textList]])"
+        "for(let n=0;n<3;n++){const li=document.createElement('li');"
+        "li.onclick=()=>li.id;li.addEventListener('click',()=>li.id);"
+        "list.appendChild(li);mk(name+n,li)}pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(runtime->bridge.node_wrapper_sweep_remaining == 0);
+    CHECK(var_cache_eval(runtime,
+        "htmlList.innerHTML='';textList.textContent='';pocSummary='CLEARED'",
+        "CLEARED"));
+    size_t collections = runtime->heap_collections;
+    for (size_t turn = 0; turn < 16; turn++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    /* A collection arms the sweep by itself and would hide the bug. */
+    CHECK(runtime->heap_collections == collections);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=__tilefinchRootCensus.heldEventTargets+':'+"
+        "__tilefinchRootCensus.nativeHandlerTargets", "6:0"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=Object.keys(refs).filter(k=>refs[k].deref()||"
+        "!fin.includes(k)).join(',')||'COLLECTED'", "COLLECTED"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* A hold that a frozen wrapper refuses leaves no holder behind: the
+   wrappers it had already stamped must not carry the refused holder, or a
+   later insertion releases it and roots again the state of a node retired
+   since (whose cleanup has run and never runs again). Here `x` keeps a
+   listener, the tree is refused, `w1` leaves the tree, `x` leaves it and
+   is retired, and an insertion under `w1` follows while another detached
+   tree is held. The listener must then be collectable. */
+static int test_refused_hold_leaves_no_holder(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const root=document.createElement('div'),"
+        "w1=document.createElement('p'),x=document.createElement('b'),"
+        "f=document.createElement('i');root.append(w1,x,f);"
+        "const fn=()=>0;x.addEventListener('click',fn);"
+        "globalThis.xListener=new WeakRef(fn);"
+        "w1.addEventListener('click',()=>0);Object.preventExtensions(f);"
+        "globalThis.stuckRoot=root;globalThis.stuckW1=w1;"
+        "globalThis.stuckF=f;"
+        "const held=document.createElement('div');"
+        "held.addEventListener('click',()=>held.id);"
+        "globalThis.heldBox=held})();pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(runtime->bridge.event_stuck_slots != 0);
+    CHECK(runtime->bridge.event_held_slots != 0);
+    CHECK(var_cache_eval(runtime,
+        "stuckW1.remove();stuckRoot.children[0].remove();"
+        "pocSummary=String(stuckRoot.children.length)", "1"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "stuckW1.appendChild(document.createElement('span'));"
+        "pocSummary='JOINED'", "JOINED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=xListener.deref()?'LEAKED':'COLLECTED'", "COLLECTED"));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* On a section-paged page whose event-target maps are all full, a
+   connected node's state lives on its wrapper (kept). A section swap
+   rebinds the retained wrapper to the new node; the new node must keep
+   that wrapper, and so its listeners, after the stable-wrapper cache lets
+   go of it. On the old code the rebind released the old node's reference
+   and nothing took one for the new node. */
+static int test_rebind_keeps_kept_state(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               true);
+    CHECK(runtime != NULL);
+    ScriptRemoteDocumentBinding binding = {
+        .node_write = accept_remote_node_write
+    };
+    CHECK(script_runtime_rebind_remote_document(runtime, &binding));
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.hits=0;globalThis.ons=0;"
+        "globalThis.markup='<p>x</p>'.repeat(300);"
+        "document.body.innerHTML=markup;"
+        "for(const p of document.querySelectorAll('p')){"
+        "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
+        "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
+        "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    /* The swap. Walking back from the last element reaches the retained
+       wrappers (the last 128 wrapped) before fresh wrappers evict them,
+       so each is rebound to its successor; the kept ones are the last 44
+       (past 128 stable and 128 per-handle targets). */
+    CHECK(var_cache_eval(runtime,
+        "hits=0;ons=0;document.body.innerHTML=markup;"
+        "for(let i=300;i>0;i--)"
+        "document.querySelector('p:nth-child('+i+')').click();"
+        "pocSummary=hits+':'+ons", "256:256"));
+    /* Push the rebound wrappers out of the stable-wrapper cache. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const box=document.createElement('div');"
+        "box.innerHTML='<span>y</span>'.repeat(300);"
+        "document.body.appendChild(box);"
+        "for(const s of box.querySelectorAll('span'))void s.id})();"
+        "pocSummary='EVICTED'", "EVICTED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "const before=hits+':'+ons;hits=0;ons=0;"
+        "for(const p of document.querySelectorAll('p'))p.click();"
+        "pocSummary=before+'/'+hits+':'+ons", "256:256/172:172"));
+    script_runtime_rebind_remote_document(runtime, NULL);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* A node inserted into a held tree joins the tree's holder, so the tree's
+   listeners live as long as any of its wrappers, the new one included,
+   even when the wrappers that were there at the hold are all gone; and so
+   does a tree whose last old wrapper goes after a node was moved in from
+   another held tree. A held tree attached to the document is never held
+   again, so later insertions under its nodes stop calling the bootstrap. */
+static int test_insertion_joins_held_tree(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.hits=[];"
+        "(()=>{const r=document.createElement('div'),"
+        "c=document.createElement('p');r.appendChild(c);"
+        "c.addEventListener('click',()=>hits.push('c'));globalThis.r=r;"
+        "const o=document.createElement('div'),"
+        "d=document.createElement('p');o.appendChild(d);"
+        "d.addEventListener('click',()=>hits.push('d'));globalThis.o=o})();"
+        "pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(runtime->bridge.event_held_slots == 2);
+    uint64_t releases = runtime->bridge.event_held_releases;
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const x=document.createElement('b');"
+        "r.firstChild.appendChild(x);globalThis.kept=x;"
+        "const y=document.createElement('i');o.firstChild.appendChild(y);"
+        "r.appendChild(o);globalThis.inner=y;r=null;o=null})();"
+        "pocSummary='JOINED'", "JOINED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "kept.parentNode.click();inner.parentNode.click();"
+        "pocSummary=hits.join(',')", "c,d"));
+    /* Only the move of one held tree into the other re-rooted state. */
+    CHECK(runtime->bridge.event_held_releases - releases <= 2);
+    CHECK(var_cache_eval(runtime,
+        "document.body.appendChild(kept.parentNode.parentNode);"
+        "pocSummary='ATTACHED'", "ATTACHED"));
+    uint64_t hooks = runtime->bridge.event_state_hook_calls;
+    CHECK(var_cache_eval(runtime,
+        "for(let n=0;n<50;n++){kept.parentNode.appendChild("
+        "document.createElement('u'));"
+        "inner.parentNode.appendChild(document.createElement('s'))}"
+        "pocSummary='GREW'", "GREW"));
+    CHECK(runtime->bridge.event_state_hook_calls - hooks <= 2);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* Event state under a full page heap. The bootstrap's hold and release
+   hooks move a node's listeners and handlers between the per-handle maps,
+   a node's own wrapper and a detached tree's holder; a refused allocation
+   (tilefinch_test_faults: the Nth JavaScript heap allocation inside the
+   next hook call) must leave every node's state where it was, or (a
+   release) keep it alive until a later release finishes, never drop it.
+   Each case runs once without a refusal (the control) and then once per
+   allocation the hook makes, refusing that one, on a fresh page:
+   - after the refusal, 16 turns without a collection call no hook again
+     (the sweep waits for the heap to collect, rather than retrying every
+     turn);
+   - the case then drops its references, the heap collects (the hook is
+     retried and succeeds), fresh wrappers are made, and every listener
+     and on* handler must fire exactly as in the control, with the same
+     census of where the state lives.
+   On the old hooks the state a refusal caught in flight was gone: the
+   node's entries had left the per-handle maps (or its wrapper, or its
+   earlier holder) before the holder entry, its WeakRef or the stamp
+   allocated, and a release unhooked an entry before rooting it. */
+typedef struct {
+    const char *name;
+    bool refuse_growth;
+    /* Builds the tree; pocSummary='MADE'. */
+    const char *setup;
+    /* Collect first, so the tree is held before `change`. */
+    bool held_first;
+    /* Optional: the change that calls the release hook (release cases)
+       or makes the sweep call the hold hook; pocSummary='CHANGED'. */
+    const char *change;
+    bool release;
+    /* Drops references; pocSummary='DROPPED'. */
+    const char *drop;
+    /* Fires everything; pocSummary is the outcome compared with the
+       control's. */
+    const char *check;
+    /* The control's outcome, which every refused run must reproduce. */
+    const char *expected;
+} EventStateOomCase;
+
+#define EVENT_STATE_OOM_TREE                                                  \
+    "globalThis.hits=[];"                                                     \
+    "(()=>{const r=document.createElement('div');r.id='r';"                   \
+    "for(const id of ['a','b','c','d']){const e=document.createElement('p');" \
+    "e.id=id;r.appendChild(e)}"                                               \
+    "r.addEventListener('click',()=>hits.push('r'));"                         \
+    "r.querySelector('#a').addEventListener('click',()=>hits.push('a'));"     \
+    "r.querySelector('#b').onclick=()=>hits.push('bOn');"                     \
+    "const c=r.querySelector('#c');"                                          \
+    "c.addEventListener('click',()=>hits.push('c'));"                         \
+    "c.onclick=()=>hits.push('cOn');globalThis.root=r})();"
+#define EVENT_STATE_OOM_CLICKS                                                \
+    "hits=[];const at=globalThis.root||document;"                             \
+    "for(const id of ['a','b','c','d'])at.querySelector('#'+id).click();"     \
+    "(globalThis.root||document.getElementById('r')).click();"                \
+    "const census=__tilefinchRootCensus;"                                     \
+    "pocSummary=hits.join(',')+'|'+census.heldEventTargets+':'+"              \
+    "census.nativeListenerTargets+':'+census.nativeHandlerTargets"
+
+static const EventStateOomCase event_state_oom_cases[] = {
+    /* Rooted state moves to a new holder. */
+    {"hold-rooted", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'", false,
+     NULL, false, "pocSummary='DROPPED'",
+     EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,r,r|4:0:0"},
+    /* Held state moves from the tree's earlier holder, with a node rooted
+       since. */
+    {"hold-previous", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'", true,
+     "root.querySelector('#d').addEventListener('click',()=>hits.push('d'));"
+     "pocSummary='CHANGED'", false, "pocSummary='DROPPED'",
+     EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,d,r,r|5:0:0"},
+    /* State kept on the nodes' wrappers (the maps are full). */
+    {"hold-kept", true,
+     "for(let i=0;i<128;i++){const p=document.createElement('p');"
+     "document.body.appendChild(p);p.onclick=()=>0;"
+     "p.addEventListener('click',()=>0)}" EVENT_STATE_OOM_TREE
+     "pocSummary='MADE'", false, NULL, false, "pocSummary='DROPPED'",
+     EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,r,r|4:128:128"},
+    /* A frozen wrapper refuses the holder: the state stays rooted. */
+    {"hold-refused", false,
+     EVENT_STATE_OOM_TREE "globalThis.frozen=root.querySelector('#b');"
+     "Object.freeze(frozen);pocSummary='MADE'", false, NULL, false,
+     "pocSummary='DROPPED'", EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,r,r|0:4:2"},
+    /* A held tree inserted into the document is rooted again. */
+    {"release-insert", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'", true,
+     "document.body.appendChild(root);pocSummary='CHANGED'", true,
+     "root=null;pocSummary='DROPPED'",
+     EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,r,r|0:4:2"},
+    /* A node inserted into a held tree joins its holder (or, refused,
+       both are rooted again). */
+    {"release-join", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'", true,
+     "(()=>{const s=document.createElement('p');s.id='d';"
+     "s.addEventListener('click',()=>hits.push('d'));"
+     "root.querySelector('#d').replaceWith(s)})();pocSummary='CHANGED'",
+     true, "pocSummary='DROPPED'", EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,d,r,r|5:0:0"},
+    /* A frozen node inserted into a held tree cannot join its holder:
+       both trees are rooted again. */
+    {"release-join-refused", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'",
+     true,
+     "(()=>{const s=document.createElement('p');s.id='d';"
+     "s.addEventListener('click',()=>hits.push('d'));"
+     "Object.preventExtensions(s);root.querySelector('#d').replaceWith(s)})();"
+     "pocSummary='CHANGED'",
+     true, "pocSummary='DROPPED'", EVENT_STATE_OOM_CLICKS,
+     "a,r,bOn,r,c,cOn,r,d,r,r|5:0:0"},
+    /* A native pin (a detached media element's request) roots its tree's
+       held state again. */
+    {"release-pin", false,
+     "globalThis.fns=[];(()=>{const box=document.createElement('div'),"
+     "v=document.createElement('video');box.appendChild(v);"
+     "v.src='https://media.test/clip.mp4';"
+     "for(const [e,t] of [[box,'click'],[v,'playing'],[v,'pause']]){"
+     "const f=()=>e.id;e.addEventListener(t,f);fns.push(new WeakRef(f))}"
+     "v.onplaying=()=>v.id;fns.push(new WeakRef(v.onplaying));"
+     "globalThis.pinned=v})();pocSummary='MADE'", true,
+     "pinned.load();pocSummary='CHANGED'", true,
+     "pinned=null;pocSummary='DROPPED'",
+     "const census=__tilefinchRootCensus;"
+     "pocSummary=fns.map(r=>r.deref()?'kept':'lost').join(',')+'|'+"
+     "census.heldEventTargets+':'+census.nativeListenerTargets+':'+"
+     "census.nativeHandlerTargets",
+     "kept,kept,kept,kept|0:2:1"},
+};
+
+static bool event_state_oom_eval(ScriptRuntime *runtime, const char *script,
+                                 char *outcome, size_t capacity)
+{
+    ScriptResult result = {0};
+    if (!script_runtime_evaluate_diagnostic(runtime, script,
+                                            "<event-state-oom>", &result)) {
+        snprintf(outcome, capacity, "error: %s", result.error);
+        return false;
+    }
+    snprintf(outcome, capacity, "%s", result.summary);
+    return true;
+}
+
+/* Collects and runs owner turns until the wrappers the case dropped are
+   gone and a retried hold or release has run: four rounds of a collection
+   and four turns (collect_and_drain_finalizers' 64 turns are more than
+   these small trees need, over hundreds of runs). */
+static bool event_state_oom_settle(ScriptRuntime *runtime,
+                                   ScriptResult *result)
+{
+    for (size_t round = 0; round < 4; round++) {
+        (void) script_runtime_collect_and_trim(runtime);
+        for (size_t turn = 0; turn < 4; turn++)
+            if (!script_runtime_advance(runtime, 0, 1024, result))
+                return false;
+    }
+    return true;
+}
+
+/* Runs `test` with the Nth allocation of its hook refused (0: none).
+   *reached tells whether the hook made that many. */
+static int event_state_oom_run(const EventStateOomCase *test, unsigned nth,
+                               bool *reached, char *outcome, size_t capacity)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               test->refuse_growth);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    char summary[256];
+    CHECK(event_state_oom_eval(runtime, test->setup, summary, sizeof summary)
+          && strcmp(summary, "MADE") == 0);
+    if (test->held_first) {
+        CHECK(event_state_oom_settle(runtime, &result));
+        CHECK(runtime->bridge.event_held_slots != 0);
+    }
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->event_hook_refused = false;
+    uint64_t hooks = runtime->bridge.event_state_hook_calls,
+        failures = runtime->bridge.event_hook_failures;
+    if (test->release) faults->event_release_refuse_allocation = nth;
+    else faults->event_hold_refuse_allocation = nth;
+    if (test->change != NULL)
+        CHECK(event_state_oom_eval(runtime, test->change, summary,
+                                   sizeof summary)
+              && strcmp(summary, "CHANGED") == 0);
+    /* The sweep holds the tree within a few turns. */
+    for (size_t turn = 0; turn < 64 && !test->release
+         && runtime->bridge.event_state_hook_calls == hooks; turn++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    CHECK(runtime->bridge.event_state_hook_calls != hooks);
+    faults->event_hold_refuse_allocation = 0;
+    faults->event_release_refuse_allocation = 0;
+    *reached = nth != 0 && faults->event_hook_refused;
+    if (runtime->bridge.event_hook_failures != failures) {
+        /* The hook threw: no retry until the heap collects. */
+        size_t collections = runtime->heap_collections;
+        hooks = runtime->bridge.event_state_hook_calls;
+        uint64_t retries = runtime->bridge.event_release_retries;
+        for (size_t turn = 0; turn < 16; turn++)
+            CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+        if (runtime->heap_collections == collections) {
+            CHECK(runtime->bridge.event_state_hook_calls == hooks);
+            CHECK(runtime->bridge.event_release_retries == retries);
+        }
+    }
+    CHECK(event_state_oom_eval(runtime, test->drop, summary, sizeof summary)
+          && strcmp(summary, "DROPPED") == 0);
+    CHECK(event_state_oom_settle(runtime, &result));
+    CHECK(!runtime->bridge.event_release_pending);
+    CHECK(event_state_oom_eval(runtime, test->check, outcome, capacity));
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+static int test_event_state_survives_refused_allocations(void)
+{
+    for (size_t i = 0;
+         i < sizeof(event_state_oom_cases) / sizeof(event_state_oom_cases[0]);
+         i++) {
+        const EventStateOomCase *test = &event_state_oom_cases[i];
+        char control[256], outcome[256];
+        bool reached = false;
+        if (event_state_oom_run(test, 0, &reached, control, sizeof control)
+            != 0 || strcmp(control, test->expected) != 0) {
+            fprintf(stderr, "event-state oom %s control: %s\n", test->name,
+                    control);
+            return 1;
+        }
+        unsigned nth = 1;
+        for (; nth < 1000; nth++) {
+            outcome[0] = '\0';
+            if (event_state_oom_run(test, nth, &reached, outcome,
+                                    sizeof outcome) != 0
+                || strcmp(outcome, control) != 0) {
+                fprintf(stderr,
+                        "event-state oom %s: allocation %u refused: %s "
+                        "(control %s)\n", test->name, nth, outcome, control);
+                return 1;
+            }
+            if (!reached) break;
+        }
+        CHECK(nth > 1 && nth < 1000);
+        printf("event-state oom %s: %u refusal points\n", test->name,
+               nth - 1);
+    }
+    return 0;
+}
+
+/* Page script under a full page heap, through a probe the test installs:
+   __testRefuse(n) refuses the realm's Nth allocation from then on (0
+   disarms) and __testRefusalPending() tells whether it is still to come.
+   Each case refuses every allocation of one operation in turn, on a fresh
+   page, then retries the operation unrefused, drops its references,
+   collects, and must fire everything as the unrefused control does.
+   - wrap-held: a wrapper made in a held tree must join the tree's holder
+     before it becomes the node's live wrapper. On the old code a refused
+     stamp left a live wrapper outside the holder, which the collector
+     then took with the tree's handlers once the old wrappers went.
+   - rebind-kept: a section swap rebinds a retained wrapper whose node's
+     state it carries (the event-target maps are full). On the old code a
+     refusal after the old handle's lease went left the state on the
+     wrapper with no native reference, and the retried rebind (same
+     handle) never took one, so the state died with the wrapper. */
+static JSValue event_state_test_refuse(JSContext *context,
+                                       JSValueConst this_value, int argc,
+                                       JSValueConst *argv)
+{
+    (void) this_value;
+    uint32_t nth = 0;
+    if (argc > 0 && JS_ToUint32(context, &nth, argv[0]) < 0)
+        return JS_EXCEPTION;
+    JS_TestRefuseAllocation(nth);
+    return JS_UNDEFINED;
+}
+
+static JSValue event_state_test_refusal_pending(JSContext *context,
+                                                JSValueConst this_value,
+                                                int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    return JS_NewBool(context, JS_TestRefusalPending());
+}
+
+typedef struct {
+    const char *name;
+    bool remote_writer;
+    const char *setup;
+    /* Runs the refused operation (`N` is the refusal) and retries it;
+       pocSummary='LEFT' when the refusal never came. */
+    const char *operation;
+    const char *check;
+    const char *expected;
+} EventStatePageOomCase;
+
+static const EventStatePageOomCase event_state_page_oom_cases[] = {
+    {"wrap-held", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'",
+     "let w=null;__testRefuse(N);try{w=root.querySelector('#b')}catch{}"
+     "const left=__testRefusalPending();__testRefuse(0);"
+     "globalThis.kept=w||root.querySelector('#b');root=null;"
+     "pocSummary=left?'LEFT':'DONE'",
+     "hits=[];kept.click();kept.parentNode.querySelector('#c').click();"
+     "pocSummary=hits.join(',')+'|'+"
+     "__tilefinchRootCensus.heldEventTargets",
+     "bOn,r,c,cOn,r|4"},
+    {"rebind-kept", true,
+     "globalThis.hits=0;globalThis.ons=0;"
+     "globalThis.markup='<p>x</p>'.repeat(300);"
+     "document.body.innerHTML=markup;"
+     "for(const p of document.querySelectorAll('p')){"
+     "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
+     "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
+     "const sel='p:nth-child(300)';document.querySelector(sel);"
+     "document.body.innerHTML=markup;"
+     "__testRefuse(N);try{document.querySelector(sel)}catch{}"
+     "const left=__testRefusalPending();__testRefuse(0);"
+     "for(let i=300;i>0;i--)"
+     "document.querySelector('p:nth-child('+i+')').click();"
+     "(()=>{const box=document.createElement('div');"
+     "box.innerHTML='<span>y</span>'.repeat(300);"
+     "document.body.appendChild(box);"
+     "for(const s of box.querySelectorAll('span'))void s.id})();"
+     "pocSummary=left?'LEFT':'DONE'",
+     "hits=0;ons=0;for(const p of document.querySelectorAll('p'))p.click();"
+     "pocSummary=hits+':'+ons",
+     "172:172"},
+};
+
+static int event_state_page_oom_run(const EventStatePageOomCase *test,
+                                    unsigned nth, bool *reached,
+                                    char *outcome, size_t capacity)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               test->remote_writer);
+    CHECK(runtime != NULL);
+    ScriptRemoteDocumentBinding binding = {
+        .node_write = accept_remote_node_write
+    };
+    if (test->remote_writer)
+        CHECK(script_runtime_rebind_remote_document(runtime, &binding));
+    JSContext *context = runtime->context;
+    JSValue global = JS_GetGlobalObject(context);
+    CHECK(JS_SetPropertyStr(context, global, "__testRefuse",
+                            JS_NewCFunction(context, event_state_test_refuse,
+                                            "__testRefuse", 1)) >= 0);
+    CHECK(JS_SetPropertyStr(
+              context, global, "__testRefusalPending",
+              JS_NewCFunction(context, event_state_test_refusal_pending,
+                              "__testRefusalPending", 0)) >= 0);
+    JS_FreeValue(context, global);
+    ScriptResult result = {0};
+    char summary[256], script[2048];
+    CHECK(event_state_oom_eval(runtime, test->setup, summary, sizeof summary)
+          && strcmp(summary, "MADE") == 0);
+    CHECK(event_state_oom_settle(runtime, &result));
+    snprintf(script, sizeof script, "const N=%u;%s", nth, test->operation);
+    CHECK(event_state_oom_eval(runtime, script, summary, sizeof summary));
+    JS_TestRefuseAllocation(0);
+    *reached = strcmp(summary, "DONE") == 0;
+    CHECK(*reached || strcmp(summary, "LEFT") == 0);
+    CHECK(event_state_oom_settle(runtime, &result));
+    CHECK(event_state_oom_eval(runtime, test->check, outcome, capacity));
+    if (test->remote_writer)
+        script_runtime_rebind_remote_document(runtime, NULL);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+static int test_event_state_survives_refused_page_allocations(void)
+{
+    for (size_t i = 0; i < sizeof(event_state_page_oom_cases)
+                               / sizeof(event_state_page_oom_cases[0]);
+         i++) {
+        const EventStatePageOomCase *test = &event_state_page_oom_cases[i];
+        char control[256], outcome[256];
+        bool reached = false;
+        if (event_state_page_oom_run(test, 0, &reached, control,
+                                     sizeof control) != 0
+            || strcmp(control, test->expected) != 0) {
+            fprintf(stderr, "event-state page oom %s control: %s\n",
+                    test->name, control);
+            return 1;
+        }
+        unsigned nth = 1;
+        for (; nth < 2000; nth++) {
+            outcome[0] = '\0';
+            if (event_state_page_oom_run(test, nth, &reached, outcome,
+                                         sizeof outcome) != 0
+                || strcmp(outcome, control) != 0) {
+                fprintf(stderr,
+                        "event-state page oom %s: allocation %u refused: %s "
+                        "(control %s)\n", test->name, nth, outcome, control);
+                return 1;
+            }
+            if (!reached) break;
+        }
+        CHECK(nth > 1 && nth < 2000);
+        printf("event-state page oom %s: %u refusal points\n", test->name,
+               nth - 1);
+    }
+    return 0;
+}
+
+/* The cost of the event-state bookkeeping, as counted in test builds
+   (calls into the bootstrap's hold and release hooks, held states rooted
+   again, STUCK reopenings) and timed on the host:
+   - an append-heavy build of a 1,000-node detached tree while one pending
+     image with an onload handler is held;
+   - a held tree built 20 nodes per turn over 10 turns;
+   - 2,000 wrappers made for connected nodes while a tree is held;
+   - 200 detached wrappers released over 10 rounds while a frozen wrapper
+     keeps another tree STUCK.
+   Prints the numbers and checks the counts that must stay at zero. */
+static uint64_t bookkeeping_eval_us(ScriptRuntime *runtime, const char *script,
+                                    const char *expected, bool *ok)
+{
+    uint64_t start = tilefinch_platform_monotonic_time_ns();
+    *ok &= var_cache_eval(runtime, script, expected);
+    return (tilefinch_platform_monotonic_time_ns() - start) / 1000u;
+}
+
+static int test_event_state_bookkeeping_cost(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    DomBridge *bridge = &runtime->bridge;
+    ScriptResult result = {0};
+    bool ok = true;
+    CHECK(var_cache_eval(runtime,
+        "globalThis.pending=new Image();pending.onload=()=>pending.width;"
+        "pending.src='https://images.test/never.png';"
+        "document.body.innerHTML='<i></i>'.repeat(2000);pocSummary='MADE'",
+        "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(bridge->event_held_slots != 0);
+
+    uint64_t hooks = bridge->event_state_hook_calls;
+    uint64_t build_us = bookkeeping_eval_us(runtime,
+        "(()=>{const root=document.createElement('div');"
+        "for(let r=0;r<250;r++){const row=document.createElement('div');"
+        "for(let c=0;c<3;c++)row.appendChild(document.createElement('span'));"
+        "root.appendChild(row)}globalThis.built=root})();"
+        "pocSummary=String(built.querySelectorAll('span').length)", "750",
+        &ok);
+    uint64_t build_hooks = bridge->event_state_hook_calls - hooks;
+
+    CHECK(var_cache_eval(runtime,
+        "globalThis.growing=document.createElement('ul');globalThis.calls=0;"
+        "growing.addEventListener('click',()=>calls++);pocSummary='GROWING'",
+        "GROWING"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    hooks = bridge->event_state_hook_calls;
+    uint64_t releases = bridge->event_held_releases;
+    for (int turn = 0; turn < 10; turn++) {
+        CHECK(var_cache_eval(runtime,
+            "for(let n=0;n<20;n++){const li=document.createElement('li');"
+            "li.addEventListener('click',()=>calls++);growing.appendChild(li)}"
+            "pocSummary='GREW'", "GREW"));
+        for (int step = 0; step < 8; step++)
+            CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    }
+    uint64_t grow_hooks = bridge->event_state_hook_calls - hooks;
+    uint64_t grow_releases = bridge->event_held_releases - releases;
+    CHECK(var_cache_eval(runtime,
+        "for(const li of growing.children)li.click();"
+        "pocSummary=String(calls)", "400"));
+
+    uint64_t wrap_us = bookkeeping_eval_us(runtime,
+        "pocSummary=String(document.body.querySelectorAll('i').length)",
+        "2000", &ok);
+
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const root=document.createElement('div'),"
+        "f=document.createElement('i');root.appendChild(f);"
+        "root.addEventListener('click',()=>0);Object.preventExtensions(f);"
+        "globalThis.stuck=root;globalThis.stuckF=f})();pocSummary='STUCK'",
+        "STUCK"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(bridge->event_stuck_slots != 0);
+    uint64_t reopens = bridge->event_stuck_reopens;
+    hooks = bridge->event_state_hook_calls;
+    for (int round = 0; round < 10; round++) {
+        CHECK(var_cache_eval(runtime,
+            "for(let n=0;n<20;n++)document.createElement('p').id='p'+n;"
+            "pocSummary='DROPPED'", "DROPPED"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+    }
+    uint64_t stuck_reopens = bridge->event_stuck_reopens - reopens;
+    uint64_t stuck_hooks = bridge->event_state_hook_calls - hooks;
+    /* Losing the frozen wrapper reopens its own tree, which is held. */
+    CHECK(var_cache_eval(runtime, "stuckF=null;pocSummary='THAWED'",
+                         "THAWED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(bridge->event_stuck_slots == 0);
+    CHECK(var_cache_eval(runtime,
+        "stuck.click();pocSummary='OK'", "OK"));
+
+    printf("event-state-cost build-1000 hooks=%llu us=%llu | "
+           "grow-200 hooks=%llu held-releases=%llu | "
+           "wrap-2000-connected us=%llu | "
+           "stuck-200-releases reopens=%llu hooks=%llu\n",
+           (unsigned long long) build_hooks, (unsigned long long) build_us,
+           (unsigned long long) grow_hooks,
+           (unsigned long long) grow_releases,
+           (unsigned long long) wrap_us,
+           (unsigned long long) stuck_reopens,
+           (unsigned long long) stuck_hooks);
+    CHECK(ok);
+    /* Appends that concern no holder stay native; appends into a held
+       tree join its holder instead of rooting its state again. */
+    CHECK(build_hooks == 0);
+    CHECK(grow_releases == 0);
+    /* Releases in other trees leave the stuck one alone. */
+    CHECK(stuck_reopens == 0 && stuck_hooks == 0);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+static int test_detached_style_ownership(void)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.styleOwnerDocument=document.implementation.createHTMLDocument('Other');"
+        "(()=>{const n=styleOwnerDocument.createElement('div');n.style.color='red'})();"
+        "pocSummary='WARM'", "WARM"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = script_runtime_heap_used(runtime);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{for(let i=0;i<128;i++){const n=styleOwnerDocument.createElement('div');"
+        "n.payload=new Uint8Array(4096);void n.style;"
+        "if(!i)globalThis.deadStyleOwner=new WeakRef(n)}pocSummary='DROPPED'})()", "DROPPED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = script_runtime_heap_used(runtime);
+    printf("detached-style dropped=128 retained-delta=%lld\n",
+           (long long) after - (long long) before);
+    CHECK(after < before + 128u * 1024u);
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=deadStyleOwner.deref()===undefined?'COLLECTED':'RETAINED'", "COLLECTED"));
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const n=styleOwnerDocument.createElement('div');"
+        "globalThis.heldDetachedStyle=n.style;globalThis.heldStyleOwner=new WeakRef(n);"
+        "const same=n.style===heldDetachedStyle;n.style.color='blue';"
+        "pocSummary=same?'SAME':'DIFFERENT'})()", "SAME"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "heldDetachedStyle.color='red';pocSummary=heldStyleOwner.deref().getAttribute('style')"
+        ".includes('red')?'LIVE':'LOST';heldDetachedStyle=null", "LIVE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=heldStyleOwner.deref()===undefined?'RELEASED':'RETAINED'", "RELEASED"));
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -5061,9 +6532,9 @@ static int test_usv_string_conversion(void)
     return 0;
 }
 
-/* The node-handle table has SCRIPT_DOM_HANDLE_SLOT_CAPACITY slots, and a
-   slot is released only when its wrapper is finalized, which normally waits
-   for a job checkpoint. A single synchronous script that creates more
+/* The node-handle table has SCRIPT_DOM_HANDLE_SLOT_CAPACITY slots. Dead
+   wrapper identities normally retire in bounded owner-turn maintenance.
+   A single synchronous script that creates more
    unreferenced wrappers than the table holds must reclaim the dead ones at
    exhaustion; one that genuinely retains them all must get a clean
    RangeError from the DOM API, and the realm must recover once they drop. */
@@ -5081,6 +6552,722 @@ static bool handle_table_eval(ScriptRuntime *runtime, const char *source,
             result->dom_handle_slot_reuses, result->dom_handle_exhaustions,
             result->dom_handle_wrapper_releases);
     return false;
+}
+
+static int test_parser_timer_checkpoint(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    const char html[] = "<!doctype html><body>Streaming</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://parser.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.order=[];requestAnimationFrame(()=>order.push('frame'));"
+        "setTimeout(()=>{order.push('first');"
+        "Promise.resolve().then(()=>order.push('microtask'))},20);"
+        "setTimeout(()=>order.push('second'),20);pocSummary='READY'",
+        "READY", &result));
+    /* Make the rendering task the due wheel head. A parser delivery must
+       find the ordinary task behind it, run only one, and checkpoint its
+       promises without pretending a rendering opportunity occurred. */
+    CHECK(script_runtime_advance(runtime, 33u, 0u, &result));
+    CHECK(script_runtime_parser_timer_checkpoint(runtime));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=order.join(',')", "first,microtask", &result));
+    CHECK(script_runtime_parser_timer_checkpoint(runtime));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=order.join(',')", "first,microtask,second", &result));
+    CHECK(script_runtime_parser_timer_checkpoint(runtime));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=order.join(',')", "first,microtask,second", &result));
+    CHECK(script_runtime_advance(runtime, 0u, 1u, &result));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=order.join(',')", "first,microtask,second,frame", &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_detached_image_preloads(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    const char html[] = "<!doctype html><body>Images</body>";
+    PocDocument document;
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://image.test/", &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.imageLoads=0;globalThis.imageErrors=0;"
+        "globalThis.preload=new Image();"
+        "preload.onload=()=>imageLoads++;preload.onerror=()=>imageErrors++;"
+        "preload.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%222%22 height=%223%22%3E%3Crect width=%222%22 height=%223%22 fill=%22red%22/%3E%3C/svg%3E';"
+        "pocSummary=!preload.complete&&imageLoads===0?'QUEUED':'SYNC'",
+        "QUEUED", &result));
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=JSON.stringify([imageLoads,imageErrors,preload.complete,"
+        "preload.naturalWidth,preload.naturalHeight,preload.isConnected,"
+        "document.querySelectorAll('img').length])",
+        "[1,0,true,2,3,false,0]", &result));
+    CHECK(handle_table_eval(runtime,
+        "{const c=document.createElement('canvas');c.width=2;c.height=3;"
+        "const x=c.getContext('2d');x.drawImage(preload,0,0);"
+        "const p=x.getImageData(0,0,1,1).data;"
+        "pocSummary=p[0]===255&&p[1]===0&&p[2]===0&&p[3]===255?'PIXELS':'BAD'}",
+        "PIXELS", &result));
+    CHECK(handle_table_eval(runtime,
+        "preload.src='data:image/png;base64,YmFk';pocSummary='BAD-QUEUED'",
+        "BAD-QUEUED", &result));
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=JSON.stringify([imageLoads,imageErrors,preload.complete,"
+        "preload.naturalWidth,preload.naturalHeight])",
+        "[1,1,true,0,0]", &result));
+    CHECK(handle_table_eval(runtime,
+        "preload.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%224%22 height=%225%22/%3E';"
+        "preload.src='';pocSummary='CANCELLED'", "CANCELLED", &result));
+    for (size_t i = 0; i < 16u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    /* The empty source supersedes the load and fires its own error. */
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=JSON.stringify([imageLoads,imageErrors,preload.complete])",
+        "[1,2,true]", &result));
+    CHECK(handle_table_eval(runtime,
+        "preload.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%224%22 height=%225%22/%3E';"
+        "pocSummary='FIRST'", "FIRST", &result));
+    CHECK(script_runtime_advance(runtime, 0u, 0u, &result));
+    CHECK(handle_table_eval(runtime,
+        "preload.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%226%22 height=%227%22/%3E';"
+        "pocSummary='REPLACED'", "REPLACED", &result));
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=JSON.stringify([imageLoads,imageErrors,preload.naturalWidth,"
+        "preload.naturalHeight])", "[2,2,6,7]", &result));
+    /* The source setter never throws (a browser's does not), and teardown
+       must cancel every held wrapper, including work which never reached
+       transport. */
+    CHECK(handle_table_eval(runtime,
+        "preload.removeAttribute('src');globalThis.preloadKeep=[];"
+        "{let threw=false;try{for(let i=0;i<129;i++){const n=new Image();"
+        "n.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%221%22 height=%221%22/%3E';"
+        "preloadKeep.push(n)}}catch(e){threw=true}"
+        "pocSummary=!threw&&preloadKeep.length===129"
+        "&&preloadKeep[128].getAttribute('src')!==null"
+        "&&!preloadKeep[128].complete?'BOUNDED':'THREW'}",
+        "BOUNDED", &result));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+#define PRELOAD_TEST_SVG(w, h) "data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22" #w "%22 height=%22" #h "%22%3E%3Crect width=%22" #w "%22 height=%22" #h "%22 fill=%22red%22/%3E%3C/svg%3E"
+
+typedef struct {
+    Budget budget;
+    PocDocument document;
+    Stylesheet sheet;
+    ScriptResult result;
+    ScriptRuntime *runtime;
+} PreloadPage;
+
+static int preload_page_open(PreloadPage *page)
+{
+    memset(page, 0, sizeof(*page));
+    budget_init(&page->budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&page->budget));
+    static const char html[] = "<!doctype html><body>Images</body>";
+    CHECK(document_parse(&page->document, &page->budget, html,
+                         sizeof(html) - 1u, 17)
+        && stylesheet_build(&page->sheet, &page->budget, &page->document, 480));
+    page->runtime = script_runtime_create(
+        &page->document, &page->budget, 8u * MIB, 1500,
+        "https://image.test/", &page->result);
+    CHECK(page->runtime != NULL);
+    script_runtime_set_stylesheet(page->runtime, &page->sheet);
+    return 0;
+}
+
+static int preload_page_close(PreloadPage *page)
+{
+    script_runtime_destroy(page->runtime);
+    stylesheet_destroy(&page->sheet);
+    document_destroy(&page->document);
+    CHECK(page->budget.current == 0 && budget_uninstall_lexbor(&page->budget));
+    return 0;
+}
+
+/* Advances until `probe` sets pocSummary to `expected`, at most `turns`. */
+static bool preload_page_await(PreloadPage *page, size_t turns,
+                               const char *probe, const char *expected)
+{
+    for (size_t i = 0; i < turns; i++) {
+        if (!script_runtime_advance(page->runtime, 16u, 4u, &page->result))
+            return false;
+        if (i % 16u != 15u) continue;
+        if (script_runtime_evaluate_diagnostic(page->runtime, probe,
+                                               "<preload-await>", &page->result)
+            && strcmp(page->result.summary, expected) == 0) return true;
+    }
+    return handle_table_eval(page->runtime, probe, expected, &page->result);
+}
+
+/* A page that awaits every detached image settles, however many it makes.
+   Images past the first slots queue and load as earlier ones finish. The
+   lane's image table tracks at most IMAGE_TRACKED_NODE_LIMIT live images
+   (an image past that fails to load), and an image past the lane's slot
+   bound gets an error event without a load. */
+static int test_detached_image_preloads_settle_past_lane(void)
+{
+    PreloadPage page;
+    CHECK(preload_page_open(&page) == 0);
+    CHECK(IMAGE_TRACKED_NODE_LIMIT == 192u);
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.keep=[];globalThis.state='WAITING';"
+        "globalThis.batch=n=>{const all=[];for(let i=0;i<n;i++){"
+        "const img=new Image();all.push(new Promise(r=>{"
+        "img.onload=function(){r(this.naturalWidth===1?'load':'bad')};"
+        "img.onerror=()=>r('error')}));"
+        "img.src='" PRELOAD_TEST_SVG(1, 1) "';keep.push(img)}"
+        "Promise.all(all).then(r=>state='SETTLED:'"
+        "+r.filter(x=>x==='load').length+':'"
+        "+r.filter(x=>x==='error').length)};"
+        "batch(200);pocSummary='QUEUED'", "QUEUED", &page.result));
+    CHECK(preload_page_await(&page, 1024u, "pocSummary=state",
+                             "SETTLED:192:8"));
+    /* Dropping them frees their slots and table entries for new images. */
+    CHECK(handle_table_eval(page.runtime, "keep=[];pocSummary='DROPPED'",
+                            "DROPPED", &page.result));
+    JS_RunGC(page.runtime->runtime);
+    JS_RunGC(page.runtime->runtime);
+    for (size_t i = 0; i < 32u; i++)
+        CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    /* 600 live images: 512 take slots (192 of those load), 88 overflow. */
+    CHECK(handle_table_eval(page.runtime,
+        "state='WAITING';batch(600);pocSummary='QUEUED'", "QUEUED",
+        &page.result));
+    CHECK(preload_page_await(&page, 2048u, "pocSummary=state",
+                             "SETTLED:192:408"));
+    CHECK(preload_page_close(&page) == 0);
+    return 0;
+}
+
+/* A detached image whose node is freed releases every preload pointer to
+   it at once. A new image allocated at the same address before the next
+   sweep must neither answer with the old image's pixels nor lose its own
+   when the stale slot is finally swept. */
+static int test_detached_image_preload_address_reuse(void)
+{
+    PreloadPage page;
+    CHECK(preload_page_open(&page) == 0);
+    tilefinch_test_faults()->defer_image_preload_sweep = true;
+    bool ok = true;
+    for (int phase = 0; ok && phase < 2; phase++) {
+        ok = handle_table_eval(page.runtime,
+            "globalThis.old=new Image();old.src='" PRELOAD_TEST_SVG(2, 3) "';"
+            "pocSummary='OLD'", "OLD", &page.result)
+            && preload_page_await(&page, 64u,
+                "pocSummary=old.complete+':'+old.naturalWidth", "true:2")
+            && handle_table_eval(page.runtime,
+                "old=null;pocSummary='DROPPED'", "DROPPED", &page.result);
+        if (!ok) break;
+        size_t releases = page.result.dom_handle_wrapper_releases;
+        JS_RunGC(page.runtime->runtime);
+        JS_RunGC(page.runtime->runtime);
+        for (size_t i = 0; i < 16u; i++)
+            ok = ok && script_runtime_advance(page.runtime, 16u, 4u, &page.result);
+        if (!ok || page.result.dom_handle_wrapper_releases == releases) {
+            fprintf(stderr, "address reuse: wrapper not released\n");
+            ok = false;
+            break;
+        }
+        /* Several new images, so one lands on the freed address. Phase 0
+           loads undecodable bytes (each must fail, not borrow the old
+           pixels); phase 1 loads a 4x5 image and then lets the stale
+           slot's sweep run (each must keep its own pixels). */
+        ok = handle_table_eval(page.runtime, phase == 0
+            ? "globalThis.events=[];globalThis.fresh=[];"
+              "for(let i=0;i<8;i++){const n=new Image();"
+              "n.onload=()=>events.push('load'+n.naturalWidth);"
+              "n.onerror=()=>events.push('error');"
+              "n.src='data:image/png;base64,YmFk';fresh.push(n)}"
+              "pocSummary='FRESH'"
+            : "events=[];fresh=[];"
+              "for(let i=0;i<8;i++){const n=new Image();"
+              "n.onload=()=>events.push('load'+n.naturalWidth);"
+              "n.onerror=()=>events.push('error');"
+              "n.src='" PRELOAD_TEST_SVG(4, 5) "';fresh.push(n)}"
+              "pocSummary='FRESH'", "FRESH", &page.result)
+            && preload_page_await(&page, 256u,
+                "pocSummary=events.length===8?[...new Set(events)].join():'WAIT'",
+                phase == 0 ? "error" : "load4");
+        if (ok && phase == 1) {
+            tilefinch_test_faults()->defer_image_preload_sweep = false;
+            for (size_t i = 0; ok && i < 8u; i++)
+                ok = script_runtime_advance(page.runtime, 16u, 4u, &page.result);
+            ok = ok && handle_table_eval(page.runtime,
+                "pocSummary=[...new Set(fresh.map(n=>n.naturalWidth+'x'"
+                "+n.naturalHeight))].join()", "4x5", &page.result);
+        }
+    }
+    tilefinch_test_faults()->defer_image_preload_sweep = false;
+    CHECK(ok);
+    CHECK(preload_page_close(&page) == 0);
+    return 0;
+}
+
+/* HTMLImageElement.complete is true for a broken image. An image refused
+   a lane slot is broken from its error event until its source changes,
+   like one whose fetch or decode failed, with no natural size. */
+static int test_refused_image_complete(void)
+{
+    PreloadPage page;
+    CHECK(preload_page_open(&page) == 0);
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.log=[];globalThis.keep=[];"
+        "globalThis.watch=(k,img)=>{img.onerror=()=>log.push(k+':'+img.complete"
+        "+':'+img.naturalWidth+'x'+img.naturalHeight)};"
+        "for(let n=0;n<512;n++){const i=new Image();"
+        "i.src='" PRELOAD_TEST_SVG(1, 1) "';keep.push(i)}"
+        "globalThis.refused=new Image();watch('refused',refused);"
+        "refused.src='" PRELOAD_TEST_SVG(2, 2) "';"
+        "const undecodable=new Image();keep.push(undecodable);"
+        "watch('undecodable',undecodable);"
+        "undecodable.src='data:image/png;base64,AAAAAAAA';"
+        "pocSummary=String(refused.complete)", "false", &page.result));
+    CHECK(preload_page_await(&page, 2048u,
+        "pocSummary=log.slice().sort().join(',')",
+        "refused:true:0x0,undecodable:true:0x0"));
+    CHECK(handle_table_eval(page.runtime,
+        "pocSummary=String(refused.complete)", "true", &page.result));
+    /* A new source starts a new request (refused again while the lane is
+       full): not complete until its error. Without a source it is. */
+    CHECK(handle_table_eval(page.runtime,
+        "log.length=0;refused.src='" PRELOAD_TEST_SVG(3, 3) "';"
+        "pocSummary=String(refused.complete)", "false", &page.result));
+    CHECK(preload_page_await(&page, 2048u, "pocSummary=log.join(',')",
+                             "refused:true:0x0"));
+    CHECK(handle_table_eval(page.runtime,
+        "refused.removeAttribute('src');const empty=new Image();empty.src='';"
+        "pocSummary=refused.complete+','+empty.complete+','+new Image().complete",
+        "true,true,true", &page.result));
+    CHECK(preload_page_close(&page) == 0);
+    return 0;
+}
+
+/* Shared setup for detached-image lanes fed by the http-image-cap replay:
+   /a.svg answers one pump after its request, so a load spans pumps. */
+typedef struct {
+    Budget budget;
+    PocDocument document;
+    Stylesheet sheet;
+    ScriptResult result;
+    ScriptRuntime *runtime;
+} PreloadReplayPage;
+
+static int preload_replay_open(PreloadReplayPage *page)
+{
+    memset(page, 0, sizeof(*page));
+    budget_init(&page->budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&page->budget));
+    char trace_error[256] = {0};
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-image-cap",
+        trace_error, sizeof(trace_error)));
+    static const char html[] = "<!doctype html><body>Images</body>";
+    CHECK(document_parse(&page->document, &page->budget, html,
+                         sizeof(html) - 1u, 17)
+        && stylesheet_build(&page->sheet, &page->budget, &page->document, 480));
+    page->runtime = script_runtime_create(
+        &page->document, &page->budget, 8u * MIB, 1500,
+        "https://image-cap.test/", &page->result);
+    CHECK(page->runtime != NULL);
+    script_runtime_set_stylesheet(page->runtime, &page->sheet);
+    return 0;
+}
+
+static int preload_replay_close(PreloadReplayPage *page)
+{
+    script_runtime_destroy(page->runtime);
+    fetch_trace_end();
+    stylesheet_destroy(&page->sheet);
+    document_destroy(&page->document);
+    CHECK(page->budget.current == 0 && budget_uninstall_lexbor(&page->budget));
+    return 0;
+}
+
+static size_t preload_replay_requests(void)
+{
+    FetchTraceReplayStats stats = {0};
+    return fetch_trace_replay_stats(&stats) ? stats.matched_request_count : 0;
+}
+
+/* Drawing (or uploading) a detached image that has not decoded yet reads no
+   pixels and must not restart its load: a canvas game draws every frame. */
+static int test_detached_image_preload_drawn_while_loading(void)
+{
+    PreloadReplayPage page;
+    CHECK(preload_replay_open(&page) == 0);
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.loads=0;globalThis.errors=0;globalThis.img=new Image();"
+        "img.onload=()=>loads++;img.onerror=()=>errors++;img.src='/a.svg';"
+        "{const c=document.createElement('canvas'),x=c.getContext('2d');"
+        "const draw=()=>{if(loads+errors)return;x.drawImage(img,0,0);"
+        "requestAnimationFrame(draw)};requestAnimationFrame(draw)}"
+        "pocSummary='DRAWING'", "DRAWING", &page.result));
+    for (size_t i = 0; i < 32u; i++)
+        CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    size_t requests = preload_replay_requests();
+    bool ok = handle_table_eval(page.runtime,
+        "pocSummary=JSON.stringify([loads,errors,img.complete,img.naturalWidth])",
+        "[1,0,true,1]", &page.result);
+    if (!ok || requests != 1u)
+        fprintf(stderr, "drawn preload: requests=%zu\n", requests);
+    CHECK(ok && requests == 1u);
+    CHECK(preload_replay_close(&page) == 0);
+    return 0;
+}
+
+/* Clearing a finished preload (its source changed, or its wrapper died)
+   must not restart another image's in-flight load. */
+static int test_detached_image_preload_unrelated_clear(void)
+{
+    PreloadReplayPage page;
+    CHECK(preload_replay_open(&page) == 0);
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.events=[];globalThis.done=new Image();"
+        "done.onload=()=>events.push('done');"
+        "done.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%222%22 height=%222%22/%3E';"
+        "pocSummary='QUEUED'", "QUEUED", &page.result));
+    for (size_t i = 0; i < 16u; i++)
+        CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    CHECK(handle_table_eval(page.runtime,
+        "globalThis.slow=new Image();slow.onload=()=>events.push('slow');"
+        "slow.onerror=()=>events.push('slow-error');slow.src='/a.svg';"
+        "pocSummary=events.join()", "done", &page.result));
+    /* One pump admits the request; it answers on a later pump. */
+    CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    CHECK(preload_replay_requests() == 1u);
+    CHECK(handle_table_eval(page.runtime,
+        "done.src='';pocSummary=events.join()", "done", &page.result));
+    for (size_t i = 0; i < 16u; i++)
+        CHECK(script_runtime_advance(page.runtime, 16u, 4u, &page.result));
+    size_t requests = preload_replay_requests();
+    bool ok = handle_table_eval(page.runtime,
+        "pocSummary=events.join()", "done,slow", &page.result);
+    if (!ok || requests != 1u)
+        fprintf(stderr, "unrelated clear: requests=%zu\n", requests);
+    CHECK(ok && requests == 1u);
+    CHECK(preload_replay_close(&page) == 0);
+    return 0;
+}
+
+/* A queued preload's timeout runs from its own first start attempt, and a
+   busy decoder defers that start rather than failing the image. */
+static int test_detached_image_preload_busy_decoder(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><body>Images</body>";
+    PocDocument document;
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 100, "https://image.test/", &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    tilefinch_test_faults()->image_decode_busy = true;
+    CHECK(handle_table_eval(runtime,
+        "globalThis.events=[];globalThis.img=new Image();"
+        "img.onload=()=>events.push('load');img.onerror=()=>events.push('error');"
+        "img.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%223%22 height=%223%22/%3E';"
+        "pocSummary='QUEUED'", "QUEUED", &result));
+    /* Longer than the 100 ms timeout passes before the first pump. */
+    usleep(150000);
+    for (size_t i = 0; i < 4u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    bool waited = handle_table_eval(runtime,
+        "pocSummary=events.join()+'|'+img.complete", "|false", &result);
+    tilefinch_test_faults()->image_decode_busy = false;
+    CHECK(waited);
+    for (size_t i = 0; i < 16u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 4u, &result));
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=events.join()+'|'+img.naturalWidth", "load|3", &result));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A failed atob/btoa leaves nothing diagnostic behind: no page-visible
+   global records the input, and a later unrelated error is reported as the
+   page threw it, with no base64 text appended. */
+static int test_base64_failure_leaves_no_diagnostic(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><body>Base64</body>";
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://base64.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(handle_table_eval(runtime,
+        "let names=[];try{atob('!')}catch(e){names.push(e.name,e.message)}"
+        "try{btoa('\\u0100')}catch(e){names.push(e.name,e.message)}"
+        "pocSummary=('__tilefinchBase64Error' in globalThis?'GLOBAL':'CLEAN')"
+        "+'|'+names.join('|')",
+        "CLEAN|InvalidCharacterError|The string to be decoded is not "
+        "correctly encoded.|InvalidCharacterError|The string to be encoded "
+        "contains characters outside of the Latin1 range.", &result));
+    bool threw = !script_runtime_evaluate_diagnostic(
+        runtime, "throw new Error('later')", "<later-error>", &result);
+    bool clean = strstr(result.error, "later") != NULL
+        && strstr(result.error, "base64") == NULL;
+    if (!threw || !clean) fprintf(stderr, "base64 diagnostic: %s\n", result.error);
+    CHECK(threw && clean);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Every connected <img> of a page with more than 128 images gets its load
+   event, exactly once across republications. */
+static int test_connected_image_loads_past_128(void)
+{
+    enum { IMAGE_COUNT = 150 };
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char head[] = "<!doctype html><body>";
+    static const char image[] =
+        "<img src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%221%22 height=%221%22/%3E\">";
+    size_t length = sizeof(head) - 1u + IMAGE_COUNT * (sizeof(image) - 1u);
+    char *html = malloc(length + 1u);
+    CHECK(html != NULL);
+    memcpy(html, head, sizeof(head) - 1u);
+    for (size_t i = 0; i < IMAGE_COUNT; i++)
+        memcpy(html + sizeof(head) - 1u + i * (sizeof(image) - 1u),
+               image, sizeof(image) - 1u);
+    html[length] = '\0';
+    PocDocument document;
+    Stylesheet sheet = {0};
+    ImageResources images = {0};
+    bool parsed = document_parse(&document, &budget, html, length, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480);
+    free(html);
+    CHECK(parsed);
+    CHECK(images_load_external(&document, &sheet, &images, &budget,
+        "https://images.test/", "https://images.test/", NULL,
+        128, 1u * MIB, 64u * 1024u, 4u * MIB, 1000, NULL, NULL));
+    size_t available = 0;
+    for (size_t i = 0; i < images.count; i++)
+        available += image_resource_available(&images.items[i]);
+    if (available != IMAGE_COUNT)
+        fprintf(stderr, "connected loads: available=%zu count=%zu\n",
+                available, images.count);
+    CHECK(available == IMAGE_COUNT);
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 16u * MIB, 1500, "https://images.test/", &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.loads=0;document.addEventListener('load',event=>{"
+        "if(event.target.tagName==='IMG')loads++},true);"
+        "pocSummary=String(document.images.length)", "150", &result));
+    script_runtime_set_images(runtime, &images);
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    /* Republishing the same table delivers nothing again. */
+    script_runtime_set_images(runtime, &images);
+    for (size_t i = 0; i < 8u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    bool ok = handle_table_eval(runtime, "pocSummary=String(loads)", "150",
+                                &result);
+    CHECK(ok);
+    script_runtime_set_images(runtime, NULL);
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A connected image fires error once per failed request, as a queued
+   task: a fetch that fails, bytes no decoder takes, an empty src. A
+   source assigned after the failure supersedes its error, and removing
+   src fires nothing. Republishing the table fires nothing again. */
+static int test_connected_image_errors(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char trace_error[256] = {0};
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-image-cap",
+        trace_error, sizeof(trace_error)));
+    static const char html[] = "<!doctype html><body>"
+        "<img id=ok src=\"https://image-cap.test/a.svg\">"
+        "<img id=missing src=\"https://image-cap.test/missing.png\">"
+        "<img id=undecodable src=\"data:image/png;base64,AAAAAAAA\">"
+        "<img id=superseded src=\"https://image-cap.test/gone.png\">"
+        "<img id=emptied src=\"https://image-cap.test/b.svg\">"
+        "<img id=removed src=\"https://image-cap.test/b.svg\">"
+        "</body>";
+    PocDocument document;
+    Stylesheet sheet = {0};
+    ImageResources images = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://image-cap.test/", &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.log=[];for(const i of document.images){"
+        "i.onload=()=>log.push(i.id+':load');"
+        "i.onerror=()=>log.push(i.id+':error:'+i.complete)}"
+        "document.getElementById('emptied').src='';"
+        "document.getElementById('removed').removeAttribute('src');"
+        "pocSummary=String(log.length)", "0", &result));
+    CHECK(images_load_external(&document, &sheet, &images, &budget,
+        "https://image-cap.test/", "https://image-cap.test/", NULL,
+        128, 1u * MIB, 64u * 1024u, 4u * MIB, 1000, NULL, NULL));
+    CHECK(handle_table_eval(runtime,
+        "document.getElementById('superseded').src="
+        "'https://image-cap.test/b.svg';pocSummary=log.join(',')", "",
+        &result));
+    script_runtime_set_images(runtime, &images);
+    for (size_t i = 0; i < 64u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    static const char expected[] =
+        "emptied:error:true,missing:error:true,ok:load,undecodable:error:true";
+    CHECK(handle_table_eval(runtime, "pocSummary=log.slice().sort().join(',')",
+                            expected, &result));
+    script_runtime_set_images(runtime, &images);
+    for (size_t i = 0; i < 8u; i++)
+        CHECK(script_runtime_advance(runtime, 16u, 8u, &result));
+    CHECK(handle_table_eval(runtime, "pocSummary=log.slice().sort().join(',')",
+                            expected, &result));
+    script_runtime_set_images(runtime, NULL);
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    fetch_trace_end();
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Watched siblings share their ancestor chain: after the first snapshot
+   resolves it, later ones read only their own style, and the shared
+   verdict still follows an ancestor's display change. */
+static int test_transition_snapshot_shared_ancestors(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><body>Motion</body>";
+    PocDocument document;
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://motion.test/", &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    CHECK(handle_table_eval(runtime,
+        "{let d=document.body;globalThis.chain=[];for(let i=0;i<30;i++){"
+        "const c=document.createElement('div');d.appendChild(c);chain.push(c);d=c}"
+        "globalThis.kids=[];for(let i=0;i<40;i++){const k=document.createElement('i');"
+        "k.style.transition='opacity 1s';d.appendChild(k);kids.push(k)}"
+        "globalThis.snap=k=>__tilefinchTransitionSnapshot(k.__handle,[])[4];"
+        "pocSummary=String(kids.every(snap))}", "true", &result));
+    size_t probes = runtime->bridge.computed_style_cache.lookup_probes;
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=String(kids.every(snap))", "true", &result));
+    probes = runtime->bridge.computed_style_cache.lookup_probes - probes;
+    if (probes >= 40u * 8u)
+        fprintf(stderr, "transition snapshot probes=%zu for 40 siblings at depth 30\n",
+                probes);
+    CHECK(probes < 40u * 8u);
+    CHECK(handle_table_eval(runtime,
+        "chain[10].style.display='none';const hidden=kids.map(snap);"
+        "chain[10].style.display='';const shown=kids.map(snap);"
+        "pocSummary=String(hidden.some(Boolean))+','+String(shown.every(Boolean))",
+        "false,true", &result));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* One owner-turn sweep releases connected wrappers in batches of notices;
+   every released wrapper still leaves the bootstrap's node cache. */
+static int test_wrapper_sweep_batched_notices(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><body>Sweep</body>";
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://sweep.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(handle_table_eval(runtime,
+        "for(let i=0;i<200;i++)document.body.appendChild("
+        "document.createElement('p'));"
+        "globalThis.finalizedBefore=__tilefinchRetentionStats.wrappersFinalized;"
+        "pocSummary='BUILT'", "BUILT", &result));
+    /* Collect, then sweep before any finalization job can run. */
+    JS_RunGC(runtime->runtime);
+    JS_RunGC(runtime->runtime);
+    runtime->bridge.node_wrapper_sweep_remaining = runtime->bridge.node_count;
+    for (size_t turn = 0; turn < 64u
+         && runtime->bridge.node_wrapper_sweep_remaining != 0; turn++)
+        js_rt_bridge_sweep_node_wrappers(&runtime->bridge);
+    CHECK(runtime->bridge.node_wrapper_sweep_remaining == 0);
+    CHECK(handle_table_eval(runtime,
+        "const finalized=__tilefinchRetentionStats.wrappersFinalized-finalizedBefore;"
+        "const p=document.querySelectorAll('p');"
+        "pocSummary=String(finalized>=200&&p.length===200&&p[7]===p[7]"
+        "&&p[7]===document.body.children[7])", "true", &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
 }
 
 static int test_dom_handle_table_exhaustion(void)
@@ -5781,11 +7968,169 @@ static int test_microtask_queue_ignores_promise_species(void)
     return 0;
 }
 
+static int test_mutable_global_this_does_not_redirect_host_methods(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body><button id=b>test</button></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const realm=globalThis,node=document.getElementById('b');"
+        "let calls=0;const listener=()=>calls++;"
+        "try{realm.globalThis={};"
+        "node.addEventListener('probe',listener);"
+        "node.dispatchEvent(new Event('probe'));"
+        "node.removeEventListener('probe',listener);"
+        "node.dispatchEvent(new Event('probe'));"
+        "document.addEventListener('probe',listener);"
+        "document.dispatchEvent(new Event('probe'));"
+        "document.removeEventListener('probe',listener);"
+        "realm.addEventListener('probe',listener);"
+        "realm.dispatchEvent(new Event('probe'));"
+        "realm.removeEventListener('probe',listener);"
+        "const timer=setTimeout(()=>{},10);clearTimeout(timer);"
+        "node.setAttribute('data-test','yes');"
+        "realm.pocSummary=String(calls===3&&node.dataset.test==='yes'"
+        "&&realm.globalThis!==realm);"
+        "}finally{realm.globalThis=realm;}})()", "true"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_large_blob_worker(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body><p>Worker</p></body>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const padding=' '.repeat(480*1024),source=padding+"
+        "\"const image=new ImageData(2,2),pixels=new Uint8ClampedArray(16),"
+        "borrowed=new ImageData(pixels,2);postMessage(image.data instanceof "
+        "Uint8ClampedArray&&image instanceof ImageData&&borrowed.data===pixels"
+        "&&image.width===2&&image.height===2?'large-worker-ok':'image-data-failed')\","
+        "blob=new Blob([source]);"
+        "let encoderBound=false,blobBound=false,urlBound=false;"
+        "try{new TextEncoder().encode(padding)}catch(e){encoderBound=e.name==='RangeError'}"
+        "try{new Blob(['x'.repeat(512*1024+1)])}catch(e){blobBound=e.name==='RangeError'}"
+        "const url=URL.createObjectURL(blob);"
+        "try{URL.createObjectURL(new Blob(['x'.repeat(40*1024)]))}"
+        "catch(e){urlBound=e.name==='RangeError'}"
+        "const worker=new Worker(url);URL.revokeObjectURL(url);"
+        "worker.onmessage=e=>{pocSummary=e.data;worker.terminate()};"
+        "worker.onerror=e=>{pocSummary='error:'+e.message};"
+        "pocSummary=String(blob.size===source.length&&encoderBound&&blobBound&&urlBound)})()",
+        "true"));
+    ScriptResult result = {0};
+    for (unsigned tick = 0; tick < 32; tick++) {
+        bool advanced = script_runtime_advance(runtime, 1, 512, &result);
+        if (!advanced) fprintf(stderr, "large worker: %s %s\n",
+                               result.summary, result.error);
+        CHECK(advanced);
+        if (strcmp(result.summary, "large-worker-ok") == 0) break;
+    }
+    CHECK(strcmp(result.summary, "large-worker-ok") == 0);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{let byteBound=false,totalBound=false;"
+        "try{new Blob(['\u20ac'.repeat(180*1024)])}catch(e){byteBound=e.name==='RangeError'}"
+        "try{new Blob([new Uint8Array(300*1024),new Uint8Array(220*1024)])}"
+        "catch(e){totalBound=e.name==='RangeError'}"
+        "const data=new Uint8Array([239,187,191,65,226,130,65]),blob=new Blob([data]);"
+        "data[3]=66;const Decoder=TextDecoder,decode=Decoder.prototype.decode;"
+        "TextDecoder=function(){throw Error('replaced')};"
+        "Decoder.prototype.decode=function(){throw Error('replaced')};"
+        "try{blob.text().then(text=>pocSummary=String(byteBound&&totalBound&&"
+        "text==='A\ufffdA'))}finally{TextDecoder=Decoder;Decoder.prototype.decode=decode}"
+        "pocSummary='pending'})()", "true"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--component-stack-only") == 0)
+        return test_component_stack_headroom();
+    CHECK(test_component_stack_headroom() == 0);
+    if (argc == 2 && strcmp(argv[1], "--fragment-ownership-only") == 0)
+        return test_detached_fragment_ownership();
+    CHECK(test_detached_fragment_ownership() == 0);
+    if (argc == 2 && strcmp(argv[1], "--slotless-mutation-only") == 0)
+        return test_slotless_shadow_mutation_queue();
+    CHECK(test_slotless_shadow_mutation_queue() == 0);
+    if (argc == 2 && strcmp(argv[1], "--wrapper-cleanup-only") == 0)
+        return test_wrapper_cleanup_backlog();
+    CHECK(test_wrapper_cleanup_backlog() == 0);
+    if (argc == 2 && strcmp(argv[1], "--abort-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(0);
+    if (argc == 2 && strcmp(argv[1], "--idb-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(1);
+    if (argc == 2 && strcmp(argv[1], "--slot-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(2);
+    CHECK(test_discarded_browser_state_ownership(0) == 0);
+    CHECK(test_discarded_browser_state_ownership(1) == 0);
+    CHECK(test_discarded_browser_state_ownership(2) == 0);
+    if (argc == 2 && strcmp(argv[1], "--detached-style-only") == 0)
+        return test_detached_style_ownership();
+    CHECK(test_detached_style_ownership() == 0);
+    if (argc == 2 && strcmp(argv[1], "--large-blob-worker-only") == 0)
+        return test_large_blob_worker();
+    CHECK(test_large_blob_worker() == 0);
+    if (argc == 2 && strcmp(argv[1], "--mutable-global-only") == 0)
+        return test_mutable_global_this_does_not_redirect_host_methods();
+    CHECK(test_mutable_global_this_does_not_redirect_host_methods() == 0);
     if (argc == 2 && strcmp(argv[1], "--event-target-ownership-only") == 0)
         return test_event_target_listener_ownership();
     CHECK(test_event_target_listener_ownership() == 0);
+    if (argc == 2 && strcmp(argv[1], "--event-state-only") == 0)
+        return test_detached_event_state_collection();
+    CHECK(test_detached_event_state_collection() == 0);
+    if (argc == 2 && strcmp(argv[1], "--event-targets-only") == 0)
+        return test_connected_event_targets_past_capacity(false)
+            || test_connected_event_targets_past_capacity(true)
+            || test_event_target_overflow_collection()
+            || test_event_state_rooted_by_pin()
+            || test_frozen_detached_wrapper_settles()
+            || test_stable_event_targets_past_capacity(false)
+            || test_stable_event_targets_past_capacity(true);
+    CHECK(test_connected_event_targets_past_capacity(false) == 0);
+    CHECK(test_connected_event_targets_past_capacity(true) == 0);
+    CHECK(test_event_target_overflow_collection() == 0);
+    CHECK(test_event_state_rooted_by_pin() == 0);
+    CHECK(test_frozen_detached_wrapper_settles() == 0);
+    CHECK(test_stable_event_targets_past_capacity(false) == 0);
+    CHECK(test_stable_event_targets_past_capacity(true) == 0);
+    if (argc == 2 && strcmp(argv[1], "--event-state-fixes-only") == 0)
+        return (test_cleared_children_event_state_collection() != 0)
+            | (test_refused_hold_leaves_no_holder() != 0)
+            | (test_rebind_keeps_kept_state() != 0);
+    CHECK(test_cleared_children_event_state_collection() == 0);
+    CHECK(test_refused_hold_leaves_no_holder() == 0);
+    CHECK(test_rebind_keeps_kept_state() == 0);
+    if (argc == 2 && strcmp(argv[1], "--held-join-only") == 0)
+        return test_insertion_joins_held_tree();
+    CHECK(test_insertion_joins_held_tree() == 0);
+    if (argc == 2 && strcmp(argv[1], "--event-state-oom-only") == 0)
+        return test_event_state_survives_refused_allocations()
+            | test_event_state_survives_refused_page_allocations();
+    CHECK(test_event_state_survives_refused_allocations() == 0);
+    CHECK(test_event_state_survives_refused_page_allocations() == 0);
+    if (argc == 2 && strcmp(argv[1], "--event-state-cost-only") == 0)
+        return test_event_state_bookkeeping_cost();
+    CHECK(test_event_state_bookkeeping_cost() == 0);
     if (argc == 2 && strcmp(argv[1], "--attribute-cache-only") == 0)
         return test_attribute_cache_ownership();
     CHECK(test_attribute_cache_ownership() == 0);
@@ -5793,6 +8138,9 @@ int main(int argc, char **argv)
         return test_heap_return_checks_back_off();
     if (argc == 2 && strcmp(argv[1], "--inline-style-state-only") == 0)
         return test_shared_inline_style_state();
+    if (argc == 2 && strcmp(argv[1], "--live-collection-state-only") == 0)
+        return test_shared_live_collection_state();
+    CHECK(test_shared_live_collection_state() == 0);
     CHECK(test_shared_inline_style_state() == 0);
     if (argc == 2 && strcmp(argv[1], "--microtask-intrinsics-only") == 0)
         return test_microtask_queue_ignores_promise_species();
@@ -5846,6 +8194,39 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--handle-table-only") == 0)
         return test_dom_handle_table_exhaustion()
             || test_dom_handle_table_scales_with_profile();
+    if (argc == 2 && strcmp(argv[1], "--parser-timers-only") == 0)
+        return test_parser_timer_checkpoint();
+    CHECK(test_parser_timer_checkpoint() == 0);
+    if (argc == 2 && strcmp(argv[1], "--transition-ancestors-only") == 0)
+        return test_transition_snapshot_shared_ancestors();
+    if (argc == 2 && strcmp(argv[1], "--wrapper-sweep-only") == 0)
+        return test_wrapper_sweep_batched_notices();
+    if (argc == 2 && strcmp(argv[1], "--image-preloads-only") == 0) {
+        CHECK(test_detached_image_preloads() == 0);
+        CHECK(test_detached_image_preload_drawn_while_loading() == 0);
+        CHECK(test_detached_image_preload_unrelated_clear() == 0);
+        CHECK(test_detached_image_preload_busy_decoder() == 0);
+        CHECK(test_detached_image_preloads_settle_past_lane() == 0);
+        CHECK(test_refused_image_complete() == 0);
+        CHECK(test_detached_image_preload_address_reuse() == 0);
+        CHECK(test_connected_image_loads_past_128() == 0);
+        CHECK(test_connected_image_errors() == 0);
+        return 0;
+    }
+    CHECK(test_detached_image_preloads() == 0);
+    CHECK(test_detached_image_preload_drawn_while_loading() == 0);
+    CHECK(test_detached_image_preload_unrelated_clear() == 0);
+    CHECK(test_detached_image_preload_busy_decoder() == 0);
+    CHECK(test_detached_image_preloads_settle_past_lane() == 0);
+    CHECK(test_refused_image_complete() == 0);
+    CHECK(test_detached_image_preload_address_reuse() == 0);
+    CHECK(test_connected_image_loads_past_128() == 0);
+    CHECK(test_connected_image_errors() == 0);
+    if (argc == 2 && strcmp(argv[1], "--base64-only") == 0)
+        return test_base64_failure_leaves_no_diagnostic();
+    CHECK(test_base64_failure_leaves_no_diagnostic() == 0);
+    CHECK(test_transition_snapshot_shared_ancestors() == 0);
+    CHECK(test_wrapper_sweep_batched_notices() == 0);
     CHECK(test_coalesced_attribute_tokens() == 0);
     if (argc == 2 && strcmp(argv[1], "--detached-move-only") == 0)
         return test_detached_move_is_a_removal();
@@ -5871,6 +8252,8 @@ int main(int argc, char **argv)
         return test_resize_observer_registration_budget();
     if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
         return test_job_heap_rejection_is_fatal();
+    if (argc == 2 && strcmp(argv[1], "--inline-trackers-only") == 0)
+        return test_inline_tracker_policy();
     if (argc == 2 && strcmp(argv[1], "--host-state-only") == 0)
         return test_host_state_timers_and_scroll(false)
             || test_host_state_timers_and_scroll(true)
@@ -5914,6 +8297,7 @@ int main(int argc, char **argv)
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_job_heap_rejection_is_fatal() == 0);
+    CHECK(test_inline_tracker_policy() == 0);
     CHECK(test_attribute_mutation_skips_document_refresh() == 0);
     CHECK(test_get_element_by_id_tracks_id_changes() == 0);
     CHECK(test_document_domain_setter() == 0);
@@ -7281,10 +9665,9 @@ int main(int argc, char **argv)
           && result.external_scripts_loaded == loaded_before_null + 1
           && result.external_scripts_failed == failed_before_null);
 
-    /* Collection decides when dead wrappers' FinalizationRegistry cleanups
-       join the job queue, and one checkpoint runs at most 64 jobs, so a
-       backlog left by earlier probes could otherwise outlast this probe's
-       own checkpoint. Collect now and settle the queue first. */
+    /* Collection decides when wrappers become reclaimable. Settle bounded
+       native maintenance and any author cleanup tasks from earlier probes
+       before measuring this independent lifetime test. */
     (void) script_runtime_collect_and_trim(runtime);
     for (size_t tick = 0;
          tick < 64 && js_rt_runtime_checkpoint_pending(runtime); tick++) {
@@ -10174,7 +12557,7 @@ int main(int argc, char **argv)
         "(()=>{const lazy=['__tilefinchSubmittedFormHandle',"
         "'__tilefinchSubmittedSubmitterHandle','__tilefinchFragmentInsertCount',"
         "'__tilefinchFragmentInsertText',"
-        "'__tilefinchBase64Error','__tilefinchSelectedControl',"
+        "'__tilefinchSelectedControl',"
         "'__tilefinchParentAppendBypass','__tilefinchMutationSuppressed',"
         "'__tilefinchNow'],"
         "entries=['__tilefinchCommitSameDocument','__tilefinchDeliverNetwork',"

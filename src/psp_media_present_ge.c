@@ -1110,7 +1110,7 @@ bool psp_media_present_ge_submit(
             break;
         }
         if (quad->clockwise) {
-            psp_media_present_quad_vertices(quad, vertices);
+            psp_media_present_clockwise_vertices(quad, vertices);
         } else {
             vertices[0] = (PspMediaPresentGeVertex) {
                 quad->u0, quad->v0, quad->x0, quad->y0, 0.0f};

@@ -44,6 +44,9 @@ typedef struct {
        media-mismatched or failed earlier reference may be promoted by a
        later matching duplicate during suffix continuation. */
     bool rules_applied;
+    /* A <link rel=stylesheet> recorded this response, so a rebuild's
+       reservation walk can find it; @import-only responses cannot be. */
+    bool link_originated;
     /* Both the final response URL and the response's normalized
        Referrer-Policy are known.  Retained CSS is never reapplied without
        this pair because request-key/document-policy fallbacks can leak or
@@ -202,9 +205,7 @@ typedef struct {
     uint64_t processed_sources;
     uint64_t required_faces;
     uint64_t preferred_faces;
-    uint8_t required_families;
     bool usage_filter;
-    bool face_usage_filter;
     bool cancelled;
     bool active;
 } ExternalFontLoader;
@@ -216,6 +217,10 @@ typedef struct ImageCanvasNativeSurface {
     uint32_t epoch;
     bool authoritative;
 } ImageCanvasNativeSurface;
+
+/* The most entries an ImageResources table tracks (one per image node,
+   shared-source aliases included). */
+#define IMAGE_TRACKED_NODE_LIMIT 192u
 
 typedef struct ImageResource {
     lxb_dom_node_t *node;
@@ -253,6 +258,12 @@ typedef struct ImageResource {
     /* A no-CORS image whose final response origin differs from the owning
        document may be painted, but it taints any canvas that consumes it. */
     bool cross_origin;
+    /* An admitted SVG reused without a fetch or decode does not spend
+       another network/decode attempt. Preserve its accounting on retirement. */
+    bool reused_raster_count_exempt;
+    /* Publishing this resource dropped its element's failure record for the
+       same source; a rollback that discards it restores the record. */
+    bool recovered_failure;
     PseudoElement pseudo;
     bool owns_pixels;
     bool owns_encoded;
@@ -406,6 +417,25 @@ typedef struct {
     } retarget;
     /* Bounded, generation-keyed display-size scan, owned by this table. */
     struct ImageRetargetPlan *retarget_plan;
+    /* <img> elements whose source failed for good while loading into this
+       table: a fetch error, a refused or invalid request, or bytes no
+       decoder takes. Script fires their error event once the table is
+       published (script_runtime_set_images). Each names the source hash
+       (image_current_source_hash) it failed for, so a newer source is not
+       blamed; one per element, at most IMAGE_TRACKED_NODE_LIMIT. A record
+       is dropped once the table publishes a resource for the same element
+       and source (a successful retry). */
+    struct ImageFailure {
+        lxb_dom_node_t *node;
+        /* failure_serial when noted; a rolled-back load drops the records
+           noted since it began. It fills the PSP's alignment gap before
+           the hash. */
+        uint32_t serial;
+        uint64_t source_hash;
+    } *failures;
+    size_t failure_count;
+    size_t failure_capacity;
+    uint32_t failure_serial;
     bool priority_staged;
 } ImageResources;
 
@@ -423,6 +453,9 @@ typedef struct {
 #define IMAGE_PRIORITY_KIND_MASK UINT8_C(1)
 #define IMAGE_PRIORITY_KIND_BACKGROUND UINT8_C(2)
 #define IMAGE_PRIORITY_KIND_LINKED_VIDEO UINT8_C(3)
+/* A script preloader selects srcset against the viewport, while retaining
+   only a tiny raster until pixels are actually requested by script/layout. */
+#define IMAGE_PRIORITY_KIND_PRELOAD UINT8_C(4)
 
 /* Exact resource identity retained by a transient bounded layout.  CSS
    source pointers are interned in the page stylesheet; document-image
@@ -494,6 +527,15 @@ size_t stylesheet_complete_rules_prefix(const char *css, size_t length);
    the unfinished tail left open. */
 bool stylesheet_next_statement(const char *css, size_t length,
                                size_t *offset, size_t *open_blocks);
+
+/* Shared staging admission for authoritative styles and their preloads.
+   Existing page/source ceilings stay in force; in_flight_bytes, the sum of
+   the response bounds of the stylesheet requests in flight (script and
+   other requests do not count), reserves the same worst-case parse/staging
+   headroom in either lane. */
+size_t stylesheets_in_flight_add(size_t in_flight_bytes, size_t request_bytes);
+size_t stylesheets_response_byte_limit(const Budget *budget,
+    size_t single_limit, size_t remaining, size_t in_flight_bytes);
 
 bool stylesheets_load_external(const PocDocument *document, Stylesheet *sheet,
                                Budget *budget, const char *base_url,
@@ -636,12 +678,12 @@ void fonts_external_loader_cancel(ExternalFontLoader *loader,
                                   FetchScheduler *scheduler,
                                   ExternalFontStats *stats);
 bool fonts_external_loader_pending(const ExternalFontLoader *loader);
-/* Defer unreferenced families, but reconsider them after a later layout.
-   Standalone loaders retain declaration-order behavior until this is set. */
-void fonts_external_loader_set_usage(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint8_t required_families);
-void fonts_external_loader_set_face_usage(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint64_t required_faces);
+/* Defer faces the layout does not use, but reconsider them after a later
+   layout. Bit family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT + face_slot
+   marks a face; preferred faces (a subset of the required ones) load first,
+   and a required face that is not preferred loads only while a preferred
+   face of its family is still missing. Standalone loaders retain
+   declaration-order behavior until this is set. */
 void fonts_external_loader_prioritize_faces(ExternalFontLoader *loader,
     const Stylesheet *sheet, uint64_t required_faces, uint64_t preferred_faces);
 
@@ -802,6 +844,9 @@ bool images_decode_worker_shutdown(Budget *budget);
 /* Browser-thread reap for a navigation-cancelled completion. False means a
    lower-priority decode is still running; callers never wait for it. */
 bool images_decode_worker_reap_cancelled(Budget *budget);
+/* Required synchronous resource replacement may yield for a cancelled
+   worker tail, for at most two seconds. Never steals an active owner's job. */
+bool images_decode_worker_wait_cancelled(Budget *budget);
 /* Whether an inline <svg> draws anything itself: a shape, text, image,
    <use> or foreignObject outside the non-rendering containers (<defs>,
    <symbol>, gradients, patterns, clip paths, masks, markers, filters,
@@ -835,6 +880,11 @@ const ImageResource *images_find_pseudo_background(
  */
 const char *image_select_source(const Stylesheet *stylesheet,
                                 lxb_dom_node_t *node, size_t *length);
+/* The hash the loader keys `node`'s selected source by (0 without one). */
+uint64_t image_current_source_hash(const Stylesheet *stylesheet,
+                                   lxb_dom_node_t *node);
+/* The same hash for a source already selected (image_select_source). */
+uint64_t image_source_hash(const char *source, size_t length);
 /* Empty sources and encoded one-pixel sentinels, not arbitrary data images.
    Simplified views share the loader's placeholder/lazy-source decision. */
 bool image_source_is_placeholder(const char *source, size_t length);
@@ -862,6 +912,14 @@ bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
                                   lxb_dom_node_t *node,
                                   unsigned char *rgba_pixels,
                                   int width, int height);
+/* Release reloadable resources before rebuilding styles. A live decoder's
+   admitted, unencoded video surface must survive until the image transaction
+   can transfer it; ordinary pages keep the destroy-first memory behavior. */
+void images_prepare_external_rebuild(ImageResources *images);
+/* Retire raw DOM references before a detached subtree is destroyed. Keep
+   surfaces/indices valid for the outgoing display list until its rebuild. */
+void images_retire_subtree(ImageResources *images,
+                           const lxb_dom_node_t *root);
 /*
  * Replace a document image already associated with node, if any, with a
  * mutable decoded surface.  Video uses this to hand off from its poster to

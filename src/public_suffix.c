@@ -17,17 +17,22 @@ static bool next_offset(const unsigned char **position,
                         const unsigned char *end,
                         const unsigned char **offset)
 {
-    if (*position >= end || (size_t) (end - *position) < 3) return false;
+    if (*position >= end) return false;
     const unsigned char *at = *position;
+    /* Each offset is 1, 2 or 3 bytes by its tag; a short final offset may
+       end the graph (libpsl checks only the bytes the tag needs). */
+    size_t available = (size_t) (end - at);
     size_t distance;
     size_t consumed;
     switch (*at & 0x60u) {
         case 0x60u:
+            if (available < 3) return false;
             distance = ((size_t) (*at & 0x1fu) << 16)
                 | ((size_t) at[1] << 8) | at[2];
             consumed = 3;
             break;
         case 0x40u:
+            if (available < 2) return false;
             distance = ((size_t) (*at & 0x1fu) << 8) | at[1];
             consumed = 2;
             break;
@@ -42,11 +47,12 @@ static bool next_offset(const unsigned char **position,
     return true;
 }
 
-static int fixed_set_lookup(const char *key, size_t key_length)
+static int fixed_set_lookup_graph(const unsigned char *graph,
+                                  size_t graph_length,
+                                  const char *key, size_t key_length)
 {
-    const unsigned char *position = tilefinch_psl_dafsa;
-    const unsigned char *end = tilefinch_psl_dafsa
-        + sizeof(tilefinch_psl_dafsa);
+    const unsigned char *position = graph;
+    const unsigned char *end = graph + graph_length;
     const unsigned char *offset = position;
     const unsigned char *key_at = (const unsigned char *) key;
     const unsigned char *key_end = key_at + key_length;
@@ -82,6 +88,23 @@ static int fixed_set_lookup(const char *key, size_t key_length)
     }
     return -1;
 }
+
+static int fixed_set_lookup(const char *key, size_t key_length)
+{
+    return fixed_set_lookup_graph(tilefinch_psl_dafsa,
+                                  sizeof(tilefinch_psl_dafsa),
+                                  key, key_length);
+}
+
+#ifndef __PSP__
+int tilefinch_public_suffix_test_lookup(const unsigned char *graph,
+                                        size_t graph_length,
+                                        const char *key)
+{
+    if (graph == NULL || graph_length == 0 || key == NULL) return -1;
+    return fixed_set_lookup_graph(graph, graph_length, key, strlen(key));
+}
+#endif
 
 static bool dns_name(const char *input, char output[254])
 {

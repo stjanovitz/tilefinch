@@ -31,7 +31,10 @@ static unsigned char lower(unsigned char c)
 
 static void scan_meta(LinkedVideoPreviewScanner *scan)
 {
-    if (++scan->meta_count > 64u) { scan->stopped = true; return; }
+    if (++scan->meta_count > LINKED_VIDEO_PREVIEW_META_TAGS) {
+        scan->stopped = true;
+        return;
+    }
     PocDocument fragment = {0};
     if (!document_parse(&fragment, scan->budget,
             scan->tag, scan->tag_length, scan->tag_length)) {
@@ -41,19 +44,11 @@ static void scan_meta(LinkedVideoPreviewScanner *scan)
     }
     lxb_dom_node_t *root = lxb_dom_interface_node(fragment.html);
     size_t visited = 0;
-    for (lxb_dom_node_t *node = root; node != NULL && visited++ < 16u;) {
+    for (lxb_dom_node_t *node = root;
+         node != NULL && visited++ < LINKED_VIDEO_PREVIEW_TAG_NODES;) {
         if (name_is(node, "meta")) {
             size_t length = 0;
-            const char *key = document_attribute(node, "property", &length);
-            if (key == NULL) key = document_attribute(node, "name", &length);
-            bool image = key != NULL
-                && ((length == 8u && strncasecmp(key, "og:image", 8u) == 0)
-                    || (length == 19u && strncasecmp(key,
-                        "og:image:secure_url", 19u) == 0)
-                    || (length == 13u && strncasecmp(key,
-                        "twitter:image", 13u) == 0));
-            const char *value = image
-                ? document_attribute(node, "content", &length) : NULL;
+            const char *value = document_meta_image_content(node, &length);
             /* Absolute HTTPS metadata avoids guessing a different base from
                a truncated document. Actual image authority is checked again
                by the normal image loader (CSP, redirects, PNA, quotas). */
@@ -278,103 +273,124 @@ static bool preview_link(NavigationSession *session, lxb_dom_node_t *node,
     return false;
 }
 
-bool navigation_run_linked_video_preview(NavigationSession *session)
+/* Drop a job whose document changed, whose video left the DOM, or which
+   outlived LINKED_VIDEO_PREVIEW_JOB_LIFETIME_US. */
+static bool preview_job_stale(NavigationSession *session,
+                              const struct LinkedVideoPreviewJob *job)
 {
-    if (session == NULL || !session->page.loaded || session->maximum_images == 0
-        || session->maximum_image_file_bytes == 0) return false;
     NavigationPage *page = &session->page;
-    const NavigationEntry *entry = navigation_current(session);
-    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
-    struct LinkedVideoPreviewJob *job = page->linked_video_preview;
-    if (job != NULL && (job->content_generation != page->document.content_generation
+    return job->content_generation != page->document.content_generation
         || (job->node_handle != 0 && (page->runtime == NULL
             || script_runtime_node_handle_resolve_connected(
                 page->runtime, job->node_handle) != job->node))
-        || tilefinch_platform_monotonic_time_us() - job->started_us > UINT64_C(5000000))) {
-        navigation_destroy_linked_video_preview(session, page);
+        || tilefinch_platform_monotonic_time_us() - job->started_us
+            > LINKED_VIDEO_PREVIEW_JOB_LIFETIME_US;
+}
+
+/* Create the job for one candidate video and enqueue its head fetch. */
+static void preview_start_fetch(NavigationSession *session,
+                                const LayoutNodeBox *box, long handle,
+                                const char *url)
+{
+    NavigationPage *page = &session->page;
+    unsigned slot = page->linked_video_preview_attempts++;
+    page->linked_video_preview_nodes[slot] = box->node;
+    page->linked_video_preview_handles[slot] = handle;
+    struct LinkedVideoPreviewJob *job = budget_calloc_category(
+        session->budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*job));
+    if (job == NULL) return;
+    page->linked_video_preview = job;
+    linked_video_preview_scanner_init(&job->scanner, session->budget);
+    job->session = session;
+    job->node = box->node;
+    job->node_handle = handle;
+    job->content_generation = page->document.content_generation;
+    job->started_us = tilefinch_platform_monotonic_time_us();
+    job->width = box->width > UINT16_MAX ? UINT16_MAX : (uint16_t) box->width;
+    job->height = box->height > UINT16_MAX ? UINT16_MAX : (uint16_t) box->height;
+    TilefinchRequestContext context = {
+        .target_url = url, .initiator_url = page->document_url,
+        .top_level_url = page->document_url, .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_SAME_ORIGIN,
+        .credentials = TILEFINCH_CREDENTIALS_OMIT,
+        .destination = TILEFINCH_DESTINATION_FETCH
+    };
+    FetchRequest transport = {.accept = "text/html",
+        .redirect_same_origin_only = true};
+    FetchPreparedPageRequest *prepared = budget_malloc_category(session->budget,
+        BUDGET_CATEGORY_RESOURCE, sizeof(*prepared));
+    if (prepared != NULL && fetch_prepare_page_request_context(&context,
+            page->document_url, page->referrer_policy, session->browser_session,
+            &page->document.content_security_policy, NULL, &transport, prepared, NULL)) {
+        FetchStreamOptions stream = {
+            .on_headers = preview_headers, .on_body = preview_body, .opaque = job,
+            .chunk_bytes = 4096u
+        };
+        job->request = fetch_scheduler_enqueue_stream(page->resource_scheduler,
+            url, fetch_prepared_page_request(prepared),
+            LINKED_VIDEO_PREVIEW_SCAN_BYTES,
+            LINKED_VIDEO_PREVIEW_FETCH_TIMEOUT_MS, &stream);
+    }
+    budget_free(session->budget, prepared);
+    if (job->request == 0) navigation_destroy_linked_video_preview(session, page);
+}
+
+/* Resumably walk the laid-out boxes for a visible, poster-less video inside a
+   same-origin link, and start a job for the first untried one. Returns
+   whether work was done or remains. */
+static bool preview_find_candidate(NavigationSession *session, int scroll_y)
+{
+    NavigationPage *page = &session->page;
+    if (page->linked_video_preview_attempts >= LINKED_VIDEO_PREVIEW_ATTEMPTS
+        || page->resource_scheduler == NULL
+        || !navigation_image_publication_allowed(session)) return false;
+    if (!page->linked_video_preview_scan_valid
+        || page->linked_video_preview_scan_generation != session->incremental_relayouts
+        || page->linked_video_preview_scan_content != page->document.content_generation
+        || page->linked_video_preview_scan_scroll_y != scroll_y) {
+        page->linked_video_preview_scan_valid = true;
+        page->linked_video_preview_scan_generation = session->incremental_relayouts;
+        page->linked_video_preview_scan_content = page->document.content_generation;
+        page->linked_video_preview_scan_scroll_y = scroll_y;
+        page->linked_video_preview_scan_cursor = 0;
+    }
+    size_t scanned = 0;
+    size_t limit = page->layout.node_box_count < LINKED_VIDEO_PREVIEW_BOX_LIMIT
+        ? page->layout.node_box_count : LINKED_VIDEO_PREVIEW_BOX_LIMIT;
+    while (page->linked_video_preview_scan_cursor < limit
+           && scanned++ < LINKED_VIDEO_PREVIEW_BOXES_PER_CALL) {
+        size_t at = page->linked_video_preview_scan_cursor++;
+        const LayoutNodeBox *box = &page->layout.node_boxes[at];
+        if (box->node == NULL || box->width <= 0 || box->height <= 0
+            || box->y >= (int64_t) scroll_y + session->viewport.css_height
+            || (int64_t) box->y + box->height <= scroll_y
+            || box->x >= session->viewport.css_width || (int64_t) box->x + box->width <= 0
+            || !name_is(box->node, "video") || images_find_node(&page->images, box->node) != NULL)
+            continue;
+        long handle = page->runtime != NULL
+            ? script_runtime_node_weak_handle(page->runtime, box->node) : 0;
+        if (page->runtime != NULL && handle == 0) continue;
+        bool tried = false;
+        for (unsigned i = 0; i < page->linked_video_preview_attempts; i++)
+            tried |= page->linked_video_preview_nodes[i] == box->node
+                && page->linked_video_preview_handles[i] == handle;
+        if (tried) continue;
+        ImagePriorityTarget visible = {.node = box->node, .weak_handle = handle};
+        if (!navigation_image_target_visible(session, &visible, true)) continue;
+        char url[NAVIGATION_URL_LIMIT];
+        if (!preview_link(session, box->node, url, sizeof(url))) continue;
+        preview_start_fetch(session, box, handle, url);
         return true;
     }
-    if (job == NULL) {
-        if (page->linked_video_preview_attempts >= LINKED_VIDEO_PREVIEW_ATTEMPTS
-            || page->resource_scheduler == NULL
-            || !navigation_image_publication_allowed(session)) return false;
-        if (!page->linked_video_preview_scan_valid
-            || page->linked_video_preview_scan_generation != session->incremental_relayouts
-            || page->linked_video_preview_scan_content != page->document.content_generation
-            || page->linked_video_preview_scan_scroll_y != scroll_y) {
-            page->linked_video_preview_scan_valid = true;
-            page->linked_video_preview_scan_generation = session->incremental_relayouts;
-            page->linked_video_preview_scan_content = page->document.content_generation;
-            page->linked_video_preview_scan_scroll_y = scroll_y;
-            page->linked_video_preview_scan_cursor = 0;
-        }
-        size_t scanned = 0;
-        size_t limit = page->layout.node_box_count < 16384u
-            ? page->layout.node_box_count : 16384u;
-        while (page->linked_video_preview_scan_cursor < limit && scanned++ < 256u) {
-            size_t at = page->linked_video_preview_scan_cursor++;
-            const LayoutNodeBox *box = &page->layout.node_boxes[at];
-            if (box->node == NULL || box->width <= 0 || box->height <= 0
-                || box->y >= (int64_t) scroll_y + session->viewport.css_height
-                || (int64_t) box->y + box->height <= scroll_y
-                || box->x >= session->viewport.css_width || (int64_t) box->x + box->width <= 0
-                || !name_is(box->node, "video") || images_find_node(&page->images, box->node) != NULL)
-                continue;
-            long handle = page->runtime != NULL
-                ? script_runtime_node_weak_handle(page->runtime, box->node) : 0;
-            if (page->runtime != NULL && handle == 0) continue;
-            bool tried = false;
-            for (unsigned i = 0; i < page->linked_video_preview_attempts; i++)
-                tried |= page->linked_video_preview_nodes[i] == box->node
-                    && page->linked_video_preview_handles[i] == handle;
-            if (tried) continue;
-            ImagePriorityTarget visible = {.node = box->node, .weak_handle = handle};
-            if (!navigation_image_target_visible(session, &visible, true)) continue;
-            char url[NAVIGATION_URL_LIMIT];
-            if (!preview_link(session, box->node, url, sizeof(url))) continue;
-            unsigned slot = page->linked_video_preview_attempts++;
-            page->linked_video_preview_nodes[slot] = box->node;
-            page->linked_video_preview_handles[slot] = handle;
-            job = budget_calloc_category(session->budget, BUDGET_CATEGORY_RESOURCE,
-                                         1, sizeof(*job));
-            if (job == NULL) return true;
-            page->linked_video_preview = job;
-            linked_video_preview_scanner_init(&job->scanner, session->budget);
-            job->session = session;
-            job->node = box->node;
-            job->node_handle = handle;
-            job->content_generation = page->document.content_generation;
-            job->started_us = tilefinch_platform_monotonic_time_us();
-            job->width = box->width > UINT16_MAX ? UINT16_MAX : (uint16_t) box->width;
-            job->height = box->height > UINT16_MAX ? UINT16_MAX : (uint16_t) box->height;
-            TilefinchRequestContext context = {
-                .target_url = url, .initiator_url = page->document_url,
-                .top_level_url = page->document_url, .method = "GET",
-                .mode = TILEFINCH_REQUEST_MODE_SAME_ORIGIN,
-                .credentials = TILEFINCH_CREDENTIALS_OMIT,
-                .destination = TILEFINCH_DESTINATION_FETCH
-            };
-            FetchRequest transport = {.accept = "text/html",
-                .redirect_same_origin_only = true};
-            FetchPreparedPageRequest *prepared = budget_malloc_category(session->budget,
-                BUDGET_CATEGORY_RESOURCE, sizeof(*prepared));
-            if (prepared != NULL && fetch_prepare_page_request_context(&context,
-                    page->document_url, page->referrer_policy, session->browser_session,
-                    &page->document.content_security_policy, NULL, &transport, prepared, NULL)) {
-                FetchStreamOptions stream = {
-                    .on_headers = preview_headers, .on_body = preview_body, .opaque = job,
-                    .chunk_bytes = 4096u
-                };
-                job->request = fetch_scheduler_enqueue_stream(page->resource_scheduler,
-                    url, fetch_prepared_page_request(prepared),
-                    LINKED_VIDEO_PREVIEW_SCAN_BYTES, 3000, &stream);
-            }
-            budget_free(session->budget, prepared);
-            if (job->request == 0) navigation_destroy_linked_video_preview(session, page);
-            return true;
-        }
-        return page->linked_video_preview_scan_cursor < limit;
-    }
+    return page->linked_video_preview_scan_cursor < limit;
+}
+
+/* Advance a running job: scan the linked page's head for an image, then
+   load that image and publish it through the ordinary relayout path. */
+static bool preview_pump(NavigationSession *session,
+                         struct LinkedVideoPreviewJob *job)
+{
+    NavigationPage *page = &session->page;
     if (job->image == NULL) {
         const FetchPumpQuota quota = {.maximum_body_callbacks = 1,
             .maximum_body_bytes = 4096u, .maximum_time_us = 2000u};
@@ -416,4 +432,21 @@ bool navigation_run_linked_video_preview(NavigationSession *session)
     }
     if (status != IMAGE_PRIORITY_LOAD_PENDING) navigation_destroy_linked_video_preview(session, page);
     return true;
+}
+
+bool navigation_run_linked_video_preview(NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded || session->maximum_images == 0
+        || session->maximum_image_file_bytes == 0) return false;
+    NavigationPage *page = &session->page;
+    struct LinkedVideoPreviewJob *job = page->linked_video_preview;
+    if (job != NULL && preview_job_stale(session, job)) {
+        navigation_destroy_linked_video_preview(session, page);
+        return true;
+    }
+    if (job == NULL) {
+        const NavigationEntry *entry = navigation_current(session);
+        return preview_find_candidate(session, entry == NULL ? 0 : entry->scroll_y);
+    }
+    return preview_pump(session, job);
 }

@@ -2,7 +2,19 @@
    metric profile, in 2048-unit em space at 13/22px, regular/bold. These are
    independently measured advances, not font outlines or a shaping engine.
    Row offsets bound each binary search to at most 95 right-hand characters.
-   No table is expanded or allocated at runtime. */
+   No table is expanded or allocated at runtime.
+
+   Provenance: committed as data in d6c9ce11 (2026-10-16), alongside the
+   per-glyph system_sans_advances and system_sans_small_advances tables in
+   font.c (a01c3688), measured at the same two sizes. No generator script or
+   raw measurements were committed, and the measuring setup (browser, font
+   and platform) was not recorded, so this table cannot be regenerated or
+   extended in place. Each row is the adjustment that
+   family_compatible_kerning adds between the left and right characters
+   (absent pairs adjust by zero); no row is zero at both sizes and both
+   weights, so there is nothing to prune. To change it, re-measure
+   all three tables together with one recorded setup and commit the tool
+   that produces them. See docs/FIDELITY.md, "What is measured". */
 static const uint16_t system_pair_starts[96] = {
     0, 0, 0, 24, 25, 25, 25, 78, 102, 109, 109, 133,
     149, 187, 203, 241, 286, 310, 339, 359, 387, 412, 423, 434,

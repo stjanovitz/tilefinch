@@ -70,6 +70,15 @@ zedo.com
 Top-level navigation is never blocked, and a matching site exception bypasses
 both Basic/Custom request rules and cosmetic hiding.
 
+Basic and Custom also refuse narrowly identified inline telemetry bundles.
+Rules require a site boundary, an exact first-statement trigger and all reviewed
+bundle markers; mentioning a tracker name is insufficient. Matching scans at
+most 512 KiB without an allocation. Off and site exceptions bypass these rules.
+The original script text is retained in the DOM, while execution is skipped
+before its first effect. Reference captures use the same rule definitions and
+record the blocking separately; unrelated script errors and crypto refusals
+remain failures.
+
 ## Built-in cosmetic hiding
 
 Cosmetic hiding is a small user stylesheet, not an image/color transform, so
@@ -81,6 +90,7 @@ ins.adsbygoogle
 .advertisement .advertising .ad-banner .ad-container .ad-slot .ad-wrapper
 .sponsored .promoted .promotedlink
 [data-ad] [data-ad-slot] [data-ad-client]
+[data-csa-c-slot-id^="adplacements:"]
 [aria-label="advertisement"] [aria-label="sponsored"]
 ```
 
@@ -93,6 +103,10 @@ The complete prefix unions compile to bounded native scans. The first two
 bytes reject unrelated tokens before a full prefix comparison. Byte loads
 keep unaligned class spans safe on PSP, with no per-element allocation,
 extra DOM walk, or added cache.
+
+The stylesheet is shared verbatim with offline visual-reference capture via
+`src/cosmetic_blocker_css.inc`. The explicit ad-placement attribute namespace
+is hidden; ordinary content slots and similar substrings remain visible.
 The matched container is removed from flow, including its own reserved
 height and margins; unmatched ancestors' spacing is left intact.
 

@@ -281,6 +281,33 @@ static ImageResource *retarget_owner(ImageResources *images, size_t first,
     return owner;
 }
 
+size_t images_reclaim_rebuildable_rasters(ImageResources *images,
+                                         BrowserSession *session,
+                                         size_t needed_bytes)
+{
+    if (images == NULL || images->budget == NULL || needed_bytes == 0)
+        return 0;
+    size_t before = budget_remaining(images->budget);
+    bool changed = false;
+    for (size_t i = 0; i < images->count; i++) {
+        if (images->items[i].pixels == NULL) continue;
+        const void *identity = retarget_identity(&images->items[i]);
+        bool eligible;
+        ImageResource *owner = retarget_owner(images, 0, identity, &eligible);
+        if (!eligible) continue;
+        retarget_replace(images, identity, owner, NULL,
+            owner->width, owner->height, IMAGE_RETARGET_DROPPED, session);
+        changed = true;
+        images->retarget.drops++;
+        size_t now = budget_remaining(images->budget);
+        if (now > before && now - before >= needed_bytes) break;
+    }
+    /* A pending plan may have passed a newly dropped surface already. */
+    if (changed) images_retarget_plan_discard(images);
+    size_t after = budget_remaining(images->budget);
+    return after > before ? after - before : 0;
+}
+
 ImageRetargetOutcome images_retarget_display_step(
     ImageResources *images, const LayoutDocument *layout,
     BrowserSession *session, size_t generation)
@@ -379,7 +406,12 @@ ImageRetargetOutcome images_retarget_display_step(
             if ((flags & IMAGE_RETARGET_DROPPED) == 0 || !need.painted)
                 continue;
             int width = full_width, height = full_height;
-            if (!need.fixed && need.width > 0 && need.height > 0
+            if ((flags & IMAGE_RETARGET_GROWN) != 0) {
+                /* Pressure release is not permission to reduce a surface
+                   which already grew. Restore its last published size. */
+                width = owner->width;
+                height = owner->height;
+            } else if (!need.fixed && need.width > 0 && need.height > 0
                 && need.width < full_width && need.height < full_height) {
                 width = need.width;
                 height = need.height;
@@ -457,6 +489,26 @@ done:
     return outcome;
 }
 
+/* Whether the surface owned by `owner` is below its decoded size. */
+static bool retarget_reduced(const ImageResource *owner)
+{
+    return owner != NULL
+        && (owner->pixels == NULL
+            || (owner->full_width > 0
+                && (owner->width < owner->full_width
+                    || owner->height < owner->full_height)));
+}
+
+bool images_retarget_pin_full_restores(ImageResources *images, size_t index)
+{
+    if (images == NULL || index >= images->count) return false;
+    const void *identity = retarget_identity(&images->items[index]);
+    if (identity == NULL) return false;
+    bool eligible = false;
+    ImageResource *owner = retarget_owner(images, 0, identity, &eligible);
+    return eligible && retarget_reduced(owner);
+}
+
 bool images_retarget_pin_full(ImageResources *images, size_t index,
                               BrowserSession *session)
 {
@@ -466,12 +518,7 @@ bool images_retarget_pin_full(ImageResources *images, size_t index,
     if (identity == NULL) return false;
     bool eligible = false;
     ImageResource *owner = retarget_owner(images, 0, identity, &eligible);
-    bool reduced = owner != NULL
-        && (owner->pixels == NULL
-            || (owner->full_width > 0
-                && (owner->width < owner->full_width
-                    || owner->height < owner->full_height)));
-    if (reduced && eligible) {
+    if (retarget_reduced(owner) && eligible) {
         ImageRetargetOutcome outcome = retarget_restore(
             images, owner, identity, owner->full_width, owner->full_height,
             IMAGE_RETARGET_GROWN, session, &images->retarget.grows);

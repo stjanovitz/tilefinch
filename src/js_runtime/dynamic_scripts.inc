@@ -206,7 +206,7 @@ static bool dynamic_task_activate(
         task->effective_referrer_policy =
             task->incoming_referrer_policy;
     }
-    bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+    bridge_pin_node_slot(bridge, slot);
     bridge->dynamic_script_count++;
     if (bridge->result != NULL) {
         js_rt_saturating_add_size(&bridge->result->dynamic_scripts_queued, 1);

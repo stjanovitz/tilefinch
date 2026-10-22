@@ -48,6 +48,9 @@
     navigation_destroy(&navigation);
     CHECK(budget.current == 0);
 
+    CHECK(test_image_rebuild_pressure() == 0);
+    budget_install_lexbor(&budget);
+
     {
     puts("test: layout pressure retains exact selector results");
     static char pressure_html[96 * 1024];
@@ -2072,6 +2075,9 @@
     CHECK(test_constructed_sheet_scan_chunks(&budget));
     puts("test: one constructed sheet shared by many shadow roots");
     CHECK(test_constructed_sheet_shared_by_roots(&budget));
+    CHECK(test_constructed_sheet_nested_scope(&budget));
+    puts("test: a full adopted root table keeps shadow-confined rules");
+    CHECK(test_constructed_sheet_full_root_table(&budget));
     puts("test: adopted sheets keep cascade order and leave when dropped");
     CHECK(test_constructed_sheet_order_and_removal(&budget));
     puts("test: adopted roots preserve independent order and confinement on refusal");
@@ -2620,6 +2626,51 @@
         CHECK(budget.current == 0);
     }
     {
+        puts("test: inert subtrees paint without native focus or hit targets");
+        static const char page[] =
+            "<!doctype html><body><nav id=drawer inert>"
+            "<a href=/hidden>Hidden menu entry</a><button>Hidden control</button>"
+            "</nav><a inert href=/self>Self inert</a><button id=menu>Open menu</button>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://focus.test/inert", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        CHECK(session.page.layout.link_count == 0);
+        CHECK(session.page.layout.control_count == 1);
+        CHECK(command_x(&session.page.layout, "Hidden") >= 0);
+        CHECK(controller_focus_next(&controller)
+            && controller.focus_node == find_id(
+                lxb_dom_interface_node(session.page.document.html), "menu"));
+        CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+            "document.getElementById('drawer').inert=false", "<open-drawer>",
+            &session.page.script_result) && navigation_relayout(&session));
+        CHECK(session.page.layout.link_count != 0
+            && session.page.layout.control_count == 2);
+        CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+            "const host=document.createElement('div');host.inert=true;"
+            "document.body.appendChild(host);const root=host.attachShadow({mode:'open'});"
+            "root.innerHTML='<button id=shadowButton>Shadow</button>';"
+            "const dialog=document.createElement('dialog');dialog.innerHTML='<button id=modalButton>Modal</button>';"
+            "host.appendChild(dialog);dialog.showModal();",
+            "<inert-flat-tree>", &session.page.script_result)
+            && navigation_relayout(&session));
+        lxb_dom_node_t *shadow_host = document_body_node(&session.page.document)->last_child;
+        lxb_dom_node_t *shadow = document_shadow_carrier_of_host(shadow_host);
+        CHECK(shadow != NULL && document_node_is_inert(find_id(shadow, "shadowButton")));
+        /* A modal escapes the inert host; its own explicit inertness wins. */
+        CHECK(!document_node_is_inert(find_id(shadow_host, "modalButton")));
+        CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+            "host.appendChild(dialog);dialog.inert=true;", "<inert-modal-self>",
+            &session.page.script_result) && navigation_relayout(&session));
+        CHECK(document_node_is_inert(find_id(shadow_host, "modalButton")));
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
         /* A bot wall must be named instead of leaving a blank page; ordinary
            refusals and successful responses must not be. */
         puts("test: bot-protection walls are recognized generically");
@@ -2911,6 +2962,9 @@
         "button{display:block;width:60px;height:20px}"
         "button:focus{width:120px}"
         "input:focus+span{color:#ff0000}"
+        ".unrelated-menu:has(:focus){padding-top:9px}"
+        ".unrelated-menu:has(:focus){--focus-ink:red}"
+        ".unrelated-carousel[data-ready=true] li:first-child span:has(a:focus-visible){background:red}"
         ".paint{width:80px;background:transparent;border:1px solid transparent;border-radius:2px}"
         ".paint:focus{width:80px;border-color:#3366cc;"
         "box-shadow:inset 0 0 0 1px #3366cc;outline:1px solid transparent}"
@@ -3421,6 +3475,10 @@
         CHECK(controller_init(&controller, &session));
         lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
         CHECK(layout_box_for_node(&session.page.layout, find_id(root, "head"))->height == 40);
+        /* Both '#' decorations are indexed, so focus moves need not scan
+           the whole display list for them. */
+        CHECK(session.page.layout.focus_pseudo_texts_indexed
+              && session.page.layout.focus_pseudo_text_count == 2);
         size_t pixels = 480u * 272u;
         uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
         uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));

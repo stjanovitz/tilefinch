@@ -3,9 +3,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/url.h"
 #include "tilefinch_test_faults.h"
 
@@ -620,29 +622,12 @@ static bool stick_compact(BrowserSession *session,
         return false;
     }
     stick_close(site);
-    remove(backup);
-    if (rename(path, backup) != 0) {
-        remove(temporary);
-        budget_free(session->budget, offsets);
-        return false;
-    }
-#ifndef __PSP__
-    if (tilefinch_test_faults()->crash_next_site_storage_compact) {
-        tilefinch_test_faults()->crash_next_site_storage_compact = false;
-        budget_free(session->budget, offsets);
-        return false;
-    }
-    bool refuse_rename =
-        tilefinch_test_faults()->fail_next_site_storage_compact_rename;
-    tilefinch_test_faults()->fail_next_site_storage_compact_rename = false;
-#else
-    const bool refuse_rename = false;
-#endif
-    if (refuse_rename || rename(temporary, path) != 0) {
-        /* Put the original back: this session's offsets describe it. If
-           even that fails, the next load finds .tmp or .bak. */
-        (void) rename(backup, path);
-        remove(temporary);
+    if (!tilefinch_platform_replace_file(temporary, path, backup)) {
+        /* The original is back (this session's offsets describe it) or,
+           if even that failed, the complete rewrite stays for the next
+           load beside .bak. */
+        struct stat status;
+        if (stat(path, &status) == 0) remove(temporary);
         budget_free(session->budget, offsets);
         return false;
     }

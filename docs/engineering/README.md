@@ -14,7 +14,7 @@ remain authoritative when a focused manual is narrower.
 - [PSP_ENVELOPE.md](PSP_ENVELOPE.md) — memory, CPU-slice, executable-size, and storage budgets.
 - [PERF_JOURNEYS.md](PERF_JOURNEYS.md) — deterministic PPSSPP performance journeys (trace replay at 111 MHz) and their lower-only baselines.
 - [BUILD_SPEED_EXPERIMENT.md](BUILD_SPEED_EXPERIMENT.md) — the measured targeted host incremental build-speed experiment (base `2ad0b27c`).
-- [NATIVE_TIER_INVESTIGATION.md](NATIVE_TIER_INVESTIGATION.md) — native-tier feasibility findings, the decision to park the research and conditions for revisiting it; not a shipping feature.
+- [NATIVE_TIER_INVESTIGATION.md](NATIVE_TIER_INVESTIGATION.md) — the decision to park native-tier research (its records are in the private archive); not a shipping feature.
 
 ## Labs and acceptance
 

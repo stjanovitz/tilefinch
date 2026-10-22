@@ -128,7 +128,13 @@ void psp_media_present_texture_for(
            quarantine is already keeping intact. */
         || psp_media_present_ge_stage_dma_quarantine_holds_staging(staging)
         || !psp_media_present_stage_fits(
-               plan, frame->height, staging_bytes)) {
+               plan, frame->height, staging_bytes)
+        /* A subtexture outside the source columns is declined here too, so
+           that the draw still takes its claim on the surface. */
+        || plan->quads[0].texture_column < 0
+        || plan->quads[0].texture_column > frame->stride_pixels
+        || plan->quads[0].texture_width
+               > frame->stride_pixels - plan->quads[0].texture_column) {
         /* Unstaged, so the engine will sample the decoder's surface for the
            whole draw. Claim it here, before the list is built, and let
            psp_media_present_texture_release end the claim once the engine has
@@ -143,8 +149,6 @@ void psp_media_present_texture_for(
     }
     int texture_width = plan->quads[0].texture_width;
     int source_column = plan->quads[0].texture_column;
-    if (source_column > frame->stride_pixels
-        || texture_width > frame->stride_pixels - source_column) return;
     const uint32_t *source = (const uint32_t *) frame->pixels + source_column;
     media->present_stage_async = false;
     /* Mode changes can reuse the picture identity but need a different
@@ -242,32 +246,9 @@ void psp_media_present_texture_for(
 }
 
 /*
- * Recover a refused access unit by resetting the decoder instead of skipping
- * it -- on the browser thread, at the point the refusal reaches it.
- *
- * Which thread does what is the whole of this design. The refusal is detected
- * inside psp_media_decode_staged_video, which runs on the codec worker, and the
- * worker keeps doing exactly what it did before: it counts the refusal, logs
- * it, retires the unit and returns. It resets nothing, waits on nothing, and
- * reads no session state -- a worker that reached into a seek would be a second
- * writer of the demuxer, the clock and the surface. All it publishes is a
- * number, the backend's running refusal total, and this runs after an advance
- * has collected the job that incremented it. A total above the one already
- * accounted for is a refusal this frame owes a recovery to.
- *
- * The recovery rebuilds at a later random-access point. Device experiments
- * proved that continuing, replaying the refused AU, or omitting it while
- * replaying dependent pictures can all hang firmware. This conservative path
- * can visibly skip content, but it remains only as a backstop: the ordinary
- * decode path now completes the firmware's Detail2 transaction after every
- * successful AU and should prevent the refusal state from arising.
- *
- * Returns true when it acted, which ends the caller's frame: the reset
- * invalidated the borrowed surface, so no picture is left for the rest of the
- * advance to present. `decision_ready` is distinct: false means the shared
- * codec slot was still running and the refusal total could not be observed.
- * That is not "no refusal"; the worker's video hold must stay latched until a
- * later frame can make the decision from a stable snapshot.
+ * Feed the decoder while the frame waits on the graphics engine (`still_busy`),
+ * in slices bounded by PSP_MEDIA_PUMP_DRAW_SLICE_US and
+ * PSP_MEDIA_PUMP_DRAW_MAXIMUM_UNITS. Returns the number of units advanced.
  */
 static size_t psp_media_pump_present(
     PspMediaSession *media, bool (*still_busy)(void), int mode)

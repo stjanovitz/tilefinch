@@ -91,7 +91,7 @@ def first_visit_script():
                       "quit"]) + "\n"
 
 
-def command_script(frames, probe, revisit_url=None, idle=0):
+def command_script(frames, probe, revisit_url=None, idle=0, focus_moves=0):
     # --revisit-ticked: run the first visit for the same ticks (so its async
     # and dynamic scripts load too) and its idle turns (the PSP loop runs
     # idle work whenever the page is quiet: classic bytecode is stored
@@ -114,6 +114,11 @@ def command_script(frames, probe, revisit_url=None, idle=0):
         lines += ["js 'probe-chunk=' + (globalThis.__tfApiProbe ? "
                   "__tfApiProbe.chunk(%d) : '')" % i for i in range(PROBE_CHUNKS)]
     lines += ["script-report"]
+    if focus_moves:
+        # D-pad focus moves after every frame and page fact is taken, so
+        # they change no frame; extract.py reports their latency and the
+        # layout-reuse resets they caused.
+        lines += ["focus-next"] * focus_moves
     if probe:
         # Basic view retires the page realm and rebuilds the DOM, which would
         # rewrite the end-of-run summary, so only the probe pass takes it.
@@ -139,7 +144,8 @@ def lab_command(lab, site, run_dir, network_args, reload_count,
 
 
 def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
-             timeout=600, revisit_ticked=False, restart=False, idle=0):
+             timeout=600, revisit_ticked=False, restart=False, idle=0,
+             focus_moves=0):
     if os.path.isdir(run_dir):
         shutil.rmtree(run_dir)
     frames = os.path.join(run_dir, "frames")
@@ -147,7 +153,7 @@ def run_page(lab, site, run_dir, network_args, mode, probe=False, revisit=False,
     with open(os.path.join(run_dir, "commands"), "w") as f:
         f.write(command_script(frames, probe,
                                site["url"] if revisit_ticked else None,
-                               idle))
+                               idle, focus_moves))
     env = dict(os.environ)
     env["TILEFINCH_TRACE_CENSUS"] = "1"
     for name in ("TILEFINCH_LAB_INIT_SCRIPT", "TILEFINCH_TRACE_SCRIPT_FAILURES"):
@@ -255,7 +261,8 @@ def replay(args):
                      ["--replay-http-response-keyed", trace],
                      "replay", probe=args.probe, revisit=args.revisit,
                      revisit_ticked=args.revisit_ticked,
-                     restart=args.restart, idle=args.idle)
+                     restart=args.restart, idle=args.idle,
+                     focus_moves=args.focus_moves)
             reps.append(extract.extract(run_dir))
             if (reps[0]["wall_s"] or 0) > 20:
                 # A page that runs into the 60 s script watchdog is
@@ -284,7 +291,8 @@ def replay(args):
                    "revisit": args.revisit,
                    "revisit_ticked": args.revisit_ticked,
                    "restart": args.restart,
-                   "idle": args.idle}, f, indent=1)
+                   "idle": args.idle,
+                   "focus_moves": args.focus_moves}, f, indent=1)
     print("replayed %d pages in %.1f s with %d jobs -> %s" % (
         len(records), wall, args.jobs, jsonl))
 
@@ -392,6 +400,10 @@ def main():
                         "bytecode stores); default none")
     p.add_argument("--repeat", type=int, default=3,
                    help="runs per page; timings are the minimum (default 3)")
+    p.add_argument("--focus-moves", type=int, default=0,
+                   help="D-pad focus moves (focus-next) after the frames and "
+                        "page facts; timing.focus_ms and focus_full_resets "
+                        "report them (default none)")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("selectors", nargs="*")
     p.set_defaults(func=replay)

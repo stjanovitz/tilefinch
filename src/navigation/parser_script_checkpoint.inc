@@ -629,6 +629,34 @@ static bool navigation_stream_eof_parser_mutation_checkpoint(
         stream, started, allowance.deadline_us, refused);
 }
 
+/* Parser deliveries are event-loop opportunities, not rendering turns. Let
+   one due ordinary task progress without executing frame callbacks or
+   network completions inside a parser-owned classic script. Share the
+   parser-stage circuit breaker so a timer chain cannot extend its allowance. */
+static bool navigation_stream_parser_timer_checkpoint(
+    NavigationDocumentStream *stream)
+{
+    if (stream == NULL || stream->runtime == NULL || stream->parser == NULL
+        || stream->session == NULL || stream->optional_work_shed
+        || stream->parser_script_circuit_open
+        || stream->script_disabled_after_failure
+        || !stream->session->scripts_enabled
+        || !stream->session->document_scripts_enabled
+        || !script_runtime_parser_timer_runnable(stream->runtime)) return true;
+    NavigationParserScriptAllowance allowance = {0};
+    NavigationParserScriptAllowanceResult status =
+        navigation_stream_prepare_parser_script_allowance(
+            stream, 0u, 0u, &allowance);
+    if (status != NAVIGATION_PARSER_SCRIPT_ALLOWANCE_READY)
+        return status == NAVIGATION_PARSER_SCRIPT_ALLOWANCE_SKIPPED;
+    ScriptRuntime *runtime = stream->runtime;
+    uint64_t started = navigation_now_us();
+    bool failed = !script_runtime_parser_timer_checkpoint(runtime);
+    navigation_stream_finish_parser_script_allowance(runtime);
+    return navigation_stream_finish_parser_mutation_checkpoint(
+        stream, started, allowance.deadline_us, failed);
+}
+
 static NavigationParserCheckpointOutcome
 navigation_stream_metadata_checkpoint(NavigationDocumentStream *stream)
 {

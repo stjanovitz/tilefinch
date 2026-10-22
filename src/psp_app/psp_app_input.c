@@ -273,8 +273,16 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
         case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
             return NULL;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
         case PSP_UI_ACTION_POWER_TEST: return "POWER TEST CHANGING...";
         case PSP_UI_ACTION_MEDIA_TEST: return "VIDEO TEST STARTING...";
+#else
+        /* Only the validation build's test menu raises these
+           (TILEFINCH_PSP_POWER_TEST_MENU in psp_ui.c). */
+        case PSP_UI_ACTION_POWER_TEST:
+        case PSP_UI_ACTION_MEDIA_TEST:
+            return NULL;
+#endif
         case PSP_UI_ACTION_EDIT_DEVELOPER_URL:
             return "OPENING DEVELOPER URL INPUT...";
         case PSP_UI_ACTION_SET_VIDEO_DECODER: return NULL;
@@ -818,10 +826,13 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
                  view.tls_version[0] == '\0'
                     ? (view.secure ? "TLS" : "HTTP")
                     : view.tls_version);
+        /* The issuer is the server's own text; only our placeholder for
+           its absence is translated. */
         snprintf(ui->site_tls_issuer, sizeof(ui->site_tls_issuer), "%s",
                  view.tls_peer_issuer[0] == '\0'
-                    ? (view.secure ? "Certificate issuer unavailable"
-                                   : "No TLS certificate")
+                    ? tilefinch_ui_text(view.secure
+                          ? "Certificate issuer unavailable"
+                          : "No TLS certificate")
                     : view.tls_peer_issuer);
         }
         if (psp_ui_internal_url(view.url))

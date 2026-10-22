@@ -39,6 +39,7 @@ static bool test_runtime_navigation_releases_large_incumbent(void);
 void navigation_test_set_parser_script_stage_work_limit(size_t limit);
 void navigation_test_set_parser_script_stage_elapsed_us(uint64_t elapsed_us);
 void navigation_test_set_parser_script_stage_time_limit_us(uint64_t limit_us);
+void navigation_test_retired_stream_teardown(NavigationSession *session);
 
 static bool replay_begin(void)
 {
@@ -881,9 +882,13 @@ static bool clamp_initial_layout_budget(void *opaque, const char *phase, size_t 
             if (pressure->resumable)
                 tilefinch_test_faults()->refuse_next_layout_context = true;
             else budget_inject_failure_after(pressure->budget, 0);
-        } else if (pressure->mode == 3) {
+        } else if (pressure->mode == 3 || pressure->mode == 4) {
             /* Dropping all optional CSS still cannot admit the context. */
             pressure->budget->limit = pressure->budget->current + 1;
+            /* Mode 4: the minimal stylesheet cannot be installed either,
+               so the retry never starts. */
+            if (pressure->mode == 4)
+                tilefinch_test_faults()->refuse_next_minimal_stylesheet = true;
         }
     }
     if (pressure->clamped && pressure->mode == 2 && phase != NULL
@@ -930,17 +935,22 @@ static bool test_initial_layout_pressure_case(unsigned mode)
         ? loaded && navigation.page.loaded
             && navigation.performance.stylesheet_pressure_fallbacks == 1
             && navigation.page.layout.control_count == 1
-        : !loaded && navigation.performance.stylesheet_pressure_fallbacks == 0
+        : !loaded && navigation.performance.stylesheet_pressure_fallbacks
+                         == (mode == 3 ? 1u : 0u)
             && (mode != 2 || pressure.cancelled));
+    /* The first build's failed phase survives layout_destroy when the
+       retry cannot start (it read 0, "no failure"). */
+    if (mode == 4 && navigation.last_layout_failure.phase == 0)
+        fprintf(stderr, "layout pressure mode 4: failed phase lost\n");
+    tilefinch_test_faults()->refuse_next_minimal_stylesheet = false;
     if (mode != 0) {
-        unsigned phase = 0, cancelled = 0;
-        size_t refusals = 0, current = 0, limit = 0;
-        ok = ok && sscanf(navigation.last_error,
-            "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
-            &phase, &cancelled, &refusals, &current, &limit) == 5
-            && phase != 0 && phase <= 11 && limit != 0
-            && cancelled == (mode == 2)
-            && (mode != 1 || refusals != 0);
+        ok = ok && !strcmp(navigation.last_error, NAVIGATION_LAYOUT_FAILED_ERROR)
+            && navigation.last_layout_failure.phase != 0
+            && (navigation.last_layout_failure.phase <= 11
+                || navigation.last_layout_failure.phase == LAYOUT_BUILD_FAILED_AT_STARTUP)
+            && navigation.last_layout_failure.limit != 0
+            && navigation.last_layout_failure.cancelled == (mode == 2)
+            && (mode != 1 || navigation.last_layout_failure.refusals != 0);
     }
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
@@ -953,6 +963,8 @@ static bool test_initial_layout_pressure_uses_minimal_style(void)
     return test_initial_layout_pressure_case(0)
         && test_initial_layout_pressure_case(1)
         && test_initial_layout_pressure_case(2)
+        && test_initial_layout_pressure_case(3)
+        && test_initial_layout_pressure_case(4)
         && test_resumable_initial_layout_pressure();
 }
 
@@ -1815,6 +1827,77 @@ static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
                 image == NULL ? 0 : image->height,
                 navigation.page.images.stats.skipped_limit,
                 navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A JPEG whose header probes fine but whose scan the decode worker
+   refuses (its scan names a component the frame lacks) failed for good:
+   it is recorded as the image's failure, which fires its error event once
+   the table is published (test_connected_image_errors), not as a limit
+   skip, which left it with neither load nor error and complete false. The
+   one retry fails the same way and keeps the one record. */
+static bool test_deferred_jpeg_decode_failure_is_an_error(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Deferred corrupt JPEG</title>"
+        "<style>img{display:block;width:24px;height:24px}</style>"
+        "<img id=thumb loading=lazy src=\"data:image/jpeg;base64,"
+        "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgEBAQE"
+        "BAUFBQUFBQYGBgYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJ"
+        "CQoKCgwMCwsODg4RERT/xABMAAEBAAAAAAAAAAAAAAAAAAAABQEBAQAAAAAAAAAA"
+        "AAAAAAAAAAYQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAAR"
+        "CABAAEADASIAAhEAAxEA/9oADAMJAAIRAxEAPwCUAvEOAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAA//2Q==\">";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/jpeg",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool saw_pending_decode = false;
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 64u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+        saw_pending_decode |= navigation.page.deferred_image_job != NULL;
+    }
+    lxb_dom_node_t *root = ready
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *thumb = root == NULL
+        ? NULL : test_find_id(root, "thumb");
+    const ExternalImageStats *stats = &navigation.page.images.stats;
+    bool ok = committed && saw_pending_decode && thumb != NULL
+        && !navigation_background_resources_pending(&navigation)
+        && stats->loaded == 0 && stats->unsupported != 0
+        && stats->skipped_limit == 0
+        && !image_resource_available(
+               images_find_node(&navigation.page.images, thumb))
+        && navigation.page.images.failure_count == 1
+        && navigation.page.images.failures[0].node == thumb;
+    if (!ok) {
+        fprintf(stderr,
+                "deferred-jpeg-failure committed=%d pending=%d pumps=%zu "
+                "loaded=%zu unsupported=%zu skipped=%zu failures=%zu "
+                "error=\"%s\"\n",
+                committed, saw_pending_decode, pumps, stats->loaded,
+                stats->unsupported, stats->skipped_limit,
+                navigation.page.images.failure_count, navigation.last_error);
     }
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
@@ -3978,6 +4061,48 @@ static bool test_parser_insertions_reach_mutation_observers(void)
     return all_ok;
 }
 
+static bool test_parser_timers_progress_before_eof(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64u * 1024u);
+    char error[256] = {0};
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-timer", error, sizeof(error));
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4u * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8u, 64u * 1024u, 64u * 1024u, 1500);
+        navigation_set_stream_delivery(&navigation, 19u, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(&navigation, generation,
+        "https://parser-timer.test/document", 4096u, 1500, 480,
+        NULL, NULL, true);
+    size_t length = 0;
+    const char *value = loaded ? document_attribute(
+        document_body_node(&navigation.page.document), "data-early", &length)
+        : NULL;
+    bool ok = loaded && value != NULL && length == 5u
+        && memcmp(value, "early", 5u) == 0
+        && !navigation.page.script_degradation_observed;
+    if (!ok) fprintf(stderr, "parser timer ready=%d loaded=%d value=%.*s error=%s\n",
+        ready, loaded, (int) length, value == NULL ? "" : value, error);
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)
 {
     Budget budget;
@@ -5032,6 +5157,49 @@ static void remove_referrer_navigation_replay(const char *directory)
         (void) unlink(path);
     }
     (void) rmdir(directory);
+}
+
+static bool test_parser_scripts_see_requested_fragment(void)
+{
+    ReferrerNavigationReplay fixture = {
+        .document_url = "https://fragment.test/document",
+        .stylesheet_url = "https://unused.test/style.css",
+        .html = "<!doctype html><head><script>globalThis.initialHash=location.hash"
+                "</script></head><body><p>Fragment navigation</p>",
+        .css = "", .response_referrer_policy = "",
+        .stylesheet_request_policy = ""
+    };
+    char directory[128] = {0}, error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && write_referrer_navigation_replay(directory, &fixture)
+        && fetch_trace_replay_begin(directory, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                            32 * 1024, 1000);
+    }
+    bool loaded = ready && navigation_load_url(&navigation,
+        navigation_begin(&navigation),
+        "https://fragment.test/document#section=12/34.5/67.8",
+        4096, 1000, 480, NULL, NULL, true);
+    ScriptResult result = {0};
+    bool ok = loaded && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+            "pocSummary=String(initialHash==='#section=12/34.5/67.8'"
+            "&&location.hash===initialHash)", "<initial-fragment>", &result)
+        && strcmp(result.summary, "true") == 0;
+    if (!ok) fprintf(stderr, "initial fragment: loaded=%d summary=%s error=%s %s\n",
+                     loaded, result.summary, result.error, navigation.last_error);
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    ok = budget.current == 0 && ok;
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    if (directory[0]) remove_referrer_navigation_replay(directory);
+    return ok;
 }
 
 static bool test_runtime_navigation_releases_large_incumbent(void)

@@ -228,6 +228,16 @@ deny storage to every other site. Paths through 319 bytes remain inline.
 Exceptional paths through 2,047 bytes use an on-demand session pool capped at
 8 KiB, so accepting a long URL does not enlarge every fixed PSP cookie entry.
 
+A request's Cookie field is bounded by `BROWSER_COOKIE_HEADER_CAPACITY`
+(4,096 bytes with its terminator), which every header builder, the fetch hop
+and the PSP transport share. When the matching cookies would not fit, the
+lowest-priority ones are left out instead of the request going without
+cookies: a signed-in site's registered credential cookies are kept first
+(YouTube registers Google's account cookies), then cookies marked `HttpOnly`
+or `__Host-`/`__Secure-`, then the rest, each rank in Cookie-header order.
+A cookie whose `name=value` alone cannot fit is never sent, and a saved
+YouTube login holding one is refused at load.
+
 Unpartitioned cookies from an embedded cross-site response are neither stored
 nor sent by default, including ordinary `SameSite=None` cookies. `Partitioned`
 cookies remain available under their top-level-site partition. A separate

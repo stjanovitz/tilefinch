@@ -815,105 +815,72 @@ static inline bool psp_media_audio_pending_should_wait(
 #include "psp_module_policy.h"
 
 /*
- * The one experimental decoder-program knob, spelled
- * `experimental_wide_video=` in boot.cfg. Its name is historical: it now
- * selects any decoder program the default build refuses to attempt, because
- * every such program is one hardware has already rejected.
+ * The decoder-program knob, spelled `experimental_wide_video=` in boot.cfg.
+ * The name is historical; the value now picks between the two programs this
+ * build ships.
  *
- * `wide` is the shipping default after its 360p presentation, lifecycle and
- * network-promotion gates passed on a PSP-3000. The absent spelling selects
- * it; explicit `off` remains the safe escape hatch and the process latch
- * still falls back to 240p after a first-access-unit rejection.
+ * `wide` -- the wide Main-profile program (sceMpeg create mode 5 / Media
+ * Engine boot type 1) -- is the default. It passed its 360p presentation,
+ * lifecycle and network-promotion gates on a PSP-3000, so an absent value
+ * selects it. Explicit `off` keeps the 240p compatibility program (create
+ * mode 4 / boot type 3), and the process-local latch still falls back to 240p
+ * after a first-access-unit rejection.
  *
- * `wide` restores the wide Main-profile program (sceMpeg create mode 5 /
- * Media Engine boot type 1) transcribed from PMPlayer, which a PSP-3000
- * rejects at the raw-NAL bridge -- sceMpegGetAvcNalAu returns 0xFFFFFFFF for
- * a structurally valid IDR. `wide-annexb` additionally rewrites the submitted
- * AVCC length prefixes to Annex-B start codes.
- *
- * `boot4` restores the historical Baseline program (create mode 4 / boot type
- * 4) for A/B against the boot-call-free default described at
- * psp_media_decoder_policy. It says nothing about wide pictures: those stay
- * clamped exactly as they are with the knob off, so `boot4` changes one
- * decision and only that one.
- *
- * `edram-real` and `no-boot` each restore one half of the pre-PMPlayer
- * behaviour the default no longer has:
- *
- * - `edram-real` calls the firmware's own sceAudiocodecGetEDRAM/ReleaseEDRAM
- *   pair for the AAC work buffer. The default is PMPlayer's substitute, which
- *   never calls either: cooleyesAudiocodecGetEDRAM allocates Buffer[4] bytes
- *   of ordinary 64-aligned storage and writes the pointer into Buffer[3].
- *   PMPlayer is the hardware-proven implementation and it bypasses the real
- *   grant deliberately, so the grant is the suspect, not the substitute.
- * - `no-boot` restores the assumption that the Media Engine is already
- *   running program type 3 when the process starts, so a first open that
- *   selects type 3 makes no sceMeBootStart call at all. The default makes one
- *   real call per process for whatever type the policy chose, because
- *   PMPlayer only ever short-circuits type 3 AFTER a real boot call has
- *   succeeded -- an assumption Tilefinch never earned.
+ * The device A/B spellings that once shared this key (`wide-annexb`, `boot4`,
+ * `edram-real`, `no-boot`) are retired: each tested an alternative to a
+ * default that has since been qualified on hardware. A boot.cfg written
+ * while one was selected must still boot after an update, so a retired
+ * spelling is accepted silently and reads as the default, exactly like an
+ * empty value. Any other unknown value still halts at the boot-config gate.
  */
 typedef enum {
     PSP_MEDIA_WIDE_PROGRAM_OFF = 0,
-    PSP_MEDIA_WIDE_PROGRAM_WIDE = 1,
-    PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB = 2,
-    /* Not a wide selection. Named inside this enum because there is exactly
-       one boot.cfg key for "attempt a program the default build will not". */
-    PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4 = 3,
-    /* Nor are these. Same key, same reason: one spelling, one act to flip. */
-    PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL = 4,
-    PSP_MEDIA_WIDE_PROGRAM_NO_BOOT = 5
+    PSP_MEDIA_WIDE_PROGRAM_WIDE = 1
 } PspMediaWideProgram;
 
 static inline PspMediaWideProgram psp_media_wide_program_from_name(
     const char *name)
 {
-    if (name == NULL) return PSP_MEDIA_WIDE_PROGRAM_OFF;
-    if (strcmp(name, "wide") == 0) return PSP_MEDIA_WIDE_PROGRAM_WIDE;
-    if (strcmp(name, "wide-annexb") == 0)
-        return PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB;
-    if (strcmp(name, "boot4") == 0)
-        return PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4;
-    if (strcmp(name, "edram-real") == 0)
-        return PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL;
-    if (strcmp(name, "no-boot") == 0)
-        return PSP_MEDIA_WIDE_PROGRAM_NO_BOOT;
-    return PSP_MEDIA_WIDE_PROGRAM_OFF;
+    return name != NULL && strcmp(name, "wide") == 0
+        ? PSP_MEDIA_WIDE_PROGRAM_WIDE : PSP_MEDIA_WIDE_PROGRAM_OFF;
+}
+
+/* A spelling a past build accepted for a since-retired device A/B. */
+static inline bool psp_media_wide_program_retired(const char *name)
+{
+    return name != NULL
+        && (strcmp(name, "wide-annexb") == 0 || strcmp(name, "boot4") == 0
+            || strcmp(name, "edram-real") == 0
+            || strcmp(name, "no-boot") == 0);
 }
 
 /* Resolve the boot setting rather than merely parsing a spelling. Keeping
    this separate preserves `from_name`'s fail-closed answer for unknown input
-   while making the absent, validated config select the promoted default. */
+   while making the absent (or retired), validated config select the
+   promoted default. */
 static inline PspMediaWideProgram psp_media_wide_program_configured(
     const char *name)
 {
     return name == NULL || name[0] == '\0'
+            || psp_media_wide_program_retired(name)
         ? PSP_MEDIA_WIDE_PROGRAM_WIDE
         : psp_media_wide_program_from_name(name);
 }
 
 static inline const char *psp_media_wide_program_name(int mode)
 {
-    if (mode == PSP_MEDIA_WIDE_PROGRAM_WIDE) return "wide";
-    if (mode == PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB) return "wide-annexb";
-    if (mode == PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4) return "boot4";
-    if (mode == PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL) return "edram-real";
-    if (mode == PSP_MEDIA_WIDE_PROGRAM_NO_BOOT) return "no-boot";
-    return "off";
+    return mode == PSP_MEDIA_WIDE_PROGRAM_WIDE ? "wide" : "off";
 }
 
-/* True for a boot.cfg spelling this build understands, including the absent
-   and explicit-off spellings. Anything else is a typo the loader rejects
-   rather than silently reading as "off". */
+/* True for a boot.cfg spelling this build understands, including the absent,
+   explicit-off and retired spellings. Anything else is a typo the loader
+   rejects rather than silently reading as "off". */
 static inline bool psp_media_wide_program_name_valid(const char *name)
 {
     return name != NULL
         && (name[0] == '\0' || strcmp(name, "off") == 0
             || strcmp(name, "wide") == 0
-            || strcmp(name, "wide-annexb") == 0
-            || strcmp(name, "boot4") == 0
-            || strcmp(name, "edram-real") == 0
-            || strcmp(name, "no-boot") == 0);
+            || psp_media_wide_program_retired(name));
 }
 
 /*
@@ -922,79 +889,27 @@ static inline bool psp_media_wide_program_name_valid(const char *name)
  * psp_media_wide_program_name_valid already accepts, so no selection can
  * reach the boot-time config gate's halt.
  */
-#define PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT 6u
+#define PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT 2u
 
 static inline const char *psp_media_wide_program_choice(unsigned index)
 {
-    switch (index) {
-    case 0: return "off";
-    case 1: return "wide";
-    case 2: return "wide-annexb";
-    case 3: return "boot4";
-    case 4: return "edram-real";
-    case 5: return "no-boot";
-    default: return NULL;
-    }
+    return index < PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT
+        ? psp_media_wide_program_name((int) index) : NULL;
 }
 
 /* Where a stored spelling sits in that list, so a picker can open on the
-   value the next boot will really use. Empty selects the promoted wide
-   default; an unrecognized direct input fails closed to explicit `off`.
+   value the next boot will really use. Empty or retired selects the
+   promoted wide default; an unrecognized direct input fails closed to
+   explicit `off`.
    Boot-config validation rejects that latter case before this helper. */
 static inline unsigned psp_media_wide_program_choice_index(const char *name)
 {
-    if (name == NULL || name[0] == '\0')
-        return (unsigned) PSP_MEDIA_WIDE_PROGRAM_WIDE;
-    for (unsigned index = 0;
-         index < PSP_MEDIA_WIDE_PROGRAM_CHOICE_COUNT; index++) {
-        const char *choice = psp_media_wide_program_choice(index);
-        if (choice != NULL && name != NULL && strcmp(name, choice) == 0)
-            return index;
-    }
-    return 0;
+    return (unsigned) psp_media_wide_program_configured(name);
 }
 
 static inline bool psp_media_wide_program_enabled(int mode)
 {
-    return mode == PSP_MEDIA_WIDE_PROGRAM_WIDE
-        || mode == PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB;
-}
-
-static inline bool psp_media_wide_program_annexb(int mode)
-{
-    return mode == PSP_MEDIA_WIDE_PROGRAM_WIDE_ANNEXB;
-}
-
-/* The Baseline A/B: restore the Media Engine boot call the default build no
-   longer makes. Only `boot4` asks for it; the wide spellings are about a
-   different decision and must not drag this one along. */
-static inline bool psp_media_baseline_boot_call_enabled(int mode)
-{
-    return mode == PSP_MEDIA_WIDE_PROGRAM_BASELINE_BOOT4;
-}
-
-/* The EDRAM A/B. False -- the default -- means the AAC work buffer comes from
-   PMPlayer's substitute rather than the firmware grant, and no
-   sceAudiocodecGetEDRAM or sceAudiocodecReleaseEDRAM call is made at all. */
-static inline bool psp_media_real_edram_enabled(int mode)
-{
-    return mode == PSP_MEDIA_WIDE_PROGRAM_EDRAM_REAL;
-}
-
-/*
- * Whether the process's first media open makes a real sceMeBootStart call.
- *
- * True by default, including for the firmware's own type 3: PMPlayer's
- * lastMeBooterType starts at 3 too, but its first real-world stream was
- * always Baseline (type 4) or wide (type 1), so it always made a real call
- * through its kernel bridge before decoding anything and the type-3
- * short-circuit only ever ran after one had succeeded. Tilefinch's default
- * program IS type 3, so the same initializer meant the Media Engine may never
- * have been given the codec program at all. `no-boot` restores that.
- */
-static inline bool psp_media_cold_boot_call_enabled(int mode)
-{
-    return mode != PSP_MEDIA_WIDE_PROGRAM_NO_BOOT;
+    return mode == PSP_MEDIA_WIDE_PROGRAM_WIDE;
 }
 
 /*
@@ -1979,19 +1894,18 @@ static inline bool psp_media_module_failure_retryable(int status)
  * Constrained Baseline (avcC profile byte 0x42 with constraint_set1 set),
  * which is by definition decodable by any conforming Main-profile decoder.
  * Routing it to the Main-profile program is legitimate, not merely expedient. Type 3
- * is now also really booted rather than assumed: see
- * psp_media_cold_boot_call_enabled for why that assumption was never earned.
+ * is now also really booted rather than assumed: the first open in a process
+ * makes one real sceMeBootStart call even for type 3, because PMPlayer only
+ * ever short-circuited type 3 after a real boot call had succeeded.
  *
  * Repeated physical-device qualification later promoted wide type 1 to the
  * absent-config default. The policy still receives an
  * explicit `wide_program_enabled` guard so compatibility mode and the
  * process-local first-AU rejection latch can refuse it before create/prime.
- * `baseline_boot_call` remains the boot4 diagnostic for historical A/B work.
  */
 static inline bool psp_media_decoder_policy(
     unsigned profile, unsigned level, unsigned width, unsigned height,
-    bool wide_program_enabled, bool baseline_boot_call,
-    PspMediaDecoderPolicy *policy)
+    bool wide_program_enabled, PspMediaDecoderPolicy *policy)
 {
     if (policy == NULL || width == 0 || height == 0
         || level == 0 || level > PSP_MEDIA_AVC_MAXIMUM_LEVEL)
@@ -2005,8 +1919,7 @@ static inline bool psp_media_decoder_policy(
     }
     if (profile == PSP_MEDIA_AVC_PROFILE_BASELINE && !wide) {
         policy->mpeg_mode = 4;
-        policy->me_boot_type = baseline_boot_call
-            ? 4 : PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;
+        policy->me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;
         return true;
     }
     /* A tall 240p Baseline picture has the same admitted surface size as
@@ -2224,55 +2137,6 @@ static inline bool psp_media_surface_canary_was_overwritten(
             : PSP_MEDIA_SURFACE_CANARY_A;
         if (row[x] == canary) return false;
     }
-    return true;
-}
-
-/*
- * AVCC to Annex-B, in place, for the wide-program experiment.
- *
- * The demux hands the bridge exactly what the MP4 sample contained: NAL units
- * each preceded by a big-endian length of `prefix_size` bytes. The hardware
- * rejection logged a submitted head of 0000014125b84005, which reads as an
- * AVCC length of 321 followed by an IDR header, and equally as an Annex-B
- * three-byte start code followed by a non-IDR header. PMPlayer-era streams
- * were Annex-B, so the framing is the leading hypothesis for why firmware
- * refuses the access unit -- but it is a hypothesis, which is why this only
- * runs behind the experimental knob.
- *
- * Only a four-byte prefix can be rewritten: 00 00 00 01 is exactly four bytes,
- * so the buffer keeps its length and no per-NAL allocation is needed. Any
- * other prefix width, a length that leaves the buffer, or trailing bytes that
- * cannot start another unit are refused rather than half-converted; the caller
- * logs the refusal and fails the submission.
- *
- * Parameter sets are not touched. The bridge takes SPS and PPS as separate
- * pointers with explicit sizes, so nothing in this buffer carries them and no
- * in-band injection is required.
- */
-static inline bool psp_media_annexb_rewrite(
-    unsigned char *buffer, size_t bytes, unsigned prefix_size,
-    unsigned *nal_count)
-{
-    if (nal_count != NULL) *nal_count = 0;
-    if (buffer == NULL || bytes == 0 || prefix_size != 4u) return false;
-    size_t at = 0;
-    unsigned count = 0;
-    while (at < bytes) {
-        if (bytes - at < 4u) return false;
-        size_t length = ((size_t) buffer[at] << 24)
-            | ((size_t) buffer[at + 1u] << 16)
-            | ((size_t) buffer[at + 2u] << 8)
-            | (size_t) buffer[at + 3u];
-        if (length == 0 || length > bytes - at - 4u) return false;
-        buffer[at] = 0u;
-        buffer[at + 1u] = 0u;
-        buffer[at + 2u] = 0u;
-        buffer[at + 3u] = 1u;
-        at += 4u + length;
-        count++;
-    }
-    if (count == 0) return false;
-    if (nal_count != NULL) *nal_count = count;
     return true;
 }
 

@@ -813,6 +813,107 @@ static int test_backup_index_survives_primary_refusal(void)
     return 0;
 }
 
+/* A publish rename that fails after the old index was removed must keep
+   the complete temporary copy (the only one left), retry once, and leave
+   the next boot able to recover every pack. */
+static int test_index_rename_failure_keeps_temporary(void)
+{
+    for (unsigned failures = 1u; failures <= 2u; failures++) {
+        char directory[600], primary[640], temporary[640];
+        fresh_directory(directory, sizeof(directory));
+        snprintf(primary, sizeof(primary), "%s/index.tfsi", directory);
+        snprintf(temporary, sizeof(temporary), "%s/index.tfsi.tmp", directory);
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 64u * KIB)
+            && browser_session_script_disk_configure(&session, directory, true, 0));
+        uint32_t generation = browser_session_module_bytecode_generation(&session);
+        CHECK(put_group(&session, 0, 16u * KIB, generation));
+        (void) idle(&session, 1000u);
+        CHECK(exists(primary));
+        CHECK(put_group(&session, 1, 16u * KIB, generation));
+        tilefinch_test_faults()->fail_script_cache_index_renames = failures;
+        (void) idle(&session, 1000u);
+        CHECK(tilefinch_test_faults()->fail_script_cache_index_renames == 0u);
+        BrowserScriptDiskStats stats = {0};
+        browser_session_script_disk_stats(&session, &stats);
+        CHECK(stats.writes == 2u && stats.write_failures == failures);
+        if (failures == 1u) {
+            /* The paced retry publishes it this session. */
+            CHECK(stats.index_writes == 2u && exists(primary)
+                && !exists(temporary));
+        } else {
+            /* Not published: the complete temporary copy survives. */
+            CHECK(stats.index_writes == 1u && !exists(primary)
+                && exists(temporary));
+        }
+        browser_session_destroy(&session);
+        CHECK(budget.current == 0u);
+        CHECK(count_files(directory, ".tfsc", NULL, 0) == 2u);
+
+        CHECK(browser_session_init(&session, &budget, 64u * KIB)
+            && browser_session_script_disk_configure(&session, directory, true, 0));
+        generation = browser_session_module_bytecode_generation(&session);
+        CHECK(group_on_disk(&session, 0, generation)
+            && group_on_disk(&session, 1, generation));
+        (void) idle(&session, 1000u);
+        size_t files = 0;
+        CHECK(browser_session_script_disk_usage(&session, NULL, &files)
+            && files == 2u && exists(primary));
+        browser_session_destroy(&session);
+        CHECK(budget.current == 0u);
+        script_test_remove_tree(directory);
+    }
+    return 0;
+}
+
+/* A replaced pack whose publish rename fails after the old pack was removed
+   must not stay listed (and counted) in the index. */
+static int test_pack_rename_failure_drops_entry(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+        && browser_session_script_disk_configure(&session, directory, true, 0));
+    uint32_t generation = browser_session_module_bytecode_generation(&session);
+    CHECK(put_group(&session, 0, 16u * KIB, generation));
+    (void) idle(&session, 1000u);
+    uint64_t bytes = 0;
+    size_t files = 0;
+    CHECK(browser_session_script_disk_usage(&session, &bytes, &files)
+        && files == 1u && bytes != 0u);
+    /* A second record in the same group (same URL) rewrites its pack. */
+    static unsigned char bytecode[8u * 1024u];
+    memset(bytecode, 7, sizeof(bytecode));
+    BrowserScriptBytecodeKey key = {
+        .module_name = "https://site.test/g0.js",
+        .response_url = "https://site.test/g0.js",
+        .partition_key = "https://site.test",
+        .source = (const unsigned char *) "var other=2;",
+        .source_length = strlen("var other=2;")
+    };
+    CHECK(browser_session_script_bytecode_put(
+        &session, BROWSER_SCRIPT_BYTECODE_CLASSIC, &key, generation,
+        bytecode, sizeof(bytecode)));
+    tilefinch_test_faults()->fail_script_cache_pack_renames = 1u;
+    (void) idle(&session, 1000u);
+    CHECK(tilefinch_test_faults()->fail_script_cache_pack_renames == 0u);
+    BrowserScriptDiskStats stats = {0};
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.write_failures == 1u);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 0u);
+    CHECK(browser_session_script_disk_usage(&session, &bytes, &files)
+        && files == 0u && bytes == 0u);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0u);
+    script_test_remove_tree(directory);
+    return 0;
+}
+
 static int test_ceiling_and_lru(void)
 {
     char directory[600];
@@ -1099,6 +1200,10 @@ int main(void)
     puts("script disk cache: I/O failure reads once per generation");
     failed |= test_backup_index_survives_primary_refusal();
     puts("script disk cache: valid backup survives primary Budget refusal");
+    failed |= test_index_rename_failure_keeps_temporary();
+    puts("script disk cache: index rename failure keeps the temporary copy");
+    failed |= test_pack_rename_failure_drops_entry();
+    puts("script disk cache: pack rename failure drops its index entry");
     puts("script disk cache: ceiling and LRU");
     failed |= test_oversized_record_stays_in_ram();
     puts("script disk cache: oversized record stays in RAM");

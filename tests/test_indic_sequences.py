@@ -35,6 +35,22 @@ class IndicTests(unittest.TestCase):
             self.assertEqual(entries, sorted(set(entries)))
             self.assertEqual(indic.encoded(labels, language), indic.encoded(labels, language))
 
+    def test_legacy_hindi_producer_stays_frozen(self):
+        # devanagari_sequences.py produces the published hi.sequences bytes,
+        # so its known join-control split must not be "fixed" in place.
+        self.assertEqual(list(legacy_hindi.clusters("क्\u200dषि")), ["क्", "षि"])
+        self.assertNotEqual(list(legacy_hindi.clusters("क्\u200dषि")),
+                            list(indic.clusters("क्\u200dषि", "hi")))
+
+    def test_minimum_glyph_sequence_table(self):
+        expected = {("DEVANAGARI", 3): 2, ("DEVANAGARI", 5): 3, ("DEVANAGARI", 7): 4,
+                    ("DEVANAGARI", 10): 5, ("DEVANAGARI", 11): 6,
+                    ("BENGALI_ASSAMESE", 9): 1, ("BENGALI_ASSAMESE", 11): 2,
+                    ("CYRILLIC", 11): 1, ("EMBEDDED", 1): 1}
+        for (glyphs, version), sequence in expected.items():
+            self.assertEqual(catalogs.minimum_glyph_sequence(glyphs, version), sequence,
+                             (glyphs, version))
+
     def test_does_not_join_across_scripts_or_word_boundaries(self):
         self.assertEqual(list(indic.clusters("কি English ক্‍ षि", "bn")), ["কি", "ক্‍"])
         self.assertEqual(list(indic.clusters("ক‍ষ", "bn")), ["ক", "ষ"])
@@ -43,7 +59,7 @@ class IndicTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(indic.clusters("ক" + "ি" * 8, "bn"))
         with self.assertRaises(ValueError):
-            indic.inventory(["a" * 32769], "hi")
+            indic.inventory(["a" * (indic.MAX_LABEL_BYTES + 1)], "hi")
         with self.assertRaises(ValueError):
             indic.inventory([], "th")
 

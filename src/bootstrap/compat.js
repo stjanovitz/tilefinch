@@ -8,6 +8,8 @@
       "type",
     ).get,
     trustedFunctionApply = Function.call.bind(Function.prototype.apply),
+    /* Host and validation realms only (see hardening.js). */
+    testProbes = !!globalThis.__tilefinchTestProbes,
     TrustedObject = Object,
     TrustedString = String,
     TrustedTypeError = TypeError,
@@ -2519,18 +2521,17 @@
     document.createCDATASection = (data) =>
       detachedLeaf(document, Node.CDATA_SECTION_NODE, "#cdata-section", data);
   }
+  let readAbortSignalState, readAbortControllerState;
   const defaultAbortReason = () =>
     new DOMException("This operation was aborted", "AbortError"),
     abortSignalToken = Object.freeze({}),
-    abortSignalStates = new TrustedWeakMap(),
-    abortControllerStates = new TrustedWeakMap(),
     abortSignalState = (signal) => {
-      const state = trustedWeakMapGet(abortSignalStates, signal);
+      const state = readAbortSignalState(signal);
       if (!state) throw new TrustedTypeError("Illegal invocation");
       return state;
     },
     abortControllerState = (controller) => {
-      const state = trustedWeakMapGet(abortControllerStates, controller);
+      const state = readAbortControllerState(controller);
       if (!state) throw new TrustedTypeError("Illegal invocation");
       return state;
     },
@@ -2640,6 +2641,14 @@
       }
     };
   globalThis.AbortSignal = class AbortSignal extends EventTarget {
+    #state;
+    static {
+      /* onabort and fetch algorithms may close over the signal. Keep the
+         cycle on its owner, not in a realm-global weak-key value. */
+      readAbortSignalState = signal => signal &&
+        (typeof signal === "object" || typeof signal === "function") &&
+        #state in signal ? signal.#state : undefined;
+    }
     constructor(token) {
       if (token !== abortSignalToken)
         throw new TrustedTypeError("Illegal constructor");
@@ -2657,7 +2666,7 @@
         nextAbortEvent: null,
       };
       state.onabortListener = (event) => state.onabort?.call(this, event);
-      trustedWeakMapSet(abortSignalStates, this, state);
+      this.#state = state;
     }
     get aborted() {
       return abortSignalState(this).aborted;
@@ -2744,10 +2753,16 @@
     }
   };
   globalThis.AbortController = class AbortController {
+    #state;
+    static {
+      readAbortControllerState = controller => controller &&
+        (typeof controller === "object" || typeof controller === "function") &&
+        #state in controller ? controller.#state : undefined;
+    }
     constructor() {
-      trustedWeakMapSet(abortControllerStates, this, {
+      this.#state = {
         signal: new AbortSignal(abortSignalToken),
-      });
+      };
     }
     get signal() {
       return abortControllerState(this).signal;
@@ -3674,18 +3689,21 @@
       waiting: 0,
       active: 0,
     },
-    networkQueueView = {};
-  for (const key of Object.keys(networkQueueStats))
-    Object.defineProperty(networkQueueView, key, {
-      enumerable: true,
-      get: () => networkQueueStats[key],
+    networkQueueView = testProbes ? {} : null;
+  /* A read-only view for host tests. */
+  if (networkQueueView) {
+    for (const key of Object.keys(networkQueueStats))
+      Object.defineProperty(networkQueueView, key, {
+        enumerable: true,
+        get: () => networkQueueStats[key],
+      });
+    Object.freeze(networkQueueView);
+    Object.defineProperty(globalThis, "__tilefinchNetworkQueueStats", {
+      value: networkQueueView,
+      writable: false,
+      configurable: false,
     });
-  Object.freeze(networkQueueView);
-  Object.defineProperty(globalThis, "__tilefinchNetworkQueueStats", {
-    value: networkQueueView,
-    writable: false,
-    configurable: false,
-  });
+  }
   /* The native result snapshot and pending-work count read the backing
      record directly: plain data properties, no getter call per turn. */
   globalThis.__tilefinchHostChannel.networkQueueStats = networkQueueStats;
@@ -3947,8 +3965,11 @@
       url,
     };
   };
-  globalThis.__tilefinchXHRSendCalls = 0;
-  globalThis.__tilefinchXHRLastError = "";
+  /* The lab's per-request telemetry globals (test-probe realms only). */
+  if (testProbes) {
+    globalThis.__tilefinchXHRSendCalls = 0;
+    globalThis.__tilefinchXHRLastError = "";
+  }
   const responseBrands = new WeakSet(),
     responseMetadata = new WeakMap(),
     responseBodyStorage = new TrustedWeakMap(),
@@ -5096,14 +5117,23 @@
   const xhrIteratorPrototype = Object.getPrototypeOf((function* () {})()),
     xhrIteratorNext = Function.call.bind(xhrIteratorPrototype.next),
     xhrIteratorReturn = Function.call.bind(xhrIteratorPrototype.return);
+  /* The host lab's private-session recorder. Test-probe realms hand its
+     installer to native code; nothing else can enable it. */
   let xhrDiagnosticRecord = null;
   const xhrDiagnosticAdd = (state, column, value = 1, replace = false) => {
     if (xhrDiagnosticRecord && state && state.diagnosticSequence)
       xhrDiagnosticRecord(state.diagnosticSequence, column, value, replace);
-  };
-  globalThis.__tilefinchXHRDiagnostics = (recorder) => {
-    xhrDiagnosticRecord = recorder;
-  };
+  },
+    /* A readyState change: the lab's state trace and recorder phase. */
+    xhrTracePhase = (state, phase) => {
+      if (!testProbes) return;
+      state.stateTrace.push(phase);
+      xhrDiagnosticAdd(state, 4, phase, true);
+    };
+  if (testProbes)
+    globalThis.__tilefinchHostChannel.xhrDiagnostics = (recorder) => {
+      xhrDiagnosticRecord = recorder;
+    };
   const xhrEventHandlerTypes = [
       "abort",
       "error",
@@ -5204,7 +5234,7 @@
         responseText: "",
         responseType: "",
         sent: false,
-        stateTrace: [],
+        stateTrace: testProbes ? [] : null,
         timeoutId: 0,
         uploadBytes: 0,
         uploadComplete: false,
@@ -5212,7 +5242,8 @@
         url: "",
         diagnosticSequence: 0,
       };
-      xhrEventTargetState(this).diagnosticState = this.#privateState;
+      if (testProbes)
+        xhrEventTargetState(this).diagnosticState = this.#privateState;
     }
     get responseType() {
       return xhrPrivateState(this).responseType;
@@ -5273,7 +5304,7 @@
       state.uploadComplete = false;
       state.uploadStarted = false;
       xhrSetPublic(this, "readyState", 1);
-      state.stateTrace = [1];
+      if (testProbes) state.stateTrace = [1];
       xhrEmit(this, "readystatechange");
     }
     setRequestHeader(name, value) {
@@ -5333,8 +5364,7 @@
         raw.headers || "content-type: " + raw.contentType + "\n",
       );
       xhrSetPublic(this, "readyState", 2);
-      state.stateTrace.push(2);
-      xhrDiagnosticAdd(state, 4, 2, true);
+      xhrTracePhase(state, 2);
       yield [this, "readystatechange", 0, 0, false];
       if (state.done || state.generation !== generation) return;
       const supplied =
@@ -5358,8 +5388,7 @@
         : "";
       xhrDiagnosticAdd(state, 3, state.responseText.length, true);
       xhrSetPublic(this, "readyState", 3);
-      state.stateTrace.push(3);
-      xhrDiagnosticAdd(state, 4, 3, true);
+      xhrTracePhase(state, 3);
       yield [this, "readystatechange", 0, 0, false];
       if (state.done || state.generation !== generation) return;
       const fallbackBody = raw.body === undefined ? "" : String(raw.body),
@@ -5423,8 +5452,7 @@
         xhrSetPublic(this, "responseXML", this.response);
       }
       xhrSetPublic(this, "readyState", 4);
-      state.stateTrace.push(4);
-      xhrDiagnosticAdd(state, 4, 4, true);
+      xhrTracePhase(state, 4);
       yield [this, "readystatechange", 0, 0, false];
       if (state.done || state.generation !== generation) return;
       state.done = true;
@@ -5441,9 +5469,10 @@
       const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return;
       if (!xhrUploadFinish(this, type, generation)) return;
-      globalThis.__tilefinchXHRLastError = String(
-        (error && error.stack) || error || type,
-      );
+      if (testProbes)
+        globalThis.__tilefinchXHRLastError = String(
+          (error && error.stack) || error || type,
+        );
       xhrSetPublic(this, "status", 0);
       xhrSetPublic(this, "response", null);
       state.responseText = "";
@@ -5454,7 +5483,7 @@
       const state = xhrPrivateState(this);
       if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
-      globalThis.__tilefinchXHRSendCalls++;
+      if (testProbes) globalThis.__tilefinchXHRSendCalls++;
       if (xhrDiagnosticRecord)
         state.diagnosticSequence = xhrDiagnosticRecord(0, 0, 0, false);
       state.sent = true;
@@ -5625,12 +5654,14 @@
     configurable: true,
     value: "XMLHttpRequest",
   });
-  globalThis.__tilefinchXHRResponseCount = 0;
-  globalThis.__tilefinchXHRLastStatus = 0;
-  globalThis.__tilefinchXHRLastResponseType = "";
-  globalThis.__tilefinchXHRLastTextLength = 0;
-  globalThis.__tilefinchXHRLastByteLength = 0;
-  globalThis.__tilefinchXHRLastStates = "";
+  if (testProbes) {
+    globalThis.__tilefinchXHRResponseCount = 0;
+    globalThis.__tilefinchXHRLastStatus = 0;
+    globalThis.__tilefinchXHRLastResponseType = "";
+    globalThis.__tilefinchXHRLastTextLength = 0;
+    globalThis.__tilefinchXHRLastByteLength = 0;
+    globalThis.__tilefinchXHRLastStates = "";
+  }
   for (const name of [
     "readyState",
     "status",
@@ -5758,8 +5789,7 @@
     xhrState = (xhr, value, generation) => {
       const state = xhrPrivateState(xhr);
       if (state.generation !== generation || state.done) return false;
-      state.stateTrace.push(value);
-      xhrDiagnosticAdd(state, 4, value, true);
+      xhrTracePhase(state, value);
       xhrStateImpl.call(xhr, value);
       return state.generation === generation && !state.done;
     },
@@ -5779,7 +5809,7 @@
             : new TextEncoder().encode(String(raw.body || "")).byteLength;
       const iterator = xhrApplyImpl.call(xhr, raw, generation),
         completed = () => {
-          if (xhrGenerationCurrent(xhr, generation)
+          if (testProbes && xhrGenerationCurrent(xhr, generation)
           && xhr.readyState === 4 && xhr.status !== 0) {
             const state = xhrPrivateState(xhr);
             xhrDiagnosticAdd(state, 1, xhr.status, true);
@@ -5836,10 +5866,11 @@
     },
     xhrFail = (xhr, error, type = "error", generation) => {
       if (!xhrGenerationCurrent(xhr, generation)) return;
-      const previous = globalThis.__tilefinchXHRLastError;
+      const previous = testProbes ? globalThis.__tilefinchXHRLastError : "";
       xhrFailImpl.call(xhr, error, type, generation);
       xhrDiagnosticAdd(xhrPrivateState(xhr), 4, 6, true);
-      if (type !== "error") globalThis.__tilefinchXHRLastError = previous;
+      if (testProbes && type !== "error")
+        globalThis.__tilefinchXHRLastError = previous;
     };
   /* A dedicated worker may be terminated while one of its owner-backed XHR
      transports is still pending.  Abort that transport without dispatching
@@ -5922,9 +5953,10 @@
       markXhrNative(descriptor?.set);
     }
   }
-  Object.defineProperty(globalThis.__tilefinchRootCensus, "pendingNetwork", {
-    get: () => pendingNetwork.size,
-  });
+  if (globalThis.__tilefinchRootCensus)
+    Object.defineProperty(globalThis.__tilefinchRootCensus, "pendingNetwork", {
+      get: () => pendingNetwork.size,
+    });
 
   /* Small device-state APIs live with the compatibility layer so platform.js
      remains below the source-fallback admission ceiling. Public objects are

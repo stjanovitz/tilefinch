@@ -44,6 +44,12 @@ reclaim frees them first. On the PlayStation Portable article on a PSP-3000
 this raised the page's budget peak by about 200 KiB and cut Page Down to a
 complete frame from p50 117 ms to 83 ms.
 
+Beneath the profiles, PSPSDK's grow-to-largest heap takes what is left after
+2 MiB is held back. After the executable, stacks, modules, and system
+reserves, physical validation measures about 43 MiB allocatable through
+newlib (PPSSPP reports 47 MiB). That process heap does not decide what a page
+may use; the profile ceiling does.
+
 Both reserve at least 8 MiB outside the page budget for process control,
 network/TLS internals, firmware modules, media, native chrome, stacks, and
 library bookkeeping. The PSP's measured free heap is never treated as
@@ -113,6 +119,72 @@ Native and JavaScript callback boundaries must either poll the watchdog or
 prove a small fixed upper bound. A dependency call which cannot be interrupted
 is named in diagnostics rather than being counted as cooperative work.
 
+### Boot order
+
+HOME and Collections are native chrome, so boot does only what their first
+frame needs. Profile settings, bookmarks, and HOME destinations load before
+that frame, because they define the native UI. An ordinary boot shows one
+static splash until HOME is ready rather than waiting on scanout for
+intermediate startup messages. The timing markers `platform-ready` and
+`runtime-ready` describe native callbacks, input, clocks, and service setup,
+**not** a page JavaScript runtime. The Media Engine pool still reserves its
+addressable memory before the browser heap grows; that is an ownership
+requirement, not deferrable page work. Synthetic clock benchmarking runs only
+in the explicit `validation_power_test_auto` mode. HOME's first input sample
+skips the redundant post-presentation vblank wait and duplicate Home
+publication, while later frames keep their usual cadence.
+
+The native HOME placeholder is committed through the initial empty-document
+path, so it owns neither an unused QuickJS realm nor a resource
+scheduler/HTTP worker. Its temporary resource and script policy is restored
+on success or refusal; the configured global and per-site policy applies from
+the first real navigation.
+
+Wi-Fi warm-up starts after HOME's first paint, and the highlighted built-in
+provider can preconnect once association completes. Secure entropy, the
+bounded TLS-session store, the trust bundle (4 KiB reads), and the shared
+HTTP worker are prepared in separate post-paint units during association.
+The same owner continues those units if an immediate first navigation adopts
+the foreground connection wait, including a native provider open. Optional
+provider work yields until this preparation completes or refuses; ordinary
+demand remains the fallback. No extra host is contacted. The provider's local
+YouTube search screen can open before association finishes; explicit
+searches, topic requests, and sign-in handoffs still require networking. The
+saved Wi-Fi profile name is queried only when Options needs it; the
+already-loaded profile number remains usable for navigation before that
+query.
+
+Local adapter entry surfaces retain a deferred resource-scheduler view:
+creating or pumping an empty view does not acquire curl or start its worker.
+The first accepted resource request initializes that view, with ordinary
+retryable refusal and teardown. Ordinary document admission keeps its
+network reservation, so font and resource pressure decisions do not change.
+
+Activating a HOME tile publishes `OPENING...` through the shared
+acknowledgement path before any network or page preparation, so navigation
+never has to hide input receipt while background warm-up finishes.
+
+Page fonts follow the same staged boundary, with one presentation rule: the
+regular sans face used by native HOME is loaded before HOME's first frame, so
+its labels never switch from the bitmap fallback after they are visible. That
+is the only page-font read before the first frame. Its metric-only
+counterpart loads during association wait frames. On the frame networking
+becomes ready, the highlighted built-in provider's preconnect takes precedence
+over any remaining font read, and a navigation that outruns warm-up completes
+this two-face baseline before measuring text. Serif, italic, and bold faces
+are requested from the committed page's bounded census of draw commands and
+load one at a time in 16 KiB idle slices, which navigation and rendering can
+pre-empt. Bold text requests only the bold face its family draws with
+(TilefinchSans Bold for Arial/Helvetica stacks, DejaVu Sans Bold for other
+sans families, DejaVu Serif Bold for serif), and a web family is counted as
+its built-in fallback. A newly arrived metric face triggers one transactional
+relayout before its first repaint, so fallback measurements never survive
+under the real glyph advances.
+
+Optional disk-cache and local-storage restoration starts only after HOME is
+interactive; [Storage](../STORAGE.md) describes the transactional reader and
+its ordering against the first navigation.
+
 ### Boot timeline
 
 PPSSPP ordinary-launcher validation measured browser-main to HOME at
@@ -137,6 +209,29 @@ Large transient stack objects receive the same scrutiny. The PSP build records
 stack usage for critical translation units, and temporary tables move to
 bounded owner storage only when that shortens a genuinely live frame rather
 than hiding the same memory elsewhere.
+
+### Fast paths
+
+PSP-specific fast paths never change results:
+
+- checked 32-bit arithmetic for ordinary viewport geometry, with 64-bit
+  fallbacks only for values that need them, and fixed-point font advances
+  and kerning in hot measurement paths;
+- selector programs that compare interned identifiers and reuse node-local
+  attribute facts, and compiled stylesheet fragments reused from bounded RAM
+  caches (never written to the Memory Stick);
+- preview layout limited to geometry that can affect the viewport;
+- on simple script-free pages, visible images loaded before publication and
+  offscreen images pumped from idle work one viewport-ranked request and one
+  decode at a time, kept in the bounded RAM cache for repeat navigations;
+- native image slots retained before decoding for script-free, fixed-size
+  raster images, so a matching DOM/cascade generation permits paint-only
+  publication that keeps unrelated tiles and the display list (intrinsic
+  sizing, author runtimes, fixed/sticky layers, and expanding filters keep the
+  full-layout fallback);
+- image discovery that carries the computed parent style instead of
+  rebuilding the cascade per image, and bounded caches with measured eviction
+  for repeated gradients, glyphs, and tiles.
 
 ## Executable and hot-symbol ratchets
 

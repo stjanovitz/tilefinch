@@ -1,10 +1,12 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/glyph_component.h"
 #include "tilefinch/ui_language.h"
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_power_policy.h"
 #include "tilefinch/youtube_subtitles.h"
 #include "../src/psp_ui_theme.h"
+#include "../src/tilefinch_test_faults.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1513,8 +1515,9 @@ static bool test_glyph_offer_toast_state_machine(void)
     CHECK(!psp_ui_glyph_offer_visible(&ui));
     psp_ui_show_glyph_offer(&ui, TILEFINCH_GLYPH_PACK_CYRILLIC);
     CHECK(psp_ui_glyph_offer_visible(&ui)
-          && ui.glyph_offer_plus_one == TILEFINCH_GLYPH_PACK_CYRILLIC + 1u
-          && strcmp(ui.status, "This page uses Cyrillic text.") == 0);
+          && ui.toast_kind == PSP_UI_TOAST_GLYPH_OFFER
+          && ui.toast_payload == TILEFINCH_GLYPH_PACK_CYRILLIC
+          && strcmp(ui.status, "Cyrillic") == 0);
     ui.toast_entry_frames = 0;
     psp_ui_composite(&ui, offered, WIDTH, HEIGHT, WIDTH);
     CHECK(memcmp(plain, offered, sizeof(plain)) != 0);
@@ -1627,7 +1630,7 @@ static bool test_glyph_offer_toast_state_machine(void)
         intent = psp_ui_update(&ui, &input);
         CHECK(intent.glyph_offer_answer == PSP_UI_GLYPH_OFFER_NONE);
     }
-    CHECK(!psp_ui_glyph_offer_visible(&ui) && ui.glyph_offer_plus_one == 0);
+    CHECK(!psp_ui_glyph_offer_visible(&ui) && ui.toast_kind == PSP_UI_TOAST_PLAIN);
     intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
     CHECK(intent.glyph_offer_answer == PSP_UI_GLYPH_OFFER_NONE);
 
@@ -1687,13 +1690,157 @@ static bool test_glyph_offer_settings_rows(void)
     return true;
 }
 
+/* The saved interface language's catalog or pack is missing: a timed
+   three-line toast over Home or a settled page, in English, that takes X
+   to Settings > Appearance > Language & emoji with Interface language
+   focused on that language (one more X is the regular download) and closes
+   on O. It never covers a menu, another toast or a loading page. */
+static bool test_language_repair_offer(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t plain[WIDTH * HEIGHT], offered[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "News", "https://news.example.es/", true);
+    psp_ui_set_loading(&ui, false, 0);
+    ui.toast_frames = 0;
+    ui.ui_language = TILEFINCH_UI_LANGUAGE_ENGLISH;
+    CHECK(tilefinch_ui_translation_bound_language()
+          == TILEFINCH_UI_LANGUAGE_ENGLISH);
+    psp_ui_composite(&ui, plain, WIDTH, HEIGHT, WIDTH);
+    /* English needs nothing. */
+    CHECK(!psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_ENGLISH, false) && ui.toast_frames == 0);
+    CHECK(!psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_COUNT, false) && ui.toast_frames == 0);
+
+    /* Never over a loading page, another toast, a menu or a modal. */
+    psp_ui_set_loading(&ui, true, 0);
+    CHECK(!psp_ui_language_repair_offer_ready(&ui));
+    psp_ui_set_loading(&ui, false, 0);
+    psp_ui_show_status(&ui, "PAGE SAVED", 60);
+    CHECK(!psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_SPANISH, false)
+          && strcmp(ui.status, "PAGE SAVED") == 0);
+    ui.toast_frames = 0;
+    const PspUiScreen modal[] = {
+        PSP_UI_SCREEN_MENU, PSP_UI_SCREEN_OPTIONS, PSP_UI_SCREEN_TEXT_ENTRY,
+        PSP_UI_SCREEN_STORAGE_OFFER, PSP_UI_SCREEN_HEAVY_OFFER,
+        PSP_UI_SCREEN_GLYPH_OFFER, PSP_UI_SCREEN_YOUTUBE_LOGIN,
+        PSP_UI_SCREEN_FILE_DOWNLOAD, PSP_UI_SCREEN_UPDATE
+    };
+    for (size_t at = 0; at < sizeof(modal) / sizeof(modal[0]); at++) {
+        ui.screen = modal[at];
+        CHECK(!psp_ui_show_language_repair_offer(
+            &ui, TILEFINCH_UI_LANGUAGE_SPANISH, false)
+              && ui.toast_frames == 0);
+    }
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    ui.page_fullscreen = true;
+    CHECK(!psp_ui_language_repair_offer_ready(&ui));
+    ui.page_fullscreen = false;
+    ui.captive_portal_active = true;
+    CHECK(!psp_ui_language_repair_offer_ready(&ui));
+    ui.captive_portal_active = false;
+    CHECK(psp_ui_language_repair_offer_ready(&ui));
+
+    CHECK(psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_SPANISH, false));
+    CHECK(ui.toast_kind == PSP_UI_TOAST_LANGUAGE_REPAIR
+          && ui.toast_payload == TILEFINCH_UI_LANGUAGE_SPANISH
+          && strcmp(ui.status, "Interface text needs a download") == 0);
+    /* With the catalog missing nothing is bound, so the painter's lookups
+       return the English keys themselves. */
+    CHECK(tilefinch_ui_text(ui.status) == ui.status);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, offered, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(plain, offered, sizeof(plain)) != 0);
+    CHECK(memcmp(plain, offered, (size_t) WIDTH * 120u * sizeof(uint16_t))
+          == 0);
+
+    /* A press already on its way to the page is the page's. */
+    PspUiInput input = {.analog_x = 128, .analog_y = 128, .elapsed_ms = 16};
+    PspUiIntent intent = glyph_offer_press(&ui, &input,
+                                           PSP_UI_BUTTON_CONFIRM);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE
+          && ui.toast_kind == PSP_UI_TOAST_LANGUAGE_REPAIR
+          && !intent.glyph_component_probe_requested);
+    glyph_offer_arm(&ui, &input);
+    /* Armed X: the Interface language row, focused on Spanish. */
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
+    CHECK(ui.screen == PSP_UI_SCREEN_GLYPH_OPTIONS
+          && ui.glyph_options_selection == 6u
+          && ui.ui_language == TILEFINCH_UI_LANGUAGE_SPANISH
+          && intent.glyph_component_probe_requested
+          && intent.setting.id == PSP_UI_SETTING_NONE
+          && ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
+    /* One more X is the row's own install request. */
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.setting.id == PSP_UI_SETTING_UI_LANGUAGE
+          && intent.setting.value.unsigned_value
+              == TILEFINCH_UI_LANGUAGE_SPANISH);
+    /* Back retraces the menu path: Language & emoji under Appearance. */
+    (void) glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
+    (void) glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
+    CHECK(ui.screen == PSP_UI_SCREEN_GLYPH_OPTIONS
+          && ui.glyph_options_selection == 0u);
+    (void) glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CANCEL);
+    (void) glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
+          && ui.options_group_selection == 0u);
+
+    /* O closes it at once, armed or not, and is not a Back. */
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    ui.toast_frames = 0;
+    CHECK(psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_HINDI, true));
+    CHECK(strcmp(ui.status, "Needs a font pack update") == 0
+          && ui.toast_payload == TILEFINCH_UI_LANGUAGE_HINDI);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CANCEL);
+    CHECK(intent.action == PSP_UI_ACTION_NONE
+          && ui.screen == PSP_UI_SCREEN_PAGE
+          && ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
+
+    /* Unanswered, it times out like the language-pack offer. */
+    CHECK(psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_HINDI, true));
+    input.pressed = 0;
+    input.elapsed_ms = 100;
+    for (int frame = 0; frame < 200 && ui.toast_frames != 0; frame++)
+        (void) psp_ui_update(&ui, &input);
+    CHECK(ui.toast_frames == 0 && ui.toast_kind == PSP_UI_TOAST_PLAIN);
+
+    /* On Home it draws and answers too; O there is not "Already home". */
+    psp_ui_show_home(&ui);
+    ui.overlay_animation_frames = 0;
+    psp_ui_composite(&ui, plain, WIDTH, HEIGHT, WIDTH);
+    CHECK(psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_BENGALI, false));
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, offered, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(plain, offered, sizeof(plain)) != 0);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CANCEL);
+    CHECK(ui.screen == PSP_UI_SCREEN_HOME && ui.toast_frames == 0
+          && strcmp(ui.status, "ALREADY HOME") != 0);
+    CHECK(psp_ui_show_language_repair_offer(
+        &ui, TILEFINCH_UI_LANGUAGE_BENGALI, false));
+    glyph_offer_arm(&ui, &input);
+    intent = glyph_offer_press(&ui, &input, PSP_UI_BUTTON_CONFIRM);
+    CHECK(ui.screen == PSP_UI_SCREEN_GLYPH_OPTIONS
+          && ui.ui_language == TILEFINCH_UI_LANGUAGE_BENGALI
+          && intent.action == PSP_UI_ACTION_NONE);
+    CHECK(psp_ui_state_bytes() <= 1024);
+    return true;
+}
+
 static bool test_wifi_sign_in_suggestion_is_actionable(void)
 {
     PspUiState ui;
     psp_ui_init(&ui);
     psp_ui_show_wifi_sign_in_status(
         &ui, "THIS WI-FI MAY REQUIRE SIGN-IN", 600);
-    CHECK(ui.captive_portal_suggested && ui.toast_frames != 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_WIFI_SIGN_IN && ui.toast_frames != 0);
     PspUiInput input = {
         .pressed = PSP_UI_BUTTON_CONFIRM,
         .analog_x = 128,
@@ -1701,14 +1848,14 @@ static bool test_wifi_sign_in_suggestion_is_actionable(void)
     };
     PspUiIntent intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_CHECK_WIFI_SIGN_IN);
-    CHECK(!ui.captive_portal_suggested && ui.toast_frames == 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
 
     psp_ui_show_wifi_sign_in_status(
         &ui, "THIS WI-FI MAY REQUIRE SIGN-IN", 600);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_NONE);
-    CHECK(!ui.captive_portal_suggested && ui.toast_frames == 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
     return true;
 }
 
@@ -2812,18 +2959,18 @@ static bool test_heavy_page_screens(void)
     /* The status's X stops scripts; O only dismisses; an ordinary status
        that replaces it gives X back to the page. */
     psp_ui_show_heavy_scripts_status(&ui, "PAGE SCRIPTS: ABOUT 3.9 MB", 300u);
-    CHECK(ui.heavy_scripts_suggested && ui.toast_frames != 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_HEAVY_SCRIPTS && ui.toast_frames != 0);
     psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
     CHECK(site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM).action
           == PSP_UI_ACTION_HEAVY_STOP_SCRIPTS);
-    CHECK(!ui.heavy_scripts_suggested && ui.toast_frames == 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
     psp_ui_show_heavy_scripts_status(&ui, "PAGE SCRIPTS: ABOUT 3.9 MB", 300u);
     CHECK(site_storage_press(&ui, PSP_UI_BUTTON_CANCEL).action
           == PSP_UI_ACTION_NONE);
-    CHECK(!ui.heavy_scripts_suggested && ui.toast_frames == 0);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN && ui.toast_frames == 0);
     psp_ui_show_heavy_scripts_status(&ui, "PAGE SCRIPTS: ABOUT 3.9 MB", 300u);
     psp_ui_show_status(&ui, "SAVED", 60u);
-    CHECK(!ui.heavy_scripts_suggested);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN);
 
     psp_ui_show_heavy_recovery(&ui, "ITS SCRIPTS NEED ABOUT 9.5 MB MORE",
                                PSP_UI_FAILURE_BASIC_VIEW);
@@ -3563,7 +3710,8 @@ static bool test_large_toast_uses_full_psp_width(void)
     ui.toast_entry_frames = 0;
     psp_ui_composite(
         &ui, redirect_hint_without_tail, WIDTH, HEIGHT, WIDTH);
-    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
+    CHECK(ui.toast_kind == PSP_UI_TOAST_TLS
+          && ui.toast_payload == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
           && memcmp(redirect_hint, redirect_hint_without_tail,
                     sizeof(redirect_hint)) != 0);
     /* The recovery sheet covers page toasts. Clock guidance must also live
@@ -3573,15 +3721,17 @@ static bool test_large_toast_uses_full_psp_width(void)
     psp_ui_show_failure_recovery_actions(&ui, "Certificate not yet valid", 0u);
     ui.toast_frames = 0;
     ui.overlay_animation_frames = 0;
-    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_TIME);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_TLS
+          && ui.toast_payload == TILEFINCH_TLS_GUIDANCE_TIME);
     psp_ui_composite(&ui, certificate_hint, WIDTH, HEIGHT, WIDTH);
-    ui.tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    ui.toast_kind = PSP_UI_TOAST_PLAIN;
     psp_ui_composite(&ui, certificate_hint_without_tail, WIDTH, HEIGHT, WIDTH);
     CHECK(memcmp(certificate_hint, certificate_hint_without_tail,
                  sizeof(certificate_hint)) != 0);
-    ui.tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_TIME;
+    ui.toast_kind = PSP_UI_TOAST_TLS;
+    ui.toast_payload = TILEFINCH_TLS_GUIDANCE_TIME;
     psp_ui_show_failure_recovery_actions(&ui, "Connection timed out", 0u);
-    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_NONE);
+    CHECK(ui.toast_kind == PSP_UI_TOAST_PLAIN);
     psp_ui_clear_chrome_font();
     font_set_destroy(&fonts);
     CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
@@ -5599,6 +5749,36 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     CHECK(menu_cache.signature != midnight_signature);
     psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
 
+    /* A glyph-pack change replaces the glyphs the menu's labels were drawn
+       with, so the retained menu repaints (review 1021b F2). */
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    uint32_t unpacked_signature = menu_cache.signature;
+    unsigned unpacked_changes = menu_blit_source_changes;
+    Budget pack_budget;
+    budget_init(&pack_budget, 256u * 1024u);
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&pack_budget);
+    CHECK(provider != NULL && font_optional_glyph_provider_install(provider));
+    PspUiState pack_ui;
+    psp_ui_init(&pack_ui);
+    psp_ui_composite(&pack_ui, expected_menu_scratch, WIDTH, HEIGHT, WIDTH);
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    CHECK(menu_cache.signature != unpacked_signature
+          && menu_blit_source_changes == unpacked_changes + 1u);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    psp_ui_composite(&pack_ui, expected_menu_scratch, WIDTH, HEIGHT, WIDTH);
+    CHECK(pack_budget.current == 0);
+
     presentation.track_menu_open = false;
     static uint32_t video[512 * 272];
     static uint16_t scratch[512 * 272];
@@ -6271,9 +6451,18 @@ static bool test_status_sentence_case_keeps_acronyms(void)
         { "A PAGE IS LOADING", "A page is loading" },
         { "LOGGING ON - TILEFINCH/DATA", "Logging on - tilefinch/data" },
         { "Already Sentence Case", "Already Sentence Case" },
+        /* Translated all-caps statuses: an accented capital continues its
+           word and is lowercased with it, never splitting the word. */
+        { "ÉCHEC DU TÉLÉCHARGEMENT - RÉESSAYEZ",
+          "Échec du téléchargement - réessayez" },
+        { "TRANSFERÊNCIA DO IDIOMA CANCELADA", "Transferência do idioma cancelada" },
+        { "À JOUR ŒUVRE Ÿ ĹÁ", "À jour œuvre ÿ ĺá" },
+        { "GRÖSSE ändern", "GRÖSSE ändern" },
+        /* Other scripts keep their bytes; Latin acronyms keep their case. */
+        { "ОШИБКА QR СТРАНИЦЫ PAGE", "ОШИБКА QR СТРАНИЦЫ page" },
     };
     for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
-        char text[64];
+        char text[96];
         snprintf(text, sizeof(text), "%s", cases[at].in);
         psp_ui_status_sentence_case(text);
         if (strcmp(text, cases[at].out) != 0) {
@@ -6459,6 +6648,75 @@ static bool test_chrome_font_cache_binding_and_refusals(void)
     CHECK(psp_ui_chrome_glyph_preload().glyphs == 0u);
     psp_ui_clear_chrome_font();
     font_set_destroy(&fonts);
+    return true;
+}
+
+/* The media raster's ink check rescans the glyph cache only after a glyph
+   slot changes, and still sees every refusal and its recovery (review
+   2026-10-21 M6). */
+static bool test_media_ink_check_follows_glyph_state(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(face, NULL, 1u);
+    uint32_t generation = psp_ui_media_raster_generation();
+    CHECK(generation != 0u);
+    tilefinch_test_faults()->chrome_media_ink_scans = 0u;
+    for (unsigned frame = 0; frame < 60u; frame++)
+        CHECK(psp_ui_media_raster_generation() == generation);
+    CHECK(tilefinch_test_faults()->chrome_media_ink_scans == 0u);
+    /* A refused glyph withholds the retained raster at once... */
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    psp_ui_preload_chrome_scale(2u);
+    CHECK(psp_ui_media_raster_generation() == 0u);
+    CHECK(psp_ui_media_raster_generation() == 0u);
+    /* ...and its successful retry restores it. */
+    budget.limit = limit;
+    psp_ui_preload_chrome_scale(2u);
+    CHECK(psp_ui_media_raster_generation() == generation);
+    /* Rebinding the faces is a new raster generation. */
+    psp_ui_clear_chrome_font();
+    psp_ui_set_chrome_fonts(face, NULL, 1u);
+    CHECK(psp_ui_media_raster_generation() != 0u
+          && psp_ui_media_raster_generation() != generation);
+    /* A refused Unicode glyph withholds the raster; a glyph-pack change
+       drops it with every other Unicode entry, and that drop must reach
+       the ink check too (review 1021b F1). */
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    PspUiState unicode_ui, ascii_ui;
+    psp_ui_init(&unicode_ui);
+    psp_ui_init(&ascii_ui);
+    psp_ui_show_status(&unicode_ui, "Caf\xc3\xa9 menu", 240);
+    psp_ui_show_status(&ascii_ui, "Cafe menu", 240);
+    psp_ui_preload_chrome_scale(1u);
+    psp_ui_preload_chrome_scale(2u);
+    psp_ui_composite(&ascii_ui, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(psp_ui_media_raster_generation() != 0u);
+    budget.limit = budget.current;
+    psp_ui_composite(&unicode_ui, frame, WIDTH, HEIGHT, WIDTH);
+    budget.limit = limit;
+    CHECK(psp_ui_media_raster_generation() == 0u);
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL && font_optional_glyph_provider_install(provider));
+    psp_ui_composite(&ascii_ui, frame, WIDTH, HEIGHT, WIDTH);
+    generation = psp_ui_media_raster_generation();
+    CHECK(generation != 0u);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    psp_ui_composite(&ascii_ui, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(psp_ui_media_raster_generation() != 0u
+          && psp_ui_media_raster_generation() != generation);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
     return true;
 }
 
@@ -7274,6 +7532,7 @@ static bool test_queue_taller_cache_and_selection(void)
 
 int main(void)
 {
+    if (!test_media_ink_check_follows_glyph_state()) return 1;
     if (!test_media_chrome_warmup_avoids_unused_weight()
         || !test_media_control_ground_exact_colors()) return 1;
     if (!test_queue_square_is_modal()) return 1;
@@ -7293,6 +7552,7 @@ int main(void)
         || !test_priority_menu_during_page_work()
         || !test_input_mapping_and_menu()
         || !test_wifi_sign_in_suggestion_is_actionable()
+        || !test_language_repair_offer()
         || !test_glyph_offer_toast_state_machine()
         || !test_glyph_offer_settings_rows()
         || !test_contextual_failure_recovery_actions()

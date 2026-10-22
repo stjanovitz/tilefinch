@@ -8,6 +8,8 @@ step is checked for tanks or shells inside or through scenery, overlaps,
 unreachable pickups and objectives, non-finite or out-of-range values,
 transitions that never end and long bot stalls; keyboard runs also replay
 their recording and compare digests. See tests/fixtures/treadline-invariants.js.
+The harness page pins Daily Arena to 20261001 (?daily=), so results do not
+change at UTC midnight.
 
 Every step also composes the camera as a device frame does and tracks it for
 oscillation, re-retraction (pumping), sudden jumps, sustained jerk and

@@ -1,6 +1,6 @@
 #include "tilefinch/browser_tabs.h"
+#include "tilefinch/platform.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -421,12 +421,10 @@ bool browser_tabs_hibernate(
         budget_free(tabs->budget, payload);
         return false;
     }
-    if (rename(temporary, path) != 0) {
-        if (remove(path) != 0 || rename(temporary, path) != 0) {
-            remove(temporary);
-            budget_free(tabs->budget, payload);
-            return false;
-        }
+    if (!tilefinch_platform_replace_file(temporary, path, NULL)) {
+        remove(temporary);
+        budget_free(tabs->budget, payload);
+        return false;
     }
     budget_free(tabs->budget, payload);
     BrowserTabSlot *slot = &tabs->slots[index];
@@ -466,21 +464,8 @@ static bool tab_session_replace(const char *path, const char *temporary)
 {
     char backup[1024];
     int written = snprintf(backup, sizeof(backup), "%s.bak", path);
-    if (written < 0 || (size_t) written >= sizeof(backup)) return false;
-
-    /* Keep one complete generation throughout publication. POSIX replaces an
-       older backup atomically. FAT can refuse that replacement, so remove
-       only the older backup while the primary is still intact and retry. */
-    bool had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) return false;
-    }
-    if (rename(temporary, path) == 0) return true;
-    if (had_previous) (void) rename(backup, path);
-    return false;
+    return written >= 0 && (size_t) written < sizeof(backup)
+        && tilefinch_platform_replace_file(temporary, path, backup);
 }
 
 bool browser_tabs_save_session(

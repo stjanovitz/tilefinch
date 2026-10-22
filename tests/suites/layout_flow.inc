@@ -346,6 +346,44 @@ static int test_scroll_scene_coordinate_containment(Budget *budget)
     document_destroy(&document);
     CHECK(budget->current == 0);
 
+    /* A virtual scroller's out-of-flow world establishes its logical range.
+       Unrelated keyframes must not turn that empty spacer into a one-screen
+       motion fallback. The overflow viewport itself remains bounded. */
+    static const char spacer_page[] =
+        "<!doctype html><style>body{margin:0}"
+        "@keyframes spinner{to{transform:rotate(360deg)}}"
+        "#viewport{position:relative;overflow:auto;width:480px;height:160px}"
+        "#world{position:absolute;width:1000px;height:110000px;"
+        "transform:scale(.461361);transform-origin:0 0}"
+        "#leaf{width:100px;height:20px;transform:translateY(100000px)}"
+        "</style><div id=viewport><div id=world><div id=leaf></div></div></div>";
+    PocDocument spacer_document = {0};
+    Stylesheet spacer_sheet = {0};
+    LayoutDocument spacer_layout = {0};
+    CHECK(document_parse(&spacer_document, budget, spacer_page,
+                         sizeof(spacer_page) - 1u, 31u)
+          && stylesheet_build(&spacer_sheet, budget, &spacer_document, 480)
+          && layout_build(&spacer_layout, budget, &spacer_document,
+                          &spacer_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *spacer_root = lxb_dom_interface_node(spacer_document.html);
+    const LayoutNodeBox *spacer_box = layout_box_for_node(&spacer_layout,
+        find_id(spacer_root, "world"));
+    const LayoutNodeBox *viewport_box = layout_box_for_node(&spacer_layout,
+        find_id(spacer_root, "viewport"));
+    const LayoutNodeBox *leaf_box = layout_box_for_node(&spacer_layout,
+        find_id(spacer_root, "leaf"));
+    CHECK(spacer_box != NULL && spacer_box->height >= 50745
+          && spacer_box->height <= 50752
+          && viewport_box != NULL && viewport_box->height == 160
+          && viewport_box->content_height >= 50745
+          && leaf_box != NULL && leaf_box->y >= 46133 && leaf_box->y <= 46139
+          && spacer_layout.height == 272
+          && spacer_layout.performance.coordinate_containments == 0u);
+    layout_destroy(&spacer_layout);
+    stylesheet_destroy(&spacer_sheet);
+    document_destroy(&spacer_document);
+    CHECK(budget->current == 0);
+
     static const char root_page[] =
         "<!doctype html><style>body{margin:0;height:1048575px}</style>"
         "<body><p>ROOT-CONTENT</p></body>";
@@ -727,12 +765,16 @@ static int test_responsive_replaced_sizing(Budget *budget)
         "#flexed{width:120px;max-width:60px;min-width:0;flex:0 1 auto}"
         "#grid-host{display:grid;width:60px;grid-template-columns:60px}"
         "#gridded{display:block;width:100%;aspect-ratio:2/1;min-width:0}"
+        "#height-flex-host{display:flex;width:160px}"
+        "#height-flexed{width:auto!important;height:auto!important;"
+        "max-height:100px;max-width:100%}"
         "</style><body><img id=positioned><img id=height-only>"
         "<img id=natural><img id=bounded><img id=minimum>"
         "<video id=poster poster=poster.png></video>"
         "<iframe id=frame></iframe>"
         "<div id=flex-host><img id=flexed></div>"
-        "<div id=grid-host><img id=gridded></div></body>";
+        "<div id=grid-host><img id=gridded></div>"
+        "<div id=height-flex-host><img id=height-flexed></div></body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -748,6 +790,7 @@ static int test_responsive_replaced_sizing(Budget *budget)
     lxb_dom_node_t *frame = find_id(root, "frame");
     lxb_dom_node_t *flexed = find_id(root, "flexed");
     lxb_dom_node_t *gridded = find_id(root, "gridded");
+    lxb_dom_node_t *height_flexed = find_id(root, "height-flexed");
     static unsigned char pixels[20 * 10 * 4];
     ImageResource items[] = {
         {.node=positioned, .pixels=pixels, .width=20, .height=10},
@@ -757,7 +800,9 @@ static int test_responsive_replaced_sizing(Budget *budget)
         {.node=minimum, .pixels=pixels, .width=20, .height=10},
         {.node=poster, .pixels=pixels, .width=20, .height=50},
         {.node=flexed, .pixels=pixels, .width=20, .height=10},
-        {.node=gridded, .pixels=pixels, .width=20, .height=10}
+        {.node=gridded, .pixels=pixels, .width=20, .height=10},
+        {.node=height_flexed, .pixels=pixels, .width=20, .height=10,
+         .source_width=200, .source_height=400}
     };
     ImageResources images = {
         .items = items, .count = sizeof(items) / sizeof(items[0])
@@ -789,6 +834,14 @@ static int test_responsive_replaced_sizing(Budget *budget)
         else if (command->image == &items[7]) gridded_command = command;
     }
     const LayoutNodeBox *frame_box = layout_box_for_node(&layout, frame);
+    const LayoutNodeBox *height_flex_box = layout_box_for_node(&layout, height_flexed);
+    if (height_flex_box == NULL || height_flex_box->width != 50
+        || height_flex_box->height != 100)
+        fprintf(stderr, "max-height flex image: %dx%d expected 50x100\n",
+            height_flex_box == NULL ? -1 : height_flex_box->width,
+            height_flex_box == NULL ? -1 : height_flex_box->height);
+    CHECK(height_flex_box != NULL && height_flex_box->width == 50
+          && height_flex_box->height == 100);
     ComputedStyle positioned_style = style_for_node(
         &sheet, positioned, NULL);
     CHECK(positioned_command != NULL

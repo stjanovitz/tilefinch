@@ -28,7 +28,7 @@
    and budgets", for the measurement behind them). */
 #define BROWSER_PSP_STRICT_INSTALLED_APP_HEAP (6u * 1024u * 1024u)
 /* Default module bytecode ceilings (BrowserConfig.module_bytecode_cache_limit).
-   See docs/engineering/MEMORY_EXPERIMENTS.md for the measurement. */
+   See .private-investigations/MEMORY_EXPERIMENTS.md for the measurement. */
 #define BROWSER_MODULE_BYTECODE_CACHE_BYTES (1024u * 1024u)
 #define BROWSER_MODULE_BYTECODE_CACHE_STRICT_BYTES (512u * 1024u)
 /* The default classic-script bytecode ceilings
@@ -1064,10 +1064,11 @@ typedef enum {
     BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE,
     BROWSER_BASIC_VIEW_RECOVERY_DEFERRED
 } BrowserBasicViewRecovery;
-/* Offer a hidden Basic clone only after author work settles, current-page
-   script degradation is proven, and the page is blank or has no positive-size
-   actionable region. Preparing the clone does not apply CSS or hide useful
-   raw pixels; the frontend decides whether to switch presentations. */
+/* Offer a hidden Basic clone after author work settles and current-page
+   degradation is proven: either memory prevented script initialization, or
+   the page is blank/has no positive-size actionable region. Surviving header
+   links do not suppress measured memory failure. Preparation does not apply
+   CSS or hide raw pixels; the frontend decides whether to switch. */
 BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
 typedef enum {

@@ -186,6 +186,15 @@ def extract(run_dir, name=None, url=None, tags=None):
         "resource_ms": round(num(perf.get("resource")) / 1000.0, 1),
         "raster_ms": round(num(perf.get("raster")) / 1000.0, 1),
     }
+    # census.py --focus-moves: the D-pad focus moves' latency, and whether
+    # they kept the layout-reuse cache (scoped invalidation) or reset it.
+    focus_us = [num(fields(line).get("total-us")) for line in lines
+                if line.startswith("interaction-latency command=focus-next ")]
+    if focus_us:
+        rec["timing"]["focus_moves"] = len(focus_us)
+        rec["timing"]["focus_ms"] = round(sum(focus_us) / 1000.0, 1)
+        reuse = fields(last_line(lines, "layout-reuse ") or "")
+        rec["focus_full_resets"] = num(reuse.get("full-resets"))
     resp = fields(last_line(lines, "responsiveness max-slice-us=") or "")
     rec["timing"]["longest_step_ms"] = round(num(resp.get("max-slice-us")) / 1000.0, 1)
     rec["timing"]["longest_step_phase"] = resp.get("phase", "")

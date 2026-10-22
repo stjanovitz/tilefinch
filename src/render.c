@@ -5,6 +5,7 @@
 #include "tilefinch/work_vector.h"
 #include "tilefinch_test_faults.h"
 #include "diagnostic_trace.h"
+#include "image_decode_internal.h"
 
 #include <limits.h>
 #include <math.h>
@@ -186,14 +187,14 @@ static void rasterize_tile(TileCache *cache, RenderTile *tile)
     uint64_t elapsed = finished - started;
     cache->raster_us += elapsed;
     if (elapsed > cache->max_raster_us) cache->max_raster_us = elapsed;
-    if (!cache->frame_composing && cache->raster_cooperate_phase != NULL) {
+    if (!cache->frame_composing) {
         if (cache->raster_slice_started_us == 0
             || finished < cache->raster_slice_started_us) {
             cache->raster_slice_started_us = started;
         }
         if (finished - cache->raster_slice_started_us >= UINT64_C(8000)) {
             (void) render_platform_cooperate(
-                cache, cache->raster_cooperate_phase, cache->rasterized);
+                cache, RENDER_COOPERATE_PHASE, cache->rasterized);
             cache->raster_slice_started_us = render_now_us();
         }
     }
@@ -378,7 +379,6 @@ bool tile_cache_init(TileCache *cache, Budget *budget,
     }
     memset(cache, 0, sizeof(*cache));
     cache->budget = budget;
-    cache->raster_cooperate_phase = "render-prepare";
     cache->retain_layout_rasters =
         tilefinch_lab_getenv("TILEFINCH_DISABLE_LAYOUT_RASTER_RETENTION") == NULL;
     if (!tile_cache_prepare_layout(cache, layout)) {
@@ -394,8 +394,8 @@ bool tile_cache_init(TileCache *cache, Budget *budget,
         return false;
     }
     cache->tile_capacity = tile_capacity;
-    /* The base screen is reserved up front, as before, so a later allocation
-       failure can never take away a tile the visible frame depends on. */
+    /* The base screen is reserved up front, so a later allocation failure
+       can never take away a tile the visible frame depends on. */
     size_t base = tile_capacity < RENDER_TILE_BASE_CAPACITY
         ? tile_capacity : RENDER_TILE_BASE_CAPACITY;
     for (size_t i = 0; i < base; i++) {
@@ -459,7 +459,8 @@ void tile_cache_repaint_glyphs(TileCache *cache)
 
 static void paint_overflow_command(TileCache *cache, uint16_t *frame,
                                    size_t index, int scroll_y,
-                                   int viewport_width, int viewport_height)
+                                   int viewport_width, int viewport_height,
+                                   OverflowFallback *fallback)
 {
     int dx = 0, dy = 0, clip_left = 0, clip_top = 0;
     int clip_right = 0, clip_bottom = 0;
@@ -476,18 +477,12 @@ static void paint_overflow_command(TileCache *cache, uint16_t *frame,
         clip_bottom = geometry->clip_bottom;
     } else if (!overflow_command_geometry(
                    cache->layout, index, &dx, &dy, &clip_left, &clip_top,
-                   &clip_right, &clip_bottom)) {
+                   &clip_right, &clip_bottom, fallback)) {
         return;
     }
     DrawCommand command = cache->layout->commands[index];
     command.x += dx;
     command.y += dy;
-    RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
-    size_t rounded_clip_count = geometry != NULL
-        ? overflow_cached_rounded_clips(cache, index, rounded_clips,
-                                        MAXIMUM_ROUNDED_CLIPS)
-        : overflow_rounded_clips(cache->layout, index, rounded_clips,
-                                 MAXIMUM_ROUNDED_CLIPS);
     int visible_left = clip_left > 0 ? clip_left : 0;
     int visible_right = clip_right < viewport_width
                         ? clip_right : viewport_width;
@@ -497,6 +492,14 @@ static void paint_overflow_command(TileCache *cache, uint16_t *frame,
     if (visible_right <= visible_left || visible_bottom <= visible_top
         || !intersects(&command, visible_left, visible_top,
                        visible_right, visible_bottom)) return;
+    /* Rounded ancestry is irrelevant when the rectangular clip already
+       rejects the command, especially when the bounded cache was refused. */
+    RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
+    size_t rounded_clip_count = geometry != NULL
+        ? overflow_cached_rounded_clips(cache, index, rounded_clips,
+                                        MAXIMUM_ROUNDED_CLIPS)
+        : overflow_rounded_clips(cache->layout, index, rounded_clips,
+                                 MAXIMUM_ROUNDED_CLIPS, fallback);
     RasterTarget target = {
         .pixels = frame,
         .stride = (size_t) viewport_width,
@@ -554,6 +557,7 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
     }
     /* Baked into the tiles this frame copied. */
     if (overflow_stream_static(cache)) return;
+    OverflowFallback fallback = {0};
     if (cache->layout->command_flags == NULL
         || cache->layout->spatial_band_offsets == NULL) {
         for (size_t order = 0; order < cache->layout->count; order++) {
@@ -563,7 +567,7 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
                 ? cache->layout->paint_order[order] : order;
             if (command_in_overflow(cache->layout, index)) {
                 paint_overflow_command(cache, frame, index, scroll_y,
-                                       viewport_width, viewport_height);
+                                       viewport_width, viewport_height, &fallback);
             }
         }
         return;
@@ -587,7 +591,7 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
             if (cache->layout->command_flags[index]
                 & LAYOUT_COMMAND_OVERFLOW) {
                 paint_overflow_command(cache, frame, index, scroll_y,
-                                       viewport_width, viewport_height);
+                                       viewport_width, viewport_height, &fallback);
             } else if (cache->layout->command_flags[index]
                        & LAYOUT_COMMAND_LATE_POSITIONED) {
                 paint_overlay_command(
@@ -639,7 +643,7 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
         if (cache->layout->command_flags[index]
             & LAYOUT_COMMAND_OVERFLOW) {
             paint_overflow_command(cache, frame, index, scroll_y,
-                                   viewport_width, viewport_height);
+                                   viewport_width, viewport_height, &fallback);
         } else if (cache->layout->command_flags[index]
                    & LAYOUT_COMMAND_LATE_POSITIONED) {
             paint_overlay_command(
@@ -791,10 +795,10 @@ static bool fixed_screen_command_geometry(
     } else {
         if (!overflow_command_geometry(
                 cache->layout, index, &dx, &dy, &clip_left, &clip_top,
-                &clip_right, &clip_bottom)) return false;
+                &clip_right, &clip_bottom, NULL)) return false;
         fixed->rounded_clip_count = overflow_rounded_clips(
             cache->layout, index, fixed->rounded_clips,
-            MAXIMUM_ROUNDED_CLIPS);
+            MAXIMUM_ROUNDED_CLIPS, NULL);
     }
 
     int fixed_target_y = range->from_bottom
@@ -1332,7 +1336,7 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
         clip_bottom = geometry->clip_bottom;
     } else if (!overflow_command_geometry(
                    cache->layout, i, &dx, &dy, &clip_left, &clip_top,
-                   &clip_right, &clip_bottom)) {
+                   &clip_right, &clip_bottom, NULL)) {
         return;
     }
     command.x = render_saturating_add_int(command.x, dx);
@@ -1344,7 +1348,7 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
         ? overflow_cached_rounded_clips(
             cache, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS)
         : overflow_rounded_clips(
-            cache->layout, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS);
+            cache->layout, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS, NULL);
     for (size_t clip = 0; clip < rounded_clip_count; clip++) {
         rounded_clips[clip].y = render_saturating_add_int(
             rounded_clips[clip].y, sticky_dy);
@@ -2111,13 +2115,13 @@ static bool canvas_fast_frame_candidate_impl(
                 if (!overflow_command_geometry(
                         cache->layout, index, &dx, &dy,
                         &candidate->clip_left, &candidate->clip_top,
-                        &candidate->clip_right, &candidate->clip_bottom)) {
+                        &candidate->clip_right, &candidate->clip_bottom, NULL)) {
                     return false;
                 }
                 RoundedClip rounded[MAXIMUM_ROUNDED_CLIPS];
                 if (overflow_rounded_clips(
                         cache->layout, index, rounded,
-                        MAXIMUM_ROUNDED_CLIPS) != 0) return false;
+                        MAXIMUM_ROUNDED_CLIPS, NULL) != 0) return false;
             }
             candidate->command.x = render_saturating_add_int(
                 candidate->command.x, dx);
@@ -2301,14 +2305,14 @@ static void canvas_overlay_command(
         if (!overflow_command_geometry(
                 cache->layout, index, &dx, &dy,
                 &resolved->clip_left, &resolved->clip_top,
-                &resolved->clip_right, &resolved->clip_bottom)) return;
+                &resolved->clip_right, &resolved->clip_bottom, NULL)) return;
         resolved->command.x = render_saturating_add_int(
             resolved->command.x, dx);
         resolved->command.y = render_saturating_add_int(
             resolved->command.y, dy);
         resolved->rounded_clip_count = overflow_rounded_clips(
             cache->layout, index, resolved->rounded_clips,
-            MAXIMUM_ROUNDED_CLIPS);
+            MAXIMUM_ROUNDED_CLIPS, NULL);
     }
     if (resolved->clip_left < 0) resolved->clip_left = 0;
     if (resolved->clip_top < scroll_y) resolved->clip_top = scroll_y;
@@ -2962,12 +2966,8 @@ static void rasterize_opaque_canvas_fast(
         canvas_setup_render(
             target, command, image, source_pixels, source_stride, metrics))
         return;
-    int64_t right = (int64_t) command->x + command->width;
-    int64_t bottom = (int64_t) command->y + command->height;
-    int x0 = command->x > target->left ? command->x : target->left;
-    int y0 = command->y > target->top ? command->y : target->top;
-    int x1 = right < target->right ? (int) right : target->right;
-    int y1 = bottom < target->bottom ? (int) bottom : target->bottom;
+    int x0, y0, x1, y1;
+    raster_command_bounds(target, command, &x0, &y0, &x1, &y1);
     ScaleStepper source_y = scale_stepper(
         y0 - command->y, image->height, command->height);
     int previous_source_y = -1;
@@ -3286,7 +3286,7 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
                 || (cache->layout->command_flags == NULL
                     && command_in_overflow(cache->layout, index))) {
                 paint_overflow_command(cache, cache->frame, index, scroll_y,
-                                       viewport_width, viewport_height);
+                                       viewport_width, viewport_height, NULL);
                 continue;
             }
             if ((flags & LAYOUT_COMMAND_LATE_POSITIONED) != 0) {
@@ -3944,9 +3944,10 @@ static bool prefetch_command_image(TileCache *cache,
         + cache->scaled_image_builds;
     int pixel_width = 0, pixel_height = 0;
     unsigned char *temporary = NULL;
+    bool grayscale = false;
     (void) image_pixels_for_command(
         cache, command->image, command, &pixel_width, &pixel_height,
-        &temporary);
+        &temporary, &grayscale);
     image_resource_free_decoded(cache->budget, temporary);
     if (cache->decoded_image_builds + cache->scaled_image_builds
         > builds_before) {
@@ -4209,12 +4210,8 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
     if (cache == NULL || command == NULL || text_offset == NULL
         || command->type != DRAW_TEXT || command->text == NULL
         || *text_offset >= command->text_length) return false;
-    bool bold_face = draw_uses_bold_face(command);
-    const FontFace *face = font_context_face_at_weight(
-        cache->layout->fonts, cache->layout->web_fonts,
-        draw_command_font_family(command), draw_command_font_italic(command),
-        bold_face, draw_command_font_weight(command));
-    if (face == NULL) return false;
+    GlyphTextFace state;
+    if (!glyph_text_face(cache->layout, command, &state)) return false;
     unsigned codepoint = 0;
     const LayoutBidiCommand *bidi = NULL;
     uintptr_t command_address = (uintptr_t) command;
@@ -4245,33 +4242,20 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
             command, codepoint, *text_offset == 0);
         *text_offset += used;
     }
-    unsigned weight = draw_font_weight(command);
-    bool synthetic_bold = font_face_needs_synthetic_bold(
-        cache->layout->fonts, cache->layout->web_fonts, face, weight);
     int pixel_height_fixed = draw_command_text_font_size_fixed(command);
     if (pixel_height_fixed > TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64) {
         pixel_height_fixed = TILEFINCH_FONT_RASTER_PIXEL_LIMIT * 64;
     }
     if (pixel_height_fixed <= 0) return false;
     size_t misses_before = cache->glyph_cache_misses;
-    bool synthetic_italic = draw_command_font_italic(command)
-        && face == font_context_face_at_weight(
-            cache->layout->fonts, cache->layout->web_fonts,
-            draw_command_font_family(command), false, bold_face, draw_command_font_weight(command));
-    unsigned humanist_profile = glyph_humanist_profile(
-        cache->layout->fonts, face,
-        font_context_metric_family(cache->layout->web_fonts,
-                                   draw_command_font_family(command), face),
-        bold_face, draw_command_font_italic(command),
-        synthetic_bold, synthetic_italic);
     FontGlyph temporary = {0};
     bool smoothed = false;
     const FontGlyph *glyph = glyph_cache_acquire(
-        cache, face, codepoint, pixel_height_fixed, synthetic_bold,
-        humanist_profile,
+        cache, state.text.face, codepoint, pixel_height_fixed,
+        state.text.synthetic_bold, state.humanist_profile,
         &temporary, &smoothed);
     (void) smoothed;
-    font_glyph_destroy(face, &temporary);
+    font_glyph_destroy(state.text.face, &temporary);
     if (glyph == NULL) return false;
     cache->idle_glyphs_prewarmed++;
     cache->idle_glyph_cache_misses +=

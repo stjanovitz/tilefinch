@@ -1,6 +1,6 @@
 #include "tilefinch/youtube_login.h"
 #include "tilefinch/sha256.h"
-#include "tilefinch_test_faults.h"
+#include "tilefinch/platform.h"
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +12,13 @@
 #define LOGIN_HEADER 48u
 #define LOGIN_PATH 800u
 #define LOGIN_VALUE 4096u
+
+/* A cookie is sent as name=value inside one bounded Cookie header. */
+static bool sendable(size_t name_length, size_t value_length)
+{
+    return value_length < BROWSER_COOKIE_HEADER_CAPACITY
+        && name_length < BROWSER_COOKIE_HEADER_CAPACITY - 1u - value_length;
+}
 
 static void wipe(void *memory, size_t length)
 {
@@ -29,7 +36,7 @@ static bool eligible(const BrowserCookieEntry *c, int64_t now)
     return c->value != NULL && c->secure && !c->partitioned
         && domain_allowed(c->domain)
         && (c->expires_at == 0 || c->expires_at > now)
-        && c->value_length <= LOGIN_VALUE
+        && sendable(strlen(c->name), c->value_length)
         && strlen(browser_cookie_entry_path(c)) < BROWSER_ORIGIN_LIMIT;
 }
 static void put32(unsigned char *p, uint32_t v)
@@ -62,14 +69,6 @@ static bool temporary_path(const char *path, char temporary[LOGIN_PATH])
     if (path == NULL || path[0] == '\0') return false;
     int n = snprintf(temporary, LOGIN_PATH, "%s.tmp", path);
     return n > 0 && (size_t) n < LOGIN_PATH;
-}
-static int publish_rename(const char *temporary, const char *path)
-{
-#ifndef __PSP__
-    if (tilefinch_test_faults()->youtube_login_no_replace_rename
-        && access(path, F_OK) == 0) { errno = EEXIST; return -1; }
-#endif
-    return rename(temporary, path);
 }
 bool youtube_login_remove(const char *path)
 {
@@ -118,21 +117,18 @@ bool youtube_login_save(const BrowserSession *session, const char *path, int64_t
     FILE *file = okay ? open_file(temporary, true) : NULL;
     okay = file != NULL && fwrite(buffer, 1, size, file) == size;
     if (file != NULL && fclose(file) != 0) okay = false;
-    if (okay) {
-        okay = publish_rename(temporary, path) == 0;
-        /* FAT cannot replace a destination. Remove only after the complete
-           temporary file is closed, and only for that refusal. No backup of
-           credentials survives sign-out; a power loss here loses the saved
-           login, never the live session. Other I/O failures keep the old file. */
-        if (!okay && errno == EEXIST)
-            okay = remove(path) == 0 && publish_rename(temporary, path) == 0;
-    }
+    /* No backup: no copy of credentials may survive sign-out. Where FAT
+       refuses to replace the old file it is removed first; a power loss
+       there loses the saved login, never the live session. */
+    if (okay) okay = tilefinch_platform_replace_file(temporary, path, NULL);
     if (file != NULL && !okay) (void) remove(temporary);
     wipe(buffer, size); budget_free(session->budget, buffer);
     return okay;
 }
-bool youtube_login_load(BrowserSession *session, const char *path, int64_t now)
+bool youtube_login_load(BrowserSession *session, const char *path, int64_t now,
+                        YoutubeLoginLoadStatus *status)
 {
+    if (status != NULL) *status = YOUTUBE_LOGIN_NOT_LOADED;
     if (session == NULL || !session->site_data_allowed || now < 0 || path == NULL) return false;
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++)
         if (session->cookies[i].value != NULL) return false;
@@ -153,6 +149,7 @@ bool youtube_login_load(BrowserSession *session, const char *path, int64_t now)
     if (fclose(file) != 0) okay = false;
     if (initialized) staged->maximum_cookie_bytes = session->maximum_cookie_bytes;
     size_t at = 0, payload = size >= LOGIN_HEADER ? size - LOGIN_HEADER : 0;
+    bool too_large = false;
     for (size_t i = 0; okay && i < count; i++) {
         if (at > payload || 24u > payload - at) { okay = false; break; }
         unsigned flags = buffer[at + 3]; size_t lengths[4];
@@ -167,6 +164,13 @@ bool youtube_login_load(BrowserSession *session, const char *path, int64_t now)
             total += lengths[k];
         }
         if (!okay || (flags >> 2) > BROWSER_COOKIE_SAME_SITE_NONE || expiry > INT64_MAX) { okay = false; break; }
+        if (!sendable(lengths[2], lengths[3])
+            && (expiry == 0 || expiry > (uint64_t) now)) {
+            /* Written by an older build; restoring it would only fill the
+               jar with a cookie no request can carry. */
+            too_large = true;
+            okay = false; break;
+        }
         char domain[BROWSER_ORIGIN_LIMIT], cookie[LOGIN_VALUE + 1024u], url[BROWSER_ORIGIN_LIMIT + 16u];
         memcpy(domain, buffer + at, lengths[0]); domain[lengths[0]] = '\0';
         if (memchr(buffer + at, 0, total) != NULL || memchr(buffer + at, ';', total) != NULL
@@ -205,6 +209,7 @@ bool youtube_login_load(BrowserSession *session, const char *path, int64_t now)
         at += total;
     }
     okay = okay && at == payload;
+    if (okay && status != NULL) *status = YOUTUBE_LOGIN_LOADED;
     if (okay) {
         memcpy(session->cookies, staged->cookies, sizeof(session->cookies));
         session->cookie_bytes = staged->cookie_bytes;
@@ -217,5 +222,12 @@ bool youtube_login_load(BrowserSession *session, const char *path, int64_t now)
     budget_free(session->budget, staged);
     if (buffer != NULL) { wipe(buffer, size); budget_free(session->budget, buffer); }
     wipe(header, sizeof(header)); wipe(hash, sizeof(hash));
+    if (too_large) {
+        /* The verified file can never be restored. Remove it, so the
+           refusal is reported once rather than on every start, and no
+           unusable credentials stay on the Memory Stick. */
+        (void) youtube_login_remove(path);
+        if (status != NULL) *status = YOUTUBE_LOGIN_COOKIE_TOO_LARGE;
+    }
     return okay;
 }

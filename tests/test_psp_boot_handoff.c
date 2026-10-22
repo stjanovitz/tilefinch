@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE 1
 #include "tilefinch/psp_boot_handoff.h"
 #include "tilefinch/psp_boot_cache.h"
+#include "tilefinch/install_paths.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -33,8 +34,24 @@ static int cache_test_rename(const char *from, const char *to)
 #define setvbuf traced_setup
 #define fread traced_read
 #endif
+/* Report a chosen Memory Stick flush result, and whether the receipt
+   already existed when the flush ran. */
+static TilefinchMemoryStickSync cache_test_sync_result =
+    TILEFINCH_MEMORY_STICK_SYNC_SKIPPED;
+static unsigned cache_test_syncs;
+static const char *cache_test_receipt;
+static bool cache_test_receipt_before_sync;
+static TilefinchMemoryStickSync cache_test_sync(void)
+{
+    cache_test_syncs++;
+    if (cache_test_receipt != NULL && access(cache_test_receipt, F_OK) == 0)
+        cache_test_receipt_before_sync = true;
+    return cache_test_sync_result;
+}
 #define rename cache_test_rename
+#define tilefinch_memory_stick_sync cache_test_sync
 #include "../src/psp_boot_cache.c"
+#undef tilefinch_memory_stick_sync
 #undef rename
 #ifdef TILEFINCH_BOOT_CACHE_TEST_STDIO
 #undef fopen
@@ -437,10 +454,56 @@ static int test_prepackaged_and_incremental(void)
     return 0;
 }
 
+/* A new copy's receipt lets later boots trust it by metadata, so it is
+   written only after the copy was flushed; a rejected flush keeps the copy
+   without a receipt, and the next boot adopts it by comparing its bytes
+   (review 1021b NM4). */
+static int test_receipt_waits_for_flush(void)
+{
+    uint8_t image[8500] = {0, 'P', 'B', 'P', 0, 0, 1, 0};
+    for (unsigned at = 8; at < 36; at += 4) put32(image + at, 40u);
+    put32(image + 36, sizeof(image));
+    const uint8_t prx[20] = {0x7f, 'E', 'L', 'F', 1, 1, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0xa0, 0xff, 8, 0};
+    memcpy(image + 40, prx, sizeof(prx));
+    for (size_t at = 60; at < sizeof(image); at++) image[at] = (uint8_t)(at * 41u);
+    char dir[] = "/tmp/tilefinch-boot-flush-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char source[160], cache[160], temp[160], receipt[180];
+    snprintf(source, sizeof(source), "%s/EBOOT.PBP", dir);
+    snprintf(cache, sizeof(cache), "%s/startup.prx", dir);
+    snprintf(temp, sizeof(temp), "%s/startup.tmp", dir);
+    snprintf(receipt, sizeof(receipt), "%s.receipt", cache);
+    FILE *file = fopen(source, "wb"); CHECK(file != NULL);
+    CHECK(fwrite(image, 1, sizeof(image), file) == sizeof(image)); CHECK(fclose(file) == 0);
+    cache_test_receipt = receipt;
+    cache_test_receipt_before_sync = false;
+    cache_test_syncs = 0;
+    cache_test_sync_result = TILEFINCH_MEMORY_STICK_SYNCED;
+    CHECK(cache_with_space(source, cache, temp, UINT64_MAX) == PSP_BOOT_CACHE_CREATED);
+    CHECK(cache_test_syncs == 1 && !cache_test_receipt_before_sync);
+    CHECK(access(receipt, F_OK) == 0);
+    CHECK(remove(receipt) == 0 && remove(cache) == 0);
+    cache_test_sync_result = TILEFINCH_MEMORY_STICK_SYNC_REJECTED;
+    CHECK(cache_with_space(source, cache, temp, UINT64_MAX) == PSP_BOOT_CACHE_CREATED);
+    CHECK(access(cache, F_OK) == 0 && access(receipt, F_OK) != 0);
+    /* The next boot compares the bytes on the card, then trusts them. */
+    cache_test_syncs = 0;
+    CHECK(cache_with_space(source, cache, temp, 0) == PSP_BOOT_CACHE_REUSED);
+    CHECK(access(receipt, F_OK) == 0 && cache_test_syncs == 0);
+    CHECK(cache_with_space(source, cache, temp, 0) == PSP_BOOT_CACHE_REUSED);
+    cache_test_receipt = NULL;
+    cache_test_sync_result = TILEFINCH_MEMORY_STICK_SYNC_SKIPPED;
+    CHECK(remove(receipt) == 0 && remove(cache) == 0 && remove(source) == 0);
+    CHECK(rmdir(dir) == 0);
+    return 0;
+}
+
 int main(void)
 {
     if (test_arguments() || test_retirement() || test_formats() || test_cache()
-        || test_prepackaged_and_incremental()) return 1;
+        || test_prepackaged_and_incremental() || test_receipt_waits_for_flush())
+        return 1;
     puts("PSP boot handoff checks passed");
     return 0;
 }

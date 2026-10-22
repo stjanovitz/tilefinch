@@ -353,19 +353,20 @@ static bool interactive_media_execute_intent(
     TileCache *cache, PspUiMediaIntent intent)
 {
     if (media == NULL) return false;
-    if (intent.action == PSP_UI_MEDIA_ACTION_RETRY) {
-#ifdef TILEFINCH_HAVE_HOST_MEDIA
-        host_media_destroy(media->player);
-#endif
-        media->player = NULL;
-        media->open_failed = false;
-        media->pending_open = media->source[0] != '\0';
-        if (media->pending_open)
-            psp_ui_media_set_resolving(&media->ui, "YouTube video");
-        return media->pending_open;
-    }
-    if (media->player == NULL) return false;
+    /* Retry is the one action that works without a player. */
+    if (media->player == NULL && intent.action != PSP_UI_MEDIA_ACTION_RETRY)
+        return false;
     switch (intent.action) {
+        case PSP_UI_MEDIA_ACTION_RETRY:
+#ifdef TILEFINCH_HAVE_HOST_MEDIA
+            host_media_destroy(media->player);
+#endif
+            media->player = NULL;
+            media->open_failed = false;
+            media->pending_open = media->source[0] != '\0';
+            if (media->pending_open)
+                psp_ui_media_set_resolving(&media->ui, "YouTube video");
+            return media->pending_open;
         case PSP_UI_MEDIA_ACTION_NONE:
             return true;
         case PSP_UI_MEDIA_ACTION_PLAY_PAUSE:
@@ -399,7 +400,6 @@ static bool interactive_media_execute_intent(
 #endif
             return sought;
         }
-        case PSP_UI_MEDIA_ACTION_RETRY:
         /* The host player does not advertise the PSP GE rotation action. */
         case PSP_UI_MEDIA_ACTION_ROTATE:
         case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
@@ -410,6 +410,15 @@ static bool interactive_media_execute_intent(
         case PSP_UI_MEDIA_ACTION_CLOSE:
             return interactive_media_set_visible(
                 media, navigation, false);
+        /* The host player has no playlist queue, so the queue actions are
+           refused. Keep this switch exhaustive with no default, so a new
+           action is a compiler warning here rather than a silent refusal. */
+        case PSP_UI_MEDIA_ACTION_NEXT:
+        case PSP_UI_MEDIA_ACTION_PREVIOUS:
+        case PSP_UI_MEDIA_ACTION_AUTOMATIC_NEXT:
+        case PSP_UI_MEDIA_ACTION_QUEUE_SELECT:
+        case PSP_UI_MEDIA_ACTION_QUEUE_RETRY:
+            return false;
     }
     return false;
 }
@@ -573,6 +582,26 @@ static void interactive_media_composite(const InteractiveMediaSession *media,
                                         int width, int height, int stride)
 {
     if (media == NULL) return;
+#ifdef TILEFINCH_HAVE_HOST_MEDIA
+    if (media->native_player && media->ui.visible && media->player != NULL
+        && frame != NULL && stride >= width) {
+        HostMediaStats stats;
+        PspMediaPresentPlan plan;
+        if (host_media_get_stats(media->player, &stats)
+            && psp_media_present_plan(&plan, stats.output_width,
+                stats.output_height, stats.output_width, width, height)) {
+            /* Native playback replaces the page on hardware. Do not let
+               author CSS, clipping or retained page tiles hide its picture
+               in the host qualification path. Use the shared fit geometry. */
+            for (int y = 0; y < height; y++)
+                memset(frame + (size_t) y * stride, 0,
+                       (size_t) width * sizeof(*frame));
+            (void) host_media_copy_current_frame_rgb565(media->player,
+                frame + (size_t) plan.video.y * stride + plan.video.x,
+                plan.video.width, plan.video.height, stride);
+        }
+    }
+#endif
     PspUiMediaPreview preview = {
         .pixels = media->seek_preview_pixels,
         .width = INTERACTIVE_MEDIA_PREVIEW_WIDTH,

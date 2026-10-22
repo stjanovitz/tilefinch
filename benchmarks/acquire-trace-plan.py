@@ -9,6 +9,7 @@ credentials, mutates the source trace, or publishes a partial output trace.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import ctypes
 import email.utils
 import errno
@@ -29,8 +30,10 @@ from urllib.parse import urlsplit
 
 PLAN_MODE = "exact-get-head-plan-v1"
 ORIGIN_PLAN_MODE = "exact-get-head-plan-v2"
+VARIANT_PLAN_MODE = "exact-get-head-plan-v3"
 ALLOWLIST_DOMAIN = b"tilefinch-exact-get-head-allowlist-v1\0"
 ORIGIN_ALLOWLIST_DOMAIN = b"tilefinch-exact-get-head-allowlist-v2\0"
+VARIANT_ALLOWLIST_DOMAIN = b"tilefinch-exact-get-head-allowlist-v3\0"
 TRACE_DIGEST_DOMAIN = b"tilefinch-http-trace-v1\0"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 TRACE_RECORD = re.compile(r"([0-9]{4})\.(meta|body)\Z")
@@ -290,16 +293,17 @@ def _request_origin(value: Any, label: str) -> str:
 def _allowlist_digest(
     requests: Iterable[dict[str, Any]], mode: str = PLAN_MODE
 ) -> str:
-    if mode not in (PLAN_MODE, ORIGIN_PLAN_MODE):
+    if mode not in (PLAN_MODE, ORIGIN_PLAN_MODE, VARIANT_PLAN_MODE):
         raise AcquisitionError("unsupported allowlist mode")
-    with_origin = mode == ORIGIN_PLAN_MODE
+    with_origin = mode != PLAN_MODE
     rows = sorted(
         (request["method"], request["url"], request["request_origin"])
         if with_origin else (request["method"], request["url"])
         for request in requests
     )
     digest = hashlib.sha256()
-    digest.update(ORIGIN_ALLOWLIST_DOMAIN if with_origin else ALLOWLIST_DOMAIN)
+    digest.update(VARIANT_ALLOWLIST_DOMAIN if mode == VARIANT_PLAN_MODE
+                  else ORIGIN_ALLOWLIST_DOMAIN if with_origin else ALLOWLIST_DOMAIN)
     digest.update(str(len(rows)).encode("ascii"))
     digest.update(b"\0")
     for row in rows:
@@ -617,6 +621,47 @@ def _validate_diagnostic_plan_binding(
             request["request_origin"] = request_origins[
                 (request["method"], request["url"])
             ]
+    if diagnostic["acquisition_plan"]["mode"] == VARIANT_PLAN_MODE:
+        evidence = diagnostic.get("browser_request_origins")
+        if (not isinstance(evidence, dict)
+                or set(evidence) != {"version", "entries", "overflow", "total"}
+                or evidence.get("version") != "unmatched-request-origin-v2"
+                or evidence.get("overflow") is not False
+                or not isinstance(evidence.get("entries"), list)
+                or len(evidence["entries"]) > MAX_DIAGNOSTIC_ENTRIES):
+            raise AcquisitionError("browser Origin variant evidence is incomplete or unsupported")
+        _integer(evidence["total"], "Origin variant total", 1, MAX_DIAGNOSTIC_EVENTS)
+        actual_counts: Counter = Counter()
+        expected_counts = Counter((e["method"], e["url"], e["resource_type"])
+                                  for e in validated_entries)
+        variants = {}
+        previous = None
+        for entry in evidence["entries"]:
+            if not isinstance(entry, dict) or set(entry) != {
+                    "method", "url", "request_origin", "resource_type", "occurrences"}:
+                raise AcquisitionError("Origin variant entry has an unsupported shape")
+            method, url, resource_type = entry["method"], entry["url"], entry["resource_type"]
+            _url_authority(url, "Origin variant URL")
+            origin = _request_origin(entry["request_origin"], "Origin variant request_origin")
+            count = _integer(entry["occurrences"], "Origin variant occurrences", 1, MAX_RECORDS)
+            if (not isinstance(method, str) or not isinstance(resource_type, str)
+                    or (method, url, resource_type) not in expected_counts):
+                raise AcquisitionError("Origin variant is not an observed read-only request")
+            key = (method, url, origin, resource_type)
+            if previous is not None and key <= previous:
+                raise AcquisitionError("Origin variants are duplicate or not in canonical order")
+            previous = key
+            actual_counts[(method, url, resource_type)] += count
+            request = variants.setdefault((method, url, origin), {
+                "method": method, "url": url,
+                "url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+                "request_origin": origin, "resource_types": set(), "occurrences": 0})
+            request["resource_types"].add(resource_type)
+            request["occurrences"] += count
+        if actual_counts != expected_counts or sum(actual_counts.values()) != evidence["total"]:
+            raise AcquisitionError("Origin variant counts do not exactly cover unmatched evidence")
+        expected_requests = [dict(row, resource_types=sorted(row["resource_types"]))
+                             for _, row in sorted(variants.items())]
     if requests != expected_requests:
         raise AcquisitionError(
             "acquisition_plan is not the exact canonical projection of unmatched evidence"
@@ -640,7 +685,7 @@ def _validate_plan(
         raise AcquisitionError("acquisition_plan has an unsupported shape")
     requests = plan.get("requests")
     if (
-        plan.get("mode") not in (PLAN_MODE, ORIGIN_PLAN_MODE)
+        plan.get("mode") not in (PLAN_MODE, ORIGIN_PLAN_MODE, VARIANT_PLAN_MODE)
         or plan.get("complete") is not True
         or plan.get("unplannable") != 0
         or not isinstance(requests, list)
@@ -661,11 +706,11 @@ def _validate_plan(
             "resource_types",
             "occurrences",
         }
-        if plan["mode"] == ORIGIN_PLAN_MODE:
+        if plan["mode"] != PLAN_MODE:
             request_keys.add("request_origin")
         if not isinstance(request, dict) or set(request) != request_keys:
             raise AcquisitionError(f"{label} has an unsupported shape")
-        if plan["mode"] == ORIGIN_PLAN_MODE:
+        if plan["mode"] != PLAN_MODE:
             _request_origin(request["request_origin"], f"{label}.request_origin")
         method = request["method"]
         if method not in contract["allowed_methods"]:
@@ -683,13 +728,16 @@ def _validate_plan(
         ):
             raise AcquisitionError(f"{label}.resource_types is invalid")
         _integer(request["occurrences"], f"{label}.occurrences", 1, MAX_RECORDS)
-        key = (method, url)
+        key = ((method, url, request["request_origin"])
+               if plan["mode"] == VARIANT_PLAN_MODE else (method, url))
         if key in seen:
             raise AcquisitionError(f"{label} duplicates an authorized request")
         seen.add(key)
         origins.add(origin)
         normalized.append(request)
-    if [(item["method"], item["url"]) for item in normalized] != sorted(seen):
+    if [((item["method"], item["url"], item["request_origin"]))
+        if plan["mode"] == VARIANT_PLAN_MODE else (item["method"], item["url"])
+        for item in normalized] != sorted(seen):
         raise AcquisitionError("acquisition requests are not in canonical order")
     if sorted(origins) != contract["allowed_origins"]:
         raise AcquisitionError("plan origins do not exactly match the contract")
@@ -783,7 +831,7 @@ def trace_digest(root: Path, maximum_bytes: int) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, str]]]:
+def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, str, str | None]]]:
     info, raw_info = _metadata(root / "trace.meta")
     if info.get("psp-http-trace-clock") != "1" or info.get("capture-complete") != "yes":
         raise AcquisitionError("trace.meta lacks finalized clock metadata")
@@ -794,7 +842,7 @@ def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, 
     if count == 0:
         raise AcquisitionError("trace record-count must be positive")
     expected = {"trace.meta"}
-    keys: set[tuple[str, str]] = set()
+    keys: set[tuple[str, str, str | None]] = set()
     for sequence in range(count):
         stem = f"{sequence:04d}"
         expected.update({f"{stem}.meta", f"{stem}.body"})
@@ -803,7 +851,7 @@ def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, 
         url = meta.get("url", "")
         if not method or not url:
             raise AcquisitionError(f"trace record {stem} has no method/URL")
-        keys.add((method, url))
+        keys.add((method, url, meta.get("request-origin")))
         _regular_file(root / f"{stem}.body", f"trace body {stem}")
         # Capture keeps a request body of up to 16 KiB beside its record
         # (NNNN.request, diagnostic only; replay keys on the meta hash).
@@ -828,6 +876,13 @@ def _trace_inventory(root: Path) -> tuple[dict[str, str], bytes, set[tuple[str, 
             f"extra={sorted(actual - expected)})"
         )
     return info, raw_info, keys
+
+
+def _already_retained(request: dict, keys: set) -> bool:
+    pair = (request["method"], request["url"])
+    if "request_origin" not in request:
+        return any(key[:2] == pair for key in keys)
+    return (*pair, request["request_origin"]) in keys or (*pair, None) in keys
 
 
 def _fnv1a64(body: bytes) -> str:
@@ -1357,7 +1412,9 @@ def _run_route_closure(
     plan = json.dumps(
         {
             "requests": [
-                {"method": request["method"], "url": request["url"]}
+                {"method": request["method"], "url": request["url"],
+                 **({"request_origin": request["request_origin"]}
+                    if "request_origin" in request else {})}
                 for request in requests
             ]
         },
@@ -1405,16 +1462,20 @@ def _run_route_closure(
         "merged_trace_sha256",
         "origin_ms",
     }
+    origin_variants = any("request_origin" in request for request in requests)
+    if origin_variants:
+        required.add("origin_variants_verified")
     if (
         not isinstance(closed, dict)
         or set(closed) != required
-        or closed["schema"] != 1
+        or closed["schema"] != (2 if origin_variants else 1)
         or closed["verified"] is not True
         or closed["source_records"] != source_count
         or closed["merged_records"] != merged_count
         or closed["acquired_routes"] != len(requests)
-        or closed["source_ambiguous_routes"]
-            != closed["merged_ambiguous_routes"]
+        or (origin_variants and closed.get("origin_variants_verified") is not True)
+        or (not origin_variants and closed["source_ambiguous_routes"]
+            != closed["merged_ambiguous_routes"])
         or closed["source_trace_sha256"] != source_digest
         or closed["merged_trace_sha256"] != merged_digest
         or closed["origin_ms"] != origin_ms
@@ -1520,7 +1581,7 @@ def _publish(
     if source_bytes + contract["max_response_bytes"] > contract["max_trace_bytes"]:
         raise AcquisitionError("merged trace could not fit another response within its byte limit")
     for request in requests:
-        if (request["method"], request["url"]) in existing_keys:
+        if _already_retained(request, existing_keys):
             raise AcquisitionError("acquisition plan contains an already retained route")
 
     staging = Path(
@@ -1710,7 +1771,7 @@ def main(argv: list[str]) -> int:
             raise AcquisitionError("source trace record count differs from the contract")
         if int(info["origin-ms"], 10) != contract["source_origin_ms"]:
             raise AcquisitionError("source trace origin differs from the contract")
-        if any((item["method"], item["url"]) in existing for item in requests):
+        if any(_already_retained(item, existing) for item in requests):
             raise AcquisitionError("plan includes a route already present in source")
         node = _node_executable()
         source_inspection = _inspect_reference_trace(node, source)

@@ -550,17 +550,23 @@ static bool test_release_artifacts(void)
                 || verified.manifest.release_sequence == 3u
                 || verified.manifest.release_sequence == 4u
                 || verified.manifest.release_sequence == 5u
-                || verified.manifest.release_sequence == 6u);
+                || verified.manifest.release_sequence == 6u
+                || verified.manifest.release_sequence == 7u);
         bool revised_bengali = pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
-            && verified.manifest.release_sequence == 2u;
+            && (verified.manifest.release_sequence == 2u
+                || verified.manifest.release_sequence == 3u);
         CHECK(revised_hindi || revised_bengali
               || verified.manifest.release_sequence == 1u);
         CHECK(strcmp(verified.manifest.tag,
                      pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
-                        ? (revised_bengali ? "components-v6"
+                        ? (verified.manifest.release_sequence == 3u
+                            ? "components-v7"
+                            : revised_bengali ? "components-v6"
                                            : "glyph-bengali-assamese-v1")
                         : revised_hindi
-                        ? (verified.manifest.release_sequence == 6u
+                        ? (verified.manifest.release_sequence == 7u
+                            ? "components-v7"
+                            : verified.manifest.release_sequence == 6u
                             ? "components-v6"
                             : verified.manifest.release_sequence == 5u
                             ? "components-v5"
@@ -1161,10 +1167,14 @@ static bool test_phase_aware_install_faults(void)
         TILEFINCH_GLYPH_INSTALL_FAULT_SELF_CHECK,
         TILEFINCH_GLYPH_INSTALL_FAULT_REMOVE_PREVIOUS,
         TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE,
-        TILEFINCH_GLYPH_INSTALL_FAULT_POST_ACTIVATION_SYNC,
         TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK
     };
-    for (size_t at = 0; at < sizeof(faults) / sizeof(faults[0]); at++) {
+    const size_t fault_count = sizeof(faults) / sizeof(faults[0]);
+    /* The extra last pass has no fault hook. Every Memory Stick sync is
+       rejected instead, as some real firmware/storage-driver combinations
+       do after checked writes and renames succeeded (PPSSPP accepts it). */
+    for (size_t at = 0; at <= fault_count; at++) {
+        bool reject_sync = at == fault_count;
         char root[] = "/tmp/tilefinch-glyph-fault-XXXXXX";
         CHECK(mkdtemp(root) != NULL);
         Budget budget;
@@ -1182,7 +1192,8 @@ static bool test_phase_aware_install_faults(void)
             &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
             old_active, sizeof(old_active)));
 
-        if (faults[at] == TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK) {
+        if (!reject_sync
+            && faults[at] == TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK) {
             char tombstone[TILEFINCH_INSTALL_PATH_LIMIT];
             snprintf(tombstone, sizeof(tombstone),
                      "%s/components/glyph-ja/UNINSTALLED", root);
@@ -1193,14 +1204,19 @@ static bool test_phase_aware_install_faults(void)
 
         char package[128];
         CHECK(write_fixture(package, "glyph-ja"));
-        bool pre_activation = faults[at]
+        bool pre_activation = !reject_sync && faults[at]
             <= TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE;
         GlyphInstallFault fault = {
-            .point = faults[at],
+            .point = reject_sync ? 0 : faults[at],
             .persistent = !pre_activation
         };
+        if (reject_sync)
+            tilefinch_memory_stick_sync_set_host_result(
+                TILEFINCH_MEMORY_STICK_SYNC_REJECTED);
         TilefinchGlyphComponentInstall *install = create_fixture_install(
-            &budget, root, package, glyph_install_fault_once, &fault);
+            &budget, root, package,
+            reject_sync ? NULL : glyph_install_fault_once,
+            reject_sync ? NULL : &fault);
         CHECK(install != NULL);
         TilefinchUpdateInstallSnapshot snapshot = {0};
         if (pre_activation) {
@@ -1220,6 +1236,17 @@ static bool test_phase_aware_install_faults(void)
             memset(&snapshot, 0, sizeof(snapshot));
             CHECK(install != NULL && pump_fixture_install(install, &snapshot)
                   && snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE);
+        } else if (reject_sync) {
+            /* The sync is a durability hint, so the verified pack is
+               installed, not reported as failed. */
+            char resolved[TILEFINCH_INSTALL_PATH_LIMIT];
+            CHECK(pump_fixture_install(install, &snapshot)
+                  && snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE
+                  && tilefinch_glyph_component_install_activated(install)
+                  && access(package, F_OK) != 0
+                  && tilefinch_glyph_component_resolve(
+                      &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
+                      resolved, sizeof(resolved)));
         } else {
             char resolved[TILEFINCH_INSTALL_PATH_LIMIT];
             CHECK(pump_fixture_install(install, &snapshot) && fault.fired);
@@ -1239,8 +1266,11 @@ static bool test_phase_aware_install_faults(void)
                 resolved, sizeof(resolved)));
         }
         tilefinch_glyph_component_install_destroy(install);
+        /* Removal still succeeds when its syncs are rejected. */
         CHECK(tilefinch_glyph_component_remove(
             &paths, TILEFINCH_GLYPH_PACK_JAPANESE));
+        tilefinch_memory_stick_sync_set_host_result(
+            TILEFINCH_MEMORY_STICK_SYNC_SKIPPED);
         char cleanup[TILEFINCH_INSTALL_PATH_LIMIT];
         snprintf(cleanup, sizeof(cleanup),
                  "%s/components/glyph-ja/UNINSTALLED", root);
@@ -1263,6 +1293,7 @@ int main(void)
     if (!test_glyph_offer_session_memory()) return 1;
     if (!test_glyph_offer_decline_persists()) return 1;
     if (!test_glyph_session_install_reattaches()) return 1;
+    if (!test_glyph_session_installed_status()) return 1;
     if (!test_pack_catalog()) return 1;
     if (!test_authored_sample_packed_pixels()) return 1;
     if (!test_script_sequence_matching()) return 1;

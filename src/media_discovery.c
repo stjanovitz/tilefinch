@@ -911,7 +911,7 @@ static bool media_discover_declared_video_uncached(
             || media_metadata_name_is(node, "og:video:secure_url"))) {
             media_consider_span(&og_best, content, length, 0u, length);
         } else if (declared->thumbnail_url[0] == '\0'
-                   && media_metadata_name_is(node, "og:image")) {
+                   && document_meta_image_content(node, &(size_t) {0}) != NULL) {
             (void) media_copy_bounded_text(
                 declared->thumbnail_url, sizeof(declared->thumbnail_url),
                 content, length);

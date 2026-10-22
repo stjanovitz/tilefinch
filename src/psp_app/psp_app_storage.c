@@ -114,18 +114,21 @@ static void site_storage_fill(PspApp *app)
                  sizeof(presentation->site_storage_origins[0]), "%s",
                  info.origin);
         site_storage_label(info.origin, row->origin, sizeof(row->origin));
+        /* Where it is kept, in the words of the storage choice the
+           painter shows (ui_site_storage_states). "RAM" is the same in
+           every language. */
         char size[16];
         const char *where;
         if (info.tier == BROWSER_SITE_STORAGE_STICK_ALWAYS) {
             psp_ui_format_bytes(size, sizeof(size), info.file_bytes);
-            where = "Always";
+            where = tilefinch_ui_text("Memory Stick");
         } else if (info.tier == BROWSER_SITE_STORAGE_STICK_SESSION) {
             psp_ui_format_bytes(size, sizeof(size), info.file_bytes);
-            where = "Session";
+            where = tilefinch_ui_text("This session");
         } else {
             psp_ui_format_bytes(size, sizeof(size), info.bytes);
             where = info.policy == BROWSER_SITE_STORAGE_MEMORY_ONLY
-                ? "RAM only" : "RAM";
+                ? tilefinch_ui_text("RAM only") : "RAM";
         }
         snprintf(row->detail, sizeof(row->detail), "%s  %s", size, where);
         row->state = info.tier == BROWSER_SITE_STORAGE_STICK_SESSION
@@ -138,8 +141,8 @@ static void site_storage_fill(PspApp *app)
                app->process->storage.site_storage, &free_bytes)) {
         char size[16];
         psp_ui_format_bytes(size, sizeof(size), free_bytes);
-        snprintf(view->stick_free, sizeof(view->stick_free),
-                 "%s free on Memory Stick", size);
+        snprintf(view->stick_free, sizeof(view->stick_free), "%s %s",
+                 tilefinch_ui_text("Free space:"), size);
     }
     /* From Site information, start on this site's row. */
     char origin[BROWSER_ORIGIN_LIMIT];

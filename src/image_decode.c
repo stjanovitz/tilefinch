@@ -9,6 +9,7 @@
 
 #include "image_decode_internal.h"
 #include "image_svg_decode_internal.h"
+#include "tilefinch_test_faults.h"
 #include "tilefinch/integer_math.h"
 #include "tilefinch/platform.h"
 
@@ -122,6 +123,9 @@ static void image_decode_end(void)
 
 bool image_decode_busy(void)
 {
+#ifndef __PSP__
+    if (tilefinch_test_faults()->image_decode_busy) return true;
+#endif
     return atomic_load_explicit(
                &image_worker_decode_pending, memory_order_acquire)
         || atomic_load_explicit(&decode_gate, memory_order_acquire);
@@ -399,6 +403,7 @@ static unsigned char *image_decode_gif_first_frame(
 
 #include "image_decode/row_sampler.inc"
 #include "image_decode/png_stream.inc"
+#include "image_decode/jpeg_gray_rows.inc"
 
 /* The largest IDCT reduction (1/2, 1/4 or 1/8 per dimension) that still
    leaves at least the target in both dimensions. */
@@ -429,12 +434,15 @@ static unsigned char *image_decode_jpeg_scaled(
     const unsigned char *encoded, int encoded_length,
     int expected_width, int expected_height,
     int target_width, int target_height, int *source_width,
-    int *source_height, int *components, unsigned char *external_output)
+    int *source_height, int *components, unsigned char *external_output,
+    bool *interrupted)
 {
     if (encoded == NULL || encoded_length <= 0
         || target_width <= 0 || target_height <= 0
         || expected_width < target_width
-        || expected_height < target_height) return NULL;
+        || expected_height < target_height
+        || (size_t) target_width > SIZE_MAX / 4u / (size_t) target_height)
+        return NULL;
     /* stb does not initialize img_n in start_mem. A pre-SOF failure must
        clean up zero components rather than interpreting stack bytes. */
     stbi__context stream = {0};
@@ -449,6 +457,20 @@ static unsigned char *image_decode_jpeg_scaled(
     int shift = image_jpeg_scale_shift(
         expected_width, expected_height, target_width, target_height);
     jpeg->tilefinch_scale_shift = shift;
+    if (shift == 0 && image_jpeg_gray_rows_eligible(
+            encoded, (size_t) encoded_length)) {
+        unsigned char *gray = image_jpeg_gray_rows(jpeg,
+            expected_width, expected_height, target_width, target_height,
+            external_output, false, interrupted);
+        stbi__cleanup_jpeg(jpeg);
+        STBI_FREE(jpeg);
+        if (gray != NULL) {
+            if (source_width != NULL) *source_width = expected_width;
+            if (source_height != NULL) *source_height = expected_height;
+            if (components != NULL) *components = 1;
+        }
+        return gray;
+    }
     if (!stbi__decode_jpeg_image(jpeg) || jpeg->scan_n <= 0) {
         stbi__cleanup_jpeg(jpeg);
         STBI_FREE(jpeg);
@@ -673,6 +695,7 @@ static void image_decode_worker_execute(ImageDecodeWorker *worker)
         memory_order_release);
     int source_width = 0, source_height = 0, components = 0;
     unsigned char *pixels = NULL;
+    bool interrupted = false;
     bool entered = image_decode_begin_arena(&worker->arena);
     if (entered) {
         pixels = image_decode_jpeg_scaled(
@@ -680,7 +703,7 @@ static void image_decode_worker_execute(ImageDecodeWorker *worker)
             worker->expected_source_width, worker->expected_source_height,
             worker->target_width, worker->target_height,
             &source_width, &source_height, &components,
-            worker->arena_storage);
+            worker->arena_storage, &interrupted);
         image_decode_end();
     }
     worker->source_width = source_width;
@@ -1025,6 +1048,29 @@ bool images_decode_worker_reap_cancelled(Budget *budget)
     return true;
 }
 
+bool images_decode_worker_wait_cancelled(Budget *budget)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!image_decode_busy()) return true;
+    if (!worker->initialized || worker->budget != budget
+        || worker->abandoned_generation == 0) return false;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    for (size_t i = 0; i < 2000u; i++) {
+        if (images_decode_worker_reap_cancelled(budget))
+            return !image_decode_busy();
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        if ((now >= started && now - started >= UINT64_C(2000000))
+            || !tilefinch_platform_cooperate("image-decoder-release", i))
+            return false;
+#if defined(__PSP__)
+        /* The browser outranks the worker. Polling without yielding would
+           prevent the cancelled decoder from finishing on hardware. */
+        (void) sceKernelDelayThread(1000u);
+#endif
+    }
+    return false;
+}
+
 bool images_decode_worker_shutdown(Budget *budget)
 {
     ImageDecodeWorker *worker = &image_decode_worker;
@@ -1107,7 +1153,7 @@ ImageDecodeStatus image_resource_decode_checked(
         pixels = image_decode_jpeg_scaled(
             image->encoded, (int) image->encoded_length,
             expected_width, expected_height, image->width, image->height,
-            &width, &height, &components, NULL);
+            &width, &height, &components, NULL, &interrupted);
         at_target = true;
     } else {
         ImagePngStreamResult png = image->width > 0 && image->height > 0
@@ -1180,6 +1226,42 @@ ImageDecodeStatus image_resource_decode_checked(
     image_resource_free_decoded(budget, pixels);
     *decoded = target;
     return IMAGE_DECODE_SUCCEEDED;
+}
+
+ImageDecodeStatus image_resource_decode_gray_checked(
+    const ImageResource *image, Budget *budget, unsigned char **decoded)
+{
+    if (decoded == NULL) return IMAGE_DECODE_DETERMINISTIC_FAILURE;
+    *decoded = NULL;
+    if (image == NULL || budget == NULL || image->width <= 0 || image->height <= 0
+        || image->encoded == NULL || image->encoded_length > INT_MAX
+        || !image_jpeg_gray_rows_eligible(image->encoded, image->encoded_length))
+        return IMAGE_DECODE_DETERMINISTIC_FAILURE;
+    int width = image->source_width > 0 ? image->source_width : image->width;
+    int height = image->source_height > 0 ? image->source_height : image->height;
+    if (image->width > width || image->height > height
+        || image_jpeg_scale_shift(width,height,image->width,image->height) != 0)
+        return IMAGE_DECODE_DETERMINISTIC_FAILURE;
+    if (!image_decode_begin_budget(budget)) return IMAGE_DECODE_TRANSIENT_FAILURE;
+    decode_live_bytes = decode_peak_bytes = 0;
+    size_t failures = budget->failure_count;
+    bool interrupted = false;
+    stbi__context stream = {0};
+    stbi__start_mem(&stream,image->encoded,(int)image->encoded_length);
+    stbi__jpeg *jpeg = image_malloc(sizeof(*jpeg));
+    if (jpeg != NULL) {
+        memset(jpeg,0,sizeof(*jpeg));
+        jpeg->s = &stream;
+        stbi__setup_jpeg(jpeg);
+        *decoded = image_jpeg_gray_rows(jpeg,width,height,
+            image->width,image->height,NULL,true,&interrupted);
+        stbi__cleanup_jpeg(jpeg);
+        image_free(jpeg);
+    }
+    image_decode_end();
+    return *decoded != NULL ? IMAGE_DECODE_SUCCEEDED
+        : interrupted || budget->failure_count != failures
+          ? IMAGE_DECODE_TRANSIENT_FAILURE : IMAGE_DECODE_DETERMINISTIC_FAILURE;
 }
 
 unsigned char *image_resource_decode(const ImageResource *image,

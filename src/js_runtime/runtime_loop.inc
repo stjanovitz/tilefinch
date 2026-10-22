@@ -136,7 +136,7 @@ bool script_runtime_task_runnable(ScriptRuntime *runtime)
     if (js_rt_runtime_checkpoint_pending(runtime)
         || js_rt_dynamic_classic_continuation_pending(runtime))
         return true;
-    if (runtime->image_load_pending != 0
+    if (image_preloads_pending(runtime) != 0 || runtime->image_load_pending != 0
         || runtime_task_due_in_ms(runtime) <= 0) return true;
     return runtime_responses_ready(runtime) != 0;
 }
@@ -186,7 +186,8 @@ bool script_runtime_runnable_state(ScriptRuntime *runtime,
         state->task_due_in_us = (int64_t) (task_due_in_ms * 1000.0);
     }
     state->jobs_pending = js_rt_runtime_checkpoint_pending(runtime);
-    state->cleanup_pending = JS_IsCleanupJobPending(runtime->runtime);
+    state->cleanup_pending = JS_IsCleanupJobPending(runtime->runtime)
+        || runtime->bridge.node_wrapper_sweep_remaining != 0;
     state->continuation_pending =
         js_rt_dynamic_classic_continuation_pending(runtime);
     state->responses_ready = runtime_responses_ready(runtime);
@@ -199,14 +200,19 @@ bool script_runtime_runnable_state(ScriptRuntime *runtime,
 static bool runtime_pump_timers(ScriptRuntime *runtime,
                                 unsigned elapsed_ms,
                                 size_t callback_budget,
+                                bool tasks_only,
                                 size_t *callbacks_out)
 {
     if (callbacks_out != NULL) *callbacks_out = 0;
-    JSValue arguments[2] = {
+    JSValue arguments[3] = {
         JS_NewUint32(runtime->context, elapsed_ms),
-        JS_NewInt64(runtime->context, (int64_t) callback_budget)
+        JS_NewInt64(runtime->context, (int64_t) callback_budget),
+        JS_NewBool(runtime->context, tasks_only)
     };
     JSValue returned = JS_UNDEFINED;
+    double exceptions_before =
+        runtime->host_state[SCRIPT_HOST_STATE_TIMER_EXCEPTIONS];
+    size_t heap_rejections_before = script_runtime_heap_rejections(runtime);
     /* A zero-budget pump only advances the scheduler's clock: bookkeeping.
        A budgeted pump runs an author task. */
     unsigned ledger = work_ledger_enter(callback_budget == 0
@@ -215,7 +221,7 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
         ? SCRIPT_SPLIT_KIND_COUNT + 1u : script_split_enter(SCRIPT_SPLIT_JS);
     bool ok = !JS_IsException(arguments[0])
         && !JS_IsException(arguments[1])
-        && runtime_call_host(runtime, SCRIPT_HOST_PUMP_TIMERS, 2, arguments,
+        && runtime_call_host(runtime, SCRIPT_HOST_PUMP_TIMERS, 3, arguments,
                         &returned);
     script_split_leave(split);
     work_ledger_leave(ledger);
@@ -229,10 +235,28 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
     JS_FreeValue(runtime->context, returned);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
+    /* The scheduler reports a throwing timer callback and carries on. As for
+       a microtask (runtime_job_exception_is_fatal), the exception is fatal
+       when the realm's heap refused an allocation while it ran: the realm is
+       exhausted, however the exception text reads. */
+    if (ok && runtime->host_state[SCRIPT_HOST_STATE_TIMER_EXCEPTIONS]
+                  != exceptions_before
+        && script_runtime_heap_rejections(runtime) != heap_rejections_before) {
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        js_rt_runtime_update_core(runtime, global);
+        JS_FreeValue(runtime->context, global);
+        if (runtime->result.error[0] == '\0')
+            snprintf(runtime->result.error, sizeof(runtime->result.error),
+                     "timer callback: out of memory");
+        ok = false;
+    }
     if (ok && callbacks_out != NULL) *callbacks_out = (size_t) callbacks;
     return ok;
 }
 
+#ifdef JS_RT_XHR_DIAGNOSTICS
+/* Host lab private-session instrumentation: the XHR history, the JSON.parse
+   observer and the outcome classifier. */
 static JSValue runtime_record_xhr(JSContext *context, JSValueConst receiver,
                                    int argc, JSValueConst *argv)
 {
@@ -424,8 +448,19 @@ bool script_runtime_xhr_diagnostics(
             JS_FreeValue(runtime->context, exception);
         }
         bool ok = !JS_IsException(recorder)
-            && runtime_call_host(runtime, SCRIPT_HOST_XHR_DIAGNOSTICS,
-                                  1, &recorder, NULL);
+            && JS_IsFunction(runtime->context,
+                             runtime->xhr_diagnostics_install);
+        if (ok) {
+            JSValue installed = JS_Call(
+                runtime->context, runtime->xhr_diagnostics_install,
+                JS_UNDEFINED, 1, (JSValueConst *) &recorder);
+            ok = !JS_IsException(installed);
+            if (!ok) {
+                JSValue exception = JS_GetException(runtime->context);
+                JS_FreeValue(runtime->context, exception);
+            }
+            JS_FreeValue(runtime->context, installed);
+        }
         JS_FreeValue(runtime->context, recorder);
         if (ok) {
             ok = runtime_install_private_json_observer(runtime);
@@ -448,12 +483,10 @@ bool script_runtime_xhr_diagnostics(
         snapshot->navigation_accepted = history->navigation_accepted;
         snapshot->navigation_refused = history->navigation_refused;
         snapshot->navigation_consumed = history->navigation_consumed;
-#if !defined(__PSP__)
         snapshot->staging_count = history->staging_count;
         snapshot->staging_overwritten = history->staging_overwritten;
         memcpy(snapshot->staging_rows, history->staging_rows,
                sizeof(snapshot->staging_rows));
-#endif
         memcpy(snapshot->outcome_counts, history->outcome_counts,
                sizeof(snapshot->outcome_counts));
         memcpy(snapshot->rejection_kinds, history->rejection_kinds,
@@ -469,6 +502,7 @@ bool script_runtime_xhr_diagnostics(
     }
     return true;
 }
+#endif
 
 bool script_runtime_scheduler_snapshot(
     ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot)
@@ -815,6 +849,8 @@ static bool runtime_dispatch_page_visibility_edge(ScriptRuntime *runtime)
 
 static bool runtime_dispatch_image_load(ScriptRuntime *runtime, bool *dispatched)
 {
+    bool preload_ok = image_preload_dispatch(runtime, dispatched);
+    if (!preload_ok || *dispatched) return preload_ok;
     *dispatched = false;
     for (size_t i = 0; i < runtime->image_load_state_count; i++) {
         ScriptImageLoadState *state = &runtime->image_load_states[i];
@@ -824,6 +860,10 @@ static bool runtime_dispatch_image_load(ScriptRuntime *runtime, bool *dispatched
         lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
             runtime, state->handle);
         const ImageResource *image = images_find_node(runtime->bridge.images, node);
+        if (js_rt_image_preload_status(&runtime->bridge, node) >= 1) {
+            state->delivered = true;
+            continue;
+        }
         if (node == NULL || !image_resource_available(image)
             || image->source_hash != state->source_hash
             || !image_resource_source_current(runtime->bridge.stylesheet, image))
@@ -885,8 +925,8 @@ static bool runtime_task_slice_available(const ScriptRuntime *runtime,
     return now < started_ns || (now - started_ns) / UINT64_C(1000) < limit;
 }
 
-/* Low-priority JavaScript-engine tasks: never spend the promise-job quota on
-   wrapper cleanup, and never run it inside a continued task. Each cleanup
+/* Low-priority author finalization tasks: never spend the promise-job quota
+   on cleanup, and never run it inside a continued task. Each cleanup
    is one task from the caller's budget followed by its own checkpoint.
    Memory-pressure handle reclamation remains synchronous and independent. */
 static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
@@ -933,6 +973,29 @@ static size_t runtime_run_cleanup_tasks(ScriptRuntime *runtime, size_t limit,
         *ok = js_rt_runtime_run_jobs(runtime);
     }
     return ran_tasks;
+}
+
+bool script_runtime_parser_timer_runnable(ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->context != NULL
+        && !js_rt_dynamic_classic_continuation_pending(runtime)
+        && runtime_task_due_in_ms(runtime) <= 0;
+}
+
+bool script_runtime_parser_timer_checkpoint(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->context == NULL) return false;
+    if (js_rt_dynamic_classic_continuation_pending(runtime)) return true;
+    js_rt_runtime_arm_watchdog(runtime);
+    bool ok = script_runtime_parser_mutation_checkpoint(runtime);
+    if (!ok || js_rt_runtime_checkpoint_pending(runtime)) return ok;
+    if (runtime_task_due_in_ms(runtime) > 0) return true;
+    size_t callbacks = 0;
+    ok = runtime_pump_timers(runtime, 0, 1, true, &callbacks);
+    js_rt_saturating_add_size(&runtime->result.timer_callbacks_run, callbacks);
+    if (ok) ok = js_rt_runtime_run_jobs(runtime);
+    runtime->result.success = ok;
+    return ok;
 }
 
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -1006,7 +1069,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
        zero. No author callback runs at this preparation boundary. */
     uint64_t phase_started = js_rt_monotonic_time_ns();
     size_t prepared_callbacks = 0;
-    bool ok = runtime_pump_timers(runtime, elapsed_ms, 0,
+    bool ok = runtime_pump_timers(runtime, elapsed_ms, 0, false,
                                   &prepared_callbacks);
     uint64_t timer_prepare_ns = js_rt_monotonic_time_ns() - phase_started;
     timer_elapsed_ns += timer_prepare_ns;
@@ -1026,6 +1089,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     size_t prepared_network_tasks = 0;
     ok = runtime_pump_network(runtime, 0, elapsed_ms,
                               &prepared_network_tasks);
+    image_preloads_pump(runtime);
     network_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
     js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_PREPARATION);
@@ -1126,7 +1190,8 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 
         if (!classic_continuation
             && (!image_task_ran || !runtime_timer_due(runtime))
-            && runtime->image_load_pending != 0) {
+            && (runtime->image_load_pending != 0
+                || image_preloads_pending(runtime) != 0)) {
             bool dispatched = false;
             ok = runtime_dispatch_image_load(runtime, &dispatched);
             if (!ok) break;
@@ -1151,7 +1216,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
         js_rt_validation_cpu_enter(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
 #endif
-        ok = runtime_pump_timers(runtime, 0, 1, &timer_callbacks);
+        ok = runtime_pump_timers(runtime, 0, 1, false, &timer_callbacks);
         if (timer_callbacks != 0) image_task_ran = false;
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
         js_rt_validation_cpu_leave(runtime, SCRIPT_RUNTIME_CPU_CALLBACK);
@@ -1193,6 +1258,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         if (runtime->profile != NULL) runtime->profile->micro_site = 0;
         microtask_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     }
+    if (ok && !classic_continuation && callback_budget != 0
+        && !js_rt_runtime_checkpoint_pending(runtime))
+        js_rt_bridge_sweep_node_wrappers(&runtime->bridge);
     if (ok && !classic_continuation && cleanups < 16) {
         cleanups += runtime_run_cleanup_tasks(
             runtime, 16 - cleanups, &remaining, task_slice_started_ns,

@@ -4505,6 +4505,162 @@ static int test_basic_view_admission_and_presentation(void)
     return 0;
 }
 
+static int test_basic_view_recovery_memory_limited_case(bool late)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 3u * MIB;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    navigation_set_fixed_script_memory_limits(
+        browser_engine_navigation(engine), true);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+    static const char page_format[] =
+        "<!doctype html><header><a href='/'>Home</a></header>"
+        "<main><h1>Retained catalog</h1><p>The useful server response "
+        "survives an application that cannot initialize on this device.</p>"
+        "<p><a id=next href='/next'>Next entry</a></p>"
+        "<p><a id=jump href='#end'>Jump to final entry</a></p>"
+        "<form role=search action='/find'><label>Search<input name=q></label>"
+        "<button id=submit>Go</button></form>"
+        "<p>First retained catalog paragraph.</p>"
+        "<p>Second retained catalog paragraph.</p>"
+        "<p>Third retained catalog paragraph.</p>"
+        "<p>Fourth retained catalog paragraph.</p>"
+        "<p>Fifth retained catalog paragraph.</p>"
+        "<p>Sixth retained catalog paragraph.</p>"
+        "<p>Seventh retained catalog paragraph.</p>"
+        "<p>Eighth retained catalog paragraph.</p>"
+        "<p>Ninth retained catalog paragraph.</p>"
+        "<p>Tenth retained catalog paragraph.</p>"
+        "<h2 id=end>Final retained entry</h2></main>"
+        "<script>setTimeout(function(){document.body.textContent="
+        "'LATE AUTHOR REPLACEMENT';},60000);"
+        "function exhaust(){globalThis.hold=[];for(let i=0;i<50000;i++)"
+        "hold.push({value:i,text:'stored-'+i});}%s</script>";
+    char page[sizeof(page_format) + 64u];
+    int length = snprintf(page, sizeof(page), page_format,
+                          late ? "setTimeout(exhaust,1000);" : "exhaust();");
+    CHECK(length > 0 && (size_t)length < sizeof(page));
+    CHECK(browser_engine_commit_html(engine, "https://catalog.example.test/",
+                                    page, (size_t)length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    if (late) {
+        CHECK(navigation->page.runtime != NULL
+              && !navigation->page.script_memory_limited);
+        for (unsigned turn = 0; turn < 16u
+             && !navigation->page.script_memory_limited; turn++)
+            CHECK(browser_engine_advance_runtime(engine, 1100u, 4u, NULL));
+    }
+    CHECK(navigation->page.loaded && navigation->page.script_degradation_observed
+          && navigation->page.script_memory_limited
+          && navigation->page.layout.link_count > 0u
+          && !browser_engine_page_is_visually_blank(engine));
+    ReaderDocumentAnalysis basic = {0};
+    BrowserBasicViewRecovery recovery =
+        browser_engine_prepare_basic_view_recovery(engine, &basic);
+    for (unsigned turn = 0; turn < 16u
+         && recovery == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED; turn++) {
+        (void) browser_engine_advance_runtime(engine, 1u, 4u, NULL);
+        recovery = browser_engine_prepare_basic_view_recovery(engine, &basic);
+    }
+    CHECK(recovery == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
+          && basic.kind == READER_PAGE_BASIC && basic.retained_forms == 1u);
+    char css[SITE_ADAPTER_READER_CSS_LIMIT], adapter[32];
+    CHECK(site_adapter_reader_css("https://catalog.example.test/",
+              SITE_ADAPTER_READER_FONT_SANS, 100u, css, sizeof(css),
+              adapter, sizeof(adapter))
+          && browser_engine_apply_user_css(engine, css, strlen(css))
+          && browser_engine_activate_basic_view(engine));
+    navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *end = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html),
+        "tilefinch-extracted-end");
+    CHECK(navigation->page.runtime == NULL
+          && browser_engine_budget(engine)->current < config.memory_limit
+          && end != NULL && end->first_child != NULL);
+    size_t end_length = 0;
+    const char *end_text = document_text_data(end->first_child, &end_length);
+    CHECK(end_text != NULL && end_length == strlen("Final retained entry")
+          && memcmp(end_text, "Final retained entry", end_length) == 0);
+    /* Recovery must preserve real link actions, not merely paint anchor
+       labels. Neither focus nor scrolling may restart the failed realm. */
+    lxb_dom_node_t *next = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html),
+        "tilefinch-extracted-next");
+    lxb_dom_node_t *jump = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html),
+        "tilefinch-extracted-jump");
+    ControllerAction action = {0};
+    size_t loads_before = navigation->loads_started;
+    uint64_t generation_before = navigation->generation;
+    CHECK(next != NULL && browser_engine_focus_node(engine, next)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url, "https://catalog.example.test/next") == 0);
+    CHECK(jump != NULL && browser_engine_focus_node(engine, jump)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_CONTROL
+          && strcmp(navigation_current(navigation)->url,
+                    "https://catalog.example.test/#end") == 0
+          && navigation_current(navigation)->scroll_y > 0);
+    CHECK(browser_engine_scroll_to_edge(engine, false)
+          && navigation_current(navigation)->scroll_y == 0
+          && browser_engine_scroll_page(engine, 1)
+          && navigation_current(navigation)->scroll_y > 0
+          && browser_engine_scroll_to_edge(engine, false)
+          && navigation_current(navigation)->scroll_y == 0
+          && browser_engine_focus_node(engine, next)
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_focus_move(engine, false)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url, "https://catalog.example.test/next") == 0
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before
+          && navigation->page.runtime == NULL);
+    CHECK(browser_engine_advance_runtime(engine, 2000u, 4u, NULL)
+          && test_reader_find_id(
+                 lxb_dom_interface_node(navigation->page.document.html),
+                 "tilefinch-extracted-end") == end
+          && navigation->page.runtime == NULL);
+    lxb_dom_node_t *submit = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html),
+        "tilefinch-extracted-submit");
+    CHECK(submit != NULL && browser_engine_focus_node(engine, submit)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strcmp(action.url, "https://catalog.example.test/find?q=") == 0);
+    static const char healthy[] =
+        "<!doctype html><h1>Healthy page</h1><a href='/next'>Next</a>"
+        "<script>throw new Error('out of memory');</script>";
+    CHECK(browser_engine_apply_user_css(engine, "", 0u)
+          && browser_engine_commit_html(engine, "https://healthy.example.test/",
+                                       healthy, sizeof(healthy) - 1u, true));
+    CHECK(browser_engine_prepare_basic_view_recovery(engine, &basic)
+              == BROWSER_BASIC_VIEW_RECOVERY_NONE
+          && !browser_engine_navigation(engine)->page.script_memory_limited);
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(browser_engine_shutdown(engine) && budget->current == 0u);
+    browser_engine_test_set_recovery_time_us(0u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_basic_view_recovery_memory_limited_with_navigation(void)
+{
+    CHECK(test_basic_view_recovery_memory_limited_case(false) == 0);
+    CHECK(test_basic_view_recovery_memory_limited_case(true) == 0);
+    return 0;
+}
+
 static int test_basic_view_recovery_large_and_hidden_pages(void)
 {
     BrowserDeviceProfile profile;
@@ -6062,10 +6218,11 @@ static bool youtube_header_baselines_match(BrowserEngine *engine)
         for (size_t at=box->command_start;at<box->command_end && at<layout->count;at++) {
             const DrawCommand *command=&layout->commands[at];
             if(command->type != DRAW_TEXT || command->text_length == 0) continue;
-            const FontFace *face=font_context_face_variant(browser_engine_fonts(engine),NULL,
+            const FontFace *face=font_context_face_at_weight(browser_engine_fonts(engine),NULL,
                 draw_command_font_family(command),draw_command_font_italic(command),
-                draw_command_font_weight_code(command)>=65u);
-            int current=command->y+font_ascent_at_size(face,draw_command_text_font_size_fixed(command));
+                draw_uses_bold_face(command),draw_command_font_weight(command));
+            int current=command->y+font_line_baseline_at_size(face,
+                draw_command_text_font_size_fixed(command),command->height);
             if(baseline>=0 && abs(baseline-current)>1)return false;
             baseline=current;count++;break;
         }
@@ -6289,6 +6446,23 @@ static int test_youtube_resume_metadata(void)
     CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=-1") == 0);
     CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=604801") == 0);
     CHECK(youtube_watch_url_start_time_us("https://evil.test/watch?v=TFTEST00001&t=125") == 0);
+    /* Desktop share links carry units; a fragment is the older share form. */
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=90s") == UINT64_C(90000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1m30s") == UINT64_C(90000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1h2m3s") == UINT64_C(3723000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=12m") == UINT64_C(720000000));
+    CHECK(youtube_watch_url_start_time_us("https://youtu.be/TFTEST00001?t=2h") == UINT64_C(7200000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001#t=1m30s") == UINT64_C(90000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001#t=45") == UINT64_C(45000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=20#t=45") == UINT64_C(20000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=168h") == UINT64_C(604800000000));
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=168h1s") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=30s1m") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1m1m") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1m30") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1x") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=s") == 0);
+    CHECK(youtube_watch_url_start_time_us("https://www.youtube.com/watch?v=TFTEST00001&t=1234567s") == 0);
     Budget budget;
     budget_init(&budget, 2u * MIB);
     char source[2048], error[256];

@@ -64,6 +64,8 @@ BOOTSTRAP_SOURCE(browser_bootstrap_traversal, "traversal.js",
 BOOTSTRAP_SOURCE(browser_bootstrap_game_audio_slots, "game-audio-slots.js",
                  "<browser-game-audio-slots>",
                  browser_bootstrap_game_audio_slots_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_shadow, "shadow.js", "<browser-shadow>",
+                 browser_bootstrap_shadow_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

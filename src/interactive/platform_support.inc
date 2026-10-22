@@ -152,7 +152,7 @@ static int text_metrics_advance_fixed(const LayoutDocument *layout,
     int advance = font_text_width_for_family_at_size_fixed(
         face, metric_family, command->text, command->text_length,
         draw_command_text_font_size_fixed(command), synthetic_bold,
-        draw_command_font_weight_code(command) >= 65);
+        draw_uses_bold_face(command));
     if (advance < 0) return advance;
     size_t characters = 0;
     for (size_t at = 0; at < command->text_length;) {
@@ -212,16 +212,10 @@ static bool dump_text_metrics(const char *path, const LayoutDocument *layout)
         const DrawCommand *command = &layout->commands[i];
         if (!text_metrics_command_eligible(layout, command)
             || command->text_length > TEXT_METRICS_TEXT_LIMIT) continue;
-        uint8_t weight_code = draw_command_font_weight_code(command);
-        unsigned weight = weight_code == 0
-            ? 400u : (unsigned) weight_code * 10u;
-        bool bold_face = weight >= 650u;
-        const FontFace *face = font_context_face_at_weight(
-            layout->fonts, layout->web_fonts,
-            draw_command_font_family(command),
-            draw_command_font_italic(command), bold_face, draw_command_font_weight(command));
-        bool synthetic_bold = font_face_needs_synthetic_bold(
-            layout->fonts, layout->web_fonts, face, weight);
+        DrawTextFace resolved = draw_command_text_face(layout, command);
+        const FontFace *face = resolved.face;
+        unsigned weight = resolved.weight;
+        bool synthetic_bold = resolved.synthetic_bold;
         int advance_fixed = text_metrics_advance_fixed(
             layout, command, face, synthetic_bold);
         int line_baseline = font_line_baseline_at_size(

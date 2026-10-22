@@ -25,12 +25,18 @@ static bool psp_input_script_ever_ready;
 static bool psp_input_script_saw_exit;
 static uint32_t psp_input_script_previous_buttons;
 static uint16_t psp_input_script_last_press_step;
-static PspUiState psp_input_script_last_presented_ui;
+/* Only the two fields a response compares: copying the whole PspUiState
+   on every present would perturb the timings being measured. */
+typedef struct {
+    PspUiScreen screen;
+    bool chrome_visible;
+} PspInputScriptPresented;
+static PspInputScriptPresented psp_input_script_last_presented_ui;
 static bool psp_input_script_last_presented_valid;
 static struct {
     uint64_t requested_us, sampled_us;
     uint16_t buttons, step;
-    PspUiState before;
+    PspInputScriptPresented before;
 } psp_input_script_response;
 
 uint64_t psp_input_script_request_time(uint64_t sampled_us)
@@ -84,7 +90,9 @@ void psp_input_script_measure_presented(const PspUiState *ui)
                (unsigned) ui->screen, (unsigned) ui->chrome_visible);
         psp_input_script_response.requested_us = 0;
     }
-    psp_input_script_last_presented_ui = *ui;
+    psp_input_script_last_presented_ui = (PspInputScriptPresented) {
+        .screen = ui->screen, .chrome_visible = ui->chrome_visible
+    };
     psp_input_script_last_presented_valid = true;
 }
 

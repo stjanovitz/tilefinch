@@ -4,6 +4,16 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Queue positions are 0..65535. Fetching every page of the largest queue
+   takes ceil(65536 / 12) = 5462 page loads, so a selection walk may make
+   that many before it gives up. The next page is fetched once only three
+   entries remain ahead of the current one. */
+#define PLAYLIST_POSITION_LIMIT 65536u
+#define PLAYLIST_PAGE_LIMIT \
+    ((PLAYLIST_POSITION_LIMIT + YOUTUBE_LITE_MAXIMUM_RESULTS - 1u) \
+     / YOUTUBE_LITE_MAXIMUM_RESULTS)
+#define PLAYLIST_PREFETCH_REMAINING 3u
+
 struct YoutubePlaylistQueue {
     Budget *budget;
     BrowserSession *session;
@@ -12,7 +22,7 @@ struct YoutubePlaylistQueue {
     size_t first, count, current, target; /* target is page-relative until the first publication. */
     char root[2048], next[2048], request[2048];
     char error[160];
-    char expected_video[32];
+    char expected_video[YOUTUBE_VIDEO_ID_CAPACITY];
     bool initialized, selecting, relative, ready, failed;
     unsigned pages;
     uint64_t initial_start_us;
@@ -24,7 +34,8 @@ YoutubePlaylistQueue *youtube_playlist_begin(Budget *budget, BrowserSession *ses
     char root[2048];
     if (!budget || !session || !url || strnlen(url, sizeof(root)) >= sizeof(root)
         || index >= YOUTUBE_LITE_MAXIMUM_RESULTS || !youtube_lite_playlist_root_url(url, root, sizeof(root))
-        || (expected_video && strnlen(expected_video, 32) >= 32)) return NULL;
+        || (expected_video
+            && strnlen(expected_video, YOUTUBE_VIDEO_ID_CAPACITY) >= YOUTUBE_VIDEO_ID_CAPACITY)) return NULL;
     YoutubePlaylistQueue *q = budget_calloc_category(budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*q));
     if (!q) return NULL;
     if (all) { url = root; index = 0; expected_video = NULL; }
@@ -54,7 +65,8 @@ static bool playlist_fail(YoutubePlaylistQueue *q, const char *error)
 bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylistPage *p)
 {
     if (!q || !p || p->count > YOUTUBE_LITE_MAXIMUM_RESULTS
-        || p->first > 65535u || p->count > 65536u - p->first
+        || p->first >= PLAYLIST_POSITION_LIMIT
+        || p->count > PLAYLIST_POSITION_LIMIT - p->first
         || !memchr(p->next_url, 0, sizeof(p->next_url))) return false;
     /* Never follow a service-supplied arbitrary URL or another playlist. */
     char root[2048];
@@ -96,7 +108,7 @@ bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylist
 
 bool youtube_playlist_select(YoutubePlaylistQueue *q, size_t position)
 {
-    if (!q || position > 65535u) return false;
+    if (!q || position >= PLAYLIST_POSITION_LIMIT) return false;
     if (q->initialized && position >= q->first + q->count && !q->next[0]) return false;
     if (q->job) { youtube_lite_load_destroy(q->job); q->job = NULL; }
     q->initial_start_us = 0;
@@ -140,12 +152,12 @@ bool youtube_playlist_pump(YoutubePlaylistQueue *q, const FetchPumpQuota *quota)
     if (!q || q->failed) return false;
     if (!q->request[0] && q->next[0] && (q->selecting
         || (q->initialized && q->current >= q->first
-            && q->first + q->count - q->current <= 3u)))
+            && q->first + q->count - q->current <= PLAYLIST_PREFETCH_REMAINING)))
         snprintf(q->request, sizeof(q->request), "%s", q->next);
     if (!q->request[0]) return false;
     bool started = false;
     if (!q->job) {
-        if (++q->pages > 5462u) { playlist_fail(q, "Playlist navigation limit reached"); return true; }
+        if (++q->pages > PLAYLIST_PAGE_LIMIT) { playlist_fail(q, "Playlist navigation limit reached"); return true; }
         YoutubePlaylistPage page;
         if (youtube_lite_copy_playlist(q->session, q->request, &page)) {
             if (!youtube_playlist_accept_page(q, &page) && !q->failed)

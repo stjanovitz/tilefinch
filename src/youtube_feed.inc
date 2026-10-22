@@ -2,6 +2,26 @@
    One bootstrap, one feed and an optional recent-history request, with
    bounded renderer walks; all RAM-owned. */
 enum { LITE_FEED_BYTES = 512u * 1024u };
+/* One framing step examines at most this many response bytes, and the
+   located responseContext object may be at most this large. */
+enum {
+    LITE_FEED_SCAN_BYTES = 16u * 1024u,
+    LITE_FEED_CONTEXT_BYTES = 16u * 1024u
+};
+/* YoutubeLiteFeedJob.phase. The values are reported as numbers by
+   youtube_lite_feed_diagnostics, so they never change. */
+typedef enum {
+    LITE_FEED_BOOTSTRAP = 0,        /* fetching the bootstrap page */
+    LITE_FEED_IDENTITY = 1,         /* scanning it for identity and login */
+    LITE_FEED_API = 2,              /* fetching the browse/action API */
+    LITE_FEED_BUILD = 3,            /* building the feed page */
+    LITE_FEED_API_FRAMING = 4,      /* framing the API response */
+    LITE_FEED_HISTORY_FETCH = 5,    /* fetching optional recent history */
+    LITE_FEED_HISTORY_FRAMING = 6,  /* framing the history response */
+    LITE_FEED_HISTORY_VIDEO = 7,    /* reading its first history video */
+    LITE_FEED_PLAYLIST_RECHECK = 8, /* waiting to re-read a playlist edit */
+    LITE_FEED_ACCOUNT_STATE = 9     /* confirming exact account state */
+} LiteFeedPhase;
 struct YoutubeLiteFeedJob {
     Budget *budget;
     BrowserSession *session;
@@ -9,9 +29,7 @@ struct YoutubeLiteFeedJob {
     uint64_t request;
     uint64_t began_us;
     long timeout_ms;
-    unsigned phase; /* 0 configuration, 1 identity, 2 API, 3 build, 4 JSON framing,
-                       5 history fetch, 6 history framing, 7 first history video,
-                       8 delayed playlist readback, 9 exact account state */
+    unsigned phase; /* LiteFeedPhase */
     size_t cursor;
     bool subscriptions;
     bool history_attempted;
@@ -19,7 +37,7 @@ struct YoutubeLiteFeedJob {
     char like_video_id[YOUTUBE_VIDEO_ID_CAPACITY];
     bool like_selected;
     YoutubeLiteAccountAction action;
-    char action_target[128];
+    char action_target[YOUTUBE_ACCOUNT_ID_CAPACITY];
     char action_video[YOUTUBE_VIDEO_ID_CAPACITY];
     bool action_prepared;
     bool action_submitted;
@@ -28,8 +46,6 @@ struct YoutubeLiteFeedJob {
     uint64_t action_recheck_us;
     uint64_t login_identity;
     bool compact;
-    bool logged_in;
-    bool bootstrap_login_known;
     bool request_signed;
     bool request_admitted, configuration_valid, clock_available;
     bool api_authenticated;
@@ -43,10 +59,9 @@ struct YoutubeLiteFeedJob {
     uint64_t authenticated_identity;
     uint64_t rejected_identity;
     unsigned history_outcome;
-    unsigned auth_user;
-    char client_name[16];
     YoutubeLiteLoadStatus status;
     YoutubeLiteIdentity identity;
+    YoutubeLiteBootstrapAccount account;
     FetchResult response;
     YoutubeLiteBuildWork *build;
     YoutubeLiteDocument document;
@@ -79,7 +94,7 @@ bool youtube_lite_feed_diagnostics(const YoutubeLiteFeedJob *job,
         .history_status = job->history_status, .failure = job->failure,
         .history_outcome = job->history_outcome,
         .transported = job->transported, .same_origin = job->same_origin,
-        .bootstrap_signed_in = job->logged_in,
+        .bootstrap_signed_in = job->account.logged_in,
         .auth_user_known = job->identity.auth_user_known,
         .request_signed = job->request_signed, .api_authenticated = job->api_authenticated,
         .request_admitted = job->request_admitted, .configuration_valid = job->configuration_valid,
@@ -172,36 +187,104 @@ static unsigned lite_account_response_flags(const YoutubeLiteFeedJob *job)
 }
 #endif
 
+/*
+ * The identity is asked for several times a frame while a feed is pending or
+ * a login offer is up, so it is cached rather than re-read from the jar each
+ * time. Its answer depends only on the identity cookies' own fields and
+ * bytes, on site-data permission and on the cookie clock (expiry). Every jar
+ * mutation changes some row's value pointer (a replacement allocates before
+ * it frees), length, creation sequence, expiry or flags; only an identity
+ * cookie's bytes can change under all of those, and they are hashed. So a key
+ * over the rows plus the clock's second tells exactly when the jar must be
+ * read again. A replayed capture's cookie clock can move within one wall
+ * second; the identity then follows on the next second.
+ * Main-thread state, like the session it describes.
+ */
+static struct {
+    const BrowserSession *session;
+    uint64_t key;
+    uint64_t identity;
+    bool valid;
+} lite_login_identity_cache;
+
+static uint64_t lite_login_identity_mix(uint64_t hash, uint64_t value)
+{
+    return (hash ^ value) * UINT64_C(1099511628211);
+}
+
+static uint64_t lite_login_identity_key(const BrowserSession *session,
+                                        int64_t now)
+{
+    uint64_t key = lite_login_identity_mix(
+        UINT64_C(14695981039346656037), (uintptr_t) session);
+    key = lite_login_identity_mix(key, session->site_data_allowed);
+    key = lite_login_identity_mix(key, (uint64_t) now);
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        const BrowserCookieEntry *entry = &session->cookies[i];
+        if (entry->value == NULL) continue;
+        key = lite_login_identity_mix(key, i);
+        key = lite_login_identity_mix(key, (uintptr_t) entry->value);
+        key = lite_login_identity_mix(key, entry->value_length);
+        key = lite_login_identity_mix(key, entry->creation_sequence);
+        key = lite_login_identity_mix(key, (uint64_t) entry->expires_at);
+        key = lite_login_identity_mix(key, (uint64_t) entry->host_only
+            | (uint64_t) entry->secure << 1 | (uint64_t) entry->http_only << 2
+            | (uint64_t) entry->partitioned << 3
+            | (uint64_t) entry->same_site << 4);
+        if (strcmp(entry->name, "SAPISID") == 0
+            || strcmp(entry->name, "__Secure-3PAPISID") == 0) {
+            for (size_t at = 0; at < entry->value_length; at++)
+                key = lite_login_identity_mix(
+                    key, (unsigned char) entry->value[at]);
+        }
+    }
+    return key;
+}
+
 uint64_t youtube_lite_session_login_identity(BrowserSession *session)
 {
+    if (session == NULL) return 0;
+    uint64_t key = lite_login_identity_key(session, (int64_t) time(NULL));
+    if (lite_login_identity_cache.valid
+        && lite_login_identity_cache.session == session
+        && lite_login_identity_cache.key == key)
+        return lite_login_identity_cache.identity;
+#ifndef __PSP__
+    tilefinch_test_faults()->youtube_login_identity_builds++;
+#endif
     const char *origin = "https://m.youtube.com/";
     TilefinchRequestContext context = lite_supplemental_context(origin, origin);
     context.initiator_url = origin;
-    char cookies[4096] = {0};
     const char *value = NULL;
-    if (browser_session_cookie_header_context(session, &context, cookies, sizeof(cookies))) {
-        const char *names[] = {"SAPISID=", "__Secure-3PAPISID="};
-        for (unsigned i = 0; value == NULL && i < 2u; i++) {
-            const char *at = cookies;
-            for (unsigned j = 0; *at != '\0' && j < BROWSER_COOKIE_ENTRIES; j++) {
-                if (strncmp(at, names[i], strlen(names[i])) == 0) {
-                    value = at + strlen(names[i]); break;
-                }
-                at = strchr(at, ';');
-                if (at == NULL) break;
-                at++; if (*at == ' ') at++;
-            }
-        }
-    }
+    size_t length = 0;
     uint64_t identity = 0;
-    if (value != NULL && *value != '\0' && *value != ';') {
+    if (lite_session_sapisid(session, &context, &value, &length)) {
         identity = UINT64_C(14695981039346656037);
-        for (size_t i = 0; value[i] != '\0' && value[i] != ';' && i < sizeof(cookies); i++)
+        for (size_t i = 0; i < length; i++)
             identity = (identity ^ (unsigned char) value[i]) * UINT64_C(1099511628211);
         if (identity == 0) identity = 1;
     }
-    lite_probe_wipe(cookies, sizeof(cookies));
+    lite_login_identity_cache.session = session;
+    lite_login_identity_cache.key = key;
+    lite_login_identity_cache.identity = identity;
+    lite_login_identity_cache.valid = true;
     return identity; /* RAM-only change detection, never an authentication proof. */
+}
+
+/* Google's account cookies as YouTube receives them at sign-in: the SID
+   family, its API keys (SAPISID signs requests) and LOGIN_INFO. */
+static const char *const lite_account_cookies[] = {
+    "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "APISID",
+    "SID", "HSID", "SSID", "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+    "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "LOGIN_INFO"
+};
+
+void youtube_lite_session_register_credentials(BrowserSession *session)
+{
+    browser_session_set_credential_cookies(
+        session, "youtube.com", lite_account_cookies,
+        sizeof(lite_account_cookies) / sizeof(lite_account_cookies[0]));
 }
 
 bool youtube_lite_session_signed_in(BrowserSession *session)
@@ -239,7 +322,7 @@ static bool lite_feed_enqueue(YoutubeLiteFeedJob *job, bool api)
                 ? (job->like_selected ? "like/like" : "like/removelike") : "browse",
             job->identity.api_key);
         okay = count > 0 && (size_t) count < sizeof(endpoint)
-            && lite_identity_valid(&job->identity) && strcmp(job->client_name, "MWEB") == 0
+            && lite_identity_valid(&job->identity) && strcmp(job->account.client_name, "MWEB") == 0
             && lite_json_quote(job->identity.visitor, visitor, sizeof(visitor));
         char payload[512];
         if (job->action != YOUTUBE_LITE_ACTION_NONE) {
@@ -268,7 +351,7 @@ static bool lite_feed_enqueue(YoutubeLiteFeedJob *job, bool api)
             "\"hl\":\"%s\",\"gl\":\"US\",\"visitorData\":%s}},%s}",
             job->identity.client_version, lite_preferred_language(), okay ? visitor : "\"\"", payload);
         okay = okay && count > 0 && (size_t) count < sizeof(body);
-        lite_probe_wipe(payload, sizeof(payload));
+        lite_secure_wipe(payload, sizeof(payload));
         size_t body_length = okay ? (size_t) count : 0u;
         context = lite_supplemental_context(origin, endpoint);
         context.initiator_url = origin;
@@ -278,7 +361,7 @@ static bool lite_feed_enqueue(YoutubeLiteFeedJob *job, bool api)
             && job->like_video_id[0] == '\0')
             job->login_identity = youtube_lite_session_login_identity(job->session);
         if (!okay) job->failure = YOUTUBE_FEED_FAILURE_CONFIGURATION;
-        okay = okay && job->logged_in && lite_feed_authorization(job->session,
+        okay = okay && job->account.logged_in && lite_feed_authorization(job->session,
             &context, tilefinch_platform_wall_time_ns() / UINT64_C(1000000000),
             authorization, sizeof(authorization));
         job->request_signed = okay;
@@ -288,7 +371,7 @@ static bool lite_feed_enqueue(YoutubeLiteFeedJob *job, bool api)
             "X-YouTube-Client-Name: 2\nX-YouTube-Client-Version: %s"
             "\nAuthorization: %s\nX-Origin: https://m.youtube.com"
             "\nX-Goog-AuthUser: %u\nX-Youtube-Bootstrap-Logged-In: true",
-            job->identity.client_version, authorization, job->auth_user);
+            job->identity.client_version, authorization, job->identity.auth_user);
         okay = okay && count > 0 && (size_t) count < sizeof(headers);
         request = (FetchRequest) {.method = "POST", .body = body,
             .body_length = body_length, .content_type = "application/json",
@@ -312,10 +395,10 @@ static bool lite_feed_enqueue(YoutubeLiteFeedJob *job, bool api)
             job->history_request && job->timeout_ms - (long) elapsed > 3000L
                 ? 3000L : job->timeout_ms - (long) elapsed);
     }
-    lite_probe_wipe(&prepared, sizeof(prepared));
-    lite_probe_wipe(body, sizeof(body)); lite_probe_wipe(visitor, sizeof(visitor));
-    lite_probe_wipe(headers, sizeof(headers)); lite_probe_wipe(authorization, sizeof(authorization));
-    lite_probe_wipe(endpoint, sizeof(endpoint));
+    lite_secure_wipe(&prepared, sizeof(prepared));
+    lite_secure_wipe(body, sizeof(body)); lite_secure_wipe(visitor, sizeof(visitor));
+    lite_secure_wipe(headers, sizeof(headers)); lite_secure_wipe(authorization, sizeof(authorization));
+    lite_secure_wipe(endpoint, sizeof(endpoint));
     if ((!okay || job->request == 0) && job->failure == YOUTUBE_FEED_FAILURE_NONE)
         job->failure = YOUTUBE_FEED_FAILURE_ADMISSION;
     if (api && !job->history_request) job->request_admitted = okay && job->request != 0;
@@ -520,7 +603,7 @@ static bool lite_feed_json_pump(YoutubeLiteFeedJob *job)
 {
     const char *data = job->response.data;
     size_t stop = job->response.length - job->cursor;
-    if (stop > 16u * 1024u) stop = 16u * 1024u;
+    if (stop > LITE_FEED_SCAN_BYTES) stop = LITE_FEED_SCAN_BYTES;
     stop += job->cursor;
     for (size_t at = job->cursor; at < stop; at++) {
         char byte = data[at];
@@ -589,9 +672,9 @@ static bool lite_feed_json_pump(YoutubeLiteFeedJob *job)
 static void lite_feed_history_finish(YoutubeLiteFeedJob *job)
 {
     if (job->history_outcome == 1) job->history_outcome = 2;
-    lite_probe_release(&job->response);
+    lite_secure_release(&job->response);
     job->history_request = false;
-    job->phase = 3u;
+    job->phase = LITE_FEED_BUILD;
 }
 
 static void lite_feed_history_video_pump(YoutubeLiteFeedJob *job)
@@ -669,11 +752,12 @@ __attribute__((noinline))
 #endif
 static void lite_feed_next_api(YoutubeLiteFeedJob *job)
 {
-    lite_probe_release(&job->response);
+    lite_secure_release(&job->response);
     job->cursor = job->json_depth = 0;
     job->json_string = job->json_escape = job->json_started = job->json_done = job->json_error = false;
     job->context_begin = job->context_end = 0;
-    if (lite_feed_enqueue(job, true)) job->phase = job->history_request ? 5u : 2u;
+    if (lite_feed_enqueue(job, true)) job->phase = job->history_request
+        ? LITE_FEED_HISTORY_FETCH : LITE_FEED_API;
     else if (job->history_request) lite_feed_history_finish(job);
     else job->status = YOUTUBE_LITE_LOAD_FAILED;
 }
@@ -688,14 +772,14 @@ static void lite_account_unconfirmed(YoutubeLiteFeedJob *job)
         job->action_rechecks++;
         job->action_recheck_us = tilefinch_platform_monotonic_time_us()
             + 5000000u;
-        lite_probe_release(&job->response);
-        job->phase = 8u;
+        lite_secure_release(&job->response);
+        job->phase = LITE_FEED_PLAYLIST_RECHECK;
     } else job->status = YOUTUBE_LITE_LOAD_FAILED;
 }
 
 static bool lite_account_channel_matches(const YoutubeLiteSpan *object, const char *target)
 {
-    char id[25];
+    char id[YOUTUBE_CHANNEL_ID_CAPACITY];
     YoutubeLiteSpan value, endpoint, ids, extra;
     if (lite_json_member(object, "channelId", &value))
         return lite_json_string(value.start, value.end, id, sizeof(id))
@@ -731,7 +815,7 @@ static void lite_account_state_pump(YoutubeLiteFeedJob *job)
             && (!found || modern.start < object.start)) { object = modern; found = true; }
     }
     if (found) {
-        char target[128];
+        char target[YOUTUBE_ACCOUNT_ID_CAPACITY];
         bool selected = false, known = false;
 #ifndef __PSP__
         job->account_diagnostics.candidates++;
@@ -797,6 +881,119 @@ static void lite_account_state_pump(YoutubeLiteFeedJob *job)
     else job->cursor += YOUTUBE_LITE_BUILD_SCAN_BYTES;
 }
 
+/* The responseContext the framing pass located, when it is complete and
+   within LITE_FEED_CONTEXT_BYTES. */
+static bool lite_feed_context(const YoutubeLiteFeedJob *job,
+                              YoutubeLiteSpan *context)
+{
+    *context = (YoutubeLiteSpan) {job->response.data + job->context_begin,
+                                  job->response.data + job->context_end};
+    return job->context_end > job->context_begin
+        && job->context_end - job->context_begin <= LITE_FEED_CONTEXT_BYTES;
+}
+
+/* LITE_FEED_IDENTITY: read the bootstrap page, then send the API request. */
+static YoutubeLiteLoadStatus lite_feed_identity_pump(YoutubeLiteFeedJob *job)
+{
+    /* Account actions need the account index; every request signs with
+       it when the page states one. */
+    if (!lite_bootstrap_scan_pump(job->response.data, job->response.length,
+            &job->cursor, true, &job->identity, &job->account))
+        return job->status;
+    if (job->account.login_known && !job->account.logged_in) {
+        job->rejected_identity = job->login_identity;
+        job->failure = YOUTUBE_FEED_FAILURE_AUTHENTICATION;
+        job->status = YOUTUBE_LITE_LOAD_FAILED;
+        return job->status;
+    }
+    if (job->action != YOUTUBE_LITE_ACTION_NONE
+        && (!job->identity.auth_user_known || !job->account.logged_in)) {
+        job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
+    }
+    lite_secure_release(&job->response);
+    if (!lite_feed_enqueue(job, true)) job->status = YOUTUBE_LITE_LOAD_FAILED;
+    else job->phase = LITE_FEED_API;
+    return job->status;
+}
+
+/* LITE_FEED_API_FRAMING: frame the API response, then confirm an account
+   action, a rating, or the signed-in feed and start building its page. */
+static YoutubeLiteLoadStatus lite_feed_api_framing_pump(YoutubeLiteFeedJob *job)
+{
+    if (!lite_feed_json_pump(job)) {
+        job->failure = YOUTUBE_FEED_FAILURE_JSON;
+        job->status = YOUTUBE_LITE_LOAD_FAILED;
+    }
+    if (job->status != YOUTUBE_LITE_LOAD_PENDING || job->cursor != job->response.length)
+        return job->status;
+    if (job->action != YOUTUBE_LITE_ACTION_NONE) {
+        YoutubeLiteSpan root = {job->response.data, job->response.data + job->response.length}, error;
+        if (!job->json_done || job->json_error || lite_json_member(&root, "error", &error)) {
+            job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
+        }
+        if (job->action_prepared && !job->action_submitted) {
+            job->action_submitted = true;
+            if (job->action >= YOUTUBE_LITE_ACTION_SUBSCRIBE) { job->cursor = 0; job->phase = LITE_FEED_ACCOUNT_STATE; }
+            else lite_feed_next_api(job);
+        } else {
+            YoutubeLiteSpan context;
+            if (!lite_feed_context(job, &context) || !lite_feed_authenticated(&context))
+                job->status = YOUTUBE_LITE_LOAD_FAILED;
+            else { job->cursor = 0; job->phase = LITE_FEED_ACCOUNT_STATE; }
+        }
+        return job->status;
+    }
+    if (job->like_video_id[0] != '\0') {
+#ifndef __PSP__
+        job->rating_diagnostics.response_flags = lite_rating_response_flags(job);
+#endif
+        job->status = job->json_done && !job->json_error
+            && lite_like_confirmed(job->response.data, job->response.length,
+                job->like_video_id, job->like_selected)
+            ? YOUTUBE_LITE_LOAD_SUCCEEDED : YOUTUBE_LITE_LOAD_FAILED;
+        return job->status;
+    }
+    YoutubeLiteSpan context;
+    bool complete = job->json_done && !job->json_error
+        && lite_feed_context(job, &context);
+    if (!complete || !lite_feed_authenticated(&context)) {
+        job->failure = complete ? YOUTUBE_FEED_FAILURE_AUTHENTICATION : YOUTUBE_FEED_FAILURE_JSON;
+        if (complete && lite_feed_authentication(&context) < 0)
+            job->rejected_identity = job->login_identity;
+        job->status = YOUTUBE_LITE_LOAD_FAILED;
+        return job->status;
+    }
+    /* Server proof belongs to the session that signed this request, not
+       a replacement cookie jar. Even server rotation requires a fresh
+       request before the replacement can be offered for persistence. */
+    if (job->login_identity == 0 || job->login_identity
+        != youtube_lite_session_login_identity(job->session)) {
+        job->failure = YOUTUBE_FEED_FAILURE_SESSION_CHANGED;
+        job->status = YOUTUBE_LITE_LOAD_FAILED;
+        return job->status;
+    }
+    job->api_authenticated = true;
+    job->authenticated_identity = job->login_identity;
+    const char *url = job->subscriptions
+        ? "https://www.youtube.com/?tilefinch_feed=subscriptions"
+        : "https://www.youtube.com/?tilefinch_feed=recommended";
+#ifndef __PSP__
+    bool refuse_build = tilefinch_test_faults()->refuse_next_youtube_feed_build;
+    tilefinch_test_faults()->refuse_next_youtube_feed_build = false;
+    job->build = refuse_build ? NULL : lite_build_work_create(job->budget, url, NULL, 0,
+#else
+    job->build = lite_build_work_create(job->budget, url, NULL, 0,
+#endif
+        job->response.length, NULL, 0, job->response.data, job->response.length,
+        job->compact, false, NULL, 0);
+    if (job->build == NULL) {
+        job->failure = YOUTUBE_FEED_FAILURE_BUILD;
+        job->status = YOUTUBE_LITE_LOAD_FAILED;
+    }
+    else job->phase = LITE_FEED_BUILD;
+    return job->status;
+}
+
 YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
                                             const FetchPumpQuota *quota)
 {
@@ -840,16 +1037,16 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
         && (job->login_identity == 0 || job->login_identity != youtube_lite_session_login_identity(job->session))) {
         job->status = YOUTUBE_LITE_LOAD_CANCELLED; return job->status;
     }
-    if (job->phase == 8u || job->phase == 9u) {
-        if (job->phase == 9u) lite_account_state_pump(job);
+    if (job->phase == LITE_FEED_PLAYLIST_RECHECK || job->phase == LITE_FEED_ACCOUNT_STATE) {
+        if (job->phase == LITE_FEED_ACCOUNT_STATE) lite_account_state_pump(job);
         else if (now >= job->action_recheck_us) lite_feed_next_api(job);
         return job->status;
     }
-    if (job->phase == 7u) {
+    if (job->phase == LITE_FEED_HISTORY_VIDEO) {
         lite_feed_history_video_pump(job);
         return job->status;
     }
-    if (job->phase == 6u) {
+    if (job->phase == LITE_FEED_HISTORY_FRAMING) {
         bool parsed = lite_feed_json_pump(job);
         if (!parsed) {
             job->history_outcome = 4;
@@ -857,151 +1054,19 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
             return job->status;
         }
         if (job->cursor != job->response.length) return job->status;
-        bool complete = job->json_done && !job->json_error && job->context_end > job->context_begin
-            && job->context_end - job->context_begin <= 16u * 1024u;
-        YoutubeLiteSpan context = {job->response.data + job->context_begin,
-                                  job->response.data + job->context_end};
+        YoutubeLiteSpan context;
+        bool complete = job->json_done && !job->json_error
+            && lite_feed_context(job, &context);
         if (!complete || !lite_feed_authenticated(&context)) {
             job->history_outcome = 4;
             lite_feed_history_finish(job);
         } else if (job->history_contents_end <= job->history_contents_begin) lite_feed_history_finish(job);
-        else { job->cursor = job->history_contents_begin; job->phase = 7u; }
+        else { job->cursor = job->history_contents_begin; job->phase = LITE_FEED_HISTORY_VIDEO; }
         return job->status;
     }
-    if (job->phase == 4u) {
-        if (!lite_feed_json_pump(job)) {
-            job->failure = YOUTUBE_FEED_FAILURE_JSON;
-            job->status = YOUTUBE_LITE_LOAD_FAILED;
-        }
-        if (job->status != YOUTUBE_LITE_LOAD_PENDING || job->cursor != job->response.length)
-            return job->status;
-        if (job->action != YOUTUBE_LITE_ACTION_NONE) {
-            YoutubeLiteSpan root = {job->response.data, job->response.data + job->response.length}, error;
-            if (!job->json_done || job->json_error || lite_json_member(&root, "error", &error)) {
-                job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
-            }
-            if (job->action_prepared && !job->action_submitted) {
-                job->action_submitted = true;
-                if (job->action >= YOUTUBE_LITE_ACTION_SUBSCRIBE) { job->cursor = 0; job->phase = 9u; }
-                else lite_feed_next_api(job);
-            } else {
-                bool complete = job->context_end > job->context_begin
-                    && job->context_end - job->context_begin <= 16u * 1024u;
-                YoutubeLiteSpan context = {job->response.data + job->context_begin,
-                    job->response.data + job->context_end};
-                if (!complete || !lite_feed_authenticated(&context))
-                    job->status = YOUTUBE_LITE_LOAD_FAILED;
-                else { job->cursor = 0; job->phase = 9u; }
-            }
-            return job->status;
-        }
-        if (job->like_video_id[0] != '\0') {
-#ifndef __PSP__
-            job->rating_diagnostics.response_flags = lite_rating_response_flags(job);
-#endif
-            job->status = job->json_done && !job->json_error
-                && lite_like_confirmed(job->response.data, job->response.length,
-                    job->like_video_id, job->like_selected)
-                ? YOUTUBE_LITE_LOAD_SUCCEEDED : YOUTUBE_LITE_LOAD_FAILED;
-            return job->status;
-        }
-        bool complete = job->json_done && !job->json_error && job->context_end > job->context_begin
-            && job->context_end - job->context_begin <= 16u * 1024u;
-        YoutubeLiteSpan context = {job->response.data + job->context_begin,
-                                  job->response.data + job->context_end};
-        if (!complete || !lite_feed_authenticated(&context)) {
-            job->failure = complete ? YOUTUBE_FEED_FAILURE_AUTHENTICATION : YOUTUBE_FEED_FAILURE_JSON;
-            if (complete && lite_feed_authentication(&context) < 0)
-                job->rejected_identity = job->login_identity;
-            job->status = YOUTUBE_LITE_LOAD_FAILED;
-            return job->status;
-        }
-        /* Server proof belongs to the session that signed this request, not
-           a replacement cookie jar. Even server rotation requires a fresh
-           request before the replacement can be offered for persistence. */
-        if (job->login_identity == 0 || job->login_identity
-            != youtube_lite_session_login_identity(job->session)) {
-            job->failure = YOUTUBE_FEED_FAILURE_SESSION_CHANGED;
-            job->status = YOUTUBE_LITE_LOAD_FAILED;
-            return job->status;
-        }
-        job->api_authenticated = true;
-        job->authenticated_identity = job->login_identity;
-        const char *url = job->subscriptions
-            ? "https://www.youtube.com/?tilefinch_feed=subscriptions"
-            : "https://www.youtube.com/?tilefinch_feed=recommended";
-#ifndef __PSP__
-        bool refuse_build = tilefinch_test_faults()->refuse_next_youtube_feed_build;
-        tilefinch_test_faults()->refuse_next_youtube_feed_build = false;
-        job->build = refuse_build ? NULL : lite_build_work_create(job->budget, url, NULL, 0,
-#else
-        job->build = lite_build_work_create(job->budget, url, NULL, 0,
-#endif
-            job->response.length, NULL, 0, job->response.data, job->response.length,
-            job->compact, false, NULL, 0);
-        if (job->build == NULL) {
-            job->failure = YOUTUBE_FEED_FAILURE_BUILD;
-            job->status = YOUTUBE_LITE_LOAD_FAILED;
-        }
-        else job->phase = 3u;
-        return job->status;
-    }
-    if (job->phase == 1u) {
-        size_t stop = job->response.length - job->cursor;
-        if (stop > 16u * 1024u) stop = 16u * 1024u;
-        stop += job->cursor;
-        for (size_t at = job->cursor; at < stop; at++) {
-            char byte = job->response.data[at];
-            if (byte == 'S' && !job->identity.auth_user_known) {
-                job->identity.auth_user_known = lite_session_index_at(job->response.data,
-                    job->response.length, at, &job->identity.auth_user);
-                if (job->identity.auth_user_known) job->auth_user = job->identity.auth_user;
-            }
-            if (byte == 'I' && job->identity.api_key[0] == '\0')
-                (void) lite_json_key_string_at(job->response.data, job->response.length,
-                    at, "INNERTUBE_API_KEY", job->identity.api_key, sizeof(job->identity.api_key));
-            if (byte == 'I' && job->identity.client_version[0] == '\0')
-                (void) lite_json_key_string_at(job->response.data, job->response.length,
-                    at, "INNERTUBE_CONTEXT_CLIENT_VERSION", job->identity.client_version,
-                    sizeof(job->identity.client_version));
-            if (byte == 'I' && job->client_name[0] == '\0')
-                (void) lite_json_key_string_at(job->response.data, job->response.length,
-                    at, "INNERTUBE_CLIENT_NAME", job->client_name, sizeof(job->client_name));
-            if (byte == 'V' && job->identity.visitor[0] == '\0')
-                (void) lite_json_key_string_at(job->response.data, job->response.length,
-                    at, "VISITOR_DATA", job->identity.visitor, sizeof(job->identity.visitor));
-            if (byte == 'L' && at >= 1u && job->response.data[at - 1u] == '"'
-                && job->response.length - at >= 17u
-                && memcmp(job->response.data + at, "LOGGED_IN\"", 10u) == 0) {
-                const char *value = job->response.data + at + 10u;
-                const char *end = job->response.data + job->response.length;
-                while (value < end && isspace((unsigned char) *value)) value++;
-                if (value < end && *value++ == ':') {
-                    while (value < end && isspace((unsigned char) *value)) value++;
-                    job->logged_in = end - value >= 4 && memcmp(value, "true", 4) == 0;
-                    job->bootstrap_login_known = job->logged_in
-                        || (end - value >= 5 && memcmp(value, "false", 5) == 0);
-                }
-            }
-        }
-        job->cursor = stop;
-        if (stop != job->response.length) return job->status;
-        if (job->bootstrap_login_known && !job->logged_in) {
-            job->rejected_identity = job->login_identity;
-            job->failure = YOUTUBE_FEED_FAILURE_AUTHENTICATION;
-            job->status = YOUTUBE_LITE_LOAD_FAILED;
-            return job->status;
-        }
-        if (job->action != YOUTUBE_LITE_ACTION_NONE
-            && (!job->identity.auth_user_known || !job->logged_in)) {
-            job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
-        }
-        lite_probe_release(&job->response);
-        if (!lite_feed_enqueue(job, true)) job->status = YOUTUBE_LITE_LOAD_FAILED;
-        else job->phase = 2u;
-        return job->status;
-    }
-    if (job->phase == 3u) {
+    if (job->phase == LITE_FEED_API_FRAMING) return lite_feed_api_framing_pump(job);
+    if (job->phase == LITE_FEED_IDENTITY) return lite_feed_identity_pump(job);
+    if (job->phase == LITE_FEED_BUILD) {
         if (!job->subscriptions && job->like_video_id[0] == '\0'
             && !job->history_attempted && job->build->phase == YOUTUBE_LITE_BUILD_EMIT_HEADER) {
             job->history_attempted = true;
@@ -1031,7 +1096,7 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
     job->tls_verification_failed = job->response.tls_verification_failed;
     job->transport_timed_out = job->response.timed_out;
     job->http_status = job->response.status_code;
-    if (job->phase == 0u) job->bootstrap_status = job->http_status;
+    if (job->phase == LITE_FEED_BOOTSTRAP) job->bootstrap_status = job->http_status;
     else if (job->history_request) job->history_status = job->http_status;
     else job->api_status = job->http_status;
     job->transported = fetched;
@@ -1044,7 +1109,7 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
         if (job->action_prepared && !job->action_submitted && job->response.data != NULL) {
             job->account_diagnostics.mutation_flags = job->account_diagnostics.flags;
             YoutubeLiteSpan root = {job->response.data, job->response.data + job->response.length};
-            char status[32], playlist[128];
+            char status[32], playlist[YOUTUBE_ACCOUNT_ID_CAPACITY];
             job->account_diagnostics.mutation_bound = lite_member_string(&root, "playlistId", playlist, sizeof(playlist), false)
                 && strcmp(playlist, job->action_target) == 0;
             if (lite_member_string(&root, "status", status, sizeof(status), false))
@@ -1053,7 +1118,7 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
         }
     }
     if (job->like_video_id[0] != '\0') {
-        if (job->phase == 0u) job->rating_diagnostics.bootstrap_status = job->response.status_code;
+        if (job->phase == LITE_FEED_BOOTSTRAP) job->rating_diagnostics.bootstrap_status = job->response.status_code;
         else {
             job->rating_diagnostics.api_status = job->response.status_code;
             job->rating_diagnostics.api_bytes = job->response.length;
@@ -1062,7 +1127,7 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
 #endif
     if (!fetched || job->response.status_code != 200 || job->response.data == NULL
         || !tilefinch_url_same_origin(job->response.effective_url, "https://m.youtube.com/")) {
-        if (job->phase == 5u) {
+        if (job->phase == LITE_FEED_HISTORY_FETCH) {
             lite_feed_history_finish(job);
             job->history_outcome = 4;
         }
@@ -1074,18 +1139,19 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
         }
         return job->status;
     }
-    TilefinchRequestContext context = job->phase == 0u
+    TilefinchRequestContext context = job->phase == LITE_FEED_BOOTSTRAP
         ? lite_primary_context("https://m.youtube.com/", job->target)
         : lite_supplemental_context("https://m.youtube.com/", job->target);
     context.initiator_url = "https://m.youtube.com/";
     lite_accept_cookies(job->session, &context, &job->response, job->target);
     if (job->action != YOUTUBE_LITE_ACTION_NONE)
         job->login_identity = youtube_lite_session_login_identity(job->session);
-    if (job->phase == 0u) {
-        job->logged_in = false;
+    if (job->phase == LITE_FEED_BOOTSTRAP) {
+        job->account = (YoutubeLiteBootstrapAccount) {0};
         job->cursor = 0;
-        job->phase = 1u;
-    } else { job->phase = job->history_request ? 6u : 4u; job->cursor = 0; }
+        job->phase = LITE_FEED_IDENTITY;
+    } else { job->phase = job->history_request
+        ? LITE_FEED_HISTORY_FRAMING : LITE_FEED_API_FRAMING; job->cursor = 0; }
     return job->status;
 }
 
@@ -1104,9 +1170,9 @@ void youtube_lite_feed_destroy(YoutubeLiteFeedJob *job)
     if (job == NULL) return;
     fetch_scheduler_destroy(job->scheduler);
     lite_build_work_destroy(job->build);
-    lite_probe_release(&job->response);
+    lite_secure_release(&job->response);
     youtube_lite_document_destroy(&job->document);
     Budget *budget = job->budget;
-    lite_probe_wipe(job, sizeof(*job));
+    lite_secure_wipe(job, sizeof(*job));
     budget_free(budget, job);
 }

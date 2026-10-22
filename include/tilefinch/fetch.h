@@ -1264,6 +1264,9 @@ bool fetch_trace_replay_begin(const char *directory, char *error,
 /* Lab-only response replay for visual comparisons. Unlike the strict API
    above, this mode selects a retained response by method plus normalized
    request URL and deliberately ignores the captured request-header shape.
+   Where request-body authority is retained, non-GET/HEAD routes also match
+   its length and hash before ranking. Legacy body-less fixtures and explicit
+   body/UUID diagnostic waivers retain their prior compatibility behavior.
    Successful nonzero HTTP records outrank retained HTTP and status-zero
    failures. The highest-rank records are claimed in record order and fail
    closed after exhaustion; a singleton is reusable. Integrity-valid retained

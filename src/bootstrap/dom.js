@@ -1,9 +1,15 @@
+/* A private global lexical constant avoids adding a captured environment slot
+   to every DOM/platform method. The public globalThis property stays writable;
+   this binding is neither a property nor a privileged host capability. */
+const __tilefinchRealmGlobal = this;
 (() => {
-  const scriptForceAsync = globalThis.__tilefinchScriptForceAsync,
-    scriptAsyncAssigned = globalThis.__tilefinchScriptAsyncAssigned,
-    elementNonce = globalThis.__tilefinchElementNonce,
-    prepareDynamicSubtree = globalThis.__tilefinchPrepareDynamicSubtree,
-    appendMany = globalThis.__tilefinchAppendMany,
+  const scriptForceAsync = __tilefinchRealmGlobal.__tilefinchScriptForceAsync,
+    scriptAsyncAssigned = __tilefinchRealmGlobal.__tilefinchScriptAsyncAssigned,
+    elementNonce = __tilefinchRealmGlobal.__tilefinchElementNonce,
+    prepareDynamicSubtree = __tilefinchRealmGlobal.__tilefinchPrepareDynamicSubtree,
+    appendMany = __tilefinchRealmGlobal.__tilefinchAppendMany,
+    /* Host and validation realms only (see hardening.js). */
+    testProbes = !!__tilefinchRealmGlobal.__tilefinchTestProbes,
     ancestorApply = Reflect.apply,
     numberFrom = Number,
     numberIsFinite = Number.isFinite,
@@ -135,7 +141,7 @@
     const result = expression(0);
     return at === tokens.length ? result : NaN;
   };
-  Object.defineProperty(globalThis, "__tilefinchBoundedAncestorPath", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchBoundedAncestorPath", {
     enumerable: false,
     configurable: false,
     writable: false,
@@ -148,13 +154,13 @@
      that -- a cycle cannot terminate, so it always reaches the cap -- and
      unlike boundedAncestorPath it allocates nothing, which matters on paths
      as hot as contains(), closest(), and every mutation record. */
-  Object.defineProperty(globalThis, "__tilefinchAncestorLimit", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchAncestorLimit", {
     enumerable: false,
     configurable: false,
     writable: false,
     value: ancestorLimit,
   });
-  /* hardening.js takes a single snapshot of Reflect.ownKeys(globalThis), so
+  /* hardening.js takes a single snapshot of Reflect.ownKeys(__tilefinchRealmGlobal), so
      a __tilefinch global created lazily on first write stays enumerable for the
      rest of the page's life.  Declaring them up front makes
      non-enumerability an invariant of the global instead of a property of
@@ -168,7 +174,7 @@
     ["__tilefinchFragmentInsertText", ""],
     ["__tilefinchSelectedControl", null],
   ])
-    Object.defineProperty(globalThis, name, {
+    Object.defineProperty(__tilefinchRealmGlobal, name, {
       enumerable: false,
       configurable: false,
       writable: true,
@@ -193,7 +199,7 @@
     templateOwnerDocument = () =>
       templateContentsOwnerDocument ||
       (templateContentsOwnerDocument =
-        globalThis.__tilefinchNewDocument?.() || null),
+        __tilefinchRealmGlobal.__tilefinchNewDocument?.() || null),
     nodeOwnerTag = (owner) => {
       if (!owner || owner === document) return 1;
       if (owner === templateContentsOwnerDocument) return 2;
@@ -223,7 +229,7 @@
         value: owner,
       }),
     setNodeOwner = (node, owner) => {
-      if (node.__handle > 0 && !globalThis.__tilefinchIsVirtualRemote(node)) {
+      if (node.__handle > 0 && !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(node)) {
         // Tag 0 (253 live documents) leaves only the wrapper's record.
         const tag = nodeOwnerTag(owner);
         if (tag > 1 || (tag === 1 && nodeOwnersActive))
@@ -232,7 +238,7 @@
       }
       cacheNodeOwner(node, owner);
     };
-  Object.defineProperty(globalThis, "__tilefinchSetNodeOwner", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchSetNodeOwner", {
     enumerable: false,
     configurable: false,
     writable: false,
@@ -245,11 +251,24 @@
     node.__handle !== undefined ? document : node.ownerDocument || document;
   const documentListeners = new Map(),
     smoothElementScrolls = new WeakMap();
-  globalThis.__tilefinchTaskRealm = "top";
+  let pendingElementScrolls = null;
+  const queueElementScroll = (node) => {
+    if (pendingElementScrolls) {
+      if (pendingElementScrolls.size < 128) pendingElementScrolls.add(node);
+      return;
+    }
+    pendingElementScrolls = new Set([node]);
+    setTimeout(() => {
+      const pending = pendingElementScrolls;
+      pendingElementScrolls = null;
+      for (const target of pending) target.dispatchEvent(new Event("scroll"));
+    }, 0);
+  };
+  __tilefinchRealmGlobal.__tilefinchTaskRealm = "top";
   let activeTaskKind = "bootstrap",
     activeTaskSequence = 0,
     nextTaskSequence = 1;
-  Object.defineProperties(globalThis, {
+  Object.defineProperties(__tilefinchRealmGlobal, {
     __tilefinchActiveTaskKind: {
       configurable: false,
       enumerable: false,
@@ -261,7 +280,7 @@
       get: () => activeTaskSequence,
     },
   });
-  globalThis.__tilefinchRunTask = (kind, callback, thisArg, args) => {
+  __tilefinchRealmGlobal.__tilefinchRunTask = (kind, callback, thisArg, args) => {
     const previousKind = activeTaskKind,
       previousSequence = activeTaskSequence;
     activeTaskKind = typeof kind === "string" && kind.length <= 96
@@ -285,33 +304,33 @@
   const uncaughtErrors = [];
   let uncaughtReportDepth = 0;
   let uncaughtReportCount = 0;
-  globalThis.__tilefinchUncaughtErrors = uncaughtErrors;
-  globalThis.__tilefinchUncaughtErrorCount = 0;
-  globalThis.__tilefinchLastUncaughtTask = "";
-  globalThis.__tilefinchReportUncaught = (error, context = "callback") => {
+  __tilefinchRealmGlobal.__tilefinchUncaughtErrors = uncaughtErrors;
+  __tilefinchRealmGlobal.__tilefinchUncaughtErrorCount = 0;
+  if (testProbes) __tilefinchRealmGlobal.__tilefinchLastUncaughtTask = "";
+  __tilefinchRealmGlobal.__tilefinchReportUncaught = (error, context = "callback") => {
     uncaughtReportDepth++;
     try {
       /* Count before any string/stack allocation: an OOM must not disappear
          merely because formatting its diagnostic also fails. Existing own
          property + int32 value keep this publication allocation-free. */
       if (uncaughtReportCount < 2147483647) uncaughtReportCount++;
-      globalThis.__tilefinchUncaughtErrorCount = uncaughtReportCount;
+      __tilefinchRealmGlobal.__tilefinchUncaughtErrorCount = uncaughtReportCount;
       const message = String(error),
         stack = String((error && error.stack) || ""),
         detail =
           stack && stack.indexOf(message) < 0
             ? message + "\n" + stack
-            : stack || message,
-        provenance =
+            : stack || message;
+      if (testProbes)
+        __tilefinchRealmGlobal.__tilefinchLastUncaughtTask =
           "realm=" +
-          String(globalThis.__tilefinchTaskRealm || "unknown") +
+          String(__tilefinchRealmGlobal.__tilefinchTaskRealm || "unknown") +
           " task=" +
           String(activeTaskKind) +
           "#" +
           String(activeTaskSequence) +
           " context=" +
           String(context).slice(0, 64);
-      globalThis.__tilefinchLastUncaughtTask = provenance;
       if (uncaughtErrors.length >= 16) uncaughtErrors.shift();
       uncaughtErrors.push(String(context) + ": " + detail);
       /*
@@ -321,7 +340,7 @@
        * before console logging so test and application error handlers see the
        * original value even when diagnostic formatting later fails.
        */
-      const onerror = globalThis.onerror;
+      const onerror = __tilefinchRealmGlobal.onerror;
       /* HTML's exception-reporting algorithm must not recursively report an
          exception raised while it is already firing the Window error event.
          Without this guard, one throwing `error` listener recursively creates
@@ -329,7 +348,7 @@
       if (uncaughtReportDepth === 1 && typeof onerror === "function")
         try {
           onerror.call(
-            globalThis,
+            __tilefinchRealmGlobal,
             error?.message || message,
             "",
             0,
@@ -339,8 +358,8 @@
         } catch (_) {}
       if (
         uncaughtReportDepth === 1 &&
-        typeof globalThis.Event === "function" &&
-        typeof globalThis.dispatchEvent === "function"
+        typeof __tilefinchRealmGlobal.Event === "function" &&
+        typeof __tilefinchRealmGlobal.dispatchEvent === "function"
       )
         try {
           const event = new Event("error", { cancelable: true });
@@ -356,14 +375,14 @@
            * registered "error" listeners still receive the ErrorEvent-shaped
            * value.
            */
-          globalThis.onerror = null;
+          __tilefinchRealmGlobal.onerror = null;
           try {
-            globalThis.dispatchEvent(event);
+            __tilefinchRealmGlobal.dispatchEvent(event);
           } finally {
-            globalThis.onerror = onerror;
+            __tilefinchRealmGlobal.onerror = onerror;
           }
         } catch (_) {}
-      if (globalThis.console && typeof console.error === "function")
+      if (__tilefinchRealmGlobal.console && typeof console.error === "function")
         console.error("Uncaught " + String(context), detail, provenance);
     } catch (_) {
       /* Reporting must never turn an isolated callback exception into a failed host dispatch, including when the JS heap is exhausted. */
@@ -391,14 +410,14 @@
     mutationRecords: 0,
     observerVisits: 0,
   };
-  globalThis.__tilefinchRetentionStats = retentionStats;
+  __tilefinchRealmGlobal.__tilefinchRetentionStats = retentionStats;
   /* The lazily loaded traversal module installs the live NodeIterator
      removal hook once; removals must then be enumerated even when no
      MutationObserver is registered. */
   let nodeIteratorHooks = null;
-  globalThis.__tilefinchSetNodeIteratorHooks = (hooks) => {
+  __tilefinchRealmGlobal.__tilefinchSetNodeIteratorHooks = (hooks) => {
     nodeIteratorHooks = hooks;
-    delete globalThis.__tilefinchSetNodeIteratorHooks;
+    delete __tilefinchRealmGlobal.__tilefinchSetNodeIteratorHooks;
   };
   const mutationChildSnapshot = (node) => {
     if (mutationObservers.length === 0 && !nodeIteratorHooks?.active())
@@ -413,38 +432,39 @@
     return values;
   };
   const nativeNodeStateCleanups = [];
-  globalThis.__tilefinchRegisterNativeNodeStateCleanup = (callback) => {
+  __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup = (callback) => {
     if (
       typeof callback === "function" &&
       nativeNodeStateCleanups.length < 4
     )
       nativeNodeStateCleanups.push(callback);
   };
-  globalThis.__tilefinchRetireNativeNodeState = (handle) => {
+  __tilefinchRealmGlobal.__tilefinchRetireNativeNodeState = (handle, wrapperOnly) => {
+    if (wrapperOnly && typeof handle === "object" && handle !== null) {
+      /* A native sweep's released wrappers, batched into one call. */
+      for (let i = 0; i < handle.length; i++)
+        if (nodeCache.delete(Number(handle[i]))) retentionStats.wrappersFinalized++;
+      return;
+    }
     handle = Number(handle);
+    if (nodeCache.delete(handle) && wrapperOnly) retentionStats.wrappersFinalized++;
+    if (wrapperOnly) return;
     for (const cleanup of nativeNodeStateCleanups) cleanup(handle);
   };
   const nodeCache = new Map(),
-    weakNodeCache =
-      typeof WeakRef === "function" &&
-      typeof FinalizationRegistry === "function";
-  const nodeFinalizer = weakNodeCache
-    ? new FinalizationRegistry((held) => {
-        retentionStats.wrappersFinalized++;
-        const entry = nodeCache.get(held.handle);
-        if (entry && entry.lease === held.lease) nodeCache.delete(held.handle);
-        __tilefinchReleaseNodeWrapper(held.handle, held.lease);
-      })
-    : null;
-  /* Held records are private cache bookkeeping. Do not expose them through
-     an author replacement of FinalizationRegistry's prototype methods. */
-  const registerNodeWrapper = nodeFinalizer?.register.bind(nodeFinalizer),
-    unregisterNodeWrapper = nodeFinalizer?.unregister.bind(nodeFinalizer);
+    weakNodeCache = typeof WeakRef === "function";
+  const nodeReferenceDeref = weakNodeCache ? WeakRef.prototype.deref : null,
+    /* Reflect.apply allocates its argument list; a bound call does not,
+       so the event-state hooks can look a wrapper or holder up after they
+       began moving state (see __tilefinchHoldEventState). */
+    derefReference = weakNodeCache
+      ? Function.prototype.call.bind(nodeReferenceDeref)
+      : null;
   const cachedNode = (handle) => {
     const entry = nodeCache.get(Number(handle));
     if (!entry) return null;
-    if (!weakNodeCache || !entry.reference) return entry.wrapper || null;
-    const wrapper = entry.reference.deref();
+    if (!weakNodeCache) return entry.wrapper || null;
+    const wrapper = derefReference(entry);
     if (wrapper) return wrapper;
     nodeCache.delete(Number(handle));
     return null;
@@ -454,11 +474,8 @@
     const entry = nodeCache.get(handle);
     if (!entry) return 0;
     const current =
-      weakNodeCache && entry.reference
-        ? entry.reference.deref()
-        : entry.wrapper;
+      weakNodeCache ? derefReference(entry) : entry.wrapper;
     if (current !== wrapper) return 0;
-    if (weakNodeCache) unregisterNodeWrapper(entry);
     nodeCache.delete(handle);
     return Number(entry.lease) || 0;
   };
@@ -479,12 +496,12 @@
       wrapper.__tilefinchHandleLease = 0;
       return wrapper;
     }
-    /* The same private record is the cache entry, held value and unregister
-       token. It contains only a WeakRef to the wrapper: sharing it must not
-       turn finalizer bookkeeping into a strong target-retention cycle. */
-    const entry = { reference, handle, lease };
+    /* The native handle table reclaims cleared WeakRefs in bounded owner
+       turns. No per-wrapper registry cell or queued finalizer is needed. */
+    const entry = reference;
+    entry.handle = handle;
+    entry.lease = lease;
     nodeCache.set(handle, entry);
-    registerNodeWrapper(wrapper, entry, entry);
     wrapper.__tilefinchHandleLease = lease;
     return wrapper;
   };
@@ -494,10 +511,12 @@
      only this module can name, the same way compat.js brands storage kinds
      through a private WeakMap. */
   const rebindToken = {};
-  const stableNodeWrappers = new Map();
+  const stableNodeWrappers = new Map(),
+    /* The longest stable key a wrapper or event state is kept under. */
+    STABLE_KEY_LIMIT = 192;
   let stableWrapperLimit = 16;
-  globalThis.__tilefinchBeginTraversal = () => {
-    if (globalThis.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
+  __tilefinchRealmGlobal.__tilefinchBeginTraversal = () => {
+    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
   };
   /* Until a node has a stable key or is a section-remote stand-in, no
      wrapper can be virtual-remote (__tilefinchIsVirtualRemote). */
@@ -509,12 +528,12 @@
   const rememberStableWrapper = (key, wrapper) => {
     key = String(key || "");
     if (key) remoteIdentitySeen = true;
-    if (!key || key.length > 192) return;
+    if (!key || key.length > STABLE_KEY_LIMIT) return;
     /* The section writer can be installed after bootstrap traversal began.
        Promote at the first actual section-aware retention point as well, so
        a live author reference is not orphaned merely because setup order
        left the ordinary-document limit in place. */
-    if (globalThis.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
+    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
     if (stableNodeWrappers.has(key)) stableNodeWrappers.delete(key);
     while (stableNodeWrappers.size >= stableWrapperLimit) {
       stableNodeWrappers.delete(stableNodeWrappers.keys().next().value);
@@ -534,45 +553,393 @@
     stableNodeListeners = new Map(),
     stableNodeHandlers = new Map(),
     nativeNodeListeners = new Map(),
-    nativeNodeHandlers = new Map(),
-    volatileNodeHandlers = new WeakMap();
+    nativeNodeHandlers = new Map();
+  /* A node's event state (its listener and handler maps) is rooted in the
+     two per-handle maps above, so a connected or pinned node keeps it when
+     its wrapper is collected, and a later wrapper finds it again. Rooting a
+     detached tree's state would also keep alive every wrapper a handler
+     closes over (element -> handler -> element through a global root). The
+     native owner-turn sweep therefore moves a detached, unpinned tree's
+     state into a holder that only the tree's live wrappers reference
+     (__tilefinchHoldEventState); a wrapper made later in that tree joins it.
+     The collector then reclaims the tree with its handlers once no wrapper
+     of it is reachable. Native code roots the state again
+     (__tilefinchReleaseEventHolders) before anything lets the tree outlive
+     those wrappers: inserting it or into it, or pinning it. An insertion
+     into a held tree instead has the moving subtree's wrappers join the
+     tree's holder when they can.
+
+     The per-handle maps hold 128 targets each to start with and grow by
+     doubling while the page Budget confirms the memory free
+     (__tilefinchGrowEventTargets). Past a refused growth a node's state
+     lives on its wrapper instead (wrapperListeners, wrapperHandlers), and
+     native code keeps that wrapper alive while the node is connected or
+     pinned (state 3 below), so the state still lives as long as the node
+     can receive events; a detached tree's goes to its holder as above.
+
+     A page with a remote node writer (a section-paged document) keys a
+     node's state by its stable key instead (stableNodeListeners,
+     stableNodeHandlers), so it carries over to the node a section swap
+     makes for the same key. That pair grows the same way, through the
+     same native admission; past a refused growth the node's state takes
+     the per-handle path above, so it is never dropped while the node can
+     get events, though a later node with the same key does not inherit
+     it. */
+  const wrapperEventHolder = Symbol("event holder"),
+    wrapperHandlers = Symbol("wrapper handlers"),
+    /* handle -> WeakRef of the holder keeping that node's state */
+    heldEventStates = new Map(),
+    /* On every holder: false, or the next holder in pendingHolders. */
+    holderPending = Symbol("pending release");
+  /* Holders whose release has not finished (a refused allocation stopped
+     it), chained through holderPending and kept alive from here until a
+     later release finishes them: their trees may have outlived their
+     wrappers by then. */
+  let pendingHolders = null;
+  /* Where a node's state lives, for __tilefinchNoteEventState: nowhere,
+     rooted, held, or kept on its wrapper. (Native code marks a detached
+     tree whose state could not be held STUCK: the sweep leaves it until
+     the tree changes.) */
+  const EVENT_STATE_NONE = 0,
+    EVENT_STATE_ROOTED = 1,
+    EVENT_STATE_HELD = 2,
+    EVENT_STATE_KEPT = 3;
+  /* The capacity each pair of maps shares, and the longest key its
+     targets add (a stable key is a string the map keeps alive). */
+  const nativeEventTargets = { capacity: 128, keyLength: 0 },
+    stableEventTargets = { capacity: 128, keyLength: STABLE_KEY_LIMIT };
+  /* Room for one more target in `storage`, one map of `pair`, growing the
+     pair's capacity when it is full and native code admits the growth. */
+  const eventTargetRoom = (storage, pair = nativeEventTargets) => {
+    if (storage.size < pair.capacity) return true;
+    const grown = Number(
+      __tilefinchGrowEventTargets(pair.capacity, pair.keyLength)) || 0;
+    if (grown > pair.capacity) pair.capacity = grown;
+    return storage.size < pair.capacity;
+  };
+  const heldEventHolder = (handle) => {
+    const reference = heldEventStates.get(handle);
+    return reference ? derefReference(reference) || null : null;
+  };
+  const heldEventState = (handle) =>
+    heldEventStates.size ? heldEventHolder(handle)?.get(handle) || null : null;
+  const hasOwnProperty = Object.prototype.hasOwnProperty;
+  /* The node's wrapper carries its state (kept). The state leaves a
+     wrapper as an undefined value rather than a deleted property: a
+     delete can copy a shape the wrapper shares, an allocation that may
+     fail after the state already moved. */
+  const keptOnWrapper = (wrapper) =>
+    !!wrapper && hasOwnProperty.call(wrapper, wrapperHandlers) &&
+    wrapper[wrapperHandlers] !== undefined;
+  /* The state left the node's wrapper (rooted or held): the maps it
+     shares stay, but new state must not be added to the wrapper alone. */
+  const unkeep = (handle) => {
+    const wrapper = cachedNode(handle);
+    if (keptOnWrapper(wrapper)) wrapper[wrapperHandlers] = undefined;
+  };
+  /* Puts a node's whole state on `wrapper` and has native code keep that
+     wrapper; false when the wrapper cannot carry it (a page froze it) or
+     is not the node's live wrapper. Allocates nothing when the wrapper
+     already carries it. */
+  const keepOnWrapper = (handle, wrapper, listeners, handlers) => {
+    if (!wrapper) return false;
+    const wasKept = keptOnWrapper(wrapper);
+    try {
+      if (wasKept) wrapper[wrapperHandlers] = handlers;
+      else
+        Object.defineProperty(wrapper, wrapperHandlers, {
+          value: handlers,
+          writable: true,
+          configurable: true,
+        });
+      if (listeners) wrapper[wrapperListeners] = listeners;
+    } catch {}
+    if (
+      wrapper[wrapperHandlers] !== handlers ||
+      (listeners && wrapper[wrapperListeners] !== listeners) ||
+      !__tilefinchNoteEventState(handle, EVENT_STATE_KEPT, wrapper)
+    ) {
+      if (!wasKept && keptOnWrapper(wrapper))
+        try {
+          wrapper[wrapperHandlers] = undefined;
+        } catch {}
+      return false;
+    }
+    nativeNodeListeners.delete(handle);
+    nativeNodeHandlers.delete(handle);
+    return true;
+  };
+  /* Roots `state` in the per-handle maps; past their capacity it is kept
+     on the node's live wrapper. Only a node without a usable wrapper roots
+     past the capacity (a held tree re-rooted after its own wrapper went,
+     or a frozen wrapper): the state is never dropped. The state leaves
+     where it was (a kept wrapper) only once rooted. */
+  const rootEventState = (handle, state) => {
+    const { listeners, handlers } = state;
+    if (!listeners && !handlers) {
+      __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
+      return;
+    }
+    if (
+      (!listeners || nativeNodeListeners.has(handle) ||
+        eventTargetRoom(nativeNodeListeners)) &&
+      (!handlers || nativeNodeHandlers.has(handle) ||
+        eventTargetRoom(nativeNodeHandlers))
+    ) {
+      if (listeners) nativeNodeListeners.set(handle, listeners);
+      if (handlers) nativeNodeHandlers.set(handle, handlers);
+      unkeep(handle);
+      __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
+      return;
+    }
+    if (keepOnWrapper(handle, cachedNode(handle), listeners, handlers))
+      return;
+    if (listeners) nativeNodeListeners.set(handle, listeners);
+    if (handlers) nativeNodeHandlers.set(handle, handlers);
+    unkeep(handle);
+    __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
+  };
+  /* Roots again each entry of `holder`. An entry leaves the holder only
+     once rooted, so one a refused allocation stopped stays held (the
+     caller keeps the holder in pendingHolders). */
+  const releaseEventHolder = (holder) => {
+    if (!holder?.size) return;
+    for (const [handle, state] of holder) {
+      rootEventState(handle, state);
+      heldEventStates.delete(handle);
+      holder.delete(handle);
+    }
+  };
+  /* Queues `holder` for release; allocates nothing. */
+  const pendEventHolder = (holder) => {
+    if (!holder?.size || holder[holderPending] !== false) return;
+    holder[holderPending] = pendingHolders;
+    pendingHolders = holder;
+  };
+  /* Releases the queued holders; one a refused allocation stopped stays
+     queued, with those after it. */
+  const releasePendingHolders = () => {
+    while (pendingHolders !== null) {
+      const holder = pendingHolders;
+      releaseEventHolder(holder);
+      pendingHolders = holder[holderPending];
+      holder[holderPending] = false;
+    }
+  };
+  /* Drops the heldEventStates keys a failed hold added for `reference`. */
+  const unstageEventHold = (records, reference) => {
+    for (let i = 0; i < records.length; i++) {
+      const handle = Number(records[i]);
+      if (heldEventStates.get(handle) === reference)
+        heldEventStates.delete(handle);
+    }
+  };
+  /* Native: `records` are the handles in one detached tree with event
+     state, `wrappers` those of its live wrappers. False when a wrapper
+     refused the holder: a wrapper the page made non-extensible cannot keep
+     the tree's state, which then stays where it was, and native code
+     leaves the tree to the sweep until it changes. No wrapper keeps a
+     refused holder: a later release would root its entries again, a node
+     retired since among them.
+
+     Everything that allocates comes first: the holder with its entries,
+     its WeakRef, the stamp property on every wrapper, and the
+     heldEventStates keys it adds. Only then does the state leave its old
+     places (the per-handle maps, a kept wrapper, an earlier holder), in
+     steps that allocate nothing. A refused allocation (the realm's heap
+     is full) throws before any state moved, and native code retries the
+     tree later. */
+  __tilefinchRealmGlobal.__tilefinchHoldEventState = (records, wrappers) => {
+    const holder = new Map();
+    holder[holderPending] = false;
+    for (let i = 0; i < records.length; i++) {
+      const handle = Number(records[i]),
+        state = heldEventHolder(handle)?.get(handle),
+        kept = cachedNode(handle),
+        own = keptOnWrapper(kept),
+        listeners = nativeNodeListeners.get(handle) || state?.listeners ||
+          (own ? kept[wrapperListeners] : null) || null,
+        handlers = nativeNodeHandlers.get(handle) || state?.handlers ||
+          (own ? kept[wrapperHandlers] : null) || null;
+      if (listeners || handlers) holder.set(handle, { listeners, handlers });
+    }
+    const reference = holder.size ? new WeakRef(holder) : null;
+    if (reference) {
+      /* The wrappers and what each carried before. A wrapper without the
+         stamp property gets it (undefined, as good as none) now, so that
+         stamping it allocates nothing. */
+      const stamped = [];
+      for (let i = 0; i < wrappers.length; i++) {
+        const wrapper = cachedNode(wrappers[i]);
+        if (!wrapper) continue;
+        if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) {
+          try {
+            wrapper[wrapperEventHolder] = undefined;
+          } catch (error) {
+            if (Object.isExtensible(wrapper)) throw error;
+          }
+          if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) return false;
+        }
+        stamped.push(wrapper, wrapper[wrapperEventHolder]);
+      }
+      try {
+        for (let i = 0; i < records.length; i++) {
+          const handle = Number(records[i]);
+          if (holder.has(handle) && !heldEventStates.has(handle))
+            heldEventStates.set(handle, reference);
+        }
+      } catch (error) {
+        unstageEventHold(records, reference);
+        throw error;
+      }
+      for (let j = 0; j < stamped.length; j += 2) {
+        const wrapper = stamped[j];
+        try {
+          wrapper[wrapperEventHolder] = holder;
+        } catch {}
+        if (wrapper[wrapperEventHolder] !== holder) {
+          for (let k = 0; k < j; k += 2)
+            stamped[k][wrapperEventHolder] = stamped[k + 1];
+          unstageEventHold(records, reference);
+          return false;
+        }
+      }
+    }
+    /* From here nothing allocates. */
+    for (let i = 0; i < records.length; i++) {
+      const handle = Number(records[i]),
+        previous = heldEventHolder(handle),
+        kept = cachedNode(handle);
+      if (previous !== holder) previous?.delete(handle);
+      nativeNodeListeners.delete(handle);
+      nativeNodeHandlers.delete(handle);
+      if (keptOnWrapper(kept)) kept[wrapperHandlers] = undefined;
+      if (holder.has(handle)) {
+        heldEventStates.set(handle, reference);
+        __tilefinchNoteEventState(handle, EVENT_STATE_HELD);
+      } else {
+        heldEventStates.delete(handle);
+        __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
+      }
+    }
+    return true;
+  };
+  /* The moving subtree's wrappers join `holder`, that of the tree they
+     move into, when the held state moving with them is already its own
+     and no wrapper keeps another holder or refuses this one. */
+  const joinEventHolder = (holder, handles, wrappers) => {
+    for (let i = 1; i < handles.length; i++)
+      if (heldEventHolder(Number(handles[i])) !== holder) return false;
+    for (let i = 0; i < wrappers.length; i++) {
+      const wrapper = cachedNode(wrappers[i]);
+      if (!wrapper || wrapper[wrapperEventHolder] === holder) continue;
+      if (wrapper[wrapperEventHolder]?.size) return false;
+      try {
+        wrapper[wrapperEventHolder] = holder;
+      } catch {}
+      if (wrapper[wrapperEventHolder] !== holder) return false;
+    }
+    return true;
+  };
+  /* Native: roots again the held state of each handle and that of its
+     live wrapper's tree. For an insertion, `handles` are the parent's
+     handle and then the held handles moving, and `wrappers`, when given,
+     the moving subtree's live wrappers, which join the parent tree's
+     holder instead when they can. True when the first handle's tree had a
+     holder.
+
+     The holders are queued first, which allocates nothing, and leave the
+     queue only once all their state is rooted: a release a refused
+     allocation stopped throws, and the queue keeps the rest alive until a
+     later release (native code retries one with `handles` 0) finishes
+     it. `handles` may be one handle as a number: native code could not
+     make the list. */
+  __tilefinchRealmGlobal.__tilefinchReleaseEventHolders = (handles, wrappers) => {
+    if (typeof handles === "number") {
+      if (handles) {
+        pendEventHolder(heldEventHolder(handles));
+        pendEventHolder(cachedNode(handles)?.[wrapperEventHolder]);
+      }
+      releasePendingHolders();
+      return false;
+    }
+    const first = Number(handles[0]) || 0,
+      holder = first
+        ? heldEventHolder(first) || cachedNode(first)?.[wrapperEventHolder]
+        : null,
+      held = !!holder?.size;
+    if (!wrappers || !held || !joinEventHolder(holder, handles, wrappers))
+      for (let i = 0; i < handles.length; i++) {
+        const handle = Number(handles[i]);
+        if (!handle) continue;
+        pendEventHolder(heldEventHolder(handle));
+        pendEventHolder(cachedNode(handle)?.[wrapperEventHolder]);
+      }
+    releasePendingHolders();
+    return held;
+  };
   nativeNodeStateCleanups.push((handle) => {
     nativeNodeListeners.delete(handle);
     nativeNodeHandlers.delete(handle);
+    if (heldEventStates.size) {
+      heldEventHolder(handle)?.delete(handle);
+      heldEventStates.delete(handle);
+    }
   });
-  const stableListenerMap = (key, create = false) => {
+  /* The stable-key map of `key` in `storage`, made when `create` and the
+     pair has room; null otherwise, when the caller takes the per-handle
+     path. */
+  const stableStateMap = (storage, key, create, refusalCounter) => {
     key = String(key || "");
-    if (!key || key.length > 192) return null;
-    let map = stableNodeListeners.get(key);
+    if (!key || key.length > STABLE_KEY_LIMIT) return null;
+    let map = storage.get(key);
     if (!map && create) {
-      if (stableNodeListeners.size < 128) {
+      if (eventTargetRoom(storage, stableEventTargets)) {
         map = new Map();
-        stableNodeListeners.set(key, map);
-      } else retentionStats.listenerDrops++;
+        storage.set(key, map);
+      } else retentionStats[refusalCounter]++;
     }
     return map || null;
   };
-  const nativeNodeMap = (storage, node, create, dropCounter) => {
+  const nativeNodeMap = (storage, field, node, create, dropCounter) => {
     const handle = Number(node?.__handle) || 0;
     if (!handle) return null;
     let map = storage.get(handle);
-    if (!map && create) {
-      if (storage.size < 128) {
-        map = new Map();
-        storage.set(handle, map);
-      } else retentionStats[dropCounter]++;
+    if (map) return map;
+    const held = heldEventState(handle);
+    if (held?.[field]) return held[field];
+    if (!create) return null;
+    if (held) return (held[field] = new Map());
+    /* A node whose state its wrapper carries keeps it all there. */
+    if (keptOnWrapper(node)) return null;
+    if (!eventTargetRoom(storage)) {
+      retentionStats[dropCounter]++;
+      if (
+        keepOnWrapper(
+          handle,
+          node,
+          nativeNodeListeners.get(handle) || node[wrapperListeners] || null,
+          nativeNodeHandlers.get(handle) || null,
+        )
+      )
+        return null;
     }
-    return map || null;
+    map = new Map();
+    storage.set(handle, map);
+    __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
+    return map;
   };
   const listenerMap = (node, create = false) => {
     const stable =
-      (globalThis.__tilefinchHasRemoteNodeWriter ||
-        globalThis.__tilefinchIsVirtualRemote?.(node)) &&
-      stableListenerMap(node?.__tilefinchStableKey, create);
+      (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter ||
+        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(node)) &&
+      stableStateMap(stableNodeListeners, node?.__tilefinchStableKey, create,
+        "listenerDrops");
     return (
       stable ||
       nativeNodeMap(
         nativeNodeListeners,
+        "listeners",
         node,
         create,
         "listenerDrops",
@@ -581,34 +948,42 @@
   };
   const propertyHandlerRecordToken = {},
     eventHandlerMap = (node, create = false) => {
-    const key = String(node?.__tilefinchStableKey || "");
     if (
-      key &&
-      (globalThis.__tilefinchHasRemoteNodeWriter ||
-        globalThis.__tilefinchIsVirtualRemote?.(node))
+      node?.__tilefinchStableKey &&
+      (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter ||
+        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(node))
     ) {
-      let map = stableNodeHandlers.get(key);
-      if (!map && create) {
-        if (stableNodeHandlers.size < 128) {
-          map = new Map();
-          stableNodeHandlers.set(key, map);
-        } else retentionStats.handlerDrops++;
-      }
+      const map = stableStateMap(stableNodeHandlers,
+        node.__tilefinchStableKey, create, "handlerDrops");
       if (map) return map;
     }
     const native = nativeNodeMap(
       nativeNodeHandlers,
+      "handlers",
       node,
       create,
       "handlerDrops",
     );
     if (native) return native;
-    let map = volatileNodeHandlers.get(node);
-    if (!map && create) {
+    /* A kept node's handlers, or those of a node without a native handle:
+       owned by the wrapper alone, so a handler closing over its element
+       is an ordinary collectable cycle. */
+    let map = node?.[wrapperHandlers] || null;
+    if (!map && create && node) {
       map = new Map();
-      volatileNodeHandlers.set(node, map);
+      try {
+        if (Object.prototype.hasOwnProperty.call(node, wrapperHandlers))
+          node[wrapperHandlers] = map;
+        else
+          Object.defineProperty(node, wrapperHandlers, {
+            value: map,
+            writable: true,
+            configurable: true,
+          });
+      } catch {}
+      if (node[wrapperHandlers] !== map) return null;
     }
-    return map || null;
+    return map;
   },
     installEventHandler = (
       node, type, callback, token = propertyHandlerRecordToken,
@@ -652,7 +1027,7 @@
           return value.callback;
       }
       if (
-        globalThis.__tilefinchCspAllowsInlineEventHandlers === false ||
+        __tilefinchRealmGlobal.__tilefinchCspAllowsInlineEventHandlers === false ||
         typeof node?.getAttribute !== "function"
       )
         return null;
@@ -660,7 +1035,7 @@
       if (source === null) return null;
       let callable = null;
       try {
-        callable = globalThis.__tilefinchCompileInlineEventHandler(source);
+        callable = __tilefinchRealmGlobal.__tilefinchCompileInlineEventHandler(source);
       } catch (error) {
         __tilefinchReportUncaught(error, "inline " + name);
       }
@@ -686,7 +1061,7 @@
         map.delete(type);
       }
       if (type.startsWith("mouse") || type.startsWith("pointer"))
-        globalThis.__tilefinchPointerMarkupChanged?.();
+        __tilefinchRealmGlobal.__tilefinchPointerMarkupChanged?.();
     };
   const remoteNodeMutations = new Map(),
     remoteMutationLimit = 32;
@@ -704,14 +1079,14 @@
     }
     return state || null;
   };
-  globalThis.__tilefinchRememberRemoteContent = (node, mode, value) => {
+  const rememberRemoteContent = (node, mode, value) => {
     const state = remoteMutationState(node, true);
     if (state) {
       state.contentMode = String(mode);
       state.contentValue = String(value);
     }
   };
-  globalThis.__tilefinchRememberRemoteAttribute = (node, name, value) => {
+  const rememberRemoteAttribute = (node, name, value) => {
     const state = remoteMutationState(node, true);
     if (state)
       state.attributes.set(
@@ -719,7 +1094,7 @@
         value === null ? null : String(value),
       );
   };
-  globalThis.__tilefinchApplyRemoteMutation = (node, handle) => {
+  const applyRemoteMutation = (node, handle) => {
     const state = remoteMutationState(node, false);
     if (!state) return;
     if (state.contentMode === "text")
@@ -736,7 +1111,7 @@
         ? __tilefinchRemoveAttribute(handle, name)
         : __tilefinchSetAttribute(handle, name, value);
   };
-  globalThis.__tilefinchMergeRemoteAttributes = (node, values) => {
+  const mergeRemoteAttributes = (node, values) => {
     const merged = values.map((attribute) => ({
         name: String(attribute.name),
         value: String(attribute.value),
@@ -754,7 +1129,7 @@
     }
     return merged;
   };
-  globalThis.__tilefinchIsVirtualRemote = (node) =>
+  __tilefinchRealmGlobal.__tilefinchIsVirtualRemote = (node) =>
     remoteIdentitySeen &&
     (!!node?.__tilefinchRemote ||
       (!!node?.__tilefinchStableKey &&
@@ -762,13 +1137,13 @@
         Number(node.__tilefinchRemoteSection) !==
           Number(__tilefinchSectionIdentity())));
   const canReadRemoteRelation = (node) =>
-    globalThis.__tilefinchHasRemoteNodeWriter &&
+    __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
     !!node?.__tilefinchStableKey &&
     !String(node.__tilefinchStableKey).startsWith("d:") &&
     !node.__tilefinchProgrammatic &&
     (!!node.__tilefinchRemote ||
       (!!node.__handle && __tilefinchIsConnected(node.__handle)));
-  globalThis.__tilefinchCanonicalElement = (node) => {
+  __tilefinchRealmGlobal.__tilefinchCanonicalElement = (node) => {
     const tag = String(node?.tagName || "").toLowerCase();
     return tag === "html"
       ? document.documentElement || node
@@ -778,29 +1153,41 @@
           ? document.body || node
           : node;
   };
-  /* Attr and NamedNodeMap retain their owner. A realm-global WeakMap whose
-     value points back to that key keeps the cycle alive in this collector.
-     Stamp one unreflectable private slot on the owner instead, so ordinary
-     cycle collection sees the complete ownership graph. Stamping preserves
-     its prototype and also works after the author freezes the wrapper. */
-  const createAttributeState = Object.create;
-  class AttributeStateBase {
-    constructor(owner) { return owner; }
-  }
-  class AttributeStateOwner extends AttributeStateBase {
-    #state = createAttributeState(null);
-    static get(owner, create = false) {
-      if (#state in owner) return owner.#state;
-      if (!create) return undefined;
-      new AttributeStateOwner(owner);
-      return owner.#state;
+  /* State that points back at its owner (Attr and NamedNodeMap caches,
+     listener lists, shadow peers) must not live in a realm-global WeakMap:
+     its values keep that cycle alive in this collector. Stamp an
+     unreflectable private slot on the owner instead, so ordinary cycle
+     collection sees the complete ownership graph. Stamping preserves the
+     prototype and also works after the author freezes the object. Each call
+     makes an independent slot; set() on an already stamped owner throws. */
+  const createPrivateSlot = () => {
+    class Stamp extends class { constructor(owner) { return owner; } } {
+      #value;
+      constructor(owner, value) { super(owner); this.#value = value; }
+      static get(owner) {
+        return owner !== null
+          && (typeof owner === "object" || typeof owner === "function")
+          && #value in owner ? owner.#value : undefined;
+      }
     }
-  }
-  const attributeState = AttributeStateOwner.get,
-    /* Nonempty namespace mirrors contain semantic data the native DOM cannot
-       reconstruct yet. Keep their existing lifetime across wrapper collection;
-       ordinary Attr/NamedNodeMap caches no longer retain discarded owners. */
-    namespacedAttributes = new WeakMap(),
+    return {
+      get: Stamp.get,
+      set: (owner, value) => (new Stamp(owner, value), value),
+    };
+  };
+  const createAttributeState = Object.create,
+    attributeSlot = createPrivateSlot(),
+    attributeState = (owner, create = false) => {
+      const state = attributeSlot.get(owner);
+      return state !== undefined || !create
+        ? state : attributeSlot.set(owner, createAttributeState(null));
+    };
+  /* Consumed by the CSSOM installer before author script runs. */
+  __tilefinchRealmGlobal.__tilefinchTakeOwnerAttributeState = attributeState;
+  /* Nonempty namespace mirrors contain semantic data the native DOM cannot
+     reconstruct yet. Keep their existing lifetime across wrapper collection;
+     ordinary Attr/NamedNodeMap caches no longer retain discarded owners. */
+  const namespacedAttributes = new WeakMap(),
     emptyNamespaceAttributes = Object.freeze([]),
     normalizeNamespace = (namespace) =>
       namespace === null || namespace === undefined || namespace === ""
@@ -839,7 +1226,7 @@
           __tilefinchAttributeOwnerDocument: {
             configurable: true,
             writable: true,
-            value: owner?.ownerDocument || globalThis.document || null,
+            value: owner?.ownerDocument || __tilefinchRealmGlobal.document || null,
           },
           __tilefinchAttributeName: {
             configurable: true,
@@ -908,12 +1295,12 @@
       ? view
       : document.getElementById(name) || undefined;
   };
-  globalThis.__tilefinchBindNamedChildNavigables = (lookup) => {
-    delete globalThis.__tilefinchBindNamedChildNavigables;
+  __tilefinchRealmGlobal.__tilefinchBindNamedChildNavigables = (lookup) => {
+    delete __tilefinchRealmGlobal.__tilefinchBindNamedChildNavigables;
     namedChildNavigable = lookup;
     /* Retire a name exposed for a child navigable that nothing answers. */
     return (name) => {
-      const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+      const descriptor = Object.getOwnPropertyDescriptor(__tilefinchRealmGlobal, name);
       if (!namedWindowProperties.has(name)) return;
       /* A page can replace our accessor with defineProperty, bypassing
          its setter. Retire only the exact accessor we installed. */
@@ -923,17 +1310,17 @@
       }
       if (namedWindowValue(name) !== undefined) return;
       namedWindowProperties.delete(name);
-      delete globalThis[name];
+      delete __tilefinchRealmGlobal[name];
     };
   };
-  globalThis.__tilefinchExposeNamedProperty = (name) => {
+  __tilefinchRealmGlobal.__tilefinchExposeNamedProperty = (name) => {
     name = String(name || "");
     if (
       !name ||
       name.length > 128 ||
       namedWindowProperties.has(name) ||
       namedWindowProperties.size >= namedWindowLimit ||
-      Object.prototype.hasOwnProperty.call(globalThis, name)
+      Object.prototype.hasOwnProperty.call(__tilefinchRealmGlobal, name)
     )
       return false;
     const descriptor = {
@@ -944,7 +1331,7 @@
       },
       set(value) {
         namedWindowProperties.delete(name);
-        Object.defineProperty(globalThis, name, {
+        Object.defineProperty(__tilefinchRealmGlobal, name, {
           configurable: true,
           enumerable: true,
           writable: true,
@@ -953,7 +1340,7 @@
       },
     };
     namedWindowProperties.set(name, descriptor.get);
-    Object.defineProperty(globalThis, name, descriptor);
+    Object.defineProperty(__tilefinchRealmGlobal, name, descriptor);
     return true;
   };
   class EventTarget {}
@@ -1106,29 +1493,29 @@
     configurable: true,
     writable: true,
     value: function animate(keyframes, options = undefined) {
-      if (typeof globalThis.__tilefinchAnimateElement !== "function") {
+      if (typeof __tilefinchRealmGlobal.__tilefinchAnimateElement !== "function") {
         try {
-          globalThis.__tilefinchEnsureMotionBootstrap?.();
+          __tilefinchRealmGlobal.__tilefinchEnsureMotionBootstrap?.();
         } catch {}
       }
-      if (typeof globalThis.__tilefinchAnimateElement !== "function")
+      if (typeof __tilefinchRealmGlobal.__tilefinchAnimateElement !== "function")
         throw new DOMException("Animations are unavailable", "NotSupportedError");
-      return globalThis.__tilefinchAnimateElement(this, keyframes, options);
+      return __tilefinchRealmGlobal.__tilefinchAnimateElement(this, keyframes, options);
     },
   });
   class HTMLElement extends Element {
     constructor() {
       super();
-      const stack = globalThis.__tilefinchCustomElementConstructionStack;
+      const stack = __tilefinchRealmGlobal.__tilefinchCustomElementConstructionStack;
       if (stack?.length) {
         const element = stack[stack.length - 1];
-        globalThis.__tilefinchPrepareNativePrototype?.(
+        __tilefinchRealmGlobal.__tilefinchPrepareNativePrototype?.(
           element, new.target.prototype);
         Object.setPrototypeOf(element, new.target.prototype);
         return element;
       }
       const constructed =
-        globalThis.__tilefinchConstructCustomElement?.(new.target);
+        __tilefinchRealmGlobal.__tilefinchConstructCustomElement?.(new.target);
       if (constructed) return constructed;
     }
   }
@@ -1173,9 +1560,10 @@
       }),
     /* Documents other than the main one (see hardening.js). */
     secondaryDocumentPrototype = (base) =>
-      globalThis.__tilefinchSecondaryDocumentPrototype?.(base) || base;
+      __tilefinchRealmGlobal.__tilefinchSecondaryDocumentPrototype?.(base) || base;
   /* platform.js and compat.js take these; compat.js deletes the global. */
-  globalThis.__tilefinchDomShared = {
+  __tilefinchRealmGlobal.__tilefinchDomShared = {
+    createPrivateSlot,
     reflectString,
     reflectBoolean,
     reflectEnumerated,
@@ -1249,12 +1637,12 @@
   class HTMLScriptElement extends HTMLElement {}
   class HTMLFormElement extends HTMLElement {
     submit() {
-      if (globalThis.__tilefinchQueueFormSubmission?.(this, null)) return;
-      globalThis.__tilefinchSubmittedBody =
-        globalThis.__tilefinchSubmissionBody?.(this, null) ?? null;
-      globalThis.__tilefinchSubmitted = true;
-      globalThis.__tilefinchSubmittedFormHandle = this.__handle;
-      globalThis.__tilefinchSubmittedSubmitterHandle = 0;
+      if (__tilefinchRealmGlobal.__tilefinchQueueFormSubmission?.(this, null)) return;
+      __tilefinchRealmGlobal.__tilefinchSubmittedBody =
+        __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(this, null) ?? null;
+      __tilefinchRealmGlobal.__tilefinchSubmitted = true;
+      __tilefinchRealmGlobal.__tilefinchSubmittedFormHandle = this.__handle;
+      __tilefinchRealmGlobal.__tilefinchSubmittedSubmitterHandle = 0;
     }
     requestSubmit(submitter = null) {
       if (
@@ -1281,13 +1669,13 @@
         }),
       );
       if (this.dispatchEvent(event)) {
-        if (globalThis.__tilefinchQueueFormSubmission?.(this, submitter))
+        if (__tilefinchRealmGlobal.__tilefinchQueueFormSubmission?.(this, submitter))
           return;
-        globalThis.__tilefinchSubmittedBody =
-          globalThis.__tilefinchSubmissionBody?.(this, submitter) ?? null;
-        globalThis.__tilefinchSubmitted = true;
-        globalThis.__tilefinchSubmittedFormHandle = this.__handle;
-        globalThis.__tilefinchSubmittedSubmitterHandle = submitter?.__handle || 0;
+        __tilefinchRealmGlobal.__tilefinchSubmittedBody =
+          __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(this, submitter) ?? null;
+        __tilefinchRealmGlobal.__tilefinchSubmitted = true;
+        __tilefinchRealmGlobal.__tilefinchSubmittedFormHandle = this.__handle;
+        __tilefinchRealmGlobal.__tilefinchSubmittedSubmitterHandle = submitter?.__handle || 0;
       }
     }
   }
@@ -1332,7 +1720,7 @@
       value: name,
     });
     sharedLayerPrototypes.push(constructor.prototype);
-    Object.defineProperty(globalThis, name, {
+    Object.defineProperty(__tilefinchRealmGlobal, name, {
       configurable: true,
       writable: true,
       value: constructor,
@@ -1347,7 +1735,8 @@
     "xmp=26 progress=27 blockquote=28 q=28 span=29 table=30 caption=31 " +
     "td=32 th=32 col=33 colgroup=33 tr=34 thead=35 tbody=35 tfoot=35 " +
     "time=36 title=37 track=38 ul=39 ";
-  sharedLayerPrototypes.push(HTMLUnknownElement.prototype);
+  sharedLayerPrototypes.push(HTMLUnknownElement.prototype,
+    HTMLDivElement.prototype, HTMLBodyElement.prototype);
   /* Elements the table gives plain HTMLElement; any other name that is not
      a valid custom element name is HTMLUnknownElement. */
   const plainHTMLElementTags = " abbr acronym address article aside b " +
@@ -1363,31 +1752,24 @@
   class DocumentFragment extends Node {
     constructor() {
       super();
-      return globalThis.document?.createDocumentFragment?.() || this;
+      return __tilefinchRealmGlobal.document?.createDocumentFragment?.() || this;
     }
   }
-  const registerNativeShadowRoot = globalThis.__tilefinchRegisterShadowRoot;
-  delete globalThis.__tilefinchRegisterShadowRoot;
-  const shadowConstructionToken = {},
-    shadowRootByHost = new WeakMap(),
-    shadowRootByHostHandle = new Map(),
-    shadowHostByRoot = new WeakMap(),
-    shadowModeByRoot = new WeakMap(),
-    shadowDelegatesFocusByRoot = new WeakMap();
-  globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
-    shadowRootByHostHandle.delete(Number(handle));
+  const registerNativeShadowRoot = __tilefinchRealmGlobal.__tilefinchRegisterShadowRoot,
+    ensureShadowBootstrap = __tilefinchRealmGlobal.__tilefinchEnsureShadowBootstrap,
+    shadowWeakRef = weakNodeCache ? WeakRef : null,
+    shadowMapType = Map, shadowWeakMapType = WeakMap;
+  delete __tilefinchRealmGlobal.__tilefinchRegisterShadowRoot;
+  const shadowConstructionToken = {};
+  let shadowState = null, shadowFactory = null, shadowRootCreated = false,
+    shadowModeByRoot = null, shadowDelegatesFocusByRoot = null,
+    sharedShadowDescriptors = null, sharedShadowHostDescriptors = null;
+  __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
+    shadowState?.retire(Number(handle));
   });
-  let shadowRootCreated = false;
-  const shadowRootForHost = (host) => {
-    /* Only attachShadow registers a root (and sets the flag). */
-    if (!shadowRootCreated) return null;
-    if (typeof host === "number")
-      return shadowRootByHostHandle.get(Number(host)) || null;
-    return shadowRootByHost.get(host) ||
-      (host?.__handle !== undefined
-        ? shadowRootByHostHandle.get(Number(host.__handle)) || null
-        : null);
-  };
+  const shadowPeerFor = node => shadowState?.peer(node) || null,
+    shadowRootForHost = (host, connectivity) =>
+      shadowState?.forHost(host, connectivity) || null;
   class ShadowRoot extends DocumentFragment {
     constructor(token) {
       super();
@@ -1395,20 +1777,20 @@
         throw new TypeError("Illegal constructor");
     }
     get host() {
-      return shadowHostByRoot.get(this) || null;
+      return shadowPeerFor(this);
     }
     get mode() {
-      return shadowModeByRoot.get(this) || "open";
+      return shadowModeByRoot?.get(this) || "open";
     }
     get delegatesFocus() {
-      return !!shadowDelegatesFocusByRoot.get(this);
+      return !!shadowDelegatesFocusByRoot?.get(this);
     }
     get slotAssignment() {
       return "named";
     }
     get activeElement() {
       if (!this.isConnected) return null;
-      const active = (this.ownerDocument === document ? globalThis.__tilefinchActiveElement : null) || null;
+      const active = (this.ownerDocument === document ? __tilefinchRealmGlobal.__tilefinchActiveElement : null) || null;
       return active && active.getRootNode() === this ? active : null;
     }
     get styleSheets() {
@@ -1421,7 +1803,7 @@
   class Document extends Node {
     constructor() {
       super();
-      return globalThis.__tilefinchNewDocument?.() || this;
+      return __tilefinchRealmGlobal.__tilefinchNewDocument?.() || this;
     }
   }
   class HTMLDocument extends Document {}
@@ -1469,6 +1851,7 @@
     }
   }
   class HTMLCollection {}
+  let createLiveCollection;
   class Window extends EventTarget {}
   const domInterfaces = {
     EventTarget,
@@ -1534,51 +1917,71 @@
       configurable: true,
       value: name,
     });
-  Object.assign(globalThis, domInterfaces);
-  if (!(globalThis instanceof Window))
-    Object.setPrototypeOf(globalThis, Window.prototype);
+  Object.assign(__tilefinchRealmGlobal, domInterfaces);
+  if (!(__tilefinchRealmGlobal instanceof Window))
+    Object.setPrototypeOf(__tilefinchRealmGlobal, Window.prototype);
   /* QuickJS gives its global object an internal `global` class tag which
      wins over the inherited Window prototype tag. Browsing-context globals
      must nevertheless stringify as Window, like their WindowProxy surface.
      Keep an own, immutable brand so deleting an author-visible property
      cannot reveal the engine's internal global class name. */
-  Object.defineProperty(globalThis, Symbol.toStringTag, {
+  Object.defineProperty(__tilefinchRealmGlobal, Symbol.toStringTag, {
     configurable: false,
     value: "Window",
   });
-  globalThis.__tilefinchLiveHTMLCollection = (read) => {
-    const target = new HTMLCollection();
-    return new Proxy(target, {
-      get(object, key) {
-        const values = read();
-        if (key === "length") return values.length;
-        if (key === "item")
-          return (index) => read()[Number(index)] ?? null;
-        if (key === "namedItem")
-          return (name) => {
-            name = String(name);
-            return (
-              read().find((item) => item.id === name || item.name === name) ??
-              null
-            );
+  __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection = (read) => {
+    if (!createLiveCollection) {
+      /* Keep the reader on the collection, not in a realm-global WeakMap
+         value: it may retain the node that retains this collection. Defer
+         the private brand and shared traps too; even that one-time setup
+         matters to parser startup in tiny realms. */
+      let create;
+      class LiveCollection {
+        #read;
+        constructor(read) {
+          this.#read = read;
+        }
+        static {
+          const handler = {
+            get(object, key) {
+              const read = object.#read, values = read();
+              if (key === "length") return values.length;
+              if (key === "item")
+                return (index) => read()[Number(index)] ?? null;
+              if (key === "namedItem")
+                return (name) => {
+                  name = String(name);
+                  return (
+                    read().find((item) => item.id === name || item.name === name) ??
+                    null
+                  );
+                };
+              if (key === Symbol.iterator)
+                return () => read()[Symbol.iterator]();
+              if (typeof key === "string" && /^\d+$/.test(key))
+                return values[Number(key)];
+              if (
+                ["filter", "find", "forEach", "indexOf", "map", "some"].includes(key)
+              )
+                return Array.prototype[key].bind(values);
+              return object[key];
+            },
+            has(object, key) {
+              if (key === "length") return true;
+              if (typeof key === "string" && /^\d+$/.test(key))
+                return Number(key) < object.#read().length;
+              return key in object;
+            },
           };
-        if (key === Symbol.iterator)
-          return () => read()[Symbol.iterator]();
-        if (typeof key === "string" && /^\d+$/.test(key))
-          return values[Number(key)];
-        if (
-          ["filter", "find", "forEach", "indexOf", "map", "some"].includes(key)
-        )
-          return Array.prototype[key].bind(values);
-        return object[key];
-      },
-      has(object, key) {
-        if (key === "length") return true;
-        if (typeof key === "string" && /^\d+$/.test(key))
-          return Number(key) < read().length;
-        return key in object;
-      },
-    });
+          const construct = Reflect.construct;
+          create = (read) =>
+            new Proxy(construct(LiveCollection, [read], HTMLCollection), handler);
+        }
+      }
+      /* Publish only after class initialization has completed successfully. */
+      createLiveCollection = create;
+    }
+    return createLiveCollection(read);
   };
   const characterDataUnsignedLong = (value) => {
     if (typeof value === "bigint")
@@ -1696,10 +2099,10 @@
     }
   };
   Node.prototype.appendChild = function appendChild(child) {
-    globalThis.__tilefinchValidatePreInsert?.(this, child, null);
+    __tilefinchRealmGlobal.__tilefinchValidatePreInsert?.(this, child, null);
     throw new DOMException("Node cannot have children", "HierarchyRequestError");
   };
-  const nativeRootNode = globalThis.__tilefinchRootNode;
+  const nativeRootNode = __tilefinchRealmGlobal.__tilefinchRootNode;
   Node.prototype.getRootNode = function getRootNode(options = {}) {
     /* Until a shadow root exists every root is a tree root: one native walk
        instead of a wrapper and an instanceof per ancestor. A root with a
@@ -1789,14 +2192,14 @@
       return nodeList(output);
     },
     shadowAdjustedSibling = (node, related, relation) => {
-      if (!related || globalThis.__tilefinchIsVirtualRemote(node))
+      if (!related || __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(node))
         return related || null;
       return related instanceof ShadowRoot
         ? wrap(__tilefinchRelation(related.__handle, relation))
         : related;
     },
     installShadowHostView = (host) => {
-      Object.defineProperties(host, {
+      const descriptors = sharedShadowHostDescriptors ||= {
         shadowRoot: {
           configurable: true,
           enumerable: true,
@@ -1819,7 +2222,7 @@
             if (!this.__tilefinchShadowChildrenCollection)
               Object.defineProperty(this, "__tilefinchShadowChildrenCollection", {
                 configurable: true,
-                value: globalThis.__tilefinchLiveHTMLCollection(() =>
+                value: __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
                   shadowLightChildren(this, true),
                 ),
               });
@@ -1863,7 +2266,8 @@
             return shadowLightChildren(this, true).length;
           },
         },
-      });
+      };
+      Object.defineProperties(host, descriptors);
     };
   Element.prototype.attachShadow = function attachShadow(init) {
     if (shadowRootForHost(this))
@@ -1880,6 +2284,18 @@
         "Element cannot host a shadow tree",
         "NotSupportedError",
       );
+    if (!shadowState) {
+      if (!shadowFactory) {
+        ensureShadowBootstrap();
+        shadowFactory = __tilefinchRealmGlobal.__tilefinchCreateShadowState;
+        delete __tilefinchRealmGlobal.__tilefinchCreateShadowState;
+      }
+      shadowState = shadowFactory(shadowMapType, shadowWeakRef, nodeReferenceDeref,
+        ancestorApply, __tilefinchIsConnected, emptyTaskArguments,
+        createPrivateSlot);
+    }
+    shadowModeByRoot ||= new shadowWeakMapType();
+    shadowDelegatesFocusByRoot ||= new shadowWeakMapType();
     const detached = this.__handle === undefined,
       root = detached
         ? this.ownerDocument.createDocumentFragment()
@@ -1893,7 +2309,9 @@
           replaceChild: root.replaceChild,
         }
       : null;
-    globalThis.__tilefinchPrepareNativePrototype?.(root);
+    const sharedNative = !detached && shadowState.prepare(
+      root, ShadowRoot.prototype, nativeLayer,
+      __tilefinchRealmGlobal.__tilefinchPrepareNativePrototype);
     Object.setPrototypeOf(root, ShadowRoot.prototype);
     if (detachedOperations)
       for (const [name, operation] of Object.entries(detachedOperations))
@@ -1908,7 +2326,14 @@
       __tilefinchSetAttribute(root.__handle, "style", "display:contents");
       if (!__tilefinchAppend(this.__handle, root.__handle))
         throw new Error("ShadowRoot connection failed");
-      if (!registerNativeShadowRoot(root.__handle)) {
+      let registered = registerNativeShadowRoot(root.__handle, false, sharedNative);
+      if (!registered) {
+        /* Disconnect reactions may already have weakened every eligible
+           entry. Dead native slots still need sweeping in that case. */
+        shadowState.weaken();
+        registered = registerNativeShadowRoot(root.__handle, true, sharedNative);
+      }
+      if (!registered) {
         __tilefinchRemove(root.__handle);
         throw new DOMException(
           "Shadow root limit exceeded",
@@ -1916,60 +2341,43 @@
         );
       }
     }
-    shadowRootByHost.set(this, root);
+    shadowState.remember(this, root);
     shadowRootCreated = true;
-    if (this.__handle !== undefined && shadowRootByHostHandle.size < 128)
-      shadowRootByHostHandle.set(Number(this.__handle), root);
-    shadowHostByRoot.set(root, this);
     shadowModeByRoot.set(root, mode);
     shadowDelegatesFocusByRoot.set(root, !!init?.delegatesFocus);
-    const shadowDescriptors = {
-      namespaceURI: {
-        configurable: true,
-        enumerable: true,
-        get: () => null,
-      },
-      parentNode: {
-        configurable: true,
-        enumerable: true,
-        get: () => null,
-      },
-      parentElement: {
-        configurable: true,
-        enumerable: true,
-        get: () => null,
-      },
-      ownerDocument: {
-        configurable: true,
-        enumerable: true,
-        get: () => this.ownerDocument,
-      },
-      isConnected: {
-        configurable: true,
-        enumerable: true,
-        get: () => this.isConnected,
-      },
-    };
+    const shadowDescriptors = sharedShadowDescriptors ||=
+      Object.getOwnPropertyDescriptors({
+        get namespaceURI() { return null; },
+        get parentNode() { return null; },
+        get parentElement() { return null; },
+        get ownerDocument() {
+          return shadowPeerFor(this)?.ownerDocument || null;
+        },
+        get isConnected() {
+          return !!shadowPeerFor(this)?.isConnected;
+        },
+      });
+    const rootDescriptors = { ...shadowDescriptors };
     if (!detached) {
-      shadowDescriptors.nodeType = {
+      rootDescriptors.nodeType = {
         configurable: true,
         enumerable: true,
         get: () => Node.DOCUMENT_FRAGMENT_NODE,
       };
-      shadowDescriptors.nodeName = {
+      rootDescriptors.nodeName = {
         configurable: true,
         enumerable: true,
         get: () => "#document-fragment",
       };
     } else {
-      shadowDescriptors.childNodes = {
+      rootDescriptors.childNodes = {
         configurable: true,
         enumerable: true,
         get() {
           return nodeList(Array.from(this.__detachedChildren || []));
         },
       };
-      shadowDescriptors.children = {
+      rootDescriptors.children = {
         configurable: true,
         enumerable: true,
         get() {
@@ -1980,14 +2388,14 @@
           );
         },
       };
-      shadowDescriptors.firstChild = {
+      rootDescriptors.firstChild = {
         configurable: true,
         enumerable: true,
         get() {
           return this.__detachedChildren?.[0] || null;
         },
       };
-      shadowDescriptors.lastChild = {
+      rootDescriptors.lastChild = {
         configurable: true,
         enumerable: true,
         get() {
@@ -1995,14 +2403,14 @@
           return values[values.length - 1] || null;
         },
       };
-      shadowDescriptors.querySelectorAll = {
+      rootDescriptors.querySelectorAll = {
         configurable: true,
         writable: true,
         value: function querySelectorAll(selector) {
           return detachedShadowQueryAll(this, selector);
         },
       };
-      shadowDescriptors.querySelector = {
+      rootDescriptors.querySelector = {
         configurable: true,
         writable: true,
         value: function querySelector(selector) {
@@ -2010,7 +2418,7 @@
         },
       };
     }
-    Object.defineProperties(root, shadowDescriptors);
+    Object.defineProperties(root, rootDescriptors);
     installShadowHostView(this);
     return root;
   };
@@ -2076,14 +2484,14 @@
       !!this.isConnected &&
       node.ownerDocument === this.ownerDocument;
     if (preserved)
-      globalThis.__tilefinchCustomElementMovePreserved =
-        (globalThis.__tilefinchCustomElementMovePreserved || 0) + 1;
+      __tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved =
+        (__tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved || 0) + 1;
     try {
       this.insertBefore(node, child ?? null);
     } finally {
-      if (preserved) globalThis.__tilefinchCustomElementMovePreserved--;
+      if (preserved) __tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved--;
     }
-    if (preserved) globalThis.__tilefinchCustomElementMoved?.(node);
+    if (preserved) __tilefinchRealmGlobal.__tilefinchCustomElementMoved?.(node);
   };
   {
     const crossOrigin = {
@@ -2215,7 +2623,7 @@
     return true;
   };
   {
-    const nativeComparePosition = globalThis.__tilefinchComparePosition;
+    const nativeComparePosition = __tilefinchRealmGlobal.__tilefinchComparePosition;
     const disconnectedOrder = new WeakMap();
     let nextDisconnectedOrder = 1;
     const order = (node) => {
@@ -2240,7 +2648,7 @@
       if (!(other instanceof Node)) throw new TypeError("Node required");
       if (this === other) return 0;
       if (typeof nativeComparePosition === "function"
-          && !globalThis.__tilefinchHasRemoteNodeWriter
+          && !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
           && !shadowRootCreated
           && !this.__tilefinchDetachedParent && !other.__tilefinchDetachedParent
           && this.__handle > 0 && other.__handle > 0) {
@@ -2430,9 +2838,8 @@
         if (at instanceof ShadowRoot) return at;
       return null;
     },
-    slotListsByRoot = new WeakMap(),
     slotsForRoot = (root) => {
-      let slots = slotListsByRoot.get(root);
+      let slots = attributeState(root)?.slots;
       if (slots) return slots;
       slots = Array.from(root?.querySelectorAll?.("slot") || [])
         .filter(
@@ -2441,7 +2848,9 @@
             containingShadowRoot(slot) === root,
         )
         .slice(0, 128);
-      slotListsByRoot.set(root, slots);
+      /* Slots retain their parent/root. The cache belongs on that root so
+         discarded component trees are not held by a global weak-key value. */
+      attributeState(root, true).slots = slots;
       return slots;
     },
     assignedSlotInternal = (node, exposeClosed = false) => {
@@ -2481,7 +2890,7 @@
            * event whose actual tree root is this shadow root stops here.
            */
           return composed || originRoot !== node
-            ? shadowHostByRoot.get(node) || null
+            ? shadowPeerFor(node)
             : null;
         return (
           node.__tilefinchDetachedParent ||
@@ -2496,7 +2905,7 @@
         const candidate = at.getRootNode?.() || null;
         if (!(candidate instanceof ShadowRoot)) return false;
         if (candidate === root) return true;
-        at = shadowHostByRoot.get(candidate) || null;
+        at = shadowPeerFor(candidate);
       }
       return false;
     },
@@ -2529,7 +2938,7 @@
         if (!(root instanceof ShadowRoot)) return target;
         if (nodeInsideShadowRoot(current, root))
           return target;
-        target = shadowHostByRoot.get(root) || null;
+        target = shadowPeerFor(root);
       }
       return target || original;
     },
@@ -2543,7 +2952,7 @@
         String(candidate.getAttribute("name") || "") === name
       ) !== slot)
         return [];
-      const host = shadowHostByRoot.get(root),
+      const host = shadowPeerFor(root),
         direct = host
           ? shadowLightChildren(host).filter(
               (node) =>
@@ -2571,19 +2980,21 @@
       }
       return flattened.slice(0, 256);
     },
-    slotAssignmentSnapshots = new WeakMap(),
-    pendingSlotAssignments = new WeakMap(),
     removedSignalledSlotsByRoot = new WeakMap(),
     pendingSlotRoots = new Set(),
     resignalSlotRoots = new Set(),
     forcedSlotRoots = new Set(),
     preObserverSlotMutationRoots = new Set();
-  let slotFlushScheduled = false;
+  let slotFlushScheduled = false, shadowReleaseScheduled = false;
+  const releaseDisconnectedShadowRoots = () => {
+    shadowReleaseScheduled = false;
+    shadowState?.weaken();
+  };
   const shadowRootDepth = (root) => {
       let depth = 0,
         at = root;
       for (let steps = 0; at && steps < ancestorLimit; steps++) {
-        const host = shadowHostByRoot.get(at);
+        const host = shadowPeerFor(at);
         if (!host) break;
         at = containingShadowRoot(host);
         if (at) depth++;
@@ -2618,11 +3029,11 @@
         const forced = forcedSlotRoots.delete(root);
         for (const slot of slotsForRoot(root)) {
           const current = assignedNodesInternal(slot, false),
-            previous = slotAssignmentSnapshots.get(slot) || [],
+            previous = attributeState(slot)?.slotSnapshot || [],
             changed =
               current.length !== previous.length ||
               current.some((node, index) => node !== previous[index]);
-          slotAssignmentSnapshots.set(slot, current.slice());
+          attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
             slot.dispatchEvent(
               new Event("slotchange", { bubbles: true }),
@@ -2630,11 +3041,11 @@
         }
         for (const { slot, assignment: current } of
           removedSignalledSlotsByRoot.get(root) || []) {
-          const previous = slotAssignmentSnapshots.get(slot) || [],
+          const previous = attributeState(slot)?.slotSnapshot || [],
             changed =
               current.length !== previous.length ||
               current.some((node, index) => node !== previous[index]);
-          slotAssignmentSnapshots.set(slot, current.slice());
+          attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
             slot.dispatchEvent(
               new Event("slotchange", { bubbles: true }),
@@ -2660,6 +3071,14 @@
       /* Ordinary pages should not pay an ancestor walk for a facility which
          has never been used in this page realm. */
       if (!shadowRootCreated) return;
+      /* Plain shadow hosts have no custom-element disconnect reaction.
+         Batch the bounded identity-cache check after removals so they do not
+         remain strong roots until the native root table happens to fill. */
+      if (mutationType === "childList" && removedNodes.length &&
+          !shadowReleaseScheduled) {
+        queueMicrotask(releaseDisconnectedShadowRoots);
+        shadowReleaseScheduled = true;
+      }
       let root = null;
       const containing =
         target instanceof ShadowRoot ? target : containingShadowRoot(target);
@@ -2673,16 +3092,20 @@
       /* Structural mutations inside a shadow tree can change its slot set.
          Invalidate once, then share one bounded query across all assignment
          work for this mutation instead of re-querying for every slot. */
-      if (containing && mutationType === "childList")
-        slotListsByRoot.delete(root);
-      for (const slot of slotsForRoot(root))
-        pendingSlotAssignments.set(
-          slot,
-          assignedNodesInternal(slot, false),
-        );
-      const removedSlots = removedNodes.filter(
+      if (containing && mutationType === "childList") {
+        const state = attributeState(root);
+        if (state) state.slots = null;
+      }
+      const slots = slotsForRoot(root),
+        removedSlots = removedNodes.filter(
         (node) => node instanceof HTMLSlotElement,
       );
+      /* Most component trees contain no slots. Retaining and sorting their
+         roots until a compound microtask cannot produce a slotchange. */
+      if (!slots.length && !removedSlots.length) return;
+      for (const slot of slots)
+        attributeState(slot, true).pendingSlotAssignment =
+          assignedNodesInternal(slot, false);
       if (removedSlots.length) {
         const retained =
           removedSignalledSlotsByRoot.get(root) || [];
@@ -2690,7 +3113,7 @@
           if (retained.length < 128)
             retained.push({
               slot,
-              assignment: pendingSlotAssignments.get(slot) || [],
+              assignment: attributeState(slot)?.pendingSlotAssignment || [],
             });
         removedSignalledSlotsByRoot.set(root, retained);
       }
@@ -2717,7 +3140,7 @@
         queueMicrotask(flushShadowSlotChanges);
       }
     };
-  Object.defineProperties(globalThis, {
+  Object.defineProperties(__tilefinchRealmGlobal, {
     __tilefinchShadowEventPath: {
       configurable: false,
       enumerable: false,
@@ -2946,10 +3369,10 @@
           compact === ":not(:defined)"
         ) {
           const defined =
-            globalThis.__tilefinchCustomElementIsDefined?.(this) ?? true;
+            __tilefinchRealmGlobal.__tilefinchCustomElementIsDefined?.(this) ?? true;
           return compact === ":defined" ? defined : !defined;
         }
-        return globalThis.__tilefinchIsVirtualRemote?.(this)
+        return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(this)
           ? __tilefinchRemoteNodeRead(
               this.__tilefinchStableKey,
               this.__tilefinchRemoteSection,
@@ -2980,9 +3403,9 @@
      disabled accessor says; null for any other element. */
   const formAssociatedCustomDisabled = (element) => {
     const internals =
-      globalThis.__tilefinchElementInternalsFor?.(element);
+      __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(element);
     if (
-      !globalThis.__tilefinchFormAssociatedCustomElement?.(element)
+      !__tilefinchRealmGlobal.__tilefinchFormAssociatedCustomElement?.(element)
     )
       return null;
     if (internals)
@@ -3006,11 +3429,11 @@
   };
   /* For platform.js (:disabled, :enabled) and compat.js (focus), which
      deletes it. */
-  globalThis.__tilefinchFormAssociatedCustomDisabled =
+  __tilefinchRealmGlobal.__tilefinchFormAssociatedCustomDisabled =
     formAssociatedCustomDisabled;
   HTMLElement.prototype.click = function click() {
     if (this.disabled || formAssociatedCustomDisabled(this)) {
-      globalThis.__tilefinchLastClickDefault = "disabled";
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault = "disabled";
       return false;
     }
     const inputReset =
@@ -3018,7 +3441,7 @@
         String(this.getAttribute("type") || "text").toLowerCase() === "reset",
       controlState = inputReset
         ? null
-        : globalThis.__tilefinchBeginControlDefault?.(this) || null,
+        : __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(this) || null,
       clickEvent = new PointerEvent("click", {
           bubbles: true,
           cancelable: true,
@@ -3033,28 +3456,28 @@
     clickEvent.__tilefinchControlDefaultPrepared = true;
     const proceed = this.dispatchEvent(clickEvent),
       controlHandled =
-        globalThis.__tilefinchFinishControlDefault?.(controlState, proceed) ||
+        __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(controlState, proceed) ||
         false;
     if (!proceed) {
-      globalThis.__tilefinchLastClickDefault = "cancelled";
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault = "cancelled";
       return false;
     }
-    if (controlHandled) globalThis.__tilefinchLastClickDefault = "control";
+    if (controlHandled) __tilefinchRealmGlobal.__tilefinchLastClickDefault = "control";
     else if (
       this instanceof HTMLInputElement &&
       String(this.getAttribute("type") || "text").toLowerCase() === "reset"
     ) {
       const form = this.closest("form");
-      globalThis.__tilefinchLastClickDefault =
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault =
         form instanceof HTMLFormElement ? "reset" : "no-form";
       if (form instanceof HTMLFormElement)
-        globalThis.__tilefinchResetFormFromActivation(form);
+        __tilefinchRealmGlobal.__tilefinchResetFormFromActivation(form);
     } else if (
       this instanceof HTMLInputElement &&
       String(this.getAttribute("type") || "text").toLowerCase() === "submit"
     ) {
       const form = this.closest("form");
-      globalThis.__tilefinchLastClickDefault =
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault =
         form instanceof HTMLFormElement ? "submit" : "no-form";
       if (form instanceof HTMLFormElement) form.requestSubmit(this);
     }
@@ -3063,7 +3486,7 @@
       String(this.getAttribute("type") || "submit").toLowerCase() === "reset"
     ) {
       const form = this.closest("form");
-      globalThis.__tilefinchLastClickDefault =
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault =
         form instanceof HTMLFormElement ? "reset" : "no-form";
       if (form instanceof HTMLFormElement) form.reset();
     } else if (
@@ -3071,14 +3494,14 @@
       String(this.getAttribute("type") || "submit").toLowerCase() === "submit"
     ) {
       const form = this.closest("form");
-      globalThis.__tilefinchLastClickDefault =
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault =
         form instanceof HTMLFormElement ? "submit" : "no-form";
       if (form instanceof HTMLFormElement) form.requestSubmit(this);
-    } else if (globalThis.__tilefinchDetailsDefault?.(this))
-      globalThis.__tilefinchLastClickDefault = "details";
-    else if (globalThis.__tilefinchLabelDefault?.(this, false))
-      globalThis.__tilefinchLastClickDefault = "label";
-    else globalThis.__tilefinchLastClickDefault = "none";
+    } else if (__tilefinchRealmGlobal.__tilefinchDetailsDefault?.(this))
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault = "details";
+    else if (__tilefinchRealmGlobal.__tilefinchLabelDefault?.(this, false))
+      __tilefinchRealmGlobal.__tilefinchLastClickDefault = "label";
+    else __tilefinchRealmGlobal.__tilefinchLastClickDefault = "none";
     return true;
   };
   Element.prototype.insertAdjacentHTML = function insertAdjacentHTML(position, source) {
@@ -3129,14 +3552,14 @@
      streaming renderer reads effect.getComputedTiming().endTime to pace its
      word reveal. */
   const effectClocks = new WeakMap();
-  globalThis.__tilefinchBindEffectClock = (effect, clock) => {
+  __tilefinchRealmGlobal.__tilefinchBindEffectClock = (effect, clock) => {
     effectClocks.set(effect, clock);
   };
   const timingNumber = (value, fallback) => {
     const number = Number(value);
     return Number.isFinite(number) && number >= 0 ? number : fallback;
   };
-  globalThis.KeyframeEffect = class KeyframeEffect {
+  __tilefinchRealmGlobal.KeyframeEffect = class KeyframeEffect {
     #target;
     #keyframes;
     #timing;
@@ -3153,6 +3576,10 @@
           : options && typeof options === "object"
             ? options
             : {};
+      const easing = __tilefinchRealmGlobal.__tilefinchTimingFunction(
+        timing.easing === undefined ? "linear" : String(timing.easing),
+      );
+      if (easing === null) throw new TypeError("Invalid easing");
       this.#timing = {
         delay: timingNumber(timing.delay, 0),
         endDelay: timingNumber(timing.endDelay, 0),
@@ -3172,7 +3599,7 @@
         ].includes(String(timing.direction))
           ? String(timing.direction)
           : "normal",
-        easing: String(timing.easing || "linear"),
+        easing,
       };
     }
     get target() {
@@ -3216,16 +3643,16 @@
     }
   };
   Element.prototype.getAnimations = function getAnimations() {
-    return globalThis.__tilefinchElementAnimations?.(this) || [];
+    return __tilefinchRealmGlobal.__tilefinchElementAnimations?.(this) || [];
   };
   if (typeof Document === "function")
     Document.prototype.getAnimations = function getAnimations() {
-      return globalThis.__tilefinchElementAnimations?.(null) || [];
+      return __tilefinchRealmGlobal.__tilefinchElementAnimations?.(null) || [];
     };
-  globalThis.reportError = function reportError(error) {
+  __tilefinchRealmGlobal.reportError = function reportError(error) {
     if (arguments.length < 1)
       throw new TypeError("reportError requires an argument");
-    globalThis.__tilefinchReportUncaught?.(error, "reportError");
+    __tilefinchRealmGlobal.__tilefinchReportUncaught?.(error, "reportError");
   };
   for (const [name, attribute] of [["inert", "inert"]])
     Object.defineProperty(HTMLElement.prototype, name, {
@@ -3508,13 +3935,15 @@
     // because nobody has read classList yet. Replace it with the token-list
     // owner relationship on first use, without two new functions per node.
     Object.defineProperty(node, classListValue, { value: node, writable: true });
-    Object.defineProperty(node, "classList", classListDescriptor);
+    if (node instanceof Element)
+      Object.defineProperty(node, "classList", classListDescriptor);
   };
-  const nativeStyles = new WeakMap();
+  let nativeStyles;
   const nativeStyleFor = (node) => {
-    let value = nativeStyles.get(node);
+    let value = nativeStyles?.get(node);
     if (!value) {
-      value = globalThis.__tilefinchMakeStyle(node.__handle);
+      value = __tilefinchRealmGlobal.__tilefinchMakeStyle(node.__handle);
+      nativeStyles ||= new shadowWeakMapType();
       nativeStyles.set(node, value);
     }
     return value;
@@ -3526,13 +3955,14 @@
     set(cssText) { nativeStyleFor(this).cssText = String(cssText); },
   };
   const installStyle = (node, handle) => {
-    nativeStyles.delete(node);
-    Object.defineProperty(node, "style", nativeStyleDescriptor);
+    nativeStyles?.delete(node);
+    if (node instanceof Element)
+      Object.defineProperty(node, "style", nativeStyleDescriptor);
   };
-  const detachedStyles = new WeakMap();
-  Object.defineProperty(globalThis, "__tilefinchInvalidateDetachedStyle", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchInvalidateDetachedStyle", {
     value(node) {
-      detachedStyles.delete(node);
+      const state = attributeState(node);
+      if (state) state.detachedStyle = undefined;
     },
     writable: false,
     configurable: false,
@@ -3545,10 +3975,14 @@
          make style disappear from a still-live Element. */
       if (Number(this.__handle) > 0) return nativeStyleFor(this);
       if (!this.__detachedOwner) return undefined;
-      let value = detachedStyles.get(this);
+      /* The declaration's methods retain this node. Keep that cycle on
+         the owner, like Attr/NamedNodeMap, rather than in a realm-global
+         WeakMap whose values this collector marks unconditionally. */
+      const state = attributeState(this, true);
+      let value = state.detachedStyle;
       if (!value) {
-        value = globalThis.__tilefinchMakeDetachedStyle(this);
-        detachedStyles.set(this, value);
+        value = __tilefinchRealmGlobal.__tilefinchMakeDetachedStyle(this);
+        state.detachedStyle = value;
       }
       return value;
     },
@@ -3647,7 +4081,7 @@
     attributeState(owner, true).map = map;
     return map;
   };
-  globalThis.__tilefinchNamedNodeMapFor = namedNodeMapFor;
+  __tilefinchRealmGlobal.__tilefinchNamedNodeMapFor = namedNodeMapFor;
   Object.assign(NamedNodeMap.prototype, {
     item(index) {
       return this.__tilefinchAttributeRead()[Number(index) >>> 0] || null;
@@ -3782,7 +4216,7 @@
   /* Adoption stamps the Attr objects script already holds; one created
      later takes its element's (adopted) document then, so the element's
      attribute list need not be materialised for every adopted node. */
-  Object.defineProperty(globalThis, "__tilefinchAdoptAttributeObjects", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchAdoptAttributeObjects", {
     enumerable: false,
     configurable: false,
     writable: false,
@@ -3794,7 +4228,7 @@
             attribute.__tilefinchAttributeOwnerDocument = owner;
     },
   });
-  globalThis.__tilefinchCreateAttribute = (
+  __tilefinchRealmGlobal.__tilefinchCreateAttribute = (
     ownerDocument,
     qualifiedName,
     namespace = null,
@@ -3995,10 +4429,10 @@
       const parent = this.parentElement;
       if (
         parent &&
-        !globalThis.__tilefinchHasRemoteNodeWriter &&
+        !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
         !parent.__tilefinchDetachedParent &&
         Number(parent.__handle) > 0 &&
-        !globalThis.__tilefinchIsVirtualRemote?.(parent) &&
+        !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(parent) &&
         Number(__tilefinchClosest(parent.__handle, "fieldset[disabled]")) === 0
       )
         return false;
@@ -4026,28 +4460,28 @@
     get value() {
       const tag = String(this.tagName).toLowerCase();
       if (tag === "textarea")
-        return globalThis.__tilefinchTextAreaValue?.(this) ?? this.textContent;
+        return __tilefinchRealmGlobal.__tilefinchTextAreaValue?.(this) ?? this.textContent;
       if (tag === "select")
-        return globalThis.__tilefinchSelectValue?.(this) || "";
+        return __tilefinchRealmGlobal.__tilefinchSelectValue?.(this) || "";
       if (tag === "option") {
         const value = this.getAttributeNS(null, "value");
         return value === null
           ? String(this.textContent).replace(/\s+/g, " ").trim()
           : value;
       }
-      if (tag === "input" && globalThis.__tilefinchInputValue)
-        return globalThis.__tilefinchInputValue(this);
+      if (tag === "input" && __tilefinchRealmGlobal.__tilefinchInputValue)
+        return __tilefinchRealmGlobal.__tilefinchInputValue(this);
       return this.getAttribute("value") || "";
     },
     set value(value) {
       const tag = String(this.tagName).toLowerCase();
-      if (tag === "textarea" && globalThis.__tilefinchSetTextAreaValue)
-        globalThis.__tilefinchSetTextAreaValue(this, value);
+      if (tag === "textarea" && __tilefinchRealmGlobal.__tilefinchSetTextAreaValue)
+        __tilefinchRealmGlobal.__tilefinchSetTextAreaValue(this, value);
       else if (tag === "textarea") this.textContent = String(value);
       else if (tag === "select")
-        globalThis.__tilefinchSetSelectValue?.(this, String(value));
-      else if (tag === "input" && globalThis.__tilefinchSetInputValue)
-        globalThis.__tilefinchSetInputValue(this, value);
+        __tilefinchRealmGlobal.__tilefinchSetSelectValue?.(this, String(value));
+      else if (tag === "input" && __tilefinchRealmGlobal.__tilefinchSetInputValue)
+        __tilefinchRealmGlobal.__tilefinchSetInputValue(this, value);
       else this.setAttribute("value", String(value));
     },
     get name() {
@@ -4058,9 +4492,9 @@
     },
     get type() {
       const tag = String(this.tagName).toLowerCase();
-      return globalThis.__tilefinchControlType &&
+      return __tilefinchRealmGlobal.__tilefinchControlType &&
         (tag === "input" || tag === "button")
-        ? globalThis.__tilefinchControlType(this)
+        ? __tilefinchRealmGlobal.__tilefinchControlType(this)
         : this.getAttribute("type") || "";
     },
     set type(value) {
@@ -4081,22 +4515,22 @@
       return this.hasAttribute("checked");
     },
     set checked(value) {
-      if (globalThis.__tilefinchSetChecked)
-        globalThis.__tilefinchSetChecked(this, !!value);
+      if (__tilefinchRealmGlobal.__tilefinchSetChecked)
+        __tilefinchRealmGlobal.__tilefinchSetChecked(this, !!value);
       else this.toggleAttribute("checked", !!value);
     },
     get selected() {
       return String(this.tagName).toLowerCase() === "option" &&
-        globalThis.__tilefinchOptionSelected
-        ? globalThis.__tilefinchOptionSelected(this)
+        __tilefinchRealmGlobal.__tilefinchOptionSelected
+        ? __tilefinchRealmGlobal.__tilefinchOptionSelected(this)
         : this.hasAttribute("selected");
     },
     set selected(value) {
       if (
         String(this.tagName).toLowerCase() === "option" &&
-        globalThis.__tilefinchSetOptionSelected
+        __tilefinchRealmGlobal.__tilefinchSetOptionSelected
       )
-        globalThis.__tilefinchSetOptionSelected(this, !!value);
+        __tilefinchRealmGlobal.__tilefinchSetOptionSelected(this, !!value);
       else this.toggleAttribute("selected", !!value);
     },
     get placeholder() {
@@ -4149,12 +4583,12 @@
       this.__selectionDirection = ["forward", "backward"].includes(direction)
         ? direction
         : "none";
-      globalThis.__tilefinchSelectionChanged?.();
+      __tilefinchRealmGlobal.__tilefinchSelectionChanged?.();
     },
     select() {
       if (this.selectionStart !== null) {
         this.setSelectionRange(0, this.value.length);
-        globalThis.__tilefinchSelectedControl = this;
+        __tilefinchRealmGlobal.__tilefinchSelectedControl = this;
       }
     },
     get tabIndex() {
@@ -4182,7 +4616,7 @@
       if (
         !nodeOwnersActive ||
         !(this.__handle > 0) ||
-        globalThis.__tilefinchIsVirtualRemote(this)
+        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
       )
         return document;
       const tag = __tilefinchNodeOwner(this.__handle),
@@ -4240,17 +4674,17 @@
     },
     get width() {
       if (this instanceof HTMLCanvasElement) {
-        globalThis.__tilefinchEnsureCanvasBootstrap?.();
-        if (globalThis.__tilefinchCanvasDimension)
-          return globalThis.__tilefinchCanvasDimension(this, "width");
+        __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
+        if (__tilefinchRealmGlobal.__tilefinchCanvasDimension)
+          return __tilefinchRealmGlobal.__tilefinchCanvasDimension(this, "width");
       }
       return this.getAttribute("width") || "";
     },
     set width(value) {
       if (this instanceof HTMLCanvasElement) {
-        globalThis.__tilefinchEnsureCanvasBootstrap?.();
-        if (globalThis.__tilefinchSetCanvasDimension) {
-          globalThis.__tilefinchSetCanvasDimension(this, "width", value);
+        __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
+        if (__tilefinchRealmGlobal.__tilefinchSetCanvasDimension) {
+          __tilefinchRealmGlobal.__tilefinchSetCanvasDimension(this, "width", value);
           return;
         }
       }
@@ -4258,17 +4692,17 @@
     },
     get height() {
       if (this instanceof HTMLCanvasElement) {
-        globalThis.__tilefinchEnsureCanvasBootstrap?.();
-        if (globalThis.__tilefinchCanvasDimension)
-          return globalThis.__tilefinchCanvasDimension(this, "height");
+        __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
+        if (__tilefinchRealmGlobal.__tilefinchCanvasDimension)
+          return __tilefinchRealmGlobal.__tilefinchCanvasDimension(this, "height");
       }
       return this.getAttribute("height") || "";
     },
     set height(value) {
       if (this instanceof HTMLCanvasElement) {
-        globalThis.__tilefinchEnsureCanvasBootstrap?.();
-        if (globalThis.__tilefinchSetCanvasDimension) {
-          globalThis.__tilefinchSetCanvasDimension(this, "height", value);
+        __tilefinchRealmGlobal.__tilefinchEnsureCanvasBootstrap?.();
+        if (__tilefinchRealmGlobal.__tilefinchSetCanvasDimension) {
+          __tilefinchRealmGlobal.__tilefinchSetCanvasDimension(this, "height", value);
           return;
         }
       }
@@ -4337,12 +4771,12 @@
         compact === ":not(:defined)"
       ) {
         const defined =
-          globalThis.__tilefinchCustomElementIsDefined?.(this) ?? true;
+          __tilefinchRealmGlobal.__tilefinchCustomElementIsDefined?.(this) ?? true;
         return compact === ":defined" ? defined : !defined;
       }
-      return globalThis.__tilefinchElementMatches
-        ? globalThis.__tilefinchElementMatches(this, selector)
-        : globalThis.__tilefinchIsVirtualRemote(this)
+      return __tilefinchRealmGlobal.__tilefinchElementMatches
+        ? __tilefinchRealmGlobal.__tilefinchElementMatches(this, selector)
+        : __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
           ? __tilefinchRemoteNodeRead(
               this.__tilefinchStableKey,
               this.__tilefinchRemoteSection,
@@ -4352,8 +4786,8 @@
           : __tilefinchMatches(this.__handle, selector);
     },
     closest(selector) {
-      return globalThis.__tilefinchElementClosest
-        ? globalThis.__tilefinchElementClosest(this, selector)
+      return __tilefinchRealmGlobal.__tilefinchElementClosest
+        ? __tilefinchRealmGlobal.__tilefinchElementClosest(this, selector)
         : (() => {
             for (
               let at = this, steps = 0;
@@ -4512,8 +4946,8 @@
       return rect.width && rect.height ? [rect] : [];
     },
     prepend(...values) {
-      if (globalThis.__tilefinchParentAppend)
-        return globalThis.__tilefinchParentAppend(this, values, true);
+      if (__tilefinchRealmGlobal.__tilefinchParentAppend)
+        return __tilefinchRealmGlobal.__tilefinchParentAppend(this, values, true);
       for (let at = values.length - 1; at >= 0; at--) {
         const value =
           values[at] instanceof Node
@@ -4581,7 +5015,7 @@
           !name.includes(":") && Number(this.__handle) > 0 &&
           this.namespaceURI === "http://www.w3.org/1999/xhtml" &&
           !namespacedAttributes.get(this)?.length &&
-          !globalThis.__tilefinchIsVirtualRemote(this))
+          !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
         return __tilefinchGetAttribute(this.__handle, name);
       const found = [...this.attributes].find(
         (attribute) =>
@@ -4752,21 +5186,21 @@
         });
       }
       const root = document.scrollingElement;
-      if (root && typeof globalThis.scrollTo === "function") {
+      if (root && typeof __tilefinchRealmGlobal.scrollTo === "function") {
         const rootStyle = getComputedStyle(root),
           rect = this.getBoundingClientRect(),
           rootFont = parseFloat(rootStyle.fontSize) || 16,
           paddingTop = length(rootStyle, "scroll-padding-top", rootFont,
-                              Number(globalThis.innerHeight) || 0),
+                              Number(__tilefinchRealmGlobal.innerHeight) || 0),
           paddingBottom = length(rootStyle, "scroll-padding-bottom", rootFont,
-                                 Number(globalThis.innerHeight) || 0),
+                                 Number(__tilefinchRealmGlobal.innerHeight) || 0),
           viewportHeight =
-            Number(globalThis.innerHeight) ||
-            Number(globalThis.visualViewport?.height) ||
+            Number(__tilefinchRealmGlobal.innerHeight) ||
+            Number(__tilefinchRealmGlobal.visualViewport?.height) ||
             0,
-          start = globalThis.scrollY + rect.top - paddingTop - marginTop,
+          start = __tilefinchRealmGlobal.scrollY + rect.top - paddingTop - marginTop,
           end =
-            globalThis.scrollY +
+            __tilefinchRealmGlobal.scrollY +
             rect.bottom -
             viewportHeight +
             paddingBottom +
@@ -4780,8 +5214,8 @@
               ? start
               : rect.bottom > viewportHeight - paddingBottom
                 ? end
-                : globalThis.scrollY;
-        globalThis.scrollTo({ top, behavior });
+                : __tilefinchRealmGlobal.scrollY;
+        __tilefinchRealmGlobal.scrollTo({ top, behavior });
       }
     },
     getBoundingClientRect() {
@@ -5136,10 +5570,10 @@
     },
     append(...values) {
       if (
-        globalThis.__tilefinchParentAppend &&
-        !globalThis.__tilefinchParentAppendBypass
+        __tilefinchRealmGlobal.__tilefinchParentAppend &&
+        !__tilefinchRealmGlobal.__tilefinchParentAppendBypass
       )
-        return globalThis.__tilefinchParentAppend(this, values, false);
+        return __tilefinchRealmGlobal.__tilefinchParentAppend(this, values, false);
       const nodes = [];
       for (const value of values) {
         const node =
@@ -5179,13 +5613,13 @@
           nodes.length === 1
             ? nodes[0]
             : owner.createDocumentFragment();
-      globalThis.__tilefinchMutationSuppressed =
-        (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+      __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+        (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
       let removed;
       try {
         if (nodes.length !== 1)
           for (const node of nodes) insertion.appendChild(node);
-        globalThis.__tilefinchValidatePreInsert?.(
+        __tilefinchRealmGlobal.__tilefinchValidatePreInsert?.(
           this,
           insertion,
           null,
@@ -5195,10 +5629,10 @@
         for (const child of removed) this.removeChild(child);
         if (nodes.length) this.appendChild(insertion);
       } finally {
-        globalThis.__tilefinchMutationSuppressed--;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
       }
       for (const move of moved)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           move.parent,
           "childList",
           null,
@@ -5209,7 +5643,7 @@
           move.nextSibling,
         );
       if (removed.length || nodes.length)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "childList",
           null,
@@ -5285,7 +5719,7 @@
       if (node === child) {
         const previousSibling = child.previousSibling,
           nextSibling = child.nextSibling;
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "childList",
           null,
@@ -5295,7 +5729,7 @@
           previousSibling,
           nextSibling,
         );
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "childList",
           null,
@@ -5316,16 +5750,16 @@
             : child.previousSibling,
         nextSibling =
           child.nextSibling === node ? node.nextSibling : child.nextSibling;
-      globalThis.__tilefinchMutationSuppressed =
-        (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+      __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+        (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
       try {
         this.insertBefore(node, child);
         this.removeChild(child);
       } finally {
-        globalThis.__tilefinchMutationSuppressed--;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
       }
       if (oldParent)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           oldParent,
           "childList",
           null,
@@ -5335,7 +5769,7 @@
           oldPrevious,
           oldNext,
         );
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "childList",
         null,
@@ -5353,7 +5787,7 @@
         value instanceof Event &&
         value.type === "click" &&
         !value.__tilefinchControlDefaultPrepared
-          ? globalThis.__tilefinchBeginControlDefault?.(this) || null
+          ? __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(this) || null
           : null;
       const path = shadowEventPath(this, !!value.composed);
       /*
@@ -5372,25 +5806,25 @@
       if (reachesDocument) {
         if (!(path[path.length - 1] instanceof Document))
           path.push(document);
-        path.push(globalThis);
+        path.push(__tilefinchRealmGlobal);
       }
       const invoke = (target, capture, phase) => {
         value.target = retargetShadowEvent(this, target);
-        if (target === globalThis)
-          globalThis.__tilefinchInvokeWindowEvent(value, capture);
+        if (target === __tilefinchRealmGlobal)
+          __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent(value, capture);
         else if (target === document)
-          globalThis.__tilefinchInvokeDocumentEvent(value, capture);
+          __tilefinchRealmGlobal.__tilefinchInvokeDocumentEvent(value, capture);
         else if (typeof target?.__invokeEvent === "function")
           target.__invokeEvent(value, capture);
         else
-          globalThis.__tilefinchInvokeEventTarget?.(
+          __tilefinchRealmGlobal.__tilefinchInvokeEventTarget?.(
             target,
             value,
             capture,
             phase,
           );
       };
-      globalThis.__tilefinchPrepareEvent(value, this, path);
+      __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, this, path);
       for (let i = path.length - 1; i >= 1 && !value.__stopped; i--)
         invoke(path[i], true, 1);
       if (!value.__stopped) {
@@ -5401,7 +5835,7 @@
       if (value.bubbles && !value.__stopped)
         for (let i = 1; i < path.length && !value.__stopped; i++)
           invoke(path[i], false, 3);
-      globalThis.__tilefinchFinishEventDispatch(value);
+      __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
       value.target = retargetShadowEvent(
         this,
         path[path.length - 1] || this,
@@ -5409,12 +5843,12 @@
       __tilefinchRecordEvent();
       const accepted = !value.defaultPrevented;
       if (controlState)
-        globalThis.__tilefinchFinishControlDefault?.(controlState, accepted);
+        __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(controlState, accepted);
       return accepted;
     },
     __tilefinchGeometryValue() {
       const nativeReceiver = this;
-      return globalThis.__tilefinchIsVirtualRemote(this)
+      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
         ? __tilefinchRemoteNodeGeometry(
             this.__tilefinchStableKey,
             this.__tilefinchRemoteSection,
@@ -5423,7 +5857,7 @@
     },
     get textContent() {
       const nativeReceiver = this;
-      if (globalThis.__tilefinchIsVirtualRemote(this))
+      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
         return __tilefinchRemoteNodeRead(
           this.__tilefinchStableKey,
           this.__tilefinchRemoteSection,
@@ -5447,12 +5881,12 @@
           type === Node.COMMENT_NODE,
         oldValue = character ? this.textContent : null,
         removedNodes = character ? [] : mutationChildSnapshot(this),
-        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         /* Only a remote node writer mirrors root writes; check it before
            resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection
+          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+          !__tilefinchRealmGlobal.__tilefinchRestoringSection
             ? this === document.body
               ? "d:body"
               : this === document.documentElement
@@ -5473,8 +5907,8 @@
         );
       let result = false;
       if (shadowRootForHost(this) && !character && !remote) {
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+          (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         dynamicPreparationSuppressed++;
         try {
           for (const child of shadowLightChildren(this))
@@ -5484,15 +5918,15 @@
           result = true;
         } finally {
           dynamicPreparationSuppressed--;
-          globalThis.__tilefinchMutationSuppressed--;
+          __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
       } else {
         result = __tilefinchSetText(nativeReceiver.__handle, value);
       }
       if ((result || remote) && remote)
-        globalThis.__tilefinchRememberRemoteContent?.(this, "text", value);
+        rememberRemoteContent(this, "text", value);
       if (character)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "characterData",
           null,
@@ -5501,7 +5935,7 @@
           oldValue,
         );
       else if (removedNodes.length || value)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "childList",
           null,
@@ -5511,7 +5945,7 @@
     },
     get innerHTML() {
       const nativeReceiver = this;
-      if (globalThis.__tilefinchIsVirtualRemote(this))
+      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
         return __tilefinchRemoteNodeRead(
           this.__tilefinchStableKey,
           this.__tilefinchRemoteSection,
@@ -5547,17 +5981,17 @@
       value = String(value);
       const shadow = shadowRootForHost(this),
         customLifecycle =
-          globalThis.__tilefinchCustomElementLifecycleNeeded?.(this) ||
+          __tilefinchRealmGlobal.__tilefinchCustomElementLifecycleNeeded?.(this) ||
           false,
         removedNodes = customLifecycle
           ? Array.from(this.childNodes).slice(0, 256)
           : mutationChildSnapshot(this),
-        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         /* Only a remote node writer mirrors root writes; check it before
            resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection
+          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+          !__tilefinchRealmGlobal.__tilefinchRestoringSection
             ? this === document.body
               ? "d:body"
               : this === document.documentElement
@@ -5594,8 +6028,8 @@
         if (!__tilefinchSetInnerHTML(container.__handle, value))
           throw new Error("innerHTML mutation failed");
         const replacements = Array.from(container.childNodes);
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+          (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         dynamicPreparationSuppressed++;
         try {
           for (const child of shadowLightChildren(this))
@@ -5603,7 +6037,7 @@
           for (const child of replacements) this.appendChild(child);
         } finally {
           dynamicPreparationSuppressed--;
-          globalThis.__tilefinchMutationSuppressed--;
+          __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
         shadowMutation = true;
       } else if (!remote && !__tilefinchSetInnerHTML(target, value)) {
@@ -5611,7 +6045,7 @@
       }
       if (remote) {
         __tilefinchSetInnerHTML(target, value);
-        globalThis.__tilefinchRememberRemoteContent?.(this, "html", value);
+        rememberRemoteContent(this, "html", value);
       }
       const addedNodes = customLifecycle
         ? Array.from(this.childNodes).slice(0, 256)
@@ -5622,11 +6056,11 @@
         String(this.tagName).toLowerCase() !== "template"
       ) {
         for (const node of removedNodes)
-          globalThis.__tilefinchCustomElementDisconnected?.(node);
+          __tilefinchRealmGlobal.__tilefinchCustomElementDisconnected?.(node);
         for (const node of addedNodes)
-          globalThis.__tilefinchCustomElementConnected?.(node, true);
+          __tilefinchRealmGlobal.__tilefinchCustomElementConnected?.(node, true);
       }
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "childList",
         null,
@@ -5636,13 +6070,13 @@
     },
     get tagName() {
       const nativeReceiver = this;
-      return globalThis.__tilefinchIsVirtualRemote(this)
+      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
         ? this.__tilefinchRemoteTagName
         : __tilefinchTagName(nativeReceiver.__handle) || "";
     },
     get nodeType() {
       const nativeReceiver = this;
-      return globalThis.__tilefinchIsVirtualRemote(this)
+      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
         ? this.__tilefinchRemoteNodeType
         : __tilefinchNodeType(nativeReceiver.__handle);
     },
@@ -5652,7 +6086,7 @@
         return this.__tilefinchDetachedParent.nodeType === Node.ELEMENT_NODE
           ? this.__tilefinchDetachedParent
           : null;
-      const parent = globalThis.__tilefinchIsVirtualRemote(this)
+      const parent = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
         ? __tilefinchRemoteNodeRelation(
             this.__tilefinchStableKey,
             this.__tilefinchRemoteSection,
@@ -5664,13 +6098,13 @@
          Deriving parentElement from the native "element parent" relation
          leaked that carrier to children of a shadow root. */
       return parent instanceof Element
-        ? globalThis.__tilefinchCanonicalElement(parent)
+        ? __tilefinchRealmGlobal.__tilefinchCanonicalElement(parent)
         : null;
     },
     get parentNode() {
       const nativeReceiver = this;
       if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
-      if (globalThis.__tilefinchIsVirtualRemote(this)) return this.parentElement;
+      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)) return this.parentElement;
       /* Ancestor walks read this once per step: resolve the common case
          (a parent that already has a wrapper) without the documentElement
          getter or a nodeType query. */
@@ -5689,10 +6123,10 @@
     },
     get firstElementChild() {
       const nativeReceiver = this;
-      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body)
+      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body)
         return document.querySelector("body > *");
-      return globalThis.__tilefinchCanonicalElement(
-        globalThis.__tilefinchIsVirtualRemote(this)
+      return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
+        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
           ? __tilefinchRemoteNodeRelation(
               this.__tilefinchStableKey,
               this.__tilefinchRemoteSection,
@@ -5703,7 +6137,7 @@
     },
     get firstChild() {
       const nativeReceiver = this;
-      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
+      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body) {
         let child = document.querySelector("body > *");
         if (!child) return null;
         for (
@@ -5714,7 +6148,7 @@
           child = previous;
         return child;
       }
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 4));
       return remote
         ? __tilefinchRemoteNodeRelation(
@@ -5733,11 +6167,11 @@
     },
     get lastChild() {
       const nativeReceiver = this;
-      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
+      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body) {
         const values = this.childNodes;
         return values.length ? values[values.length - 1] : null;
       }
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 7));
       return remote
         ? __tilefinchRemoteNodeRelation(
@@ -5756,7 +6190,7 @@
     },
     get nextElementSibling() {
       const nativeReceiver = this;
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 2)),
         related = shadowAdjustedSibling(
           this,
@@ -5770,7 +6204,7 @@
               : null),
           2,
         );
-      return globalThis.__tilefinchCanonicalElement(
+      return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
         remote
           ? __tilefinchRemoteNodeRelation(
               this.__tilefinchStableKey,
@@ -5782,7 +6216,7 @@
     },
     get nextSibling() {
       const nativeReceiver = this;
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 5));
       return remote
         ? __tilefinchRemoteNodeRelation(
@@ -5805,7 +6239,7 @@
     },
     get previousElementSibling() {
       const nativeReceiver = this;
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 3)),
         related = shadowAdjustedSibling(
           this,
@@ -5819,7 +6253,7 @@
               : null),
           3,
         );
-      return globalThis.__tilefinchCanonicalElement(
+      return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
         remote
           ? __tilefinchRemoteNodeRelation(
               this.__tilefinchStableKey,
@@ -5831,7 +6265,7 @@
     },
     get previousSibling() {
       const nativeReceiver = this;
-      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 6));
       return remote
         ? __tilefinchRemoteNodeRelation(
@@ -5861,7 +6295,7 @@
         ))
           if (at instanceof Document) return true;
       return (
-        globalThis.__tilefinchIsVirtualRemote(this) ||
+        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this) ||
         __tilefinchIsConnected(nativeReceiver.__handle)
       );
     },
@@ -5870,10 +6304,10 @@
       if (!this.__tilefinchChildrenCollection)
         Object.defineProperty(this, "__tilefinchChildrenCollection", {
           configurable: true,
-          value: globalThis.__tilefinchLiveHTMLCollection(() => {
+          value: __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() => {
             if (
-              !globalThis.__tilefinchHasRemoteNodeWriter &&
-              !globalThis.__tilefinchIsVirtualRemote(this)
+              !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+              !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
             )
               return __tilefinchChildren(nativeReceiver.__handle).map(wrap);
             const values = [];
@@ -5891,8 +6325,8 @@
     get childNodes() {
       const nativeReceiver = this;
       if (
-        !globalThis.__tilefinchHasRemoteNodeWriter &&
-        !globalThis.__tilefinchIsVirtualRemote(this)
+        !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+        !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
       )
         return __tilefinchChildNodes(nativeReceiver.__handle).map(wrap);
       const values = [];
@@ -5926,7 +6360,7 @@
     get contentWindow() {
       const nativeReceiver = this;
       return String(this.tagName).toLowerCase() === "iframe"
-        ? globalThis.__tilefinchFrameWindow?.(nativeReceiver.__handle) || null
+        ? __tilefinchRealmGlobal.__tilefinchFrameWindow?.(nativeReceiver.__handle) || null
         : null;
     },
     get contentDocument() {
@@ -5936,8 +6370,8 @@
         !this.isConnected
       )
         return null;
-      globalThis.__tilefinchLoadLocalFrame?.(this);
-      const view = globalThis.__tilefinchFrameWindow?.(nativeReceiver.__handle),
+      __tilefinchRealmGlobal.__tilefinchLoadLocalFrame?.(this);
+      const view = __tilefinchRealmGlobal.__tilefinchFrameWindow?.(nativeReceiver.__handle),
         value = view?.document;
       return value instanceof Document ? value : null;
     },
@@ -5949,14 +6383,14 @@
            reads. Reuse the list within one task while no script mutation
            happened (every one bumps the DOM version, as for form.elements;
            host-native attribute changes happen between tasks). */
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
           version = remote ? -1 : __tilefinchDomVersion(),
           task = activeTaskSequence,
           memo = remote ? null : attributeState(this)?.memo;
         if (memo && memo.version === version && memo.task === task)
           return memo.values;
         const raw = remote
-            ? globalThis.__tilefinchMergeRemoteAttributes(
+            ? mergeRemoteAttributes(
                 this,
                 __tilefinchRemoteNodeAttributes(
                   this.__tilefinchStableKey,
@@ -6029,12 +6463,12 @@
           ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
           : matching?.value ?? null,
         lowerName = name.toLowerCase(),
-        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         /* Only a remote node writer mirrors root writes; check it before
            resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection
+          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+          !__tilefinchRealmGlobal.__tilefinchRestoringSection
             ? this === document.body
               ? "d:body"
               : this === document.documentElement
@@ -6081,32 +6515,32 @@
           attributeRecord(this, name, value);
       }
       if (remote)
-        globalThis.__tilefinchRememberRemoteAttribute?.(this, name, value);
-      else if (globalThis.__tilefinchHasRemoteNodeWriter
+        rememberRemoteAttribute(this, name, value);
+      else if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
                && lowerName === "id") {
         const sourceKey = String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""),
           idKey = value && value.length <= 128 ? "i:" + value : "";
         rekeyStableWrapper(this, idKey || sourceKey);
       }
-      if (lowerName === "id") globalThis.__tilefinchExposeNamedProperty(value);
+      if (lowerName === "id") __tilefinchRealmGlobal.__tilefinchExposeNamedProperty(value);
       if (lowerName === "style" && this.__detachedOwner)
         detachedStyles.delete(this);
       invalidateInlineEventHandler(this, lowerName);
-      globalThis.__tilefinchCustomElementAttributeChanged?.(
+      __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
         this,
         lowerName,
         oldValue,
         value,
       );
-      globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
+      __tilefinchRealmGlobal.__tilefinchCanvasAttributeChanged?.(this, lowerName);
       if (
         this instanceof HTMLIFrameElement &&
         (lowerName === "srcdoc" ||
           (lowerName === "src" && !this.hasAttribute("srcdoc"))) &&
         this.isConnected
       )
-        globalThis.__tilefinchLoadLocalFrame?.(this, true);
-      globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchLoadLocalFrame?.(this, true);
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "attributes",
         name,
@@ -6175,15 +6609,15 @@
         __tilefinchSetAttribute(nativeReceiver.__handle, name, String(value));
       }
       if (namespace === null)
-        globalThis.__tilefinchCanvasAttributeChanged?.(this, localName);
-      globalThis.__tilefinchCustomElementAttributeChanged?.(
+        __tilefinchRealmGlobal.__tilefinchCanvasAttributeChanged?.(this, localName);
+      __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
         this,
         localName,
         oldValue,
         String(value),
         namespace,
       );
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "attributes",
         localName,
@@ -6200,7 +6634,7 @@
       name = String(name);
       if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
         name = name.toLowerCase();
-      if (globalThis.__tilefinchIsVirtualRemote(this))
+      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
         return __tilefinchRemoteNodeRead(
           this.__tilefinchStableKey,
           this.__tilefinchRemoteSection,
@@ -6238,12 +6672,12 @@
           ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
           : matching?.value ?? null,
         lowerName = name.toLowerCase(),
-        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
         /* Only a remote node writer mirrors root writes; check it before
            resolving document.body, which is a bridge call and a wrap. */
         rootKey =
-          globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchRestoringSection
+          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
+          !__tilefinchRealmGlobal.__tilefinchRestoringSection
             ? this === document.body
               ? "d:body"
               : this === document.documentElement
@@ -6285,29 +6719,29 @@
         );
       }
       if (remote)
-        globalThis.__tilefinchRememberRemoteAttribute?.(this, name, null);
-      else if (globalThis.__tilefinchHasRemoteNodeWriter
+        rememberRemoteAttribute(this, name, null);
+      else if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
                && lowerName === "id")
         rekeyStableWrapper(this, String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""));
       if (oldValue !== null) {
         if (lowerName === "style" && this.__detachedOwner)
           detachedStyles.delete(this);
         invalidateInlineEventHandler(this, lowerName);
-        globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
+        __tilefinchRealmGlobal.__tilefinchCanvasAttributeChanged?.(this, lowerName);
         if (
           this instanceof HTMLIFrameElement &&
           (lowerName === "srcdoc" ||
             (lowerName === "src" && !this.hasAttribute("srcdoc"))) &&
           this.isConnected
         )
-          globalThis.__tilefinchLoadLocalFrame?.(this, true);
-        globalThis.__tilefinchCustomElementAttributeChanged?.(
+          __tilefinchRealmGlobal.__tilefinchLoadLocalFrame?.(this, true);
+        __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
           this,
           lowerName,
           oldValue,
           null,
         );
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "attributes",
           matching?.localName || name,
@@ -6340,16 +6774,16 @@
           attributeKey(namespace, removed.localName),
         );
         if (namespace === null)
-          globalThis.__tilefinchCanvasAttributeChanged?.(
+          __tilefinchRealmGlobal.__tilefinchCanvasAttributeChanged?.(
             this, removed.localName);
-        globalThis.__tilefinchCustomElementAttributeChanged?.(
+        __tilefinchRealmGlobal.__tilefinchCustomElementAttributeChanged?.(
           this,
           removed.localName,
           removed.value,
           null,
           namespace,
         );
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
           "attributes",
           removed.localName,
@@ -6374,12 +6808,12 @@
        no-quirks mode) reports and moves the viewport's scroll position. */
     get scrollTop() {
       if (this === document.documentElement)
-        return Number(globalThis.scrollY) || 0;
+        return Number(__tilefinchRealmGlobal.scrollY) || 0;
       return this.__tilefinchGeometryValue().scrollTop;
     },
     set scrollTop(value) {
       if (this === document.documentElement) {
-        globalThis.scrollTo(Number(globalThis.scrollX) || 0,
+        __tilefinchRealmGlobal.scrollTo(Number(__tilefinchRealmGlobal.scrollX) || 0,
                             Number(value) || 0);
         return;
       }
@@ -6394,16 +6828,17 @@
           ? 0
           : Number(value) || 0,
       );
+      if (this.scrollTop !== g.scrollTop) queueElementScroll(this);
     },
     get scrollLeft() {
       if (this === document.documentElement)
-        return Number(globalThis.scrollX) || 0;
+        return Number(__tilefinchRealmGlobal.scrollX) || 0;
       return this.__tilefinchGeometryValue().scrollLeft;
     },
     set scrollLeft(value) {
       if (this === document.documentElement) {
-        globalThis.scrollTo(Number(value) || 0,
-                            Number(globalThis.scrollY) || 0);
+        __tilefinchRealmGlobal.scrollTo(Number(value) || 0,
+                            Number(__tilefinchRealmGlobal.scrollY) || 0);
         return;
       }
       const nativeReceiver = this;
@@ -6417,6 +6852,7 @@
           : Number(value) || 0,
         g.scrollTop,
       );
+      if (this.scrollLeft !== g.scrollLeft) queueElementScroll(this);
     },
     scrollTo(xOrOptions, y) {
       const nativeReceiver = this;
@@ -6428,8 +6864,8 @@
           new TypeError("Single scroll argument must be a dictionary"),
         );
       if (this === document.documentElement) {
-        if (arguments.length === 1) globalThis.scrollTo(xOrOptions);
-        else globalThis.scrollTo(xOrOptions, y);
+        if (arguments.length === 1) __tilefinchRealmGlobal.scrollTo(xOrOptions);
+        else __tilefinchRealmGlobal.scrollTo(xOrOptions, y);
         return Promise.resolve();
       }
       if (
@@ -6538,8 +6974,8 @@
         child.__handle === undefined &&
         !(child instanceof DocumentFragment)
       )
-        child = globalThis.__tilefinchMaterializeDetachedNode?.(child) || child;
-      globalThis.__tilefinchValidatePreInsert?.(this, child, null);
+        child = __tilefinchRealmGlobal.__tilefinchMaterializeDetachedNode?.(child) || child;
+      __tilefinchRealmGlobal.__tilefinchValidatePreInsert?.(this, child, null);
       if (child instanceof DocumentFragment) {
         const nodes = [...child.childNodes],
           removals = nodes.map((node) => ({
@@ -6548,14 +6984,14 @@
             previousSibling: node.previousSibling,
             nextSibling: node.nextSibling,
           }));
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+          (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         dynamicPreparationSuppressed++;
         try {
           for (const node of nodes) this.appendChild(node);
         } finally {
           dynamicPreparationSuppressed--;
-          globalThis.__tilefinchMutationSuppressed--;
+          __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
         prepareDynamicSubtree?.(nativeReceiver.__handle);
         const removalParents = new Set(
@@ -6565,7 +7001,7 @@
           const group = removals.filter(
             (removal) => removal.parent === parent,
           );
-          globalThis.__tilefinchNotifyMutation?.(
+          __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
             parent,
             "childList",
             null,
@@ -6577,7 +7013,7 @@
           );
         }
         if (nodes.length)
-          globalThis.__tilefinchNotifyMutation?.(
+          __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
             this,
             "childList",
             null,
@@ -6593,17 +7029,17 @@
         throw new Error("appendChild failed");
       if (
         wasConnected &&
-        !globalThis.__tilefinchCustomElementMovePreserved
+        !__tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved
       )
-        globalThis.__tilefinchCustomElementDisconnected?.(child);
+        __tilefinchRealmGlobal.__tilefinchCustomElementDisconnected?.(child);
       const targetOwner = this.ownerDocument || document;
       if (oldOwner && targetOwner && oldOwner !== targetOwner)
-        globalThis.__tilefinchAdoptNodeOwner?.(child, targetOwner);
-      if (!globalThis.__tilefinchCustomElementMovePreserved)
-        globalThis.__tilefinchCustomElementConnected?.(child);
-      globalThis.__tilefinchCanvasConnected?.(child);
+        __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner?.(child, targetOwner);
+      if (!__tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved)
+        __tilefinchRealmGlobal.__tilefinchCustomElementConnected?.(child);
+      __tilefinchRealmGlobal.__tilefinchCanvasConnected?.(child);
       if (oldParent)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           oldParent,
           "childList",
           null,
@@ -6613,7 +7049,7 @@
           oldPrevious,
           oldNext,
         );
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "childList",
         null,
@@ -6624,7 +7060,7 @@
         null,
       );
       if (child instanceof HTMLIFrameElement)
-        globalThis.__tilefinchLoadLocalFrame?.(child);
+        __tilefinchRealmGlobal.__tilefinchLoadLocalFrame?.(child);
       if (!dynamicPreparationSuppressed) prepareDynamicSubtree?.(nativeReceiver.__handle);
       return child;
     },
@@ -6642,7 +7078,7 @@
           const clone = wrap(__tilefinchClone(nativeReceiver.__handle, false));
           for (const child of this.content.childNodes)
             clone.content.appendChild(child.cloneNode(true));
-          globalThis.__tilefinchCopyFormCloneState?.(this, clone, true);
+          __tilefinchRealmGlobal.__tilefinchCopyFormCloneState?.(this, clone, true);
           return clone;
         }
         const clone = wrap(__tilefinchClone(nativeReceiver.__handle, !!deep));
@@ -6686,7 +7122,7 @@
             }
           }
         }
-        globalThis.__tilefinchCopyFormCloneState?.(this, clone, !!deep);
+        __tilefinchRealmGlobal.__tilefinchCopyFormCloneState?.(this, clone, !!deep);
         return clone;
       } finally {
         cloneCallDepth--;
@@ -6706,32 +7142,32 @@
         node.__handle === undefined &&
         !(node instanceof DocumentFragment)
       )
-        node = globalThis.__tilefinchMaterializeDetachedNode?.(node) || node;
-      globalThis.__tilefinchValidatePreInsert?.(this, node, child);
+        node = __tilefinchRealmGlobal.__tilefinchMaterializeDetachedNode?.(node) || node;
+      __tilefinchRealmGlobal.__tilefinchValidatePreInsert?.(this, node, child);
       if (node instanceof DocumentFragment) {
         const nodes = [...node.childNodes],
           previousSibling = child ? child.previousSibling : this.lastChild;
-        globalThis.__tilefinchFragmentInsertCount =
-          (globalThis.__tilefinchFragmentInsertCount || 0) + 1;
-        globalThis.__tilefinchFragmentInsertText =
-          (globalThis.__tilefinchFragmentInsertText || "") +
+        __tilefinchRealmGlobal.__tilefinchFragmentInsertCount =
+          (__tilefinchRealmGlobal.__tilefinchFragmentInsertCount || 0) + 1;
+        __tilefinchRealmGlobal.__tilefinchFragmentInsertText =
+          (__tilefinchRealmGlobal.__tilefinchFragmentInsertText || "") +
           String(node.textContent || "").slice(0, 80);
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
+          (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         try {
           for (const item of nodes) this.insertBefore(item, child);
         } finally {
-          globalThis.__tilefinchMutationSuppressed--;
+          __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
         if (nodes.length) {
-          globalThis.__tilefinchNotifyMutation?.(
+          __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
             node,
             "childList",
             null,
             [],
             nodes,
           );
-          globalThis.__tilefinchNotifyMutation?.(
+          __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
             this,
             "childList",
             null,
@@ -6750,17 +7186,17 @@
         throw new Error("insertBefore failed");
       if (
         wasConnected &&
-        !globalThis.__tilefinchCustomElementMovePreserved
+        !__tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved
       )
-        globalThis.__tilefinchCustomElementDisconnected?.(node);
+        __tilefinchRealmGlobal.__tilefinchCustomElementDisconnected?.(node);
       const targetOwner = this.ownerDocument || document;
       if (oldOwner && targetOwner && oldOwner !== targetOwner)
-        globalThis.__tilefinchAdoptNodeOwner?.(node, targetOwner);
-      if (!globalThis.__tilefinchCustomElementMovePreserved)
-        globalThis.__tilefinchCustomElementConnected?.(node);
-      globalThis.__tilefinchCanvasConnected?.(node);
+        __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner?.(node, targetOwner);
+      if (!__tilefinchRealmGlobal.__tilefinchCustomElementMovePreserved)
+        __tilefinchRealmGlobal.__tilefinchCustomElementConnected?.(node);
+      __tilefinchRealmGlobal.__tilefinchCanvasConnected?.(node);
       if (oldParent)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           oldParent,
           "childList",
           null,
@@ -6770,7 +7206,7 @@
           oldPrevious,
           oldNext,
         );
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         this,
         "childList",
         null,
@@ -6793,15 +7229,15 @@
         return;
       }
       if (
-        globalThis.__tilefinchActiveElement === this ||
-        this.contains(globalThis.__tilefinchActiveElement) ||
-        shadowEventPath(globalThis.__tilefinchActiveElement, true).includes(this)
+        __tilefinchRealmGlobal.__tilefinchActiveElement === this ||
+        this.contains(__tilefinchRealmGlobal.__tilefinchActiveElement) ||
+        shadowEventPath(__tilefinchRealmGlobal.__tilefinchActiveElement, true).includes(this)
       )
-        globalThis.__tilefinchActiveElement = document.body;
+        __tilefinchRealmGlobal.__tilefinchActiveElement = document.body;
       const result = __tilefinchRemove(nativeReceiver.__handle);
-      if (result) globalThis.__tilefinchCustomElementDisconnected?.(this);
+      if (result) __tilefinchRealmGlobal.__tilefinchCustomElementDisconnected?.(this);
       if (parent)
-        globalThis.__tilefinchNotifyMutation?.(
+        __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           parent,
           "childList",
           null,
@@ -6833,11 +7269,11 @@
     if (typeof fast === "function") descriptor.value = fast;
   }
   let detachedAttributeMethod;
-  Object.defineProperty(globalThis, "__tilefinchBindDetachedAttributeMethods", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchBindDetachedAttributeMethods", {
     configurable: true,
     value(lookup) {
       detachedAttributeMethod = lookup;
-      delete globalThis.__tilefinchBindDetachedAttributeMethods;
+      delete __tilefinchRealmGlobal.__tilefinchBindDetachedAttributeMethods;
     },
   });
   /* Attribute operations belong to Element's WebIDL interface, not only
@@ -6883,7 +7319,7 @@
          attribute list instead of materializing a NamedNodeMap. Namespaced
          attributes are written through to the host list too. */
       const handle = Number(this.__handle);
-      if (handle > 0 && !globalThis.__tilefinchIsVirtualRemote(this))
+      if (handle > 0 && !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
         return __tilefinchAttributes(handle).length !== 0;
       const attributes = this.attributes;
       return !!attributes && attributes.length !== 0;
@@ -6937,22 +7373,22 @@
          motion module watches an element once something listens for them. */
       if (type.startsWith("transition") || type === "webkitTransitionEnd") {
         try {
-          if (typeof globalThis.__tilefinchWatchTransitions !== "function")
-            globalThis.__tilefinchEnsureMotionBootstrap?.();
-          globalThis.__tilefinchWatchTransitions?.(this, type);
+          if (typeof __tilefinchRealmGlobal.__tilefinchWatchTransitions !== "function")
+            __tilefinchRealmGlobal.__tilefinchEnsureMotionBootstrap?.();
+          __tilefinchRealmGlobal.__tilefinchWatchTransitions?.(this, type);
         } catch {}
       }
       const retained = listenerMap(this, true);
       const listeners = retained || this[wrapperListeners] || new Map();
       this[wrapperListeners] = listeners;
-      return globalThis.__tilefinchAddEventListener?.(
+      return __tilefinchRealmGlobal.__tilefinchAddEventListener?.(
         listeners, type, callback, options,
       );
     },
     removeEventListener(type, callback, options = false) {
       const listeners = this[wrapperListeners];
       if (listeners)
-        return globalThis.__tilefinchRemoveEventListener?.(
+        return __tilefinchRealmGlobal.__tilefinchRemoveEventListener?.(
           listeners, type, callback, options,
         );
     },
@@ -6962,7 +7398,7 @@
       if (!capture) inlineEventHandler(this, value.type, "on" + value.type);
       const listeners = this[wrapperListeners];
       if (listeners)
-        globalThis.__tilefinchInvokeListenerList?.(
+        __tilefinchRealmGlobal.__tilefinchInvokeListenerList?.(
           listeners, this, value, capture,
         );
     },
@@ -6997,12 +7433,25 @@
      left to them: an own copy would shadow them, and Lit would save it as
      an initial property value (MDN's runner got a DOMTokenList for its
      string `sandbox`). */
-  Object.defineProperty(globalThis, "__tilefinchPrepareNativePrototype", {
+  let sharedCustomElementMembers = false;
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchPrepareNativePrototype", {
     value(node, target) {
       if (!(node?.__handle > 0)) return;
+      if (target && Object.prototype.isPrototypeOf.call(HTMLElement.prototype, target)) {
+        if (!sharedCustomElementMembers) try {
+          /* Preserve author prototype identity without copying the native
+             member table (or enumerating its keys) for every component. */
+          for (const descriptors of [nativeNodeEventDescriptors, nativeNodeReceiverDescriptors])
+            for (const name of Object.keys(descriptors))
+              if (!Object.hasOwn(HTMLElement.prototype, name))
+                Object.defineProperty(HTMLElement.prototype, name, descriptors[name]);
+          sharedCustomElementMembers = true;
+        } catch (_) { /* Frozen/refused bases keep per-instance fallback. */ }
+        if (sharedCustomElementMembers) return;
+      }
       const classDefined = (name) => {
-        for (let p = target; p && p !== HTMLElement.prototype &&
-             p !== Element.prototype; p = Object.getPrototypeOf(p))
+        for (let p = target; p && p !== Element.prototype;
+             p = Object.getPrototypeOf(p))
           if (Object.prototype.hasOwnProperty.call(p, name)) return true;
         return false;
       };
@@ -7027,8 +7476,8 @@
             handlers.delete(type);
           }
     }
-    if (!globalThis.__tilefinchHasRemoteNodeWriter)
-      globalThis.__tilefinchApplyRemoteMutation?.(node, handle);
+    if (!__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter)
+      applyRemoteMutation(node, handle);
     node.__tilefinchRemote = false;
     node.__tilefinchRemoteSection = Number(__tilefinchSectionIdentity());
     node.__tilefinchRemoteTagName = String(
@@ -7049,7 +7498,7 @@
     const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
       id = String(__tilefinchGetAttribute(handle, "id") || ""),
       idKey = id && id.length <= 128 ? "i:" + id : "",
-      stable = globalThis.__tilefinchHasRemoteNodeWriter
+      stable = __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
         ? sourceKey || idKey
         : "";
     node.__tilefinchStableKey =
@@ -7059,9 +7508,23 @@
     installStyle(node, handle);
     installClassList(node);
     cacheNode(handle, node);
+    /* Releasing the previous handle's lease dropped the reference native
+       code kept to this wrapper for state it carries. Keep or root that
+       state for the new handle, or it would last only as long as the
+       wrapper. Keeping it first allocates nothing, so a refused
+       allocation while rooting leaves it kept; a rebind a refusal cut
+       short before here comes back for the same handle, which keeps it
+       then. */
+    if (keptOnWrapper(node)) {
+      const listeners = node[wrapperListeners] || null,
+        handlers = node[wrapperHandlers] || null;
+      keepOnWrapper(handle, node, listeners, handlers);
+      if (previous !== handle) rootEventState(handle, { listeners, handlers });
+    }
     return node;
   };
-  const nodeIdentity = ["", 0, null, 0];
+  const nodeIdentity = ["", 0, null, 0, 0];
+  let wrapperTrace = null;
   function wrap(handle) {
     if (!handle) return null;
     const cached = cachedNode(handle);
@@ -7069,7 +7532,7 @@
     /* Stable keys only matter to a remote node writer; without one, skip
        the two bridge lookups on every wrapper creation. */
     let stableKey = "";
-    if (globalThis.__tilefinchHasRemoteNodeWriter) {
+    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) {
       remoteIdentitySeen = true;
       const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
         stableId = String(__tilefinchGetAttribute(handle, "id") || "");
@@ -7083,13 +7546,18 @@
       return retained;
     }
     retentionStats.wrapperCreates++;
-    /* [tagName || "", nodeType, namespaceURI, section] in one bridge call,
-       refilling one array rather than allocating one per wrapper. */
-    __tilefinchNodeIdentity(handle, nodeIdentity);
+    /* [tagName || "", nodeType, namespaceURI, section, held-in] in one
+       bridge call, refilling one array rather than allocating one per
+       wrapper. */
+    const held = heldEventStates.size;
+    __tilefinchNodeIdentity(handle, nodeIdentity, held);
     const tagName = nodeIdentity[0],
       nodeType = nodeIdentity[1],
       namespaceURI = nodeIdentity[2],
-      section = nodeIdentity[3];
+      section = nodeIdentity[3],
+      /* With a tree held: the handle whose holder this wrapper joins (the
+         holder of its detached tree, if it has one), or 0. */
+      heldIn = held && nodeIdentity[4];
     // Start with the final prototype and final descriptor flags. Changing
     // either after filling the wrapper de-interns QuickJS's large property
     // shape, leaving a separate shape allocation for every visited element.
@@ -7118,10 +7586,14 @@
       },
     });
     node.__namespaceURI = namespaceURI;
-    node.__tilefinchStableKey = stableKey;
-    node.__tilefinchRemoteSection = section;
-    node.__tilefinchRemoteTagName = tagName;
-    node.__tilefinchRemoteNodeType = nodeType;
+    /* Ordinary live nodes read identity from the native DOM. Remote-only
+       metadata must not occupy four property slots on every such node. */
+    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter || nodeType === Node.DOCUMENT_NODE) {
+      node.__tilefinchStableKey = stableKey;
+      node.__tilefinchRemoteSection = section;
+      node.__tilefinchRemoteTagName = tagName;
+      node.__tilefinchRemoteNodeType = nodeType;
+    }
     Object.defineProperty(node, "__handle", {
       enumerable: false,
       configurable: false,
@@ -7136,25 +7608,40 @@
     Object.defineProperty(node, wrapperListeners, {
       value: stableKey
         ? listenerMap(node, false)
-        : nativeNodeListeners.size
-          ? nativeNodeListeners.get(Number(handle)) || null
-          : null,
+        : nativeNodeListeners.get(Number(handle)) ||
+          heldEventState(Number(handle))?.listeners || null,
       writable: true,
     });
     const exposed =
-      typeof globalThis.__tilefinchTraceObject === "function"
-        ? globalThis.__tilefinchTraceObject(
+      wrapperTrace !== null
+        ? wrapperTrace(
             node,
             "element." + String(node.tagName || "unknown").toLowerCase(),
           )
         : node;
+    /* A wrapper of a held tree joins its holder before it becomes the
+       node's live wrapper: were the stamp refused after, the tree could
+       outlive the wrappers keeping its holder. */
+    if (heldIn) {
+      const holder = heldEventHolder(heldIn);
+      if (holder) node[wrapperEventHolder] = holder;
+    }
     cacheNode(handle, exposed);
     if (stableKey) rememberStableWrapper(stableKey, exposed);
-    globalThis.__tilefinchRestoreCustomElement?.(exposed);
+    __tilefinchRealmGlobal.__tilefinchRestoreCustomElement?.(exposed);
     return exposed;
   }
-  globalThis.__tilefinchWrap = wrap;
-  globalThis.__tilefinchWrapRemote = (id, tag, section) => {
+  __tilefinchRealmGlobal.__tilefinchWrap = wrap;
+  /* The lab's capability trace wraps new node wrappers. Only test-probe
+     realms can install it, through a fixed setter; the shipping realm has no
+     such hook, and a page-defined global never substitutes wrappers. */
+  if (__tilefinchRealmGlobal.__tilefinchTestProbes)
+    Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchSetWrapperTrace", {
+      value: (trace) => {
+        wrapperTrace = typeof trace === "function" ? trace : null;
+      },
+    });
+  __tilefinchRealmGlobal.__tilefinchWrapRemote = (id, tag, section) => {
     noteRemoteWrapper();
     id = String(id).slice(0, 128);
     if (!id) return null;
@@ -7174,7 +7661,7 @@
     rememberStableWrapper(key, node);
     return node;
   };
-  globalThis.__tilefinchWrapRemoteSelector = (selector, tag, section) => {
+  __tilefinchRealmGlobal.__tilefinchWrapRemoteSelector = (selector, tag, section) => {
     noteRemoteWrapper();
     selector = String(selector).slice(0, 128);
     section = Number(section);
@@ -7197,7 +7684,7 @@
     rememberStableWrapper(key, node);
     return node;
   };
-  globalThis.__tilefinchWrapRemoteStable = (
+  __tilefinchRealmGlobal.__tilefinchWrapRemoteStable = (
     key,
     tag,
     section,
@@ -7234,7 +7721,7 @@
     rememberStableWrapper(key, node);
     return node;
   };
-  globalThis.__tilefinchWrapRemoteRelation = (
+  __tilefinchRealmGlobal.__tilefinchWrapRemoteRelation = (
     key,
     tag,
     section,
@@ -7247,13 +7734,13 @@
     if (special === 3) return document.body;
     key = String(key);
     return key.startsWith("i:")
-      ? globalThis.__tilefinchWrapRemote(key.slice(2), tag, section)
-      : globalThis.__tilefinchWrapRemoteStable(key, tag, section, nodeType);
+      ? __tilefinchRealmGlobal.__tilefinchWrapRemote(key.slice(2), tag, section)
+      : __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(key, tag, section, nodeType);
   };
-  globalThis.__tilefinchClearNodeCache = () => {
+  __tilefinchRealmGlobal.__tilefinchClearNodeCache = () => {
     nodeCache.clear();
   };
-  globalThis.__tilefinchRebindStableNodes = () => {
+  __tilefinchRealmGlobal.__tilefinchRebindStableNodes = () => {
     __tilefinchSuppressRemoteLookup(true);
     try {
       for (const [key, retained] of [...stableNodeWrappers.entries()]) {
@@ -7294,7 +7781,7 @@
       __tilefinchSuppressRemoteLookup(false);
     }
   };
-  globalThis.__tilefinchNodeForStableKey = (key) => {
+  __tilefinchRealmGlobal.__tilefinchNodeForStableKey = (key) => {
     key = String(key || "");
     if (key.startsWith("i:")) return document.getElementById(key.slice(2));
     if (key.startsWith("q:")) {
@@ -7304,7 +7791,7 @@
     const handle = __tilefinchFindStableNode(key);
     return handle ? wrap(handle) : null;
   };
-  globalThis.__tilefinchWrapTraversalNode = (
+  __tilefinchRealmGlobal.__tilefinchWrapTraversalNode = (
     key,
     tag,
     section,
@@ -7313,7 +7800,7 @@
   ) => {
     special = Number(special);
     if (special)
-      return globalThis.__tilefinchWrapRemoteRelation(
+      return __tilefinchRealmGlobal.__tilefinchWrapRemoteRelation(
         key,
         tag,
         section,
@@ -7321,13 +7808,13 @@
         nodeType,
       );
     return (
-      globalThis.__tilefinchNodeForStableKey(key) ||
-      globalThis.__tilefinchWrapRemoteStable(key, tag, section, nodeType)
+      __tilefinchRealmGlobal.__tilefinchNodeForStableKey(key) ||
+      __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(key, tag, section, nodeType)
     );
   };
-  globalThis.__tilefinchCurrentScriptForStable = (key, section) =>
-    globalThis.__tilefinchNodeForStableKey(key) ||
-    globalThis.__tilefinchWrapRemoteStable(
+  __tilefinchRealmGlobal.__tilefinchCurrentScriptForStable = (key, section) =>
+    __tilefinchRealmGlobal.__tilefinchNodeForStableKey(key) ||
+    __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(
       key,
       "script",
       section,
@@ -7425,10 +7912,10 @@
     if (arguments.length < 2) throw new TypeError("Two coordinates required");
     return hitTestElements(x, y)[0] || null;
   };
-  globalThis.__tilefinchDocumentListeners = documentListeners;
+  __tilefinchRealmGlobal.__tilefinchDocumentListeners = documentListeners;
   const mutationObservers = [],
     pendingMutationObservers = new Set(),
-    mutationObserverStates = new WeakMap();
+    mutationObserverStates = { get: null };
   let mutationDeliveryPending = false,
     mutationDeliveryActive = false,
     parserInsertionsArmed = false;
@@ -7529,7 +8016,7 @@
      quadruples in insertion order. Each becomes the childList record the
      parser's insertion would have queued; the checkpoint's microtask run
      then delivers them before the script executes. */
-  globalThis.__tilefinchParserMutationCheckpoint = (batch) => {
+  __tilefinchRealmGlobal.__tilefinchParserMutationCheckpoint = (batch) => {
     const length = Math.min(Number(batch?.length) || 0, 0x10000);
     retentionStats.parserRecordsCoalesced = Number(batch?.coalesced) || 0;
     if (!parserInsertionsArmed) return;
@@ -7537,7 +8024,7 @@
       const parent = parserInsertionNode(batch[index]),
         node = parserInsertionNode(batch[index + 1]);
       if (!parent || !node) continue;
-      globalThis.__tilefinchNotifyMutation?.(
+      __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
         parent,
         "childList",
         null,
@@ -7549,7 +8036,7 @@
       );
     }
   };
-  globalThis.MutationRecord = class MutationRecord {
+  __tilefinchRealmGlobal.MutationRecord = class MutationRecord {
     constructor(init = {}) {
       this.type = String(init.type || "");
       this.target = init.target || null;
@@ -7575,10 +8062,18 @@
     state.subtree = subtree;
   };
   const NativeMutationObserver = class MutationObserver {
+    #state;
+    static {
+      /* A callback can retain its observer through its component owner.
+         Keep that cycle on the observer, not in a global WeakMap value. */
+      mutationObserverStates.get = observer =>
+        observer && typeof observer === "object" && #state in observer
+          ? observer.#state : undefined;
+    }
     constructor(callback) {
       if (typeof callback !== "function")
         throw new TypeError("callback required");
-      mutationObserverStates.set(this, {
+      this.#state = {
         callback,
         targets: [],
         records: [],
@@ -7591,7 +8086,7 @@
            registrations): queueMutationRecords skips the rest unread. */
         interest: 0,
         subtree: false,
-      });
+      };
     }
     observe(target, options = {}) {
       const state = mutationObserverStates.get(this);
@@ -7675,7 +8170,7 @@
       return records;
     }
   };
-  globalThis.MutationObserver = NativeMutationObserver;
+  __tilefinchRealmGlobal.MutationObserver = NativeMutationObserver;
   /* WebIDL operations are enumerable, unlike authored class methods.
      Enumeration-based wrappers must discover these on an observer instance. */
   for (const name of ["observe", "disconnect", "takeRecords"])
@@ -7687,7 +8182,7 @@
   /* Motion is installed lazily, after pages may replace the public
      constructor or its methods. Keep its observer in this realm's original
      bounded observer machinery, without invoking authored wrappers. */
-  Object.defineProperty(globalThis, "__tilefinchObserveMutations", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchObserveMutations", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -7703,7 +8198,7 @@
   });
   {
     const observers = new Set(),
-      resizeStates = new WeakMap(),
+      resizeStates = { get: null },
       resizeTargetLimit = 1024,
       resizeState = (observer) => {
         const state = resizeStates.get(observer);
@@ -7919,7 +8414,7 @@
             const state = resizeState(observer);
             if (!state.targets.size) continue;
             try {
-              globalThis.__tilefinchRunTask(
+              __tilefinchRealmGlobal.__tilefinchRunTask(
                 "resize-observer",
                 state.callback,
                 observer,
@@ -7948,23 +8443,29 @@
         if (resizeRecheckPending) return true;
         resizeRecheckPending = true;
         const schedule =
-          globalThis.__tilefinchScheduleRenderObserver || queueMicrotask;
+          __tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || queueMicrotask;
         schedule(deliverResizeObservations);
         return true;
       };
-    globalThis.__tilefinchResizeRecheck = scheduleResizeRecheck;
-    globalThis.ResizeObserverSize = ResizeObserverSize;
-    globalThis.ResizeObserverEntry = ResizeObserverEntry;
-    globalThis.ResizeObserver = class ResizeObserver {
+    __tilefinchRealmGlobal.__tilefinchResizeRecheck = scheduleResizeRecheck;
+    __tilefinchRealmGlobal.ResizeObserverSize = ResizeObserverSize;
+    __tilefinchRealmGlobal.ResizeObserverEntry = ResizeObserverEntry;
+    __tilefinchRealmGlobal.ResizeObserver = class ResizeObserver {
+      #state;
+      static {
+        resizeStates.get = observer =>
+          observer && typeof observer === "object" && #state in observer
+            ? observer.#state : undefined;
+      }
       constructor(callback) {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
         /* Empty observers have no delivery work and must not be retained.
            Bound live registrations, not the number of component instances:
            pages commonly create one observer per card. */
-        resizeStates.set(this, {
+        this.#state = {
           callback, targets: new Map(), lastSizes: new Map(),
-        });
+        };
       }
       observe(target, options = {}) {
         const state = resizeState(this);
@@ -8013,7 +8514,7 @@
     };
   }
   {
-    globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
+    __tilefinchRealmGlobal.IntersectionObserverEntry = class IntersectionObserverEntry {
       constructor(init = {}) {
         /* Copy entry fields as own data properties. Compatibility shims may
            install getter-only prototype fields; ordinary assignment must
@@ -8175,7 +8676,7 @@
         const entries = observer.takeRecords();
         if (!entries.length) return;
         try {
-          globalThis.__tilefinchRunTask(
+          __tilefinchRealmGlobal.__tilefinchRunTask(
             "intersection-observer",
             observer.callback,
             observer,
@@ -8234,7 +8735,7 @@
         (freshAt < fresh.length || pass || passRequested)
       ) {
         continuationQueued = true;
-        (globalThis.__tilefinchScheduleRenderObserver || queueMicrotask)(
+        (__tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || queueMicrotask)(
           () => {
             continuationQueued = false;
             step();
@@ -8257,21 +8758,21 @@
       if (active.size) passRequested = true;
       queueUpdate(queueMicrotask);
     };
-    globalThis.__tilefinchIntersectionRecheck = () => {
+    __tilefinchRealmGlobal.__tilefinchIntersectionRecheck = () => {
       requestPass();
-      globalThis.__tilefinchResizeRecheck?.();
+      __tilefinchRealmGlobal.__tilefinchResizeRecheck?.();
     };
     let scrollHooked = false;
     const hookScroll = () => {
-      if (scrollHooked || typeof globalThis.addEventListener !== "function")
+      if (scrollHooked || typeof __tilefinchRealmGlobal.addEventListener !== "function")
         return;
       scrollHooked = true;
-      globalThis.addEventListener("scroll", requestPass, {
+      __tilefinchRealmGlobal.addEventListener("scroll", requestPass, {
         capture: true,
         passive: true,
       });
     };
-    globalThis.IntersectionObserver = class {
+    __tilefinchRealmGlobal.IntersectionObserver = class {
       constructor(callback, options = {}) {
         if (typeof callback !== "function")
           throw new TypeError("callback required");
@@ -8323,8 +8824,8 @@
          * platform-mandated ResizeObserver ordering remains truthful.
          */
         queueUpdate(
-          globalThis.__tilefinchResizeRecheck?.() === true
-            ? globalThis.__tilefinchScheduleRenderFixup || queueMicrotask
+          __tilefinchRealmGlobal.__tilefinchResizeRecheck?.() === true
+            ? __tilefinchRealmGlobal.__tilefinchScheduleRenderFixup || queueMicrotask
             : queueMicrotask,
         );
       }
@@ -8352,7 +8853,7 @@
     motionInlineHintCheckedGeneration = 0,
     motionInlineHintCached = false,
     motionInlineHintScans = 0;
-  Object.defineProperty(globalThis, "__tilefinchStyleSheetGeneration", {
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchStyleSheetGeneration", {
     configurable: false,
     enumerable: false,
     writable: false,
@@ -8365,64 +8866,133 @@
     }
     return false;
   };
-  const motionHintUtf8Length = (text) => {
-    let bytes = 0;
-    for (let at = 0; at < text.length; at++) {
-      const code = text.charCodeAt(at);
-      if (code <= 0x7f) bytes++;
-      else if (code <= 0x7ff) bytes += 2;
-      else if (
-        code >= 0xd800 &&
-        code <= 0xdbff &&
-        at + 1 < text.length &&
-        text.charCodeAt(at + 1) >= 0xdc00 &&
-        text.charCodeAt(at + 1) <= 0xdfff
-      ) {
-        bytes += 4;
-        at++;
-      } else bytes += 3;
-    }
-    return bytes;
-  };
-  const motionStyleTextPrefix = (node, maximumBytes, maximumNodes) => {
-    try {
-      const result = globalThis.__tilefinchGetTextPrefix?.(
-          node?.__handle,
-          maximumBytes,
-          maximumNodes,
+  /* CSS motion's bounded style-text scan, shared with the lazy motion.js
+     (__tilefinchMotionStyleScan): at most 64 sibling elements per root,
+     256 KiB and 4096 text nodes in all. */
+  const MOTION_STYLE_LIMIT = 64,
+    MOTION_STYLE_BYTES_LIMIT = 256 * 1024,
+    MOTION_STYLE_NODE_LIMIT = 4096,
+    motionUtf8Length = (text) => {
+      /* ASCII text, the common case, is one byte per code unit: one native
+         regular-expression pass instead of a loop per character. */
+      if (!/[^\x00-\x7f]/.test(text)) return text.length;
+      let bytes = 0;
+      for (let at = 0; at < text.length; at++) {
+        const code = text.charCodeAt(at);
+        if (code <= 0x7f) bytes++;
+        else if (code <= 0x7ff) bytes += 2;
+        else if (
+          code >= 0xd800 &&
+          code <= 0xdbff &&
+          at + 1 < text.length &&
+          text.charCodeAt(at + 1) >= 0xdc00 &&
+          text.charCodeAt(at + 1) <= 0xdfff
+        ) {
+          bytes += 4;
+          at++;
+        } else bytes += 3;
+      }
+      return bytes;
+    },
+    motionStyleTextPrefix = (style, maximumBytes, maximumNodes) => {
+      if (!style || maximumBytes <= 0 || maximumNodes <= 0)
+        return { text: "", nodes: 0, bytes: 0 };
+      try {
+        const result = __tilefinchRealmGlobal.__tilefinchGetTextPrefix?.(
+            typeof style === "number" ? style : style.__handle,
+            Math.min(MOTION_STYLE_BYTES_LIMIT, maximumBytes),
+            Math.min(MOTION_STYLE_NODE_LIMIT, maximumNodes),
+          );
+        return result && typeof result === "object"
+          ? {
+              text: String(result.text || ""),
+              nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
+              bytes: Math.max(
+                0,
+                Math.min(
+                  maximumBytes,
+                  typeof result.bytes === "number"
+                    ? result.bytes | 0
+                    : motionUtf8Length(String(result.text || "")),
+                ),
+              ),
+            }
+          : { text: "", nodes: 0, bytes: 0 };
+      } catch {
+        return { text: "", nodes: 0, bytes: 0 };
+      }
+    },
+    motionStyleAttributePrefix = (element, maximumBytes) => {
+      if (!element || maximumBytes <= 0) return "";
+      try {
+        return String(
+          __tilefinchRealmGlobal.__tilefinchGetStyleAttributePrefix?.(
+            typeof element === "number" ? element : element.__handle,
+            Math.min(MOTION_STYLE_BYTES_LIMIT, maximumBytes),
+          ) ?? "",
         );
-      return result && typeof result === "object"
-        ? {
-            text: String(result.text || ""),
-            nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
-            bytes: Math.max(0, Math.min(maximumBytes, result.bytes | 0)),
+      } catch {
+        return "";
+      }
+    },
+    /* Whether a <style> or style attribute in the head or body names
+       keyframes or an animation. */
+    motionInlineHint = () => {
+      let inspectedBytes = 0,
+        inspectedNodes = 0;
+      for (const root of [document.head, document.body]) {
+        let node = root?.firstElementChild || null;
+        for (
+          let visited = 0;
+          node &&
+          visited < MOTION_STYLE_LIMIT &&
+          inspectedBytes < MOTION_STYLE_BYTES_LIMIT &&
+          inspectedNodes < MOTION_STYLE_NODE_LIMIT;
+          visited++
+        ) {
+          const available = MOTION_STYLE_BYTES_LIMIT - inspectedBytes;
+          let text = "";
+          if (String(node.localName || "").toLowerCase() === "style") {
+            const retained = motionStyleTextPrefix(
+              node,
+              available,
+              MOTION_STYLE_NODE_LIMIT - inspectedNodes,
+            );
+            text = retained.text;
+            inspectedNodes += retained.nodes;
+            inspectedBytes += retained.bytes;
+          } else {
+            text = motionStyleAttributePrefix(node, available);
+            inspectedNodes++;
+            inspectedBytes += motionUtf8Length(text);
           }
-        : { text: "", nodes: 0, bytes: 0 };
-    } catch {
-      return { text: "", nodes: 0, bytes: 0 };
-    }
-  };
-  const motionStyleAttributePrefix = (node, maximumBytes) => {
-    try {
-      return String(
-        globalThis.__tilefinchGetStyleAttributePrefix?.(
-          node?.__handle,
-          maximumBytes,
-        ) ?? "",
-      );
-    } catch {
-      return "";
-    }
-  };
-  globalThis.__tilefinchMaybeStartMotion = () => {
-    if (typeof globalThis.__tilefinchMotionRecheck === "function") {
-      globalThis.__tilefinchBeginMotionObservation?.();
-      globalThis.__tilefinchMotionRecheck();
+          if (/@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(text))
+            return true;
+          node = node.nextElementSibling;
+        }
+      }
+      return false;
+    };
+  Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchMotionStyleScan", {
+    value: Object.freeze({
+      styleLimit: MOTION_STYLE_LIMIT,
+      bytesLimit: MOTION_STYLE_BYTES_LIMIT,
+      nodeLimit: MOTION_STYLE_NODE_LIMIT,
+      utf8Length: motionUtf8Length,
+      styleTextPrefix: motionStyleTextPrefix,
+      styleAttributePrefix: motionStyleAttributePrefix,
+      inlineHint: motionInlineHint,
+    }),
+  });
+  __tilefinchRealmGlobal.__tilefinchMaybeStartMotion = () => {
+    if (typeof __tilefinchRealmGlobal.__tilefinchMotionRecheck === "function") {
+      __tilefinchRealmGlobal.__tilefinchBeginMotionObservation?.();
+      __tilefinchRealmGlobal.__tilefinchMotionRecheck();
       return true;
     }
     let hinted = false;
     try {
-      hinted = !!globalThis.__tilefinchStylesheetHasMotionKeyframes?.();
+      hinted = !!__tilefinchRealmGlobal.__tilefinchStylesheetHasMotionKeyframes?.();
       if (
         !hinted &&
         motionInlineHintCheckedGeneration !== motionInlineHintGeneration
@@ -8433,58 +9003,19 @@
          * covers completed nested author styles. */
         motionInlineHintCached = false;
         motionInlineHintScans++;
-        let inspectedBytes = 0,
-          inspectedNodes = 0;
-        for (const root of [document.head, document.body]) {
-          let node = root?.firstElementChild || null;
-          for (
-            let visited = 0;
-            node &&
-            visited < 64 &&
-            inspectedBytes < 256 * 1024 &&
-            inspectedNodes < 4096;
-            visited++
-          ) {
-            const available = 256 * 1024 - inspectedBytes;
-            let text = "";
-            if (String(node.localName || "").toLowerCase() === "style") {
-              const retained = motionStyleTextPrefix(
-                node,
-                available,
-                4096 - inspectedNodes,
-              );
-              text = retained.text;
-              inspectedNodes += retained.nodes;
-              inspectedBytes += retained.bytes;
-            } else {
-              text = motionStyleAttributePrefix(node, available);
-              inspectedNodes++;
-              inspectedBytes += motionHintUtf8Length(text);
-            }
-            if (
-              /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
-                text,
-              )
-            ) {
-              motionInlineHintCached = true;
-              break;
-            }
-            node = node.nextElementSibling;
-          }
-          if (motionInlineHintCached) break;
-        }
+        motionInlineHintCached = motionInlineHint();
         motionInlineHintCheckedGeneration = motionInlineHintGeneration;
       }
       hinted ||= motionInlineHintCached;
     } catch {}
     if (!hinted) return false;
     try {
-      if (!globalThis.__tilefinchEnsureMotionBootstrap?.()) return false;
+      if (!__tilefinchRealmGlobal.__tilefinchEnsureMotionBootstrap?.()) return false;
     } catch {
       return false;
     }
-    globalThis.__tilefinchBeginMotionObservation?.();
-    globalThis.__tilefinchMotionRecheck?.();
+    __tilefinchRealmGlobal.__tilefinchBeginMotionObservation?.();
+    __tilefinchRealmGlobal.__tilefinchMotionRecheck?.();
     return true;
   };
   /* This turn's attribute changes with their old values, so the transition
@@ -8492,7 +9023,7 @@
      transitionend listener is added just after its class changed. */
   const recentAttributeChanges = [];
   let recentAttributeChangesQueued = false;
-  globalThis.__tilefinchRecentAttributeChanges = () => recentAttributeChanges;
+  __tilefinchRealmGlobal.__tilefinchRecentAttributeChanges = () => recentAttributeChanges;
   const scheduleMutationDelivery = () => {
     if (!mutationDeliveryPending) {
       mutationDeliveryPending = true;
@@ -8518,7 +9049,7 @@
           itemState.transientRoots = [];
           if (records.length)
             try {
-              globalThis.__tilefinchRunTask(
+              __tilefinchRealmGlobal.__tilefinchRunTask(
                 "mutation-observer",
                 itemState.callback,
                 item,
@@ -8551,9 +9082,9 @@
     mutationPromiseResolve = Function.call.bind(Promise.resolve, Promise),
     mutationPromiseThen = Function.call.bind(Promise.prototype.then),
     styleSheetAttributeNames = ["disabled", "href", "media", "rel", "type"],
-    nativeIsAncestor = globalThis.__tilefinchIsAncestor,
-    nativeNearestId = globalThis.__tilefinchNearestId,
-    nativeNextAncestorEntry = globalThis.__tilefinchNextAncestorEntry;
+    nativeIsAncestor = __tilefinchRealmGlobal.__tilefinchIsAncestor,
+    nativeNearestId = __tilefinchRealmGlobal.__tilefinchNearestId,
+    nativeNextAncestorEntry = __tilefinchRealmGlobal.__tilefinchNextAncestorEntry;
   /* Whether the node with `handle` is on the parentNode chain of the native
      mutation target, by one native parent-pointer walk instead of a wrapper
      per ancestor; undefined when only the wrapper walk can tell (either is
@@ -8804,7 +9335,7 @@
   const emptyMutationNodes = Object.freeze([]);
   /* Whether a tree change can add, remove or reorder child navigables (an
      iframe or frame element, or a subtree holding one, searched natively). */
-  const nativeFrameHandles = globalThis.__tilefinchFrameHandles,
+  const nativeFrameHandles = __tilefinchRealmGlobal.__tilefinchFrameHandles,
     childNavigableContainer = (node) => {
       const name = String(node?.localName || "").toLowerCase();
       return name === "iframe" || name === "frame";
@@ -8820,7 +9351,7 @@
       }
       return false;
     };
-  globalThis.__tilefinchNotifyMutation = (
+  __tilefinchRealmGlobal.__tilefinchNotifyMutation = (
     target,
     type,
     attributeName,
@@ -8832,8 +9363,8 @@
     attributeNamespace = null,
   ) => {
     if (
-      globalThis.__tilefinchRestoringSection ||
-      globalThis.__tilefinchMutationSuppressed
+      __tilefinchRealmGlobal.__tilefinchRestoringSection ||
+      __tilefinchRealmGlobal.__tilefinchMutationSuppressed
     )
       return;
     if (type === "childList" && removedNodes.length)
@@ -8859,15 +9390,15 @@
           clearRecentAttributeChanges,
         );
       }
-      globalThis.__tilefinchTransitionsDirty?.(target, attributeName, oldValue);
+      __tilefinchRealmGlobal.__tilefinchTransitionsDirty?.(target, attributeName, oldValue);
     }
-    globalThis.__tilefinchQueueFocusFixup?.(
+    __tilefinchRealmGlobal.__tilefinchQueueFocusFixup?.(
       target,
       type,
       attributeName,
       addedNodes,
     );
-    const writer = globalThis.__tilefinchHasRemoteNodeWriter;
+    const writer = __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter;
     /* Section state's dirty-node key. An ordinary native target takes one
        native walk to its nearest id instead of a wrapper and an id read per
        ancestor; stable keys (section-remote nodes), script-side parents and
@@ -8875,7 +9406,7 @@
     const nearestId =
       writer || !nativeTarget ? undefined : nativeNearestId(nativeTarget);
     if (nearestId !== undefined && nearestId.length <= 128) {
-      if (nearestId) globalThis.__tilefinchDirtyNodeIds?.add("i:" + nearestId);
+      if (nearestId) __tilefinchRealmGlobal.__tilefinchDirtyNodeIds?.add("i:" + nearestId);
     } else if (
       !writer ||
       (target !== document.documentElement &&
@@ -8893,7 +9424,7 @@
               (id && id.length <= 128 ? "i:" + id : ""),
           );
         if (key) {
-          globalThis.__tilefinchDirtyNodeIds?.add(key);
+          __tilefinchRealmGlobal.__tilefinchDirtyNodeIds?.add(key);
           break;
         }
       }
@@ -8910,13 +9441,13 @@
         nextSibling,
         attributeNamespace,
       );
-    globalThis.__tilefinchResizeRecheck?.();
+    __tilefinchRealmGlobal.__tilefinchResizeRecheck?.();
     if (type === "childList"
       ? childNavigablesMoved(addedNodes) || childNavigablesMoved(removedNodes)
       : type === "attributes" &&
         attributeName === "name" &&
         childNavigableContainer(target))
-      globalThis.__tilefinchChildNavigablesChanged?.(
+      __tilefinchRealmGlobal.__tilefinchChildNavigablesChanged?.(
         type === "attributes" ? target : null,
       );
     /* Names are read only for the mutation kinds that can use them. */
@@ -8952,20 +9483,22 @@
     }
     if (styleSheetMutation) {
       /* New or changed rules can restyle the focused element anywhere. */
-      globalThis.__tilefinchQueueFocusFixup?.();
+      __tilefinchRealmGlobal.__tilefinchQueueFocusFixup?.();
       styleSheetGeneration++;
       if (!styleSheetGeneration) styleSheetGeneration = 1;
     }
     if (motionStyleMutation) {
       motionInlineHintGeneration++;
       if (!motionInlineHintGeneration) motionInlineHintGeneration = 1;
-      globalThis.__tilefinchMaybeStartMotion();
+      __tilefinchRealmGlobal.__tilefinchMaybeStartMotion();
     } else if (type === "attributes" && attributeName === "class") {
-      globalThis.__tilefinchMaybeStartMotion();
+      __tilefinchRealmGlobal.__tilefinchMaybeStartMotion();
     }
     scheduleShadowSlotChange(target, removedNodes, type);
   };
-  {
+  /* Test-only counters, read by host tests and the lab's telemetry. Later
+     modules add theirs when the census exists. */
+  if (testProbes) {
     const census = {};
     Object.defineProperties(census, {
       nodeWrappers: { get: () => nodeCache.size },
@@ -8974,9 +9507,13 @@
       stableHandlerTargets: { get: () => stableNodeHandlers.size },
       nativeListenerTargets: { get: () => nativeNodeListeners.size },
       nativeHandlerTargets: { get: () => nativeNodeHandlers.size },
+      heldEventTargets: { get: () => heldEventStates.size },
+      eventTargetCapacity: { get: () => nativeEventTargets.capacity },
+      stableEventTargetCapacity: { get: () => stableEventTargets.capacity },
       mutationObservers: { get: () => mutationObservers.length },
+      slotAssignmentRoots: { get: () => pendingSlotRoots.size },
       motionInlineHintScans: { get: () => motionInlineHintScans },
     });
-    globalThis.__tilefinchRootCensus = census;
+    __tilefinchRealmGlobal.__tilefinchRootCensus = census;
   }
 })();

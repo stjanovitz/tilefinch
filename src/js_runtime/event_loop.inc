@@ -2,27 +2,6 @@
    stack when the allocator trap fires, so giant allocations can be
    attributed to page code.  Reenters the VM from inside an allocation;
    host-only, one-shot, best-effort. */
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-static uint64_t js_rt_lab_thread_cpu_ns(void)
-{
-#ifdef CLOCK_THREAD_CPUTIME_ID
-    struct timespec value;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0)
-        return (uint64_t)value.tv_sec * UINT64_C(1000000000)
-            + (uint64_t)value.tv_nsec;
-#endif
-    return 0;
-}
-
-static uint64_t js_rt_lab_realtime_us(void)
-{
-    struct timespec value;
-    if (clock_gettime(CLOCK_REALTIME, &value) != 0) return 0;
-    return (uint64_t)value.tv_sec * UINT64_C(1000000)
-        + (uint64_t)value.tv_nsec / UINT64_C(1000);
-}
-#endif
-
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static void js_rt_dump_interpreter_stack(void *opaque)
 {
@@ -50,6 +29,7 @@ void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
     /* References dropped by the previous entry may be collectable now: let
        its first handle-table exhaustion collect again. */
     runtime->bridge.node_reclaim_gc_skip = 0;
+    runtime->bridge.shadow_reclaim_gc_skip = 0;
     watchdog_finish_slice(&runtime->watchdog);
     runtime->watchdog.started_ms = monotonic_time_ms();
     runtime->watchdog.deadline_ms = runtime->timeout_ms
@@ -151,9 +131,6 @@ static void runtime_log_reentrant_checkpoint(ScriptRuntime *runtime)
 }
 #endif
 
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-#include "tilefinch/native_tier_lab.h"
-#endif
 static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime);
 
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
@@ -288,19 +265,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
         if (!js_rt_runtime_native_checkpoint(runtime)) return false;
         JSContext *job_context = NULL;
         uint64_t started_ns = js_rt_monotonic_time_ns();
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-        uint64_t tier_epoch_before = 0, tier_calls_before = 0,
-                 tier_completed_before = 0;
-        uint64_t tier_lazy_before_ns = 0;
-        uint64_t tier_cpu_before_ns = trace_steps
-            ? js_rt_lab_thread_cpu_ns() : 0;
-        if (trace_steps) tilefinch_native_tier_job_begin();
-        if (trace_steps)
-            tilefinch_native_tier_snapshot(runtime->runtime,
-                &tier_epoch_before, &tier_calls_before, &tier_completed_before);
-        if (trace_steps)
-            tier_lazy_before_ns = tilefinch_native_tier_lazy_compile_ns();
-#endif
         size_t polls_before = runtime->watchdog.polls;
         size_t failures_before = runtime->budget->failure_count;
         size_t heap_rejections_before =
@@ -317,12 +281,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             runtime->profile->phase = 1;
             runtime->profile->job_begin_ns = started_ns;
         }
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-        uint64_t execute_started_ns = trace_steps
-            ? js_rt_monotonic_time_ns() : 0;
-        uint64_t execute_started_cpu_ns = trace_steps
-            ? js_rt_lab_thread_cpu_ns() : 0;
-#endif
 #ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
         uint32_t census_job = script_census_job_begin(started_ns / UINT64_C(1000));
 #endif
@@ -330,12 +288,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
 #ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
         uint64_t census_end_us = census_job
             ? js_rt_monotonic_time_ns() / UINT64_C(1000) : 0;
-#endif
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-        uint64_t execute_elapsed_ns = trace_steps
-            ? js_rt_monotonic_time_ns() - execute_started_ns : 0;
-        uint64_t execute_cpu_ns = trace_steps && execute_started_cpu_ns != 0
-            ? js_rt_lab_thread_cpu_ns() - execute_started_cpu_ns : 0;
 #endif
         script_profile_leave(runtime);
         script_profile_job_finish(runtime, job_profile, started_ns);
@@ -346,34 +298,6 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
         if (trace_steps) {
             uint64_t elapsed_us =
                 (js_rt_monotonic_time_ns() - started_ns) / UINT64_C(1000);
-#ifdef TILEFINCH_NATIVE_TIER_LAB
-            if (elapsed_us >= 5000u) {
-                uint64_t epoch_after = 0, calls_after = 0,
-                         completed_after = 0;
-                tilefinch_native_tier_snapshot(runtime->runtime,
-                    &epoch_after, &calls_after, &completed_after);
-                bool same_owner = tier_epoch_before == 0 ||
-                                  tier_epoch_before == epoch_after;
-                fprintf(stderr,
-                    "tilefinch-native-tier-job wall-us=%llu cpu-us=%llu native-calls=%llu "
-                    "native-instructions=%llu lazy-compile-us=%llu reset=%u begin-us=%llu "
-                    "execute-wall-us=%llu execute-cpu-us=%llu realtime-end-us=%llu\n",
-                    (unsigned long long)elapsed_us,
-                    (unsigned long long)(tier_cpu_before_ns == 0 ? 0 :
-                        (js_rt_lab_thread_cpu_ns() - tier_cpu_before_ns)
-                            / UINT64_C(1000)),
-                    (unsigned long long)(same_owner ? calls_after - tier_calls_before : 0),
-                    (unsigned long long)(same_owner ? completed_after - tier_completed_before : 0),
-                    (unsigned long long)((tilefinch_native_tier_lazy_compile_ns()
-                        - tier_lazy_before_ns) / UINT64_C(1000)),
-                    same_owner ? 0u : 1u,
-                    (unsigned long long)(started_ns / UINT64_C(1000)),
-                    (unsigned long long)(execute_elapsed_ns / UINT64_C(1000)),
-                    (unsigned long long)(execute_cpu_ns / UINT64_C(1000)),
-                    (unsigned long long)js_rt_lab_realtime_us());
-                tilefinch_native_tier_job_report(runtime->runtime, elapsed_us);
-            }
-#endif
             promise_jobs++;
             promise_job_us += elapsed_us;
 #ifdef TILEFINCH_SCRIPT_SPLIT
@@ -536,7 +460,6 @@ static const char *const runtime_host_callback_names[
     "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
     "__tilefinchSchedulerSnapshot",
-    "__tilefinchXHRDiagnostics",
     "__tilefinchRebindDocument",
     "__tilefinchCommitSameDocument",
     "__tilefinchRestoreSameDocument",
@@ -609,7 +532,6 @@ static bool runtime_call_host(ScriptRuntime *runtime,
            scheduler snapshot is bookkeeping. Everything else runs script. */
         unsigned ledger = callback == SCRIPT_HOST_PUMP_TIMERS
                 || callback == SCRIPT_HOST_SCHEDULER_SNAPSHOT
-                || callback == SCRIPT_HOST_XHR_DIAGNOSTICS
             ? WORK_LEDGER_KIND_COUNT : work_ledger_enter(WORK_LEDGER_SCRIPT);
         unsigned split = ledger == WORK_LEDGER_KIND_COUNT
             ? SCRIPT_SPLIT_KIND_COUNT + 1u : script_split_enter(SCRIPT_SPLIT_JS);
@@ -1377,7 +1299,7 @@ long script_runtime_node_handle(ScriptRuntime *runtime,
         /* Public native handles may outlive any particular JavaScript
            wrapper (frame routing is the current user), so finalizers must
            not recycle their slots until document invalidation. */
-        runtime->bridge.node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+        bridge_pin_node_slot(&runtime->bridge, slot);
     }
     return (long) handle;
 }
@@ -1545,7 +1467,7 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
     runtime->pending_timer_tasks = timers >= 65535.0 ? 65535u
         : timers > 0 ? (size_t) timers : 0u;
     runtime->result.pending_tasks = runtime->pending_timer_tasks
-        + runtime->image_load_pending;
+        + runtime->image_load_pending + image_preloads_pending(runtime);
     int64_t waiting = 0;
     if (JS_IsObject(runtime->host_network_queue_stats)) {
         JSValue value = JS_GetPropertyStr(

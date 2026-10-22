@@ -9,18 +9,25 @@
    * loading/attention effects without turning authored CSS into an
    * unbounded second retained style tree on the PSP.
    */
-  const STYLE_LIMIT = 64,
-    STYLE_BYTES_LIMIT = 256 * 1024,
+  /* dom.js owns the bounded style-text scan and its limits. */
+  const {
+      styleLimit: STYLE_LIMIT,
+      bytesLimit: STYLE_BYTES_LIMIT,
+      nodeLimit: STYLE_NODE_LIMIT,
+      utf8Length: boundedUtf8Length,
+      styleTextPrefix,
+      styleAttributePrefix,
+      inlineHint: documentHasInlineMotionHint,
+    } = globalThis.__tilefinchMotionStyleScan,
     CACHE_STRING_UNITS = 32 * 1024,
     CACHE_FRAME_PROPERTIES = 512,
-    STYLE_NODE_LIMIT = 4096,
     KEYFRAME_LIMIT = 16,
     RULE_LIMIT = 128,
     ELEMENT_LIMIT = 128,
     SHADOW_ROOT_LIMIT = 16,
     FRAME_LIMIT = 16,
-    DURATION_LIMIT = 4000,
-    ITERATION_LIMIT = 8,
+    DURATION_LIMIT = globalThis.__tilefinchEffectLimits.duration,
+    ITERATION_LIMIT = globalThis.__tilefinchEffectLimits.iterations,
     reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches,
     active = new Set(),
     applied = new WeakMap(),
@@ -44,7 +51,7 @@
     scanIterator = null,
     scanRunning = false,
     ruleCache = null;
-  if (globalThis.__tilefinchRootCensus)
+  if (globalThis.__tilefinchTestProbes && globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
       motionScans: { get: () => scans },
       motionDeclarationParses: { get: () => declarationParses },
@@ -91,69 +98,6 @@
       }
       return limit;
     },
-    boundedUtf8Length = (text) => {
-      /* ASCII text, the common case, is one byte per code unit: one native
-         regular-expression pass instead of a loop per character. */
-      if (!/[^\x00-\x7f]/.test(text)) return text.length;
-      let bytes = 0;
-      for (let at = 0; at < text.length; at++) {
-        const code = text.charCodeAt(at);
-        if (code <= 0x7f) bytes++;
-        else if (code <= 0x7ff) bytes += 2;
-        else if (
-          code >= 0xd800 &&
-          code <= 0xdbff &&
-          at + 1 < text.length &&
-          text.charCodeAt(at + 1) >= 0xdc00 &&
-          text.charCodeAt(at + 1) <= 0xdfff
-        ) {
-          bytes += 4;
-          at++;
-        } else bytes += 3;
-      }
-      return bytes;
-    },
-    styleTextPrefix = (style, maximumBytes, maximumNodes) => {
-      if (!style || maximumBytes <= 0 || maximumNodes <= 0)
-        return { text: "", nodes: 0, bytes: 0 };
-      try {
-        const result = globalThis.__tilefinchGetTextPrefix?.(
-            typeof style === "number" ? style : style.__handle,
-            Math.min(STYLE_BYTES_LIMIT, maximumBytes),
-            Math.min(STYLE_NODE_LIMIT, maximumNodes),
-          );
-        return result && typeof result === "object"
-          ? {
-              text: String(result.text || ""),
-              nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
-              bytes: Math.max(
-                0,
-                Math.min(
-                  maximumBytes,
-                  typeof result.bytes === "number"
-                    ? result.bytes | 0
-                    : boundedUtf8Length(String(result.text || "")),
-                ),
-              ),
-            }
-          : { text: "", nodes: 0, bytes: 0 };
-      } catch {
-        return { text: "", nodes: 0, bytes: 0 };
-      }
-    },
-    styleAttributePrefix = (element, maximumBytes) => {
-      if (!element || maximumBytes <= 0) return "";
-      try {
-        return String(
-          globalThis.__tilefinchGetStyleAttributePrefix?.(
-            typeof element === "number" ? element : element.__handle,
-            Math.min(STYLE_BYTES_LIMIT, maximumBytes),
-          ) ?? "",
-        );
-      } catch {
-        return "";
-      }
-    },
     declarationMap = function* (text) {
       declarationParses++;
       const declarations = new Map();
@@ -187,11 +131,12 @@
       }
       return declarations;
     },
-    firstListItem = (value) => {
+    /* Where the top-level comma-separated list item starting at `at`
+       ends: its comma, or the end of the text. */
+    listItemEnd = (text, at) => {
       let depth = 0,
         quote = "";
-      const text = String(value || "");
-      for (let at = 0; at < text.length; at++) {
+      for (; at < text.length; at++) {
         const character = text[at];
         if (quote) {
           if (character === "\\") at++;
@@ -199,10 +144,34 @@
         } else if (character === '"' || character === "'") quote = character;
         else if (character === "(") depth++;
         else if (character === ")" && depth) depth--;
-        else if (character === "," && depth === 0)
-          return text.slice(0, at).trim();
+        else if (character === "," && depth === 0) return at;
       }
-      return text.trim();
+      return text.length;
+    },
+    firstListItem = (value) => {
+      const text = String(value || "");
+      return text.slice(0, listItemEnd(text, 0)).trim();
+    },
+    /* Timing functions go through the native validator behind
+       transition-timing-function, so a CSS animation accepts exactly the
+       easings a transition does. var() is not substituted here, so such a
+       value is left alone, as before. */
+    TIMING_TOKEN =
+      /^(?:linear|ease(?:-in|-out|-in-out)?|step-(?:start|end)|(?:cubic-bezier|steps|linear)\(.*)$/i,
+    VAR_REFERENCE = /var\(/i,
+    /* The first item of a valid animation-timing-function list, serialized;
+       null when any item is invalid (the declaration is then dropped). */
+    timingListFirst = (value) => {
+      const text = String(value || "");
+      let first = null;
+      for (let at = 0, items = 0; at <= text.length && items < 64; items++) {
+        const end = listItemEnd(text, at),
+          timing = __tilefinchTimingFunction(text.slice(at, end));
+        if (timing === null) return null;
+        if (first === null) first = timing;
+        at = end + 1;
+      }
+      return first;
     },
     timeMs = (value) => {
       const match = String(value || "")
@@ -230,6 +199,21 @@
         ) || [];
         let sawTime = false;
         for (const token of tokens) {
+          if (TIMING_TOKEN.test(token) && !VAR_REFERENCE.test(token)) {
+            const timing = __tilefinchTimingFunction(token);
+            /* An invalid easing makes the whole shorthand invalid. */
+            if (timing === null) {
+              name = "";
+              duration = delay = 0;
+              iterations = 1;
+              infinite = false;
+              direction = "normal";
+              easing = "ease";
+              break;
+            }
+            easing = timing;
+            continue;
+          }
           const parsedTime = timeMs(token);
           if (parsedTime !== null) {
             if (!sawTime) duration = parsedTime;
@@ -251,19 +235,7 @@
           )
             direction = token;
           else if (
-            [
-              "linear",
-              "ease",
-              "ease-in",
-              "ease-out",
-              "ease-in-out",
-            ].includes(token)
-          )
-            easing = token;
-          else if (
             ![
-              "step-start",
-              "step-end",
               "both",
               "forwards",
               "backwards",
@@ -305,10 +277,9 @@
       }
       if (declarations.has("animation-direction"))
         direction = firstListItem(declarations.get("animation-direction"));
-      if (declarations.has("animation-timing-function"))
-        easing = firstListItem(
-          declarations.get("animation-timing-function"),
-        );
+      const authoredTiming = declarations.get("animation-timing-function");
+      if (authoredTiming && !VAR_REFERENCE.test(authoredTiming))
+        easing = timingListFirst(authoredTiming) ?? easing;
       const timeline = firstListItem(
         declarations.get("animation-timeline") ||
           declarations.get("scroll-timeline"),
@@ -903,50 +874,11 @@
     },
     documentHasMotionHint = () => {
       try {
-        if (globalThis.__tilefinchStylesheetHasMotionKeyframes?.())
-          return true;
-        const roots = [document.head, document.body];
-        let inspectedBytes = 0,
-          inspectedNodes = 0;
-        for (const root of roots) {
-          let node = root?.firstElementChild || null;
-          for (
-            let visited = 0;
-            node &&
-            visited < STYLE_LIMIT &&
-            inspectedBytes < STYLE_BYTES_LIMIT &&
-            inspectedNodes < STYLE_NODE_LIMIT;
-            visited++
-          ) {
-            const available = STYLE_BYTES_LIMIT - inspectedBytes;
-            let text = "";
-            if (String(node.localName || "").toLowerCase() === "style") {
-              const retained = styleTextPrefix(
-                node,
-                available,
-                STYLE_NODE_LIMIT - inspectedNodes,
-              );
-              text = retained.text;
-              inspectedNodes += retained.nodes;
-              inspectedBytes += retained.bytes;
-            } else {
-              text = styleAttributePrefix(node, available);
-              inspectedNodes++;
-              inspectedBytes += boundedUtf8Length(text);
-            }
-            if (
-              /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
-                text,
-              )
-            )
-              return true;
-            node = node.nextElementSibling;
-          }
-        }
+        return !!globalThis.__tilefinchStylesheetHasMotionKeyframes?.()
+          || documentHasInlineMotionHint();
       } catch {
         return false;
       }
-      return false;
     };
 
   const advanceScan = () => {

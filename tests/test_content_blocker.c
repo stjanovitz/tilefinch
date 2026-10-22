@@ -140,13 +140,22 @@ static int test_cosmetic_class_families(void)
     char css[CONTENT_BLOCKER_COSMETIC_CSS_LIMIT];
     size_t css_length = 0;
     CHECK(content_blocker_cosmetic_css(css, sizeof(css), &css_length));
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    static const struct { const char *attribute; bool hidden; } slots[] = {
+        {"data-csa-c-slot-id=\"adplacements:detail:mobile\"", true},
+        {"data-csa-c-slot-id=\"content:detail:mobile\"", false},
+        {"data-csa-c-slot-id=\"not-adplacements:detail\"", false}
+    };
+    size_t class_count = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < class_count + sizeof(slots) / sizeof(slots[0]); i++) {
+        const char *classes = i < class_count ? cases[i].classes : "";
+        const char *attribute = i < class_count ? "" : slots[i - class_count].attribute;
+        bool hidden = i < class_count ? cases[i].hidden : slots[i - class_count].hidden;
         char html[512];
         int written = snprintf(html, sizeof(html),
             "<!doctype html><style>body{margin:0}</style><body>"
-            "<div class=\"%s\" style=\"display:block!important;"
+            "<div class=\"%s\" %s style=\"display:block!important;"
             "height:250px;margin:35px\"></div>"
-            "<div style=\"height:10px\"></div></body>", cases[i].classes);
+            "<div style=\"height:10px\"></div></body>", classes, attribute);
         CHECK(written > 0 && (size_t) written < sizeof(html));
         Budget budget;
         budget_init(&budget, 4u * 1024u * 1024u);
@@ -171,16 +180,16 @@ static int test_cosmetic_class_families(void)
                                        sheet.rules[rule].selector_length))
                 string_hidden = true;
         }
-        CHECK(string_hidden == cases[i].hidden);
-        if ((style.display == DISPLAY_NONE) != cases[i].hidden) {
-            fprintf(stderr, "unexpected cosmetic match: %s\n", cases[i].classes);
+        CHECK(string_hidden == hidden);
+        if ((style.display == DISPLAY_NONE) != hidden) {
+            fprintf(stderr, "unexpected cosmetic match: %s %s\n", classes, attribute);
             return 1;
         }
         CHECK(layout_build(&layout, &budget, &document, &sheet,
                            NULL, NULL, 480));
         const LayoutNodeBox *following = layout_box_for_node(&layout, node->next);
         CHECK(following != NULL
-              && (cases[i].hidden ? following->y == 0 : following->y >= 250));
+              && (hidden ? following->y == 0 : following->y >= 250));
         layout_destroy(&layout);
         stylesheet_destroy(&sheet);
         document_destroy(&document);
@@ -197,6 +206,25 @@ int main(void)
     budget_init(&budget, 2u * 1024u * 1024u);
     ContentBlocker *blocker = content_blocker_create(&budget);
     CHECK(blocker != NULL);
+    static const char inline_tracker[] = "\nwindow.ue_ibe = (window.ue_ibe || 0) + 1;"
+        "/* n.RXVM=function rx.ex64( /rd/uedata */ window.shouldNotRun=1;";
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    CHECK(content_blocker_inline_rule(blocker, "https://www.amazon.com/", inline_tracker,
+        sizeof(inline_tracker)-1) != NULL);
+    CHECK(!content_blocker_inline_rule(blocker, "https://amazon.com.example.test/", inline_tracker,
+        sizeof(inline_tracker)-1));
+    CHECK(!content_blocker_inline_rule(blocker, "https://www.amazon.com/", inline_tracker,
+        sizeof(inline_tracker)-40));
+    CHECK(!content_blocker_inline_rule(blocker, "https://www.amazon.com/", inline_tracker,
+        CONTENT_BLOCKER_INLINE_BYTES_LIMIT+1u));
+    const char *inline_allowed[] = {"amazon.com"};
+    CHECK(content_blocker_set_allowed_sites(blocker, inline_allowed, 1));
+    CHECK(!content_blocker_inline_rule(blocker, "https://www.amazon.com/", inline_tracker,
+        sizeof(inline_tracker)-1));
+    CHECK(content_blocker_set_allowed_sites(blocker, NULL, 0));
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL));
+    CHECK(!content_blocker_inline_rule(blocker, "https://www.amazon.com/", inline_tracker,
+        sizeof(inline_tracker)-1));
     char cosmetic[CONTENT_BLOCKER_COSMETIC_CSS_LIMIT];
     size_t cosmetic_length = 0;
     CHECK(content_blocker_cosmetic_css(
@@ -329,6 +357,10 @@ int main(void)
     CHECK(content_blocker_site_from_url(
               "https://en.wikipedia.org/wiki/PSP", site)
           && strcmp(site, "wikipedia.org") == 0);
+    /* Always the registrable site: a subdomain never survives, so a caller
+       compares the site itself (clear-site-data's YouTube login check). */
+    CHECK(content_blocker_site_from_url("https://m.youtube.com/watch?v=x", site)
+          && strcmp(site, "youtube.com") == 0);
     CHECK(!content_blocker_site_from_url("not a URL", site));
 
     unlink(custom_path);

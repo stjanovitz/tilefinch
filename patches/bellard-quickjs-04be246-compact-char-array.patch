@@ -12,7 +12,7 @@ index 126ac249..0a374994 100644
      /* count the number of weak references to this object. The object
         structure is freed only if header.ref_count = 0 and
         weakref_count = 0 */
-@@ -5741,8 +5742,9 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+@@ -5741,7 +5742,8 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
      p->is_constructor = 0;
      p->has_immutable_prototype = 0;
      p->tmp_mark = 0;
@@ -21,7 +21,6 @@ index 126ac249..0a374994 100644
      p->weakref_count = 0;
      p->u.opaque = NULL;
      p->shape = sh;
-     p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
 @@ -6299,22 +6301,26 @@ static void js_array_finalizer(JSRuntime *rt, JSValue val)
  {
      JSObject *p = JS_VALUE_GET_OBJ(val);

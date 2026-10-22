@@ -272,13 +272,14 @@ conjuncts outside the pack's bounded inventory may use separate fallback cells.
 
 When a page you are reading uses one of these scripts and its pack is not
 installed, a notice appears above the bottom bar, for example
-**This page uses Cyrillic text. Install the Cyrillic language pack?** It
+**Cyrillic: This page needs this language pack. Install it?** It
 does not stop you reading or scrolling, and it disappears after about 12
 seconds. While it shows:
 
 - **X Install...** opens a short confirmation. Tilefinch first fetches and
-  verifies the pack's signed details (**Checking size...**), then asks, for
-  example, **Install Cyrillic pack (1.0 MB)?** with the real download size.
+  verifies the pack's signed details (**Checking size...**), then shows the
+  pack and its real download size, for example **Cyrillic (1.0 MB)**, and
+  asks **Install this font pack?**
   Press X again to download, verify and install it exactly as the menu
   does, with progress on the notice line; O cancels. One press never starts
   a download. When the install finishes, the page redraws with the new
@@ -449,10 +450,10 @@ scripts or turn the option off ([Troubleshooting](../TROUBLESHOOTING.md#a-site-m
 ## Per-site controls
 
 **Page tools → Site information** shows the current connection, its
-certificate issuer, the site's bounded cookie and storage use, and whether
-that storage is in RAM or on the Memory Stick. From there you can open the
-site's **Site storage**, clear the site's data, or reset all of its
-exceptions, and **Permissions & controls** holds the switches below. A switch
+certificate issuer and the site's bounded cookie and storage use. From there
+you can open the site's **Site storage**, which shows beside it whether that
+storage is in RAM or on the Memory Stick, clear the site's data, or reset all
+of its exceptions, and **Permissions & controls** holds the switches below. A switch
 that cannot change on the current page says why when you press X.
 
 - **JavaScript.** Wikipedia opens with page JavaScript off by default because

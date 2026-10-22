@@ -1,15 +1,9 @@
 #include "data_url.h"
+#include "tilefinch/url.h"
 
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
-
-static int hex_digit(unsigned char value)
-{
-    if (value >= '0' && value <= '9') return value - '0';
-    value = (unsigned char) tolower(value);
-    return value >= 'a' && value <= 'f' ? value - 'a' + 10 : -1;
-}
 
 static int base64_digit(unsigned char value)
 {
@@ -77,8 +71,8 @@ DataUrlDecodeResult data_url_decode(
         for (size_t i = 0; i < payload_length; i++, decoded_length++) {
             if (payload[i] == '%') {
                 if (i + 2 >= payload_length
-                    || hex_digit(payload[i + 1]) < 0
-                    || hex_digit(payload[i + 2]) < 0) {
+                    || tilefinch_hex_digit(payload[i + 1]) < 0
+                    || tilefinch_hex_digit(payload[i + 2]) < 0) {
                     return DATA_URL_INVALID;
                 }
                 i += 2;
@@ -118,8 +112,8 @@ DataUrlDecodeResult data_url_decode(
         for (size_t i = 0; i < payload_length;) {
             if (payload[i] == '%') {
                 decoded[output++] = (unsigned char) (
-                    hex_digit(payload[i + 1]) * 16
-                    + hex_digit(payload[i + 2]));
+                    tilefinch_hex_digit(payload[i + 1]) * 16
+                    + tilefinch_hex_digit(payload[i + 2]));
                 i += 3;
             } else {
                 decoded[output++] = payload[i++];

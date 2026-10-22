@@ -1406,6 +1406,33 @@ def validate_reference_replay_contract(
     )
 
 
+def cosmetic_evidence_ready(value: Any) -> bool:
+    path = Path(__file__).resolve().parent.parent / 'src/cosmetic_blocker_css.inc'
+    return (isinstance(value, dict)
+        and set(value) == {'version', 'rules_sha256', 'enabled', 'ready'}
+        and value.get('version') == 'shared-cosmetic-v1'
+        and type(value.get('enabled')) is bool and value.get('ready') is True
+        and value.get('rules_sha256') == hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def inline_tracker_evidence_ready(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"version", "rules_sha256", "blocked", "ready", "records", "enabled"}:
+        return False
+    path = Path(__file__).resolve().parent.parent / 'src/inline_tracker_rules.inc'
+    data = path.read_bytes()
+    ids = set(re.findall(rb'INLINE_TRACKER_RULE\("([a-z0-9-]+)"', data))
+    records = value.get('records')
+    return (value.get('version') == 'shared-inline-trackers-v1' and value.get('ready') is True
+        and type(value.get('enabled')) is bool and (value['enabled'] or value.get('blocked') == 0)
+        and value.get('rules_sha256') == hashlib.sha256(data).hexdigest()
+        and type(value.get('blocked')) is int and 0 <= value['blocked'] <= 32
+        and isinstance(records, list) and len(records) == value['blocked']
+        and all(isinstance(row, dict) and set(row) == {'rule', 'source_sha256'}
+            and isinstance(row['rule'], str) and row['rule'].encode('utf-8') in ids
+            and isinstance(row['source_sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', row['source_sha256'])
+            for row in records))
+
+
 def _validate_reference_environment(
     scenario: Scenario, state: dict[str, Any]
 ) -> list[str]:
@@ -1450,6 +1477,10 @@ def _validate_reference_environment(
     if not isinstance(capability, dict):
         reasons.append("reference-capability-policy-missing")
     else:
+        if 'cosmetic_blocking' in capability and not cosmetic_evidence_ready(capability['cosmetic_blocking']):
+            reasons.append('reference-cosmetic-policy-unhealthy')
+        if 'inline_trackers' in capability and not inline_tracker_evidence_ready(capability['inline_trackers']):
+            reasons.append('reference-inline-tracker-policy-unhealthy')
         if capability.get("version") != REFERENCE_CAPABILITY_POLICY:
             reasons.append("reference-capability-policy-version")
         if capability.get("ready") is not True:
@@ -1839,7 +1870,9 @@ def _validate_reference_state_schema(state: dict[str, Any]) -> list[str]:
         ),
         (
             "offline_capability_policy",
-            REFERENCE_CAPABILITY_POLICY_FIELDS,
+            REFERENCE_CAPABILITY_POLICY_FIELDS | (set(state['offline_capability_policy'])
+                & {'inline_trackers', 'cosmetic_blocking'}
+                if isinstance(state.get('offline_capability_policy'), dict) else set()),
             "reference-capability-policy-fields",
         ),
         (
@@ -1899,7 +1932,7 @@ def _validate_reference_capture(
     scenario: Scenario, state: dict[str, Any], capture_url: str
 ) -> list[str]:
     reasons = _validate_reference_state_schema(state)
-    if state.get("capture_scope") in ("full-document-diagnostic-v1", "viewport-sweep-diagnostic-v2"):
+    if state.get("capture_scope") in ("full-document-diagnostic-v1", "viewport-sweep-diagnostic-v2", "viewport-window-diagnostic-v1", "retained-query-window-diagnostic-v1", "interaction-window-diagnostic-v1", "mobile-auto-fit-window-diagnostic-v1", "element-scroll-window-diagnostic-v1", "dedicated-worker-window-diagnostic-v1"):
         reasons.append("reference-full-document-is-diagnostic")
     if state.get("capture_transport") != REFERENCE_CAPTURE_TRANSPORT:
         reasons.append("reference-capture-transport-mismatch")

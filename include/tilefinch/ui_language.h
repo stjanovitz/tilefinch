@@ -5,8 +5,13 @@
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/install_paths.h"
 
-#define TILEFINCH_UI_TRANSLATION_BYTES (32u * 1024u)
-#define TILEFINCH_UI_TRANSLATION_ROWS 400u
+/* A catalog's value offsets are 16-bit. From v12 a catalog stores a hash
+   and length per English key instead of the key (src/ui_language.c). The
+   row count is a u16 field; a loaded catalog is sized to its actual rows,
+   so this bound reserves nothing. */
+#define TILEFINCH_UI_TRANSLATION_BYTES (64u * 1024u - 1u)
+#define TILEFINCH_UI_TRANSLATION_ROWS 2048u
+#define TILEFINCH_UI_TRANSLATION_VALUE_BYTES 256u
 
 typedef enum {
     TILEFINCH_UI_LANGUAGE_ENGLISH,
@@ -48,6 +53,11 @@ const char *tilefinch_ui_translation_text(
     const TilefinchUiTranslation *translation, const char *english);
 TilefinchUiTranslation *tilefinch_ui_translation_load(
     Budget *budget, const TilefinchInstallPaths *paths, unsigned language);
+/* Whether the language's pinned catalog file is installed: its size and
+   SHA-256 match, streamed through a small stack buffer. Allocates nothing
+   and builds no rows or display text, unlike a load. */
+bool tilefinch_ui_translation_installed(
+    const TilefinchInstallPaths *paths, unsigned language);
 /* Only an explicit language selection writes. Verified bytes are staged then
    renamed; a refused/corrupt download never replaces the previous file. */
 bool tilefinch_ui_translation_install(

@@ -1,10 +1,10 @@
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/ui_language.h"
 #include "tilefinch/url.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -567,28 +567,6 @@ static bool profile_checksum_file(
     return true;
 }
 
-static bool profile_install_temporary(
-    const char *temporary, const char *path, const char *backup)
-{
-    /*
-     * Rotate the primary through backup before installing the closed
-     * temporary file, so that every instant of the publish has at least one
-     * complete generation on the stick. POSIX replaces an older backup
-     * atomically. FAT refuses that replacement, in which case remove only the
-     * older backup while the primary is still intact and retry.
-     */
-    bool had_previous = rename(path, backup) == 0;
-    if (!had_previous) {
-        if (errno == ENOENT) return rename(temporary, path) == 0;
-        (void) remove(backup);
-        had_previous = rename(path, backup) == 0;
-        if (!had_previous && errno != ENOENT) return false;
-    }
-    if (rename(temporary, path) == 0) return true;
-    if (had_previous) (void) rename(backup, path);
-    return false;
-}
-
 bool browser_profile_save(const BrowserProfile *profile, const char *path)
 {
     if (profile == NULL || path == NULL || path[0] == '\0') return false;
@@ -867,7 +845,7 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         remove(temporary);
         return false;
     }
-    if (profile_install_temporary(temporary, path, backup)) return true;
+    if (tilefinch_platform_replace_file(temporary, path, backup)) return true;
     remove(temporary);
     return false;
 }
@@ -3111,8 +3089,7 @@ bool browser_recovery_save(
         remove(temporary);
         return false;
     }
-    if (rename(temporary, path) == 0) return true;
-    if (remove(path) == 0 && rename(temporary, path) == 0) return true;
+    if (tilefinch_platform_replace_file(temporary, path, NULL)) return true;
     remove(temporary);
     return false;
 }

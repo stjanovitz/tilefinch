@@ -15,16 +15,20 @@ void psp_app_youtube_login_boot(PspProcessResources *process, PspBrowserResource
         (void) youtube_login_remove(process->storage.youtube_login);
         return;
     }
+    YoutubeLoginLoadStatus status = YOUTUBE_LOGIN_NOT_LOADED;
     if (youtube_login_load(browser->session,
-            process->storage.youtube_login, (int64_t) time(NULL)))
-        browser->youtube_login_restored = youtube_lite_session_login_identity(browser->session);
+            process->storage.youtube_login, (int64_t) time(NULL), &status))
+        browser->youtube_login_restored_identity = youtube_lite_session_login_identity(browser->session);
+    else if (status == YOUTUBE_LOGIN_COOKIE_TOO_LARGE)
+        psp_ui_show_status(&process->presentation.ui,
+            "SAVED YOUTUBE LOGIN UNUSABLE - SIGN IN AGAIN", 240);
 }
 
 bool psp_app_youtube_login_clear(PspApp *app)
 {
     app->browser->youtube_login_pending = false;
     app->browser->youtube_login_offer_identity = 0;
-    app->browser->youtube_login_restored = false;
+    app->browser->youtube_login_restored_identity = 0;
     return youtube_login_remove(app->process->storage.youtube_login);
 }
 
@@ -61,7 +65,7 @@ bool psp_app_youtube_login_poll(PspApp *app)
         }
     }
     if (events & BROWSER_YOUTUBE_LOGIN_STARTED) {
-        browser->youtube_login_restored = 0;
+        browser->youtube_login_restored_identity = 0;
     }
     if (events & (BROWSER_YOUTUBE_LOGIN_FAILED | BROWSER_YOUTUBE_LOGIN_RECOVERING)) {
         psp_ui_show_status(&app->process->presentation.ui,
@@ -79,7 +83,7 @@ bool psp_app_youtube_login_poll(PspApp *app)
     if (events & BROWSER_YOUTUBE_LOGIN_VERIFIED) {
         browser->youtube_login_offer_identity = browser_engine_youtube_login_identity(browser->engine);
         if (browser->youtube_login_offer_identity != 0
-            && browser->youtube_login_restored != browser->youtube_login_offer_identity) {
+            && browser->youtube_login_restored_identity != browser->youtube_login_offer_identity) {
             unsigned policy = browser_profile_youtube_login_policy(browser->profile);
             if (policy == YOUTUBE_LOGIN_ALWAYS) {
                 (void) psp_app_youtube_login_save(app); changed = true;
@@ -87,7 +91,7 @@ bool psp_app_youtube_login_poll(PspApp *app)
         }
         if (!browser->youtube_login_pending && ui->screen != PSP_UI_SCREEN_YOUTUBE_LOGIN)
             browser->youtube_login_offer_identity = 0;
-        browser->youtube_login_restored = false;
+        browser->youtube_login_restored_identity = 0;
     }
     if (browser->youtube_login_pending && ui->screen == PSP_UI_SCREEN_PAGE
         && !browser_engine_navigation_pending(browser->engine)) {
@@ -105,7 +109,13 @@ void psp_app_youtube_login_action(PspApp *app, PspAppFrameState *frame,
     bool save = false;
     switch (intent->action) {
         case PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE: save = true; break;
-        case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS: policy = YOUTUBE_LOGIN_ALWAYS; save = true; break;
+        /* With no verified login bound to the offer (chosen from Settings
+           while signed out) there is nothing to write yet: remember Always,
+           and the next verified sign-in saves under it. */
+        case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS:
+            policy = YOUTUBE_LOGIN_ALWAYS;
+            save = app->browser->youtube_login_offer_identity != 0;
+            break;
         case PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER: policy = YOUTUBE_LOGIN_NEVER; break;
         default: break;
     }
@@ -122,6 +132,28 @@ void psp_app_youtube_login_action(PspApp *app, PspAppFrameState *frame,
         psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
     app->browser->youtube_login_pending = false;
     app->browser->youtube_login_offer_identity = 0;
+}
+
+/* The Settings row. Always still needs the warning and a deliberate
+   confirmation, so it opens the consent offer, bound like a verification
+   offer to the login verified now (0 when signed out). */
+void psp_app_youtube_login_setting(PspApp *app, PspAppFrameState *frame,
+                                   unsigned policy)
+{
+    if (policy > YOUTUBE_LOGIN_NEVER) return;
+    BrowserProfile *profile = app->browser->profile;
+    browser_profile_set_youtube_login_policy(profile, policy);
+    if (policy == YOUTUBE_LOGIN_NEVER) {
+        if (!psp_app_youtube_login_clear(app))
+            psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
+    } else if (policy == YOUTUBE_LOGIN_ALWAYS) {
+        browser_profile_set_youtube_login_policy(profile, YOUTUBE_LOGIN_ASK);
+        app->process->presentation.ui.youtube_login_policy = YOUTUBE_LOGIN_ASK;
+        app->browser->youtube_login_offer_identity =
+            browser_engine_youtube_login_identity(app->browser->engine);
+        psp_ui_show_youtube_login_offer(&app->process->presentation.ui);
+    }
+    psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
 }
 
 static void psp_youtube_preresolve_increment(unsigned *counter)

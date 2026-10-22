@@ -78,19 +78,21 @@
     peakBytes: 0,
     quotaErrors: 0,
   };
-  const statsView = {};
-  for (const key of Object.keys(stats)) {
-    Object.defineProperty(statsView, key, {
-      enumerable: true,
-      get: () => stats[key],
+  /* A read-only view for host tests (test-probe realms only). */
+  if (globalThis.__tilefinchTestProbes) {
+    const statsView = {};
+    for (const key of Object.keys(stats))
+      Object.defineProperty(statsView, key, {
+        enumerable: true,
+        get: () => stats[key],
+      });
+    Object.freeze(statsView);
+    Object.defineProperty(globalThis, "__tilefinchIndexedDBStats", {
+      value: statsView,
+      writable: false,
+      configurable: false,
     });
   }
-  Object.freeze(statsView);
-  Object.defineProperty(globalThis, "__tilefinchIndexedDBStats", {
-    value: statsView,
-    writable: false,
-    configurable: false,
-  });
   /* Read directly by the native result snapshot (see compat.js). */
   globalThis.__tilefinchHostChannel.indexedDBStats = stats;
 
@@ -424,11 +426,16 @@
     return { records, bytes };
   };
 
-  const idbHandlerStates = new WeakMap();
+  let idbHandlerState, idbRequestState;
   class TilefinchIDBEventTarget extends EventTarget {
+    #handlers = new Map();
+    static {
+      idbHandlerState = target => target &&
+        (typeof target === "object" || typeof target === "function") &&
+        #handlers in target ? target.#handlers : undefined;
+    }
     constructor() {
       super();
-      idbHandlerStates.set(this, new Map());
       this._lastDispatchError = null;
     }
     dispatchEvent(event) {
@@ -479,10 +486,10 @@
       configurable: true,
       enumerable: true,
       get() {
-        return idbHandlerStates.get(this)?.get(type)?.callback || null;
+        return idbHandlerState(this)?.get(type)?.callback || null;
       },
       set(callback) {
-        const state = idbHandlerStates.get(this);
+        const state = idbHandlerState(this);
         if (!state) throw new TypeError("Illegal invocation");
         const next = typeof callback === "function" ? callback : null;
         let entry = state.get(type);
@@ -502,25 +509,24 @@
       },
     });
 
-  const idbRequestStates = new WeakMap();
   const setIDBRequestTransaction = (request, transaction) => {
-    idbRequestStates.get(request).transaction = transaction;
+    idbRequestState(request).transaction = transaction;
   };
   const prepareIDBUpgradeRequest = (request, result, transaction) => {
-    const state = idbRequestStates.get(request);
+    const state = idbRequestState(request);
     state.result = result;
     state.error = null;
     state.transaction = transaction;
     state.readyState = "done";
   };
   const resetIDBRequest = (request) => {
-    const state = idbRequestStates.get(request);
+    const state = idbRequestState(request);
     state.result = undefined;
     state.error = null;
     state.readyState = "pending";
   };
   const succeedIDBRequest = (request, result, redispatch = false) => {
-    const state = idbRequestStates.get(request);
+    const state = idbRequestState(request);
     if (state.readyState === "done" && !redispatch) return null;
     state.result = result;
     state.error = null;
@@ -529,7 +535,7 @@
     return request._lastDispatchError;
   };
   const failIDBRequest = (request, error) => {
-    const state = idbRequestStates.get(request);
+    const state = idbRequestState(request);
     if (state.readyState === "done") return true;
     state.result = undefined;
     state.error =
@@ -540,42 +546,50 @@
     return request._dispatch("error");
   };
   class IDBRequest extends TilefinchIDBEventTarget {
+    #state;
+    static {
+      /* Request results, sources and handlers can refer back to a request.
+         A private slot lets ordinary cycle collection release the group. */
+      idbRequestState = request => request &&
+        (typeof request === "object" || typeof request === "function") &&
+        #state in request ? request.#state : undefined;
+    }
     constructor(source = null, transaction = null) {
       super();
-      idbRequestStates.set(this, {
+      this.#state = {
         source,
         transaction,
         readyState: "pending",
         result: undefined,
         error: null,
-      });
+      };
       this.onsuccess = null;
       this.onerror = null;
     }
     get source() {
-      const state = idbRequestStates.get(this);
+      const state = idbRequestState(this);
       if (!state) throw new TypeError("Illegal invocation");
       return state.source;
     }
     get transaction() {
-      const state = idbRequestStates.get(this);
+      const state = idbRequestState(this);
       if (!state) throw new TypeError("Illegal invocation");
       return state.transaction;
     }
     get readyState() {
-      const state = idbRequestStates.get(this);
+      const state = idbRequestState(this);
       if (!state) throw new TypeError("Illegal invocation");
       return state.readyState;
     }
     get result() {
-      const state = idbRequestStates.get(this);
+      const state = idbRequestState(this);
       if (!state) throw new TypeError("Illegal invocation");
       if (state.readyState !== "done")
         throw fail("The request is still pending", "InvalidStateError");
       return state.result;
     }
     get error() {
-      const state = idbRequestStates.get(this);
+      const state = idbRequestState(this);
       if (!state) throw new TypeError("Illegal invocation");
       if (state.readyState !== "done")
         throw fail("The request is still pending", "InvalidStateError");

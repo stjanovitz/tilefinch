@@ -1267,6 +1267,8 @@ static bool navigation_commit_document(
     }
     if (streaming != NULL) {
         const ExternalScriptMetrics *early = &streaming->scripts.early;
+        if (early->skipped_pressure != 0u)
+            session->page.script_memory_limited = true;
         bool shed_author_script_work =
             streaming->script_disabled_after_failure
             && session->scripts_enabled
@@ -1580,6 +1582,7 @@ static bool navigation_commit_document(
                refusal into a static-page degradation. */
             session->page.script_degradation_observed = true;
             session->page.script_result.success = false;
+            session->page.script_memory_limited = true;
             session->page.script_result.error[0] = '\0';
             session->page.script_result.error_source_context[0] = '\0';
             snprintf(
@@ -1681,6 +1684,8 @@ static bool navigation_commit_document(
                 || metrics.cost_class_rejections != 0;
             if (hydration_degraded || metrics.skipped_cross_origin != 0u)
                 session->page.script_degradation_observed = true;
+            if (metrics.skipped_pressure != 0u)
+                session->page.script_memory_limited = true;
             if (hydration_degraded) {
                 (void) navigation_restore_server_body_if_degraded(
                     session, rollback_snapshot);
@@ -2307,6 +2312,7 @@ static bool navigation_commit_document(
         size_t injected_failure_count = session->budget->injected_failure_count;
         bool layout_built = navigation_build_layout(
             session, &session->page.layout, fonts, images);
+        unsigned failed_phase = session->page.layout.performance.failed_phase;
         if (!layout_built && !session->layout_build_cancelled
             && session->budget->failure_count > layout_failure_count
             && session->budget->injected_failure_count == injected_failure_count) {
@@ -2314,21 +2320,23 @@ static bool navigation_commit_document(
                not strand a valid new document merely because this caller
                builds synchronously. Release failed layout/cache ownership
                before replacing optional styles, then retry exactly once.
-               Cancellation and synthetic refusals never take this path. */
+               Cancellation and synthetic refusals never take this path.
+               layout_destroy clears the failed phase; a retry that cannot
+               start reports the first build's. */
             layout_destroy(&session->page.layout);
             layout_reuse_cache_destroy(session->page.layout_reuse);
             session->page.layout_reuse = NULL;
-            if (navigation_install_minimal_stylesheet_fallback(session))
+            if (navigation_install_minimal_stylesheet_fallback(session)) {
                 layout_built = navigation_build_layout(
                     session, &session->page.layout, fonts, images);
+                failed_phase = session->page.layout.performance.failed_phase;
+            }
         }
         if (!layout_built) {
-            snprintf(session->last_error, sizeof(session->last_error),
-                     "layout construction failed phase=%u cancelled=%u refusals=%zu current=%zu limit=%zu",
-                     session->page.layout.performance.failed_phase,
-                     (unsigned) session->layout_build_cancelled,
-                     session->budget->failure_count - layout_failure_count,
-                     session->budget->current, session->budget->limit);
+            navigation_note_layout_failure(
+                session, failed_phase,
+                session->layout_build_cancelled,
+                session->budget->failure_count - layout_failure_count);
             goto fail;
         }
         uint64_t final_layout_elapsed = navigation_record_layout_slices(

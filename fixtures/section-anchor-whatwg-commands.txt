@@ -1,3 +1,0 @@
-anchor table-of-contents
-anchor ipr
-status

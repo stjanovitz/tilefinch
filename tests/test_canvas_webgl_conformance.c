@@ -2121,6 +2121,11 @@ static bool run_treadline_arena_game(void)
 {
     static const char document_url[] =
         "https://games.test/examples/treadline-arena/index.html";
+    /* Daily Arena falls back to today's UTC date, so every realm here pins
+       the day with ?daily= (the day the lab and reference scenes use):
+       seeded sweeps and fixtures must not change at UTC midnight. */
+    static const char game_url[] =
+        "https://games.test/examples/treadline-arena/index.html?daily=20261001";
     size_t html_length = 0, script_length = 0, css_length = 0;
     size_t manifest_length = 0, icon_length = 0, web_multiplayer_length = 0;
     size_t arena_generator_length = 0, campaign_length = 0;
@@ -2289,8 +2294,8 @@ static bool run_treadline_arena_game(void)
         &document, &budget, treadline_features_only ? TREADLINE_FEATURE_REALM_BYTES : 16u * MIB,
         TREADLINE_TEST_EVALUATION_MS,
         treadline_features_only
-            ? "https://games.test/examples/treadline-arena/index.html?qualification=input"
-            : document_url,
+            ? "https://games.test/examples/treadline-arena/index.html?qualification=input&daily=20261001"
+            : game_url,
         &options, &result);
     CHECK(runtime != NULL && result.success);
     ImageResources images = {.budget = &budget};
@@ -3976,7 +3981,7 @@ static bool run_treadline_arena_game(void)
     CHECK(document_parse(&client_document, &budget, html, html_length, 17));
     ScriptResult client_result;
     ScriptRuntime *client_runtime = script_runtime_create_configured(
-        &client_document, &budget, 16u * MIB, 8000, document_url,
+        &client_document, &budget, 16u * MIB, 8000, game_url,
         &options, &client_result);
     CHECK(client_runtime != NULL && client_result.success);
     ImageResources client_images = {.budget = &budget};

@@ -557,6 +557,70 @@ static int run_function_source_allocation_pressure(bool wide)
     return okay ? 0 : 1;
 }
 
+static int run_small_child_source_mode(unsigned mode)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    JSRuntime *rt = pool ? JS_NewRuntime2(budget_quickjs_pool_allocator(), pool) : NULL;
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) return 1;
+    JS_SetMaxStackSize(rt, test_stack_limit());
+    JS_SetLazyFunctionThreshold(rt, mode & 1 ? 512 : 0);
+    JSMemoryUsage before, after;
+    JS_RunGC(rt);
+    JS_ComputeMemoryUsage(rt, &before);
+    const char prefix[] = "(function outer(){const n=42;/*";
+    const char suffix[] = "*/return function child(){return n}})";
+    size_t padding = 128u * 1024u;
+    size_t length = sizeof(prefix) - 1 + padding + sizeof(suffix) - 1;
+    char *source = malloc(length + 1);
+    if (!source) return 1;
+    memcpy(source, prefix, sizeof(prefix) - 1);
+    memset(source + sizeof(prefix) - 1, 'x', padding);
+    memcpy(source + sizeof(prefix) - 1 + padding, suffix, sizeof(suffix));
+    JSValue compiled = JS_Eval(ctx, source, length, "<small-child-source>",
+                              JS_EVAL_FLAG_COMPILE_ONLY);
+    if (mode & 2) {
+        size_t size = 0;
+        uint8_t *bytes = JS_WriteObject(ctx, &size, compiled, JS_WRITE_OBJ_BYTECODE);
+        JS_FreeValue(ctx, compiled);
+        compiled = bytes ? JS_ReadObject(ctx, bytes, size, JS_READ_OBJ_BYTECODE) : JS_EXCEPTION;
+        js_free(ctx, bytes);
+    }
+    JSValue parent = JS_IsException(compiled) ? JS_EXCEPTION : JS_EvalFunction(ctx, compiled);
+    JSValue child = JS_IsException(parent) ? JS_EXCEPTION
+        : JS_Call(ctx, parent, JS_UNDEFINED, 0, NULL);
+    JS_FreeValue(ctx, parent);
+    bool okay = !JS_IsException(child);
+    JS_RunGC(rt);
+    JS_ComputeMemoryUsage(rt, &after);
+    okay = okay && after.memory_used_size - before.memory_used_size < 32768;
+    const char *text = JS_ToCString(ctx, child);
+    okay = okay && text && strcmp(text, "function child(){return n}") == 0;
+    JS_FreeCString(ctx, text);
+    JSValue result = JS_Call(ctx, child, JS_UNDEFINED, 0, NULL);
+    int32_t answer = 0;
+    okay = okay && !JS_IsException(result) && JS_ToInt32(ctx, &answer, result) == 0 && answer == 42;
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, child);
+    free(source);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    if (!okay) fprintf(stderr, "small child retained its large source owner: before=%lld after=%lld\n",
+        (long long)before.memory_used_size, (long long)after.memory_used_size);
+    return okay ? 0 : 1;
+}
+
+static int run_small_child_source_lifetime(void)
+{
+    for (unsigned mode = 0; mode < 4; mode++)
+        if (run_small_child_source_mode(mode)) return 1;
+    return 0;
+}
+
 static int run_source_snapshot_sharing(void)
 {
     Budget budget;
@@ -2947,6 +3011,44 @@ static int run_global_autoinit_refusals(void)
                 okay = !JS_IsUndefined(exception);
                 JS_FreeValue(context, exception);
             }
+            /* A refused materialization keeps the property lazy: once
+               memory is available every name is still a function, on the
+               global (variable references) and on an ordinary object. */
+            JS_RunGC(runtime);
+            for (unsigned i = 0; okay && i < 128; i++) {
+                JSValue value = JS_GetPropertyStr(context, global, names[i]);
+                okay = JS_IsFunction(context, value);
+                JS_FreeValue(context, value);
+                if (!okay)
+                    fprintf(stderr, "global autoinit %s lost after refusal\n",
+                            names[i]);
+            }
+            JSValue holder = JS_NewObject(context);
+            okay = okay && !JS_IsException(holder)
+                && JS_SetPropertyFunctionList(context, holder, entries, 128) == 0;
+            if (okay) {
+                state.refuse_from = state.calls + point;
+                state.refuse_count = once ? 1u : 0u;
+                for (unsigned i = 0; i < 128; i++) {
+                    JSValue value = JS_GetPropertyStr(context, holder, names[i]);
+                    bool exception = JS_IsException(value);
+                    JS_FreeValue(context, value);
+                    if (exception) break;
+                }
+                state.refuse_from = SIZE_MAX;
+                if (JS_HasException(context))
+                    JS_FreeValue(context, JS_GetException(context));
+                JS_RunGC(runtime);
+                for (unsigned i = 0; okay && i < 128; i++) {
+                    JSValue value = JS_GetPropertyStr(context, holder, names[i]);
+                    okay = JS_IsFunction(context, value);
+                    JS_FreeValue(context, value);
+                    if (!okay)
+                        fprintf(stderr, "object autoinit %s lost after refusal\n",
+                                names[i]);
+                }
+            }
+            JS_FreeValue(context, holder);
             JS_FreeValue(context, global);
             JS_FreeContext(context);
             JS_FreeRuntime(runtime);
@@ -2957,6 +3059,145 @@ static int run_global_autoinit_refusals(void)
             }
         }
         if (reached) return 1;
+    }
+    return 0;
+}
+
+static int run_function_metadata_refusals(void)
+{
+    for (unsigned mutation = 0; mutation < 2; mutation++) {
+        for (unsigned once = 0; once < 2; once++) {
+            bool reached = true;
+            unsigned refusals = 0;
+            for (size_t point = 0; reached && point < 128; point++) {
+                RegexpGuardState state = { .refuse_from = SIZE_MAX };
+                JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+                JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
+                if (!context) return 1;
+                JS_SetMaxStackSize(runtime, test_stack_limit());
+                const char source[] =
+                    "(function(){const a=[];for(let i=0;i<512;i++)"
+                    "a.push({get:()=>1}.get);return a})";
+                const char change[] =
+                    "(function(a){const d={value:71};"
+                    "for(let i=0;i<a.length;i++)Object.defineProperty(a[i],'name',d);"
+                    "return a})";
+                JSValue factory = JS_Eval(context, source, sizeof(source)-1,
+                    "<metadata-create-refusal>", JS_EVAL_TYPE_GLOBAL);
+                JSValue mutator = JS_Eval(context, change, sizeof(change)-1,
+                    "<metadata-change-refusal>", JS_EVAL_TYPE_GLOBAL);
+                if (JS_IsException(factory) || JS_IsException(mutator)) return 1;
+                JSValue functions = mutation
+                    ? JS_Call(context, factory, JS_UNDEFINED, 0, NULL)
+                    : JS_UNDEFINED;
+                if (JS_IsException(functions)) return 1;
+                size_t start = state.calls;
+                state.refuse_from = start + point;
+                state.refuse_count = once ? 1u : 0u;
+                JSValue result = mutation
+                    ? JS_Call(context, mutator, JS_UNDEFINED, 1, &functions)
+                    : JS_Call(context, factory, JS_UNDEFINED, 0, NULL);
+                reached = state.calls > start + point;
+                state.refuse_from = SIZE_MAX;
+                bool okay = true;
+                if (JS_IsException(result)) {
+                    refusals++;
+                    JSValue exception = JS_GetException(context);
+                    okay = !JS_IsUndefined(exception);
+                    JS_FreeValue(context, exception);
+                }
+                JSValueConst list = mutation ? functions : result;
+                if (JS_IsObject(list)) {
+                    JS_RunGC(runtime);
+                    for (unsigned i = 0; i < 512 && okay; i++) {
+                        JSValue f = JS_GetPropertyUint32(context, list, i);
+                        JSValue name = JS_GetPropertyStr(context, f, "name");
+                        JSValue called = JS_Call(context, f, JS_UNDEFINED, 0, NULL);
+                        int32_t value = 0;
+                        okay = JS_ToInt32(context, &value, called) == 0 && value == 1;
+                        if (JS_VALUE_GET_TAG(name) == JS_TAG_INT) {
+                            okay = okay && mutation && JS_VALUE_GET_INT(name) == 71;
+                        } else {
+                            const char *text = JS_IsString(name)
+                                ? JS_ToCString(context, name) : NULL;
+                            okay = okay && text && !strcmp(text, "get");
+                            JS_FreeCString(context, text);
+                        }
+                        JS_FreeValue(context, name);
+                        JS_FreeValue(context, called);
+                        JS_FreeValue(context, f);
+                    }
+                }
+                JS_FreeValue(context, result);
+                JS_FreeValue(context, functions);
+                JS_FreeValue(context, factory);
+                JS_FreeValue(context, mutator);
+                JS_RunGC(runtime);
+                JS_FreeContext(context);
+                JS_FreeRuntime(runtime);
+                if (!okay || state.live || state.corrupted) {
+                    fprintf(stderr, "metadata refusal mutation=%u once=%u point=%zu live=%zu\n",
+                            mutation, once, point, state.live);
+                    return 1;
+                }
+            }
+            if (reached || !refusals) return 1;
+        }
+    }
+    return 0;
+}
+
+static int run_single_capture_refusals(void)
+{
+    for (unsigned once = 0; once < 2; once++) {
+        bool reached = true;
+        unsigned refusals = 0;
+        for (size_t point = 0; reached && point < 512; point++) {
+            RegexpGuardState state = { .refuse_from = SIZE_MAX };
+            JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+            JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
+            if (!context) return 1;
+            JS_SetMaxStackSize(runtime, test_stack_limit());
+            const char source[] =
+                "(function(){let x={};const a=[];"
+                "for(let i=0;i<32;i++)a.push(()=>x);"
+                "x.a=a;return a})";
+            JSValue factory = JS_Eval(context, source, sizeof(source)-1,
+                "<capture-refusal>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(factory)) return 1;
+            size_t start = state.calls;
+            state.refuse_from = start + point;
+            state.refuse_count = once ? 1u : 0u;
+            JS_SetGCThreshold(runtime, 0);
+            JSValue captures = JS_Call(context, factory, JS_UNDEFINED, 0, NULL);
+            reached = state.calls > start + point;
+            state.refuse_from = SIZE_MAX;
+            bool okay = true;
+            if (JS_IsException(captures)) {
+                refusals++;
+                JSValue exception = JS_GetException(context);
+                okay = !JS_IsUndefined(exception);
+                JS_FreeValue(context, exception);
+            } else {
+                JS_RunGC(runtime);
+                JSValue closure = JS_GetPropertyUint32(context, captures, 31);
+                JSValue value = JS_Call(context, closure, JS_UNDEFINED, 0, NULL);
+                okay = JS_IsObject(value);
+                JS_FreeValue(context, value);
+                JS_FreeValue(context, closure);
+            }
+            JS_FreeValue(context, captures);
+            JS_FreeValue(context, factory);
+            JS_RunGC(runtime);
+            JS_FreeContext(context);
+            JS_FreeRuntime(runtime);
+            if (!okay || state.live || state.corrupted) {
+                fprintf(stderr, "capture refusal once=%u point=%zu live=%zu\n",
+                        once, point, state.live);
+                return 1;
+            }
+        }
+        if (reached || !refusals) return 1;
     }
     return 0;
 }
@@ -3007,8 +3248,71 @@ static int run_bound_function_refusals(void)
     return reached || refusals == 0;
 }
 
+static int run_set_prototype_refusals(void)
+{
+    size_t refusals = 0, successes = 0;
+    for (size_t boundary = 0; boundary < 4; boundary++) {
+        Budget budget;
+        budget_init(&budget, 4u * MIB);
+        BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+        if (pool == NULL) return 1;
+        JSRuntime *runtime = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+        if (runtime == NULL) return 1;
+        JSContext *context = JS_NewContext(runtime);
+        if (context == NULL) return 1;
+        JSValue target = JS_NewObject(context), sibling = JS_NewObject(context),
+            prototype = JS_NewObject(context);
+        int okay = !JS_IsException(target) && !JS_IsException(sibling)
+            && !JS_IsException(prototype);
+        /* Identical, shared shapes force copy-on-write. Make the clone
+           larger than a small-allocation arena slot so refusal is observed
+           by the host allocator, not absorbed by an existing arena. */
+        for (unsigned property = 0; okay && property < 128; property++) {
+            char name[32];
+            snprintf(name, sizeof(name), "field%u", property);
+            okay = JS_SetPropertyStr(context, target, name,
+                        JS_NewUint32(context, property)) >= 0
+                && JS_SetPropertyStr(context, sibling, name,
+                        JS_NewUint32(context, property)) >= 0;
+        }
+        if (okay) {
+            budget_inject_failure_after(&budget, boundary);
+            int changed = JS_SetPrototype(context, target, prototype);
+            budget_clear_failure_injection(&budget);
+            JSValue actual = JS_GetPrototype(context, target);
+            if (changed < 0) {
+                refusals++;
+                JSValue exception = JS_GetException(context);
+                okay = !JS_IsNull(exception)
+                    && JS_VALUE_GET_PTR(actual) != JS_VALUE_GET_PTR(prototype);
+                JS_FreeValue(context, exception);
+            } else {
+                successes++;
+                okay = JS_VALUE_GET_PTR(actual) == JS_VALUE_GET_PTR(prototype);
+            }
+            JS_FreeValue(context, actual);
+        }
+        JS_FreeValue(context, target);
+        JS_FreeValue(context, sibling);
+        JS_FreeValue(context, prototype);
+        JS_FreeContext(context);
+        JS_FreeRuntime(runtime);
+        okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+        if (!okay) {
+            fprintf(stderr, "setPrototype refusal boundary=%zu retained=%zu\n",
+                    boundary, budget.current);
+            return 1;
+        }
+    }
+    return refusals != 0 && successes != 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--small-source-only") == 0)
+        return run_small_child_source_lifetime();
+    if (argc == 2 && strcmp(argv[1], "--set-prototype-only") == 0)
+        return run_set_prototype_refusals();
     if (argc == 2 && strcmp(argv[1], "--global-autoinit-only") == 0)
         return run_global_autoinit_refusals();
     if (argc == 2 && strcmp(argv[1], "--string-buffer-growth-only") == 0)
@@ -3017,6 +3321,10 @@ int main(int argc, char **argv)
         return run_context_creation_refusals();
     if (argc == 2 && strcmp(argv[1], "--bind-refusal-only") == 0)
         return run_bound_function_refusals();
+    if (argc == 2 && strcmp(argv[1], "--capture-refusal-only") == 0)
+        return run_single_capture_refusals();
+    if (argc == 2 && strcmp(argv[1], "--metadata-refusal-only") == 0)
+        return run_function_metadata_refusals();
     if (argc == 2) {
         char *end = NULL;
         unsigned long requested = strtoul(argv[1], &end, 10);
@@ -3024,6 +3332,9 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_set_prototype_refusals() != 0) return 1;
+    if (run_single_capture_refusals() != 0) return 1;
+    if (run_function_metadata_refusals() != 0) return 1;
     if (run_context_creation_refusals() != 0) return 1;
     if (run_global_autoinit_refusals() != 0) return 1;
     if (run_bound_function_refusals() != 0) return 1;
@@ -3035,7 +3346,10 @@ int main(int argc, char **argv)
     {
         bool completed = false;
         size_t boundary = 0;
-        for (; boundary < 4096 && !completed; boundary++) {
+        /* Arena packing changes how many raw allocations the string-list
+           compiler needs (currently about 4,800). Sweep through success,
+           rather than stopping before the last refusal boundary. */
+        for (; boundary < 8192 && !completed; boundary++) {
             if (run_regexp_compile_refusal(boundary, &completed) != 0)
                 return 1;
         }
@@ -3090,6 +3404,7 @@ int main(int argc, char **argv)
     if (run_utf8_pressure_sizing() != 0) return 1;
     if (run_cstring_refusal_lifetime() != 0) return 1;
     if (run_source_snapshot_sharing() != 0) return 1;
+    if (run_small_child_source_lifetime() != 0) return 1;
     if (run_source_span_snapshot() != 0) return 1;
     if (run_dense_join_pressure() != 0) return 1;
     if (run_string_append_in_place() != 0) return 1;

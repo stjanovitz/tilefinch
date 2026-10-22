@@ -7,9 +7,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(__PSP__)
-#include <pspiofilemgr.h>
-#endif
 
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/browser_profile.h"
@@ -128,9 +125,7 @@ struct TilefinchGlyphComponentInstall {
     TilefinchUpdateStatus status;
     bool cancel_requested;
     bool activated;
-    bool activation_synced;
     bool tombstone_cleared;
-    bool final_sync_complete;
     bool activation_marker_cleared;
     uint8_t reconcile_attempts;
     TilefinchGlyphInstallFaultHook fault;
@@ -220,9 +215,9 @@ static bool write_file_bytes(const char *path, const void *bytes,
     if (ok) ok = fsync(fileno(file)) == 0;
 #endif
     if (file != NULL && fclose(file) != 0) ok = false;
-#if defined(__PSP__)
-    if (ok) ok = sceIoSync("ms0:", 0) >= 0;
-#endif
+    /* A durability hint (tilefinch_memory_stick_sync): the checked write
+       already succeeded, so a rejected sync never fails it. */
+    if (ok) (void) tilefinch_memory_stick_sync();
     return ok;
 }
 
@@ -557,18 +552,6 @@ typedef enum {
     GLYPH_PROMOTION_ACTIVATED_FAILURE
 } GlyphPromotionOutcome;
 
-static bool post_activation_sync(TilefinchGlyphComponentInstall *job)
-{
-    if (install_fault(
-            job, TILEFINCH_GLYPH_INSTALL_FAULT_POST_ACTIVATION_SYNC))
-        return false;
-#if defined(__PSP__)
-    return sceIoSync("ms0:", 0) >= 0;
-#else
-    return true;
-#endif
-}
-
 static GlyphPromotionOutcome promotion_reconcile_failure(
     TilefinchGlyphComponentInstall *job)
 {
@@ -597,12 +580,9 @@ static GlyphPromotionOutcome promote_candidate(
             return GLYPH_PROMOTION_PRE_ACTIVATION_FAILURE;
         }
         job->activated = true;
-    }
-    if (!job->activation_synced) {
-        if (!post_activation_sync(job))
-            return promotion_reconcile_failure(job);
-        job->activation_synced = true;
         job->reconcile_attempts = 0;
+        /* Each sync after a completed step is a durability hint. */
+        (void) tilefinch_memory_stick_sync();
     }
     if (!job->tombstone_cleared) {
         if (install_fault(
@@ -612,12 +592,7 @@ static GlyphPromotionOutcome promote_candidate(
         }
         job->tombstone_cleared = true;
         job->reconcile_attempts = 0;
-    }
-    if (!job->final_sync_complete) {
-        if (!post_activation_sync(job))
-            return promotion_reconcile_failure(job);
-        job->final_sync_complete = true;
-        job->reconcile_attempts = 0;
+        (void) tilefinch_memory_stick_sync();
     }
     if (!job->activation_marker_cleared) {
         char activated[TILEFINCH_INSTALL_PATH_LIMIT];
@@ -629,8 +604,7 @@ static GlyphPromotionOutcome promote_candidate(
         job->activation_marker_cleared = true;
         job->reconcile_attempts = 0;
     }
-    if (!post_activation_sync(job))
-        return promotion_reconcile_failure(job);
+    (void) tilefinch_memory_stick_sync();
     return GLYPH_PROMOTION_COMPLETE;
 }
 
@@ -766,9 +740,7 @@ bool tilefinch_glyph_component_remove(
         || (mkdir(component, 0777) != 0 && errno != EEXIST)
         || !activation_path_ready
         || (unlink(activated) != 0 && errno != ENOENT)) return false;
-#if defined(__PSP__)
-    if (sceIoSync("ms0:", 0) < 0) return false;
-#endif
+    (void) tilefinch_memory_stick_sync();
     if (!write_file_bytes(marker, removed, sizeof(removed))) return false;
     size_t entries = 0;
     (void) remove_tree(active, 0, &entries);

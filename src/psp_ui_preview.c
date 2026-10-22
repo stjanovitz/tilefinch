@@ -454,13 +454,13 @@ int main(int argc, char **argv)
             ui.overlay_animation_frames = 0;
             ui.toast_frames = 0;
         } else if (strncmp(mode, "language-pack-progress", 22) == 0) {
-            psp_ui_show_status(&ui, "Cyrillic pack: downloading 45%", 240);
+            psp_ui_show_status(&ui, "Cyrillic\nDownloading 45%", 240);
         } else if (strncmp(mode, "language-pack-installed", 23) == 0) {
-            psp_ui_show_status(&ui, "Cyrillic language pack installed",
+            psp_ui_show_status(&ui, "Cyrillic\nLanguage pack installed",
                                240);
         } else if (strncmp(mode, "language-pack-declined", 22) == 0) {
             psp_ui_show_status(
-                &ui, "Won't ask again. Install it later in\n"
+                &ui, "Won't ask again. Install it later from:\n"
                      "Settings > Appearance > Language & emoji", 300);
         } else if (strncmp(mode, "language-pack-error", 19) == 0) {
             psp_ui_show_status(&ui, "NOT ENOUGH FREE SPACE FOR UPDATE", 240);

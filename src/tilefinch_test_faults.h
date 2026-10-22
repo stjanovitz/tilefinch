@@ -38,20 +38,60 @@ typedef struct {
     bool refuse_next_same_document_relayout;
     /* Refuse the next adopted-sheet root metadata allocation once. */
     bool refuse_next_adopted_scope_table;
+    /* Fail this many upcoming focus-marker removals by style focus probes
+       (the probe toggle or its restoration). */
+    unsigned focus_marker_remove_failures;
     /* Simulate one pack I/O read failure, separately from Budget refusal. */
     bool fail_next_script_cache_read;
     unsigned script_cache_read_attempts;
+    /* Fail this many upcoming script-cache publications (index, then
+       pack) at the point where FAT has removed the old file. */
+    unsigned fail_script_cache_index_renames;
+    unsigned fail_script_cache_pack_renames;
     /* Refuse the next child-frame presentation refresh once. */
     bool refuse_next_frame_presentation;
     /* Refuse the next background web-font relayout once. */
     bool refuse_next_background_font_relayout;
-    /* Same-binary host control for page-font cost comparisons. */
-    bool legacy_web_font_work;
     /* Observe cache churn across identical versus distinct script plans. */
     unsigned web_font_kerning_cache_resets;
     unsigned web_font_charmap_lookups;
+    /* Host observation: jar reads that derive the YouTube login identity
+       (cache misses). Reset by the test. */
+    unsigned youtube_login_identity_builds;
+    /* Host observation: full scans of the chrome glyph cache for the media
+       raster's ink check. Reset by the test. */
+    unsigned chrome_media_ink_scans;
+    /* Host observation: retained Unicode chrome glyph lookups, the full
+       table scans among them, and the scans that found the entry (its
+       hint had been overwritten). Reset by the test. */
+    unsigned long chrome_unicode_lookups;
+    unsigned long chrome_unicode_scans;
+    unsigned long chrome_unicode_scan_hits;
+    /* Outline loads made only to measure an advance. */
+    unsigned web_font_advance_loads;
+    /* Clip and mask coverage rebuilds during SVG rasterization. */
+    unsigned svg_clip_mask_builds;
+    /* Sprite bytes scanned linearly to find external <use> symbols. */
+    unsigned long external_svg_symbol_scan_bytes;
     /* Refuse one validated optional image-loader setup. */
     bool refuse_next_image_load_setup;
+    /* Report the image decoder busy (a worker decode in flight) while set. */
+    bool image_decode_busy;
+    /* Hold the detached-image pump's sweep of dead slots while set, as
+       when a node is released and its address reused before that pump. */
+    bool defer_image_preload_sweep;
+    /* Refuse every growth of the bootstrap's event-target maps while set
+       (js_dom_grow_event_targets). */
+    bool refuse_event_target_growth;
+    /* Refuse the Nth (1-based) JavaScript heap allocation made inside the
+       next call of the bootstrap's event-state hold hook
+       (__tilefinchHoldEventState) or release hook
+       (__tilefinchReleaseEventHolders), once each, as a full page heap
+       would (JS_TestRefuseAllocation); event_hook_refused reports whether
+       that call reached the refusal. */
+    unsigned event_hold_refuse_allocation;
+    unsigned event_release_refuse_allocation;
+    bool event_hook_refused;
     /* Refuse the next render-shell initialization once. */
     bool refuse_next_render_shell_init;
     /* Make the next layout cooperate checkpoint decline to continue once,
@@ -59,21 +99,25 @@ typedef struct {
     bool cancel_next_layout_cooperate;
     /* Inject an allocator refusal at the job context, after optional caches. */
     bool refuse_next_layout_context;
+    /* Refuse the next minimal-stylesheet pressure fallback once. */
+    bool refuse_next_minimal_stylesheet;
     /* A NavigationParserCheckpointTestFault to inject at the next matching
        parser checkpoint (0 = none). Consumed once. */
     unsigned parser_checkpoint_fault;
     /* Fail this many upcoming Memory Stick site-storage record appends. */
     unsigned fail_site_storage_appends;
-    /* Fail the rename that puts a compacted site log in place, once. */
-    bool fail_next_site_storage_compact_rename;
-    /* Model FAT's refusal to rename over an existing credential file. */
-    bool youtube_login_no_replace_rename;
+    /* tilefinch_platform_replace_file: while set, rename refuses to
+       replace an existing file, as FAT does. */
+    bool replace_file_no_replace;
+    /* tilefinch_platform_replace_file with a backup, consumed once: fail
+       the rename that installs the temporary file (the previous file is
+       moved back), or stop right after the previous file moved aside, as a
+       power loss there would. */
+    bool replace_file_fail_install;
+    bool replace_file_crash_after_backup;
     bool refuse_next_youtube_feed_build;
     bool expire_youtube_history;
     bool refuse_youtube_signin_recovery;
-    /* Stop the next compaction right after the original log is moved
-       aside, as a power loss there would. */
-    bool crash_next_site_storage_compact;
     /* Rasterize box shadows pixel by pixel, without the fully covered
        core run, as the reference the core run must reproduce. */
     bool shadow_reference_raster;
@@ -92,6 +136,9 @@ typedef struct {
        and body text inspected by the visible-content census. */
     unsigned long long css_statement_max_source_bytes;
     unsigned long long document_body_text_bytes_inspected;
+    /* Host work observation: ancestor cascades run by the simplified-view
+       image filter. Reset by the test. */
+    unsigned long long reader_image_style_resolutions;
     /* Host observation for per-site identity tests: the request key and
        effective User-Agent of each request trace replay answered, as a
        ring of the latest 16. Reset by the test. */

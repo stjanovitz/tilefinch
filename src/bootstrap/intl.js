@@ -68,7 +68,30 @@
         return text;
       }
       formatToParts(value) {
-        return [{ type: "integer", value: this.format(value) }];
+        const parts = [];
+        let text = this.format(value);
+        if (this.options.style === "currency") {
+          const separator = text.lastIndexOf(" ");
+          parts.push({ type: "currency", value: text.slice(0, separator) },
+            { type: "literal", value: " " });
+          text = text.slice(separator + 1);
+        }
+        const percent = text.endsWith("%");
+        if (percent) text = text.slice(0, -1);
+        if (text.startsWith("-")) {
+          parts.push({ type: "minusSign", value: "-" });
+          text = text.slice(1);
+        }
+        const pair = text.split(".");
+        const groups = pair[0].split(",");
+        for (let i = 0; i < groups.length; i++) {
+          if (i) parts.push({ type: "group", value: "," });
+          parts.push({ type: text === "NaN" ? "nan" : "integer", value: groups[i] });
+        }
+        if (pair.length > 1) parts.push({ type: "decimal", value: "." },
+          { type: "fraction", value: pair[1] });
+        if (percent) parts.push({ type: "percentSign", value: "%" });
+        return parts;
       }
       resolvedOptions() {
         return {
@@ -830,9 +853,4 @@
     }
     globalThis.Intl.Segmenter = TilefinchSegmenter;
   }
-  /* A deterministic replay realm registered its DateTimeFormat facade
-     before this module loaded (see deterministic-replay-surface.js). */
-  const replayDateTimeFormat = globalThis.__tilefinchDeterministicDateTimeFormat;
-  if (typeof replayDateTimeFormat === "function")
-    globalThis.Intl.DateTimeFormat = replayDateTimeFormat;
 })();

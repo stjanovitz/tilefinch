@@ -59,7 +59,7 @@ static bool style_property_content(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[96];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->generated_content = strcmp(resolved, "none") != 0
@@ -109,11 +109,25 @@ static bool style_property_content(const StylePropertyParse *parse)
                     resolved, decoded, sizeof(decoded), &decoded_length);
             style->generated_text_length = literal
                 ? (uint8_t) decoded_length : 0;
-            style->generated_text = style->generated_text_length == 0
+            bool scalar = literal && decoded_length == 3
+                && (unsigned char) decoded[0] >= 0xe0u
+                && (unsigned char) decoded[0] <= 0xefu
+                && ((unsigned char) decoded[1] & 0xc0u) == 0x80u
+                && ((unsigned char) decoded[2] & 0xc0u) == 0x80u;
+            style->generated_text = style->generated_text_length == 0 || scalar
                 ? NULL : style_store_generated_text(
                       sheet, decoded, style->generated_text_length);
-            if (style->generated_content && style->generated_attr == NULL
-                && !literal) {
+            /* Symbol dictionaries often contain thousands of unused BMP
+               scalars. Keep their three UTF-8 bytes in the unused attr slot;
+               the winning cascade materializes only symbols actually read.
+               No ComputedStyle growth or larger literal quota is needed. */
+            if (scalar) {
+                style->generated_text = NULL;
+                memset(&style->generated_attr, 0, sizeof(style->generated_attr));
+                memcpy(style->generated_scalar, decoded, 3);
+                style->generated_attr_length = STYLE_GENERATED_SCALAR_LENGTH;
+            }
+            if (!literal && style->generated_content && style->generated_attr == NULL) {
                 size_t expression_length = strlen(resolved);
                 if (expression_length < STYLE_GENERATED_TEXT_CAPACITY) {
                     style->generated_text = style_store_generated_text(
@@ -125,7 +139,8 @@ static bool style_property_content(const StylePropertyParse *parse)
                         style->generated_text != NULL;
                 }
             }
-            if (style->generated_text == NULL) {
+            if (style->generated_attr_length != STYLE_GENERATED_SCALAR_LENGTH
+                && style->generated_text == NULL) {
                 style->generated_text_length = 0;
                 style->generated_expression = false;
             }
@@ -137,7 +152,7 @@ static bool style_property_content(const StylePropertyParse *parse)
 
 static bool style_property_clip_path(const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -221,40 +236,17 @@ static bool style_parse_inset_components(
         || percentages == NULL || count == NULL || capacity == 0
         || capacity > 4) return false;
     *count = 0;
-    for (size_t at = 0; at < length;) {
-        while (at < length && isspace((unsigned char) text[at])) at++;
-        if (at == length) break;
-        if (*count == capacity) return false;
-        size_t end = at;
-        unsigned parentheses = 0;
-        char quote = '\0';
-        bool escaped = false;
-        while (end < length) {
-            char character = text[end];
-            if (quote != '\0') {
-                if (escaped) escaped = false;
-                else if (character == '\\') escaped = true;
-                else if (character == quote) quote = '\0';
-            } else if (character == '\'' || character == '"') {
-                quote = character;
-            } else if (character == '(') {
-                parentheses++;
-            } else if (character == ')' && parentheses != 0) {
-                parentheses--;
-            } else if (parentheses == 0
-                       && isspace((unsigned char) character)) {
-                break;
-            }
-            end++;
-        }
-        if (end == at || quote != '\0' || parentheses != 0
+    /* A component holding a quote or an unbalanced parenthesis is one
+       token here, and the length parser rejects it. */
+    size_t cursor = 0, at = 0, end = 0;
+    while (style_next_top_level_token(text, length, &cursor, &at, &end)) {
+        if (*count == capacity
             || !style_parse_inset_component(
                    sheet, text + at, end - at, &values[*count],
                    &automatic[*count], &percentages[*count])) {
             return false;
         }
         (*count)++;
-        at = end;
     }
     return *count != 0;
 }
@@ -554,7 +546,7 @@ static bool style_property_visibility(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             if (strcmp(resolved, "visible") != 0
@@ -575,7 +567,7 @@ static bool style_property_position(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->fixed_position = strcmp(resolved, "fixed") == 0;
@@ -597,7 +589,7 @@ static bool style_property_float(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask_high = parse->mask_high;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->float_mode = strcmp(resolved, "left") == 0
@@ -619,7 +611,7 @@ static bool style_property_clear(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask_high = parse->mask_high;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             if (strcmp(resolved, "left") == 0
@@ -643,21 +635,17 @@ static bool style_radius_tokens(const Stylesheet *sheet,
                                 const char *text, size_t length,
                                 int radii[4], size_t *count)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (count == NULL
         || !style_resolve_value(
             sheet, text, length, resolved, sizeof(resolved), 0)
         || strchr(resolved, '/') != NULL) return false;
     *count = 0;
     size_t resolved_length = strlen(resolved);
-    size_t at = 0;
-    for (; at < resolved_length && *count < 4;) {
-        while (at < resolved_length
-               && isspace((unsigned char) resolved[at])) at++;
-        size_t end = at;
-        while (end < resolved_length
-               && !isspace((unsigned char) resolved[end])) end++;
-        if (end == at) break;
+    /* Radii split at the top level, so `calc(4px + 2px)` is one radius. */
+    size_t cursor = 0, at = 0, end = 0;
+    while (*count < 4 && style_next_top_level_token(
+               resolved, resolved_length, &cursor, &at, &end)) {
         bool percent = false;
         int radius = style_parse_length(
             sheet, resolved + at, end - at, -1, &percent);
@@ -671,10 +659,7 @@ static bool style_radius_tokens(const Stylesheet *sheet,
             radius = 32767;
         }
         radii[(*count)++] = radius;
-        at = end;
     }
-    while (at < resolved_length
-           && isspace((unsigned char) resolved[at])) at++;
     if (*count == 0) return false;
     if (*count == 1) {
         radii[1] = radii[2] = radii[3] = radii[0];
@@ -684,7 +669,8 @@ static bool style_radius_tokens(const Stylesheet *sheet,
     } else if (*count == 3) {
         radii[3] = radii[1];
     }
-    return at == resolved_length;
+    return !style_next_top_level_token(
+        resolved, resolved_length, &cursor, &at, &end);
 }
 
 static bool style_property_border_radius(const StylePropertyParse *parse)
@@ -819,7 +805,7 @@ static bool style_property_background_repeat(const StylePropertyParse *parse)
     const char *value = parse->value;
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
-    char resolved[48];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, value, value_length, resolved,
                              sizeof(resolved), 0)) return true;
     uint8_t cleared = (uint8_t) ~(STYLE_BACKGROUND_NO_REPEAT_X

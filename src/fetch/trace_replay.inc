@@ -488,6 +488,18 @@ static bool trace_parse_security_metadata(
     return true;
 }
 
+static bool trace_replay_ignore_request_body(void)
+{
+#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
+    return false;
+#else
+    static int ignored = -1;
+    if (ignored < 0)
+        ignored = getenv("TILEFINCH_REPLAY_IGNORE_REQUEST_BODY") != NULL;
+    return ignored != 0;
+#endif
+}
+
 static bool trace_replay_response_with_scratch(
     Budget *budget, const char *method, const char *url,
     const char *logical_url,
@@ -1491,15 +1503,7 @@ static bool trace_replay_response_with_scratch(
        request bodies (chatgpt.com's sentinel), so a recorded POST can only be
        replayed against a new run with its body identity waived. Validation
        EBOOTs set the variable from boot.cfg's trace_ignore_request_body. */
-    static int ignore_request_body = -1;
-#if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
-    ignore_request_body = 0;
-#else
-    if (ignore_request_body < 0)
-        ignore_request_body =
-            getenv("TILEFINCH_REPLAY_IGNORE_REQUEST_BODY") != NULL;
-#endif
-    bool request_body_match = ignore_request_body
+    bool request_body_match = trace_replay_ignore_request_body()
         || ((recorded_request_length == SIZE_MAX
              || recorded_request_length == request_length)
             && (!has_request_hash || recorded_request_hash == request_hash));
@@ -1872,7 +1876,9 @@ static bool trace_replay_response_with_scratch(
 
 static bool trace_record_request_key(
     size_t sequence, const char *method, const char *url,
-    FetchCacheMode cache_mode, TraceReplayScratch *scratch, bool *valid)
+    FetchCacheMode cache_mode, bool match_body, size_t body_length,
+    uint64_t body_hash, uint64_t body_hash_v1,
+    TraceReplayScratch *scratch, bool *valid)
 {
     if (method == NULL || url == NULL || scratch == NULL || valid == NULL) {
         return false;
@@ -1889,6 +1895,9 @@ static bool trace_record_request_key(
     unsigned trace_version = 0;
     FetchCacheMode recorded_cache_mode = FETCH_CACHE_DEFAULT;
     bool cache_mode_seen = false;
+    size_t recorded_body_length = 0;
+    uint64_t recorded_body_hash = 0;
+    bool body_length_seen = false, body_hash_seen = false;
     unsigned checkpoint_lines = 0;
     while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
         trace_replay_prepare_checkpoint(&checkpoint_lines);
@@ -1917,6 +1926,16 @@ static bool trace_record_request_key(
             if (url_seen) parse_ok = false;
             url_seen = true;
             url_match = trace_replay_url_equal(equals, url);
+        } else if (strcmp(scratch->line, "request-body-length") == 0) {
+            bool field_ok = !body_length_seen
+                && trace_parse_size_value(equals, &recorded_body_length);
+            body_length_seen = true;
+            parse_ok = parse_ok && field_ok;
+        } else if (strcmp(scratch->line, "request-body-hash") == 0) {
+            bool field_ok = !body_hash_seen
+                && trace_parse_hash_value(equals, &recorded_body_hash);
+            body_hash_seen = true;
+            parse_ok = parse_ok && field_ok;
         } else if (strcmp(
                        scratch->line,
                        "request-extra-header-shape") == 0) {
@@ -1933,8 +1952,19 @@ static bool trace_record_request_key(
     TRACE_REPLAY_IO_OPEN(meta_started_ns);
     *valid = parse_ok && version_seen && method_seen && url_seen
         && (trace_version < 13 || cache_mode_seen);
+    bool body_route = match_body && strcmp(method, "GET") != 0
+        && strcmp(method, "HEAD") != 0 && !trace_replay_ignore_request_body()
+        && !fetch_trace.replay_volatile_uuids;
+    /* Legacy response-only fixtures may have no request-body authority at
+       all. Preserve that documented compatibility, not a partial identity.
+       The explicit UUID/body diagnostic waivers keep their prior semantics. */
+    if (body_route && body_length_seen != body_hash_seen) *valid = false;
     return *valid && method_match && url_match
-        && (trace_version < 13 || recorded_cache_mode == cache_mode);
+        && (trace_version < 13 || recorded_cache_mode == cache_mode)
+        && (!body_route || (!body_length_seen && !body_hash_seen)
+            || (body_length_seen && body_hash_seen
+            && recorded_body_length == body_length
+            && recorded_body_hash == (trace_version == 1 ? body_hash_v1 : body_hash)));
 }
 
 typedef struct {
@@ -2168,7 +2198,8 @@ typedef struct {
    in record-id order even when their bytes are identical; lower ranks never
    become a fallback after exhaustion. */
 static bool trace_response_key_select(
-    const char *method, const char *url, FetchCacheMode cache_mode,
+    const char *method, const char *url, const FetchRequest *request,
+    FetchCacheMode cache_mode,
     TraceReplayScratch *scratch,
     FetchResult *result, TraceResponseKeySelection *selection)
 {
@@ -2186,6 +2217,11 @@ static bool trace_response_key_select(
            == fetch_trace.replay_record_count;
     uint64_t requested_hash = indexed
         ? trace_response_key_hash(method, url, cache_mode) : 0;
+    const char *body = request == NULL || request->body == NULL ? "" : request->body;
+    size_t body_length = request == NULL ? 0 : request->body_length;
+    bool body_route = strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0;
+    uint64_t body_hash = body_route ? trace_body_hash(body, body_length) : 0;
+    uint64_t body_hash_v1 = body_route ? trace_body_hash_v1(body, body_length) : 0;
     for (size_t sequence = 0;
          sequence < fetch_trace.replay_record_count; sequence++) {
         const TraceReplayRouteIndexEntry *entry = indexed
@@ -2200,7 +2236,8 @@ static bool trace_response_key_select(
         if (entry != NULL && entry->key_hash != requested_hash) continue;
         bool key_valid = false;
         bool key_match = trace_record_request_key(
-            sequence, method, url, cache_mode, scratch, &key_valid);
+            sequence, method, url, cache_mode, true, body_length, body_hash,
+            body_hash_v1, scratch, &key_valid);
         if (!key_valid) {
             fetch_trace.replay_invalid_route_request_count++;
             snprintf(result->error, sizeof(result->error),
@@ -2305,7 +2342,7 @@ static bool trace_replay_response(Budget *budget, const char *method,
     if (fetch_trace.replay_response_keyed) {
         TraceResponseKeySelection selection;
         bool selected = trace_response_key_select(
-            method, canonical_url,
+            method, canonical_url, request,
             request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
             scratch, result, &selection);
         if (!selected) {
@@ -2373,8 +2410,9 @@ static bool trace_replay_response(Budget *budget, const char *method,
                      method, canonical_url);
             trace_replay_decision(
                 "HTTP response-keyed replay unmatched method=%.12s "
-                "url=%.420s",
-                method, canonical_url);
+                "url=%.420s cache=%u",
+                method, canonical_url, (unsigned) (request == NULL
+                    ? FETCH_CACHE_DEFAULT : request->cache_mode));
         }
     } else {
         bool indexed = fetch_trace.replay_route_index != NULL
@@ -2401,7 +2439,7 @@ static bool trace_replay_response(Budget *budget, const char *method,
             bool key_match = trace_record_request_key(
                 sequence, method, canonical_url,
                 request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
-                scratch, &key_valid);
+                false, 0, 0, 0, scratch, &key_valid);
             if (!key_valid) {
                 snprintf(result->error, sizeof(result->error),
                          "HTTP replay record %zu metadata is corrupt",

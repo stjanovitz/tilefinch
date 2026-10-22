@@ -296,6 +296,61 @@ setup preferences, keyboard fallback, and one compact input record per actor
 suitable for future network transport. The focused qualification lane is
 described in [Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification).
 
+## How the PSP path is built
+
+WebGL is a lazy, bounded command translator, not a software GLSL interpreter.
+The JavaScript layer exposes the familiar object and state model, admits only
+the shader shapes above, combines a bounded chain of position-matrix uniforms,
+and snapshots each draw's buffers, attributes, transform, viewport, scissor,
+depth, cull, and blend state into a bounded command batch. The native wire
+format is versioned and uses fixed 32-bit integer and float words, which
+avoids software double-precision conversion on Allegrex while keeping
+draw-time snapshots. The native side reads possibly unaligned words with
+`memcpy` and validates every scalar and byte span again before either the host
+reference rasterizer or the GE sees it.
+
+Draw admission validates enabled-attribute spans and indexed-draw alignment,
+count, offset, highest referenced vertex, and source-buffer bounds before a
+command enters the batch, so malformed game geometry is an ordinary WebGL
+error rather than a late native failure or context loss.
+
+The PSP keeps one bounded EDRAM color target, depth target, and texture cache,
+and shares GE command ownership with the media presenter rather than adding a
+second graphics authority. Texture generations avoid re-uploading unchanged
+pixels within one native `(realm epoch, canvas handle)` owner; fresh realms,
+context restoration, canvas changes, and the video layout's reuse of the
+EDRAM texture region clear that authority before lookup. Page-owned command,
+buffer, texture, depth, and presentation memory is charged through `Budget`,
+so a failed allocation or an oversized scene refuses the operation without
+growing a hidden heap.
+
+PSP draw translation first counts the exact bounded vertex requirement, then
+charges only that much scratch for the submission. All emitted vertices occupy
+one contiguous prefix, so a single cache writeback just before `sceGuFinish`
+publishes the batch. GE synchronization remains the ownership boundary before
+CPU readback; command submission is deliberately synchronous.
+
+The PSP's 8888 alpha channel doubles as its stencil plane, which is why the
+drawing buffer is opaque (`alpha: false`): GE output is resolved to an opaque
+native surface while each completed row is copied, rather than claiming
+transparent-buffer behavior the hardware cannot implement consistently.
+
+When a canvas frame is not published by the GE path above, an opaque,
+untransformed canvas update can still publish without rebuilding the
+viewport's ordinary tiles. The renderer keeps the previous RGB565 frame,
+overwrites only the canvas rectangle, then replays later document paint and
+fixed or sticky chrome in order. Scaled nearest-neighbor publication converts
+each source pixel once per run and copies repeated source rows, keeping the
+fast path bounded without another canvas-sized allocation. Transparent,
+filtered, rounded, multiply-blended, or ambiguously ordered canvases refuse
+this path and use the normal retained-tile renderer.
+
+The host rasterizer exercises pixels, clipping, depth, culling, blending,
+texture wrapping, and line closure. A PSP-target GE probe separately measures
+representative cube, sprite, draw-pressure, CPU-vertex, and texture-upload
+scenes, and PPSSPP's software renderer is used when an end-to-end browser
+fixture must read GE pixels back into the page renderer.
+
 ## Preflight checklist
 
 - The drawing buffer is deliberately PSP-sized.

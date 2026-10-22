@@ -7,10 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(__PSP__)
-#include <pspiofilemgr.h>
-#endif
-
+#include "tilefinch/install_paths.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/psp_boot_cache.h"
 
@@ -95,13 +92,27 @@ static bool install_sync_file(FILE *file)
 #endif
 }
 
-static bool install_sync_device(void)
+/* Flushes the Memory Stick after completed, checked work. Some real
+   firmware/storage-driver combinations reject every sync after the checked
+   writes and renames succeeded (tilefinch_memory_stick_sync), so each flush
+   here is a durability hint and never fails the work before it. None of them
+   carries the update's safety: the launcher re-hashes every file of a
+   pending slot against the signed table before any trial, and the journal
+   commit is an A/B copy (update_journal.c). What a flush buys is that a
+   power cut soon after it cannot cost the user a finished download:
+   - staged slot: the files are on the card before the promotion rename, so
+     a promoted slot does not fail that verification and get discarded;
+   - promoted slot: the rename is on the card before the PENDING journal
+     names it, for the same reason;
+   - startup cache: the receipt reaches the card, so the next boot trusts
+     the copy by metadata instead of comparing its bytes. The copy itself is
+     flushed before its receipt is written (psp_boot_cache_copy_step, shared
+     with the launcher's own copy at boot); where that flush is rejected no
+     receipt is written, the copy is kept, and the launcher's byte
+     comparison adopts it on the next boot. */
+static void install_sync_device(void)
 {
-#if defined(__PSP__)
-    return sceIoSync("ms0:", 0) >= 0;
-#else
-    return true;
-#endif
+    (void) tilefinch_memory_stick_sync();
 }
 
 static bool remove_tree_bounded(
@@ -442,8 +453,8 @@ static bool install_write_metadata(TilefinchUpdateInstallJob *job)
         && install_sync_file(file);
     if (ok && install_fault(job, "after-sync-ready")) ok = false;
     if (file != NULL && fclose(file) != 0) ok = false;
-    if (!ok || install_fault(job, "before-sync-staged-slot")
-        || !install_sync_device()) return false;
+    if (!ok || install_fault(job, "before-sync-staged-slot")) return false;
+    install_sync_device();
     return !install_fault(job, "after-sync-staged-slot");
 }
 
@@ -460,8 +471,8 @@ static bool install_promote(TilefinchUpdateInstallJob *job)
         return false;
     }
     if (install_fault(job, "after-promote-staged-slot")) return false;
-    if (install_fault(job, "before-sync-promoted-slot")
-        || !install_sync_device()) return false;
+    if (install_fault(job, "before-sync-promoted-slot")) return false;
+    install_sync_device();
     if (install_fault(job, "after-sync-promoted-slot")) return false;
     TilefinchUpdateState pending = job->state;
     if (pending.generation == UINT64_MAX) return false;
@@ -629,10 +640,9 @@ bool tilefinch_update_install_pump(
                 job->startup_begun = true;
                 if (install_path(job->startup_source, sizeof(job->startup_source),
                                  job->target_path, "EBOOT.PBP")
-                    && install_path(job->startup_cache, sizeof(job->startup_cache),
-                                    job->data_dir, "startup-module.prx")
-                    && install_path(job->startup_temporary, sizeof(job->startup_temporary),
-                                    job->data_dir, "startup-module.tmp")
+                    && psp_boot_cache_paths(job->data_dir, job->startup_cache,
+                                            job->startup_temporary,
+                                            sizeof(job->startup_cache))
                     && !install_fault(job, "before-prepare-startup"))
                     (void)psp_boot_cache_copy_begin(&job->startup,
                         job->startup_source, job->startup_cache, job->startup_temporary,
@@ -646,9 +656,8 @@ bool tilefinch_update_install_pump(
                                                  INSTALL_IO_CHUNK, quota) == PSP_BOOT_CACHE_PENDING)
                     return true;
             }
-            if (job->startup.result == PSP_BOOT_CACHE_CREATED
-                && !install_sync_device())
-                psp_boot_cache_discard(job->data_dir);
+            if (job->startup.result == PSP_BOOT_CACHE_CREATED)
+                install_sync_device();
         }
         job->phase = TILEFINCH_UPDATE_INSTALL_COMPLETE;
         job->status = TILEFINCH_UPDATE_OK;

@@ -25,7 +25,7 @@
     activeWriterPaths = [];
   let bufferGrowths = 0,
     bufferCopiedBytes = 0;
-  if (globalThis.__tilefinchRootCensus)
+  if (globalThis.__tilefinchTestProbes && globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
       opfsBufferGrowths: { get: () => bufferGrowths },
       opfsBufferCopiedBytes: { get: () => bufferCopiedBytes },

@@ -122,10 +122,10 @@ int main(void)
     CHECK(ui.experimental_decoder_choice == 0u);
 
     /* Confirm commits the shown spelling, and does not move it. */
-    ui.experimental_decoder_choice = 4;
+    ui.experimental_decoder_choice = 1;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_SET_VIDEO_DECODER
-          && ui.experimental_decoder_choice == 4u
+          && ui.experimental_decoder_choice == 1u
           && ui.screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS);
 
     /*

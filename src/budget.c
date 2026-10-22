@@ -1659,7 +1659,8 @@ static void *quickjs_pool_malloc(void *opaque, size_t size)
                back to the underlying heap and retry once before the page
                sees an out-of-memory error.  Matters most on devices where
                the physical heap, not the configured ceiling, is the
-               binding constraint.  TILEFINCH_JS_POOL_TRIM_RETRY=0 opts out.
+               binding constraint.  TILEFINCH_JS_POOL_TRIM_RETRY=0 opts out
+               (a lab knob: host and PSP validation builds only).
                (Continuing past the first would-be OOM once trampled a
                JSString on the PSP build; that was the JS stack guard
                leaving too little physical stack margin for the OOM
@@ -1669,7 +1670,8 @@ static void *quickjs_pool_malloc(void *opaque, size_t size)
                 pool->budget->injected_failure_count != injected_before;
             static int retry_enabled = -1;
             if (retry_enabled < 0) {
-                const char *value = getenv("TILEFINCH_JS_POOL_TRIM_RETRY");
+                const char *value =
+                    tilefinch_lab_getenv("TILEFINCH_JS_POOL_TRIM_RETRY");
                 retry_enabled = value == NULL || value[0] != '0';
             }
             if (!injected_failure && retry_enabled
@@ -1870,13 +1872,6 @@ BudgetQuickJSPool *budget_quickjs_pool_create(Budget *budget)
     }
     return pool;
 }
-
-#if !defined(__PSP__)
-Budget *budget_quickjs_pool_owner(const BudgetQuickJSPool *pool)
-{
-    return pool == NULL ? NULL : pool->budget;
-}
-#endif
 
 void budget_quickjs_pool_set_limit_growth(BudgetQuickJSPool *pool,
                                           BudgetQuickJSLimitGrowth grow,

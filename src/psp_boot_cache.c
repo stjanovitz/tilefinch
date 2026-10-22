@@ -67,11 +67,24 @@ static FILE *open_read(const char *path)
     return file;
 }
 
+bool psp_boot_cache_paths(const char *directory, char *cache,
+                          char *temporary, size_t size)
+{
+    if (directory == NULL || cache == NULL || temporary == NULL) return false;
+    int cache_length = snprintf(cache, size, "%s/%s", directory,
+                                PSP_BOOT_CACHE_MODULE_NAME);
+    int temporary_length = snprintf(temporary, size, "%s/%s", directory,
+                                    PSP_BOOT_CACHE_TEMPORARY_NAME);
+    return cache_length > 0 && (size_t)cache_length < size
+        && temporary_length > 0 && (size_t)temporary_length < size;
+}
+
 void psp_boot_cache_discard(const char *directory)
 {
     if (directory == NULL || directory[0] == '\0') return;
     static const char *const names[] = {
-        "startup-module.prx", "startup-module.tmp", "startup-module.prx.receipt"
+        PSP_BOOT_CACHE_MODULE_NAME, PSP_BOOT_CACHE_TEMPORARY_NAME,
+        PSP_BOOT_CACHE_MODULE_NAME ".receipt"
     };
     char path[TILEFINCH_INSTALL_PATH_LIMIT];
     for (unsigned at = 0; at < sizeof(names) / sizeof(names[0]); at++) {
@@ -97,6 +110,21 @@ bool psp_boot_pbp_payload(const uint8_t *h, size_t n, uint32_t file_size,
     *offset = begin;
     *size = end - begin;
     return true;
+}
+
+/* Positions source at its relocatable DATA.PSP module, given the PBP's
+   size; false for a legacy static EBOOT or malformed package. */
+static bool source_payload(FILE *source, uint32_t file_size,
+                           uint32_t *begin, uint32_t *size)
+{
+    uint8_t header[40], module[20];
+    return fseek(source, 0, SEEK_SET) == 0
+        && fread(header, 1, sizeof(header), source) == sizeof(header)
+        && psp_boot_pbp_payload(header, sizeof(header), file_size, begin, size)
+        && fseek(source, (long)*begin, SEEK_SET) == 0
+        && fread(module, 1, sizeof(module), source) == sizeof(module)
+        && psp_boot_module_format(module, sizeof(module))
+        && fseek(source, (long)*begin, SEEK_SET) == 0;
 }
 
 static bool module_equal(FILE *source, FILE *cache, uint32_t size,
@@ -237,15 +265,9 @@ PspBootCacheResult psp_boot_cache_copy_begin(
     copy->temporary_path = temporary;
     copy->source = open_read(source);
     if (copy->source == NULL) return copy_failed(copy);
-    uint8_t header[40], module[20];
     uint64_t available = 0;
-    if (fread(header, 1, sizeof(header), copy->source) != sizeof(header)
-        || !psp_boot_pbp_payload(header, sizeof(header), (uint32_t)identity.size,
-                                 &copy->begin, &copy->size)
-        || fseek(copy->source, (long)copy->begin, SEEK_SET) != 0
-        || fread(module, 1, sizeof(module), copy->source) != sizeof(module)
-        || !psp_boot_module_format(module, sizeof(module))
-        || fseek(copy->source, (long)copy->begin, SEEK_SET) != 0
+    if (!source_payload(copy->source, (uint32_t)identity.size,
+                        &copy->begin, &copy->size)
         || !query_space(context, &available) || copy->size > available
         || 65536u > available - copy->size) return copy_failed(copy);
     copy->file = fopen(temporary, "wb");
@@ -308,7 +330,12 @@ PspBootCacheResult psp_boot_cache_copy_step(
         (void)remove(copy->cache_path);
         return copy_failed(copy);
     }
-    receipt_save(receipt_path, &receipt);
+    /* The receipt lets later boots trust the copy by metadata alone, so the
+       copy must reach the card first. Where the firmware rejects the flush,
+       no receipt is written: the next boot's byte comparison adopts the
+       copy instead (psp_boot_cache_prepare). */
+    if (tilefinch_memory_stick_sync() != TILEFINCH_MEMORY_STICK_SYNC_REJECTED)
+        receipt_save(receipt_path, &receipt);
     copy->result = PSP_BOOT_CACHE_CREATED;
     return copy->result;
 }
@@ -327,75 +354,46 @@ PspBootCacheResult psp_boot_cache_prepare(
         || strcmp(cache_path, temporary_path) == 0) return PSP_BOOT_CACHE_UNAVAILABLE;
     char receipt_path[TILEFINCH_INSTALL_PATH_LIMIT];
     int receipt_length = snprintf(receipt_path, sizeof(receipt_path), "%s.receipt", cache_path);
-    bool receipt_path_valid = receipt_length > 0 && (size_t)receipt_length < sizeof(receipt_path);
-    if (receipt_path_valid && (strcmp(source_path, receipt_path) == 0
-        || strcmp(temporary_path, receipt_path) == 0)) return PSP_BOOT_CACHE_UNAVAILABLE;
+    if (receipt_length <= 0 || (size_t)receipt_length >= sizeof(receipt_path)
+        || strcmp(source_path, receipt_path) == 0
+        || strcmp(temporary_path, receipt_path) == 0) return PSP_BOOT_CACHE_UNAVAILABLE;
     CacheReceipt identity;
-    bool have_identity = receipt_path_valid && receipt_identity(source_path, cache_path, &identity);
-    if (have_identity && receipt_matches(receipt_path, &identity)) return PSP_BOOT_CACHE_REUSED;
+    if (receipt_identity(source_path, cache_path, &identity)
+        && receipt_matches(receipt_path, &identity)) return PSP_BOOT_CACHE_REUSED;
     /* Invalidate before replacement: a failed copy must never leave an old hint
        authorizing newly written data. The updater also discards this record. */
-    if (receipt_path_valid) (void)remove(receipt_path);
-    CacheFileIdentity original_source;
-    bool have_source = file_identity(source_path, &original_source);
+    (void)remove(receipt_path);
     FILE *source = open_read(source_path);
     if (source == NULL) return PSP_BOOT_CACHE_UNAVAILABLE;
-    PspBootCacheResult result = PSP_BOOT_CACHE_UNAVAILABLE;
-    uint8_t *bytes = scratch;
-    size_t capacity = scratch_bytes / 2u;
+    CacheFileIdentity original_source;
     uint32_t begin, size;
-    if (fseek(source, 0, SEEK_END) != 0) goto done;
-    long length = ftell(source);
-    if (length < 0 || (unsigned long)length > PSP_BOOT_IMAGE_MAX_BYTES
-        || fseek(source, 0, SEEK_SET) != 0
-        || fread(bytes, 1u, 40u, source) != 40u
-        || !psp_boot_pbp_payload(bytes, 40u, (uint32_t)length, &begin, &size)
-        || fseek(source, (long)begin, SEEK_SET) != 0
-        || fread(bytes, 1u, 20u, source) != 20u
-        || !psp_boot_module_format(bytes, 20u)
-        || fseek(source, (long)begin, SEEK_SET) != 0) goto done;
-    if (work_started != NULL) work_started(context);
-    FILE *cache = open_read(cache_path);
+    bool valid = file_identity(source_path, &original_source)
+        && source_payload(source, (uint32_t)original_source.size, &begin, &size);
+    if (valid && work_started != NULL) work_started(context);
+    /* A matching existing copy is adopted without a free-space query (FAT
+       queries can be expensive) or a rewrite. */
+    bool equal = false;
+    FILE *cache = valid ? open_read(cache_path) : NULL;
     if (cache != NULL) {
-        bool equal = module_equal(source, cache, size, bytes, bytes + capacity, capacity);
-        int closed = fclose(cache);
-        if (equal && closed == 0) { result = PSP_BOOT_CACHE_REUSED; goto done; }
+        size_t capacity = scratch_bytes / 2u;
+        uint8_t *bytes = scratch;
+        equal = module_equal(source, cache, size, bytes, bytes + capacity, capacity);
+        if (fclose(cache) != 0) equal = false;
     }
-    if (ferror(source) || fseek(source, (long)begin, SEEK_SET) != 0) goto done;
-    /* FAT free-space queries can be expensive: never query on a cache hit. */
-    uint64_t available_bytes = 0;
-    if (!query_space(context, &available_bytes)
-        || size > available_bytes || 65536u > available_bytes - size) goto done;
-    /* A stale temporary is never recovered as authoritative. A failed write
-       leaves the previous cache intact and the PBP available for LoadExec. */
-    FILE *temporary = fopen(temporary_path, "wb");
-    if (temporary == NULL) goto done;
-    bool copied = true;
-    for (uint32_t remaining = size; remaining != 0u;) {
-        size_t count = remaining < capacity ? remaining : capacity;
-        if (fread(bytes, 1u, count, source) != count
-            || fwrite(bytes, 1u, count, temporary) != count) { copied = false; break; }
-        remaining -= (uint32_t)count;
+    if (fclose(source) != 0) return PSP_BOOT_CACHE_UNAVAILABLE;
+    if (!valid) return PSP_BOOT_CACHE_UNAVAILABLE;
+    if (equal) {
+        if (receipt_identity(source_path, cache_path, &identity)
+            && memcmp(&original_source, &identity.source, sizeof(original_source)) == 0)
+            receipt_save(receipt_path, &identity);
+        return PSP_BOOT_CACHE_REUSED;
     }
-    if (fclose(temporary) != 0) copied = false;
-    if (copied) {
-        temporary = open_read(temporary_path);
-        copied = temporary != NULL && fseek(source, (long)begin, SEEK_SET) == 0
-            && module_equal(source, temporary, size, bytes, bytes + capacity, capacity);
-        if (temporary != NULL && fclose(temporary) != 0) copied = false;
-    }
-    if (copied) {
-        /* FAT may refuse rename over an existing file. Removing a derived
-           cache is safe: interrupted promotion simply uses the source PBP. */
-        (void)remove(cache_path);
-        if (rename(temporary_path, cache_path) == 0) result = PSP_BOOT_CACHE_CREATED;
-    }
-    if (result != PSP_BOOT_CACHE_CREATED) (void)remove(temporary_path);
-done:
-    if (fclose(source) != 0) result = PSP_BOOT_CACHE_UNAVAILABLE;
-    if (result != PSP_BOOT_CACHE_UNAVAILABLE && receipt_path_valid && have_source
-        && receipt_identity(source_path, cache_path, &identity)
-        && memcmp(&original_source, &identity.source, sizeof(original_source)) == 0)
-        receipt_save(receipt_path, &identity);
-    return result;
+    /* Otherwise the same incremental copy the updater runs, to completion. */
+    PspBootCacheCopy copy;
+    if (psp_boot_cache_copy_begin(&copy, source_path, cache_path, temporary_path,
+                                  query_space, context) != PSP_BOOT_CACHE_PENDING)
+        return PSP_BOOT_CACHE_UNAVAILABLE;
+    while (psp_boot_cache_copy_step(&copy, scratch, scratch_bytes, 0)
+           == PSP_BOOT_CACHE_PENDING) {}
+    return copy.result;
 }

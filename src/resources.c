@@ -227,7 +227,7 @@ static size_t stylesheet_estimate_scale(size_t count, size_t unit)
    allocation-free pass over the text counts (comments skipped; braces in
    strings over-count, which only makes the estimate more conservative).
    The coefficients bound every sheet of the calibration recorded in
-   docs/engineering/MEMORY_EXPERIMENTS.md; a quarter is added for geometric
+   .private-investigations/MEMORY_EXPERIMENTS.md; a quarter is added for geometric
    array growth, plus a fixed allowance (ramped in for small sheets) for
    arrays and index tables that double on first use. */
 static void stylesheet_source_cost_counts(const char *css, size_t length,
@@ -277,6 +277,21 @@ size_t stylesheet_source_cost_estimate(const char *css, size_t length)
     if (css == NULL || length == 0) return 0;
     size_t blocks = 0, custom_properties = 0;
     stylesheet_source_cost_counts(css, length, &blocks, &custom_properties);
+    return stylesheet_source_cost(length, blocks, custom_properties);
+}
+
+/* Large external sources already have a retained-rule ceiling. They are
+   scanned in place, not expanded into an AST, so reserving a rule object
+   for every discarded utility rule needlessly removes the sheet's tail.
+   Custom-property storage remains independently accounted in full. */
+static size_t stylesheet_admitted_source_cost(const char *css, size_t length)
+{
+    if (length < STYLESHEET_LARGE_SOURCE_BYTES)
+        return stylesheet_source_cost_estimate(css, length);
+    size_t blocks = 0, custom_properties = 0;
+    stylesheet_source_cost_counts(css, length, &blocks, &custom_properties);
+    if (blocks > STYLESHEET_LARGE_SOURCE_RULE_LIMIT)
+        blocks = STYLESHEET_LARGE_SOURCE_RULE_LIMIT;
     return stylesheet_source_cost(length, blocks, custom_properties);
 }
 
@@ -471,21 +486,16 @@ static size_t stylesheet_pressure_prefix(ResourceContext *context,
    flight, up to STYLESHEET_FILE_CEILING_BYTES; small-memory profiles and a
    tight Budget keep the per-file cap, where the complete-rules prefix of a
    longer sheet still applies. `remaining` is the lane's aggregate room. */
-static size_t stylesheet_response_bound(const ResourceContext *context,
-                                        size_t remaining)
+size_t stylesheets_response_byte_limit(const Budget *budget,
+    size_t single_limit, size_t remaining, size_t in_flight_bytes)
 {
-    size_t bound = context->maximum_single_bytes;
+    size_t bound = single_limit;
     if (bound >= STYLESHEET_LARGE_SOURCE_BYTES
         && bound < STYLESHEET_FILE_CEILING_BYTES
-        && context->budget != NULL) {
-        size_t reserved = STYLESHEET_LAYOUT_RESERVE;
-        for (size_t i = 0; i < context->pending_count; i++) {
-            reserved = stylesheet_estimate_add(
-                reserved, stylesheet_estimate_scale(
-                    context->pending[i].maximum_bytes,
-                    STYLESHEET_STAGING_FACTOR));
-        }
-        size_t free_bytes = budget_remaining(context->budget);
+        && budget != NULL) {
+        size_t reserved = stylesheet_estimate_add(STYLESHEET_LAYOUT_RESERVE,
+            stylesheet_estimate_scale(in_flight_bytes, STYLESHEET_STAGING_FACTOR));
+        size_t free_bytes = budget_remaining(budget);
         size_t affordable = free_bytes > reserved
             ? (free_bytes - reserved) / STYLESHEET_STAGING_FACTOR : 0;
         if (affordable > STYLESHEET_FILE_CEILING_BYTES)
@@ -493,6 +503,21 @@ static size_t stylesheet_response_bound(const ResourceContext *context,
         if (affordable > bound) bound = affordable;
     }
     return bound < remaining ? bound : remaining;
+}
+
+size_t stylesheets_in_flight_add(size_t in_flight_bytes, size_t request_bytes)
+{
+    return stylesheet_estimate_add(in_flight_bytes, request_bytes);
+}
+
+static size_t stylesheet_response_bound(const ResourceContext *context,
+                                        size_t remaining)
+{
+    size_t pending = 0;
+    for (size_t i = 0; i < context->pending_count; i++)
+        pending = stylesheets_in_flight_add(pending, context->pending[i].maximum_bytes);
+    return stylesheets_response_byte_limit(context->budget,
+        context->maximum_single_bytes, remaining, pending);
 }
 
 /* Style preloads are optional hints with a lane of their own: as many
@@ -716,11 +741,25 @@ static void stylesheet_note_truncated(
     *applied_total = stylesheet_estimate_add(*applied_total, applied);
 }
 
+/* A rebuild pass records which ledger entries it applied and replaces
+   every entry's bit with that set when it completes; other passes only
+   add to the bits. */
+static void document_resource_note_applied(
+    ResourceContext *context, StylesheetDocumentResource *entry)
+{
+    StylesheetDocumentResources *resources = context->document_resources;
+    if (context->rebuilding)
+        context->applied_this_pass |=
+            UINT32_C(1) << (size_t) (entry - resources->items);
+    else entry->rules_applied = true;
+}
+
 static void document_resource_record_loaded(
     ResourceContext *context, const char *url, char **owned_url,
     const StylesheetResponseProvenance *provenance,
     BrowserSharedBody *body, size_t length, bool rules_applied,
-    bool cors_validated, TilefinchCredentialsMode credentials,
+    bool link_originated, bool cors_validated,
+    TilefinchCredentialsMode credentials,
     const TilefinchResourceGrant *resource_grant)
 {
     StylesheetDocumentResources *resources = context->document_resources;
@@ -780,12 +819,8 @@ static void document_resource_record_loaded(
         if (!reuses_existing) budget_free(context->budget, replacement);
     }
     entry->length = length;
-    if (context->rebuilding) {
-        if (rules_applied) context->applied_this_pass |=
-            UINT32_C(1) << (size_t) (entry - resources->items);
-    } else {
-        entry->rules_applied = entry->rules_applied || rules_applied;
-    }
+    if (rules_applied) document_resource_note_applied(context, entry);
+    if (link_originated) entry->link_originated = true;
     entry->cors_validated = cors_validated;
     entry->motion_source_readable = resource_grant != NULL
         && resource_grant->cors_validated;
@@ -1360,8 +1395,12 @@ static bool apply_stylesheet_data(ResourceContext *context,
                                   BrowserSharedBody *cached_body,
                                   const TilefinchRequestContext *request_context,
                                   const TilefinchResourceGrant *resource_grant,
-                                  bool retained_motion_source_readable)
+                                  bool retained_motion_source_readable,
+                                  bool *applied)
 {
+    /* True only when the rules entered the sheet: a response skipped for
+       the byte budget or memory pressure settles without applying. */
+    *applied = false;
     if (provenance == NULL || !provenance->known
         || provenance->response_url == NULL
         || (css_data == NULL && css_length != 0)
@@ -1379,7 +1418,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
         context->stats->skipped_limit++;
         return true;
     }
-    size_t parse_cost = stylesheet_source_cost_estimate(
+    size_t parse_cost = stylesheet_admitted_source_cost(
         (const char *) css_data, css_length);
     size_t source_length = css_length;
     if (!stylesheet_parse_admitted(context, css_length, parse_cost)) {
@@ -1395,7 +1434,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
             return true;
         }
         css_length = kept;
-        parse_cost = stylesheet_source_cost_estimate(
+        parse_cost = stylesheet_admitted_source_cost(
             (const char *) css_data, css_length);
     }
     if (css_length < source_length)
@@ -1742,6 +1781,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
     budget_free(context->budget, source_base);
     budget_free(context->budget, stable_cached);
     browser_shared_body_release(stable_body);
+    *applied = parsed;
     return parsed;
 }
 
@@ -1755,13 +1795,16 @@ static bool settle_stylesheet_data(ResourceContext *context,
                                    BrowserSharedBody *cached_body,
                                    bool apply_rules, bool preload,
                                    const TilefinchRequestContext *request_context,
-                                   const TilefinchResourceGrant *resource_grant)
+                                   const TilefinchResourceGrant *resource_grant,
+                                   bool *applied)
 {
+    *applied = false;
     if (apply_rules) {
         return apply_stylesheet_data(
             context, resolved, provenance, css_data, css_length,
             depth, fetched,
-            use_cached, cached_body, request_context, resource_grant, false);
+            use_cached, cached_body, request_context, resource_grant, false,
+            applied);
     }
     size_t *charged = preload ? &context->stats->preload_bytes
                               : &context->stats->bytes;
@@ -2031,13 +2074,18 @@ static bool load_stylesheet_url(
         context->stats->attempted++;
         context->stats->cache_hits++;
         context->document_resources->retained_body_hits++;
-        return apply_stylesheet_data(
+        /* Replaying the retained body applies its rules, as a fetch would
+           (which records them through document_resource_record_loaded). */
+        bool applied = false;
+        bool parsed = apply_stylesheet_data(
             context, resolved, &retained,
             document_resource->body == NULL
                 ? NULL : document_resource->body->data,
             document_resource->length, depth, NULL, true,
             document_resource->body, &request_context, NULL,
-            document_resource->motion_source_readable);
+            document_resource->motion_source_readable, &applied);
+        if (applied) document_resource_note_applied(context, document_resource);
+        return parsed;
     }
     size_t remaining = context->maximum_total_bytes - context->stats->bytes;
     size_t maximum = stylesheet_response_bound(context, remaining);
@@ -2196,6 +2244,7 @@ static bool load_stylesheet_url(
             return true;
         }
     }
+    bool applied = false;
     bool parsed = apply_stylesheet_data(context, resolved,
                                         &response_provenance, css_data,
                                         css_length, depth, fetched,
@@ -2204,7 +2253,7 @@ static bool load_stylesheet_url(
                                             ? cached_snapshot.retained_body
                                             : NULL,
                                         &request_context, &resource_grant,
-                                        false);
+                                        false, &applied);
     if (parsed) {
         BrowserSharedBody *body = use_cached
             ? cached_snapshot.retained_body
@@ -2216,7 +2265,8 @@ static bool load_stylesheet_url(
         }
         document_resource_record_loaded(
             context, resolved, NULL, &response_provenance, body, css_length,
-            true, false, TILEFINCH_CREDENTIALS_INCLUDE, &resource_grant);
+            applied, false, false, TILEFINCH_CREDENTIALS_INCLUDE,
+            &resource_grant);
     }
     if (revalidated) {
         (void) cache_revalidate_fetch(
@@ -2486,6 +2536,7 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                                              pending->element);
             }
             size_t refused_before = context->stats->skipped_limit;
+            bool applied = false;
             if (!settle_stylesheet_data(
                     context, pending->url, &provenance, css_data,
                     css_length, 0,
@@ -2494,7 +2545,8 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                     retained_data ? pending->retained_body : NULL,
                     pending->apply_rules, preload_only,
                     &request_context,
-                    resource_grant_valid ? &resource_grant : NULL)) {
+                    resource_grant_valid ? &resource_grant : NULL,
+                    &applied)) {
                 parsed = false;
             } else if (preload_only
                        && context->stats->skipped_limit != refused_before) {
@@ -2535,8 +2587,9 @@ static bool flush_stylesheet_batch(ResourceContext *context)
                     document_resource_record_loaded(
                         context, pending->url,
                         pending->owns_url ? &pending->url : NULL,
-                        &provenance, body, css_length, pending->apply_rules,
-                        pending->cors, pending->credentials,
+                        &provenance, body, css_length, applied,
+                        pending->apply_rules, pending->cors,
+                        pending->credentials,
                         resource_grant_valid ? &resource_grant : NULL);
                     if (pending->url == NULL) pending->owns_url = false;
                 }
@@ -3007,9 +3060,13 @@ static bool walk(ResourceContext *context, lxb_dom_node_t *node)
 static bool reserve_applied_links(ResourceContext *context, lxb_dom_node_t *node)
 {
     if (node == NULL || context->document_resources == NULL) return true;
+    /* Only link-recorded responses can be found by this walk; counting an
+       @import would make it walk the whole document for nothing. */
     size_t prior_applied = 0u;
     for (size_t i = 0; i < context->document_resources->count; i++)
-        if (context->document_resources->items[i].rules_applied) prior_applied++;
+        if (context->document_resources->items[i].rules_applied
+            && context->document_resources->items[i].link_originated)
+            prior_applied++;
     if (prior_applied == 0u) return true;
     lxb_dom_node_t *const boundary_parent = node->parent;
     for (size_t visited = 0; visited < 65536u; visited++) {
@@ -3060,7 +3117,10 @@ static bool reserve_applied_links(ResourceContext *context, lxb_dom_node_t *node
         }
         node = node->next;
     }
-    return false;
+    /* Reservation is a priority hint, not discovery: past the node bound,
+       stop reserving and let the real walk run. Only cancellation above
+       abandons the pass. */
+    return true;
 }
 
 static void stylesheets_record_resource_stats(
@@ -3509,18 +3569,15 @@ static bool font_loader_source_required(const ExternalFontLoader *loader,
     if (!loader->usage_filter) return true;
     if (source->family_slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT
         || source->face_slot >= TILEFINCH_WEB_FONT_WEIGHT_LIMIT) return false;
-    if (loader->face_usage_filter) {
-        unsigned shift = source->family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
-        uint64_t bit = UINT64_C(1) << (shift + source->face_slot);
-        if (!(loader->required_faces & bit)) return false;
-        if (loader->preferred_faces & bit) return true;
-        const WebFontSet *fonts = stylesheet_web_font_set(sheet);
-        for (unsigned i = 0; i < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; i++)
-            if ((loader->preferred_faces & (UINT64_C(1) << (shift+i)))
-                && (fonts == NULL || !fonts->families[source->family_slot].faces[i].loaded)) return true;
-        return false; /* No fallback download after all desired faces loaded. */
-    }
-    return (loader->required_families & (1u << source->family_slot)) != 0;
+    unsigned shift = source->family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
+    uint64_t bit = UINT64_C(1) << (shift + source->face_slot);
+    if (!(loader->required_faces & bit)) return false;
+    if (loader->preferred_faces & bit) return true;
+    const WebFontSet *fonts = stylesheet_web_font_set(sheet);
+    for (unsigned i = 0; i < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; i++)
+        if ((loader->preferred_faces & (UINT64_C(1) << (shift+i)))
+            && (fonts == NULL || !fonts->families[source->family_slot].faces[i].loaded)) return true;
+    return false; /* No fallback download after all desired faces loaded. */
 }
 
 static bool font_loader_next(ExternalFontLoader *loader, const Stylesheet *sheet)
@@ -3534,7 +3591,7 @@ static bool font_loader_next(ExternalFontLoader *loader, const Stylesheet *sheet
                 || (stylesheet_web_font_source(sheet, at, &source)
                     && font_loader_source_required(loader, sheet, &source)))) {
             uint64_t bit = UINT64_C(1) << (source.family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT + source.face_slot);
-            if (loader->face_usage_filter && !(loader->preferred_faces & bit)) {
+            if (loader->usage_filter && !(loader->preferred_faces & bit)) {
                 if (fallback == SIZE_MAX) fallback = at;
                 continue;
             }
@@ -3546,50 +3603,25 @@ static bool font_loader_next(ExternalFontLoader *loader, const Stylesheet *sheet
     return fallback != SIZE_MAX;
 }
 
-static void font_loader_set_usage(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint8_t required_families, uint64_t required_faces,
-    uint64_t preferred_faces, bool face_usage_filter)
+void fonts_external_loader_prioritize_faces(ExternalFontLoader *loader,
+    const Stylesheet *sheet, uint64_t required_faces, uint64_t preferred_faces)
 {
-#ifndef __PSP__
-    if (tilefinch_test_faults()->legacy_web_font_work) return;
-#endif
+    preferred_faces &= required_faces;
     if (loader == NULL || sheet == NULL || loader->cancelled
         || loader->deadline_ms <= loader->started_ms
-        || (loader->usage_filter && loader->required_families == required_families
+        || (loader->usage_filter
             && loader->required_faces == required_faces
-            && loader->preferred_faces == preferred_faces
-            && loader->face_usage_filter == face_usage_filter)) return;
+            && loader->preferred_faces == preferred_faces)) return;
     bool was_active = loader->active;
     loader->usage_filter = true;
-    loader->required_families = required_families;
     loader->required_faces = required_faces;
     loader->preferred_faces = preferred_faces;
-    loader->face_usage_filter = face_usage_filter;
     loader->active = loader->request_id != 0 || font_loader_next(loader, sheet);
     if (!was_active && loader->active) {
         double window = loader->deadline_ms - loader->started_ms;
         loader->started_ms = resource_now_ms();
         loader->deadline_ms = loader->started_ms + window;
     }
-}
-
-void fonts_external_loader_set_usage(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint8_t required_families)
-{
-    font_loader_set_usage(loader, sheet, required_families, 0, 0, false);
-}
-
-void fonts_external_loader_set_face_usage(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint64_t required_faces)
-{
-    font_loader_set_usage(loader, sheet, 0, required_faces, required_faces, true);
-}
-
-void fonts_external_loader_prioritize_faces(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint64_t required_faces, uint64_t preferred_faces)
-{
-    font_loader_set_usage(loader, sheet, 0, required_faces,
-                         preferred_faces & required_faces, true);
 }
 
 void fonts_external_loader_cancel(ExternalFontLoader *loader,
@@ -4117,7 +4149,7 @@ bool stylesheet_document_resources_retain(
              "%s", response_referrer_policy);
     document_resource_record_loaded(
         &context, request_url, NULL, &provenance, body, length, false,
-        cors_validated, credentials, resource_grant);
+        false, cors_validated, credentials, resource_grant);
     StylesheetDocumentResource *entry = document_resource_find(
         resources, request_url);
     return entry != NULL

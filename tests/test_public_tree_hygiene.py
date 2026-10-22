@@ -22,6 +22,20 @@ IGNORE_RULES = {
 PUBLIC_SUMMARIES = (
     "docs/engineering/NATIVE_TIER_INVESTIGATION.md",
 )
+# The private ledgers live only in maintainers' ignored
+# .private-investigations/ directory. Public files may name them only by that
+# path, so no comment or link points at a document a clone cannot contain.
+PRIVATE_LEDGER_NAME = re.compile(
+    r"(?<!\.private-investigations/)"
+    r"\b(?:BROWSING_JOURNEYS|PERFORMANCE_LEDGER|MEMORY_EXPERIMENTS)\b"
+)
+# Files that must spell the old public names: the ignore rules, the release
+# rule that forbids them, and this test.
+LEDGER_NAME_ALLOWED = {
+    ".gitignore",
+    "docs/RELEASE_PROCESS.md",
+    "tests/test_public_tree_hygiene.py",
+}
 PRIVATE_REFERENCE = re.compile(
     r"(?:/Users/[^/\s]+/|/home/[^/\s]+/|/private/tmp/|i/work/|"
     r"\b(?:claude|codex)/[\w-]+)"
@@ -36,6 +50,45 @@ def tracked_paths(root: Path) -> list[str]:
         capture_output=True,
     )
     return [path for path in result.stdout.decode().split("\0") if path]
+
+
+def all_tracked_files(root: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        )
+        return [path for path in result.stdout.decode().split("\0") if path]
+    except (OSError, subprocess.CalledProcessError):
+        # A source archive: every file present is published.
+        return [
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_file()
+            and not any(part.startswith((".git", "build", "_deps"))
+                        for part in path.relative_to(root).parts)
+        ]
+
+
+def private_ledger_references(root: Path) -> list[str]:
+    found = []
+    for name in all_tracked_files(root):
+        if name in LEDGER_NAME_ALLOWED:
+            continue
+        path = root / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "PERFORMANCE_LEDGER" not in text \
+                and "MEMORY_EXPERIMENTS" not in text \
+                and "BROWSING_JOURNEYS" not in text:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if PRIVATE_LEDGER_NAME.search(line):
+                found.append(f"{name}:{number}")
+    return found
 
 
 def main() -> int:
@@ -97,6 +150,13 @@ def main() -> int:
         print("public-tree hygiene: private references in public summaries:",
               file=sys.stderr)
         for reference in private_references:
+            print(f"  {reference}", file=sys.stderr)
+        return 1
+    ledger_references = private_ledger_references(root)
+    if ledger_references:
+        print("public-tree hygiene: private ledgers named outside "
+              ".private-investigations/:", file=sys.stderr)
+        for reference in ledger_references:
             print(f"  {reference}", file=sys.stderr)
         return 1
     print("PASS: public tree contains no private investigation files or logs")

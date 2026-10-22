@@ -124,8 +124,10 @@ bool youtube_direct_delivery_admitted(
 bool youtube_watch_url_supported(const char *url);
 bool youtube_watch_url_video_id(
     const char *url, char output[YOUTUBE_VIDEO_ID_CAPACITY]);
-/* Explicit, bounded t/start seconds from a supported video URL; never reads
-   a saved local position or estimates a position from a progress percentage. */
+/* Explicit, bounded t/start time from a supported video URL: bare seconds or
+   the share-link h/m/s form (90s, 1m30s, 1h2m3s), from the query or else a
+   #t= fragment, at most one week. Never reads a saved local position or
+   estimates a position from a progress percentage. */
 uint64_t youtube_watch_url_start_time_us(const char *url);
 /* Revalidate both the resolver result and FFmpeg's effective redirect URL.
    Only HTTPS/443 googlevideo.com hosts (or their subdomains) are admitted. */

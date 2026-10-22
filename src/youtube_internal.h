@@ -44,6 +44,58 @@ static inline bool youtube_host_is(const TilefinchUrl *url, const char *host)
                        host, url->host_length) == 0;
 }
 
+/* Buffer sizes, including the terminator, for the account-scoped IDs the
+   provider copies out of pages and URLs. A playlist ID is bounded only by
+   this buffer; a channel ID is exactly "UC" plus 22 characters. */
+#define YOUTUBE_ACCOUNT_ID_CAPACITY 128u
+#define YOUTUBE_CHANNEL_ID_CAPACITY 25u
+
+/* One '&'-separated field of a URL query or fragment. `value` is NULL when
+   the field has no '='. */
+typedef struct {
+    const char *name;
+    size_t name_length;
+    const char *value;
+    const char *value_end;
+} YoutubeQueryField;
+
+/* The one walker over query and fragment fields: reads the field at
+   *cursor and advances past it. */
+static inline bool youtube_query_next(const char **cursor, const char *end,
+                                      YoutubeQueryField *field)
+{
+    const char *at = *cursor;
+    if (at >= end) return false;
+    const char *field_end = memchr(at, '&', (size_t) (end - at));
+    if (field_end == NULL) field_end = end;
+    const char *equals = memchr(at, '=', (size_t) (field_end - at));
+    field->name = at;
+    field->name_length = (size_t) ((equals != NULL ? equals : field_end) - at);
+    field->value = equals != NULL ? equals + 1 : NULL;
+    field->value_end = field_end;
+    *cursor = field_end < end ? field_end + 1 : end;
+    return true;
+}
+
+/* A `name=...` field, with or without a value. */
+static inline bool youtube_query_field_is(const YoutubeQueryField *field,
+                                          const char *name)
+{
+    size_t length = strlen(name);
+    return field->value != NULL && field->name_length == length
+        && memcmp(field->name, name, length) == 0;
+}
+
+/* The latest start time a link or a renderer may ask for: one week. */
+#define YOUTUBE_START_MAXIMUM_SECONDS 604800u
+
+/* Parses a start time, bare seconds ("754") or the share-link unit form
+   ("754s", "12m34s", "1h2m3s"), into whole seconds. False for anything
+   else, including a time past YOUTUBE_START_MAXIMUM_SECONDS. Implemented
+   in youtube_resolver.c. */
+bool youtube_start_seconds_parse(const char *value, const char *end,
+                                 unsigned *seconds);
+
 static inline void youtube_error(char *error, size_t error_size,
                                  const char *format, ...)
 {

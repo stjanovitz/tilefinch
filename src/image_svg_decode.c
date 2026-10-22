@@ -1,6 +1,8 @@
 #include "image_svg_decode_internal.h"
 #include "tilefinch/platform.h"
+#include "tilefinch_test_faults.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -89,8 +91,9 @@ unsigned char *image_svg_decode_bounded(
     const void *data, size_t length, Budget *budget,
     size_t maximum_decoded_bytes, int *width, int *height,
     ImageSvgOversizeTarget target, void *opaque,
-    int *source_width, int *source_height)
+    int *source_width, int *source_height, bool *limited)
 {
+    if (limited != NULL) *limited = true;
     if (data == NULL || budget == NULL || width == NULL || height == NULL
         || maximum_decoded_bytes < 4 || svg_budget != NULL) return NULL;
     int target_width = *width, target_height = *height;
@@ -113,6 +116,8 @@ unsigned char *image_svg_decode_bounded(
     if (source != NULL) {
         memcpy(source, data, length);
         source[length] = '\0';
+    } else {
+        svg_allocation_failed = true;
     }
     NSVGimage *svg = source == NULL
         ? NULL : svg_parse_viewports(source, budget);
@@ -120,6 +125,10 @@ unsigned char *image_svg_decode_bounded(
     unsigned char *pixels = NULL;
     int output_width = 0, output_height = 0;
     int intrinsic_width = 0, intrinsic_height = 0;
+    /* Markup that parses to nothing, or to no positive size, fails the same
+       way every time; every other refusal below is a limit. */
+    bool markup_rejected = !svg_allocation_failed
+        && (svg == NULL || !(svg->width > 0.0f && svg->height > 0.0f));
     if (svg != NULL && !svg_allocation_failed
         && svg->width > 0.0f && svg->height > 0.0f
         && svg->width <= 32767.0f && svg->height <= 32767.0f) {
@@ -177,7 +186,11 @@ unsigned char *image_svg_decode_bounded(
     svg_budget = NULL;
     budget_rollback_owner_category(budget, scratch_owner,
                                    BUDGET_CATEGORY_RESOURCE);
-    if (pixels == NULL) return NULL;
+    if (pixels == NULL) {
+        if (limited != NULL) *limited = !markup_rejected;
+        return NULL;
+    }
+    if (limited != NULL) *limited = false;
     *width = output_width;
     *height = output_height;
     if (source_width != NULL) *source_width = intrinsic_width;
@@ -191,5 +204,5 @@ unsigned char *image_svg_decode(const void *data, size_t length,
                                 int *width, int *height)
 {
     return image_svg_decode_bounded(data, length, budget,
-        maximum_decoded_bytes, width, height, NULL, NULL, NULL, NULL);
+        maximum_decoded_bytes, width, height, NULL, NULL, NULL, NULL, NULL);
 }

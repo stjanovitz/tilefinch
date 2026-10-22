@@ -46,7 +46,7 @@ static bool style_property_grid_template_areas(
 
 static bool style_property_writing_mode(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -77,7 +77,7 @@ static bool style_property_writing_mode(const StylePropertyParse *parse)
 
 static bool style_property_direction(const StylePropertyParse *parse)
 {
-    char resolved[16];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
@@ -103,7 +103,7 @@ static bool style_property_direction(const StylePropertyParse *parse)
 
 static bool style_property_unicode_bidi(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
@@ -136,7 +136,7 @@ static bool style_property_unicode_bidi(const StylePropertyParse *parse)
 
 static bool style_property_grid_auto_flow(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -166,17 +166,16 @@ static bool style_property_grid_auto_flow(const StylePropertyParse *parse)
 }
 
 static bool style_parse_grid_auto_track_text(
-    const Stylesheet *sheet, char *resolved, uint16_t *track_value,
-    uint16_t *track_type)
+    const Stylesheet *sheet, const char *text, size_t length,
+    uint16_t *track_value, uint16_t *track_type)
 {
-    if (sheet == NULL || resolved == NULL
+    if (sheet == NULL || text == NULL
         || track_value == NULL || track_type == NULL) return false;
     uint8_t parsed_type = GRID_TRACK_AUTO;
     unsigned parsed_value = 0;
     unsigned minimum = 0;
     if (!style_parse_grid_track(
-            sheet, resolved, strlen(resolved), &parsed_type,
-            &parsed_value, &minimum)
+            sheet, text, length, &parsed_type, &parsed_value, &minimum)
         || (minimum != 0
             && !(parsed_type == GRID_TRACK_FIXED
                  && minimum == parsed_value))) {
@@ -188,53 +187,39 @@ static bool style_parse_grid_auto_track_text(
     return true;
 }
 
+/* grid-auto-rows/columns: a <track-size>+ list. ComputedStyle stores two
+   tracks (the second packed into `second` by grid_auto_second_pack(),
+   which implicit tracks alternate with the first). A longer list, a list
+   holding any invalid track, and a second track the packing cannot hold
+   (fit-content(), or a value over 14 bits) are rejected rather than
+   truncated. */
 static bool style_parse_grid_auto_tracks(
     const StylePropertyParse *parse, uint16_t *track_value,
     uint16_t *track_type, uint16_t *second)
 {
-    char resolved[64];
-    if (second != NULL) *second = 0;
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
+    *second = 0;
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
         return false;
     }
-    char *next = resolved;
-    int depth = 0;
-    while (*next != '\0') {
-        if (*next == '(') depth++;
-        else if (*next == ')' && depth > 0) depth--;
-        else if (depth == 0 && isspace((unsigned char) *next)) break;
-        next++;
-    }
-    if (*next != '\0') {
-        *next++ = '\0';
-        while (isspace((unsigned char) *next)) next++;
-    }
+    size_t length = strlen(resolved);
+    size_t cursor = 0, at = 0, end = 0;
+    if (!style_next_top_level_token(resolved, length, &cursor, &at, &end)
+        || !style_parse_grid_auto_track_text(
+               parse->sheet, resolved + at, end - at, track_value,
+               track_type)) return false;
+    if (!style_next_top_level_token(resolved, length, &cursor, &at, &end))
+        return true;
+    uint16_t second_type = 0;
+    uint16_t second_value = 0;
     if (!style_parse_grid_auto_track_text(
-            parse->sheet, resolved, track_value, track_type)) {
+            parse->sheet, resolved + at, end - at, &second_value,
+            &second_type)
+        || style_next_top_level_token(resolved, length, &cursor, &at, &end))
         return false;
-    }
-    if (second != NULL && *next != '\0') {
-        char *end = next;
-        depth = 0;
-        while (*end != '\0') {
-            if (*end == '(') depth++;
-            else if (*end == ')' && depth > 0) depth--;
-            else if (depth == 0 && isspace((unsigned char) *end)) break;
-            end++;
-        }
-        *end = '\0';
-        uint16_t second_type = 0;
-        uint16_t second_value = 0;
-        if (style_parse_grid_auto_track_text(
-                parse->sheet, next, &second_value, &second_type)) {
-            if (second_value > 16383u) second_value = 16383u;
-            *second = (uint16_t) (
-                ((second_type & 3u) << 14) | second_value);
-        }
-    }
-    return true;
+    return grid_auto_second_pack((uint8_t) second_type, second_value, second);
 }
 
 static bool style_property_grid_auto_columns(
@@ -344,7 +329,7 @@ static bool style_property_grid_area(const StylePropertyParse *parse)
             | S2_GRID_COLUMN_SPAN;
         return true;
     }
-    char resolved[192];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) {
         return true;
@@ -427,7 +412,7 @@ static bool style_property_grid_column(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask_high = parse->mask_high;
-            char resolved[96];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *slash = strchr(resolved, '/');
@@ -525,7 +510,7 @@ static bool style_property_grid_column_end(const StylePropertyParse *parse)
 
 static bool style_property_grid_row(const StylePropertyParse *parse)
 {
-    char resolved[96];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)) {
         char *slash = strchr(resolved, '/');
@@ -618,7 +603,7 @@ static bool style_property_flex_direction(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved, sizeof(resolved), 0)) {
             bool reverse = strstr(resolved, "reverse") != NULL;
             style->flex_direction = strstr(resolved, "column") != NULL
@@ -637,7 +622,7 @@ static bool style_property_flex_flow(const StylePropertyParse *parse)
        carries real layout on live article pages. */
     Stylesheet *sheet = parse->sheet;
     ComputedStyle *style = parse->style;
-    char resolved[48];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) {
         return true;
@@ -680,7 +665,7 @@ static bool style_property_flex_wrap(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             bool nowrap = strcmp(resolved, "nowrap") == 0;
@@ -703,7 +688,7 @@ static bool style_property_flex_grow(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             double grow = strtod(resolved, NULL);
@@ -723,7 +708,7 @@ static bool style_property_flex_shrink(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             double shrink = strtod(resolved, NULL);
@@ -786,7 +771,7 @@ static bool style_property_flex(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[STYLE_MATH_SOURCE_CAPACITY];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *cursor = resolved;
@@ -875,7 +860,7 @@ static bool style_property_flex(const StylePropertyParse *parse)
 
 static bool style_property_table_layout(const StylePropertyParse *parse)
 {
-    char resolved[16];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -895,7 +880,7 @@ static bool style_property_table_layout(const StylePropertyParse *parse)
 
 static bool style_property_caption_side(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1014,7 +999,7 @@ static bool style_property_aspect_ratio(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[48];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *start = resolved;
@@ -1069,7 +1054,7 @@ static bool style_property_overflow(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             bool clip_only = strcmp(resolved, "clip") == 0;
@@ -1100,7 +1085,7 @@ static bool style_property_overflow(const StylePropertyParse *parse)
 static bool style_property_scrollbar_gutter(
     const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1121,7 +1106,7 @@ static bool style_property_scrollbar_gutter(
 
 static bool style_property_border_collapse(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1144,7 +1129,7 @@ static bool style_property_border_collapse(const StylePropertyParse *parse)
 static bool style_property_overflow_clip_margin(
     const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
@@ -1285,6 +1270,7 @@ static bool style_property_min_height(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
             if (style_noninherited_length_is_auto(sheet, value, value_length)) {
             style->min_height = 0;
+            style->min_height_auto = true;
             style->min_height_percent = false;
             *mask |= S_MIN_HEIGHT;
         } else {
@@ -1293,6 +1279,7 @@ static bool style_property_min_height(const StylePropertyParse *parse)
             if (parse_dimension_length(sheet, value, value_length,
                                        &parsed, &percent)) {
                 style->min_height = parsed;
+                style->min_height_auto = false;
                 style->min_height_percent = percent;
                 *mask |= S_MIN_HEIGHT;
             }
@@ -1434,7 +1421,7 @@ static bool style_property_max_block_size(const StylePropertyParse *parse)
 
 static bool style_property_content_visibility(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1469,7 +1456,7 @@ static bool style_property_box_sizing(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (style_resolve_value(sheet, value, value_length, resolved,
                             sizeof(resolved), 0)) {
         const char *keyword = resolved;
@@ -1503,7 +1490,7 @@ static bool style_property_z_index(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[32];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             style->has_z_index = strcmp(resolved, "auto") != 0;
@@ -1606,7 +1593,8 @@ static bool style_property_fixed_containing_block(
     if (span_equal(parse->name, parse->name_length, "perspective")) {
         parse->style->has_perspective = active;
         *parse->mask_high |= S2_PERSPECTIVE;
-    } else if (span_equal(parse->name, parse->name_length, "filter")) {
+    } else if (span_equal(parse->name, parse->name_length, "filter")
+               || span_equal(parse->name, parse->name_length, "-webkit-filter")) {
         parse->style->has_filter = active;
         parse->style->filter_code &= ~STYLE_FILTER_CODE_MASK;
         StylePaintStack paint = style_paint_stack_copy(
@@ -1672,7 +1660,7 @@ static bool style_property_fixed_containing_block(
 
 static bool style_property_pointer_events(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1899,7 +1887,7 @@ static bool style_parse_alignment_pair(
 
 static bool style_property_align_items(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned value = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -1912,7 +1900,7 @@ static bool style_property_align_items(const StylePropertyParse *parse)
 
 static bool style_property_justify_items(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned value = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -1925,7 +1913,7 @@ static bool style_property_justify_items(const StylePropertyParse *parse)
 
 static bool style_property_place_items(const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned align = 0, justify = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -1947,7 +1935,7 @@ static bool style_property_order(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask_high = parse->mask_high;
-            char resolved[32];
+            char resolved[STYLE_MATH_SOURCE_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             char *end = NULL;
@@ -1966,7 +1954,7 @@ static bool style_property_order(const StylePropertyParse *parse)
 
 static bool style_property_align_self(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned value = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -1979,7 +1967,7 @@ static bool style_property_align_self(const StylePropertyParse *parse)
 
 static bool style_property_justify_self(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) {
@@ -1994,7 +1982,7 @@ static bool style_property_justify_self(const StylePropertyParse *parse)
 
 static bool style_property_align_content(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned value = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -2007,7 +1995,7 @@ static bool style_property_align_content(const StylePropertyParse *parse)
 
 static bool style_property_justify_content(const StylePropertyParse *parse)
 {
-    char resolved[32];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned value = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -2029,7 +2017,7 @@ static bool style_property_justify_content(const StylePropertyParse *parse)
    a later modern declaration therefore wins in the ordinary cascade. */
 static bool style_property_webkit_box_align(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     const char *mapped = strcmp(resolved, "start") == 0 ? "flex-start"
@@ -2042,7 +2030,7 @@ static bool style_property_webkit_box_align(const StylePropertyParse *parse)
 
 static bool style_property_webkit_box_pack(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     const char *mapped = strcmp(resolved, "start") == 0 ? "flex-start"
@@ -2061,7 +2049,7 @@ static bool style_property_webkit_box_flex(const StylePropertyParse *parse)
 
 static bool style_property_webkit_box_lines(const StylePropertyParse *parse)
 {
-    char resolved[16];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     const char *mapped = strcmp(resolved, "multiple") == 0 ? "wrap"
@@ -2074,7 +2062,7 @@ static bool style_property_webkit_box_lines(const StylePropertyParse *parse)
 
 static bool style_property_webkit_box_orient(const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     bool vertical = strcmp(resolved, "vertical") == 0
@@ -2093,7 +2081,7 @@ static bool style_property_webkit_box_orient(const StylePropertyParse *parse)
 
 static bool style_property_webkit_box_direction(const StylePropertyParse *parse)
 {
-    char resolved[16];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     if (strcmp(resolved, "normal") != 0 && strcmp(resolved, "reverse") != 0) {
@@ -2112,7 +2100,7 @@ static bool style_property_webkit_box_direction(const StylePropertyParse *parse)
 static bool style_property_webkit_box_ordinal_group(
     const StylePropertyParse *parse)
 {
-    char resolved[24];
+    char resolved[STYLE_MATH_SOURCE_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
                              resolved, sizeof(resolved), 0)) return true;
     char *end = NULL;
@@ -2129,7 +2117,7 @@ static bool style_property_webkit_box_ordinal_group(
 
 static bool style_property_place_self(const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned align = 0, justify = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -2146,7 +2134,7 @@ static bool style_property_place_self(const StylePropertyParse *parse)
 
 static bool style_property_place_content(const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_KEYWORD_RESOLVED_CAPACITY];
     unsigned align = 0, justify = 0;
     if (style_resolve_value(parse->sheet, parse->value, parse->value_length,
                             resolved, sizeof(resolved), 0)
@@ -2216,7 +2204,7 @@ static bool style_property_mask_repeat(const StylePropertyParse *parse)
 
 static bool style_property_border_spacing(const StylePropertyParse *parse)
 {
-    char resolved[64];
+    char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
@@ -2268,7 +2256,7 @@ static bool style_property_list_style(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            char resolved[96];
+            char resolved[STYLE_CUSTOM_RESOLVED_CAPACITY];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
             bool shorthand = parse->name_length == 10;

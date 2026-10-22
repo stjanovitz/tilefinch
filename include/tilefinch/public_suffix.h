@@ -15,4 +15,12 @@ bool tilefinch_public_suffix_classify(const char *domain,
 bool tilefinch_registrable_domain(const char *host, char *output,
                                size_t output_size);
 
+#ifndef __PSP__
+/* Host test seam: the fixed-set decoder over a caller's DAFSA graph.
+   Returns the key's value (0..15) or -1 when absent. Not in device builds. */
+int tilefinch_public_suffix_test_lookup(const unsigned char *graph,
+                                        size_t graph_length,
+                                        const char *key);
+#endif
+
 #endif

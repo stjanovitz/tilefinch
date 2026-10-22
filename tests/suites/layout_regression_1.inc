@@ -325,6 +325,8 @@
     CHECK(test_modern_conditional_cascade(&budget) == 0);
     CHECK(test_bounded_container_queries(&budget) == 0);
     CHECK(test_container_queries_one_pass(&budget) == 0);
+    CHECK(test_container_ratio_features_layout(&budget) == 0);
+    CHECK(test_container_size_containment_layout(&budget) == 0);
     CHECK(test_bounded_multicolumn_blocks(&budget) == 0);
 
     puts("test: bounded large layout values and aspect products");
@@ -820,13 +822,29 @@
     CHECK(document_attribute(
                  focus_probe, "data-tilefinch-focus",
                  &focus_marker_length) == NULL);
-    style_test_inject_focus_marker_remove_failures(2);
+    /* A failed probe toggle is unsafe; the restoration still runs. */
+    tilefinch_test_faults()->focus_marker_remove_failures = 1;
     CHECK(style_focus_change_classify(
               &mobile_sheet, focus_probe, &focus_host_style,
               &focus_normal, &focus_active) == STYLE_FOCUS_CHANGE_UNSAFE
           && document_attribute(
                  focus_probe, "data-tilefinch-focus",
                  &focus_marker_length) == NULL);
+    /* A failed restoration is reported as a document style change. */
+    (void) document_style_generation();
+    uint64_t focus_generation = document_style_generation();
+    tilefinch_test_faults()->focus_marker_remove_failures = 2;
+    CHECK(style_focus_change_classify(
+              &mobile_sheet, focus_probe, &focus_host_style,
+              &focus_normal, &focus_active) == STYLE_FOCUS_CHANGE_UNSAFE
+          && document_attribute(
+                 focus_probe, "data-tilefinch-focus",
+                 &focus_marker_length) != NULL
+          && document_style_generation() != focus_generation);
+    CHECK(lxb_dom_element_remove_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "data-tilefinch-focus",
+              sizeof("data-tilefinch-focus") - 1u) == LXB_STATUS_OK);
     CHECK(variable_child_style.color == 0x335577
           && variable_child_style.border.left == 5
           && stylesheet_border_color(

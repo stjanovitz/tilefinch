@@ -66,6 +66,18 @@ def run(lab, root, name, env_extra, probe, source=None):
 
 
 def main():
+    assert classify.classify('https://aax-us-east-retail-direct.amazon.com/e/is/example/impb',
+                             'https://www.amazon.com/') == 'ads'
+    assert classify.classify('https://aax-us-east-retail-direct.amazon.com.example.test/app.js',
+                             'https://www.amazon.com/') == 'third-party'
+    for host in ('fls-na.amazon.com', 'fls-eu.amazon.com', 'fls-fe.amazon.com',
+                 'unagi.amazon.com'):
+        assert classify.classify('https://' + host + '/1/batch/events',
+                                 'https://www.amazon.com/') == 'analytics'
+    assert classify.classify('https://www.amazon.com/robots.txt?host=fls-na.amazon.com',
+                             'https://www.amazon.com/') == 'first-party'
+    assert classify.classify('https://fls-na.amazon.com.example.test/app.js',
+                             'https://www.amazon.com/') == 'third-party'
     assert classify.classify('https://content.test/packs/audio-abcgga.js',
                              'https://content.test/') == 'first-party'
     assert classify.classify('https://cdn.example/ga.js?version=1',

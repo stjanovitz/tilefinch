@@ -636,7 +636,7 @@ static bool test_clockwise_portrait_geometry(void)
     CHECK(quads_sample_inside(&plan, 240, 426));
     CHECK(psp_media_present_stage_fits(&plan, 426, PSP_MEDIA_PRESENT_STAGE_BYTES));
     PspMediaPresentVertex vertices[4];
-    psp_media_present_quad_vertices(&plan.quads[0], vertices);
+    psp_media_present_clockwise_vertices(&plan.quads[0], vertices);
     CHECK(vertices[0].x == 480 && vertices[0].y == 1);
     CHECK(vertices[1].x == 480 && vertices[1].y == 271);
     CHECK(vertices[2].x == 0 && vertices[2].y == 271);
