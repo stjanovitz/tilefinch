@@ -672,6 +672,10 @@ navigation_stream_metadata_checkpoint(NavigationDocumentStream *stream)
         : NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
 }
 
+static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
+    NavigationDocumentStream *stream, PocDocument *document,
+    lxb_dom_node_t *element);
+
 static bool navigation_stream_element_closed(void *opaque,
                                              PocDocument *document,
                                              lxb_dom_node_t *element)
@@ -715,6 +719,16 @@ static bool navigation_stream_element_closed(void *opaque,
     }
     if (name == NULL || name_length != 6
         || memcmp(name, "script", 6) != 0) return true;
+    return navigation_stream_script_closed(stream, document, element);
+}
+
+/* The parser-time </script> work, kept out of line so the per-element
+   callback above does not pay its stack frame and register saves for every
+   other closed element. */
+static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
+    NavigationDocumentStream *stream, PocDocument *document,
+    lxb_dom_node_t *element)
+{
     if (stream->session == NULL) return true;
     if (document_parser_script_was_truncated(stream->parser, element)) {
         navigation_stream_record_skipped_parser_script(stream);

@@ -164,7 +164,7 @@ bool psp_app_heavy_poll(PspApp *app)
     PspUiState *ui = &app->process->presentation.ui;
     BrowserEngine *engine = app->browser->engine;
     if (browser_engine_navigation_pending(engine)) return false;
-    uint64_t generation = app->views->navigation->generation;
+    uint64_t generation = browser_engine_page_generation(engine);
     if (interactive->heavy_generation != generation) {
         interactive->heavy_generation = generation;
         interactive->heavy_offer_shown = false;

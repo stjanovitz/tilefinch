@@ -1,6 +1,0 @@
-anchor two
-go https://section-history.test/b
-back
-forward
-back
-status

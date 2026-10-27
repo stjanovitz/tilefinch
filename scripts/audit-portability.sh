@@ -28,8 +28,7 @@ if [ -z "$sources" ]; then
     printf 'Portability source manifest is empty: %s\n' "$sources_file" >&2
     exit 2
 fi
-for required in src/section_pager.c src/section_router.c src/section_store.c \
-                src/main.c src/interactive_main.c \
+for required in src/main.c src/interactive_main.c \
                 src/failure_recovery_main.c src/psp_ui.c; do
     if ! grep -Fx "$required" "$sources_file" >/dev/null 2>&1; then
         printf 'Portability source manifest is missing %s\n' "$required" >&2
@@ -82,12 +81,6 @@ if grep 'warning:' "$detail_log" | grep -v 'warning: stack frame size' \
     >/dev/null 2>&1; then
     printf 'Portability audit found a narrowing or cast warning:\n' >&2
     grep 'warning:' "$detail_log" | grep -v 'warning: stack frame size' >&2
-    exit 1
-fi
-if grep 'section_store.c:.*warning: stack frame size' "$detail_log" \
-    >/dev/null 2>&1; then
-    printf 'Section indexing regressed above the 8 KiB scratch-frame gate:\n' >&2
-    grep 'section_store.c:.*warning: stack frame size' "$detail_log" >&2
     exit 1
 fi
 

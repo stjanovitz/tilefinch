@@ -1,4 +1,6 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_ui_settings.h"
+#include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/ui_language.h"
@@ -7530,6 +7532,414 @@ static bool test_queue_taller_cache_and_selection(void)
     return true;
 }
 
+/* The plain on/off settings' table, and the profile -> chrome mirror that
+   boot fills before the first frame (it replaced a hand-written list in PSP
+   main). Every mirrored field must follow the profile, both ways. */
+static bool test_settings_table_and_profile_sync(void)
+{
+    size_t count = 0;
+    const PspBoolSetting *settings = psp_bool_settings(&count);
+    CHECK(settings != NULL && count != 0u);
+    for (size_t i = 0; i < count; i++) {
+        const PspBoolSetting *setting = &settings[i];
+        CHECK(psp_bool_setting_find(setting->id) == setting);
+        CHECK(setting->profile_get != NULL && setting->profile_set != NULL
+              && setting->on_status != NULL && setting->off_status != NULL
+              && strcmp(setting->on_status, setting->off_status) != 0
+              && setting->status_frames != 0u);
+        /* Boot reads the engine's value back when it refuses. */
+        CHECK((setting->engine_set == NULL) == (setting->engine_get == NULL));
+        for (size_t j = 0; j < i; j++) CHECK(settings[j].id != setting->id);
+    }
+    CHECK(psp_bool_setting_find(PSP_UI_SETTING_NONE) == NULL
+          && psp_bool_setting_find(PSP_UI_SETTING_NETWORK_PROFILE) == NULL
+          && psp_bool_setting_find(PSP_UI_SETTING_JAVASCRIPT) == NULL);
+
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+    for (unsigned pass = 0; pass < 2u; pass++) {
+        for (size_t i = 0; i < count; i++)
+            settings[i].profile_set(profile, ((i + pass) & 1u) != 0u);
+        /* Poison: a field the sync forgets keeps this pattern. */
+        memset(&ui, pass == 0u ? 0xa5 : 0x5a, sizeof(ui));
+        psp_app_ui_sync_from_profile(&ui, profile);
+        for (size_t i = 0; i < count; i++) {
+            if (settings[i].ui_set == NULL) continue;
+            static PspUiState expected;
+            expected = ui;
+            settings[i].ui_set(&expected, settings[i].profile_get(profile));
+            CHECK(memcmp(&expected, &ui, sizeof(ui)) == 0);
+        }
+        CHECK(ui.glyph_offers_off
+              == !browser_profile_glyph_offers_enabled(profile));
+    }
+
+    browser_profile_set_ui_scale(profile, 125u);
+    browser_profile_set_page_font_percent(profile, 130u);
+    browser_profile_set_reader_font(profile, BROWSER_READER_FONT_SERIF);
+    browser_profile_set_remember_reader_site_scale(profile, true);
+    CHECK(browser_profile_set_basic_fallback_mode(
+        profile, BROWSER_BASIC_FALLBACK_OFF));
+    CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_OFF));
+    browser_profile_set_restore_last_page(profile, true);
+    browser_profile_set_tab_hibernation_enabled(profile, true);
+    browser_profile_set_adaptive_voice_memory(profile, true);
+    browser_profile_set_text_entry_mode(profile, BROWSER_TEXT_ENTRY_DANZEFF);
+    browser_profile_set_gamepad_face_mapping(
+        profile, TILEFINCH_GAMEPAD_FACE_O_PRIMARY);
+    browser_profile_set_persist_local_storage(profile, true);
+    browser_profile_set_keep_compiled_scripts(profile, true);
+    browser_profile_set_save_diagnostic_reports(profile, true);
+    browser_profile_set_wifi_diagnostics(profile, true);
+    browser_profile_set_youtube_login_policy(profile, 2u);
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
+    browser_profile_set_glyph_language(
+        profile, BROWSER_GLYPH_LANGUAGE_CYRILLIC);
+    browser_profile_set_youtube_quality(profile, BROWSER_YOUTUBE_QUALITY_240P);
+    browser_profile_set_video_language(profile, BROWSER_VIDEO_LANGUAGE_KOREAN);
+    browser_profile_set_subtitle_size(profile, BROWSER_SUBTITLE_SIZE_SMALL);
+    browser_profile_set_subtitle_background(
+        profile, BROWSER_SUBTITLE_BACKGROUND_SHADOW);
+    browser_profile_set_video_scaling(profile, BROWSER_VIDEO_SCALING_SHARP);
+    browser_profile_set_save_playback_positions(profile, true);
+    browser_profile_set_content_blocker_cosmetic_hiding(profile, true);
+    browser_profile_set_update_check_enabled(profile, true);
+    browser_profile_set_update_channel(profile, BROWSER_UPDATE_CHANNEL_BETA);
+    browser_profile_set_update_check_available_sequence(
+        profile, TILEFINCH_RELEASE_SEQUENCE + 1u);
+    memset(&ui, 0, sizeof(ui));
+    psp_app_ui_sync_from_profile(&ui, profile);
+    CHECK(ui.browser_ui_scale == browser_profile_ui_scale(profile)
+          && ui.page_font_percent == browser_profile_page_font_percent(profile)
+          && ui.reader_font_serif && ui.remember_reader_site_scale
+          && ui.basic_fallback_mode == BROWSER_BASIC_FALLBACK_OFF
+          && ui.web_font_mode == WEB_FONTS_OFF
+          && ui.restore_last_page && ui.tab_hibernation_enabled
+          && ui.adaptive_voice_memory && ui.danzeff_text_input
+          && ui.gamepad_circle_primary && ui.persist_local_storage
+          && ui.keep_compiled_scripts && ui.save_diagnostic_reports
+          && ui.wifi_diagnostics
+          && ui.youtube_login_policy
+                 == browser_profile_youtube_login_policy(profile)
+          && ui.search_engine == browser_profile_search_engine(profile)
+          && ui.color_mode == BROWSER_COLOR_MODE_DARK
+          && ui.glyph_language == BROWSER_GLYPH_LANGUAGE_CYRILLIC
+          && ui.ui_language == browser_profile_ui_language(profile)
+          && ui.youtube_240p
+          && ui.video_language == BROWSER_VIDEO_LANGUAGE_KOREAN
+          && ui.subtitle_language == browser_profile_subtitle_language(profile)
+          && ui.alternate_language
+                 == browser_profile_alternate_language(profile)
+          && ui.subtitle_size == BROWSER_SUBTITLE_SIZE_SMALL
+          && ui.subtitle_background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
+          && ui.video_scaling_sharp && ui.save_playback_positions
+          && ui.content_blocker_cosmetic_hiding && ui.update_check_enabled
+          && ui.update_channel == BROWSER_UPDATE_CHANNEL_BETA
+          && ui.update_release_available);
+    browser_profile_set_update_check_available_sequence(
+        profile, TILEFINCH_RELEASE_SEQUENCE);
+    psp_app_ui_sync_from_profile(&ui, profile);
+    CHECK(!ui.update_release_available);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
+/* The settings failure policy (psp_ui_settings.h): when the profile or the
+   engine refuses, profile, engine and chrome all keep the value in effect,
+   and the toast names it. The engine half is injected through the row's
+   descriptor; a NULL engine is the real setters' own refusal. */
+static struct {
+    unsigned calls;
+    bool last;
+    bool refuse;
+} settings_engine_stub;
+
+static bool settings_stub_engine_set(BrowserEngine *engine, bool enabled)
+{
+    (void) engine;
+    settings_engine_stub.calls++;
+    settings_engine_stub.last = enabled;
+    return !settings_engine_stub.refuse;
+}
+
+/* A profile that will not take the value: it keeps what it had. */
+static void settings_refusing_profile_set(BrowserProfile *profile, bool enabled)
+{
+    (void) profile;
+    (void) enabled;
+}
+
+static bool settings_engine_row_mirror(PspUiSettingId id, const PspUiState *ui)
+{
+    return id == PSP_UI_SETTING_YOUTUBE_TOPICS ? ui->youtube_topics
+        : ui->youtube_compact_results;
+}
+
+static bool test_bool_setting_failures_keep_one_value(void)
+{
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+    static const PspUiSettingId engine_rows[] = {
+        PSP_UI_SETTING_YOUTUBE_TOPICS, PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS
+    };
+    for (size_t row = 0; row < 2u; row++) {
+        PspUiSettingId id = engine_rows[row];
+        const PspBoolSetting *real = psp_bool_setting_find(id);
+        CHECK(real != NULL && real->engine_set != NULL && real->ui_set != NULL);
+        for (unsigned start = 0; start < 2u; start++) {
+            bool before = start != 0u, wanted = !before;
+            const char *kept = before ? real->on_status : real->off_status;
+            const char *changed = wanted ? real->on_status : real->off_status;
+            real->profile_set(profile, before);
+            memset(&ui, 0, sizeof(ui));
+            psp_app_ui_sync_from_profile(&ui, profile);
+
+            /* The real engine half refuses without a live engine. The chrome
+               toggles its copy before the intent arrives. */
+            real->ui_set(&ui, wanted);
+            CHECK(psp_bool_setting_apply(real, profile, NULL, &ui, wanted)
+                  == PSP_SETTING_ENGINE_REFUSED);
+            CHECK(real->profile_get(profile) == before
+                  && settings_engine_row_mirror(id, &ui) == before
+                  && strcmp(ui.status, kept) == 0);
+
+            /* An injected engine refusal puts the profile back. */
+            PspBoolSetting injected = *real;
+            injected.engine_set = settings_stub_engine_set;
+            settings_engine_stub.calls = 0;
+            settings_engine_stub.refuse = true;
+            real->ui_set(&ui, wanted);
+            CHECK(psp_bool_setting_apply(&injected, profile, NULL, &ui, wanted)
+                  == PSP_SETTING_ENGINE_REFUSED);
+            CHECK(settings_engine_stub.calls == 1u
+                  && settings_engine_stub.last == wanted
+                  && real->profile_get(profile) == before
+                  && settings_engine_row_mirror(id, &ui) == before
+                  && strcmp(ui.status, kept) == 0);
+
+            /* A profile refusal never reaches the engine. */
+            injected.profile_set = settings_refusing_profile_set;
+            settings_engine_stub.calls = 0;
+            settings_engine_stub.refuse = false;
+            real->ui_set(&ui, wanted);
+            CHECK(psp_bool_setting_apply(&injected, profile, NULL, &ui, wanted)
+                  == PSP_SETTING_PROFILE_REFUSED);
+            CHECK(settings_engine_stub.calls == 0u
+                  && real->profile_get(profile) == before
+                  && settings_engine_row_mirror(id, &ui) == before
+                  && strcmp(ui.status, kept) == 0);
+
+            /* Accepted by both: the new value everywhere. */
+            injected.profile_set = real->profile_set;
+            settings_engine_stub.calls = 0;
+            real->ui_set(&ui, wanted);
+            CHECK(psp_bool_setting_apply(&injected, profile, NULL, &ui, wanted)
+                  == PSP_SETTING_APPLIED);
+            CHECK(settings_engine_stub.calls == 1u
+                  && settings_engine_stub.last == wanted
+                  && real->profile_get(profile) == wanted
+                  && settings_engine_row_mirror(id, &ui) == wanted
+                  && strcmp(ui.status, changed) == 0
+                  && ui.toast_frames == real->status_frames);
+        }
+    }
+
+    /* Rows with no engine half apply as before, with or without an engine.
+       The chrome has toggled its copy; applying leaves it on the value. */
+    size_t count = 0;
+    const PspBoolSetting *settings = psp_bool_settings(&count);
+    for (size_t i = 0; i < count; i++) {
+        const PspBoolSetting *setting = &settings[i];
+        if (setting->engine_set != NULL) continue;
+        for (unsigned value = 0; value < 2u; value++) {
+            bool enabled = value != 0u;
+            memset(&ui, 0, sizeof(ui));
+            if (setting->ui_set != NULL) setting->ui_set(&ui, enabled);
+            CHECK(psp_bool_setting_apply(setting, profile, NULL, &ui, enabled)
+                  == PSP_SETTING_APPLIED);
+            CHECK(setting->profile_get(profile) == enabled
+                  && strcmp(ui.status, enabled ? setting->on_status
+                                               : setting->off_status) == 0
+                  && ui.toast_frames == setting->status_frames);
+            if (setting->ui_set != NULL) {
+                static PspUiState expected;
+                expected = ui;
+                setting->ui_set(&expected, enabled);
+                CHECK(memcmp(&expected, &ui, sizeof(ui)) == 0);
+            }
+        }
+    }
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
+static bool test_web_font_and_night_mode_failures_keep_one_value(void)
+{
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+    memset(&ui, 0, sizeof(ui));
+
+    /* Website fonts: the chrome stepped Smart -> Off, and the engine
+       refuses. The profile, the menu and the toast keep Smart. */
+    CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_SMART));
+    ui.web_font_mode = WEB_FONTS_OFF;
+    CHECK(psp_web_font_setting_apply(profile, NULL, &ui, WEB_FONTS_OFF)
+          == PSP_SETTING_ENGINE_REFUSED);
+    CHECK(browser_profile_web_font_mode(profile) == WEB_FONTS_SMART
+          && ui.web_font_mode == WEB_FONTS_SMART
+          && strcmp(ui.status, "WEBSITE FONTS SMART") == 0);
+    /* A mode the profile refuses goes no further. */
+    ui.web_font_mode = WEB_FONTS_ON;
+    CHECK(psp_web_font_setting_apply(profile, NULL, &ui, WEB_FONTS_MODE_COUNT)
+          == PSP_SETTING_PROFILE_REFUSED);
+    CHECK(browser_profile_web_font_mode(profile) == WEB_FONTS_SMART
+          && ui.web_font_mode == WEB_FONTS_SMART
+          && strcmp(ui.status, "WEBSITE FONTS SMART") == 0);
+
+    /* Night mode: the chrome stepped Dark -> Light and the caller computed
+       the light page; the engine refuses, so both go back. */
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
+    ui.color_mode = BROWSER_COLOR_MODE_LIGHT;
+    ui.page_dark = false;
+    CHECK(psp_color_mode_setting_apply(
+              profile, NULL, &ui, BROWSER_COLOR_MODE_LIGHT, true)
+          == PSP_SETTING_ENGINE_REFUSED);
+    CHECK(browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_DARK
+          && ui.color_mode == BROWSER_COLOR_MODE_DARK && ui.page_dark
+          && strcmp(ui.status, "NIGHT MODE DARK") == 0);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
+/* Boot and Night mode's clock refresh follow the failure policy without a
+   toast; a NULL engine is the real setters' refusal, and it reports a new
+   engine's values (Night mode light, compact results off, topics on). */
+static bool test_boot_and_clock_refresh_keep_engine_value(void)
+{
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+
+    /* Every engine half refuses: the profile and the chrome take the
+       engine's values, quietly. Dark contradicts a light engine. */
+    browser_profile_set_youtube_compact_results(profile, true);
+    browser_profile_set_youtube_topics(profile, false);
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
+    memset(&ui, 0, sizeof(ui));
+    psp_app_ui_sync_from_profile(&ui, profile);
+    ui.page_dark = true;
+    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 3u);
+    CHECK(!browser_profile_youtube_compact_results(profile)
+          && browser_profile_youtube_topics(profile)
+          && !ui.youtube_compact_results && ui.youtube_topics
+          && browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_LIGHT
+          && ui.color_mode == BROWSER_COLOR_MODE_LIGHT && !ui.page_dark
+          && ui.status[0] == '\0' && ui.toast_frames == 0u);
+
+    /* Auto stays Auto; only the page follows the engine. */
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_AUTO);
+    memset(&ui, 0, sizeof(ui));
+    psp_app_ui_sync_from_profile(&ui, profile);
+    ui.page_dark = true;
+    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 3u);
+    CHECK(browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_AUTO
+          && ui.color_mode == BROWSER_COLOR_MODE_AUTO && !ui.page_dark
+          && ui.status[0] == '\0');
+
+    /* Website fonts at boot report the refusal; with no engine there is
+       no mode to take, so the profile keeps its own. */
+    CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_OFF));
+    CHECK(psp_web_font_setting_boot(profile, NULL)
+          == PSP_SETTING_ENGINE_REFUSED);
+    CHECK(browser_profile_web_font_mode(profile) == WEB_FONTS_OFF);
+
+    /* The clock turned Auto dark and the engine refused: the page keeps
+       its light appearance, no repaint is asked for, and no toast. */
+    memset(&ui, 0, sizeof(ui));
+    ui.color_mode = BROWSER_COLOR_MODE_AUTO;
+    ui.page_dark = true;
+    CHECK(!psp_color_mode_refresh_apply(NULL, &ui, false));
+    CHECK(!ui.page_dark && ui.status[0] == '\0');
+    /* Nothing changed: nothing to apply. */
+    CHECK(!psp_color_mode_refresh_apply(NULL, &ui, false) && !ui.page_dark);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
+/* Site JavaScript names the value in effect when it did not change, and
+   reports a refusal otherwise; Basic view fallback names the mode in
+   effect even when the profile refuses the one asked for. */
+static bool test_site_javascript_and_basic_fallback_name_value_in_effect(void)
+{
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+    memset(&ui, 0, sizeof(ui));
+    snprintf(ui.url, sizeof(ui.url), "%s", "https://example.com/");
+    CHECK(browser_profile_site_javascript_enabled(profile, ui.url));
+
+    /* Already on: no failure toast, nothing written, the engine untouched
+       (a NULL engine would refuse). */
+    ui.site_javascript_enabled = true;
+    CHECK(psp_site_javascript_setting_apply(profile, NULL, &ui, true)
+          == PSP_SETTING_UNCHANGED);
+    CHECK(browser_profile_site_javascript_enabled(profile, ui.url)
+          && ui.site_javascript_enabled
+          && strcmp(ui.status, "SITE JAVASCRIPT ON") == 0);
+    /* A change the engine refuses puts the profile back. */
+    ui.site_javascript_enabled = false;
+    CHECK(psp_site_javascript_setting_apply(profile, NULL, &ui, false)
+          == PSP_SETTING_ENGINE_REFUSED);
+    CHECK(browser_profile_site_javascript_enabled(profile, ui.url)
+          && ui.site_javascript_enabled
+          && strcmp(ui.status, "SITE JAVASCRIPT SETTING UNAVAILABLE") == 0);
+    /* A page the profile keeps no exception for refuses the change. */
+    snprintf(ui.url, sizeof(ui.url), "%s", "about:blank");
+    bool blank = browser_profile_site_javascript_enabled(profile, ui.url);
+    ui.site_javascript_enabled = !blank;
+    CHECK(psp_site_javascript_setting_apply(profile, NULL, &ui, !blank)
+          == PSP_SETTING_PROFILE_REFUSED);
+    CHECK(ui.site_javascript_enabled == blank
+          && strcmp(ui.status, "SITE JAVASCRIPT SETTING UNAVAILABLE") == 0);
+
+    CHECK(browser_profile_set_basic_fallback_mode(
+        profile, BROWSER_BASIC_FALLBACK_ASK));
+    ui.basic_fallback_mode = BROWSER_BASIC_FALLBACK_AUTOMATIC;
+    CHECK(psp_basic_fallback_setting_apply(
+              profile, &ui, BROWSER_BASIC_FALLBACK_MODE_COUNT)
+          == PSP_SETTING_PROFILE_REFUSED);
+    CHECK(browser_profile_basic_fallback_mode(profile)
+              == BROWSER_BASIC_FALLBACK_ASK
+          && ui.basic_fallback_mode == BROWSER_BASIC_FALLBACK_ASK
+          && strcmp(ui.status, "BASIC VIEW FALLBACK: ASK") == 0);
+    CHECK(psp_basic_fallback_setting_apply(
+              profile, &ui, BROWSER_BASIC_FALLBACK_OFF)
+          == PSP_SETTING_APPLIED);
+    CHECK(ui.basic_fallback_mode == BROWSER_BASIC_FALLBACK_OFF
+          && strcmp(ui.status, "BASIC VIEW FALLBACK OFF") == 0
+          && ui.toast_frames == 180u);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
 int main(void)
 {
     if (!test_media_ink_check_follows_glyph_state()) return 1;
@@ -7544,6 +7954,12 @@ int main(void)
     if (!test_menu_cache_only_tracks_visible_catalogs()) return 1;
     if (!test_playlist_player_controls()) return 1;
     if (!test_website_font_setting()) return 1;
+    if (!test_settings_table_and_profile_sync()) return 1;
+    if (!test_bool_setting_failures_keep_one_value()
+        || !test_web_font_and_night_mode_failures_keep_one_value()
+        || !test_boot_and_clock_refresh_keep_engine_value()
+        || !test_site_javascript_and_basic_fallback_name_value_in_effect())
+        return 1;
     if (!test_player_chapter_timeline_and_menu()
         || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()

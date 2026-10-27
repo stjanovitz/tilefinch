@@ -12,7 +12,7 @@ static bool lite_html_account_action(YoutubeLiteHtml *html,
         || (!channel && !lite_valid_video_id(video))) return false;
     return lite_html_format(html,
         "<a id=\"%s\" class=\"comments-link%s\" data-yt-action=%u data-yt-target=\"%s\" "
-        "data-yt-video=\"%s\" href=\"#tilefinch-account-action\" ",
+        "data-yt-video=\"%s\" href=\"" YOUTUBE_LITE_FRAGMENT_ACCOUNT_ACTION "\" ",
         control_id, icon ? " icon-action" : "", (unsigned) action, target, channel ? "" : video)
         && lite_html_action_content(html, label, icon)
         && lite_html_text(html, "</a> ");

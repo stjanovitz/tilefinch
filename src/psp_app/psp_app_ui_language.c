@@ -35,12 +35,13 @@ void psp_ui_language_destroy(PspBrowserResources *browser)
    new catalog version, say) falls back to English silently at boot. Say
    what is missing once, when the UI is first idle, and let X take the
    reader to the Interface language row, whose ordinary download fixes it.
-   Scripted and replayed runs keep their deterministic frames. */
+   Automated runs (replayed, input-scripted, ticked) keep their
+   deterministic frames, and no toast takes their next X or O. */
 bool psp_ui_language_repair_poll(PspApp *app)
 {
     PspBrowserResources *browser = app->browser;
     if (browser->ui_language_repair_checked) return false;
-    if (strcmp(app->process->config.trace, "none") != 0) {
+    if (psp_boot_config_automated(&app->process->config)) {
         browser->ui_language_repair_checked = true;
         return false;
     }

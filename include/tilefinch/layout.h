@@ -1105,6 +1105,13 @@ typedef struct {
     /* ... and those some selectors do, reaching only elements carrying
        those rules' subject keys. */
     size_t class_keyed;
+    /* Run measurements answered from the retained table, measured and
+       stored, and stored over a live entry; the table's bytes (also in
+       retained_bytes). */
+    size_t text_measure_hits;
+    size_t text_measure_misses;
+    size_t text_measure_evictions;
+    size_t text_measure_bytes;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow
@@ -1235,6 +1242,17 @@ typedef struct LayoutDocument {
        y (the rest follows later): rows below it render as a placeholder,
        and height keeps the previous page's scroll extent. */
     int content_limit_y;
+    /* Where a provisional build first stopped at its limit: the links,
+       controls and node boxes recorded until then are the complete
+       layout's own (same index, same geometry). Entries past these counts
+       were laid out after the cut (positioned content) and their geometry
+       can differ from the complete layout's. preview_inexact marks a cut
+       that also changed geometry above the limit (a table whose columns
+       were measured from its first rows only). Zero for a complete build. */
+    size_t preview_cut_link_count;
+    size_t preview_cut_control_count;
+    size_t preview_cut_box_count;
+    bool preview_inexact;
     ViewportContext viewport;
     uint32_t page_background;
     /* True when this layout encountered an external image, mask, or
@@ -1426,6 +1444,13 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache);
 /* Release bulky resolved values without discarding exact selector results.
    Resolved-value storage resumes only after layout has working headroom. */
 size_t layout_reuse_cache_reclaim_styles(LayoutReuseCache *cache);
+/* Frees the retained run measurements (src/layout_text_cache.c) and keeps
+   them off for this cache's lifetime: another allocation, the script heap
+   growing toward its ceiling, needs the room more than a relayout
+   accelerator does. Safe from a Budget reclaim hook (frees only, during
+   any allocation, including one made while measuring). Returns the bytes
+   released. */
+size_t layout_reuse_cache_yield_text_measures(LayoutReuseCache *cache);
 void layout_reuse_cache_reset(LayoutReuseCache *cache);
 /* Allow the cache to retain each element's exact matched author rules across
    builds (and across the image traversal), sized for a whole document. Only
@@ -1629,6 +1654,12 @@ void layout_reuse_cache_invalidate_focus(
    same stylesheet and DOM. This still invalidates geometry and measurements. */
 void layout_reuse_cache_invalidate_local_focus(
     LayoutReuseCache *cache, lxb_dom_node_t *node);
+/* A paint-only focus skip moved focus onto or off this element without a
+   relayout. Drops only its own retained style and matched-rule lists (its
+   pseudo-elements' included), which were resolved in the other focus
+   state, so a later relayout re-resolves it from the live marker. */
+void layout_reuse_cache_forget_focus_state(
+    LayoutReuseCache *cache, lxb_dom_node_t *node);
 /* The checked state of the given checkboxes/radios changed (attribute and
    checkedness together). Drops the retained matched-rule lists of those
    controls and of every element a checked-state rule can select, plus all
@@ -1718,6 +1749,28 @@ bool layout_apply_focus_pseudo_visibility(
     LayoutDocument *layout, lxb_dom_node_t *node,
     const StyleFocusPseudoTranslation *change, bool focused, bool dry_run,
     int *left, int *top, int *right, int *bottom);
+/*
+ * A COLOR_PAINT_ONLY focus change: recolour the retained text borrowed from
+ * texts->texts and, when the background colour changed, the element's own
+ * solid background fill, from `other` (the painted state) to `style`. Text
+ * in the element's area that no listed node owns, or any command not
+ * painted in either state's colour, refuses. dry_run proves the patch.
+ * `runs` (optional) carries the dry run's owned text commands to the apply,
+ * which then recolours them without scanning the display list again; the
+ * caller passes it to the apply only when nothing but colours changed in
+ * between.
+ */
+#define LAYOUT_FOCUS_COLOR_RUN_LIMIT 64u
+typedef struct {
+    uint32_t owned[LAYOUT_FOCUS_COLOR_RUN_LIMIT];
+    uint32_t count;
+    bool complete;  /* every owned command is listed */
+} LayoutFocusColorRuns;
+bool layout_apply_focus_color_paint(
+    LayoutDocument *layout, lxb_dom_node_t *node,
+    const ComputedStyle *style, const ComputedStyle *other,
+    const StyleFocusColorTexts *texts, LayoutFocusColorRuns *runs,
+    bool dry_run, int *left, int *top, int *right, int *bottom);
 bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
                         int scroll_x, int scroll_y);
 bool layout_build_scroll_metadata(LayoutDocument *layout,

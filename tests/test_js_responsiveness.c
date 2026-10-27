@@ -1024,13 +1024,8 @@ static int test_heap_decisions_skip_census(void)
     CHECK(budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool)
           + reserve <= base);
     (void) script_runtime_collect_and_trim(runtime);
-    static const char probe[] = "__tilefinchHeapRemaining()";
-    JSValue remaining = JS_Eval(runtime->context, probe, sizeof(probe) - 1u,
-                                "<boot-census>", JS_EVAL_TYPE_GLOBAL);
-    int64_t remaining_bytes = 0;
-    CHECK(JS_ToInt64(runtime->context, &remaining_bytes, remaining) == 0);
-    JS_FreeValue(runtime->context, remaining);
-    CHECK(remaining_bytes > 0 && (size_t) remaining_bytes < base);
+    size_t remaining_bytes = script_runtime_heap_remaining(runtime);
+    CHECK(remaining_bytes > 0 && remaining_bytes < base);
     CHECK(runtime->heap_censuses == censuses);
     script_runtime_destroy(runtime);
     document_destroy(&document);
@@ -3269,61 +3264,11 @@ static int test_computed_style_sibling_scopes(void)
     return 0;
 }
 
-/* A section replacement detaches the page's document, destroys its tree
+/* A runtime rebind detaches the page's document, destroys its tree
    wholesale (no per-node removal reaches the removal listener) and binds
    the next one. getComputedStyle's retained styles held the old tree's
-   node addresses; the next mutation note followed them into freed memory
-   (a nondeterministic crash in experimental-section-link-activation).
+   node addresses; the next mutation note followed them into freed memory.
    Detaching must forget every retained node. */
-static int test_computed_style_forgets_detached_document(void)
-{
-    Budget budget;
-    budget_init(&budget, 12u * MIB);
-    CHECK(budget_install_lexbor(&budget));
-    PocDocument first = {0}, second = {0};
-    Stylesheet first_sheet = {0}, second_sheet = {0};
-    ScriptRuntime *runtime = var_cache_runtime(&budget, &first, &first_sheet,
-        "<!doctype html><style>.on{color:rgb(1,2,3)}</style><body>"
-        "<main><div id=a class=on><p id=p>x</p></div><div id=b></div>"
-        "</main></body>");
-    CHECK(runtime != NULL);
-    CHECK(var_cache_eval(runtime,
-        "pocSummary=getComputedStyle(document.getElementById('p')).color+"
-        "getComputedStyle(document.getElementById('a')).color",
-        "rgb(1, 2, 3)rgb(1, 2, 3)"));
-    lxb_dom_node_t *root = lxb_dom_interface_node(first.html);
-    lxb_dom_node_t *held[] = {find_element_id(root, "a"),
-                              find_element_id(root, "p")};
-    for (size_t i = 0; i < 2; i++)
-        CHECK(held[i] != NULL
-              && js_rt_bridge_computed_style_cache_holds(&runtime->bridge,
-                                                         held[i]));
-    script_runtime_detach_document(runtime, &first);
-    for (size_t i = 0; i < 2; i++)
-        CHECK(!js_rt_bridge_computed_style_cache_holds(&runtime->bridge,
-                                                       held[i]));
-    stylesheet_destroy(&first_sheet);
-    document_destroy(&first);
-    /* The next document: a mutation note and fresh reads touch only it. */
-    static const char next_html[] =
-        "<!doctype html><style>.on{color:rgb(4,5,6)}</style><body>"
-        "<section><div id=a><p id=p>y</p></div></section></body>";
-    CHECK(document_parse(&second, &budget, next_html, strlen(next_html), 31));
-    CHECK(stylesheet_build(&second_sheet, &budget, &second, 480));
-    ScriptResult result = {0};
-    CHECK(script_runtime_rebind_document(runtime, &second, &result));
-    script_runtime_set_stylesheet(runtime, &second_sheet);
-    CHECK(var_cache_eval(runtime,
-        "document.getElementById('a').setAttribute('class','on');"
-        "pocSummary=getComputedStyle(document.getElementById('p')).color",
-        "rgb(4, 5, 6)"));
-    script_runtime_destroy(runtime);
-    stylesheet_destroy(&second_sheet);
-    document_destroy(&second);
-    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
-    return 0;
-}
-
 static int test_inline_style_scoped_invalidation(void)
 {
     Budget budget;
@@ -3459,7 +3404,7 @@ static int test_computed_style_host_generation(void)
     CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
 
     /* A detached construction tree (as for an SVG raster clone) and the
-       focus-state probe, which restores its marker, change nothing. */
+       focus-state probe, which never writes the DOM, change nothing. */
     lxb_dom_element_t *loose = lxb_dom_document_create_element(
         &document.html->dom_document, (const lxb_char_t *) "div", 3, NULL);
     lxb_dom_element_t *loose_child = lxb_dom_document_create_element(
@@ -3477,17 +3422,6 @@ static int test_computed_style_host_generation(void)
           == NULL);
     CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", true));
 
-    /* A probe that cannot restore the marker (its toggle and its one
-       restoration both fail) leaves the element focused. */
-    tilefinch_test_faults()->focus_marker_remove_failures = 2;
-    CHECK(style_focus_change_classify(&sheet, a, NULL, &normal, &focused)
-          == STYLE_FOCUS_CHANGE_UNSAFE);
-    CHECK(tilefinch_test_faults()->focus_marker_remove_failures == 0);
-    CHECK(host_style_read(runtime, "a", "color", "rgb(7, 7, 7)", false));
-    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(a),
-              (const lxb_char_t *) "data-tilefinch-focus",
-              sizeof("data-tilefinch-focus") - 1u) == LXB_STATUS_OK);
-    CHECK(host_style_read(runtime, "a", "color", "rgb(1, 2, 3)", false));
 
     /* Native attribute writes: an ancestor class, as the parser or reader
        mode make, and the checked attribute the controller toggles. */
@@ -5142,6 +5076,37 @@ static int test_detached_event_state_collection(void)
     return 0;
 }
 
+/* A runtime whose QuickJS context is refused (a JavaScript heap too small
+   for the intrinsics) is abandoned with nothing left charged to the page
+   Budget, script profiling on included: runtime_create_abandon freed the
+   context, runtime, pool and host but not the profile block
+   runtime_create_engine had allocated before JS_NewContext. Profiling is
+   read once per process, so this runs alone (--profile-abandon-only). */
+static int test_refused_context_frees_profile(void)
+{
+    CHECK(setenv("TILEFINCH_TRACE_JS_PROFILE", "1", 1) == 0);
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><body></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    size_t before = budget.current;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 16u * 1024u, 4000, "https://abandon.test/",
+        &result);
+    CHECK(runtime == NULL);
+    CHECK(strstr(result.error, "QuickJS context") != NULL);
+    if (budget.current != before)
+        printf("refused context left %zu bytes charged\n",
+               budget.current - before);
+    CHECK(budget.current == before);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* Opens a page for the event-target tests, with growth of the
    bootstrap's event-target maps refused or not. */
 static ScriptRuntime *event_target_page(Budget *budget, PocDocument *document,
@@ -5191,73 +5156,6 @@ static int test_connected_event_targets_past_capacity(bool refuse_growth)
     CHECK(var_cache_eval(runtime,
         "pocSummary=String(__tilefinchRootCensus.eventTargetCapacity)",
         refuse_growth ? "128" : "256"));
-    return event_target_page_close(&budget, &document, &sheet, runtime);
-}
-
-/* A remote node writer that accepts every write (a section-paged page's
-   backing, which this test has no sections for). */
-static bool accept_remote_node_write(
-    void *opaque, const char *stable_key, size_t stable_key_length,
-    size_t section_index, ScriptRemoteNodeWriteKind kind, const char *name,
-    size_t name_length, const char *value, size_t value_length)
-{
-    (void) opaque; (void) stable_key; (void) stable_key_length;
-    (void) section_index; (void) kind; (void) name; (void) name_length;
-    (void) value; (void) value_length;
-    return true;
-}
-
-/* On a page with a remote node writer, listeners and handlers are kept by
-   stable key, so they carry over to the element a section swap makes for
-   the same id. Past the 128 keys that pair starts with it grows as the
-   per-handle pair does; with growth refused, a node's state takes the
-   per-handle path and still lives as long as the node. Here 300 parsed
-   elements get a listener and a handler, then the body is parsed again
-   from the same markup, which gives the new elements the same
-   (positional) stable keys, as a section swap does: every new element
-   fires both. On the old code the keys past 128 fell to the per-handle
-   maps of the replaced elements, and only those whose wrapper the
-   stable-wrapper cache still held kept anything. */
-static int test_stable_event_targets_past_capacity(bool refuse_growth)
-{
-    Budget budget;
-    PocDocument document = {0};
-    Stylesheet sheet = {0};
-    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
-                                               refuse_growth);
-    CHECK(runtime != NULL);
-    ScriptRemoteDocumentBinding binding = {
-        .node_write = accept_remote_node_write
-    };
-    CHECK(script_runtime_rebind_remote_document(runtime, &binding));
-    ScriptResult result = {0};
-    CHECK(var_cache_eval(runtime,
-        "globalThis.hits=0;globalThis.ons=0;"
-        "globalThis.markup='<p>x</p>'.repeat(300);"
-        "document.body.innerHTML=markup;"
-        "for(const p of document.querySelectorAll('p')){"
-        "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
-        "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
-        "MADE"));
-    CHECK(collect_and_drain_finalizers(runtime, &result));
-    if (refuse_growth) {
-        /* Refused: the elements themselves keep their state. */
-        CHECK(var_cache_eval(runtime,
-            "for(const p of document.querySelectorAll('p'))p.click();"
-            "pocSummary=hits+':'+ons+':'+"
-            "__tilefinchRootCensus.stableEventTargetCapacity", "300:300:128"));
-    } else {
-        CHECK(var_cache_eval(runtime,
-            "document.body.innerHTML=markup;pocSummary='SWAPPED'",
-            "SWAPPED"));
-        CHECK(collect_and_drain_finalizers(runtime, &result));
-        CHECK(collect_and_drain_finalizers(runtime, &result));
-        CHECK(var_cache_eval(runtime,
-            "for(const p of document.querySelectorAll('p'))p.click();"
-            "pocSummary=hits+':'+ons+':'+"
-            "__tilefinchRootCensus.stableEventTargetCapacity", "300:300:512"));
-    }
-    script_runtime_rebind_remote_document(runtime, NULL);
     return event_target_page_close(&budget, &document, &sheet, runtime);
 }
 
@@ -5448,8 +5346,8 @@ static int test_refused_hold_leaves_no_holder(void)
         "globalThis.heldBox=held})();pocSummary='MADE'", "MADE"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(runtime->bridge.event_stuck_slots != 0);
-    CHECK(runtime->bridge.event_held_slots != 0);
+    CHECK(runtime->bridge.events.stuck_slots != 0);
+    CHECK(runtime->bridge.events.held_slots != 0);
     CHECK(var_cache_eval(runtime,
         "stuckW1.remove();stuckRoot.children[0].remove();"
         "pocSummary=String(stuckRoot.children.length)", "1"));
@@ -5462,60 +5360,6 @@ static int test_refused_hold_leaves_no_holder(void)
     CHECK(collect_and_drain_finalizers(runtime, &result));
     CHECK(var_cache_eval(runtime,
         "pocSummary=xListener.deref()?'LEAKED':'COLLECTED'", "COLLECTED"));
-    return event_target_page_close(&budget, &document, &sheet, runtime);
-}
-
-/* On a section-paged page whose event-target maps are all full, a
-   connected node's state lives on its wrapper (kept). A section swap
-   rebinds the retained wrapper to the new node; the new node must keep
-   that wrapper, and so its listeners, after the stable-wrapper cache lets
-   go of it. On the old code the rebind released the old node's reference
-   and nothing took one for the new node. */
-static int test_rebind_keeps_kept_state(void)
-{
-    Budget budget;
-    PocDocument document = {0};
-    Stylesheet sheet = {0};
-    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
-                                               true);
-    CHECK(runtime != NULL);
-    ScriptRemoteDocumentBinding binding = {
-        .node_write = accept_remote_node_write
-    };
-    CHECK(script_runtime_rebind_remote_document(runtime, &binding));
-    ScriptResult result = {0};
-    CHECK(var_cache_eval(runtime,
-        "globalThis.hits=0;globalThis.ons=0;"
-        "globalThis.markup='<p>x</p>'.repeat(300);"
-        "document.body.innerHTML=markup;"
-        "for(const p of document.querySelectorAll('p')){"
-        "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
-        "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
-        "MADE"));
-    CHECK(collect_and_drain_finalizers(runtime, &result));
-    /* The swap. Walking back from the last element reaches the retained
-       wrappers (the last 128 wrapped) before fresh wrappers evict them,
-       so each is rebound to its successor; the kept ones are the last 44
-       (past 128 stable and 128 per-handle targets). */
-    CHECK(var_cache_eval(runtime,
-        "hits=0;ons=0;document.body.innerHTML=markup;"
-        "for(let i=300;i>0;i--)"
-        "document.querySelector('p:nth-child('+i+')').click();"
-        "pocSummary=hits+':'+ons", "256:256"));
-    /* Push the rebound wrappers out of the stable-wrapper cache. */
-    CHECK(var_cache_eval(runtime,
-        "(()=>{const box=document.createElement('div');"
-        "box.innerHTML='<span>y</span>'.repeat(300);"
-        "document.body.appendChild(box);"
-        "for(const s of box.querySelectorAll('span'))void s.id})();"
-        "pocSummary='EVICTED'", "EVICTED"));
-    CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(var_cache_eval(runtime,
-        "const before=hits+':'+ons;hits=0;ons=0;"
-        "for(const p of document.querySelectorAll('p'))p.click();"
-        "pocSummary=before+'/'+hits+':'+ons", "256:256/172:172"));
-    script_runtime_rebind_remote_document(runtime, NULL);
     return event_target_page_close(&budget, &document, &sheet, runtime);
 }
 
@@ -5544,8 +5388,8 @@ static int test_insertion_joins_held_tree(void)
         "d.addEventListener('click',()=>hits.push('d'));globalThis.o=o})();"
         "pocSummary='MADE'", "MADE"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(runtime->bridge.event_held_slots == 2);
-    uint64_t releases = runtime->bridge.event_held_releases;
+    CHECK(runtime->bridge.events.held_slots == 2);
+    uint64_t releases = runtime->bridge.events.held_releases;
     CHECK(var_cache_eval(runtime,
         "(()=>{const x=document.createElement('b');"
         "r.firstChild.appendChild(x);globalThis.kept=x;"
@@ -5558,17 +5402,58 @@ static int test_insertion_joins_held_tree(void)
         "kept.parentNode.click();inner.parentNode.click();"
         "pocSummary=hits.join(',')", "c,d"));
     /* Only the move of one held tree into the other re-rooted state. */
-    CHECK(runtime->bridge.event_held_releases - releases <= 2);
+    CHECK(runtime->bridge.events.held_releases - releases <= 2);
     CHECK(var_cache_eval(runtime,
         "document.body.appendChild(kept.parentNode.parentNode);"
         "pocSummary='ATTACHED'", "ATTACHED"));
-    uint64_t hooks = runtime->bridge.event_state_hook_calls;
+    uint64_t hooks = runtime->bridge.events.hook_calls;
     CHECK(var_cache_eval(runtime,
         "for(let n=0;n<50;n++){kept.parentNode.appendChild("
         "document.createElement('u'));"
         "inner.parentNode.appendChild(document.createElement('s'))}"
         "pocSummary='GREW'", "GREW"));
-    CHECK(runtime->bridge.event_state_hook_calls - hooks <= 2);
+    CHECK(runtime->bridge.events.hook_calls - hooks <= 2);
+    return event_target_page_close(&budget, &document, &sheet, runtime);
+}
+
+/* An insertion under a parent first wrapped after the hold: detached tree
+   R > P > C (P never wrapped, so it had no handle when the tree was held)
+   is held with only C's wrapper alive. C.after(M) inserts M
+   under P, so M's wrapper must join the tree's holder (or both sides be
+   rooted again), or once C's wrapper goes the holder (C's listener with
+   it) is collected while C stays reachable through M. The insertion names
+   P by handle, so after() wraps it first, and that new wrapper marks P as
+   in a held tree (bridge_wrapper_event_holder): review 1026 J5 asked
+   whether a parent without a handle slips past the join; this pins that
+   it cannot through after(). */
+static int test_insertion_under_unwrapped_parent_joins_held_tree(void)
+{
+    Budget budget;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
+                                               false);
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "globalThis.hits=[];"
+        "(()=>{const r=document.createElement('div');"
+        "r.innerHTML='<span><i></i></span>';const c=r.querySelector('i');"
+        "c.addEventListener('click',()=>hits.push('c'));"
+        "globalThis.w1=c})();"
+        "pocSummary='MADE'", "MADE"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(runtime->bridge.events.held_slots == 1);
+    CHECK(var_cache_eval(runtime,
+        "globalThis.wm=document.createElement('b');w1.after(wm);w1=null;"
+        "pocSummary='MOVED'", "MOVED"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(var_cache_eval(runtime,
+        "document.body.appendChild(wm.parentNode.parentNode);"
+        "wm.previousSibling.click();"
+        "pocSummary=hits.join(',')||'none'", "c"));
     return event_target_page_close(&budget, &document, &sheet, runtime);
 }
 
@@ -5746,12 +5631,12 @@ static int event_state_oom_run(const EventStateOomCase *test, unsigned nth,
           && strcmp(summary, "MADE") == 0);
     if (test->held_first) {
         CHECK(event_state_oom_settle(runtime, &result));
-        CHECK(runtime->bridge.event_held_slots != 0);
+        CHECK(runtime->bridge.events.held_slots != 0);
     }
     TilefinchTestFaults *faults = tilefinch_test_faults();
     faults->event_hook_refused = false;
-    uint64_t hooks = runtime->bridge.event_state_hook_calls,
-        failures = runtime->bridge.event_hook_failures;
+    uint64_t hooks = runtime->bridge.events.hook_calls,
+        failures = runtime->bridge.events.hook_failures;
     if (test->release) faults->event_release_refuse_allocation = nth;
     else faults->event_hold_refuse_allocation = nth;
     if (test->change != NULL)
@@ -5760,28 +5645,28 @@ static int event_state_oom_run(const EventStateOomCase *test, unsigned nth,
               && strcmp(summary, "CHANGED") == 0);
     /* The sweep holds the tree within a few turns. */
     for (size_t turn = 0; turn < 64 && !test->release
-         && runtime->bridge.event_state_hook_calls == hooks; turn++)
+         && runtime->bridge.events.hook_calls == hooks; turn++)
         CHECK(script_runtime_advance(runtime, 0, 1024, &result));
-    CHECK(runtime->bridge.event_state_hook_calls != hooks);
+    CHECK(runtime->bridge.events.hook_calls != hooks);
     faults->event_hold_refuse_allocation = 0;
     faults->event_release_refuse_allocation = 0;
     *reached = nth != 0 && faults->event_hook_refused;
-    if (runtime->bridge.event_hook_failures != failures) {
+    if (runtime->bridge.events.hook_failures != failures) {
         /* The hook threw: no retry until the heap collects. */
         size_t collections = runtime->heap_collections;
-        hooks = runtime->bridge.event_state_hook_calls;
-        uint64_t retries = runtime->bridge.event_release_retries;
+        hooks = runtime->bridge.events.hook_calls;
+        uint64_t retries = runtime->bridge.events.release_retries;
         for (size_t turn = 0; turn < 16; turn++)
             CHECK(script_runtime_advance(runtime, 0, 1024, &result));
         if (runtime->heap_collections == collections) {
-            CHECK(runtime->bridge.event_state_hook_calls == hooks);
-            CHECK(runtime->bridge.event_release_retries == retries);
+            CHECK(runtime->bridge.events.hook_calls == hooks);
+            CHECK(runtime->bridge.events.release_retries == retries);
         }
     }
     CHECK(event_state_oom_eval(runtime, test->drop, summary, sizeof summary)
           && strcmp(summary, "DROPPED") == 0);
     CHECK(event_state_oom_settle(runtime, &result));
-    CHECK(!runtime->bridge.event_release_pending);
+    CHECK(!runtime->bridge.events.release_pending);
     CHECK(event_state_oom_eval(runtime, test->check, outcome, capacity));
     return event_target_page_close(&budget, &document, &sheet, runtime);
 }
@@ -5813,7 +5698,12 @@ static int test_event_state_survives_refused_allocations(void)
             }
             if (!reached) break;
         }
-        CHECK(nth > 1 && nth < 1000);
+        /* release-join may allocate nothing: stamping the holder on the
+           joining wrapper fits the wrapper's existing property storage
+           (release-join-refused covers the refused join). Every other case
+           must reach at least one refusal. */
+        CHECK(nth < 1000
+              && (nth > 1 || strcmp(test->name, "release-join") == 0));
         printf("event-state oom %s: %u refusal points\n", test->name,
                nth - 1);
     }
@@ -5829,12 +5719,7 @@ static int test_event_state_survives_refused_allocations(void)
    - wrap-held: a wrapper made in a held tree must join the tree's holder
      before it becomes the node's live wrapper. On the old code a refused
      stamp left a live wrapper outside the holder, which the collector
-     then took with the tree's handlers once the old wrappers went.
-   - rebind-kept: a section swap rebinds a retained wrapper whose node's
-     state it carries (the event-target maps are full). On the old code a
-     refusal after the old handle's lease went left the state on the
-     wrapper with no native reference, and the retried rebind (same
-     handle) never took one, so the state died with the wrapper. */
+     then took with the tree's handlers once the old wrappers went. */
 static JSValue event_state_test_refuse(JSContext *context,
                                        JSValueConst this_value, int argc,
                                        JSValueConst *argv)
@@ -5857,7 +5742,6 @@ static JSValue event_state_test_refusal_pending(JSContext *context,
 
 typedef struct {
     const char *name;
-    bool remote_writer;
     const char *setup;
     /* Runs the refused operation (`N` is the refusal) and retries it;
        pocSummary='LEFT' when the refusal never came. */
@@ -5867,7 +5751,7 @@ typedef struct {
 } EventStatePageOomCase;
 
 static const EventStatePageOomCase event_state_page_oom_cases[] = {
-    {"wrap-held", false, EVENT_STATE_OOM_TREE "pocSummary='MADE'",
+    {"wrap-held", EVENT_STATE_OOM_TREE "pocSummary='MADE'",
      "let w=null;__testRefuse(N);try{w=root.querySelector('#b')}catch{}"
      "const left=__testRefusalPending();__testRefuse(0);"
      "globalThis.kept=w||root.querySelector('#b');root=null;"
@@ -5876,27 +5760,6 @@ static const EventStatePageOomCase event_state_page_oom_cases[] = {
      "pocSummary=hits.join(',')+'|'+"
      "__tilefinchRootCensus.heldEventTargets",
      "bOn,r,c,cOn,r|4"},
-    {"rebind-kept", true,
-     "globalThis.hits=0;globalThis.ons=0;"
-     "globalThis.markup='<p>x</p>'.repeat(300);"
-     "document.body.innerHTML=markup;"
-     "for(const p of document.querySelectorAll('p')){"
-     "p.addEventListener('click',()=>hits++);p.onclick=()=>{ons++}}"
-     "pocSummary=__tilefinchHasRemoteNodeWriter?'MADE':'NO-WRITER'",
-     "const sel='p:nth-child(300)';document.querySelector(sel);"
-     "document.body.innerHTML=markup;"
-     "__testRefuse(N);try{document.querySelector(sel)}catch{}"
-     "const left=__testRefusalPending();__testRefuse(0);"
-     "for(let i=300;i>0;i--)"
-     "document.querySelector('p:nth-child('+i+')').click();"
-     "(()=>{const box=document.createElement('div');"
-     "box.innerHTML='<span>y</span>'.repeat(300);"
-     "document.body.appendChild(box);"
-     "for(const s of box.querySelectorAll('span'))void s.id})();"
-     "pocSummary=left?'LEFT':'DONE'",
-     "hits=0;ons=0;for(const p of document.querySelectorAll('p'))p.click();"
-     "pocSummary=hits+':'+ons",
-     "172:172"},
 };
 
 static int event_state_page_oom_run(const EventStatePageOomCase *test,
@@ -5907,13 +5770,8 @@ static int event_state_page_oom_run(const EventStatePageOomCase *test,
     PocDocument document = {0};
     Stylesheet sheet = {0};
     ScriptRuntime *runtime = event_target_page(&budget, &document, &sheet,
-                                               test->remote_writer);
+                                               false);
     CHECK(runtime != NULL);
-    ScriptRemoteDocumentBinding binding = {
-        .node_write = accept_remote_node_write
-    };
-    if (test->remote_writer)
-        CHECK(script_runtime_rebind_remote_document(runtime, &binding));
     JSContext *context = runtime->context;
     JSValue global = JS_GetGlobalObject(context);
     CHECK(JS_SetPropertyStr(context, global, "__testRefuse",
@@ -5936,8 +5794,6 @@ static int event_state_page_oom_run(const EventStatePageOomCase *test,
     CHECK(*reached || strcmp(summary, "LEFT") == 0);
     CHECK(event_state_oom_settle(runtime, &result));
     CHECK(event_state_oom_eval(runtime, test->check, outcome, capacity));
-    if (test->remote_writer)
-        script_runtime_rebind_remote_document(runtime, NULL);
     return event_target_page_close(&budget, &document, &sheet, runtime);
 }
 
@@ -6012,9 +5868,9 @@ static int test_event_state_bookkeeping_cost(void)
         "MADE"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(bridge->event_held_slots != 0);
+    CHECK(bridge->events.held_slots != 0);
 
-    uint64_t hooks = bridge->event_state_hook_calls;
+    uint64_t hooks = bridge->events.hook_calls;
     uint64_t build_us = bookkeeping_eval_us(runtime,
         "(()=>{const root=document.createElement('div');"
         "for(let r=0;r<250;r++){const row=document.createElement('div');"
@@ -6022,15 +5878,15 @@ static int test_event_state_bookkeeping_cost(void)
         "root.appendChild(row)}globalThis.built=root})();"
         "pocSummary=String(built.querySelectorAll('span').length)", "750",
         &ok);
-    uint64_t build_hooks = bridge->event_state_hook_calls - hooks;
+    uint64_t build_hooks = bridge->events.hook_calls - hooks;
 
     CHECK(var_cache_eval(runtime,
         "globalThis.growing=document.createElement('ul');globalThis.calls=0;"
         "growing.addEventListener('click',()=>calls++);pocSummary='GROWING'",
         "GROWING"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    hooks = bridge->event_state_hook_calls;
-    uint64_t releases = bridge->event_held_releases;
+    hooks = bridge->events.hook_calls;
+    uint64_t releases = bridge->events.held_releases;
     for (int turn = 0; turn < 10; turn++) {
         CHECK(var_cache_eval(runtime,
             "for(let n=0;n<20;n++){const li=document.createElement('li');"
@@ -6039,8 +5895,8 @@ static int test_event_state_bookkeeping_cost(void)
         for (int step = 0; step < 8; step++)
             CHECK(script_runtime_advance(runtime, 0, 1024, &result));
     }
-    uint64_t grow_hooks = bridge->event_state_hook_calls - hooks;
-    uint64_t grow_releases = bridge->event_held_releases - releases;
+    uint64_t grow_hooks = bridge->events.hook_calls - hooks;
+    uint64_t grow_releases = bridge->events.held_releases - releases;
     CHECK(var_cache_eval(runtime,
         "for(const li of growing.children)li.click();"
         "pocSummary=String(calls)", "400"));
@@ -6056,9 +5912,9 @@ static int test_event_state_bookkeeping_cost(void)
         "globalThis.stuck=root;globalThis.stuckF=f})();pocSummary='STUCK'",
         "STUCK"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(bridge->event_stuck_slots != 0);
-    uint64_t reopens = bridge->event_stuck_reopens;
-    hooks = bridge->event_state_hook_calls;
+    CHECK(bridge->events.stuck_slots != 0);
+    uint64_t reopens = bridge->events.stuck_reopens;
+    hooks = bridge->events.hook_calls;
     for (int round = 0; round < 10; round++) {
         CHECK(var_cache_eval(runtime,
             "for(let n=0;n<20;n++)document.createElement('p').id='p'+n;"
@@ -6066,14 +5922,14 @@ static int test_event_state_bookkeeping_cost(void)
         CHECK(collect_and_drain_finalizers(runtime, &result));
         CHECK(collect_and_drain_finalizers(runtime, &result));
     }
-    uint64_t stuck_reopens = bridge->event_stuck_reopens - reopens;
-    uint64_t stuck_hooks = bridge->event_state_hook_calls - hooks;
+    uint64_t stuck_reopens = bridge->events.stuck_reopens - reopens;
+    uint64_t stuck_hooks = bridge->events.hook_calls - hooks;
     /* Losing the frozen wrapper reopens its own tree, which is held. */
     CHECK(var_cache_eval(runtime, "stuckF=null;pocSummary='THAWED'",
                          "THAWED"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
     CHECK(collect_and_drain_finalizers(runtime, &result));
-    CHECK(bridge->event_stuck_slots == 0);
+    CHECK(bridge->events.stuck_slots == 0);
     CHECK(var_cache_eval(runtime,
         "stuck.click();pocSummary='OK'", "OK"));
 
@@ -6385,62 +6241,6 @@ static int test_network_queue_replay(void)
     }
     CHECK(ok && strcmp(result.summary, expected) == 0);
 
-    static const char teardown_probe[] =
-        "globalThis.teardown=[];starts.length=0;for(let i=0;i<8;i++)"
-        "teardown.push(fetch('/t/'+i).then(()=>'resolved',"
-        "error=>error.name));globalThis.pocSummary='TEARDOWN:'+starts.length"
-        "+':'+__tilefinchNetworkQueueStats.waiting;";
-    /* The shared scheduler's response reservation admits two at once; the
-       other six wait in the JavaScript FIFO. */
-    CHECK(script_runtime_evaluate_diagnostic(
-              runtime, teardown_probe, "<network-queue-teardown>", &result)
-          && strcmp(result.summary, "TEARDOWN:2:6") == 0);
-    CHECK(script_runtime_advance(runtime, 4, 64, &result));
-    size_t reserved = 0, domain_active = 0;
-    fetch_scheduler_reservation_state(
-        runtime->bridge.fetch_scheduler, &reserved, NULL, &domain_active,
-        NULL);
-    CHECK(fetch_scheduler_pending(runtime->bridge.fetch_scheduler) == 2
-          && reserved != 0 && domain_active == 2
-          && runtime->bridge.async_fetch_count == 2
-          && result.async_network_pending_logical == 6);
-    script_runtime_detach_document(runtime, &document);
-    static const char settled_probe[] =
-        "Promise.all(teardown).then(values=>{globalThis.pocSummary="
-        "'SETTLED:'+values.join()+':'+starts.length;});";
-    ok = script_runtime_evaluate_diagnostic(
-        runtime, settled_probe, "<network-queue-settled>", &result);
-    for (size_t tick = 0; ok && tick < 16; tick++) {
-        ok = script_runtime_advance(runtime, 50, 64, &result);
-    }
-    static const char settled[] =
-        "SETTLED:TypeError,TypeError,TypeError,TypeError,TypeError,"
-        "TypeError,TypeError,TypeError:2";
-    if (!ok || strcmp(result.summary, settled) != 0) {
-        fprintf(stderr, "network queue teardown: ok=%d summary=%s error=%s\n",
-                ok, result.summary, result.error);
-    }
-    fetch_scheduler_reservation_state(
-        runtime->bridge.fetch_scheduler, &reserved, NULL, &domain_active,
-        NULL);
-    if (fetch_scheduler_pending(runtime->bridge.fetch_scheduler) != 0
-        || reserved != 0 || domain_active != 0
-        || runtime->bridge.async_fetch_count != 0
-        || result.async_network_active_native != 0
-        || result.async_network_pending_logical != 0) {
-        fprintf(stderr, "network queue teardown residue: pending=%zu "
-                "reserved=%zu domain=%zu native=%zu active=%zu logical=%zu\n",
-                fetch_scheduler_pending(runtime->bridge.fetch_scheduler),
-                reserved, domain_active, runtime->bridge.async_fetch_count,
-                result.async_network_active_native,
-                result.async_network_pending_logical);
-    }
-    CHECK(ok && strcmp(result.summary, settled) == 0
-          && fetch_scheduler_pending(runtime->bridge.fetch_scheduler) == 0
-          && reserved == 0 && domain_active == 0
-          && runtime->bridge.async_fetch_count == 0
-          && result.async_network_active_native == 0
-          && result.async_network_pending_logical == 0);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     fetch_trace_end();
@@ -8062,6 +7862,8 @@ static int test_large_blob_worker(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--profile-abandon-only") == 0)
+        return test_refused_context_frees_profile();
     if (argc == 2 && strcmp(argv[1], "--component-stack-only") == 0)
         return test_component_stack_headroom();
     CHECK(test_component_stack_headroom() == 0);
@@ -8103,26 +7905,23 @@ int main(int argc, char **argv)
             || test_connected_event_targets_past_capacity(true)
             || test_event_target_overflow_collection()
             || test_event_state_rooted_by_pin()
-            || test_frozen_detached_wrapper_settles()
-            || test_stable_event_targets_past_capacity(false)
-            || test_stable_event_targets_past_capacity(true);
+            || test_frozen_detached_wrapper_settles();
     CHECK(test_connected_event_targets_past_capacity(false) == 0);
     CHECK(test_connected_event_targets_past_capacity(true) == 0);
     CHECK(test_event_target_overflow_collection() == 0);
     CHECK(test_event_state_rooted_by_pin() == 0);
     CHECK(test_frozen_detached_wrapper_settles() == 0);
-    CHECK(test_stable_event_targets_past_capacity(false) == 0);
-    CHECK(test_stable_event_targets_past_capacity(true) == 0);
     if (argc == 2 && strcmp(argv[1], "--event-state-fixes-only") == 0)
         return (test_cleared_children_event_state_collection() != 0)
-            | (test_refused_hold_leaves_no_holder() != 0)
-            | (test_rebind_keeps_kept_state() != 0);
+            | (test_refused_hold_leaves_no_holder() != 0);
     CHECK(test_cleared_children_event_state_collection() == 0);
     CHECK(test_refused_hold_leaves_no_holder() == 0);
-    CHECK(test_rebind_keeps_kept_state() == 0);
     if (argc == 2 && strcmp(argv[1], "--held-join-only") == 0)
         return test_insertion_joins_held_tree();
     CHECK(test_insertion_joins_held_tree() == 0);
+    if (argc == 2 && strcmp(argv[1], "--unwrapped-parent-join-only") == 0)
+        return test_insertion_under_unwrapped_parent_joins_held_tree();
+    CHECK(test_insertion_under_unwrapped_parent_joins_held_tree() == 0);
     if (argc == 2 && strcmp(argv[1], "--event-state-oom-only") == 0)
         return test_event_state_survives_refused_allocations()
             | test_event_state_survives_refused_page_allocations();
@@ -8171,8 +7970,6 @@ int main(int argc, char **argv)
     CHECK(test_device_answer_checkpoint() == 0);
     if (argc == 2 && strcmp(argv[1], "--sibling-scopes-only") == 0)
         return test_computed_style_sibling_scopes();
-    if (argc == 2 && strcmp(argv[1], "--detached-document-only") == 0)
-        return test_computed_style_forgets_detached_document();
     if (argc == 2 && strcmp(argv[1], "--style-no-cascade-only") == 0)
         return test_computed_style_reads_without_cascade();
     if (argc == 2 && strcmp(argv[1], "--script-split-only") == 0)
@@ -8285,7 +8082,6 @@ int main(int argc, char **argv)
     CHECK(test_script_split_attributes_bridge_work() == 0);
     CHECK(test_computed_style_reads_without_cascade() == 0);
     CHECK(test_computed_style_sibling_scopes() == 0);
-    CHECK(test_computed_style_forgets_detached_document() == 0);
     CHECK(test_computed_style_container_cache(false) == 0);
     CHECK(test_computed_style_container_cache(true) == 0);
     CHECK(test_computed_style_scoped_invalidation() == 0);
@@ -9404,8 +9200,8 @@ int main(int argc, char **argv)
     CHECK(observer_order_ok
           && strcmp(result.summary, "OBSERVER-ORDER-OK") == 0);
 
-    /* Mutation-observer interest: fast paths (native ancestor and nearest-id
-       walks, per-registration interest before any ancestry check) keep the
+    /* Mutation-observer interest: fast paths (native ancestor walks,
+       per-registration interest before any ancestry check) keep the
        records, oldValue merging, transient registrations and the 256-step
        ancestor bound of the wrapper walks; see queueMutationRecords. */
     static const char observer_interest_probe[] =
@@ -9420,35 +9216,13 @@ int main(int argc, char **argv)
         "af'),other=el('div','mi-other');"
         "mid.appendChild(leaf);root.appendChild(mid);document.body.append(root,"
         "other);"
-        "const dirty=globalThis.__tilefinchDirtyNodeIds;dirty.clear();"
         "mid.setAttribute('data-a','1');leaf.setAttribute('data-a','1');"
-        "check('dirty-nearest',dirty.has('i:mi-root')&&dirty.has('i:mi-leaf')&&"
-        "dirty.size===2);"
         "const longId='x'.repeat(129),overlong=el('div',longId),inner=el('i'),e"
         "mpty=el('b','');"
         "overlong.appendChild(inner);mid.append(overlong,empty);const text=docu"
         "ment.createTextNode('a');leaf.appendChild(text);"
-        "dirty.clear();inner.setAttribute('data-a','1');empty.setAttribute('dat"
-        "a-a','1');"
-        "check('dirty-skips',dirty.has('i:mi-root')&&dirty.size===1);"
-        "dirty.clear();text.data='b';check('dirty-text',dirty.has('i:mi-leaf')&"
-        "&dirty.size===1);"
-        "dirty.clear();el('div').setAttribute('data-a','1');check('dirty-none',"
-        "dirty.size===0);"
-        /* Without a section save nothing drains the set: it keeps the first
-           64 keys in insertion order and counts each later add as dropped. */
-        "const stats=globalThis.__tilefinchRetentionStats,drops=stats.dirtyDro"
-        "ps,bound=[];"
-        "for(let i=0;i<70;i++){const n=el('i','mi-bound-'+i);bound.push(n);n.s"
-        "etAttribute('data-a','1')}"
-        "check('dirty-bound',dirty.size===64&&dirty.has('i:mi-bound-0')&&dirty"
-        ".has('i:mi-bound-63')&&!dirty.has('i:mi-bound-64')&&[...dirty][0]==='"
-        "i:mi-bound-0'&&stats.dirtyDrops===drops+12);"
-        "const boundDrops=stats.dirtyDrops;bound[5].setAttribute('data-a','2');"
-        "check('dirty-bound-known',dirty.size===64&&stats.dirtyDrops===boundDr"
-        "ops);dirty.clear();bound[69].setAttribute('data-a','2');"
-        "check('dirty-bound-cleared',dirty.size===1&&dirty.has('i:mi-bound-69'"
-        "));dirty.clear();"
+        "inner.setAttribute('data-a','1');empty.setAttribute('data-a','1');"
+        "text.data='b';el('div').setAttribute('data-a','1');"
         "const unrelatedLog=[],unrelated=new MutationObserver(r=>unrelatedLog.p"
         "ush(...r));"
         "unrelated.observe(other,{attributes:true,childList:true,characterData:"
@@ -12566,12 +12340,9 @@ int main(int argc, char **argv)
         "'__tilefinchDispatchDOMContentLoaded',"
         "'__tilefinchIntersectionRecheck','__tilefinchParserMutationCheckpoint',"
         "'__tilefinchMediaRecheck',"
-        "'__tilefinchPumpTimers','__tilefinchRebindDocument',"
+        "'__tilefinchPumpTimers',"
         "'__tilefinchRecordResourceTiming','__tilefinchRefreshNamedProperties',"
-        "'__tilefinchRestoreSameDocument','__tilefinchRestoreSectionState',"
-        "'__tilefinchSaveSectionState','__tilefinchSetFrameWindowState',"
-        "'__tilefinchWrapRemote','__tilefinchWrapRemoteRelation',"
-        "'__tilefinchWrapRemoteSelector','__tilefinchWrapRemoteStable'];"
+        "'__tilefinchRestoreSameDocument','__tilefinchSetFrameWindowState'];"
         "for(const name of lazy)globalThis[name]=globalThis[name];"
         "const enumerable=lazy.filter(name=>Object.getOwnPropertyDescriptor("
         "globalThis,name)?.enumerable!==false),"
@@ -13807,24 +13578,6 @@ int main(int argc, char **argv)
     }
     CHECK(media_source_ok
           && strcmp(result.summary, "MEDIA-SOURCE-EMPTY-OK") == 0);
-
-    puts("test: detached runtimes reject new network work");
-    script_runtime_detach_document(runtime, &document);
-    static const char detached_fetch_probe[] =
-        "fetch('/after-detach').then(()=>{"
-        "globalThis.pocSummary='DETACHED-FETCH-RESOLVED'"
-        "}).catch(error=>{globalThis.pocSummary=error instanceof TypeError"
-        "?'DETACHED-FETCH-REJECTED':'DETACHED-FETCH-WRONG:'+error});";
-    bool detached_fetch_ok = script_runtime_evaluate_diagnostic(
-        runtime, detached_fetch_probe, "<detached-fetch-probe>", &result);
-    for (size_t tick = 0; detached_fetch_ok && tick < 8
-         && strcmp(result.summary, "DETACHED-FETCH-REJECTED") != 0; tick++) {
-        detached_fetch_ok = script_runtime_advance(runtime, 0, 64, &result);
-    }
-    CHECK(detached_fetch_ok
-          && strcmp(result.summary, "DETACHED-FETCH-REJECTED") == 0
-          && result.async_network_active_native == 0
-          && result.async_network_pending_logical == 0);
 
     script_runtime_destroy(runtime);
     runtime = NULL;

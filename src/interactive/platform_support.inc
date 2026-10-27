@@ -1,28 +1,3 @@
-static void experimental_print_store_timing(
-    const CompressedSectionStore *store)
-{
-    printf("experimental-store-timing compression-us=%llu index-us=%llu "
-           "progress-callback-us=%llu selector-bloom-us=%llu "
-           "anchor-sort-us=%llu blocks=%zu "
-           "stored-bytes=%zu anchor-bytes=%zu index-work=%zu "
-           "index-yields=%zu index-max-slice-us=%llu "
-           "first-section-ready-us=%llu selector-index-work=%zu "
-           "selector-index-yields=%zu selector-index-max-slice-us=%llu\n",
-           (unsigned long long) store->compression_us,
-           (unsigned long long) store->index_us,
-           (unsigned long long) store->progress_callback_us,
-           (unsigned long long) store->selector_bloom_us,
-           (unsigned long long) store->anchor_sort_us,
-           store->block_count, store->stored_length,
-           store->anchor_count * sizeof(*store->anchors),
-           store->index_work_units, store->index_cooperative_yields,
-           (unsigned long long) store->index_max_slice_us,
-           (unsigned long long) store->first_section_ready_us,
-           store->selector_index_work_units,
-           store->selector_index_cooperative_yields,
-           (unsigned long long) store->selector_index_max_slice_us);
-}
-
 static bool host_platform_read_asset(void *opaque, Budget *budget,
                                      const char *path, size_t maximum_bytes,
                                      unsigned char **data, size_t *length)

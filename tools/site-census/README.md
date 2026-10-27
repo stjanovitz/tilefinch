@@ -120,7 +120,16 @@ handles, watchdog, compile cap, JS heap), `fallback` (Reader kind and
 confidence, extraction size, Basic view nodes, visible text and truncation,
 whether the page is blank), `work` (the deterministic `tilefinch-work` vector),
 `api_probe` (probe runs) and `outcome_auto` (a first-pass outcome; the report
-applies screenshot judgements on top).
+applies screenshot judgements on top). With `--focus-moves N` it adds
+`focus_issued` (moves in the command script), `timing.focus_moves` (moves
+that presented a frame), `focus_move_hashes` (each presented move's frame)
+and `focus_after_hashes` (the `frame-hash` render after each move and after
+the idle turns), both keyed by label (`focus-1`, ..., `focus-final`).
+`--focus-hashes final` skips the per-move `frame-hash` renders, which add
+1-2% to `focus_ms`; compare focus timings only between runs of one mode.
+These replaced the positional `focus_frames` list, which `compare.py` still
+reads. Move hashes come from the lab's `frame-fnv1a` field (2026-10-26),
+the same FNV-1a as `frame-hash`, so a base lab built before then has none.
 
 ## Capturing (live network)
 

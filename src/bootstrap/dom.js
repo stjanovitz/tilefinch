@@ -229,7 +229,7 @@ const __tilefinchRealmGlobal = this;
         value: owner,
       }),
     setNodeOwner = (node, owner) => {
-      if (node.__handle > 0 && !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(node)) {
+      if (node.__handle > 0) {
         // Tag 0 (253 live documents) leaves only the wrapper's record.
         const tag = nodeOwnerTag(owner);
         if (tag > 1 || (tag === 1 && nodeOwnersActive))
@@ -391,16 +391,12 @@ const __tilefinchRealmGlobal = this;
     }
   };
   const retentionStats = {
-    wrapperEvictions: 0,
     listenerDrops: 0,
     handlerDrops: 0,
     observerDrops: 0,
     recordDrops: 0,
     parserRecordsCoalesced: 0,
     recordsCoalesced: 0,
-    dirtyDrops: 0,
-    stateEvictions: 0,
-    controlDrops: 0,
     /* Wrapper churn: a wrapper built for a node whose previous wrapper the
        collector already finalized is rebuilt work. */
     wrapperCreates: 0,
@@ -469,16 +465,6 @@ const __tilefinchRealmGlobal = this;
     nodeCache.delete(Number(handle));
     return null;
   };
-  const uncacheNode = (handle, wrapper) => {
-    handle = Number(handle);
-    const entry = nodeCache.get(handle);
-    if (!entry) return 0;
-    const current =
-      weakNodeCache ? derefReference(entry) : entry.wrapper;
-    if (current !== wrapper) return 0;
-    nodeCache.delete(handle);
-    return Number(entry.lease) || 0;
-  };
   const cacheNode = (handle, wrapper) => {
     handle = Number(handle);
     /* The same WeakRef is the cache entry's and, for native getters, the
@@ -505,57 +491,15 @@ const __tilefinchRealmGlobal = this;
     wrapper.__tilefinchHandleLease = lease;
     return wrapper;
   };
-  /* Rebinding swaps the handle a wrapper has captured, which is precisely
-     the setter __handle deliberately does not expose: reaching it lets page
-     script repoint any wrapper at any node.  Brand the call with a token
-     only this module can name, the same way compat.js brands storage kinds
-     through a private WeakMap. */
-  const rebindToken = {};
-  const stableNodeWrappers = new Map(),
-    /* The longest stable key a wrapper or event state is kept under. */
-    STABLE_KEY_LIMIT = 192;
-  let stableWrapperLimit = 16;
-  __tilefinchRealmGlobal.__tilefinchBeginTraversal = () => {
-    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
-  };
-  /* Until a node has a stable key or is a section-remote stand-in, no
-     wrapper can be virtual-remote (__tilefinchIsVirtualRemote). */
-  let remoteIdentitySeen = false;
-  const noteRemoteWrapper = () => {
-    remoteIdentitySeen = true;
-    __tilefinchNoteRemoteWrapper();
-  };
-  const rememberStableWrapper = (key, wrapper) => {
-    key = String(key || "");
-    if (key) remoteIdentitySeen = true;
-    if (!key || key.length > STABLE_KEY_LIMIT) return;
-    /* The section writer can be installed after bootstrap traversal began.
-       Promote at the first actual section-aware retention point as well, so
-       a live author reference is not orphaned merely because setup order
-       left the ordinary-document limit in place. */
-    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) stableWrapperLimit = 128;
-    if (stableNodeWrappers.has(key)) stableNodeWrappers.delete(key);
-    while (stableNodeWrappers.size >= stableWrapperLimit) {
-      stableNodeWrappers.delete(stableNodeWrappers.keys().next().value);
-      retentionStats.wrapperEvictions++;
-    }
-    stableNodeWrappers.set(key, wrapper);
-  };
-  const rekeyStableWrapper = (wrapper, key) => {
-    key = String(key || "");
-    const old = String(wrapper?.__tilefinchStableKey || "");
-    if (old && stableNodeWrappers.get(old) === wrapper)
-      stableNodeWrappers.delete(old);
-    wrapper.__tilefinchStableKey = key;
-    if (key) rememberStableWrapper(key, wrapper);
-  };
   const inlineHandlerRecordToken = {},
-    stableNodeListeners = new Map(),
-    stableNodeHandlers = new Map(),
-    nativeNodeListeners = new Map(),
-    nativeNodeHandlers = new Map();
-  /* A node's event state (its listener and handler maps) is rooted in the
-     two per-handle maps above, so a connected or pinned node keeps it when
+    hasOwnProperty = Object.prototype.hasOwnProperty,
+    wrapperListeners = Symbol("wrapper listeners"),
+    /* Marks the wrapper of a native document node: parentNode answers the
+       document object for it, never that wrapper. */
+    nativeDocumentWrapper = Symbol("native document wrapper");
+  /* The event-state store. A node's event state (its listener and handler
+     maps) is rooted in two per-handle maps (nativeNodeListeners,
+     nativeNodeHandlers), so a connected or pinned node keeps it when
      its wrapper is collected, and a later wrapper finds it again. Rooting a
      detached tree's state would also keep alive every wrapper a handler
      closes over (element -> handler -> element through a global root). The
@@ -577,414 +521,400 @@ const __tilefinchRealmGlobal = this;
      pinned (state 3 below), so the state still lives as long as the node
      can receive events; a detached tree's goes to its holder as above.
 
-     A page with a remote node writer (a section-paged document) keys a
-     node's state by its stable key instead (stableNodeListeners,
-     stableNodeHandlers), so it carries over to the node a section swap
-     makes for the same key. That pair grows the same way, through the
-     same native admission; past a refused growth the node's state takes
-     the per-handle path above, so it is never dropped while the node can
-     get events, though a later node with the same key does not inherit
-     it. */
-  const wrapperEventHolder = Symbol("event holder"),
-    wrapperHandlers = Symbol("wrapper handlers"),
-    /* handle -> WeakRef of the holder keeping that node's state */
-    heldEventStates = new Map(),
-    /* On every holder: false, or the next holder in pendingHolders. */
-    holderPending = Symbol("pending release");
-  /* Holders whose release has not finished (a refused allocation stopped
-     it), chained through holderPending and kept alive from here until a
-     later release finishes them: their trees may have outlived their
-     wrappers by then. */
-  let pendingHolders = null;
-  /* Where a node's state lives, for __tilefinchNoteEventState: nowhere,
-     rooted, held, or kept on its wrapper. (Native code marks a detached
-     tree whose state could not be held STUCK: the sweep leaves it until
-     the tree changes.) */
-  const EVENT_STATE_NONE = 0,
-    EVENT_STATE_ROOTED = 1,
-    EVENT_STATE_HELD = 2,
-    EVENT_STATE_KEPT = 3;
-  /* The capacity each pair of maps shares, and the longest key its
-     targets add (a stable key is a string the map keeps alive). */
-  const nativeEventTargets = { capacity: 128, keyLength: 0 },
-    stableEventTargets = { capacity: 128, keyLength: STABLE_KEY_LIMIT };
-  /* Room for one more target in `storage`, one map of `pair`, growing the
-     pair's capacity when it is full and native code admits the growth. */
-  const eventTargetRoom = (storage, pair = nativeEventTargets) => {
-    if (storage.size < pair.capacity) return true;
-    const grown = Number(
-      __tilefinchGrowEventTargets(pair.capacity, pair.keyLength)) || 0;
-    if (grown > pair.capacity) pair.capacity = grown;
-    return storage.size < pair.capacity;
-  };
-  const heldEventHolder = (handle) => {
-    const reference = heldEventStates.get(handle);
-    return reference ? derefReference(reference) || null : null;
-  };
-  const heldEventState = (handle) =>
-    heldEventStates.size ? heldEventHolder(handle)?.get(handle) || null : null;
-  const hasOwnProperty = Object.prototype.hasOwnProperty;
-  /* The node's wrapper carries its state (kept). The state leaves a
-     wrapper as an undefined value rather than a deleted property: a
-     delete can copy a shape the wrapper shares, an allocation that may
-     fail after the state already moved. */
-  const keptOnWrapper = (wrapper) =>
-    !!wrapper && hasOwnProperty.call(wrapper, wrapperHandlers) &&
-    wrapper[wrapperHandlers] !== undefined;
-  /* The state left the node's wrapper (rooted or held): the maps it
-     shares stay, but new state must not be added to the wrapper alone. */
-  const unkeep = (handle) => {
-    const wrapper = cachedNode(handle);
-    if (keptOnWrapper(wrapper)) wrapper[wrapperHandlers] = undefined;
-  };
-  /* Puts a node's whole state on `wrapper` and has native code keep that
-     wrapper; false when the wrapper cannot carry it (a page froze it) or
-     is not the node's live wrapper. Allocates nothing when the wrapper
-     already carries it. */
-  const keepOnWrapper = (handle, wrapper, listeners, handlers) => {
-    if (!wrapper) return false;
-    const wasKept = keptOnWrapper(wrapper);
-    try {
-      if (wasKept) wrapper[wrapperHandlers] = handlers;
-      else
-        Object.defineProperty(wrapper, wrapperHandlers, {
-          value: handlers,
-          writable: true,
-          configurable: true,
-        });
-      if (listeners) wrapper[wrapperListeners] = listeners;
-    } catch {}
-    if (
-      wrapper[wrapperHandlers] !== handlers ||
-      (listeners && wrapper[wrapperListeners] !== listeners) ||
-      !__tilefinchNoteEventState(handle, EVENT_STATE_KEPT, wrapper)
-    ) {
-      if (!wasKept && keptOnWrapper(wrapper))
-        try {
-          wrapper[wrapperHandlers] = undefined;
-        } catch {}
-      return false;
-    }
-    nativeNodeListeners.delete(handle);
-    nativeNodeHandlers.delete(handle);
-    return true;
-  };
-  /* Roots `state` in the per-handle maps; past their capacity it is kept
-     on the node's live wrapper. Only a node without a usable wrapper roots
-     past the capacity (a held tree re-rooted after its own wrapper went,
-     or a frozen wrapper): the state is never dropped. The state leaves
-     where it was (a kept wrapper) only once rooted. */
-  const rootEventState = (handle, state) => {
-    const { listeners, handlers } = state;
-    if (!listeners && !handlers) {
-      __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
-      return;
-    }
-    if (
-      (!listeners || nativeNodeListeners.has(handle) ||
-        eventTargetRoom(nativeNodeListeners)) &&
-      (!handlers || nativeNodeHandlers.has(handle) ||
-        eventTargetRoom(nativeNodeHandlers))
-    ) {
+     All of it lives in the one closure below, which reaches the rest of
+     this module only through its arguments and is reached only through
+     what it returns (wrap(), rebind, the event handler and listener
+     paths, and the test census). Native code drives it through
+     __tilefinchNoteEventState, __tilefinchGrowEventTargets and the two
+     hooks it installs (js_event_state.inc). */
+  const createEventStateStore = ({
+    cachedNode, derefReference, retentionStats, nativeNodeStateCleanups,
+    wrapperListeners, hasOwnProperty,
+  }) => {
+    const nativeNodeListeners = new Map(),
+      nativeNodeHandlers = new Map();
+    const wrapperEventHolder = Symbol("event holder"),
+      wrapperHandlers = Symbol("wrapper handlers"),
+      /* handle -> WeakRef of the holder keeping that node's state */
+      heldEventStates = new Map(),
+      /* On every holder: false, or the next holder in pendingHolders. */
+      holderPending = Symbol("pending release");
+    /* Holders whose release has not finished (a refused allocation stopped
+       it), chained through holderPending and kept alive from here until a
+       later release finishes them: their trees may have outlived their
+       wrappers by then. */
+    let pendingHolders = null;
+    /* Where a node's state lives, for __tilefinchNoteEventState: nowhere,
+       rooted, held, or kept on its wrapper. (Native code marks a detached
+       tree whose state could not be held STUCK: the sweep leaves it until
+       the tree changes.) */
+    const EVENT_STATE_NONE = 0,
+      EVENT_STATE_ROOTED = 1,
+      EVENT_STATE_HELD = 2,
+      EVENT_STATE_KEPT = 3;
+    /* The capacity the pair of maps shares. */
+    const nativeEventTargets = { capacity: 128 };
+    /* Room for one more target in `storage`, one map of the pair, growing
+       the pair's capacity when it is full and native code admits the
+       growth. */
+    const eventTargetRoom = (storage) => {
+      if (storage.size < nativeEventTargets.capacity) return true;
+      const grown = Number(
+        __tilefinchGrowEventTargets(nativeEventTargets.capacity)) || 0;
+      if (grown > nativeEventTargets.capacity)
+        nativeEventTargets.capacity = grown;
+      return storage.size < nativeEventTargets.capacity;
+    };
+    const heldEventHolder = (handle) => {
+      const reference = heldEventStates.get(handle);
+      return reference ? derefReference(reference) || null : null;
+    };
+    const heldEventState = (handle) =>
+      heldEventStates.size ? heldEventHolder(handle)?.get(handle) || null : null;
+    /* The node's wrapper carries its state (kept). The state leaves a
+       wrapper as an undefined value rather than a deleted property: a
+       delete can copy a shape the wrapper shares, an allocation that may
+       fail after the state already moved. */
+    const keptOnWrapper = (wrapper) =>
+      !!wrapper && hasOwnProperty.call(wrapper, wrapperHandlers) &&
+      wrapper[wrapperHandlers] !== undefined;
+    /* The state left the node's wrapper (rooted or held): the maps it
+       shares stay, but new state must not be added to the wrapper alone. */
+    const unkeep = (handle) => {
+      const wrapper = cachedNode(handle);
+      if (keptOnWrapper(wrapper)) wrapper[wrapperHandlers] = undefined;
+    };
+    /* Puts a node's whole state on `wrapper` and has native code keep that
+       wrapper; false when the wrapper cannot carry it (a page froze it) or
+       is not the node's live wrapper. Allocates nothing when the wrapper
+       already carries it. */
+    const keepOnWrapper = (handle, wrapper, listeners, handlers) => {
+      if (!wrapper) return false;
+      const wasKept = keptOnWrapper(wrapper);
+      try {
+        if (wasKept) wrapper[wrapperHandlers] = handlers;
+        else
+          Object.defineProperty(wrapper, wrapperHandlers, {
+            value: handlers,
+            writable: true,
+            configurable: true,
+          });
+        if (listeners) wrapper[wrapperListeners] = listeners;
+      } catch {}
+      if (
+        wrapper[wrapperHandlers] !== handlers ||
+        (listeners && wrapper[wrapperListeners] !== listeners) ||
+        !__tilefinchNoteEventState(handle, EVENT_STATE_KEPT, wrapper)
+      ) {
+        if (!wasKept && keptOnWrapper(wrapper))
+          try {
+            wrapper[wrapperHandlers] = undefined;
+          } catch {}
+        return false;
+      }
+      nativeNodeListeners.delete(handle);
+      nativeNodeHandlers.delete(handle);
+      return true;
+    };
+    /* Roots `state` in the per-handle maps; past their capacity it is kept
+       on the node's live wrapper. Only a node without a usable wrapper roots
+       past the capacity (a held tree re-rooted after its own wrapper went,
+       or a frozen wrapper): the state is never dropped. The state leaves
+       where it was (a kept wrapper) only once rooted. */
+    const rootEventState = (handle, state) => {
+      const { listeners, handlers } = state;
+      if (!listeners && !handlers) {
+        __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
+        return;
+      }
+      if (
+        (!listeners || nativeNodeListeners.has(handle) ||
+          eventTargetRoom(nativeNodeListeners)) &&
+        (!handlers || nativeNodeHandlers.has(handle) ||
+          eventTargetRoom(nativeNodeHandlers))
+      ) {
+        if (listeners) nativeNodeListeners.set(handle, listeners);
+        if (handlers) nativeNodeHandlers.set(handle, handlers);
+        unkeep(handle);
+        __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
+        return;
+      }
+      if (keepOnWrapper(handle, cachedNode(handle), listeners, handlers))
+        return;
       if (listeners) nativeNodeListeners.set(handle, listeners);
       if (handlers) nativeNodeHandlers.set(handle, handlers);
       unkeep(handle);
       __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
-      return;
-    }
-    if (keepOnWrapper(handle, cachedNode(handle), listeners, handlers))
-      return;
-    if (listeners) nativeNodeListeners.set(handle, listeners);
-    if (handlers) nativeNodeHandlers.set(handle, handlers);
-    unkeep(handle);
-    __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
-  };
-  /* Roots again each entry of `holder`. An entry leaves the holder only
-     once rooted, so one a refused allocation stopped stays held (the
-     caller keeps the holder in pendingHolders). */
-  const releaseEventHolder = (holder) => {
-    if (!holder?.size) return;
-    for (const [handle, state] of holder) {
-      rootEventState(handle, state);
-      heldEventStates.delete(handle);
-      holder.delete(handle);
-    }
-  };
-  /* Queues `holder` for release; allocates nothing. */
-  const pendEventHolder = (holder) => {
-    if (!holder?.size || holder[holderPending] !== false) return;
-    holder[holderPending] = pendingHolders;
-    pendingHolders = holder;
-  };
-  /* Releases the queued holders; one a refused allocation stopped stays
-     queued, with those after it. */
-  const releasePendingHolders = () => {
-    while (pendingHolders !== null) {
-      const holder = pendingHolders;
-      releaseEventHolder(holder);
-      pendingHolders = holder[holderPending];
-      holder[holderPending] = false;
-    }
-  };
-  /* Drops the heldEventStates keys a failed hold added for `reference`. */
-  const unstageEventHold = (records, reference) => {
-    for (let i = 0; i < records.length; i++) {
-      const handle = Number(records[i]);
-      if (heldEventStates.get(handle) === reference)
+    };
+    /* Roots again each entry of `holder`. An entry leaves the holder only
+       once rooted, so one a refused allocation stopped stays held (the
+       caller keeps the holder in pendingHolders). */
+    const releaseEventHolder = (holder) => {
+      if (!holder?.size) return;
+      for (const [handle, state] of holder) {
+        rootEventState(handle, state);
         heldEventStates.delete(handle);
-    }
-  };
-  /* Native: `records` are the handles in one detached tree with event
-     state, `wrappers` those of its live wrappers. False when a wrapper
-     refused the holder: a wrapper the page made non-extensible cannot keep
-     the tree's state, which then stays where it was, and native code
-     leaves the tree to the sweep until it changes. No wrapper keeps a
-     refused holder: a later release would root its entries again, a node
-     retired since among them.
+        holder.delete(handle);
+      }
+    };
+    /* Queues `holder` for release; allocates nothing. */
+    const pendEventHolder = (holder) => {
+      if (!holder?.size || holder[holderPending] !== false) return;
+      holder[holderPending] = pendingHolders;
+      pendingHolders = holder;
+    };
+    /* Releases the queued holders; one a refused allocation stopped stays
+       queued, with those after it. */
+    const releasePendingHolders = () => {
+      while (pendingHolders !== null) {
+        const holder = pendingHolders;
+        releaseEventHolder(holder);
+        pendingHolders = holder[holderPending];
+        holder[holderPending] = false;
+      }
+    };
+    /* Drops the heldEventStates keys a failed hold added for `reference`. */
+    const unstageEventHold = (records, reference) => {
+      for (let i = 0; i < records.length; i++) {
+        const handle = Number(records[i]);
+        if (heldEventStates.get(handle) === reference)
+          heldEventStates.delete(handle);
+      }
+    };
+    /* Native: `records` are the handles in one detached tree with event
+       state, `wrappers` those of its live wrappers. False when a wrapper
+       refused the holder: a wrapper the page made non-extensible cannot keep
+       the tree's state, which then stays where it was, and native code
+       leaves the tree to the sweep until it changes. No wrapper keeps a
+       refused holder: a later release would root its entries again, a node
+       retired since among them.
 
-     Everything that allocates comes first: the holder with its entries,
-     its WeakRef, the stamp property on every wrapper, and the
-     heldEventStates keys it adds. Only then does the state leave its old
-     places (the per-handle maps, a kept wrapper, an earlier holder), in
-     steps that allocate nothing. A refused allocation (the realm's heap
-     is full) throws before any state moved, and native code retries the
-     tree later. */
-  __tilefinchRealmGlobal.__tilefinchHoldEventState = (records, wrappers) => {
-    const holder = new Map();
-    holder[holderPending] = false;
-    for (let i = 0; i < records.length; i++) {
-      const handle = Number(records[i]),
-        state = heldEventHolder(handle)?.get(handle),
-        kept = cachedNode(handle),
-        own = keptOnWrapper(kept),
-        listeners = nativeNodeListeners.get(handle) || state?.listeners ||
-          (own ? kept[wrapperListeners] : null) || null,
-        handlers = nativeNodeHandlers.get(handle) || state?.handlers ||
-          (own ? kept[wrapperHandlers] : null) || null;
-      if (listeners || handlers) holder.set(handle, { listeners, handlers });
-    }
-    const reference = holder.size ? new WeakRef(holder) : null;
-    if (reference) {
-      /* The wrappers and what each carried before. A wrapper without the
-         stamp property gets it (undefined, as good as none) now, so that
-         stamping it allocates nothing. */
-      const stamped = [];
+       Everything that allocates comes first: the holder with its entries,
+       its WeakRef, the stamp property on every wrapper, and the
+       heldEventStates keys it adds. Only then does the state leave its old
+       places (the per-handle maps, a kept wrapper, an earlier holder), in
+       steps that allocate nothing. A refused allocation (the realm's heap
+       is full) throws before any state moved, and native code retries the
+       tree later. */
+    __tilefinchRealmGlobal.__tilefinchHoldEventState = (records, wrappers) => {
+      const holder = new Map();
+      holder[holderPending] = false;
+      for (let i = 0; i < records.length; i++) {
+        const handle = Number(records[i]),
+          state = heldEventHolder(handle)?.get(handle),
+          kept = cachedNode(handle),
+          own = keptOnWrapper(kept),
+          listeners = nativeNodeListeners.get(handle) || state?.listeners ||
+            (own ? kept[wrapperListeners] : null) || null,
+          handlers = nativeNodeHandlers.get(handle) || state?.handlers ||
+            (own ? kept[wrapperHandlers] : null) || null;
+        if (listeners || handlers) holder.set(handle, { listeners, handlers });
+      }
+      const reference = holder.size ? new WeakRef(holder) : null;
+      if (reference) {
+        /* The wrappers and what each carried before. A wrapper without the
+           stamp property gets it (undefined, as good as none) now, so that
+           stamping it allocates nothing. */
+        const stamped = [];
+        for (let i = 0; i < wrappers.length; i++) {
+          const wrapper = cachedNode(wrappers[i]);
+          if (!wrapper) continue;
+          if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) {
+            try {
+              wrapper[wrapperEventHolder] = undefined;
+            } catch (error) {
+              if (Object.isExtensible(wrapper)) throw error;
+            }
+            if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) return false;
+          }
+          stamped.push(wrapper, wrapper[wrapperEventHolder]);
+        }
+        try {
+          for (let i = 0; i < records.length; i++) {
+            const handle = Number(records[i]);
+            if (holder.has(handle) && !heldEventStates.has(handle))
+              heldEventStates.set(handle, reference);
+          }
+        } catch (error) {
+          unstageEventHold(records, reference);
+          throw error;
+        }
+        for (let j = 0; j < stamped.length; j += 2) {
+          const wrapper = stamped[j];
+          try {
+            wrapper[wrapperEventHolder] = holder;
+          } catch {}
+          if (wrapper[wrapperEventHolder] !== holder) {
+            for (let k = 0; k < j; k += 2)
+              stamped[k][wrapperEventHolder] = stamped[k + 1];
+            unstageEventHold(records, reference);
+            return false;
+          }
+        }
+      }
+      /* From here nothing allocates. */
+      for (let i = 0; i < records.length; i++) {
+        const handle = Number(records[i]),
+          previous = heldEventHolder(handle),
+          kept = cachedNode(handle);
+        if (previous !== holder) previous?.delete(handle);
+        nativeNodeListeners.delete(handle);
+        nativeNodeHandlers.delete(handle);
+        if (keptOnWrapper(kept)) kept[wrapperHandlers] = undefined;
+        if (holder.has(handle)) {
+          heldEventStates.set(handle, reference);
+          __tilefinchNoteEventState(handle, EVENT_STATE_HELD);
+        } else {
+          heldEventStates.delete(handle);
+          __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
+        }
+      }
+      return true;
+    };
+    /* The moving subtree's wrappers join `holder`, that of the tree they
+       move into, when the held state moving with them is already its own
+       and no wrapper keeps another holder or refuses this one. */
+    const joinEventHolder = (holder, handles, wrappers) => {
+      for (let i = 1; i < handles.length; i++)
+        if (heldEventHolder(Number(handles[i])) !== holder) return false;
       for (let i = 0; i < wrappers.length; i++) {
         const wrapper = cachedNode(wrappers[i]);
-        if (!wrapper) continue;
-        if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) {
-          try {
-            wrapper[wrapperEventHolder] = undefined;
-          } catch (error) {
-            if (Object.isExtensible(wrapper)) throw error;
-          }
-          if (!hasOwnProperty.call(wrapper, wrapperEventHolder)) return false;
-        }
-        stamped.push(wrapper, wrapper[wrapperEventHolder]);
-      }
-      try {
-        for (let i = 0; i < records.length; i++) {
-          const handle = Number(records[i]);
-          if (holder.has(handle) && !heldEventStates.has(handle))
-            heldEventStates.set(handle, reference);
-        }
-      } catch (error) {
-        unstageEventHold(records, reference);
-        throw error;
-      }
-      for (let j = 0; j < stamped.length; j += 2) {
-        const wrapper = stamped[j];
+        if (!wrapper || wrapper[wrapperEventHolder] === holder) continue;
+        if (wrapper[wrapperEventHolder]?.size) return false;
         try {
           wrapper[wrapperEventHolder] = holder;
         } catch {}
-        if (wrapper[wrapperEventHolder] !== holder) {
-          for (let k = 0; k < j; k += 2)
-            stamped[k][wrapperEventHolder] = stamped[k + 1];
-          unstageEventHold(records, reference);
-          return false;
-        }
+        if (wrapper[wrapperEventHolder] !== holder) return false;
       }
-    }
-    /* From here nothing allocates. */
-    for (let i = 0; i < records.length; i++) {
-      const handle = Number(records[i]),
-        previous = heldEventHolder(handle),
-        kept = cachedNode(handle);
-      if (previous !== holder) previous?.delete(handle);
+      return true;
+    };
+    /* Native: roots again the held state of each handle and that of its
+       live wrapper's tree. For an insertion, `handles` are the parent's
+       handle and then the held handles moving, and `wrappers`, when given,
+       the moving subtree's live wrappers, which join the parent tree's
+       holder instead when they can. True when the first handle's tree had a
+       holder.
+
+       The holders are queued first, which allocates nothing, and leave the
+       queue only once all their state is rooted: a release a refused
+       allocation stopped throws, and the queue keeps the rest alive until a
+       later release (native code retries one with `handles` 0) finishes
+       it. `handles` may be one handle as a number: native code could not
+       make the list. */
+    __tilefinchRealmGlobal.__tilefinchReleaseEventHolders = (handles, wrappers) => {
+      if (typeof handles === "number") {
+        if (handles) {
+          pendEventHolder(heldEventHolder(handles));
+          pendEventHolder(cachedNode(handles)?.[wrapperEventHolder]);
+        }
+        releasePendingHolders();
+        return false;
+      }
+      const first = Number(handles[0]) || 0,
+        holder = first
+          ? heldEventHolder(first) || cachedNode(first)?.[wrapperEventHolder]
+          : null,
+        held = !!holder?.size;
+      if (!wrappers || !held || !joinEventHolder(holder, handles, wrappers))
+        for (let i = 0; i < handles.length; i++) {
+          const handle = Number(handles[i]);
+          if (!handle) continue;
+          pendEventHolder(heldEventHolder(handle));
+          pendEventHolder(cachedNode(handle)?.[wrapperEventHolder]);
+        }
+      releasePendingHolders();
+      return held;
+    };
+    nativeNodeStateCleanups.push((handle) => {
       nativeNodeListeners.delete(handle);
       nativeNodeHandlers.delete(handle);
-      if (keptOnWrapper(kept)) kept[wrapperHandlers] = undefined;
-      if (holder.has(handle)) {
-        heldEventStates.set(handle, reference);
-        __tilefinchNoteEventState(handle, EVENT_STATE_HELD);
-      } else {
+      if (heldEventStates.size) {
+        heldEventHolder(handle)?.delete(handle);
         heldEventStates.delete(handle);
-        __tilefinchNoteEventState(handle, EVENT_STATE_NONE);
       }
-    }
-    return true;
-  };
-  /* The moving subtree's wrappers join `holder`, that of the tree they
-     move into, when the held state moving with them is already its own
-     and no wrapper keeps another holder or refuses this one. */
-  const joinEventHolder = (holder, handles, wrappers) => {
-    for (let i = 1; i < handles.length; i++)
-      if (heldEventHolder(Number(handles[i])) !== holder) return false;
-    for (let i = 0; i < wrappers.length; i++) {
-      const wrapper = cachedNode(wrappers[i]);
-      if (!wrapper || wrapper[wrapperEventHolder] === holder) continue;
-      if (wrapper[wrapperEventHolder]?.size) return false;
-      try {
-        wrapper[wrapperEventHolder] = holder;
-      } catch {}
-      if (wrapper[wrapperEventHolder] !== holder) return false;
-    }
-    return true;
-  };
-  /* Native: roots again the held state of each handle and that of its
-     live wrapper's tree. For an insertion, `handles` are the parent's
-     handle and then the held handles moving, and `wrappers`, when given,
-     the moving subtree's live wrappers, which join the parent tree's
-     holder instead when they can. True when the first handle's tree had a
-     holder.
-
-     The holders are queued first, which allocates nothing, and leave the
-     queue only once all their state is rooted: a release a refused
-     allocation stopped throws, and the queue keeps the rest alive until a
-     later release (native code retries one with `handles` 0) finishes
-     it. `handles` may be one handle as a number: native code could not
-     make the list. */
-  __tilefinchRealmGlobal.__tilefinchReleaseEventHolders = (handles, wrappers) => {
-    if (typeof handles === "number") {
-      if (handles) {
-        pendEventHolder(heldEventHolder(handles));
-        pendEventHolder(cachedNode(handles)?.[wrapperEventHolder]);
-      }
-      releasePendingHolders();
-      return false;
-    }
-    const first = Number(handles[0]) || 0,
-      holder = first
-        ? heldEventHolder(first) || cachedNode(first)?.[wrapperEventHolder]
-        : null,
-      held = !!holder?.size;
-    if (!wrappers || !held || !joinEventHolder(holder, handles, wrappers))
-      for (let i = 0; i < handles.length; i++) {
-        const handle = Number(handles[i]);
-        if (!handle) continue;
-        pendEventHolder(heldEventHolder(handle));
-        pendEventHolder(cachedNode(handle)?.[wrapperEventHolder]);
-      }
-    releasePendingHolders();
-    return held;
-  };
-  nativeNodeStateCleanups.push((handle) => {
-    nativeNodeListeners.delete(handle);
-    nativeNodeHandlers.delete(handle);
-    if (heldEventStates.size) {
-      heldEventHolder(handle)?.delete(handle);
-      heldEventStates.delete(handle);
-    }
-  });
-  /* The stable-key map of `key` in `storage`, made when `create` and the
-     pair has room; null otherwise, when the caller takes the per-handle
-     path. */
-  const stableStateMap = (storage, key, create, refusalCounter) => {
-    key = String(key || "");
-    if (!key || key.length > STABLE_KEY_LIMIT) return null;
-    let map = storage.get(key);
-    if (!map && create) {
-      if (eventTargetRoom(storage, stableEventTargets)) {
-        map = new Map();
-        storage.set(key, map);
-      } else retentionStats[refusalCounter]++;
-    }
-    return map || null;
-  };
-  const nativeNodeMap = (storage, field, node, create, dropCounter) => {
-    const handle = Number(node?.__handle) || 0;
-    if (!handle) return null;
-    let map = storage.get(handle);
-    if (map) return map;
-    const held = heldEventState(handle);
-    if (held?.[field]) return held[field];
-    if (!create) return null;
-    if (held) return (held[field] = new Map());
-    /* A node whose state its wrapper carries keeps it all there. */
-    if (keptOnWrapper(node)) return null;
-    if (!eventTargetRoom(storage)) {
-      retentionStats[dropCounter]++;
-      if (
-        keepOnWrapper(
-          handle,
-          node,
-          nativeNodeListeners.get(handle) || node[wrapperListeners] || null,
-          nativeNodeHandlers.get(handle) || null,
+    });
+    const nativeNodeMap = (storage, field, node, create, dropCounter) => {
+      const handle = Number(node?.__handle) || 0;
+      if (!handle) return null;
+      let map = storage.get(handle);
+      if (map) return map;
+      const held = heldEventState(handle);
+      if (held?.[field]) return held[field];
+      if (!create) return null;
+      if (held) return (held[field] = new Map());
+      /* A node whose state its wrapper carries keeps it all there. */
+      if (keptOnWrapper(node)) return null;
+      if (!eventTargetRoom(storage)) {
+        retentionStats[dropCounter]++;
+        if (
+          keepOnWrapper(
+            handle,
+            node,
+            nativeNodeListeners.get(handle) || node[wrapperListeners] || null,
+            nativeNodeHandlers.get(handle) || null,
+          )
         )
-      )
-        return null;
-    }
-    map = new Map();
-    storage.set(handle, map);
-    __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
-    return map;
-  };
-  const listenerMap = (node, create = false) => {
-    const stable =
-      (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter ||
-        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(node)) &&
-      stableStateMap(stableNodeListeners, node?.__tilefinchStableKey, create,
-        "listenerDrops");
-    return (
-      stable ||
+          return null;
+      }
+      map = new Map();
+      storage.set(handle, map);
+      __tilefinchNoteEventState(handle, EVENT_STATE_ROOTED);
+      return map;
+    };
+    const listenerMap = (node, create = false) =>
       nativeNodeMap(
         nativeNodeListeners,
         "listeners",
         node,
         create,
         "listenerDrops",
-      )
-    );
+      );
+    const eventHandlerMap = (node, create = false) => {
+        const native = nativeNodeMap(
+          nativeNodeHandlers,
+          "handlers",
+          node,
+          create,
+          "handlerDrops",
+        );
+        if (native) return native;
+        /* A kept node's handlers, or those of a node without a native handle:
+           owned by the wrapper alone, so a handler closing over its element
+           is an ordinary collectable cycle. */
+        let map = node?.[wrapperHandlers] || null;
+        if (!map && create && node) {
+          map = new Map();
+          try {
+            if (Object.prototype.hasOwnProperty.call(node, wrapperHandlers))
+              node[wrapperHandlers] = map;
+            else
+              Object.defineProperty(node, wrapperHandlers, {
+                value: map,
+                writable: true,
+                configurable: true,
+              });
+          } catch {}
+          if (node[wrapperHandlers] !== map) return null;
+        }
+        return map;
+    };
+    return {
+      nativeNodeListeners, nativeNodeHandlers, wrapperEventHolder,
+      wrapperHandlers, heldEventStates, nativeEventTargets, heldEventHolder,
+      heldEventState, keptOnWrapper, keepOnWrapper, rootEventState,
+      listenerMap, eventHandlerMap,
+    };
   };
+  const {
+    nativeNodeListeners, nativeNodeHandlers, wrapperEventHolder,
+    wrapperHandlers, heldEventStates, nativeEventTargets, heldEventHolder,
+    heldEventState, keptOnWrapper, keepOnWrapper, rootEventState,
+    listenerMap, eventHandlerMap,
+  } = createEventStateStore({
+    cachedNode, derefReference, retentionStats, nativeNodeStateCleanups,
+    wrapperListeners, hasOwnProperty,
+  });
   const propertyHandlerRecordToken = {},
-    eventHandlerMap = (node, create = false) => {
-    if (
-      node?.__tilefinchStableKey &&
-      (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter ||
-        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(node))
-    ) {
-      const map = stableStateMap(stableNodeHandlers,
-        node.__tilefinchStableKey, create, "handlerDrops");
-      if (map) return map;
-    }
-    const native = nativeNodeMap(
-      nativeNodeHandlers,
-      "handlers",
-      node,
-      create,
-      "handlerDrops",
-    );
-    if (native) return native;
-    /* A kept node's handlers, or those of a node without a native handle:
-       owned by the wrapper alone, so a handler closing over its element
-       is an ordinary collectable cycle. */
-    let map = node?.[wrapperHandlers] || null;
-    if (!map && create && node) {
-      map = new Map();
-      try {
-        if (Object.prototype.hasOwnProperty.call(node, wrapperHandlers))
-          node[wrapperHandlers] = map;
-        else
-          Object.defineProperty(node, wrapperHandlers, {
-            value: map,
-            writable: true,
-            configurable: true,
-          });
-      } catch {}
-      if (node[wrapperHandlers] !== map) return null;
-    }
-    return map;
-  },
     installEventHandler = (
       node, type, callback, token = propertyHandlerRecordToken,
     ) => {
@@ -1063,86 +993,6 @@ const __tilefinchRealmGlobal = this;
       if (type.startsWith("mouse") || type.startsWith("pointer"))
         __tilefinchRealmGlobal.__tilefinchPointerMarkupChanged?.();
     };
-  const remoteNodeMutations = new Map(),
-    remoteMutationLimit = 32;
-  const remoteMutationState = (node, create = false) => {
-    const key = String(node?.__tilefinchStableKey || "");
-    if (!key) return null;
-    let state = remoteNodeMutations.get(key);
-    if (!state && create) {
-      while (remoteNodeMutations.size >= remoteMutationLimit) {
-        remoteNodeMutations.delete(remoteNodeMutations.keys().next().value);
-        retentionStats.stateEvictions++;
-      }
-      state = { contentMode: "", contentValue: "", attributes: new Map() };
-      remoteNodeMutations.set(key, state);
-    }
-    return state || null;
-  };
-  const rememberRemoteContent = (node, mode, value) => {
-    const state = remoteMutationState(node, true);
-    if (state) {
-      state.contentMode = String(mode);
-      state.contentValue = String(value);
-    }
-  };
-  const rememberRemoteAttribute = (node, name, value) => {
-    const state = remoteMutationState(node, true);
-    if (state)
-      state.attributes.set(
-        String(name).toLowerCase(),
-        value === null ? null : String(value),
-      );
-  };
-  const applyRemoteMutation = (node, handle) => {
-    const state = remoteMutationState(node, false);
-    if (!state) return;
-    if (state.contentMode === "text")
-      __tilefinchSetText(handle, state.contentValue);
-    else if (state.contentMode === "html")
-      __tilefinchSetInnerHTML(
-        String(node.tagName).toLowerCase() === "template"
-          ? __tilefinchContent(handle)
-          : handle,
-        state.contentValue,
-      );
-    for (const [name, value] of state.attributes)
-      value === null
-        ? __tilefinchRemoveAttribute(handle, name)
-        : __tilefinchSetAttribute(handle, name, value);
-  };
-  const mergeRemoteAttributes = (node, values) => {
-    const merged = values.map((attribute) => ({
-        name: String(attribute.name),
-        value: String(attribute.value),
-      })),
-      state = remoteMutationState(node, false);
-    if (!state) return merged;
-    for (const [name, value] of state.attributes) {
-      const at = merged.findIndex(
-        (attribute) => attribute.name.toLowerCase() === name,
-      );
-      if (value === null) {
-        if (at >= 0) merged.splice(at, 1);
-      } else if (at >= 0) merged[at].value = value;
-      else if (merged.length < 64) merged.push({ name, value });
-    }
-    return merged;
-  };
-  __tilefinchRealmGlobal.__tilefinchIsVirtualRemote = (node) =>
-    remoteIdentitySeen &&
-    (!!node?.__tilefinchRemote ||
-      (!!node?.__tilefinchStableKey &&
-        Number.isInteger(Number(node.__tilefinchRemoteSection)) &&
-        Number(node.__tilefinchRemoteSection) !==
-          Number(__tilefinchSectionIdentity())));
-  const canReadRemoteRelation = (node) =>
-    __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-    !!node?.__tilefinchStableKey &&
-    !String(node.__tilefinchStableKey).startsWith("d:") &&
-    !node.__tilefinchProgrammatic &&
-    (!!node.__tilefinchRemote ||
-      (!!node.__handle && __tilefinchIsConnected(node.__handle)));
   __tilefinchRealmGlobal.__tilefinchCanonicalElement = (node) => {
     const tag = String(node?.tagName || "").toLowerCase();
     return tag === "html"
@@ -2192,8 +2042,7 @@ const __tilefinchRealmGlobal = this;
       return nodeList(output);
     },
     shadowAdjustedSibling = (node, related, relation) => {
-      if (!related || __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(node))
-        return related || null;
+      if (!related) return null;
       return related instanceof ShadowRoot
         ? wrap(__tilefinchRelation(related.__handle, relation))
         : related;
@@ -2648,7 +2497,6 @@ const __tilefinchRealmGlobal = this;
       if (!(other instanceof Node)) throw new TypeError("Node required");
       if (this === other) return 0;
       if (typeof nativeComparePosition === "function"
-          && !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
           && !shadowRootCreated
           && !this.__tilefinchDetachedParent && !other.__tilefinchDetachedParent
           && this.__handle > 0 && other.__handle > 0) {
@@ -3372,14 +3220,7 @@ const __tilefinchRealmGlobal = this;
             __tilefinchRealmGlobal.__tilefinchCustomElementIsDefined?.(this) ?? true;
           return compact === ":defined" ? defined : !defined;
         }
-        return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(this)
-          ? __tilefinchRemoteNodeRead(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              4,
-              selector,
-            ) === "1"
-          : __tilefinchMatches(this.__handle, selector);
+        return __tilefinchMatches(this.__handle, selector);
       },
       writable: true,
       configurable: true,
@@ -4429,10 +4270,8 @@ const __tilefinchRealmGlobal = this;
       const parent = this.parentElement;
       if (
         parent &&
-        !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
         !parent.__tilefinchDetachedParent &&
         Number(parent.__handle) > 0 &&
-        !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(parent) &&
         Number(__tilefinchClosest(parent.__handle, "fieldset[disabled]")) === 0
       )
         return false;
@@ -4615,8 +4454,7 @@ const __tilefinchRealmGlobal = this;
       if (known) return known;
       if (
         !nodeOwnersActive ||
-        !(this.__handle > 0) ||
-        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
+        !(this.__handle > 0)
       )
         return document;
       const tag = __tilefinchNodeOwner(this.__handle),
@@ -4776,14 +4614,7 @@ const __tilefinchRealmGlobal = this;
       }
       return __tilefinchRealmGlobal.__tilefinchElementMatches
         ? __tilefinchRealmGlobal.__tilefinchElementMatches(this, selector)
-        : __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-          ? __tilefinchRemoteNodeRead(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              4,
-              selector,
-            ) === "1"
-          : __tilefinchMatches(this.__handle, selector);
+        : __tilefinchMatches(this.__handle, selector);
     },
     closest(selector) {
       return __tilefinchRealmGlobal.__tilefinchElementClosest
@@ -5010,12 +4841,11 @@ const __tilefinchRealmGlobal = this;
       /* Dataset reads use the null namespace. For ordinary native HTML
          attributes the host is authoritative: do not construct the entire
          NamedNodeMap/Attr graph just to read one value. Keep case-sensitive,
-         qualified, mirrored and remote lookups on the namespace-aware path. */
+         qualified and mirrored lookups on the namespace-aware path. */
       if (namespace === null && name === name.toLowerCase() &&
           !name.includes(":") && Number(this.__handle) > 0 &&
           this.namespaceURI === "http://www.w3.org/1999/xhtml" &&
-          !namespacedAttributes.get(this)?.length &&
-          !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
+          !namespacedAttributes.get(this)?.length)
         return __tilefinchGetAttribute(this.__handle, name);
       const found = [...this.attributes].find(
         (attribute) =>
@@ -5242,11 +5072,10 @@ const __tilefinchRealmGlobal = this;
       const retainedWidth = Number(g.width) || 0,
         retainedHeight = Number(g.height) || 0,
         parentElement = this.parentElement,
-        /* A retained box at (0, 0) is a valid authoritative position,
-           especially for the first node in a materialized section. Only
+        /* A retained box at (0, 0) is a valid authoritative position. Only
            synthesize flow when the native layout supplied no dimensions;
-           otherwise a previous remote sibling can shift a correct box by
-           its own height. */
+           otherwise a previous sibling can shift a correct box by its own
+           height. */
         needsFlowFallback =
           retainedWidth <= 0 && retainedHeight <= 0,
         positionedContainingElement =
@@ -5848,22 +5677,10 @@ const __tilefinchRealmGlobal = this;
     },
     __tilefinchGeometryValue() {
       const nativeReceiver = this;
-      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-        ? __tilefinchRemoteNodeGeometry(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-          )
-        : __tilefinchGeometry(nativeReceiver.__handle);
+      return __tilefinchGeometry(nativeReceiver.__handle);
     },
     get textContent() {
       const nativeReceiver = this;
-      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
-        return __tilefinchRemoteNodeRead(
-          this.__tilefinchStableKey,
-          this.__tilefinchRemoteSection,
-          0,
-          "",
-        );
       if (shadowRootForHost(this))
         return shadowLightChildren(this)
           .map((child) => child.textContent ?? "")
@@ -5880,33 +5697,8 @@ const __tilefinchRealmGlobal = this;
           type === Node.PROCESSING_INSTRUCTION_NODE ||
           type === Node.COMMENT_NODE,
         oldValue = character ? this.textContent : null,
-        removedNodes = character ? [] : mutationChildSnapshot(this),
-        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        /* Only a remote node writer mirrors root writes; check it before
-           resolving document.body, which is a bridge call and a wrap. */
-        rootKey =
-          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-          !__tilefinchRealmGlobal.__tilefinchRestoringSection
-            ? this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : ""
-            : "",
-        root = !!rootKey;
-      if (remote || root)
-        __tilefinchRemoteNodeWrite(
-          root ? rootKey : this.__tilefinchStableKey,
-          root
-            ? Number(__tilefinchSectionIdentity())
-            : this.__tilefinchRemoteSection,
-          0,
-          value,
-        );
-      let result = false;
-      if (shadowRootForHost(this) && !character && !remote) {
+        removedNodes = character ? [] : mutationChildSnapshot(this);
+      if (shadowRootForHost(this) && !character) {
         __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
           (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         dynamicPreparationSuppressed++;
@@ -5915,16 +5707,13 @@ const __tilefinchRealmGlobal = this;
             this.removeChild(child);
           if (value)
             this.appendChild(document.createTextNode(value));
-          result = true;
         } finally {
           dynamicPreparationSuppressed--;
           __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
       } else {
-        result = __tilefinchSetText(nativeReceiver.__handle, value);
+        __tilefinchSetText(nativeReceiver.__handle, value);
       }
-      if ((result || remote) && remote)
-        rememberRemoteContent(this, "text", value);
       if (character)
         __tilefinchRealmGlobal.__tilefinchNotifyMutation?.(
           this,
@@ -5945,13 +5734,6 @@ const __tilefinchRealmGlobal = this;
     },
     get innerHTML() {
       const nativeReceiver = this;
-      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
-        return __tilefinchRemoteNodeRead(
-          this.__tilefinchStableKey,
-          this.__tilefinchRemoteSection,
-          1,
-          "",
-        );
       const shadow = shadowRootForHost(this);
       if (
         shadow &&
@@ -5986,37 +5768,12 @@ const __tilefinchRealmGlobal = this;
         removedNodes = customLifecycle
           ? Array.from(this.childNodes).slice(0, 256)
           : mutationChildSnapshot(this),
-        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        /* Only a remote node writer mirrors root writes; check it before
-           resolving document.body, which is a bridge call and a wrap. */
-        rootKey =
-          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-          !__tilefinchRealmGlobal.__tilefinchRestoringSection
-            ? this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : ""
-            : "",
-        root = !!rootKey,
         target =
           String(this.tagName).toLowerCase() === "template"
             ? __tilefinchContent(nativeReceiver.__handle)
             : nativeReceiver.__handle;
       let shadowMutation = false;
-      if (remote || root)
-        __tilefinchRemoteNodeWrite(
-          root ? rootKey : this.__tilefinchStableKey,
-          root
-            ? Number(__tilefinchSectionIdentity())
-            : this.__tilefinchRemoteSection,
-          1,
-          value,
-        );
       if (
-        !remote &&
         shadow &&
         String(this.tagName).toLowerCase() !== "template"
       ) {
@@ -6040,12 +5797,8 @@ const __tilefinchRealmGlobal = this;
           __tilefinchRealmGlobal.__tilefinchMutationSuppressed--;
         }
         shadowMutation = true;
-      } else if (!remote && !__tilefinchSetInnerHTML(target, value)) {
+      } else if (!__tilefinchSetInnerHTML(target, value)) {
         throw new Error("innerHTML mutation failed");
-      }
-      if (remote) {
-        __tilefinchSetInnerHTML(target, value);
-        rememberRemoteContent(this, "html", value);
       }
       const addedNodes = customLifecycle
         ? Array.from(this.childNodes).slice(0, 256)
@@ -6070,15 +5823,11 @@ const __tilefinchRealmGlobal = this;
     },
     get tagName() {
       const nativeReceiver = this;
-      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-        ? this.__tilefinchRemoteTagName
-        : __tilefinchTagName(nativeReceiver.__handle) || "";
+      return __tilefinchTagName(nativeReceiver.__handle) || "";
     },
     get nodeType() {
       const nativeReceiver = this;
-      return __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-        ? this.__tilefinchRemoteNodeType
-        : __tilefinchNodeType(nativeReceiver.__handle);
+      return __tilefinchNodeType(nativeReceiver.__handle);
     },
     get parentElement() {
       const nativeReceiver = this;
@@ -6086,13 +5835,7 @@ const __tilefinchRealmGlobal = this;
         return this.__tilefinchDetachedParent.nodeType === Node.ELEMENT_NODE
           ? this.__tilefinchDetachedParent
           : null;
-      const parent = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-        ? __tilefinchRemoteNodeRelation(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            0,
-          )
-        : wrap(__tilefinchRelation(nativeReceiver.__handle, 8));
+      const parent = wrap(__tilefinchRelation(nativeReceiver.__handle, 8));
       /* The native shadow-root carrier is an internal element so layout can
          flatten it, but its JavaScript identity is a DocumentFragment.
          Deriving parentElement from the native "element parent" relation
@@ -6104,7 +5847,6 @@ const __tilefinchRealmGlobal = this;
     get parentNode() {
       const nativeReceiver = this;
       if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
-      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)) return this.parentElement;
       /* Ancestor walks read this once per step: resolve the common case
          (a parent that already has a wrapper) without the documentElement
          getter or a nodeType query. */
@@ -6114,7 +5856,7 @@ const __tilefinchRealmGlobal = this;
           ? document
           : this.parentElement;
       const cached = cachedNode(parentHandle);
-      if (cached && cached.__tilefinchRemoteNodeType !== 9) return cached;
+      if (cached && cached[nativeDocumentWrapper] !== true) return cached;
       /* <html>, and a comment or doctype beside it, have the native
          document as their parent: the document object, not a wrapper. */
       if (__tilefinchNodeType(parentHandle) === 9) return document;
@@ -6123,168 +5865,53 @@ const __tilefinchRealmGlobal = this;
     },
     get firstElementChild() {
       const nativeReceiver = this;
-      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body)
-        return document.querySelector("body > *");
       return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
-        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              1,
-            )
-          : wrap(__tilefinchRelation(nativeReceiver.__handle, 1)),
+        wrap(__tilefinchRelation(nativeReceiver.__handle, 1)),
       );
     },
     get firstChild() {
       const nativeReceiver = this;
-      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body) {
-        let child = document.querySelector("body > *");
-        if (!child) return null;
-        for (
-          let previous = child.previousSibling;
-          previous;
-          previous = child.previousSibling
-        )
-          child = previous;
-        return child;
-      }
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 4));
-      return remote
-        ? __tilefinchRemoteNodeRelation(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            4,
-          )
-        : local ||
-            (canReadRemoteRelation(this)
-              ? __tilefinchRemoteNodeRelation(
-                  this.__tilefinchStableKey,
-                  this.__tilefinchRemoteSection,
-                  4,
-                )
-              : null);
+      return wrap(__tilefinchRelation(nativeReceiver.__handle, 4)) || null;
     },
     get lastChild() {
       const nativeReceiver = this;
-      if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter && this === document.body) {
-        const values = this.childNodes;
-        return values.length ? values[values.length - 1] : null;
-      }
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 7));
-      return remote
-        ? __tilefinchRemoteNodeRelation(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            7,
-          )
-        : local ||
-            (canReadRemoteRelation(this)
-              ? __tilefinchRemoteNodeRelation(
-                  this.__tilefinchStableKey,
-                  this.__tilefinchRemoteSection,
-                  7,
-                )
-              : null);
+      return wrap(__tilefinchRelation(nativeReceiver.__handle, 7)) || null;
     },
     get nextElementSibling() {
       const nativeReceiver = this;
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 2)),
-        related = shadowAdjustedSibling(
-          this,
-          local ||
-            (!remote && canReadRemoteRelation(this)
-              ? __tilefinchRemoteNodeRelation(
-                  this.__tilefinchStableKey,
-                  this.__tilefinchRemoteSection,
-                  2,
-                )
-              : null),
-          2,
-        );
       return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
-        remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              2,
-            )
-          : related,
+        shadowAdjustedSibling(
+          this,
+          wrap(__tilefinchRelation(nativeReceiver.__handle, 2)) || null,
+          2,
+        ),
       );
     },
     get nextSibling() {
       const nativeReceiver = this;
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 5));
-      return remote
-        ? __tilefinchRemoteNodeRelation(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            5,
-          )
-        : shadowAdjustedSibling(
-            this,
-            local ||
-              (canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    5,
-                  )
-                : null),
-            5,
-          );
+      return shadowAdjustedSibling(
+        this,
+        wrap(__tilefinchRelation(nativeReceiver.__handle, 5)) || null,
+        5,
+      );
     },
     get previousElementSibling() {
       const nativeReceiver = this;
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 3)),
-        related = shadowAdjustedSibling(
-          this,
-          local ||
-            (!remote && canReadRemoteRelation(this)
-              ? __tilefinchRemoteNodeRelation(
-                  this.__tilefinchStableKey,
-                  this.__tilefinchRemoteSection,
-                  3,
-                )
-              : null),
-          3,
-        );
       return __tilefinchRealmGlobal.__tilefinchCanonicalElement(
-        remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              3,
-            )
-          : related,
+        shadowAdjustedSibling(
+          this,
+          wrap(__tilefinchRelation(nativeReceiver.__handle, 3)) || null,
+          3,
+        ),
       );
     },
     get previousSibling() {
       const nativeReceiver = this;
-      const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 6));
-      return remote
-        ? __tilefinchRemoteNodeRelation(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            6,
-          )
-        : shadowAdjustedSibling(
-            this,
-            local ||
-              (canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    6,
-                  )
-                : null),
-            6,
-          );
+      return shadowAdjustedSibling(
+        this,
+        wrap(__tilefinchRelation(nativeReceiver.__handle, 6)) || null,
+        6,
+      );
     },
     get isConnected() {
       const nativeReceiver = this;
@@ -6294,49 +5921,21 @@ const __tilefinchRealmGlobal = this;
           (node) => node.__tilefinchDetachedParent || node.parentNode,
         ))
           if (at instanceof Document) return true;
-      return (
-        __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this) ||
-        __tilefinchIsConnected(nativeReceiver.__handle)
-      );
+      return __tilefinchIsConnected(nativeReceiver.__handle);
     },
     get children() {
       const nativeReceiver = this;
       if (!this.__tilefinchChildrenCollection)
         Object.defineProperty(this, "__tilefinchChildrenCollection", {
           configurable: true,
-          value: __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() => {
-            if (
-              !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-              !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-            )
-              return __tilefinchChildren(nativeReceiver.__handle).map(wrap);
-            const values = [];
-            for (
-              let child = this.firstElementChild;
-              child && values.length < 128;
-              child = child.nextElementSibling
-            )
-              values.push(child);
-            return values;
-          }),
+          value: __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
+            __tilefinchChildren(nativeReceiver.__handle).map(wrap)),
         });
       return this.__tilefinchChildrenCollection;
     },
     get childNodes() {
       const nativeReceiver = this;
-      if (
-        !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-        !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this)
-      )
-        return __tilefinchChildNodes(nativeReceiver.__handle).map(wrap);
-      const values = [];
-      for (
-        let child = this.firstChild;
-        child && values.length < 128;
-        child = child.nextSibling
-      )
-        values.push(child);
-      return nodeList(values);
+      return __tilefinchChildNodes(nativeReceiver.__handle).map(wrap);
     },
     get content() {
       /* This receiver serves every native element, so it must also answer
@@ -6383,21 +5982,12 @@ const __tilefinchRealmGlobal = this;
            reads. Reuse the list within one task while no script mutation
            happened (every one bumps the DOM version, as for form.elements;
            host-native attribute changes happen between tasks). */
-        const remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-          version = remote ? -1 : __tilefinchDomVersion(),
+        const version = __tilefinchDomVersion(),
           task = activeTaskSequence,
-          memo = remote ? null : attributeState(this)?.memo;
+          memo = attributeState(this)?.memo;
         if (memo && memo.version === version && memo.task === task)
           return memo.values;
-        const raw = remote
-            ? mergeRemoteAttributes(
-                this,
-                __tilefinchRemoteNodeAttributes(
-                  this.__tilefinchStableKey,
-                  this.__tilefinchRemoteSection,
-                ),
-              )
-            : __tilefinchAttributes(nativeReceiver.__handle),
+        const raw = __tilefinchAttributes(nativeReceiver.__handle),
           shadow = namespaceAttributes(this),
           /* Namespace-aware attributes are written through to the host
              DOM so layout and style can see them, and mirrored here to
@@ -6424,7 +6014,7 @@ const __tilefinchRealmGlobal = this;
           ...order.filter((attribute) => current.includes(attribute)),
           ...current.filter((attribute) => !order.includes(attribute)),
         ]);
-        if (!remote) attributeState(this, true).memo = { version, task, values };
+        attributeState(this, true).memo = { version, task, values };
         return values;
       });
     },
@@ -6462,32 +6052,7 @@ const __tilefinchRealmGlobal = this;
         oldValue = html
           ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
           : matching?.value ?? null,
-        lowerName = name.toLowerCase(),
-        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        /* Only a remote node writer mirrors root writes; check it before
-           resolving document.body, which is a bridge call and a wrap. */
-        rootKey =
-          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-          !__tilefinchRealmGlobal.__tilefinchRestoringSection
-            ? this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : ""
-            : "",
-        root = !!rootKey;
-      if (remote || root)
-        __tilefinchRemoteNodeWrite(
-          root ? rootKey : this.__tilefinchStableKey,
-          root
-            ? Number(__tilefinchSectionIdentity())
-            : this.__tilefinchRemoteSection,
-          2,
-          name,
-          value,
-        );
+        lowerName = name.toLowerCase();
       let result = false;
       /* Attributes on non-HTML elements keep the qualified name the author
          wrote, which the host DOM cannot store, so they are mirrored in a
@@ -6513,14 +6078,6 @@ const __tilefinchRealmGlobal = this;
          */
         if (!html || cachedAttributes)
           attributeRecord(this, name, value);
-      }
-      if (remote)
-        rememberRemoteAttribute(this, name, value);
-      else if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
-               && lowerName === "id") {
-        const sourceKey = String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""),
-          idKey = value && value.length <= 128 ? "i:" + value : "";
-        rekeyStableWrapper(this, idKey || sourceKey);
       }
       if (lowerName === "id") __tilefinchRealmGlobal.__tilefinchExposeNamedProperty(value);
       if (lowerName === "style" && this.__detachedOwner)
@@ -6548,7 +6105,7 @@ const __tilefinchRealmGlobal = this;
         [],
         oldValue,
       );
-      return result || remote || root;
+      return result;
     },
     setAttributeNS(namespace, name, value) {
       const nativeReceiver = this;
@@ -6634,13 +6191,6 @@ const __tilefinchRealmGlobal = this;
       name = String(name);
       if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
         name = name.toLowerCase();
-      if (__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
-        return __tilefinchRemoteNodeRead(
-          this.__tilefinchStableKey,
-          this.__tilefinchRemoteSection,
-          2,
-          name,
-        );
       /*
        * The host DOM is authoritative for ordinary HTML attributes.
        * Going through `this.attributes` constructs a NamedNodeMap plus an
@@ -6671,31 +6221,7 @@ const __tilefinchRealmGlobal = this;
         oldValue = html
           ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
           : matching?.value ?? null,
-        lowerName = name.toLowerCase(),
-        remote = __tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this),
-        /* Only a remote node writer mirrors root writes; check it before
-           resolving document.body, which is a bridge call and a wrap. */
-        rootKey =
-          __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
-          !__tilefinchRealmGlobal.__tilefinchRestoringSection
-            ? this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : ""
-            : "",
-        root = !!rootKey;
-      if (remote || root)
-        __tilefinchRemoteNodeWrite(
-          root ? rootKey : this.__tilefinchStableKey,
-          root
-            ? Number(__tilefinchSectionIdentity())
-            : this.__tilefinchRemoteSection,
-          3,
-          name,
-        );
+        lowerName = name.toLowerCase();
       let result = false;
       if (
         !html &&
@@ -6718,11 +6244,6 @@ const __tilefinchRealmGlobal = this;
           attributeKey(matching.namespaceURI, matching.localName),
         );
       }
-      if (remote)
-        rememberRemoteAttribute(this, name, null);
-      else if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
-               && lowerName === "id")
-        rekeyStableWrapper(this, String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""));
       if (oldValue !== null) {
         if (lowerName === "style" && this.__detachedOwner)
           detachedStyles.delete(this);
@@ -6753,7 +6274,7 @@ const __tilefinchRealmGlobal = this;
           matching?.namespaceURI ?? null,
         );
       }
-      return result || remote || root;
+      return result;
     },
     removeAttributeNS(namespace, name) {
       const nativeReceiver = this;
@@ -7319,7 +6840,7 @@ const __tilefinchRealmGlobal = this;
          attribute list instead of materializing a NamedNodeMap. Namespaced
          attributes are written through to the host list too. */
       const handle = Number(this.__handle);
-      if (handle > 0 && !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote(this))
+      if (handle > 0)
         return __tilefinchAttributes(handle).length !== 0;
       const attributes = this.attributes;
       return !!attributes && attributes.length !== 0;
@@ -7361,7 +6882,6 @@ const __tilefinchRealmGlobal = this;
   }));
   const hiddenByDefaultTags = " area base basefont datalist head link meta " +
     "noembed noframes param rp script style template title ";
-  const wrapperListeners = Symbol("wrapper listeners");
   const nativeNodeEventDescriptors = Object.getOwnPropertyDescriptors({
     addEventListener(type, callback, options = false) {
       type = String(type);
@@ -7462,138 +6982,32 @@ const __tilefinchRealmGlobal = this;
             Object.defineProperty(node, name, descriptors[name]);
     },
   });
-  /* The rebinding every wrapper's __tilefinchRebindHandle performs once it
-     has swapped its captured handle from `previous` to `handle`. */
-  const rebindWrapper = (node, previous, handle) => {
-    if (previous !== handle) {
-      const handlers = eventHandlerMap(node, false);
-      if (handlers)
-        for (const [type, value] of handlers)
-          if (value?.token === propertyHandlerRecordToken &&
-              value.sourceToken === inlineHandlerRecordToken) {
-            if (value.wrapper)
-              node.removeEventListener(type, value.wrapper, false);
-            handlers.delete(type);
-          }
-    }
-    if (!__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter)
-      applyRemoteMutation(node, handle);
-    node.__tilefinchRemote = false;
-    node.__tilefinchRemoteSection = Number(__tilefinchSectionIdentity());
-    node.__tilefinchRemoteTagName = String(
-      __tilefinchTagName(handle) || node.__tilefinchRemoteTagName || "",
-    );
-    node.__tilefinchRemoteNodeType = Number(
-      __tilefinchNodeType(handle) || node.__tilefinchRemoteNodeType || 0,
-    );
-    node.__namespaceURI = __tilefinchNamespaceURI(handle);
-    Object.setPrototypeOf(
-      node,
-      nativeElementPrototype(
-        node.__tilefinchRemoteTagName,
-        node.__tilefinchRemoteNodeType,
-        node.__namespaceURI,
-      ),
-    );
-    const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
-      id = String(__tilefinchGetAttribute(handle, "id") || ""),
-      idKey = id && id.length <= 128 ? "i:" + id : "",
-      stable = __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter
-        ? sourceKey || idKey
-        : "";
-    node.__tilefinchStableKey =
-      node.__tilefinchQueryKey ||
-      stable ||
-      String(node.__tilefinchStableKey || "");
-    installStyle(node, handle);
-    installClassList(node);
-    cacheNode(handle, node);
-    /* Releasing the previous handle's lease dropped the reference native
-       code kept to this wrapper for state it carries. Keep or root that
-       state for the new handle, or it would last only as long as the
-       wrapper. Keeping it first allocates nothing, so a refused
-       allocation while rooting leaves it kept; a rebind a refusal cut
-       short before here comes back for the same handle, which keeps it
-       then. */
-    if (keptOnWrapper(node)) {
-      const listeners = node[wrapperListeners] || null,
-        handlers = node[wrapperHandlers] || null;
-      keepOnWrapper(handle, node, listeners, handlers);
-      if (previous !== handle) rootEventState(handle, { listeners, handlers });
-    }
-    return node;
-  };
-  const nodeIdentity = ["", 0, null, 0, 0];
+  const nodeIdentity = ["", 0, null, 0];
   let wrapperTrace = null;
   function wrap(handle) {
     if (!handle) return null;
     const cached = cachedNode(handle);
     if (cached) return cached;
-    /* Stable keys only matter to a remote node writer; without one, skip
-       the two bridge lookups on every wrapper creation. */
-    let stableKey = "";
-    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter) {
-      remoteIdentitySeen = true;
-      const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
-        stableId = String(__tilefinchGetAttribute(handle, "id") || "");
-      stableKey = sourceKey ||
-        (stableId && stableId.length <= 128 ? "i:" + stableId : "");
-    }
-    const retained = stableKey ? stableNodeWrappers.get(stableKey) : null;
-    if (retained) {
-      retained.__tilefinchRebindHandle(rebindToken, handle);
-      rememberStableWrapper(stableKey, retained);
-      return retained;
-    }
     retentionStats.wrapperCreates++;
-    /* [tagName || "", nodeType, namespaceURI, section, held-in] in one
-       bridge call, refilling one array rather than allocating one per
-       wrapper. */
+    /* [tagName || "", nodeType, namespaceURI, held-in] in one bridge call,
+       refilling one array rather than allocating one per wrapper. */
     const held = heldEventStates.size;
     __tilefinchNodeIdentity(handle, nodeIdentity, held);
     const tagName = nodeIdentity[0],
       nodeType = nodeIdentity[1],
       namespaceURI = nodeIdentity[2],
-      section = nodeIdentity[3],
       /* With a tree held: the handle whose holder this wrapper joins (the
          holder of its detached tree, if it has one), or 0. */
-      heldIn = held && nodeIdentity[4];
+      heldIn = held && nodeIdentity[3];
     // Start with the final prototype and final descriptor flags. Changing
     // either after filling the wrapper de-interns QuickJS's large property
     // shape, leaving a separate shape allocation for every visited element.
     const node = Object.create(
       nativeElementPrototype(tagName, nodeType, namespaceURI),
     );
-    Object.defineProperty(node, "__tilefinchRebindHandle", {
-      enumerable: false,
-      configurable: false,
-      writable: false,
-      /* Only the handle swap needs this wrapper's closure; the rest of the
-         rebinding is shared. */
-      value: function (token, next) {
-        if (token !== rebindToken)
-          throw new DOMException(
-            "Handle rebinding is not exposed to page script",
-            "NotSupportedError",
-          );
-        const previous = handle,
-          nextHandle = Number(next),
-          previousLease =
-            previous !== nextHandle ? uncacheNode(previous, this) : 0;
-        if (previousLease) __tilefinchReleaseNodeWrapper(previous, previousLease);
-        handle = nextHandle;
-        return rebindWrapper(this, previous, nextHandle);
-      },
-    });
     node.__namespaceURI = namespaceURI;
-    /* Ordinary live nodes read identity from the native DOM. Remote-only
-       metadata must not occupy four property slots on every such node. */
-    if (__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter || nodeType === Node.DOCUMENT_NODE) {
-      node.__tilefinchStableKey = stableKey;
-      node.__tilefinchRemoteSection = section;
-      node.__tilefinchRemoteTagName = tagName;
-      node.__tilefinchRemoteNodeType = nodeType;
-    }
+    if (nodeType === Node.DOCUMENT_NODE)
+      Object.defineProperty(node, nativeDocumentWrapper, { value: true });
     Object.defineProperty(node, "__handle", {
       enumerable: false,
       configurable: false,
@@ -7604,12 +7018,9 @@ const __tilefinchRealmGlobal = this;
     // Reserve the slot up front to keep wrapper shapes shared, but allocate
     // a listener map only on registration. Existing retained listeners survive
     // wrapper recreation; overflow maps remain owned by their live wrapper.
-    // Without a stable key only the per-handle map can apply.
     Object.defineProperty(node, wrapperListeners, {
-      value: stableKey
-        ? listenerMap(node, false)
-        : nativeNodeListeners.get(Number(handle)) ||
-          heldEventState(Number(handle))?.listeners || null,
+      value: nativeNodeListeners.get(Number(handle)) ||
+        heldEventState(Number(handle))?.listeners || null,
       writable: true,
     });
     const exposed =
@@ -7627,7 +7038,6 @@ const __tilefinchRealmGlobal = this;
       if (holder) node[wrapperEventHolder] = holder;
     }
     cacheNode(handle, exposed);
-    if (stableKey) rememberStableWrapper(stableKey, exposed);
     __tilefinchRealmGlobal.__tilefinchRestoreCustomElement?.(exposed);
     return exposed;
   }
@@ -7641,185 +7051,12 @@ const __tilefinchRealmGlobal = this;
         wrapperTrace = typeof trace === "function" ? trace : null;
       },
     });
-  __tilefinchRealmGlobal.__tilefinchWrapRemote = (id, tag, section) => {
-    noteRemoteWrapper();
-    id = String(id).slice(0, 128);
-    if (!id) return null;
-    const key = "i:" + id,
-      retained = stableNodeWrappers.get(key);
-    if (retained) {
-      retained.__tilefinchRemote = true;
-      retained.__tilefinchRemoteSection = Number(section);
-      return retained;
-    }
-    const node = wrap(__tilefinchCreate(String(tag || "div")));
-    if (!node) return null;
-    __tilefinchSetAttribute(node.__handle, "id", id);
-    node.__tilefinchStableKey = key;
-    node.__tilefinchRemote = true;
-    node.__tilefinchRemoteSection = Number(section);
-    rememberStableWrapper(key, node);
-    return node;
-  };
-  __tilefinchRealmGlobal.__tilefinchWrapRemoteSelector = (selector, tag, section) => {
-    noteRemoteWrapper();
-    selector = String(selector).slice(0, 128);
-    section = Number(section);
-    if (!selector) return null;
-    const key = "q:" + section + ":" + selector,
-      retained = stableNodeWrappers.get(key);
-    if (retained) {
-      retained.__tilefinchRemote = true;
-      return retained;
-    }
-    const node = wrap(__tilefinchCreate(String(tag || "div")));
-    if (!node) return null;
-    if (node.__tilefinchStableKey)
-      stableNodeWrappers.delete(node.__tilefinchStableKey);
-    node.__tilefinchQueryKey = key;
-    node.__tilefinchRemoteSelector = selector;
-    node.__tilefinchRemoteSection = section;
-    node.__tilefinchStableKey = key;
-    node.__tilefinchRemote = true;
-    rememberStableWrapper(key, node);
-    return node;
-  };
-  __tilefinchRealmGlobal.__tilefinchWrapRemoteStable = (
-    key,
-    tag,
-    section,
-    nodeType = Node.ELEMENT_NODE,
-  ) => {
-    noteRemoteWrapper();
-    key = String(key).slice(0, 95);
-    section = Number(section);
-    nodeType = Number(nodeType) || Node.ELEMENT_NODE;
-    if (!key) return null;
-    const retained = stableNodeWrappers.get(key);
-    if (retained) {
-      retained.__tilefinchRemote = true;
-      retained.__tilefinchRemoteSection = section;
-      retained.__tilefinchRemoteNodeType = nodeType;
-      Object.setPrototypeOf(retained, nativeElementPrototype(tag, nodeType));
-      return retained;
-    }
-    const handle =
-        nodeType === Node.TEXT_NODE
-          ? __tilefinchCreateText("")
-          : nodeType === Node.COMMENT_NODE
-            ? __tilefinchCreateComment("")
-            : __tilefinchCreate(String(tag || "div")),
-      node = wrap(handle);
-    if (!node) return null;
-    if (node.__tilefinchStableKey)
-      stableNodeWrappers.delete(node.__tilefinchStableKey);
-    node.__tilefinchRemoteSection = section;
-    node.__tilefinchStableKey = key;
-    node.__tilefinchRemote = true;
-    node.__tilefinchRemoteNodeType = nodeType;
-    Object.setPrototypeOf(node, nativeElementPrototype(tag, nodeType));
-    rememberStableWrapper(key, node);
-    return node;
-  };
-  __tilefinchRealmGlobal.__tilefinchWrapRemoteRelation = (
-    key,
-    tag,
-    section,
-    special,
-    nodeType,
-  ) => {
-    special = Number(special);
-    if (special === 1) return document.documentElement;
-    if (special === 2) return document.head;
-    if (special === 3) return document.body;
-    key = String(key);
-    return key.startsWith("i:")
-      ? __tilefinchRealmGlobal.__tilefinchWrapRemote(key.slice(2), tag, section)
-      : __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(key, tag, section, nodeType);
-  };
-  __tilefinchRealmGlobal.__tilefinchClearNodeCache = () => {
-    nodeCache.clear();
-  };
-  __tilefinchRealmGlobal.__tilefinchRebindStableNodes = () => {
-    __tilefinchSuppressRemoteLookup(true);
-    try {
-      for (const [key, retained] of [...stableNodeWrappers.entries()]) {
-        if (key.startsWith("i:")) document.getElementById(key.slice(2));
-        else if (key.startsWith("q:")) {
-          if (
-            Number(retained.__tilefinchRemoteSection) !==
-            Number(__tilefinchSectionIdentity())
-          ) {
-            retained.__tilefinchRemote = true;
-            continue;
-          }
-          const found = document.querySelector(retained.__tilefinchRemoteSelector);
-          if (found && found !== retained) {
-            const oldKey = found.__tilefinchStableKey,
-              handle = found.__handle;
-            retained.__tilefinchRebindHandle(rebindToken, handle);
-            if (oldKey && stableNodeWrappers.get(oldKey) === found)
-              stableNodeWrappers.delete(oldKey);
-            rememberStableWrapper(key, retained);
-          }
-        } else {
-          const parts = key.split(":"),
-            section = Number(parts[1]);
-          if (
-            Number.isInteger(section) &&
-            section !== Number(__tilefinchSectionIdentity())
-          ) {
-            retained.__tilefinchRemote = true;
-            retained.__tilefinchRemoteSection = section;
-            continue;
-          }
-          const handle = __tilefinchFindStableNode(key);
-          if (handle) wrap(handle);
-        }
-      }
-    } finally {
-      __tilefinchSuppressRemoteLookup(false);
-    }
-  };
-  __tilefinchRealmGlobal.__tilefinchNodeForStableKey = (key) => {
-    key = String(key || "");
-    if (key.startsWith("i:")) return document.getElementById(key.slice(2));
-    if (key.startsWith("q:")) {
-      const retained = stableNodeWrappers.get(key);
-      return retained?.isConnected ? retained : null;
-    }
-    const handle = __tilefinchFindStableNode(key);
-    return handle ? wrap(handle) : null;
-  };
-  __tilefinchRealmGlobal.__tilefinchWrapTraversalNode = (
-    key,
-    tag,
-    section,
-    special,
-    nodeType,
-  ) => {
-    special = Number(special);
-    if (special)
-      return __tilefinchRealmGlobal.__tilefinchWrapRemoteRelation(
-        key,
-        tag,
-        section,
-        special,
-        nodeType,
-      );
-    return (
-      __tilefinchRealmGlobal.__tilefinchNodeForStableKey(key) ||
-      __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(key, tag, section, nodeType)
-    );
-  };
-  __tilefinchRealmGlobal.__tilefinchCurrentScriptForStable = (key, section) =>
-    __tilefinchRealmGlobal.__tilefinchNodeForStableKey(key) ||
-    __tilefinchRealmGlobal.__tilefinchWrapRemoteStable(
-      key,
-      "script",
-      section,
-      Node.ELEMENT_NODE,
-    );
+  /* Tests drop every cached wrapper to exercise rewrapping; nothing in
+     the bootstrap clears the cache, so only test-probe realms get it. */
+  if (__tilefinchRealmGlobal.__tilefinchTestProbes)
+    __tilefinchRealmGlobal.__tilefinchClearNodeCache = () => {
+      nodeCache.clear();
+    };
   const hitTestElements = (x, y) => {
     x = Number(x);
     y = Number(y);
@@ -8124,7 +7361,6 @@ const __tilefinchRealmGlobal = this;
         throw new TypeError("Invalid MutationObserver options");
       const registration = {
         target,
-        targetKey: String(target.__tilefinchStableKey || ""),
         /* For the native subtree check; see mutationAncestor. */
         handle: target.__handle > 0 ? target.__handle : 0,
         options: normalized,
@@ -9083,14 +8319,12 @@ const __tilefinchRealmGlobal = this;
     mutationPromiseThen = Function.call.bind(Promise.prototype.then),
     styleSheetAttributeNames = ["disabled", "href", "media", "rel", "type"],
     nativeIsAncestor = __tilefinchRealmGlobal.__tilefinchIsAncestor,
-    nativeNearestId = __tilefinchRealmGlobal.__tilefinchNearestId,
     nativeNextAncestorEntry = __tilefinchRealmGlobal.__tilefinchNextAncestorEntry;
   /* Whether the node with `handle` is on the parentNode chain of the native
      mutation target, by one native parent-pointer walk instead of a wrapper
      per ancestor; undefined when only the wrapper walk can tell (either is
-     not an ordinary native node, section-remote nodes). Handles are cached
-     at registration: only section-remote wrappers are ever rebound, and
-     the native walk declines once those exist. */
+     not an ordinary native node). Handles are cached at registration;
+     wrappers are never rebound to another handle. */
   const mutationAncestor = (handle, targetHandle) =>
     handle > 0 && targetHandle > 0
       ? nativeIsAncestor(handle, targetHandle)
@@ -9103,20 +8337,16 @@ const __tilefinchRealmGlobal = this;
     return next === undefined ? start : next;
   };
   /* The wrapper walk behind the checks the native walk cannot answer: the
-     target's ancestors, and their stable keys for registrations that must
-     survive a section swap rebuilding the target's wrappers. */
+     target's ancestors. */
   const collectMutationAncestors = (target) => {
-    const nodes = new Set(),
-      keys = new Set();
+    const nodes = new Set();
     for (
       let at = target?.parentNode, steps = 0;
       at && steps < ancestorLimit;
       at = at.parentNode, steps++
-    ) {
+    )
       nodes.add(at);
-      if (at.__tilefinchStableKey) keys.add(String(at.__tilefinchStableKey));
-    }
-    return { nodes, keys };
+    return { nodes };
   };
   /* DOM "queue a mutation record": one record per interested observer.
      A registration that can neither take this record nor gain a transient
@@ -9141,7 +8371,6 @@ const __tilefinchRealmGlobal = this;
         type === "attributes" ? 1
         : type === "childList" ? 2
         : type === "characterData" ? 4 : 0,
-      targetKey = String(target?.__tilefinchStableKey || ""),
       filterName = type === "attributes" ? String(attributeName) : "";
     let connected = null,
       ancestors = null;
@@ -9178,9 +8407,7 @@ const __tilefinchRealmGlobal = this;
             (type === "characterData" && options.characterData),
           transient = removal && options.subtree;
         if (!wanted && !transient) continue;
-        let within =
-          target === watched.target ||
-          (!!watched.targetKey && targetKey === watched.targetKey);
+        let within = target === watched.target;
         if (!within && options.subtree && watched.target === document) {
           if (connected === null)
             connected = !!target?.isConnected &&
@@ -9189,9 +8416,7 @@ const __tilefinchRealmGlobal = this;
         }
         if (!within && options.subtree) {
           /* Native ancestry, like parentNode, stops at a shadow root. */
-          let found = watched.targetKey
-            ? undefined
-            : watched.target === document
+          let found = watched.target === document
               ? document.documentElement
                 ? mutationAncestor(
                     document.documentElement.__handle,
@@ -9206,7 +8431,6 @@ const __tilefinchRealmGlobal = this;
               ancestors = collectMutationAncestors(target);
             found =
               ancestors.nodes.has(watched.target) ||
-              (!!watched.targetKey && ancestors.keys.has(watched.targetKey)) ||
               (watched.target === document &&
                 ancestors.nodes.has(document.documentElement));
           }
@@ -9362,11 +8586,7 @@ const __tilefinchRealmGlobal = this;
     nextSibling = null,
     attributeNamespace = null,
   ) => {
-    if (
-      __tilefinchRealmGlobal.__tilefinchRestoringSection ||
-      __tilefinchRealmGlobal.__tilefinchMutationSuppressed
-    )
-      return;
+    if (__tilefinchRealmGlobal.__tilefinchMutationSuppressed) return;
     if (type === "childList" && removedNodes.length)
       nodeIteratorHooks?.removed(
         target,
@@ -9398,36 +8618,6 @@ const __tilefinchRealmGlobal = this;
       attributeName,
       addedNodes,
     );
-    const writer = __tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter;
-    /* Section state's dirty-node key. An ordinary native target takes one
-       native walk to its nearest id instead of a wrapper and an id read per
-       ancestor; stable keys (section-remote nodes), script-side parents and
-       overlong ids keep the wrapper walk. */
-    const nearestId =
-      writer || !nativeTarget ? undefined : nativeNearestId(nativeTarget);
-    if (nearestId !== undefined && nearestId.length <= 128) {
-      if (nearestId) __tilefinchRealmGlobal.__tilefinchDirtyNodeIds?.add("i:" + nearestId);
-    } else if (
-      !writer ||
-      (target !== document.documentElement &&
-        target !== document.head &&
-        target !== document.body)
-    )
-      for (
-        let at = target, steps = 0;
-        at && steps < ancestorLimit;
-        at = at.parentElement, steps++
-      ) {
-        const id = String(at.getAttribute?.("id") || ""),
-          key = String(
-            at.__tilefinchStableKey ||
-              (id && id.length <= 128 ? "i:" + id : ""),
-          );
-        if (key) {
-          __tilefinchRealmGlobal.__tilefinchDirtyNodeIds?.add(key);
-          break;
-        }
-      }
     if (mutationObservers.length)
       queueMutationRecords(
         target,
@@ -9502,14 +8692,10 @@ const __tilefinchRealmGlobal = this;
     const census = {};
     Object.defineProperties(census, {
       nodeWrappers: { get: () => nodeCache.size },
-      stableWrappers: { get: () => stableNodeWrappers.size },
-      stableListenerTargets: { get: () => stableNodeListeners.size },
-      stableHandlerTargets: { get: () => stableNodeHandlers.size },
       nativeListenerTargets: { get: () => nativeNodeListeners.size },
       nativeHandlerTargets: { get: () => nativeNodeHandlers.size },
       heldEventTargets: { get: () => heldEventStates.size },
       eventTargetCapacity: { get: () => nativeEventTargets.capacity },
-      stableEventTargetCapacity: { get: () => stableEventTargets.capacity },
       mutationObservers: { get: () => mutationObservers.length },
       slotAssignmentRoots: { get: () => pendingSlotRoots.size },
       motionInlineHintScans: { get: () => motionInlineHintScans },

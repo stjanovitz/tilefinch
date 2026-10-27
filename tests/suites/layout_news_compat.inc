@@ -279,12 +279,12 @@ static int test_news_block_content_links(void)
                     regions);
         }
         CHECK(regions != 0 && regions != SIZE_MAX && link_node != NULL
-              && layout_node_name_is(link_node, "a"));
+              && document_node_is_tag(link_node, LXB_TAG_A));
         anchors[i] = link_node;
         /* Each heading is covered by its link's focus rectangle. */
         if (i == 0) continue;
         lxb_dom_node_t *heading = link_node;
-        while (heading != NULL && !layout_node_name_is(heading, "h2")) {
+        while (heading != NULL && !document_node_is_tag(heading, LXB_TAG_H2)) {
             heading = heading->first_child != NULL
                 ? heading->first_child : heading->next;
         }
@@ -346,7 +346,7 @@ static int test_news_block_content_links(void)
                     inline_urls[i], regions);
         }
         CHECK(regions != 0 && regions != SIZE_MAX
-              && layout_node_name_is(link_node, "a"));
+              && document_node_is_tag(link_node, LXB_TAG_A));
     }
     const LayoutNodeBox *b3 = layout_box_for_node(
         &layout, find_id(root, "b3"));

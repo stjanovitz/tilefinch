@@ -22,7 +22,8 @@ typedef bool (*ImageSvgOversizeTarget)(void *opaque, int source_width,
    decode was refused by this engine's limits rather than by the markup,
    that is for memory (a Budget refusal while parsing or rasterizing), the
    decoded-bytes quota, a declined or missing oversize target, an
-   intrinsic size past 32767 px or re-entry; false for markup no decoder
+   intrinsic size past 32767 px, nesting past the parser's depth limits or
+   re-entry; false for markup no decoder
    takes, which fails the same way every time. */
 unsigned char *image_svg_decode_bounded(
     const void *data, size_t length, Budget *budget,

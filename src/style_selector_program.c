@@ -2,7 +2,8 @@
    compact right-to-left programs. Complex selectors remain on the string
    matcher in style_match.c. */
 
-#include "style_internal.h"
+#include "style_budget_category.h"
+#include "style_match_internal.h"
 #include "tilefinch/platform.h"
 
 #include <ctype.h>

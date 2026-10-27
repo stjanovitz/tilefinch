@@ -177,14 +177,99 @@ typedef struct {
     bool important;
 } ReaderInlineVisibility;
 
-static bool reader_name_is(const lxb_dom_node_t *node, const char *name)
+/* Element classes for reader_mode's tag ladders, indexed by static lexbor
+   tag id. Testing the id is exactly the old case-insensitive name test:
+   local names are interned lower-case and a name in lexbor's static table
+   always takes its static id, in any namespace; a custom or other dynamic
+   element (id >= LXB_TAG__LAST_ENTRY) belongs to no class. */
+enum {
+    READER_TAG_HIDDEN = 1u << 0,        /* never reader content */
+    READER_TAG_CONTENT_BLOCK = 1u << 1, /* headings, paragraphs, sections,
+                                           quotes, tables and figures */
+    READER_TAG_CHROME = 1u << 2,        /* landmark page chrome */
+    READER_TAG_FORM_CONTROL = 1u << 3,  /* basic-mode form controls */
+    READER_TAG_EXTRACT = 1u << 4,       /* kept by reader_extract_tag */
+    READER_TAG_EXTRACT_BASIC = 1u << 5  /* kept by it in basic mode only */
+};
+
+static const uint8_t reader_tag_class[LXB_TAG__LAST_ENTRY] = {
+    [LXB_TAG_A] = READER_TAG_EXTRACT,
+    [LXB_TAG_ABBR] = READER_TAG_EXTRACT,
+    [LXB_TAG_ADDRESS] = READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_ARTICLE] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_ASIDE] = READER_TAG_CHROME | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_AUDIO] = READER_TAG_EXTRACT,
+    [LXB_TAG_B] = READER_TAG_EXTRACT,
+    [LXB_TAG_BLOCKQUOTE] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_BR] = READER_TAG_EXTRACT,
+    [LXB_TAG_BUTTON] = READER_TAG_FORM_CONTROL | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_CAPTION] = READER_TAG_EXTRACT,
+    [LXB_TAG_CITE] = READER_TAG_EXTRACT,
+    [LXB_TAG_CODE] = READER_TAG_EXTRACT,
+    [LXB_TAG_DD] = READER_TAG_EXTRACT,
+    [LXB_TAG_DETAILS] = READER_TAG_EXTRACT,
+    [LXB_TAG_DL] = READER_TAG_EXTRACT,
+    [LXB_TAG_DT] = READER_TAG_EXTRACT,
+    [LXB_TAG_EM] = READER_TAG_EXTRACT,
+    [LXB_TAG_FIGCAPTION] = READER_TAG_EXTRACT,
+    [LXB_TAG_FIGURE] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_FOOTER] = READER_TAG_CHROME | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_FORM] = READER_TAG_CHROME | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_H1] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_H2] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_H3] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_H4] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_H5] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_H6] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_HEAD] = READER_TAG_HIDDEN,
+    [LXB_TAG_HEADER] = READER_TAG_EXTRACT,
+    [LXB_TAG_HR] = READER_TAG_EXTRACT,
+    [LXB_TAG_I] = READER_TAG_EXTRACT,
+    [LXB_TAG_IMG] = READER_TAG_EXTRACT,
+    [LXB_TAG_INPUT] = READER_TAG_FORM_CONTROL | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_KBD] = READER_TAG_EXTRACT,
+    [LXB_TAG_LABEL] = READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_LI] = READER_TAG_EXTRACT,
+    [LXB_TAG_MAIN] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_MARK] = READER_TAG_EXTRACT,
+    [LXB_TAG_MENU] = READER_TAG_CHROME | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_NAV] = READER_TAG_CHROME | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_NOSCRIPT] = READER_TAG_HIDDEN,
+    [LXB_TAG_OL] = READER_TAG_EXTRACT,
+    [LXB_TAG_OPTION] = READER_TAG_FORM_CONTROL | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_P] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_PICTURE] = READER_TAG_EXTRACT,
+    [LXB_TAG_PRE] = READER_TAG_EXTRACT,
+    [LXB_TAG_Q] = READER_TAG_EXTRACT,
+    [LXB_TAG_SAMP] = READER_TAG_EXTRACT,
+    [LXB_TAG_SCRIPT] = READER_TAG_HIDDEN,
+    [LXB_TAG_SECTION] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_SELECT] = READER_TAG_FORM_CONTROL | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_SOURCE] = READER_TAG_EXTRACT,
+    [LXB_TAG_STRONG] = READER_TAG_EXTRACT,
+    [LXB_TAG_STYLE] = READER_TAG_HIDDEN,
+    [LXB_TAG_SUB] = READER_TAG_EXTRACT,
+    [LXB_TAG_SUMMARY] = READER_TAG_EXTRACT,
+    [LXB_TAG_SUP] = READER_TAG_EXTRACT,
+    [LXB_TAG_TABLE] = READER_TAG_CONTENT_BLOCK | READER_TAG_EXTRACT,
+    [LXB_TAG_TBODY] = READER_TAG_EXTRACT,
+    [LXB_TAG_TD] = READER_TAG_EXTRACT,
+    [LXB_TAG_TEMPLATE] = READER_TAG_HIDDEN,
+    [LXB_TAG_TEXTAREA] = READER_TAG_FORM_CONTROL | READER_TAG_EXTRACT_BASIC,
+    [LXB_TAG_TFOOT] = READER_TAG_EXTRACT,
+    [LXB_TAG_TH] = READER_TAG_EXTRACT,
+    [LXB_TAG_THEAD] = READER_TAG_EXTRACT,
+    [LXB_TAG_TIME] = READER_TAG_EXTRACT,
+    [LXB_TAG_TR] = READER_TAG_EXTRACT,
+    [LXB_TAG_UL] = READER_TAG_EXTRACT,
+    [LXB_TAG_VIDEO] = READER_TAG_EXTRACT,
+};
+
+static unsigned reader_tag_classes(const lxb_dom_node_t *node)
 {
-    size_t length = 0;
-    const char *actual = document_element_name(
-        (lxb_dom_node_t *) node, &length);
-    size_t wanted = strlen(name);
-    return actual != NULL && length == wanted
-        && strncasecmp(actual, name, wanted) == 0;
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && node->local_name < LXB_TAG__LAST_ENTRY
+        ? reader_tag_class[node->local_name] : 0u;
 }
 
 static bool reader_has_attribute(lxb_dom_node_t *node, const char *name)
@@ -535,9 +620,7 @@ static bool reader_collapsed_disclosure(lxb_dom_node_t *node)
 
 static bool reader_hidden_element(lxb_dom_node_t *node)
 {
-    if (reader_name_is(node, "head") || reader_name_is(node, "script")
-        || reader_name_is(node, "style") || reader_name_is(node, "template")
-        || reader_name_is(node, "noscript")) return true;
+    if (reader_tag_classes(node) & READER_TAG_HIDDEN) return true;
     size_t length = 0;
     if (reader_has_attribute(node, "hidden")
         && !reader_collapsed_disclosure(node)) return true;
@@ -547,10 +630,10 @@ static bool reader_hidden_element(lxb_dom_node_t *node)
     /* The style fallback can deliberately reveal a useful server-rendered
        html/body shell after failed hydration. Do not countermand that policy
        here; inline visibility only filters descendant duplicates. */
-    if (reader_name_is(node, "html") || reader_name_is(node, "body"))
+    if (document_node_is_tag(node, LXB_TAG_HTML) || document_node_is_tag(node, LXB_TAG_BODY))
         return false;
     if (reader_has_attribute(node, "inert")) return true;
-    if (reader_name_is(node, "dialog")
+    if (document_node_is_tag(node, LXB_TAG_DIALOG)
         && !reader_has_attribute(node, "open")) return true;
     return reader_inline_style_hidden(node);
 }
@@ -578,7 +661,7 @@ static bool reader_attribute_has_any_token(
 
 static bool reader_header_is_link_masthead(lxb_dom_node_t *node)
 {
-    if (!reader_name_is(node, "header")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_HEADER)) return false;
     /* A linked-logo masthead remains page chrome even when an author puts
        the entire page inside main. Do not mistake a byline/title header for
        it: accept only a small tree of links, images and neutral wrappers. */
@@ -587,13 +670,13 @@ static bool reader_header_is_link_masthead(lxb_dom_node_t *node)
     bool linked_masthead = true;
     for (; part != NULL && visited < READER_PART_SCAN_LIMIT;
          part = reader_next_within(part, node), visited++) {
-        if (reader_name_is(part, "a")) links++;
+        if (document_node_is_tag(part, LXB_TAG_A)) links++;
         else if (part->type == LXB_DOM_NODE_TYPE_ELEMENT
-                 && !reader_name_is(part, "img")
-                 && !reader_name_is(part, "div")
-                 && !reader_name_is(part, "span")
-                 && !reader_name_is(part, "picture")
-                 && !reader_name_is(part, "source")) {
+                 && !document_node_is_tag(part, LXB_TAG_IMG)
+                 && !document_node_is_tag(part, LXB_TAG_DIV)
+                 && !document_node_is_tag(part, LXB_TAG_SPAN)
+                 && !document_node_is_tag(part, LXB_TAG_PICTURE)
+                 && !document_node_is_tag(part, LXB_TAG_SOURCE)) {
             linked_masthead = false;
             break;
         } else if (part->type == LXB_DOM_NODE_TYPE_TEXT) {
@@ -610,7 +693,7 @@ static bool reader_header_is_link_masthead(lxb_dom_node_t *node)
 
 static bool reader_basic_navigation_header(lxb_dom_node_t *node)
 {
-    if (!reader_name_is(node, "header")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_HEADER)) return false;
     /* A page-level navigation shell may be inside main. Keep article and
        section headers expanded, and never classify a title/prose header by
        its link count alone. No site names or author class names are used. */
@@ -618,8 +701,8 @@ static bool reader_basic_navigation_header(lxb_dom_node_t *node)
     size_t depth = 0;
     for (; ancestor != NULL && depth < READER_EXTRACT_DEPTH_LIMIT;
          ancestor = ancestor->parent, depth++) {
-        if (reader_name_is(ancestor, "article")
-            || reader_name_is(ancestor, "section")) return false;
+        if (document_node_is_tag(ancestor, LXB_TAG_ARTICLE)
+            || document_node_is_tag(ancestor, LXB_TAG_SECTION)) return false;
     }
     if (ancestor != NULL) return false;
     size_t links = 0, visited = 0;
@@ -627,24 +710,18 @@ static bool reader_basic_navigation_header(lxb_dom_node_t *node)
     lxb_dom_node_t *part = node->first_child;
     for (; part != NULL && visited < READER_PART_SCAN_LIMIT; visited++) {
         bool skip = part->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && (reader_hidden_element(part) || reader_name_is(part, "svg")
-                || reader_name_is(part, "nav"));
-        if (reader_name_is(part, "nav")) {
+            && (reader_hidden_element(part) || document_node_is_tag(part, LXB_TAG_SVG)
+                || document_node_is_tag(part, LXB_TAG_NAV));
+        if (document_node_is_tag(part, LXB_TAG_NAV)) {
             links += 2u;
             navigation_control = true;
         }
         if (!skip) {
-            if (reader_name_is(part, "a")) links++;
-            if (reader_name_is(part, "button") || reader_name_is(part, "input")
-                || reader_name_is(part, "select")) navigation_control = true;
-            if (reader_name_is(part, "h1") || reader_name_is(part, "h2")
-                || reader_name_is(part, "h3") || reader_name_is(part, "h4")
-                || reader_name_is(part, "h5") || reader_name_is(part, "h6")
-                || reader_name_is(part, "p") || reader_name_is(part, "article")
-                || reader_name_is(part, "section") || reader_name_is(part, "main")
-                || reader_name_is(part, "blockquote")
-                || reader_name_is(part, "table")
-                || reader_name_is(part, "figure")) return false;
+            if (document_node_is_tag(part, LXB_TAG_A)) links++;
+            if (document_node_is_tag(part, LXB_TAG_BUTTON) || document_node_is_tag(part, LXB_TAG_INPUT)
+                || document_node_is_tag(part, LXB_TAG_SELECT)) navigation_control = true;
+            if (reader_tag_classes(part) & READER_TAG_CONTENT_BLOCK)
+                return false;
             if (part->type == LXB_DOM_NODE_TYPE_TEXT) {
                 size_t length = 0;
                 const char *text = document_text_data(part, &length);
@@ -654,10 +731,10 @@ static bool reader_basic_navigation_header(lxb_dom_node_t *node)
                     for (size_t at = 0; parent != node && parent != NULL
                          && at < READER_EXTRACT_DEPTH_LIMIT;
                          parent = parent->parent, at++) {
-                        if (reader_name_is(parent, "a")
-                            || reader_name_is(parent, "button")
-                            || reader_name_is(parent, "label")
-                            || reader_name_is(parent, "option")) {
+                        if (document_node_is_tag(parent, LXB_TAG_A)
+                            || document_node_is_tag(parent, LXB_TAG_BUTTON)
+                            || document_node_is_tag(parent, LXB_TAG_LABEL)
+                            || document_node_is_tag(parent, LXB_TAG_OPTION)) {
                             label = true;
                             break;
                         }
@@ -681,19 +758,19 @@ static bool reader_basic_navigation_header(lxb_dom_node_t *node)
 
 static bool reader_header_is_page_chrome(lxb_dom_node_t *node)
 {
-    if (!reader_name_is(node, "header")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_HEADER)) return false;
     if (reader_header_is_link_masthead(node)) return true;
     lxb_dom_node_t *ancestor = node->parent;
     static const char *const content_roles[] = { "article", "main" };
     for (size_t depth = 0; ancestor != NULL && depth < 64u;
          depth++, ancestor = ancestor->parent) {
-        if (reader_name_is(ancestor, "article")
-            || reader_name_is(ancestor, "main")
+        if (document_node_is_tag(ancestor, LXB_TAG_ARTICLE)
+            || document_node_is_tag(ancestor, LXB_TAG_MAIN)
             || reader_attribute_has_any_token(
                 ancestor, "role", content_roles,
                 sizeof(content_roles) / sizeof(content_roles[0])))
             return false;
-        if (reader_name_is(ancestor, "body")) return true;
+        if (document_node_is_tag(ancestor, LXB_TAG_BODY)) return true;
     }
     /* A malformed or excessively deep ancestry must not let page chrome
        dominate the bounded Reader score. */
@@ -710,9 +787,7 @@ static bool reader_excluded_region(
     const PocDocument *document, lxb_dom_node_t *node)
 {
     if (reader_engine_media_marker(document, node)) return true;
-    if (reader_name_is(node, "nav") || reader_name_is(node, "aside")
-        || reader_name_is(node, "footer") || reader_name_is(node, "form")
-        || reader_name_is(node, "menu")
+    if ((reader_tag_classes(node) & READER_TAG_CHROME)
         || reader_header_is_page_chrome(node)) return true;
     static const char *const roles[] = {
         "banner", "navigation", "search", "complementary", "contentinfo"
@@ -730,7 +805,7 @@ static bool reader_document_has_video_element(PocDocument *document)
     size_t visited = 0u;
     while (node != NULL && node != boundary && visited++ < READER_NODE_LIMIT) {
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && reader_name_is(node, "video")
+            && document_node_is_tag(node, LXB_TAG_VIDEO)
             && !document_is_declared_video_card(document, node)) return true;
         if (node->first_child != NULL) {
             node = node->first_child;
@@ -745,7 +820,7 @@ static bool reader_document_has_video_element(PocDocument *document)
 
 static bool reader_primary_media_element(lxb_dom_node_t *node)
 {
-    if (!reader_name_is(node, "video") && !reader_name_is(node, "audio"))
+    if (!document_node_is_tag(node, LXB_TAG_VIDEO) && !document_node_is_tag(node, LXB_TAG_AUDIO))
         return false;
     size_t length = 0;
     const char *source = document_attribute(node, "src", &length);
@@ -759,7 +834,7 @@ static bool reader_primary_media_element(lxb_dom_node_t *node)
     if (source != NULL && length != 0) return true;
     for (lxb_dom_node_t *child = node->first_child;
          child != NULL; child = child->next) {
-        if (!reader_name_is(child, "source")) continue;
+        if (!document_node_is_tag(child, LXB_TAG_SOURCE)) continue;
         source = document_attribute(child, "src", &length);
         while (source != NULL && length != 0
                && isspace((unsigned char) source[0])) {
@@ -775,7 +850,7 @@ static bool reader_primary_media_element(lxb_dom_node_t *node)
 
 static bool reader_head_media_hint(lxb_dom_node_t *node)
 {
-    if (reader_name_is(node, "meta")) {
+    if (document_node_is_tag(node, LXB_TAG_META)) {
         size_t property_length = 0, content_length = 0;
         const char *property = document_attribute(
             node, "property", &property_length);
@@ -786,7 +861,7 @@ static bool reader_head_media_hint(lxb_dom_node_t *node)
                 property, property_length, "og:type")
             && reader_slice_contains_ci(content, content_length, "video");
     }
-    if (!reader_name_is(node, "script")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_SCRIPT)) return false;
     size_t type_length = 0;
     const char *type = document_attribute(node, "type", &type_length);
     if (type == NULL
@@ -825,7 +900,7 @@ static bool reader_document_head_media_hint(const PocDocument *document)
     lxb_dom_node_t *head = NULL;
     lxb_dom_node_t *node = root;
     for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
-        if (reader_name_is(node, "head")) {
+        if (document_node_is_tag(node, LXB_TAG_HEAD)) {
             head = node;
             break;
         }
@@ -1056,15 +1131,15 @@ static bool reader_basic_effectively_disabled(lxb_dom_node_t *node,
 {
     if (bounded_out != NULL) *bounded_out = false;
     if (reader_has_attribute(node, "disabled")) return true;
-    if (reader_name_is(node, "option")) {
+    if (document_node_is_tag(node, LXB_TAG_OPTION)) {
         lxb_dom_node_t *at = node == NULL ? NULL : node->parent;
         size_t visited = 0;
         for (; at != NULL && visited++ <= READER_EXTRACT_DEPTH_LIMIT;
              at = at->parent) {
-            if ((reader_name_is(at, "optgroup")
-                 || reader_name_is(at, "select"))
+            if ((document_node_is_tag(at, LXB_TAG_OPTGROUP)
+                 || document_node_is_tag(at, LXB_TAG_SELECT))
                 && reader_has_attribute(at, "disabled")) return true;
-            if (reader_name_is(at, "select")) {
+            if (document_node_is_tag(at, LXB_TAG_SELECT)) {
                 at = NULL;
                 break;
             }
@@ -1078,7 +1153,7 @@ static bool reader_basic_effectively_disabled(lxb_dom_node_t *node,
     size_t visited = 0;
     for (; at != NULL && visited++ <= READER_EXTRACT_DEPTH_LIMIT;
          at = at->parent) {
-        if (!reader_name_is(at, "fieldset")
+        if (!document_node_is_tag(at, LXB_TAG_FIELDSET)
             || !reader_has_attribute(at, "disabled")) continue;
         lxb_dom_node_t *legend = NULL;
         lxb_dom_node_t *child = at->first_child;
@@ -1086,7 +1161,7 @@ static bool reader_basic_effectively_disabled(lxb_dom_node_t *node,
         for (; child != NULL
                && children_visited++ < READER_BASIC_FORM_SCAN_LIMIT;
              child = child->next) {
-            if (reader_name_is(child, "legend")) {
+            if (document_node_is_tag(child, LXB_TAG_LEGEND)) {
                 legend = child;
                 break;
             }
@@ -1116,7 +1191,7 @@ static bool reader_basic_query_input(lxb_dom_node_t *node,
                                      bool *bounded_out)
 {
     if (bounded_out != NULL) *bounded_out = false;
-    if (!reader_name_is(node, "input")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_INPUT)) return false;
     size_t name_length = 0;
     const char *name = document_attribute(node, "name", &name_length);
     if (name == NULL || name_length == 0) return false;
@@ -1150,10 +1225,10 @@ static bool reader_basic_control_has_own_label(lxb_dom_node_t *node,
     size_t visited = 0;
     for (; at != NULL && visited++ <= READER_EXTRACT_DEPTH_LIMIT;
          at = at->parent) {
-        if (reader_name_is(at, "label")) return true;
-        if (reader_name_is(at, "form")) break;
+        if (document_node_is_tag(at, LXB_TAG_LABEL)) return true;
+        if (document_node_is_tag(at, LXB_TAG_FORM)) break;
     }
-    if (at != NULL && !reader_name_is(at, "form")
+    if (at != NULL && !document_node_is_tag(at, LXB_TAG_FORM)
         && bounded_out != NULL) *bounded_out = true;
     return false;
 }
@@ -1161,7 +1236,7 @@ static bool reader_basic_control_has_own_label(lxb_dom_node_t *node,
 static bool reader_basic_label_targets(
     lxb_dom_node_t *label, const char *id, size_t id_length)
 {
-    if (!reader_name_is(label, "label") || id == NULL || id_length == 0)
+    if (!document_node_is_tag(label, LXB_TAG_LABEL) || id == NULL || id_length == 0)
         return false;
     size_t for_length = 0;
     const char *for_value = document_attribute(label, "for", &for_length);
@@ -1176,7 +1251,7 @@ static bool reader_basic_form_admitted(lxb_dom_node_t *form,
                                        bool *bounded_out)
 {
     if (bounded_out != NULL) *bounded_out = false;
-    if (!reader_name_is(form, "form")
+    if (!document_node_is_tag(form, LXB_TAG_FORM)
         || !reader_basic_form_method_get(form)) return false;
     size_t label_length = 0;
     const char *form_label = document_attribute(
@@ -1230,7 +1305,7 @@ static bool reader_basic_form_admitted(lxb_dom_node_t *form,
 
 static bool reader_basic_submit_button(lxb_dom_node_t *node)
 {
-    if (!reader_name_is(node, "button")) return false;
+    if (!document_node_is_tag(node, LXB_TAG_BUTTON)) return false;
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
     return type == NULL || length == 0
@@ -1242,7 +1317,7 @@ static bool reader_basic_form_control(lxb_dom_node_t *node,
 {
     if (bounded_out != NULL) *bounded_out = false;
     if (reader_basic_effectively_disabled(node, bounded_out)) return false;
-    if (reader_name_is(node, "input")) {
+    if (document_node_is_tag(node, LXB_TAG_INPUT)) {
         size_t length = 0;
         const char *type = document_attribute(node, "type", &length);
         return type == NULL || length == 0
@@ -1251,7 +1326,7 @@ static bool reader_basic_form_control(lxb_dom_node_t *node,
             || reader_attribute_equals_ci_trimmed(node, "type", "hidden")
             || reader_attribute_equals_ci_trimmed(node, "type", "submit");
     }
-    if (reader_name_is(node, "select")) {
+    if (document_node_is_tag(node, LXB_TAG_SELECT)) {
         /* The Basic projection currently retains one selected option and its
            controller serializes one value. Refuse a multiple-select at the
            complete-extraction boundary rather than silently changing its
@@ -1265,7 +1340,7 @@ static bool reader_basic_form_control(lxb_dom_node_t *node,
         lxb_dom_node_t *at = node->first_child;
         for (; at != NULL && visited++ < READER_BASIC_SELECT_SCAN_LIMIT;
              at = reader_next_within(at, node)) {
-            if (reader_name_is(at, "option")
+            if (document_node_is_tag(at, LXB_TAG_OPTION)
                 && ++option_count > READER_BASIC_SELECT_OPTION_LIMIT) {
                 if (bounded_out != NULL) *bounded_out = true;
                 return false;
@@ -1277,8 +1352,8 @@ static bool reader_basic_form_control(lxb_dom_node_t *node,
         }
         return true;
     }
-    return reader_name_is(node, "option")
-        || reader_name_is(node, "textarea")
+    return document_node_is_tag(node, LXB_TAG_OPTION)
+        || document_node_is_tag(node, LXB_TAG_TEXTAREA)
         || reader_basic_submit_button(node);
 }
 
@@ -1287,40 +1362,21 @@ static const char *reader_extract_tag(lxb_dom_node_t *node,
                                       bool admitted_form,
                                       bool basic_control_safe)
 {
-    static const char *const tags[] = {
-        "article", "section", "main", "header", "h1", "h2", "h3", "h4",
-        "h5", "h6", "p", "ul", "ol", "li", "dl", "dt", "dd", "blockquote",
-        "figure", "figcaption", "table", "caption", "thead", "tbody",
-        "tfoot", "tr", "th",
-        "td", "pre", "code", "kbd", "samp", "a", "img", "picture",
-        "video", "audio", "source", "br", "hr", "strong", "em", "b",
-        "i", "time", "sup", "sub", "details", "summary", "abbr",
-        "mark", "cite", "q"
-    };
-    for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
-        if (reader_name_is(node, tags[i])) return tags[i];
-    if (basic_mode) {
-        static const char *const basic_tags[] = {
-            "nav", "aside", "footer", "menu", "address", "form",
-            "label", "input", "select", "option", "textarea", "button"
-        };
-        for (size_t i = 0;
-             i < sizeof(basic_tags) / sizeof(basic_tags[0]); i++) {
-            if (!reader_name_is(node, basic_tags[i])) continue;
-            if (reader_name_is(node, "form"))
-                return admitted_form ? "form" : NULL;
-            if (reader_name_is(node, "label"))
-                return admitted_form ? "label" : NULL;
-            if (reader_name_is(node, "input")
-                || reader_name_is(node, "select")
-                || reader_name_is(node, "option")
-                || reader_name_is(node, "textarea")
-                || reader_name_is(node, "button")) {
-                return admitted_form && basic_control_safe
-                    ? basic_tags[i] : NULL;
-            }
-            return basic_tags[i];
-        }
+    unsigned classes = reader_tag_classes(node);
+    /* The element's own (static, lower-case) name, as the old name table
+       returned it. */
+    const char *name = (classes & (READER_TAG_EXTRACT
+                                   | READER_TAG_EXTRACT_BASIC)) != 0
+        ? (const char *) lxb_tag_name_by_id(node->local_name, NULL) : NULL;
+    if (classes & READER_TAG_EXTRACT) return name;
+    if (basic_mode && (classes & READER_TAG_EXTRACT_BASIC)) {
+        if (document_node_is_tag(node, LXB_TAG_FORM))
+            return admitted_form ? "form" : NULL;
+        if (document_node_is_tag(node, LXB_TAG_LABEL))
+            return admitted_form ? "label" : NULL;
+        if (classes & READER_TAG_FORM_CONTROL)
+            return admitted_form && basic_control_safe ? name : NULL;
+        return name;
     }
     return NULL;
 }
@@ -1444,9 +1500,9 @@ static bool reader_extract_separator(ReaderExtractBuffer *output)
 
 static bool reader_flattened_block_wrapper(lxb_dom_node_t *node)
 {
-    return reader_name_is(node, "address") || reader_name_is(node, "center")
-        || reader_name_is(node, "dialog") || reader_name_is(node, "div")
-        || reader_name_is(node, "fieldset") || reader_name_is(node, "hgroup");
+    return document_node_is_tag(node, LXB_TAG_ADDRESS) || document_node_is_tag(node, LXB_TAG_CENTER)
+        || document_node_is_tag(node, LXB_TAG_DIALOG) || document_node_is_tag(node, LXB_TAG_DIV)
+        || document_node_is_tag(node, LXB_TAG_FIELDSET) || document_node_is_tag(node, LXB_TAG_HGROUP);
 }
 
 static bool reader_prune_when_empty(const char *tag)
@@ -1478,20 +1534,20 @@ static bool reader_layout_table(lxb_dom_node_t *table, bool *cancelled)
             *cancelled = true;
             return false;
         }
-        if (reader_name_is(node, "th") || reader_name_is(node, "caption")
+        if (document_node_is_tag(node, LXB_TAG_TH) || document_node_is_tag(node, LXB_TAG_CAPTION)
             || reader_has_attribute(node, "headers")
             || reader_has_attribute(node, "scope")) return false;
-        if (reader_name_is(node, "table") || reader_name_is(node, "h1")
-            || reader_name_is(node, "h2") || reader_name_is(node, "p")
-            || reader_name_is(node, "form") || reader_name_is(node, "nav"))
+        if (document_node_is_tag(node, LXB_TAG_TABLE) || document_node_is_tag(node, LXB_TAG_H1)
+            || document_node_is_tag(node, LXB_TAG_H2) || document_node_is_tag(node, LXB_TAG_P)
+            || document_node_is_tag(node, LXB_TAG_FORM) || document_node_is_tag(node, LXB_TAG_NAV))
             layout_content = true;
-        if (reader_name_is(node, "a")) links++;
-        if (reader_name_is(node, "tr")) rows++;
-        if (reader_name_is(node, "img")) images++;
-        if (reader_name_is(node, "td") && node->first_child == NULL) empty_cells++;
+        if (document_node_is_tag(node, LXB_TAG_A)) links++;
+        if (document_node_is_tag(node, LXB_TAG_TR)) rows++;
+        if (document_node_is_tag(node, LXB_TAG_IMG)) images++;
+        if (document_node_is_tag(node, LXB_TAG_TD) && node->first_child == NULL) empty_cells++;
         /* A nested table is itself layout evidence, not an invitation to
            classify its data cells as part of the outer table. */
-        if (!reader_name_is(node, "table") && node->first_child != NULL) {
+        if (!document_node_is_tag(node, LXB_TAG_TABLE) && node->first_child != NULL) {
             node = node->first_child;
             continue;
         }
@@ -1507,7 +1563,7 @@ static bool reader_previous_ends_link(lxb_dom_node_t *node)
 {
     lxb_dom_node_t *previous = node->prev;
     for (size_t depth = 0; previous != NULL && depth < 64u; depth++) {
-        if (reader_name_is(previous, "a")) return true;
+        if (document_node_is_tag(previous, LXB_TAG_A)) return true;
         previous = previous->last_child;
     }
     return false;
@@ -1561,11 +1617,11 @@ static bool reader_image_style_hidden(ReaderExtractBuffer *output,
     lxb_dom_node_t *ancestors[READER_EXTRACT_DEPTH_LIMIT];
     size_t depth = 0;
     for (lxb_dom_node_t *at = node;
-         at != NULL && !reader_name_is(at, "body")
-             && !reader_name_is(at, "html"); at = at->parent) {
+         at != NULL && !document_node_is_tag(at, LXB_TAG_BODY)
+             && !document_node_is_tag(at, LXB_TAG_HTML); at = at->parent) {
         if (depth == READER_EXTRACT_DEPTH_LIMIT) return false;
         if (reader_collapsed_disclosure(at)
-            || reader_name_is(at, "details")) return false;
+            || document_node_is_tag(at, LXB_TAG_DETAILS)) return false;
         if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         ancestors[depth++] = at;
     }
@@ -1672,7 +1728,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         || (!output->basic_mode
             && reader_excluded_region(output->document, node)))
         return true;
-    if (reader_name_is(node, "img")) {
+    if (document_node_is_tag(node, LXB_TAG_IMG)) {
         bool cancelled = false;
         bool hidden = reader_image_style_hidden(output, node, &cancelled);
         if (cancelled) {
@@ -1686,7 +1742,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     const uint16_t forms_checkpoint = output->retained_forms;
     const uint16_t controls_checkpoint = output->retained_controls;
     bool admitted_form = in_admitted_form;
-    if (reader_name_is(node, "form")) {
+    if (document_node_is_tag(node, LXB_TAG_FORM)) {
         admitted_form = false;
         bool form_scan_bounded = false;
         if (output->basic_mode && !in_admitted_form
@@ -1700,11 +1756,8 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         }
         if (form_scan_bounded) output->bounded_out = true;
     }
-    bool basic_control_node = reader_name_is(node, "input")
-        || reader_name_is(node, "select")
-        || reader_name_is(node, "option")
-        || reader_name_is(node, "textarea")
-        || reader_name_is(node, "button");
+    bool basic_control_node =
+        (reader_tag_classes(node) & READER_TAG_FORM_CONTROL) != 0;
     bool control_state_bounded = false;
     bool basic_control_safe = !basic_control_node
         || (output->basic_mode && admitted_form
@@ -1713,13 +1766,13 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     /* An unretained chooser is not prose. Flattening its option labels can
        put hundreds of hidden choices ahead of the page's actual content.
        Keep ordinary button text, but omit unusable select subtrees whole. */
-    if (reader_name_is(node, "select") && !basic_control_safe) return true;
+    if (document_node_is_tag(node, LXB_TAG_SELECT) && !basic_control_safe) return true;
     bool counted_control = basic_control_safe && output->basic_mode
         && admitted_form
-        && (reader_name_is(node, "input")
-            || reader_name_is(node, "select")
-            || reader_name_is(node, "textarea")
-            || reader_name_is(node, "button"));
+        && (document_node_is_tag(node, LXB_TAG_INPUT)
+            || document_node_is_tag(node, LXB_TAG_SELECT)
+            || document_node_is_tag(node, LXB_TAG_TEXTAREA)
+            || document_node_is_tag(node, LXB_TAG_BUTTON));
     bool control_admitted = true;
     if (counted_control) {
         if (output->retained_controls >= READER_BASIC_CONTROL_LIMIT) {
@@ -1733,7 +1786,7 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         ? reader_extract_tag(
               node, output->basic_mode, admitted_form, basic_control_safe)
         : NULL;
-    if (output->basic_mode && reader_name_is(node, "table")) {
+    if (output->basic_mode && document_node_is_tag(node, LXB_TAG_TABLE)) {
         bool cancelled = false;
         in_layout_table = reader_layout_table(node, &cancelled);
         if (cancelled) {
@@ -1742,15 +1795,15 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
         }
     }
     bool layout_cell = in_layout_table
-        && (reader_name_is(node, "th") || reader_name_is(node, "td"));
+        && (document_node_is_tag(node, LXB_TAG_TH) || document_node_is_tag(node, LXB_TAG_TD));
     if (in_layout_table) {
-        if (reader_name_is(node, "table") || reader_name_is(node, "tr")) tag = "div";
-        else if (layout_cell || reader_name_is(node, "thead")
-            || reader_name_is(node, "tbody") || reader_name_is(node, "tfoot"))
+        if (document_node_is_tag(node, LXB_TAG_TABLE) || document_node_is_tag(node, LXB_TAG_TR)) tag = "div";
+        else if (layout_cell || document_node_is_tag(node, LXB_TAG_THEAD)
+            || document_node_is_tag(node, LXB_TAG_TBODY) || document_node_is_tag(node, LXB_TAG_TFOOT))
             tag = NULL;
     }
     bool folded_navigation = output->basic_mode && !in_admitted_form
-        && (reader_name_is(node, "nav")
+        && (document_node_is_tag(node, LXB_TAG_NAV)
             || reader_header_is_link_masthead(node)
             || reader_basic_navigation_header(node)
             || reader_attribute_equals_ci_trimmed(node, "role", "navigation")
@@ -1988,9 +2041,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     bool child_in_admitted_form = admitted_form;
     if (output->basic_mode && admitted_form
         && (!control_admitted || !basic_control_safe)
-        && (reader_name_is(node, "select")
-            || reader_name_is(node, "textarea")
-            || reader_name_is(node, "button"))) {
+        && (document_node_is_tag(node, LXB_TAG_SELECT)
+            || document_node_is_tag(node, LXB_TAG_TEXTAREA)
+            || document_node_is_tag(node, LXB_TAG_BUTTON))) {
         child_in_admitted_form = false;
     }
     if (emitted && strcmp(tag, "textarea") == 0
@@ -2161,7 +2214,7 @@ static const char *reader_nested_image_alt(lxb_dom_node_t *anchor,
     lxb_dom_node_t *node = anchor;
     size_t visited = 0;
     while (node != NULL && node != boundary && visited++ < 64u) {
-        if (reader_name_is(node, "img")) {
+        if (document_node_is_tag(node, LXB_TAG_IMG)) {
             const char *alt = document_attribute(node, "alt", length);
             if (alt != NULL && *length != 0) return alt;
         }
@@ -2388,7 +2441,7 @@ static bool reader_mark_entry_parts(const ReaderNodeStat *stats,
     bool meta_marked = false;
     for (size_t i = container + 1u; i < count; i++) {
         if (!reader_descends_from(stats, (uint16_t) i, container)) break;
-        if (!thumbnail_marked && reader_name_is(stats[i].node, "img")) {
+        if (!thumbnail_marked && document_node_is_tag(stats[i].node, LXB_TAG_IMG)) {
             thumbnail_marked = reader_set_marker(
                 journal, stats[i].node,
                 "data-tilefinch-reader-thumb", "1");
@@ -2488,12 +2541,12 @@ static bool reader_article_is_clear(const ReaderNodeStat *stats,
     for (size_t i = root; i < end; i++) {
         const ReaderNodeStat *stat = &stats[i];
         if ((stat->flags & (READER_STAT_EXCLUDED | READER_STAT_OWN_STYLE_HIDDEN)) != 0) continue;
-        if (reader_name_is(stat->node, "h1")) titles++;
-        if ((reader_name_is(stat->node, "h2")
-             || reader_name_is(stat->node, "h3")
-             || reader_name_is(stat->node, "h4"))
+        if (document_node_is_tag(stat->node, LXB_TAG_H1)) titles++;
+        if ((document_node_is_tag(stat->node, LXB_TAG_H2)
+             || document_node_is_tag(stat->node, LXB_TAG_H3)
+             || document_node_is_tag(stat->node, LXB_TAG_H4))
             && reader_heading_links_away(stats, count, i)) headlines++;
-        if (reader_name_is(stat->node, "p")) {
+        if (document_node_is_tag(stat->node, LXB_TAG_P)) {
             paragraphs++;
             uint32_t own = reader_own_content(stat);
             if (own >= READER_AUTO_PROSE_PARAGRAPH_BYTES
@@ -2501,12 +2554,12 @@ static bool reader_article_is_clear(const ReaderNodeStat *stats,
                 prose_paragraphs++;
                 prose = reader_add_u32(prose, own);
             }
-        } else if (reader_name_is(stat->node, "pre")) {
+        } else if (document_node_is_tag(stat->node, LXB_TAG_PRE)) {
             prose = reader_add_u32(prose, reader_own_content(stat));
         }
     }
     if (headlines > READER_AUTO_HEADLINE_LINKS) return false;
-    if (reader_name_is(stats[root].node, "article")
+    if (document_node_is_tag(stats[root].node, LXB_TAG_ARTICLE)
         && (stats[root].flags & READER_STAT_HEADING) != 0) return true;
     return titles != 0u
         && prose_paragraphs >= READER_AUTO_PROSE_PARAGRAPHS
@@ -2573,16 +2626,16 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
         const ReaderNodeStat *stat = &stats[i];
         if ((stat->flags & READER_STAT_EXCLUDED) != 0
             || stat->text_bytes < 240u
-            || !(reader_name_is(stat->node, "article")
-                 || reader_name_is(stat->node, "main")
-                 || reader_name_is(stat->node, "section")
-                 || reader_name_is(stat->node, "div"))) continue;
+            || !(document_node_is_tag(stat->node, LXB_TAG_ARTICLE)
+                 || document_node_is_tag(stat->node, LXB_TAG_MAIN)
+                 || document_node_is_tag(stat->node, LXB_TAG_SECTION)
+                 || document_node_is_tag(stat->node, LXB_TAG_DIV))) continue;
         uint32_t content_bytes = stat->text_bytes > stat->link_bytes
             ? stat->text_bytes - stat->link_bytes : 0u;
         if (content_bytes <= stat->text_bytes / 2u) continue;
         uint32_t score = reader_add_u32(
             content_bytes, (uint32_t) stat->paragraphs * 80u);
-        if ((reader_name_is(stat->node, "main")
+        if ((document_node_is_tag(stat->node, LXB_TAG_MAIN)
              || reader_attribute_equals_ci_trimmed(stat->node, "role", "main"))
             && score > main_score) {
             main_score = score;
@@ -2592,9 +2645,9 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
            identical main/div wrapper. This also gives auto-Reader a concrete
            content-shape signal instead of treating every prose-heavy landing
            page as a high-confidence article. */
-        if (reader_name_is(stat->node, "article"))
+        if (document_node_is_tag(stat->node, LXB_TAG_ARTICLE))
             score = reader_add_u32(score, 160u);
-        if (reader_name_is(stat->node, "article")
+        if (document_node_is_tag(stat->node, LXB_TAG_ARTICLE)
             && content_bytes >= 600u && stat->paragraphs >= 3u
             && score > semantic_score) {
             semantic_score = score;
@@ -2644,8 +2697,8 @@ static bool reader_prepare_watch(const ReaderNodeStat *stats, size_t count,
         bool semantic_root = false;
         for (size_t depth = 0; winner != READER_INVALID_INDEX && depth < 6u;
              depth++) {
-            if (reader_name_is(stats[winner].node, "main")
-                || reader_name_is(stats[winner].node, "article")) {
+            if (document_node_is_tag(stats[winner].node, LXB_TAG_MAIN)
+                || document_node_is_tag(stats[winner].node, LXB_TAG_ARTICLE)) {
                 semantic_root = true;
                 break;
             }
@@ -2662,12 +2715,12 @@ static bool reader_prepare_watch(const ReaderNodeStat *stats, size_t count,
         for (size_t i = 1; i < count; i++) {
             const ReaderNodeStat *stat = &stats[i];
             if ((stat->flags & READER_STAT_EXCLUDED) != 0
-                || !(reader_name_is(stat->node, "main")
-                     || reader_name_is(stat->node, "article"))) continue;
+                || !(document_node_is_tag(stat->node, LXB_TAG_MAIN)
+                     || document_node_is_tag(stat->node, LXB_TAG_ARTICLE))) continue;
             uint32_t content = stat->text_bytes > stat->link_bytes
                 ? stat->text_bytes - stat->link_bytes : 0u;
             uint32_t score = reader_add_u32(content,
-                reader_name_is(stat->node, "article") ? 256u : 128u);
+                document_node_is_tag(stat->node, LXB_TAG_ARTICLE) ? 256u : 128u);
             if (score > best_score) {
                 best_score = score;
                 winner = (uint16_t) i;
@@ -2784,8 +2837,8 @@ static bool reader_install_extracted_tree(
             size_t title_start = article_root;
             for (uint16_t at = stats[article_root].parent;
                  at != READER_INVALID_INDEX; at = stats[at].parent) {
-                if (reader_name_is(stats[at].node, "article")) break;
-                if (reader_name_is(stats[at].node, "main")
+                if (document_node_is_tag(stats[at].node, LXB_TAG_ARTICLE)) break;
+                if (document_node_is_tag(stats[at].node, LXB_TAG_MAIN)
                     || reader_attribute_equals_ci_trimmed(
                         stats[at].node, "role", "main")) {
                     title_start = at;
@@ -2794,7 +2847,7 @@ static bool reader_install_extracted_tree(
             }
             for (size_t i = title_start; i < article_root; i++) {
                 if ((stats[i].flags & READER_STAT_EXCLUDED) == 0
-                    && reader_name_is(stats[i].node, "h1")) {
+                    && document_node_is_tag(stats[i].node, LXB_TAG_H1)) {
                     parts[0] = stats[i].node;
                     break;
                 }
@@ -2802,31 +2855,31 @@ static bool reader_install_extracted_tree(
             size_t end = reader_subtree_end(stats, count, article_root);
             for (size_t i = article_root; i < end; i++) {
                 if ((stats[i].flags & READER_STAT_EXCLUDED) != 0) continue;
-                if (parts[0] == NULL && reader_name_is(stats[i].node, "h1")) {
+                if (parts[0] == NULL && document_node_is_tag(stats[i].node, LXB_TAG_H1)) {
                     parts[0] = stats[i].node;
                     for (uint16_t at = stats[i].parent;
                          at != READER_INVALID_INDEX && at != article_root;
                          at = stats[at].parent) {
-                        if (reader_name_is(stats[at].node, "header")) {
+                        if (document_node_is_tag(stats[at].node, LXB_TAG_HEADER)) {
                             parts[0] = stats[at].node;
                             break;
                         }
                     }
                 }
-                if (parts[1] == NULL && reader_name_is(stats[i].node, "a")) {
+                if (parts[1] == NULL && document_node_is_tag(stats[i].node, LXB_TAG_A)) {
                     static const char *const author[] = {"author"};
                     if (reader_attribute_has_any_token(stats[i].node, "rel", author, 1u))
                         parts[1] = stats[i].node;
                 }
-                if (parts[2] == NULL && reader_name_is(stats[i].node, "p")
+                if (parts[2] == NULL && document_node_is_tag(stats[i].node, LXB_TAG_P)
                     && reader_own_content(&stats[i]) >= 120u) {
                     bool caption = false;
                     for (uint16_t at = stats[i].parent;
                          at != READER_INVALID_INDEX && at != article_root;
                          at = stats[at].parent)
-                        caption = caption || reader_name_is(stats[at].node, "figure")
-                            || reader_name_is(stats[at].node, "figcaption")
-                            || reader_name_is(stats[at].node, "li");
+                        caption = caption || document_node_is_tag(stats[at].node, LXB_TAG_FIGURE)
+                            || document_node_is_tag(stats[at].node, LXB_TAG_FIGCAPTION)
+                            || document_node_is_tag(stats[at].node, LXB_TAG_LI);
                     if (!caption) parts[2] = stats[i].node;
                 }
             }
@@ -3021,7 +3074,7 @@ static bool reader_document_prepare_internal(
                     || style_stack[depth].opacity == 0u);
             }
             bool excluded = reader_excluded_region(document, node);
-            bool link = reader_name_is(node, "a");
+            bool link = document_node_is_tag(node, LXB_TAG_A);
             if (hidden) hidden_depth++;
             if (style_hidden) style_hidden_depth++;
             if (excluded) excluded_depth++;
@@ -3042,14 +3095,14 @@ static bool reader_document_prepare_internal(
                 stat->own_flags |= READER_STAT_OWN_STYLE_HIDDEN;
             if (excluded) stat->own_flags |= READER_STAT_OWN_REGION;
             if (link) stat->own_flags |= READER_STAT_OWN_LINK;
-            if (reader_name_is(node, "img"))
+            if (document_node_is_tag(node, LXB_TAG_IMG))
                 stat->own_flags |= READER_STAT_IMAGE;
-            if (reader_name_is(node, "h1") || reader_name_is(node, "h2")
-                || reader_name_is(node, "h3"))
+            if (document_node_is_tag(node, LXB_TAG_H1) || document_node_is_tag(node, LXB_TAG_H2)
+                || document_node_is_tag(node, LXB_TAG_H3))
                 stat->own_flags |= READER_STAT_HEADING;
             /* Like text, a paragraph in hidden or excluded chrome does not
                count toward any candidate. */
-            if (reader_name_is(node, "p") && hidden_depth == 0
+            if (document_node_is_tag(node, LXB_TAG_P) && hidden_depth == 0
                 && excluded_depth == 0) stat->paragraphs = 1u;
             stat->flags |= stat->own_flags;
             bool media_element = hidden_depth == 0
@@ -3058,7 +3111,7 @@ static bool reader_document_prepare_internal(
             if (hidden_depth != 0 && reader_head_media_hint(node))
                 head_media_hint = true;
             primary_media = primary_media || media_element;
-            if (media_element && !reader_name_is(node, "meta")
+            if (media_element && !document_node_is_tag(node, LXB_TAG_META)
                 && primary_media_index == READER_INVALID_INDEX)
                 primary_media_index = (uint16_t) count;
             stack[depth++] = (uint16_t) count++;
@@ -3166,7 +3219,7 @@ static bool reader_document_prepare_internal(
         size_t entry_count = 0;
         memset(entries, 0, sizeof(entries));
         for (size_t i = 0; i < count; i++) {
-            if (!reader_name_is(stats[i].node, "a")
+            if (!document_node_is_tag(stats[i].node, LXB_TAG_A)
                 || (stats[i].flags & READER_STAT_EXCLUDED) != 0) continue;
             size_t href_length = 0;
             const char *href = document_attribute(

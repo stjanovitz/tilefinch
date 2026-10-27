@@ -9,8 +9,8 @@ points are compatibility wrappers around the same candidate-load machinery.
 
 `NavigationLoad` is the cooperative boundary:
 
-- `navigation_load_begin_url()`, `navigation_load_begin_request()`, and
-  `navigation_load_begin_sectioned()` create an opaque candidate;
+- `navigation_load_begin_url()` and `navigation_load_begin_request()` create
+  an opaque candidate;
 - `navigation_load_pump()` advances bounded transport, parser, resource,
   script, style, and layout work;
 - `navigation_load_finish()` adopts a completely prepared candidate;
@@ -45,15 +45,10 @@ Cancellation, transport failure, parser rejection, script failure, resource
 failure, or allocation refusal therefore leaves the incumbent page usable and
 returns candidate ownership to the budget.
 
-Remote compressed-section callbacks are bound to the incumbent until the
-candidate commits. A candidate never inherits callbacks into the previous
-document backing.
-
 ## Explicit low-memory replacement
 
 `NAVIGATION_REPLACEMENT_LOW_MEMORY` is an opt-in peak-memory tradeoff, never a
-profile default. It applies only to a streamed, non-sectioned URL replacing a
-live page.
+profile default. It applies only to a streamed URL replacing a live page.
 
 A bounded incumbent with a small author-script state may complete transport
 first, freeze an already-provisioned RGB565 frame, retire its DOM/runtime, and
@@ -150,8 +145,6 @@ constructed part of its document.
 - Enormous documents whose final DOM/layout exceed the content budget are
   rejected even though their response body can be streamed.
 - `document.write()` is unsupported.
-- The compressed-section representation is opt-in and has its narrower
-  replacement guarantee.
 - Live-site challenge clearance is not part of navigation.
 - Desktop replay timing is not PSP network or CPU timing.
 

@@ -471,6 +471,25 @@ static bool test_names(void)
                  "youtube-login") == 0);
     CHECK(strcmp(psp_input_script_setting_name(PSP_UI_SETTING_YOUTUBE_LOGIN),
                  "youtube-login") == 0);
+    /* Every setting has its own name, in enum order: the registry that
+       generates the enum also generates the names, so none falls through
+       to "unknown" (YouTube sign-in diagnostics once did). */
+    static const PspUiSettingId settings[] = {
+#define PSP_UI_SETTING(id, script_name) PSP_UI_SETTING_##id,
+#include "tilefinch/psp_ui_settings.def"
+#undef PSP_UI_SETTING
+    };
+    for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+        const char *name = psp_input_script_setting_name(settings[i]);
+        CHECK((size_t) settings[i] == i && strcmp(name, "unknown") != 0);
+        for (size_t j = 0; j < i; j++)
+            CHECK(strcmp(name, psp_input_script_setting_name(settings[j])) != 0);
+    }
+    CHECK(strcmp(psp_input_script_setting_name(
+                     PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS),
+                 "youtube-signin-diagnostics") == 0
+          && strcmp(psp_input_script_setting_name((PspUiSettingId) -1),
+                    "unknown") == 0);
     CHECK(strcmp(psp_input_script_button_name(PSP_UI_BUTTON_MENU),
                  "select") == 0);
     return true;
@@ -582,6 +601,43 @@ static bool test_treadline_long_soak_scenario(const char *directory)
           && strcmp(script.steps[11].mark, "webgl-measure-end") == 0);
     CHECK(script.steps[12].ticks == 10u
           && script.steps[13].kind == PSP_INPUT_SCRIPT_STEP_END);
+    return true;
+}
+
+/* The offline library page (offline_library_build_page) lists an
+   "Installed homebrew" link above the saved items, so from the unfocused
+   page the first Down lands on that link and the second on the item's
+   Play. One Down opened the homebrew page instead and the device journey
+   lost every media mark (and its later presses hit Delete). */
+static bool test_offline_youtube_live_scenario(const char *directory)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/offline-youtube-live.txt", directory);
+    static PspInputScript script;
+    warning_count = 0;
+    CHECK(psp_input_script_load(
+        &script, path, record_warning, NULL));
+    CHECK(warning_count == 0u);
+    size_t at = 0;
+    while (at < script.step_count
+           && !(script.steps[at].kind == PSP_INPUT_SCRIPT_STEP_MARK
+                && strcmp(script.steps[at].mark, "library") == 0)) at++;
+    CHECK(at < script.step_count);
+    size_t downs = 0;
+    for (at++; at < script.step_count
+               && script.steps[at].buttons != PSP_UI_BUTTON_CONFIRM; at++) {
+        if (script.steps[at].kind == PSP_INPUT_SCRIPT_STEP_MARK) break;
+        if (script.steps[at].buttons == 0u) continue;
+        CHECK(script.steps[at].buttons == PSP_UI_BUTTON_DOWN);
+        downs++;
+    }
+    CHECK(at < script.step_count
+          && script.steps[at].buttons == PSP_UI_BUTTON_CONFIRM);
+    CHECK(downs == 2u);
+    for (at++; at < script.step_count
+               && script.steps[at].kind != PSP_INPUT_SCRIPT_STEP_MARK; at++) {}
+    CHECK(at < script.step_count
+          && strcmp(script.steps[at].mark, "opened") == 0);
     return true;
 }
 
@@ -815,7 +871,8 @@ int main(int argc, char **argv)
         || !test_every_scenario_loads(directory)
         || !test_live_media_scenario(directory)
         || !test_treadline_long_soak_scenario(directory)
-        || !test_treadline_offline_controls_scenario(directory)) return 1;
+        || !test_treadline_offline_controls_scenario(directory)
+        || !test_offline_youtube_live_scenario(directory)) return 1;
 
     if (update) {
         FILE *out = fopen(golden_path, "wb");

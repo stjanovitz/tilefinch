@@ -1467,7 +1467,8 @@ static bool synchronize_dom_focus(BrowserController *controller,
        focus handlers or focus styling mutate that borrowed DOM. Do not move
        scroll or dispatch events reentrantly at this presentation boundary. */
     controller->has_authored_focus_outline = false;
-    if (!tilefinch_platform_cooperate("page-focus-feedback", 1)) return false;
+    if (!tilefinch_platform_cooperate_at(
+            "page-focus-feedback", 1, TILEFINCH_COOPERATE_FOCUS_FEEDBACK)) return false;
     if (navigation->page.runtime != NULL) {
         /*
          * Focus movement is a user-agent operation. A page-realm failure
@@ -1782,6 +1783,176 @@ bool controller_focus_direction(BrowserController *controller,
                || direction == CONTROLLER_FOCUS_LEFT
            ? controller_focus_previous(controller)
            : controller_focus_next(controller);
+}
+
+/* ---- Focus moves over a bounded focus layout ---------------------------
+
+   A provisional layout (NavigationPage bounded_focus_region_end) holds its
+   links and controls in the complete layout's order up to its traversal
+   cut (LayoutDocument preview_cut_*); entries past the cut, and those the
+   cut left out, lie at or below region_end (the navigation proved that
+   before publishing it). A move is answered by the provisional layout when
+   it never consults anything else: these mirror controller_focus_relative
+   and controller_focus_direction without moving focus. */
+static bool focus_flat_exact(const LayoutDocument *layout, size_t flat)
+{
+    if (flat < layout->link_count)
+        return flat < layout->preview_cut_link_count;
+    flat -= layout->link_count;
+    return flat < layout->control_count
+        && flat < layout->preview_cut_control_count;
+}
+
+static bool focus_flat_reveal_within(const BrowserController *controller,
+                                     size_t flat, int region_end)
+{
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    bool control = flat >= layout->link_count;
+    size_t index = control ? flat - layout->link_count : flat;
+    int y = 0, height = 0;
+    return focus_region_rect(controller, control, index, false,
+                             NULL, &y, NULL, &height)
+        && (int64_t) y + height + controller->viewport_height
+               <= region_end;
+}
+
+static bool focus_current_flat(const BrowserController *controller,
+                               size_t *flat, lxb_dom_node_t **node)
+{
+    *node = NULL;
+    if (controller->focus_kind != CONTROLLER_FOCUS_LINK
+        && controller->focus_kind != CONTROLLER_FOCUS_CONTROL) return false;
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    *node = retained_focus_node(controller);
+    bool control = false;
+    size_t index = 0;
+    if (*node == NULL || !layout_focus_for_node(layout, *node, &control, &index))
+        return false;
+    *flat = control ? layout->link_count + index : index;
+    return focus_flat_exact(layout, *flat);
+}
+
+static bool focus_relative_within(const BrowserController *controller,
+                                  bool forward, int region_end)
+{
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    size_t count = focus_count(controller);
+    if (count == 0) return false;
+    lxb_dom_node_t *current = NULL;
+    size_t at = 0;
+    bool had_focus = controller->focus_kind == CONTROLLER_FOCUS_LINK
+        || controller->focus_kind == CONTROLLER_FOCUS_CONTROL;
+    if (had_focus) {
+        if (!focus_current_flat(controller, &at, &current)) return false;
+    } else if (!forward) {
+        return false; /* starts at the last entry: past the cut */
+    }
+    /* Never wrap and never cross from links to controls (or back): the
+       complete layout has entries past the cut at either seam, and every
+       link precedes every control in this order. */
+    bool start_in_links = !had_focus || at < layout->link_count;
+    size_t candidate = at;
+    for (size_t visited = 0; visited < count; visited++) {
+        if (forward) {
+            candidate = had_focus || visited != 0 ? candidate + 1u : 0u;
+            if (candidate >= count
+                || (start_in_links && candidate >= layout->link_count))
+                return false;
+        } else {
+            if (candidate == 0 || candidate == layout->link_count)
+                return false;
+            candidate--;
+        }
+        if (!focus_flat_exact(layout, candidate)) return false;
+        bool control = candidate >= layout->link_count;
+        size_t index = control ? candidate - layout->link_count : candidate;
+        int width = control ? layout->controls[index].width
+                            : layout->links[index].width;
+        int height = control ? layout->controls[index].height
+                             : layout->links[index].height;
+        if (width <= 0 || height <= 0) continue;
+        lxb_dom_node_t *node = flat_focus_node(layout, candidate);
+        if (node == NULL || (current != NULL && node == current)) continue;
+        return focus_flat_reveal_within(controller, candidate, region_end);
+    }
+    return false;
+}
+
+bool controller_focus_move_within(const BrowserController *controller,
+                                  bool relative, bool forward,
+                                  ControllerFocusDirection direction,
+                                  int region_end)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || region_end <= 0) return false;
+    if (relative) return focus_relative_within(controller, forward, region_end);
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    int from_x = 0, from_y = 0, from_width = 0, from_height = 0;
+    if (!controller_focused_rect(controller, &from_x, &from_y,
+                                 &from_width, &from_height))
+        return focus_relative_within(
+            controller, direction == CONTROLLER_FOCUS_DOWN
+                || direction == CONTROLLER_FOCUS_RIGHT, region_end);
+    if ((int64_t) from_y + from_height >= region_end) return false;
+    lxb_dom_node_t *from_node = retained_focus_node(controller);
+    bool found = false, best_in_beam = false;
+    size_t best_flat = 0;
+    int64_t best_score = INT64_MAX;
+    for (size_t kind = 0; kind < 2; kind++) {
+        bool control = kind != 0;
+        size_t region_count =
+            control ? layout->control_count : layout->link_count;
+        for (size_t index = 0; index < region_count; index++) {
+            lxb_dom_node_t *node = control ? layout->controls[index].node
+                                           : layout->links[index].node;
+            if (node == NULL || node == from_node) continue;
+            int x = 0, y = 0, width = 0, height = 0;
+            if (!focus_region_rect(controller, control, index, true,
+                                   &x, &y, &width, &height)) continue;
+            size_t flat = control ? layout->link_count + index : index;
+            /* An entry laid out past the cut may sit elsewhere in the
+               complete layout: it must lie where nothing could prefer it. */
+            if (!focus_flat_exact(layout, flat) && y < region_end)
+                return false;
+            int64_t score = 0;
+            bool in_beam = false;
+            if (!focus_candidate_score(
+                    direction, from_x, from_y, from_width, from_height,
+                    x, y, width, height, controller->viewport_height,
+                    &score, &in_beam)) continue;
+            if (found && best_in_beam && !in_beam) continue;
+            if (found && best_in_beam == in_beam && score >= best_score)
+                continue;
+            best_score = score;
+            best_in_beam = in_beam;
+            best_flat = flat;
+            found = true;
+        }
+    }
+    if (!found)
+        return focus_relative_within(
+            controller, direction == CONTROLLER_FOCUS_DOWN
+                || direction == CONTROLLER_FOCUS_RIGHT, region_end);
+    if (!focus_flat_exact(layout, best_flat)
+        || !focus_flat_reveal_within(controller, best_flat, region_end))
+        return false;
+    /* The least score any entry at or below region_end could have. */
+    int64_t from_cy = (int64_t) from_y * 2 + from_height;
+    int64_t from_bottom = (int64_t) from_y + from_height;
+    int64_t penalty = (int64_t) (controller->viewport_height > 0
+        ? controller->viewport_height : 272) * 512 + 1;
+    switch (direction) {
+        case CONTROLLER_FOCUS_UP:
+            return true; /* nothing below the focus moves up to it */
+        case CONTROLLER_FOCUS_DOWN:
+            return best_in_beam
+                && best_score < (2 * (int64_t) region_end - from_cy) * 1024;
+        case CONTROLLER_FOCUS_LEFT:
+        case CONTROLLER_FOCUS_RIGHT:
+            return best_in_beam
+                || best_score < penalty + ((int64_t) region_end - from_bottom) * 64;
+    }
+    return false;
 }
 
 typedef struct {

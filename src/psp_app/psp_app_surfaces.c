@@ -363,8 +363,7 @@ static void psp_home_set_row(
 static bool psp_home_local_url(const char *url)
 {
     return url == NULL || url[0] == '\0'
-        || psp_ui_internal_url(url)
-        || strncmp(url, "tilefinch://", 12u) == 0;
+        || psp_local_route_classify(url).kind != PSP_LOCAL_ROUTE_WEB;
 }
 
 /*
@@ -485,9 +484,25 @@ void psp_show_native_home(PspApp *app)
  * Returns true when the surface is now showing, in which case the caller
  * must not start a page load.
  */
+void psp_open_native_collections(
+    PspApp *app, PspUiCollectionSection section, bool reopen)
+{
+    if (app == NULL) return;
+    PspUiState *ui = &app->process->presentation.ui;
+    if (section == PSP_UI_COLLECTION_OFFLINE)
+        (void) offline_library_load(&app->browser->offline_store.library);
+    if (reopen || ui->screen != PSP_UI_SCREEN_COLLECTIONS)
+        psp_ui_show_collections(ui, section);
+    psp_collections_sync_ui(
+        ui, &app->process->presentation.collections_surface,
+        app->browser->profile, &app->browser->offline_store, section);
+}
+
 bool psp_route_native_home(PspApp *app, const char *url)
 {
-    if (app == NULL || !psp_ui_native_home_url(url)) return false;
+    if (app == NULL
+        || psp_local_route_classify(url).kind != PSP_LOCAL_ROUTE_NATIVE_HOME)
+        return false;
     psp_show_native_home(app);
     return true;
 }
@@ -778,5 +793,416 @@ const char *psp_home_target_url(
         case PSP_HOME_TARGET_NONE:
         default:
             return NULL;
+    }
+}
+
+/* Opens the selected COLLECTIONS row (bookmark, history entry, saved page, download or offline app). */
+__attribute__((noinline))
+void psp_app_collection_activate(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent, const uint16_t *engine_frame)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    BrowserTabs *tabs = app->browser->tabs;
+    /* The pre-dispatch present has now published the pressed row.
+       Clear that transient bit in this cold receiver before package
+       I/O; a failed open must return to an ordinary selected row. */
+    app->process->presentation.ui.collections_delete_confirmation = 0;
+    if (app->process->presentation.ui.collections_section
+            == PSP_UI_COLLECTION_SCREENSHOTS) {
+        psp_text_input_before_navigation(&app->process->text_input);
+        psp_leave_reader_for_navigation(
+            engine, &app->process->presentation.ui, profile,
+            "https://tilefinch.local/screenshots");
+        bool opened = psp_open_screenshot_list(
+            engine, app->process->install_paths.data_dir, true);
+        if (opened)
+            psp_ui_leave_native_surface(
+                &app->process->presentation.ui);
+        (void) psp_engine_views_refresh(app->views, engine);
+        psp_sync_ui(
+            &app->process->presentation.ui, engine, profile);
+        if (opened && tabs != NULL)
+            (void) browser_tabs_capture_active(
+                tabs, app->views->navigation);
+        psp_tabs_sync_ui(
+            &app->process->presentation.ui, tabs,
+            &app->process->presentation.tab_view);
+        frame->page_dirty = opened || frame->page_dirty;
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            opened ? "SCREENSHOTS" : "SCREENSHOTS UNAVAILABLE",
+            180);
+        return;
+    }
+    const char *destination = psp_collections_row_url(
+        &app->process->presentation.collections_surface, intent->list_index);
+    if (destination == NULL) {
+        psp_ui_show_status(&app->process->presentation.ui, "NOTHING TO OPEN", 120);
+        return;
+    }
+    if (app->process->presentation.ui.collections_section
+            == PSP_UI_COLLECTION_SAVED
+        || app->process->presentation.ui.collections_section
+            == PSP_UI_COLLECTION_DOWNLOADS) {
+        uint32_t selected_id =
+            app->process->presentation.collections_surface.id[
+                intent->list_index];
+        const OfflineLibraryItem *selected_item =
+            offline_library_find(
+                &app->browser->offline_store.library, selected_id);
+        if (app->process->presentation.ui.collections_section
+                == PSP_UI_COLLECTION_DOWNLOADS
+            && selected_item != NULL
+            && selected_item->state != OFFLINE_ITEM_READY) {
+            uint32_t active_id = 0;
+            bool active = offline_download_manager_active(
+                &app->browser->offline_store.download, &active_id)
+                && active_id == selected_id;
+            bool changed = active
+                ? offline_download_manager_pause(
+                      &app->browser->offline_store.download,
+                      selected_id)
+                : offline_download_manager_start(
+                      &app->browser->offline_store.download,
+                      selected_id);
+            psp_collections_sync_ui(
+                &app->process->presentation.ui,
+                &app->process->presentation.collections_surface,
+                profile, &app->browser->offline_store,
+                PSP_UI_COLLECTION_DOWNLOADS);
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                changed ? (active ? "DOWNLOAD PAUSED"
+                                  : "DOWNLOAD RESUMED")
+                        : "DOWNLOAD STATE DID NOT CHANGE",
+                180);
+            return;
+        }
+        /* Bytecode from an older engine: offer to recompile it
+           (with Open anyway) rather than a silent slow start. */
+        if (selected_item != NULL
+            && selected_item->type == OFFLINE_ITEM_WEB_APP
+            && psp_offline_store_offer_recompile(
+                   &app->browser->offline_store, selected_id)) {
+            psp_ui_show_offline_app_offer(
+                &app->process->presentation.ui,
+                psp_offline_store_app_preview(
+                    &app->browser->offline_store));
+            return;
+        }
+        char offline_url[NAVIGATION_URL_LIMIT];
+        bool fullscreen_offline_app = selected_item != NULL
+            && selected_item->type == OFFLINE_ITEM_WEB_APP
+            && selected_item->app_display_mode
+               == TILEFINCH_WEB_APP_DISPLAY_FULLSCREEN;
+        snprintf(
+            offline_url, sizeof(offline_url),
+            "https://tilefinch.local/offline/%s?id=%u",
+            selected_item != NULL
+                    && selected_item->type == OFFLINE_ITEM_YOUTUBE
+                ? "video"
+                : selected_item != NULL
+                      && selected_item->type == OFFLINE_ITEM_WEB_APP
+                    ? "app" : selected_item != NULL
+                        && selected_item->type == OFFLINE_ITEM_FILE ? "file" : "article",
+            (unsigned) selected_id);
+        if (selected_id == 0)
+            snprintf(offline_url, sizeof(offline_url), "https://tilefinch.local/offline/homebrew");
+        psp_text_input_before_navigation(&app->process->text_input);
+        psp_ui_leave_native_surface(&app->process->presentation.ui);
+        psp_leave_reader_for_navigation(
+            engine, &app->process->presentation.ui, profile, offline_url);
+        PspOfflineRouteResult offline_result =
+            psp_offline_store_handle_url(
+                &app->browser->offline_store, engine, profile,
+                offline_url, NULL,
+                true);
+        (void) psp_engine_views_refresh(app->views, engine);
+        psp_sync_ui(&app->process->presentation.ui, engine, profile);
+        bool offline_opened =
+            offline_result == PSP_OFFLINE_ROUTE_PAGE;
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+        if (offline_opened) {
+            /* Native Home speculatively owns a BOOT request so the
+               first online navigation can reuse association work.
+               An offline item must not inherit that work or let the
+               warmup monopolize the idle lane needed by its local
+               dynamic scripts. Releasing only BOOT preserves any
+               explicit navigation or multiplayer owner. */
+            psp_network_lifecycle_request(
+                app->network_lifecycle, PSP_NETWORK_REQUEST_BOOT,
+                false, (int) app->process->config.network_profile,
+                app->network, PSP_NETWORK_SUPERVISOR_STATE_COUNT,
+                "offline-open");
+        }
+#endif
+        if (offline_opened && tabs != NULL)
+            (void) browser_tabs_capture_active(
+                tabs, app->views->navigation);
+        psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+        frame->page_dirty = offline_opened || frame->page_dirty;
+        if (offline_opened) {
+            /* OPENING OFFLINE LIBRARY belongs to the native surface.
+               Once its selected page is committed, carrying that
+               toast over the app's menu obscures the user's next
+               interaction and makes a completed handoff look busy. */
+            app->process->presentation.ui.status[0] = '\0';
+            app->process->presentation.ui.toast_frames = 0u;
+            app->process->presentation.ui.toast_entry_frames = 0u;
+            /* A fullscreen installed app was selected from trusted
+               native Library chrome, so honor its captured manifest
+               presentation immediately. This only retracts browser
+               chrome: Triangle remains available, while page input
+               capture and DOM fullscreen still require activation. */
+            if (fullscreen_offline_app) {
+                app->process->presentation.ui.chrome_visible = false;
+                app->process->presentation.ui.cursor_visible = false;
+            }
+        } else
+            psp_ui_show_collections(
+                &app->process->presentation.ui, (PspUiCollectionSection)
+                         app->process->presentation.ui.collections_section);
+        /* A successful Saved launch is its own acknowledgement: the
+           selected page replaces Collections immediately.  Do not
+           cover the game's first useful frame with a generic type
+           label.  Failures retain the store's actionable detail. */
+        if (!offline_opened)
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                psp_offline_store_status(
+                    &app->browser->offline_store),
+                180);
+        return;
+    }
+    char destination_copy[NAVIGATION_URL_LIMIT];
+    snprintf(destination_copy, sizeof(destination_copy),
+             "%s", destination);
+    /* A bookmark or history row saved before the start page became
+       native chrome still holds its URL. Route it to the surface
+       instead of fetching a host that no longer answers. The copy
+       is made first because showing HOME rebuilds the surfaces the
+       row pointer came from. */
+    if (psp_route_native_home(app, destination_copy)) return;
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    if (!psp_action_network_ready(
+            app, "GET", destination_copy, engine_frame))
+        return;
+#endif
+    psp_ui_leave_native_surface(&app->process->presentation.ui);
+    if (psp_begin_page_load(
+            engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
+            destination_copy, true, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS)) {
+        app->interactive->navigation_job_started_us =
+            (uint64_t) sceKernelGetSystemTimeWide();
+    } else {
+        psp_ui_show_collections(
+            &app->process->presentation.ui, (PspUiCollectionSection)
+                     app->process->presentation.ui.collections_section);
+    }
+}
+
+/* Opens, switches to or closes a tab and lands on its destination. */
+__attribute__((noinline))
+void psp_app_tab_request(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent, const uint16_t *engine_frame)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    BrowserTabs *tabs = app->browser->tabs;
+    const char *tab_hibernation_path = app->process->storage.tab_hibernation;
+    if (browser_session_captive_portal_active(
+            app->browser->session)) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "FINISH OR CANCEL WI-FI SIGN-IN FIRST", 180);
+        return;
+    }
+    const char *homepage_url =
+        browser_profile_custom_homepage_enabled(profile)
+        ? BROWSER_PROFILE_HOMEPAGE_URL
+        : TILEFINCH_HOMEPAGE_URL;
+    char destination[NAVIGATION_URL_LIMIT] = {0};
+    PspTabRequestResult result = psp_tabs_request(
+        tabs, app->views->navigation,
+        !psp_ui_screen_is_native_surface(
+            (PspUiScreen) app->process->presentation.ui.base_screen),
+        intent->action,
+        intent->tab_index, homepage_url,
+        tab_hibernation_path, &app->interactive->tab_transition, destination);
+    if (result != PSP_TAB_REQUEST_REFUSED
+        && result != PSP_TAB_REQUEST_HIBERNATION_FAILED) {
+        if (intent->action == PSP_UI_ACTION_CLOSE_TAB)
+            psp_tabs_remove_thumbnail(
+                &app->process->presentation.tab_view, intent->tab_index);
+        else if (intent->action == PSP_UI_ACTION_NEW_TAB)
+            psp_tabs_invalidate_thumbnail(
+                &app->process->presentation.tab_view,
+                browser_tabs_active_index(tabs));
+    }
+    if (result == PSP_TAB_REQUEST_HIBERNATION_FAILED) {
+        psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "HIBERNATED TAB COULD NOT OPEN", 240);
+    } else if (result == PSP_TAB_REQUEST_REFUSED) {
+        psp_ui_show_status(
+            &app->process->presentation.ui, tabs == NULL
+                ? "TABS UNAVAILABLE"
+                : (browser_tabs_count(tabs) >=
+                           BROWSER_TAB_LIMIT
+                       && intent->action
+                              == PSP_UI_ACTION_NEW_TAB
+                       ? "FIVE TAB LIMIT"
+                       : "KEEP ONE TAB OPEN"),
+            180);
+    } else if (result == PSP_TAB_REQUEST_COMPLETE) {
+        psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            intent->action == PSP_UI_ACTION_CLOSE_TAB
+                ? "TAB CLOSED" : "TAB ALREADY OPEN",
+            120);
+    } else {
+        PspLocalRoute tab_route = psp_local_route_classify(destination);
+        PspLocalOpen tab_open = psp_local_route_open(
+            &tab_route, PSP_ROUTE_ORIGIN_TAB);
+        /* COLLECTIONS answers a legacy address or the /offline
+           root; the classifier names the section for both. */
+        PspUiCollectionSection legacy_section = tab_route.section;
+        if (tab_open == PSP_LOCAL_OPEN_NATIVE_HOME) {
+            bool opened = psp_tabs_finish_native_home(
+                tabs, &app->interactive->tab_transition,
+                browser_profile_tab_hibernation_enabled(profile),
+                tab_hibernation_path);
+            /* The tab transition has to settle first, so this arm
+               shows HOME only on success and syncs the strip either
+               way; psp_show_native_home covers the success half. */
+            if (opened) psp_show_native_home(app);
+            else psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+            psp_ui_show_status(
+                &app->process->presentation.ui, opened ? "HOME" : "TAB COULD NOT OPEN",
+                120);
+        } else if (tab_open == PSP_LOCAL_OPEN_COLLECTIONS) {
+            /* A restored tab still pointing at a pre-upgrade
+               collections URL opens the native surface, not
+               the retired HTML generator. Settle the tab
+               transition as a non-load and show COLLECTIONS
+               on the section with its rows synced, the same
+               show/sync pair the menu's SHOW_* actions use. */
+            (void) psp_tabs_finish(
+                tabs, engine, &app->interactive->tab_transition, false,
+                browser_profile_tab_hibernation_enabled(
+                    profile),
+                tab_hibernation_path);
+            psp_open_native_collections(app, legacy_section, false);
+            (void) psp_engine_views_refresh(app->views, engine);
+            psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+        } else if (tab_open == PSP_LOCAL_OPEN_PROFILE_PAGE) {
+            psp_text_input_before_navigation(&app->process->text_input);
+            bool opened = psp_profile_open_page(
+                engine, &app->process->presentation.ui, profile,
+                tab_route.profile_page);
+            if (opened)
+                psp_ui_leave_native_surface(&app->process->presentation.ui);
+            (void) psp_engine_views_refresh(app->views, engine);
+            bool restored = psp_tabs_finish(
+                tabs, engine, &app->interactive->tab_transition, opened,
+                browser_profile_tab_hibernation_enabled(
+                    profile),
+                tab_hibernation_path);
+            (void) psp_engine_views_refresh(app->views, engine);
+            frame->page_dirty = opened || frame->page_dirty;
+            psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+            psp_ui_show_status(
+                &app->process->presentation.ui, opened && restored
+                    ? "TAB READY" : "TAB COULD NOT OPEN",
+                180);
+        } else if (tab_open == PSP_LOCAL_OPEN_SCREENSHOTS) {
+            /* The screenshot list is generated on the device, like
+               Reload and Back/Forward regenerate it; loading its
+               address would ask a host nothing serves. */
+            psp_text_input_before_navigation(&app->process->text_input);
+            bool opened = psp_open_screenshot_list(
+                engine, app->process->install_paths.data_dir, false);
+            if (opened)
+                psp_ui_leave_native_surface(&app->process->presentation.ui);
+            (void) psp_engine_views_refresh(app->views, engine);
+            bool restored = psp_tabs_finish(
+                tabs, engine, &app->interactive->tab_transition, opened,
+                browser_profile_tab_hibernation_enabled(
+                    profile),
+                tab_hibernation_path);
+            (void) psp_engine_views_refresh(app->views, engine);
+            psp_sync_ui(&app->process->presentation.ui, engine, profile);
+            frame->page_dirty = opened || frame->page_dirty;
+            psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+            psp_ui_show_status(
+                &app->process->presentation.ui, opened && restored
+                    ? "TAB READY" : "TAB COULD NOT OPEN",
+                180);
+        } else if (tab_open == PSP_LOCAL_OPEN_OFFLINE) {
+            psp_text_input_before_navigation(&app->process->text_input);
+            psp_leave_reader_for_navigation(
+                engine, &app->process->presentation.ui, profile, destination);
+            PspOfflineRouteResult offline_result =
+                psp_offline_store_handle_url(
+                    &app->browser->offline_store, engine, profile,
+                    destination,
+                    NULL, false);
+            bool opened =
+                offline_result == PSP_OFFLINE_ROUTE_PAGE;
+            if (opened)
+                psp_ui_leave_native_surface(&app->process->presentation.ui);
+            (void) psp_engine_views_refresh(app->views, engine);
+            bool restored = psp_tabs_finish(
+                tabs, engine, &app->interactive->tab_transition, opened,
+                browser_profile_tab_hibernation_enabled(
+                    profile),
+                tab_hibernation_path);
+            (void) psp_engine_views_refresh(app->views, engine);
+            psp_sync_ui(&app->process->presentation.ui, engine, profile);
+            frame->page_dirty = opened || frame->page_dirty;
+            psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+            psp_ui_show_status(
+                &app->process->presentation.ui, opened && restored
+                    ? "TAB READY" : "TAB COULD NOT OPEN",
+                180);
+        } else {
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            if (strcmp(app->process->config.trace, "none") == 0
+                && !psp_ensure_network_for_navigation(
+                       app->network, app->network_lifecycle,
+                       (int) app->process->config.network_profile,
+                       "GET", destination, true,
+                       engine_frame, &app->process->presentation.ui)) {
+                (void) psp_tabs_finish(
+                    tabs, engine, &app->interactive->tab_transition, false,
+                    browser_profile_tab_hibernation_enabled(
+                        profile),
+                    tab_hibernation_path);
+                psp_tabs_sync_ui(
+                    &app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+                app->interactive->previous_buttons = psp_ui_buttons(
+                    psp_navigation_observed_buttons());
+                return;
+            }
+#endif
+            bool started = psp_begin_page_load(
+                engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
+                destination, false, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
+            if (started) {
+                psp_ui_leave_native_surface(&app->process->presentation.ui);
+                app->interactive->navigation_job_started_us =
+                    (uint64_t) sceKernelGetSystemTimeWide();
+            } else {
+                (void) psp_tabs_finish(
+                    tabs, engine, &app->interactive->tab_transition, false,
+                    browser_profile_tab_hibernation_enabled(
+                        profile),
+                    tab_hibernation_path);
+                psp_tabs_sync_ui(
+                    &app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
+            }
+        }
     }
 }

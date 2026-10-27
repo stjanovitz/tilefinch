@@ -924,22 +924,6 @@ site_policy_done:;
         && text_info.editable && !text_info.multiline;
 }
 
-void psp_sync_video_preferences(
-    PspUiState *ui, const BrowserProfile *profile)
-{
-    if (ui == NULL || profile == NULL) return;
-    ui->video_language = (uint8_t)
-        browser_profile_video_language(profile);
-    ui->subtitle_language = (uint8_t)
-        browser_profile_subtitle_language(profile);
-    ui->alternate_language = (uint8_t)
-        browser_profile_alternate_language(profile);
-    ui->subtitle_size = (uint8_t)
-        browser_profile_subtitle_size(profile);
-    ui->subtitle_background = (uint8_t)
-        browser_profile_subtitle_background(profile);
-}
-
 bool psp_engine_views_refresh(
     PspEngineViews *views, const BrowserEngine *engine)
 {
@@ -951,4 +935,86 @@ bool psp_engine_views_refresh(
     views->navigation = snapshot.navigation;
     views->controller = snapshot.controller;
     return available;
+}
+
+/* Captures the visible frame and starts the bounded PNG writer. */
+__attribute__((noinline))
+void psp_app_take_screenshot(
+    PspApp *app, const uint16_t *engine_frame)
+{
+    Budget *budget = app->browser->budget;
+    if (app->interactive->screenshot.writer.status
+            == SCREENSHOT_PNG_PENDING) {
+        psp_ui_show_status(
+            &app->process->presentation.ui, "SCREENSHOT ALREADY SAVING", 180);
+        return;
+    }
+    char destination[SCREENSHOT_PNG_PATH_CAPACITY] = {0};
+    PspScreenshotDestination destination_status =
+        psp_screenshot_destination(
+            app->process->install_paths.data_dir, destination);
+    if (destination_status
+            == PSP_SCREENSHOT_DESTINATION_FULL) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "MEMORY STICK FULL - SCREENSHOT NOT SAVED",
+            240);
+        return;
+    }
+    if (destination_status
+            != PSP_SCREENSHOT_DESTINATION_OK) {
+        psp_ui_show_status(
+            &app->process->presentation.ui, "SCREENSHOT FOLDER UNAVAILABLE", 240);
+        return;
+    }
+    if (!psp_present_internal(engine_frame, &app->process->presentation.ui, true)) {
+        psp_ui_show_status(
+            &app->process->presentation.ui, "SCREENSHOT VIEW UNAVAILABLE", 240);
+        return;
+    }
+    const uint16_t *visible =
+        psp_display_front_buffer(&psp_display);
+    size_t screenshot_pixel_count =
+        (size_t) PSP_SCREEN_WIDTH * PSP_SCREEN_HEIGHT;
+    app->interactive->screenshot.pixels = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RENDER,
+        screenshot_pixel_count * sizeof(*app->interactive->screenshot.pixels));
+    if (visible == NULL || app->interactive->screenshot.pixels == NULL) {
+        budget_free(budget, app->interactive->screenshot.pixels);
+        app->interactive->screenshot.pixels = NULL;
+        psp_ui_show_status(
+            &app->process->presentation.ui, "NOT ENOUGH MEMORY FOR SCREENSHOT", 240);
+        return;
+    }
+    for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
+        memcpy(
+            app->interactive->screenshot.pixels
+                + (size_t) y * PSP_SCREEN_WIDTH,
+            visible + (size_t) y * PSP_VRAM_STRIDE,
+            PSP_SCREEN_WIDTH * sizeof(*app->interactive->screenshot.pixels));
+    }
+    if (!screenshot_png_begin(
+            &app->interactive->screenshot.writer, destination,
+            app->interactive->screenshot.pixels, PSP_SCREEN_WIDTH,
+            PSP_SCREEN_HEIGHT, PSP_SCREEN_WIDTH)) {
+        printf(
+            "tilefinch-screenshot: event=begin-failed "
+            "error=\"%s\"\n",
+            screenshot_png_error(&app->interactive->screenshot.writer));
+        screenshot_png_cancel(&app->interactive->screenshot.writer);
+        budget_free(budget, app->interactive->screenshot.pixels);
+        app->interactive->screenshot.pixels = NULL;
+        psp_ui_show_status(
+            &app->process->presentation.ui, "SCREENSHOT COULD NOT START", 240);
+        return;
+    }
+    app->interactive->screenshot.reported_tenth = 0;
+    psp_ui_show_status(
+        &app->process->presentation.ui, "SAVING SCREENSHOT 0%", 240);
+    printf(
+        "tilefinch-screenshot: event=start path=\"%s\" "
+        "bytes=%zu\n",
+        destination,
+        screenshot_pixel_count
+            * sizeof(*app->interactive->screenshot.pixels));
 }

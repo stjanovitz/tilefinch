@@ -17,9 +17,11 @@
 #include <pspiofilemgr.h>
 #endif
 
-/* The setting and screen tables below use switches without a default so that
+/* The screen and button tables below use switches without a default so that
    adding an enum value is a -Wswitch warning rather than an "unknown" in a
-   golden nobody reads twice. Action names live in the shared UI registry. */
+   golden nobody reads twice. Setting names come from the registry
+   (psp_ui_settings.def) that also generates PspUiSettingId, and action names
+   from the shared UI action registry. */
 
 const char *psp_input_script_action_name(PspUiAction action)
 {
@@ -29,93 +31,10 @@ const char *psp_input_script_action_name(PspUiAction action)
 const char *psp_input_script_setting_name(PspUiSettingId setting)
 {
     switch (setting) {
-        case PSP_UI_SETTING_NONE: return "none";
-        case PSP_UI_SETTING_BROWSER_UI_SCALE: return "browser-ui-scale";
-        case PSP_UI_SETTING_PAGE_FONT_PERCENT: return "page-font-percent";
-        case PSP_UI_SETTING_READER_FONT: return "reader-font";
-        case PSP_UI_SETTING_WEB_FONTS: return "web-fonts";
-        case PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE:
-            return "remember-reader-site-scale";
-        case PSP_UI_SETTING_READER_AUTO_MODE: return "reader-auto-mode";
-        case PSP_UI_SETTING_BASIC_FALLBACK: return "basic-fallback";
-        case PSP_UI_SETTING_GLYPH_OFFERS: return "glyph-offers";
-        case PSP_UI_SETTING_GLYPH_OFFERS_RESET: return "glyph-offers-reset";
-        case PSP_UI_SETTING_HEAVY_PAGES: return "heavy-pages";
-        case PSP_UI_SETTING_CUSTOM_HOMEPAGE: return "custom-homepage";
-        case PSP_UI_SETTING_HISTORY: return "history";
-        case PSP_UI_SETTING_RESTORE_LAST_PAGE: return "restore-last-page";
-        case PSP_UI_SETTING_TAB_HIBERNATION: return "tab-hibernation";
-        case PSP_UI_SETTING_EXPERIMENTAL_VOICE: return "experimental-voice";
-        case PSP_UI_SETTING_ADAPTIVE_VOICE_MEMORY:
-            return "adaptive-voice-memory";
-        case PSP_UI_SETTING_ANALOG_CURSOR: return "analog-cursor";
-        case PSP_UI_SETTING_TEXT_ENTRY_MODE: return "text-entry-mode";
-        case PSP_UI_SETTING_PERSISTENT_CACHE_MB: return "persistent-cache-mb";
-        case PSP_UI_SETTING_LIVE_CACHE_KIB: return "live-cache-kib";
-        case PSP_UI_SETTING_PERSIST_LOCAL_STORAGE:
-            return "persist-local-storage";
-        case PSP_UI_SETTING_SEARCH_ENGINE: return "search-engine";
-        case PSP_UI_SETTING_COLOR_MODE: return "color-mode";
-        case PSP_UI_SETTING_CHROME_THEME: return "chrome-theme";
-        case PSP_UI_SETTING_GLYPH_LANGUAGE: return "glyph-language";
-        case PSP_UI_SETTING_UI_LANGUAGE: return "ui-language";
-        case PSP_UI_SETTING_COLOR_EMOJI: return "color-emoji";
-        case PSP_UI_SETTING_YOUTUBE_QUALITY: return "youtube-quality";
-        case PSP_UI_SETTING_VIDEO_LANGUAGE: return "video-language";
-        case PSP_UI_SETTING_SUBTITLE_LANGUAGE: return "subtitle-language";
-        case PSP_UI_SETTING_ALTERNATE_LANGUAGE: return "alternate-language";
-        case PSP_UI_SETTING_SUBTITLE_SIZE: return "subtitle-size";
-        case PSP_UI_SETTING_SUBTITLE_BACKGROUND:
-            return "subtitle-background";
-        case PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS:
-            return "youtube-compact-results";
-        case PSP_UI_SETTING_YOUTUBE_TOPICS: return "youtube-topics";
-        case PSP_UI_SETTING_YOUTUBE_LOGIN: return "youtube-login";
-        case PSP_UI_SETTING_WIFI_DIAGNOSTICS: return "wifi-diagnostics";
-        case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
-            return "youtube-audio-only";
-        case PSP_UI_SETTING_VIDEO_SCALING: return "video-scaling";
-        case PSP_UI_SETTING_ROTATE_HINT_ALWAYS: return "rotate-hint-always";
-        case PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING:
-            return "video-startup-buffering";
-        case PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS:
-            return "resume-offline-downloads";
-        case PSP_UI_SETTING_CONTENT_BLOCKER_MODE:
-            return "content-blocker-mode";
-        case PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED:
-            return "content-blocker-site-allowed";
-        case PSP_UI_SETTING_CONTENT_BLOCKER_COSMETIC_HIDING:
-            return "content-blocker-cosmetic-hiding";
-        case PSP_UI_SETTING_COOKIE_BANNER_HIDDEN:
-            return "cookie-banner-hidden";
-        case PSP_UI_SETTING_UPDATE_CHECK: return "update-check";
-        case PSP_UI_SETTING_WAVE_BACKGROUND: return "wave-background";
-        case PSP_UI_SETTING_JAVASCRIPT: return "javascript";
-        case PSP_UI_SETTING_SITE_JAVASCRIPT: return "site-javascript";
-        case PSP_UI_SETTING_SITE_DATA_ALLOWED: return "site-data-allowed";
-        case PSP_UI_SETTING_MIXED_CONTENT_SITE:
-            return "mixed-content-site";
-        case PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE:
-            return "third-party-cookies-site";
-        case PSP_UI_SETTING_TLS_SESSION_PERSISTENCE:
-            return "tls-session-persistence";
-        case PSP_UI_SETTING_NETWORK_PROFILE: return "network-profile";
-        case PSP_UI_SETTING_UPDATE_CHANNEL: return "update-channel";
-        case PSP_UI_SETTING_GAMEPAD_FACE_MAPPING:
-            return "gamepad-face-mapping";
-        case PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS:
-            return "save-playback-positions";
-        case PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS:
-            return "clear-playback-positions";
-        case PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS:
-            return "save-diagnostic-reports";
-        case PSP_UI_SETTING_SITE_STORAGE_OFFERS:
-            return "site-storage-offers";
-        case PSP_UI_SETTING_SITE_STORAGE_SITE: return "site-storage-site";
-        case PSP_UI_SETTING_SITE_STORAGE_LISTED:
-            return "site-storage-listed";
-        case PSP_UI_SETTING_KEEP_COMPILED_SCRIPTS:
-            return "keep-compiled-scripts";
+#define PSP_UI_SETTING(id, script_name) \
+        case PSP_UI_SETTING_##id: return script_name;
+#include "tilefinch/psp_ui_settings.def"
+#undef PSP_UI_SETTING
     }
     return "unknown";
 }

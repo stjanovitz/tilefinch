@@ -99,7 +99,9 @@ function(check_hot_set label limit)
 endfunction()
 
 # These ratchets have deliberately different meanings. `main` is a process
-# growth tripwire over boot and teardown. The browser and media compositors
+# growth tripwire over boot and teardown: the ordered list of boot phases
+# (src/psp_app/psp_app_boot.c), the validation hooks between them, and the
+# shutdown. New boot work belongs in a phase, not inline in main. The browser and media compositors
 # are actual per-frame instruction-cache footprints; psp_ui_composite itself
 # is only their dispatcher and is not a useful hot-path measurement.
 #
@@ -112,7 +114,7 @@ endfunction()
 # was measured against on the device (2026-09-23); psp_loop_frame itself is a
 # tighter tripwire so new work arrives as a named step, not inline.
 if(NOT DEFINED PSP_MAIN_LIMIT)
-    set(PSP_MAIN_LIMIT 10752)
+    set(PSP_MAIN_LIMIT 6144)
 endif()
 check_hot_symbol(main ${PSP_MAIN_LIMIT})
 if(NOT DEFINED PSP_LOOP_FRAME_LIMIT)
@@ -130,15 +132,24 @@ set(media_frame_steps
     psp_loop_frame psp_loop_media_frame psp_loop_media_input
     psp_loop_update_frame psp_loop_track_recovery)
 if(PSP_VALIDATION_LOG)
-    # Scripted input and the power test's tick run every validation frame.
+    # Scripted input (its psp_loop_frame hook and the step it calls) and the
+    # power test's tick run every validation frame.
     list(APPEND page_frame_steps
-        psp_loop_scripted_input psp_loop_power_test_tick)
+        psp_validation_scripted_frame psp_loop_scripted_input
+        psp_loop_power_test_tick)
     list(APPEND media_frame_steps
-        psp_loop_scripted_input psp_loop_power_test_tick)
+        psp_validation_scripted_frame psp_loop_scripted_input
+        psp_loop_power_test_tick)
 endif()
 check_hot_set("page frame" ${PSP_FRAME_SET_LIMIT} ${page_frame_steps})
 check_hot_set("media frame" ${PSP_FRAME_SET_LIMIT} ${media_frame_steps})
-check_hot_symbol(layout_block_impl 36864)
+# Every block runs layout_block_impl and its child-flow phase. Rare arms
+# (controls, replaced content, list markers, <hr>, motion scenes, masks,
+# positioned finalization) live in noinline helpers behind their guards;
+# keep them there rather than growing the recursive hot path. Measured
+# 2026-10-26: 11,768 + 7,240 bytes.
+check_hot_symbol(layout_block_impl 12800)
+check_hot_set("block layout" 20480 layout_block_impl layout_block_flow_children)
 check_hot_symbol(psp_ui_composite_browser 4096)
 check_hot_symbol(psp_ui_media_composite_layers 4096)
 check_hot_symbol(rasterize_command 8192)
@@ -147,33 +158,15 @@ check_hot_symbol(rasterize_command 8192)
 # otherwise Allegrex pays that multi-kilobyte frame and I-cache footprint for
 # every focus step.
 check_hot_symbol(psp_app_dispatch_action 1024)
+# The streaming parser calls this for every closed element. Its </script>
+# work (navigation_stream_script_closed) stays out of line so other elements
+# do not pay that path's multi-kilobyte stack frame and register saves
+# (4,416 B frame and 11 saved registers when it was inline, 2026-10-26).
+check_hot_symbol(navigation_stream_element_closed 1024)
 
-# Transitional frontend access to the engine's expiring navigation/controller
-# views must only decrease. The data-model migration is complete when this
-# reaches zero; a source ratchet is more honest than a generation counter that
-# could miss an uninstrumented mutation. Count only PSP frontend call sites,
-# not the API declarations or engine implementation.
+# Frontend access to engine internals must only decrease; the ratchet and
+# its history live in CheckPspFrontendEngineAccess.cmake, which a host test
+# also runs.
 if(DEFINED TILEFINCH_SOURCE_DIR)
-    file(GLOB raw_view_sources
-        "${TILEFINCH_SOURCE_DIR}/src/psp_script_main.c"
-        "${TILEFINCH_SOURCE_DIR}/src/psp_app/*.c")
-    set(raw_view_count 0)
-    foreach(source IN LISTS raw_view_sources)
-        file(READ "${source}" source_text)
-        string(REGEX MATCHALL
-            "browser_engine_(navigation|controller)_view[ 	]*\\("
-            raw_view_matches "${source_text}")
-        list(LENGTH raw_view_matches source_count)
-        math(EXPR raw_view_count "${raw_view_count} + ${source_count}")
-    endforeach()
-    set(raw_view_limit 0)
-    if(raw_view_count GREATER raw_view_limit)
-        message(FATAL_ERROR
-            "PSP raw engine-view call sites grew to ${raw_view_count}; "
-            "nonincreasing ceiling is ${raw_view_limit}. Refresh a copied "
-            "frame snapshot instead of retaining another expiring view.")
-    endif()
-    message(STATUS
-        "PSP raw engine-view call sites: ${raw_view_count}/${raw_view_limit} "
-        "(migration target 0)")
+    include("${CMAKE_CURRENT_LIST_DIR}/CheckPspFrontendEngineAccess.cmake")
 endif()

@@ -1,5 +1,4 @@
 #include "tilefinch/youtube_resolver.h"
-#include "tilefinch/utf8_encode.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -11,6 +10,7 @@
 #include <strings.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/json_scan.h"
 #include "tilefinch/media_mp4.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
@@ -130,10 +130,8 @@ _Static_assert(
         <= YOUTUBE_RESOLVER_MAXIMUM_CLIENTS,
     "YouTube client ladder exceeds its bounded attempt policy");
 
-typedef struct {
-    const char *at;
-    const char *end;
-} YoutubeJson;
+/* A cursor over untrusted provider JSON (tilefinch/json_scan.h). */
+typedef JsonCursor YoutubeJson;
 
 typedef struct {
     int itag;
@@ -239,188 +237,20 @@ bool youtube_direct_delivery_admitted(
                  <= YOUTUBE_UNATTESTED_DELIVERY_MAXIMUM_BYTES);
 }
 
-static void json_space(YoutubeJson *json)
-{
-    while (json->at < json->end
-           && isspace((unsigned char) *json->at)) json->at++;
-}
-
-static bool json_hex(char digit, unsigned *value)
-{
-    if (digit >= '0' && digit <= '9') *value = (unsigned) (digit - '0');
-    else if (digit >= 'a' && digit <= 'f')
-        *value = (unsigned) (digit - 'a' + 10);
-    else if (digit >= 'A' && digit <= 'F')
-        *value = (unsigned) (digit - 'A' + 10);
-    else return false;
-    return true;
-}
-
-static bool json_append_utf8(char *output, size_t output_size,
-                             size_t *length, unsigned codepoint)
-{
-    unsigned char bytes[4];
-    size_t count = tilefinch_utf8_encode(codepoint, bytes);
-    if (count == 0 || *length >= output_size
-        || count > output_size - 1u - *length) return false;
-    memcpy(output + *length, bytes, count);
-    *length += count;
-    return true;
-}
-
-static bool json_string(YoutubeJson *json, char *output, size_t output_size)
-{
-    json_space(json);
-    if (json->at >= json->end || *json->at++ != '"'
-        || output == NULL || output_size == 0) return false;
-    size_t length = 0;
-    while (json->at < json->end) {
-        unsigned char byte = (unsigned char) *json->at++;
-        if (byte == '"') {
-            output[length] = '\0';
-            return true;
-        }
-        if (byte < 0x20u) return false;
-        if (byte != '\\') {
-            if (length >= output_size - 1u) return false;
-            output[length++] = (char) byte;
-            continue;
-        }
-        if (json->at >= json->end) return false;
-        char escape = *json->at++;
-        char decoded = '\0';
-        switch (escape) {
-        case '"': decoded = '"'; break;
-        case '\\': decoded = '\\'; break;
-        case '/': decoded = '/'; break;
-        case 'b': decoded = '\b'; break;
-        case 'f': decoded = '\f'; break;
-        case 'n': decoded = '\n'; break;
-        case 'r': decoded = '\r'; break;
-        case 't': decoded = '\t'; break;
-        case 'u': {
-            if ((size_t) (json->end - json->at) < 4u) return false;
-            unsigned codepoint = 0;
-            for (size_t i = 0; i < 4; i++) {
-                unsigned nibble = 0;
-                if (!json_hex(json->at[i], &nibble)) return false;
-                codepoint = (codepoint << 4) | nibble;
-            }
-            json->at += 4;
-            if (codepoint >= 0xd800u && codepoint <= 0xdbffu) {
-                if ((size_t) (json->end - json->at) < 6u
-                    || json->at[0] != '\\' || json->at[1] != 'u') return false;
-                unsigned low = 0;
-                for (size_t i = 0; i < 4; i++) {
-                    unsigned nibble = 0;
-                    if (!json_hex(json->at[i + 2], &nibble)) return false;
-                    low = (low << 4) | nibble;
-                }
-                if (low < 0xdc00u || low > 0xdfffu) return false;
-                json->at += 6;
-                codepoint = 0x10000u + ((codepoint - 0xd800u) << 10)
-                          + (low - 0xdc00u);
-            }
-            if (!json_append_utf8(
-                    output, output_size, &length, codepoint)) return false;
-            continue;
-        }
-        default:
-            return false;
-        }
-        if (length >= output_size - 1u) return false;
-        output[length++] = decoded;
-    }
-    return false;
-}
-
-static bool json_skip_value(YoutubeJson *json, unsigned depth);
-static bool json_skip_string(YoutubeJson *json);
-
-static bool json_skip_compound(YoutubeJson *json, char open, char close,
-                               unsigned depth)
-{
-    if (depth >= YOUTUBE_JSON_MAXIMUM_DEPTH
-        || json->at >= json->end || *json->at++ != open) return false;
-    json_space(json);
-    if (json->at < json->end && *json->at == close) {
-        json->at++;
-        return true;
-    }
-    while (json->at < json->end) {
-        if (open == '{') {
-            if (!json_skip_string(json)) return false;
-            json_space(json);
-            if (json->at >= json->end || *json->at++ != ':') return false;
-        }
-        if (!json_skip_value(json, depth + 1u)) return false;
-        json_space(json);
-        if (json->at < json->end && *json->at == close) {
-            json->at++;
-            return true;
-        }
-        if (json->at >= json->end || *json->at++ != ',') return false;
-        json_space(json);
-    }
-    return false;
-}
-
-static bool json_skip_string(YoutubeJson *json)
-{
-    json_space(json);
-    if (json->at >= json->end || *json->at++ != '"') return false;
-    while (json->at < json->end) {
-        unsigned char byte = (unsigned char) *json->at++;
-        if (byte == '"') return true;
-        if (byte < 0x20u) return false;
-        if (byte != '\\') continue;
-        if (json->at >= json->end) return false;
-        char escape = *json->at++;
-        if (strchr("\"\\/bfnrt", escape) != NULL) continue;
-        if (escape != 'u' || (size_t) (json->end - json->at) < 4u)
-            return false;
-        for (size_t i = 0; i < 4; i++) {
-            unsigned value = 0;
-            if (!json_hex(json->at[i], &value)) return false;
-        }
-        json->at += 4;
-    }
-    return false;
-}
-
+/* One value nested `depth` levels into the response, skipped within the
+   response's nesting bound. */
 static bool json_skip_value(YoutubeJson *json, unsigned depth)
 {
-    json_space(json);
-    if (depth >= YOUTUBE_JSON_MAXIMUM_DEPTH || json->at >= json->end)
-        return false;
-    if (*json->at == '"') return json_skip_string(json);
-    if (*json->at == '{')
-        return json_skip_compound(json, '{', '}', depth);
-    if (*json->at == '[')
-        return json_skip_compound(json, '[', ']', depth);
-    const char *start = json->at;
-    while (json->at < json->end
-           && strchr(",]} \t\r\n", *json->at) == NULL) json->at++;
-    if (json->at == start) return false;
-    size_t length = (size_t) (json->at - start);
-    if ((length == 4 && memcmp(start, "true", 4) == 0)
-        || (length == 5 && memcmp(start, "false", 5) == 0)
-        || (length == 4 && memcmp(start, "null", 4) == 0)) return true;
-    char number[64];
-    if (length >= sizeof(number)) return false;
-    memcpy(number, start, length);
-    number[length] = '\0';
-    char *end = NULL;
-    (void) strtod(number, &end);
-    return end != NULL && *end == '\0';
+    return depth < YOUTUBE_JSON_MAXIMUM_DEPTH
+        && json_scan_skip_value(json, YOUTUBE_JSON_MAXIMUM_DEPTH - depth);
 }
 
 static bool json_unsigned_value(YoutubeJson *json, uint64_t *value)
 {
-    json_space(json);
+    json_scan_space(json);
     char text[32];
     if (json->at < json->end && *json->at == '"') {
-        if (!json_string(json, text, sizeof(text))) return false;
+        if (!json_scan_string(json, text, sizeof(text))) return false;
     } else {
         const char *start = json->at;
         while (json->at < json->end
@@ -441,7 +271,7 @@ static bool json_unsigned_value(YoutubeJson *json, uint64_t *value)
 static bool json_boolean_value(YoutubeJson *json, bool *value)
 {
     if (json == NULL || value == NULL) return false;
-    json_space(json);
+    json_scan_space(json);
     size_t remaining = (size_t) (json->end - json->at);
     size_t length = remaining >= 4u
         && memcmp(json->at, "true", 4u) == 0 ? 4u
@@ -449,19 +279,12 @@ static bool json_boolean_value(YoutubeJson *json, bool *value)
           && memcmp(json->at, "false", 5u) == 0 ? 5u : 0u;
     if (length == 0) return false;
     YoutubeJson after = {json->at + length, json->end};
-    json_space(&after);
+    json_scan_space(&after);
     if (after.at < after.end
         && strchr(",}]", *after.at) == NULL) return false;
     *value = length == 4u;
     json->at += length;
     return true;
-}
-
-static bool json_member_key(YoutubeJson *json, char *key, size_t key_size)
-{
-    if (!json_string(json, key, key_size)) return false;
-    json_space(json);
-    return json->at < json->end && *json->at++ == ':';
 }
 
 static void youtube_track_language_from_id(YoutubeTrack *track)
@@ -533,9 +356,9 @@ static bool youtube_parse_audio_track_value(
     *json = skip;
     memset(track, 0, sizeof(*track));
     if (youtube_find_key(object, length, "id", &value))
-        (void) json_string(&value, track->id, sizeof(track->id));
+        (void) json_scan_string(&value, track->id, sizeof(track->id));
     if (youtube_find_key(object, length, "displayName", &value))
-        (void) json_string(&value, track->label, sizeof(track->label));
+        (void) json_scan_string(&value, track->label, sizeof(track->label));
     if (youtube_find_key(object, length, "audioIsDefault", &value))
         (void) json_boolean_value(&value, &track->authored_default);
     youtube_track_language_from_id(track);
@@ -546,22 +369,22 @@ static bool youtube_parse_audio_track_value(
 static bool youtube_parse_format(YoutubeJson *json, YoutubeFormat *format)
 {
     memset(format, 0, sizeof(*format));
-    json_space(json);
+    json_scan_space(json);
     if (json->at >= json->end || *json->at++ != '{') return false;
-    json_space(json);
+    json_scan_space(json);
     if (json->at < json->end && *json->at == '}') {
         json->at++;
         return true;
     }
     while (json->at < json->end) {
         char key[64];
-        if (!json_member_key(json, key, sizeof(key))) return false;
+        if (!json_scan_member_key(json, key, sizeof(key))) return false;
         uint64_t number = 0;
         if (strcmp(key, "url") == 0) {
-            if (!json_string(json, format->url, sizeof(format->url)))
+            if (!json_scan_string(json, format->url, sizeof(format->url)))
                 return false;
         } else if (strcmp(key, "mimeType") == 0) {
-            if (!json_string(json, format->mime, sizeof(format->mime)))
+            if (!json_scan_string(json, format->mime, sizeof(format->mime)))
                 return false;
         } else if (strcmp(key, "itag") == 0
                    || strcmp(key, "width") == 0
@@ -592,13 +415,13 @@ static bool youtube_parse_format(YoutubeJson *json, YoutubeFormat *format)
         } else if (!json_skip_value(json, 1)) {
             return false;
         }
-        json_space(json);
+        json_scan_space(json);
         if (json->at < json->end && *json->at == '}') {
             json->at++;
             return true;
         }
         if (json->at >= json->end || *json->at++ != ',') return false;
-        json_space(json);
+        json_scan_space(json);
     }
     return false;
 }
@@ -864,9 +687,9 @@ static bool youtube_parse_formats(
     YoutubeFormat *selected, YoutubeFormat *selected_audio,
     YoutubeStream *stream, const YoutubeTrackPreferences *preferences)
 {
-    json_space(json);
+    json_scan_space(json);
     if (json->at >= json->end || *json->at++ != '[') return false;
-    json_space(json);
+    json_scan_space(json);
     if (json->at < json->end && *json->at == ']') {
         json->at++;
         return true;
@@ -891,13 +714,13 @@ static bool youtube_parse_formats(
                     &candidate, selected_audio, preferences))
                 *selected_audio = candidate;
         }
-        json_space(json);
+        json_scan_space(json);
         if (json->at < json->end && *json->at == ']') {
             json->at++;
             return true;
         }
         if (json->at >= json->end || *json->at++ != ',') return false;
-        json_space(json);
+        json_scan_space(json);
     }
     return false;
 }
@@ -955,10 +778,10 @@ static void youtube_find_plain_keys(const char *json, size_t length,
             if (!candidate) continue;
             YoutubeJson probe = {quote, end};
             char key[96];
-            if (json_string(&probe, key, sizeof(key))
+            if (json_scan_string(&probe, key, sizeof(key))
                 && strlen(key) == wanted_length
                 && memcmp(key, wanted, wanted_length) == 0) {
-                json_space(&probe);
+                json_scan_space(&probe);
                 if (probe.at < probe.end && *probe.at++ == ':') {
                     values[k] = probe;
                     found[k] = true;
@@ -987,10 +810,10 @@ static bool youtube_find_key(const char *json, size_t length,
         cursor.at = quote;
         YoutubeJson probe = cursor;
         char key[96];
-        if (json_string(&probe, key, sizeof(key))
+        if (json_scan_string(&probe, key, sizeof(key))
             && strlen(key) == wanted_length
             && memcmp(key, wanted, wanted_length) == 0) {
-            json_space(&probe);
+            json_scan_space(&probe);
             if (probe.at < probe.end && *probe.at++ == ':') {
                 *value = probe;
                 return true;
@@ -1005,7 +828,7 @@ static bool youtube_object_span(YoutubeJson value,
                                 const char **start, size_t *length)
 {
     if (start == NULL || length == NULL) return false;
-    json_space(&value);
+    json_scan_space(&value);
     if (value.at >= value.end || *value.at != '{') return false;
     const char *object_start = value.at;
     if (!json_skip_value(&value, 0)) return false;
@@ -1051,17 +874,17 @@ static void youtube_caption_label(
     YoutubeJson text;
     if (youtube_object_span(value, &object, &length)
         && youtube_find_key(object, length, "simpleText", &text)) {
-        (void) json_string(&text, label, YOUTUBE_TRACK_LABEL_CAPACITY);
+        (void) json_scan_string(&text, label, YOUTUBE_TRACK_LABEL_CAPACITY);
         return;
     }
     YoutubeJson runs;
     if (object == NULL || !youtube_find_key(object, length, "runs", &runs))
         return;
-    json_space(&runs);
+    json_scan_space(&runs);
     if (runs.at >= runs.end || *runs.at++ != '[') return;
     size_t used = 0u;
     while (runs.at < runs.end && used + 1u < YOUTUBE_TRACK_LABEL_CAPACITY) {
-        json_space(&runs);
+        json_scan_space(&runs);
         if (runs.at < runs.end && *runs.at == ']') break;
         const char *run = NULL;
         size_t run_length = 0u;
@@ -1070,7 +893,7 @@ static void youtube_caption_label(
             || !json_skip_value(&after, 1)) return;
         if (youtube_find_key(run, run_length, "text", &text)) {
             char part[YOUTUBE_TRACK_LABEL_CAPACITY];
-            if (json_string(&text, part, sizeof(part))) {
+            if (json_scan_string(&text, part, sizeof(part))) {
                 size_t available = YOUTUBE_TRACK_LABEL_CAPACITY - used - 1u;
                 size_t copy = strlen(part);
                 if (copy > available) copy = available;
@@ -1080,7 +903,7 @@ static void youtube_caption_label(
             }
         }
         runs = after;
-        json_space(&runs);
+        json_scan_space(&runs);
         if (runs.at < runs.end && *runs.at == ',') runs.at++;
         else if (runs.at >= runs.end || *runs.at != ']') return;
     }
@@ -1179,7 +1002,7 @@ static void youtube_parse_caption_tracks(
         || (found_tracks == NULL
             && !youtube_find_key(json, length, "captionTracks", &array)))
         return;
-    json_space(&array);
+    json_scan_space(&array);
     if (array.at >= array.end || *array.at++ != '[') return;
     const char *preferred = preferences == NULL
         ? NULL : preferences->caption_language;
@@ -1194,7 +1017,7 @@ static void youtube_parse_caption_tracks(
        its array end so a preferred late track cannot be hidden by the six-row
        presentation bound; retained state remains fixed at six entries. */
     while (array.at < array.end) {
-        json_space(&array);
+        json_scan_space(&array);
         if (array.at < array.end && *array.at == ']') break;
         const char *object = NULL;
         size_t object_length = 0;
@@ -1205,17 +1028,17 @@ static void youtube_parse_caption_tracks(
         YoutubeTrack track = {0};
         char base_url[YOUTUBE_CAPTION_URL_CAPACITY] = {0};
         if (youtube_find_key(object, object_length, "baseUrl", &value))
-            (void) json_string(&value, base_url, sizeof(base_url));
+            (void) json_scan_string(&value, base_url, sizeof(base_url));
         if (youtube_find_key(object, object_length, "languageCode", &value))
-            (void) json_string(
+            (void) json_scan_string(
                 &value, track.language, sizeof(track.language));
         if (youtube_find_key(object, object_length, "vssId", &value))
-            (void) json_string(&value, track.id, sizeof(track.id));
+            (void) json_scan_string(&value, track.id, sizeof(track.id));
         if (youtube_find_key(object, object_length, "name", &value))
             youtube_caption_label(value, track.label);
         char kind[16] = {0};
         if (youtube_find_key(object, object_length, "kind", &value))
-            (void) json_string(&value, kind, sizeof(kind));
+            (void) json_scan_string(&value, kind, sizeof(kind));
         track.automatic = strcmp(kind, "asr") == 0;
         if (track.id[0] == '\0')
             snprintf(track.id, sizeof(track.id), "%s", track.language);
@@ -1228,7 +1051,7 @@ static void youtube_parse_caption_tracks(
                 strchr(base_url, '?') == NULL ? "?" : "&");
             if (written <= 0 || (size_t) written >= sizeof(vtt_url)) {
                 array = after;
-                json_space(&array);
+                json_scan_space(&array);
                 if (array.at < array.end && *array.at == ',') array.at++;
                 else if (array.at >= array.end || *array.at != ']') break;
                 continue;
@@ -1244,7 +1067,7 @@ static void youtube_parse_caption_tracks(
                 stream, &track, vtt_url, catalog, preferences, preferred);
         }
         array = after;
-        json_space(&array);
+        json_scan_space(&array);
         if (array.at < array.end && *array.at == ',') array.at++;
         else if (array.at >= array.end || *array.at != ']') break;
     }
@@ -1264,7 +1087,7 @@ static bool youtube_use_live_hls(YoutubeJson value, YoutubeStream *parsed,
                                  YoutubeStream *stream, char *error,
                                  size_t error_size)
 {
-    if (!json_string(
+    if (!json_scan_string(
             &value, parsed->media_url, sizeof(parsed->media_url))
         || !youtube_media_url_supported(parsed->media_url)) {
         youtube_error(error, error_size,
@@ -1401,7 +1224,7 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
             value, &playability_json, &playability_length)
         || !youtube_find_key(
             playability_json, playability_length, "status", &value)
-        || !json_string(&value, status, sizeof(status))) {
+        || !json_scan_string(&value, status, sizeof(status))) {
         youtube_error(
             error, error_size,
             "malformed YouTube playability status");
@@ -1411,7 +1234,7 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         char reason[192] = {0};
         if (youtube_find_key(
                 playability_json, playability_length, "reason", &value)) {
-            (void) json_string(&value, reason, sizeof(reason));
+            (void) json_scan_string(&value, reason, sizeof(reason));
         }
         YoutubePlayability classified =
             YOUTUBE_PLAYABILITY_CLIENT_REJECTED;
@@ -1466,7 +1289,7 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     if (have_details
         && youtube_find_key(
             details_json, details_length, "title", &value)) {
-        (void) json_string(&value, parsed->title, sizeof(parsed->title));
+        (void) json_scan_string(&value, parsed->title, sizeof(parsed->title));
     }
     const char *streaming_json = NULL;
     size_t streaming_length = 0;
@@ -1809,7 +1632,7 @@ static bool youtube_watch_string(const char *html, size_t length,
 {
     YoutubeJson value;
     return youtube_find_key(html, length, key, &value)
-        && json_string(&value, output, output_size);
+        && json_scan_string(&value, output, output_size);
 }
 
 static bool youtube_watch_unsigned(const char *html, size_t length,

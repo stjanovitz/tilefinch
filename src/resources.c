@@ -15,6 +15,7 @@
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/url.h"
 #include "data_url.h"
+#include "resources_internal.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
@@ -206,7 +207,25 @@ typedef struct {
     uint64_t slice_started_us;
     size_t slice_work_units;
     bool deadline_reached;
+#ifndef TILEFINCH_NO_TRACE
+    /* Trace-build switches, read once per load rather than per sheet. */
+    bool trace_stylesheets;
+    bool fragment_cache_disabled;
+    bool parsed_ir_disabled;
+#endif
 } ResourceContext;
+
+#ifndef TILEFINCH_NO_TRACE
+static void resource_context_read_switches(ResourceContext *context)
+{
+    context->trace_stylesheets =
+        getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL;
+    context->fragment_cache_disabled =
+        getenv("TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE") != NULL;
+    context->parsed_ir_disabled =
+        getenv("TILEFINCH_DISABLE_STYLESHEET_PARSED_IR") != NULL;
+}
+#endif
 
 static size_t stylesheet_estimate_add(size_t total, size_t amount)
 {
@@ -935,11 +954,6 @@ static bool pending_stylesheet_retain_response(
     return true;
 }
 
-static double resource_now_ms(void)
-{
-    return (double) tilefinch_platform_monotonic_time_us() * 0.001;
-}
-
 
 static void resource_finish_slice(ResourceContext *context)
 {
@@ -1385,6 +1399,146 @@ static bool load_stylesheet_imports(ResourceContext *context,
                                     const StylesheetResponseProvenance *sheet,
                                     unsigned depth);
 
+/* The session's stylesheet artifacts: a compiled selector fragment and the
+   parsed IR, keyed by the response bytes. These helpers own their reuse
+   (acquire, then reuse or build the fragment) and their store; the parse
+   between them stays in apply_stylesheet_data. */
+
+/* Narrows `*fragment_eligible` (same-origin, non-empty, parsed) by the trace
+   switches, decides `*ir_eligible`, and acquires what the session holds.
+   True when the session can back new artifacts for these bytes. */
+static bool stylesheet_artifacts_acquire(
+    ResourceContext *context, const char *resolved,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *css_data, size_t css_length,
+    bool *fragment_eligible, bool *ir_eligible,
+    BrowserSharedBody **compiled_fragment, BrowserSharedBody **parsed_ir)
+{
+#ifndef TILEFINCH_NO_TRACE
+    *fragment_eligible = *fragment_eligible
+        && !context->fragment_cache_disabled;
+#endif
+    /* Large sources deliberately retain bounded source-order bookends plus
+       a DOM-relevant selector allowance. Their structural IR would otherwise
+       replay every captured rule and silently bypass that degradation policy. */
+    *ir_eligible = *fragment_eligible
+        && css_length < STYLESHEET_LARGE_SOURCE_BYTES;
+#ifndef TILEFINCH_NO_TRACE
+    *ir_eligible = *ir_eligible && !context->parsed_ir_disabled;
+#endif
+    if (!*fragment_eligible) return false;
+    return browser_session_stylesheet_artifacts_acquire(
+        context->session, resolved, request_context,
+        css_data, css_length, compiled_fragment,
+        *ir_eligible ? parsed_ir : NULL);
+}
+
+/* Applies the acquired compiled fragment to the rules this parse added
+   (rules_before..count), counting a hit or a miss; on a miss of an eligible
+   sheet, builds a new one into `*new_fragment`. True when one was built. */
+static bool stylesheet_fragment_reuse_or_build(
+    ResourceContext *context, const char *resolved,
+    const BrowserSharedBody *compiled_fragment, bool fragment_eligible,
+    size_t rules_before, unsigned char **new_fragment,
+    size_t *new_fragment_length)
+{
+    (void) resolved;
+    size_t fragment_rules_reused = 0;
+    if (compiled_fragment != NULL) {
+        fragment_rules_reused = stylesheet_compiled_fragment_apply(
+            context->sheet, rules_before, context->sheet->count,
+            compiled_fragment->data, compiled_fragment->length);
+        if (fragment_rules_reused != 0) {
+            context->stats->compiled_fragment_hits++;
+            context->stats->compiled_fragment_rules_reused +=
+                fragment_rules_reused;
+            context->stats->compiled_fragment_bytes +=
+                compiled_fragment->length;
+#ifndef TILEFINCH_NO_TRACE
+            if (context->trace_stylesheets) {
+                fprintf(stderr,
+                        "tilefinch-stylesheet-fragment action=hit "
+                        "rules=%zu bytes=%zu url=%s\n",
+                        fragment_rules_reused, compiled_fragment->length,
+                        resolved);
+            }
+#endif
+        } else {
+            context->stats->compiled_fragment_misses++;
+        }
+    } else if (fragment_eligible) {
+        context->stats->compiled_fragment_misses++;
+    }
+    tilefinch_platform_trace_step("css-fragment-build");
+    return fragment_eligible && fragment_rules_reused == 0
+        && stylesheet_compiled_fragment_build(
+            context->sheet, rules_before, context->sheet->count,
+            new_fragment, new_fragment_length);
+}
+
+/* Hands the IR and fragment built by a first parse to the session (which
+   takes ownership; the pointer is cleared), counting each store. */
+static void stylesheet_artifacts_store(
+    ResourceContext *context, const char *resolved,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *css_data, size_t css_length, size_t rules_before,
+    unsigned char **new_ir, size_t new_ir_length,
+    unsigned char **new_fragment, size_t new_fragment_length)
+{
+    (void) rules_before;
+    bool ir_stored = *new_ir != NULL
+        && browser_session_stylesheet_ir_put_take(
+               context->session, resolved, request_context,
+               css_data, css_length, *new_ir, new_ir_length);
+    if (ir_stored) {
+        *new_ir = NULL;
+        context->stats->parsed_ir_stores++;
+        context->stats->parsed_ir_bytes += new_ir_length;
+#ifndef TILEFINCH_NO_TRACE
+        if (context->trace_stylesheets) {
+            fprintf(stderr,
+                    "tilefinch-stylesheet-ir action=store "
+                    "bytes=%zu url=%s\n", new_ir_length, resolved);
+        }
+#endif
+    }
+#ifndef TILEFINCH_NO_TRACE
+    else if (*new_ir != NULL && context->trace_stylesheets) {
+        fprintf(stderr,
+                "tilefinch-stylesheet-ir action=store-refused "
+                "bytes=%zu url=%s\n", new_ir_length, resolved);
+    }
+#endif
+    bool fragment_stored = *new_fragment != NULL
+        && browser_session_stylesheet_fragment_put_take(
+               context->session, resolved, request_context,
+               css_data, css_length,
+               *new_fragment, new_fragment_length);
+    if (fragment_stored) {
+        *new_fragment = NULL;
+        context->stats->compiled_fragment_stores++;
+        context->stats->compiled_fragment_bytes += new_fragment_length;
+#ifndef TILEFINCH_NO_TRACE
+        if (context->trace_stylesheets) {
+            fprintf(stderr,
+                    "tilefinch-stylesheet-fragment action=store "
+                    "rules=%zu bytes=%zu url=%s\n",
+                    context->sheet->count - rules_before,
+                    new_fragment_length, resolved);
+        }
+#endif
+    }
+#ifndef TILEFINCH_NO_TRACE
+    else if (*new_fragment != NULL && context->trace_stylesheets) {
+        fprintf(stderr,
+                "tilefinch-stylesheet-fragment action=store-refused "
+                "rules=%zu bytes=%zu url=%s\n",
+                context->sheet->count - rules_before,
+                new_fragment_length, resolved);
+    }
+#endif
+}
+
 static bool apply_stylesheet_data(ResourceContext *context,
                                   const char *resolved,
                                   const StylesheetResponseProvenance *provenance,
@@ -1407,7 +1561,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
         || !stylesheet_referrer_policy_valid(
                provenance->referrer_policy)) return false;
 #ifndef TILEFINCH_NO_TRACE
-    if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
+    if (context->trace_stylesheets) {
         fprintf(stderr,
                 "tilefinch-stylesheet-apply bytes=%zu/%zu source=%zu url=%s\n",
                 context->stats->bytes, context->maximum_total_bytes,
@@ -1475,34 +1629,20 @@ static bool apply_stylesheet_data(ResourceContext *context,
         depth);
     size_t rules_before = context->sheet->count;
     size_t variables_before = context->sheet->variable_count;
-    size_t previous_rule_limit = context->sheet->source_rule_limit_end;
-    size_t previous_head_limit =
-        context->sheet->source_rule_head_limit_end;
-    size_t previous_secondary_limit =
-        context->sheet->source_rule_secondary_limit_end;
-    size_t previous_relevant_limit =
-        context->sheet->source_rule_relevant_limit_end;
-    const uint32_t *previous_priority_token_bloom =
-        context->sheet->source_rule_priority_token_bloom;
-    size_t previous_priority_token_bloom_words =
-        context->sheet->source_rule_priority_token_bloom_words;
-    const uint32_t *previous_token_bloom =
-        context->sheet->source_rule_token_bloom;
-    size_t previous_token_bloom_words =
-        context->sheet->source_rule_token_bloom_words;
-    const char *previous_tail_begin =
-        context->sheet->source_rule_tail_begin;
+    /* This source's parse policy; the add-CSS entry points install it for
+       the parse and restore the sheet afterwards. */
+    StyleSourceOptions source = {0};
     if (parsed && css_length >= STYLESHEET_LARGE_SOURCE_BYTES) {
         if (context->document_resources != NULL
             && !context->document_resources->selector_census_complete
             && !context->document_resources->final_resample_completed) {
             context->document_resources->final_resample_required = true;
         }
-        context->sheet->source_rule_limit_end =
+        source.rule_limit_end =
             rules_before > SIZE_MAX - STYLESHEET_LARGE_SOURCE_RULE_LIMIT
                 ? SIZE_MAX
                 : rules_before + STYLESHEET_LARGE_SOURCE_RULE_LIMIT;
-        context->sheet->source_rule_head_limit_end =
+        source.rule_head_limit_end =
             rules_before > SIZE_MAX - STYLESHEET_LARGE_SOURCE_HEAD_RULES
                 ? SIZE_MAX
                 : rules_before + STYLESHEET_LARGE_SOURCE_HEAD_RULES;
@@ -1520,12 +1660,12 @@ static bool apply_stylesheet_data(ResourceContext *context,
             if (extra_relevant > STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES)
                 extra_relevant = STYLESHEET_LARGE_SOURCE_EXTRA_RELEVANT_RULES;
         }
-        context->sheet->source_rule_limit_end = stylesheet_estimate_add(
-            context->sheet->source_rule_limit_end, extra_relevant);
-        context->sheet->source_rule_relevant_limit_end =
+        source.rule_limit_end = stylesheet_estimate_add(
+            source.rule_limit_end, extra_relevant);
+        source.rule_relevant_limit_end =
             stylesheet_estimate_add(
                 stylesheet_estimate_add(
-                    context->sheet->source_rule_head_limit_end,
+                    source.rule_head_limit_end,
                     STYLESHEET_LARGE_SOURCE_RELEVANT_RULES),
                 extra_relevant);
         /* A whole-document census that fit its node limit is as exact as
@@ -1533,26 +1673,26 @@ static bool apply_stylesheet_data(ResourceContext *context,
            allowance. Only a saturated census (every token "present") keeps
            the small secondary allowance, which then degrades to plain
            source order. Sharing the allowance does not raise the sheet's
-           rule ceiling (source_rule_limit_end); it stops DOM-relevant rules
+           rule ceiling (source.rule_limit_end); it stops DOM-relevant rules
            in the middle of a large sheet (icon sizes, display:none on
            mobile) from being dropped while the allowance sits unused. */
-        context->sheet->source_rule_secondary_limit_end =
+        source.rule_secondary_limit_end =
             context->selector_token_census_complete
-                ? context->sheet->source_rule_relevant_limit_end
-                : context->sheet->source_rule_head_limit_end
+                ? source.rule_relevant_limit_end
+                : source.rule_head_limit_end
                         > SIZE_MAX - STYLESHEET_LARGE_SOURCE_SECONDARY_RULES
                     ? SIZE_MAX
-                    : context->sheet->source_rule_head_limit_end
+                    : source.rule_head_limit_end
                         + STYLESHEET_LARGE_SOURCE_SECONDARY_RULES;
-        context->sheet->source_rule_priority_token_bloom =
+        source.rule_priority_token_bloom =
             context->priority_token_bloom;
-        context->sheet->source_rule_priority_token_bloom_words =
+        source.rule_priority_token_bloom_words =
             STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS;
-        context->sheet->source_rule_token_bloom =
+        source.rule_token_bloom =
             context->selector_token_bloom;
-        context->sheet->source_rule_token_bloom_words =
+        source.rule_token_bloom_words =
             STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS;
-        context->sheet->source_rule_tail_begin =
+        source.rule_tail_begin =
             (const char *) css_data
             + (css_length / 100u) * STYLESHEET_LARGE_SOURCE_TAIL_PERCENT;
     }
@@ -1568,28 +1708,12 @@ static bool apply_stylesheet_data(ResourceContext *context,
                 context->selector_token_bloom[i];
         }
     }
-#ifndef TILEFINCH_NO_TRACE
-    fragment_eligible = fragment_eligible
-        && getenv("TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE") == NULL;
-#endif
-    /* Large sources deliberately retain bounded source-order bookends plus
-       a DOM-relevant selector allowance. Their structural IR would otherwise
-       replay every captured rule and silently bypass that degradation policy. */
-    bool ir_eligible = fragment_eligible
-        && css_length < STYLESHEET_LARGE_SOURCE_BYTES;
-#ifndef TILEFINCH_NO_TRACE
-    ir_eligible = ir_eligible
-        && getenv("TILEFINCH_DISABLE_STYLESHEET_PARSED_IR") == NULL;
-#endif
+    bool ir_eligible = false;
     BrowserSharedBody *compiled_fragment = NULL;
     BrowserSharedBody *parsed_ir = NULL;
-    bool artifact_backing_available = false;
-    if (fragment_eligible) {
-        artifact_backing_available = browser_session_stylesheet_artifacts_acquire(
-            context->session, resolved, request_context,
-            css_data, css_length, &compiled_fragment,
-            ir_eligible ? &parsed_ir : NULL);
-    }
+    bool artifact_backing_available = stylesheet_artifacts_acquire(
+        context, resolved, request_context, css_data, css_length,
+        &fragment_eligible, &ir_eligible, &compiled_fragment, &parsed_ir);
     unsigned char *new_ir = NULL;
     size_t new_ir_length = 0;
     size_t ir_operations_reused = 0;
@@ -1599,15 +1723,13 @@ static bool apply_stylesheet_data(ResourceContext *context,
        may style the page but must never enter that JS-visible side channel.
        Fresh imports have their own grant; retained responses keep the
        grant-derived readability bit. Missing provenance is non-readable. */
-    bool previous_motion_source_blocked =
-        context->sheet->motion_css_source_blocked;
-    context->sheet->motion_css_source_blocked =
+    source.motion_source_blocked =
         !retained_motion_source_readable
         && (resource_grant == NULL || !resource_grant->cors_validated);
     if (parsed && parsed_ir != NULL) {
         ir_result = stylesheet_add_parsed_ir_from_context(
             context->sheet, parsed_ir->data, parsed_ir->length,
-            source_base, stable_provenance.referrer_policy,
+            source_base, stable_provenance.referrer_policy, &source,
             &ir_operations_reused);
         if (ir_result == STYLE_PARSED_IR_APPLIED) {
             context->stats->parsed_ir_hits++;
@@ -1615,7 +1737,7 @@ static bool apply_stylesheet_data(ResourceContext *context,
                 ir_operations_reused;
             context->stats->parsed_ir_bytes += parsed_ir->length;
 #ifndef TILEFINCH_NO_TRACE
-            if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
+            if (context->trace_stylesheets) {
                 fprintf(stderr,
                         "tilefinch-stylesheet-ir action=hit "
                         "operations=%zu bytes=%zu url=%s\n",
@@ -1637,48 +1759,18 @@ static bool apply_stylesheet_data(ResourceContext *context,
         parsed = capture_ir
             ? stylesheet_add_css_from_context_capture_ir(
                   context->sheet, (const char *) css_data, css_length,
-                  source_base, stable_provenance.referrer_policy,
+                  source_base, stable_provenance.referrer_policy, &source,
                   &new_ir, &new_ir_length)
             : stylesheet_add_css_from_context(
                   context->sheet, (const char *) css_data, css_length,
-                  source_base, stable_provenance.referrer_policy);
+                  source_base, stable_provenance.referrer_policy, &source);
     }
-    context->sheet->motion_css_source_blocked =
-        previous_motion_source_blocked;
     fragment_eligible = fragment_eligible && parsed;
     unsigned char *new_fragment = NULL;
     size_t new_fragment_length = 0;
-    size_t fragment_rules_reused = 0;
-    if (compiled_fragment != NULL) {
-        fragment_rules_reused = stylesheet_compiled_fragment_apply(
-            context->sheet, rules_before, context->sheet->count,
-            compiled_fragment->data, compiled_fragment->length);
-        if (fragment_rules_reused != 0) {
-            context->stats->compiled_fragment_hits++;
-            context->stats->compiled_fragment_rules_reused +=
-                fragment_rules_reused;
-            context->stats->compiled_fragment_bytes +=
-                compiled_fragment->length;
-#ifndef TILEFINCH_NO_TRACE
-            if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
-                fprintf(stderr,
-                        "tilefinch-stylesheet-fragment action=hit "
-                        "rules=%zu bytes=%zu url=%s\n",
-                        fragment_rules_reused, compiled_fragment->length,
-                        resolved);
-            }
-#endif
-        } else {
-            context->stats->compiled_fragment_misses++;
-        }
-    } else if (fragment_eligible) {
-        context->stats->compiled_fragment_misses++;
-    }
-    tilefinch_platform_trace_step("css-fragment-build");
-    bool fragment_built = fragment_eligible && fragment_rules_reused == 0
-        && stylesheet_compiled_fragment_build(
-            context->sheet, rules_before, context->sheet->count,
-            &new_fragment, &new_fragment_length);
+    bool fragment_built = stylesheet_fragment_reuse_or_build(
+        context, resolved, compiled_fragment, fragment_eligible,
+        rules_before, &new_fragment, &new_fragment_length);
     tilefinch_platform_trace_step("css-fragment-seed");
     if (fragment_built) {
         /* Seed this first parse too. The final whole-page selector program
@@ -1689,19 +1781,6 @@ static bool apply_stylesheet_data(ResourceContext *context,
             context->sheet, rules_before, context->sheet->count,
             new_fragment, new_fragment_length);
     }
-    context->sheet->source_rule_limit_end = previous_rule_limit;
-    context->sheet->source_rule_head_limit_end = previous_head_limit;
-    context->sheet->source_rule_secondary_limit_end =
-        previous_secondary_limit;
-    context->sheet->source_rule_relevant_limit_end = previous_relevant_limit;
-    context->sheet->source_rule_priority_token_bloom =
-        previous_priority_token_bloom;
-    context->sheet->source_rule_priority_token_bloom_words =
-        previous_priority_token_bloom_words;
-    context->sheet->source_rule_token_bloom = previous_token_bloom;
-    context->sheet->source_rule_token_bloom_words =
-        previous_token_bloom_words;
-    context->sheet->source_rule_tail_begin = previous_tail_begin;
     if (parsed) {
         context->stats->loaded++;
         context->stats->rules_added += context->sheet->count - rules_before;
@@ -1720,59 +1799,10 @@ static bool apply_stylesheet_data(ResourceContext *context,
             css_data = (const unsigned char *) fetched->data;
         }
         tilefinch_platform_trace_step("css-artifact-store");
-        bool ir_stored = new_ir != NULL
-            && browser_session_stylesheet_ir_put_take(
-                   context->session, resolved, request_context,
-                   css_data, css_length, new_ir, new_ir_length);
-        if (ir_stored) {
-            new_ir = NULL;
-            context->stats->parsed_ir_stores++;
-            context->stats->parsed_ir_bytes += new_ir_length;
-#ifndef TILEFINCH_NO_TRACE
-            if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
-                fprintf(stderr,
-                        "tilefinch-stylesheet-ir action=store "
-                        "bytes=%zu url=%s\n", new_ir_length, resolved);
-            }
-#endif
-        }
-#ifndef TILEFINCH_NO_TRACE
-        else if (new_ir != NULL
-                 && getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
-            fprintf(stderr,
-                    "tilefinch-stylesheet-ir action=store-refused "
-                    "bytes=%zu url=%s\n", new_ir_length, resolved);
-        }
-#endif
-        bool fragment_stored = new_fragment != NULL
-            && browser_session_stylesheet_fragment_put_take(
-                   context->session, resolved, request_context,
-                   css_data, css_length,
-                   new_fragment, new_fragment_length);
-        if (fragment_stored) {
-            new_fragment = NULL;
-            context->stats->compiled_fragment_stores++;
-            context->stats->compiled_fragment_bytes += new_fragment_length;
-#ifndef TILEFINCH_NO_TRACE
-            if (getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
-                fprintf(stderr,
-                        "tilefinch-stylesheet-fragment action=store "
-                        "rules=%zu bytes=%zu url=%s\n",
-                        context->sheet->count - rules_before,
-                        new_fragment_length, resolved);
-            }
-#endif
-        }
-#ifndef TILEFINCH_NO_TRACE
-        else if (new_fragment != NULL
-                 && getenv("TILEFINCH_TRACE_STYLESHEETS") != NULL) {
-            fprintf(stderr,
-                    "tilefinch-stylesheet-fragment action=store-refused "
-                    "rules=%zu bytes=%zu url=%s\n",
-                    context->sheet->count - rules_before,
-                    new_fragment_length, resolved);
-        }
-#endif
+        stylesheet_artifacts_store(
+            context, resolved, request_context, css_data, css_length,
+            rules_before, &new_ir, new_ir_length,
+            &new_fragment, new_fragment_length);
     }
     browser_shared_body_release(compiled_fragment);
     browser_shared_body_release(parsed_ir);
@@ -3239,6 +3269,9 @@ static bool stylesheets_append_ordered_suffix_impl(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+#ifndef TILEFINCH_NO_TRACE
+    resource_context_read_switches(&context);
+#endif
     tilefinch_platform_trace_step("css-prelude");
     lxb_dom_node_t *selector_root = nodes[0];
     while (selector_root != NULL && selector_root->parent != NULL) {
@@ -3370,6 +3403,9 @@ bool stylesheets_load_external_tracked_with_context(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+#ifndef TILEFINCH_NO_TRACE
+    resource_context_read_switches(&context);
+#endif
     tilefinch_platform_trace_step("css-prelude");
     stylesheet_collect_selector_tokens(
         lxb_dom_interface_node(document->html), context.priority_token_bloom,
@@ -3476,595 +3512,6 @@ bool stylesheets_load_external(const PocDocument *document, Stylesheet *sheet,
         document, sheet, budget, base_url, base_url, "", maximum_count,
         maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
         session, stats);
-}
-
-static void font_accept_response_cookies(
-    BrowserSession *session, TilefinchRequestContext *context,
-    const char *fallback_url, const FetchResult *fetch)
-{
-    if (session == NULL || context == NULL || fetch == NULL) return;
-    for (size_t i = 0; i < fetch->set_cookie_count; i++) {
-        context->target_url = fetch_set_cookie_url(fetch, i, fallback_url);
-        (void) browser_session_cookie_set_http_context(
-            session, context, fetch->set_cookies[i]);
-    }
-    context->target_url = fallback_url;
-}
-
-static size_t font_charge_encoded_bytes(ExternalFontStats *stats,
-                                        size_t bytes, size_t maximum)
-{
-    if (stats == NULL || bytes == 0 || stats->encoded_bytes >= maximum) {
-        return 0;
-    }
-    size_t remaining = maximum - stats->encoded_bytes;
-    size_t charged = bytes < remaining ? bytes : remaining;
-    stats->encoded_bytes += charged;
-    if (charged != bytes) stats->skipped_limit++;
-    return charged;
-}
-
-static bool font_loader_arguments_valid(
-    Stylesheet *sheet, Budget *budget, const char *document_base_url,
-    const char *document_url, size_t maximum_attempts,
-    size_t maximum_total_encoded_bytes,
-    size_t maximum_single_encoded_bytes,
-    size_t maximum_face_backend_bytes, FetchScheduler *scheduler,
-    ExternalFontStats *stats)
-{
-    if (sheet == NULL || budget == NULL || document_base_url == NULL
-        || document_url == NULL || stats == NULL || maximum_attempts == 0
-        || maximum_attempts > TILEFINCH_WEB_FONT_FAMILY_LIMIT * 2u
-                               * STYLE_WEB_FONT_SOURCE_LIMIT
-        || maximum_total_encoded_bytes == 0
-        || maximum_single_encoded_bytes == 0
-        || maximum_face_backend_bytes == 0 || scheduler == NULL) return false;
-    return true;
-}
-
-static void font_loader_update_elapsed(ExternalFontLoader *loader,
-                                       ExternalFontStats *stats)
-{
-    if (loader == NULL || stats == NULL || loader->started_ms <= 0.0) return;
-    double elapsed = resource_now_ms() - loader->started_ms;
-    if (elapsed < 0.0) elapsed = 0.0;
-    stats->elapsed_ms = (uint64_t) elapsed;
-}
-
-bool fonts_external_loader_begin(ExternalFontLoader *loader,
-                                 Stylesheet *sheet, long timeout_ms,
-                                 ExternalFontStats *stats)
-{
-    if (loader == NULL || sheet == NULL || stats == NULL
-        || timeout_ms <= 0) return false;
-    memset(loader, 0, sizeof(*loader));
-    memset(stats, 0, sizeof(*stats));
-    StylesheetWebFontStats discovery = {0};
-    (void) stylesheet_web_font_stats(sheet, &discovery);
-    stats->declarations_discovered = discovery.declarations_discovered;
-    stats->sources_discovered = stylesheet_web_font_source_count(sheet);
-    stats->unsupported = discovery.unsupported_sources;
-    stats->duplicate_sources = discovery.duplicate_sources;
-    stats->skipped_limit = discovery.skipped_family_limit
-                           + discovery.skipped_source_limit;
-    loader->started_ms = resource_now_ms();
-    loader->deadline_ms = loader->started_ms + (double) timeout_ms;
-    loader->active = stats->sources_discovered != 0;
-    return true;
-}
-
-bool fonts_external_loader_pending(const ExternalFontLoader *loader)
-{
-    return loader != NULL && loader->active;
-}
-
-_Static_assert(TILEFINCH_WEB_FONT_FAMILY_LIMIT <= 8
-    && TILEFINCH_WEB_FONT_FAMILY_LIMIT * TILEFINCH_WEB_FONT_WEIGHT_LIMIT <= 64
-    && STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT <= 64,
-    "font continuation masks must cover all sources and faces");
-
-static bool font_loader_source_required(const ExternalFontLoader *loader,
-    const Stylesheet *sheet, const StylesheetWebFontSource *source)
-{
-    if (!loader->usage_filter) return true;
-    if (source->family_slot >= TILEFINCH_WEB_FONT_FAMILY_LIMIT
-        || source->face_slot >= TILEFINCH_WEB_FONT_WEIGHT_LIMIT) return false;
-    unsigned shift = source->family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
-    uint64_t bit = UINT64_C(1) << (shift + source->face_slot);
-    if (!(loader->required_faces & bit)) return false;
-    if (loader->preferred_faces & bit) return true;
-    const WebFontSet *fonts = stylesheet_web_font_set(sheet);
-    for (unsigned i = 0; i < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; i++)
-        if ((loader->preferred_faces & (UINT64_C(1) << (shift+i)))
-            && (fonts == NULL || !fonts->families[source->family_slot].faces[i].loaded)) return true;
-    return false; /* No fallback download after all desired faces loaded. */
-}
-
-static bool font_loader_next(ExternalFontLoader *loader, const Stylesheet *sheet)
-{
-    size_t count = stylesheet_web_font_source_count(sheet);
-    size_t fallback = SIZE_MAX;
-    for (size_t at = 0; at < count && at < STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT; at++) {
-        StylesheetWebFontSource source = {0};
-        if ((loader->processed_sources & (UINT64_C(1) << at)) == 0
-            && (!loader->usage_filter
-                || (stylesheet_web_font_source(sheet, at, &source)
-                    && font_loader_source_required(loader, sheet, &source)))) {
-            uint64_t bit = UINT64_C(1) << (source.family_slot * TILEFINCH_WEB_FONT_WEIGHT_LIMIT + source.face_slot);
-            if (loader->usage_filter && !(loader->preferred_faces & bit)) {
-                if (fallback == SIZE_MAX) fallback = at;
-                continue;
-            }
-            loader->next_source = at;
-            return true;
-        }
-    }
-    loader->next_source = fallback == SIZE_MAX ? count : fallback;
-    return fallback != SIZE_MAX;
-}
-
-void fonts_external_loader_prioritize_faces(ExternalFontLoader *loader,
-    const Stylesheet *sheet, uint64_t required_faces, uint64_t preferred_faces)
-{
-    preferred_faces &= required_faces;
-    if (loader == NULL || sheet == NULL || loader->cancelled
-        || loader->deadline_ms <= loader->started_ms
-        || (loader->usage_filter
-            && loader->required_faces == required_faces
-            && loader->preferred_faces == preferred_faces)) return;
-    bool was_active = loader->active;
-    loader->usage_filter = true;
-    loader->required_faces = required_faces;
-    loader->preferred_faces = preferred_faces;
-    loader->active = loader->request_id != 0 || font_loader_next(loader, sheet);
-    if (!was_active && loader->active) {
-        double window = loader->deadline_ms - loader->started_ms;
-        loader->started_ms = resource_now_ms();
-        loader->deadline_ms = loader->started_ms + window;
-    }
-}
-
-void fonts_external_loader_cancel(ExternalFontLoader *loader,
-                                  FetchScheduler *scheduler,
-                                  ExternalFontStats *stats)
-{
-    if (loader == NULL) return;
-    if (loader->request_id != 0 && scheduler != NULL) {
-        (void) fetch_scheduler_cancel(
-            scheduler, loader->request_id, "font continuation cancelled");
-        (void) fetch_scheduler_discard(scheduler, loader->request_id);
-    }
-    loader->request_id = 0;
-    loader->active = false;
-    loader->cancelled = true;
-    font_loader_update_elapsed(loader, stats);
-}
-
-static void font_loader_expire(ExternalFontLoader *loader,
-                               FetchScheduler *scheduler,
-                               ExternalFontStats *stats)
-{
-    if (loader == NULL || stats == NULL) return;
-    stats->deadline_exceeded = true;
-    if (loader->active
-        && loader->next_source < stats->sources_discovered) {
-        stats->deadline_cancelled +=
-            stats->sources_discovered - loader->next_source;
-    }
-    fonts_external_loader_cancel(loader, scheduler, stats);
-}
-
-static bool font_loader_resolve_source(
-    Stylesheet *sheet, size_t index, const char *document_base_url,
-    const char *document_url, const char *referrer_policy,
-    StylesheetWebFontSource *source, FontFace **destination,
-    const char **referrer_source, const char **source_referrer_policy,
-    char resolved[4096])
-{
-    if (!stylesheet_web_font_source(sheet, index, source)) return false;
-    *destination = stylesheet_web_font_face_at(
-        sheet, source->family_slot, source->face_slot);
-    if (*destination == NULL) return false;
-    const char *source_base = source->source_base_url != NULL
-        ? source->source_base_url : document_base_url;
-    *referrer_source = source->source_base_url != NULL
-        ? source->source_base_url : document_url;
-    *source_referrer_policy = source->source_referrer_policy != NULL
-        ? source->source_referrer_policy : referrer_policy;
-    if (source->reference == NULL) return false;
-    if (strncasecmp(source->reference, "data:", 5) == 0) {
-        resolved[0] = '\0';
-        return true;
-    }
-    return fetch_resolve_url(source_base, source->reference, resolved, 4096);
-}
-
-static void font_loader_publish_encoded(
-    Stylesheet *sheet, FontFace *destination, Budget *budget,
-    const StylesheetWebFontSource *source, const unsigned char *bytes,
-    size_t length, size_t maximum_face_backend_bytes,
-    ExternalFontStats *stats, bool *face_loaded)
-{
-    bool shared = false;
-    const WebFontSet *loaded_fonts = stylesheet_web_font_set(sheet);
-    for (size_t family = 0; loaded_fonts != NULL && !shared
-         && family < TILEFINCH_WEB_FONT_FAMILY_LIMIT; family++) {
-        for (size_t face = 0; !shared && face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT; face++)
-            shared = font_face_share_encoded(destination,
-                &loaded_fonts->families[family].faces[face], budget,
-                bytes, length, maximum_face_backend_bytes);
-    }
-    if (shared || font_face_load_encoded(destination, budget, bytes, length,
-                                         maximum_face_backend_bytes)) {
-        stats->loaded_faces++;
-        destination->authored_weight = source->weight;
-        if (!shared) stats->retained_encoded_bytes += destination->data_length;
-        *face_loaded = true;
-    } else {
-        stats->failed++;
-        stats->unsupported++;
-    }
-}
-
-bool fonts_external_loader_step(
-    ExternalFontLoader *loader, Stylesheet *sheet, Budget *budget,
-    const char *document_base_url, const char *document_url,
-    const char *referrer_policy, size_t maximum_attempts,
-    size_t maximum_total_encoded_bytes,
-    size_t maximum_single_encoded_bytes,
-    size_t maximum_face_backend_bytes, FetchScheduler *scheduler,
-    BrowserSession *session, const TilefinchContentSecurityPolicy *csp,
-    ExternalFontStats *stats,
-    unsigned maximum_wait_ms, bool *face_loaded)
-{
-    if (loader == NULL || face_loaded == NULL
-        || !font_loader_arguments_valid(
-            sheet, budget, document_base_url, document_url,
-            maximum_attempts, maximum_total_encoded_bytes,
-            maximum_single_encoded_bytes, maximum_face_backend_bytes,
-            scheduler, stats)) return false;
-    *face_loaded = false;
-    if (!loader->active) return true;
-    if (resource_now_ms() >= loader->deadline_ms) {
-        font_loader_expire(loader, scheduler, stats);
-        return true;
-    }
-
-    char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
-    if (!tilefinch_url_origin(document_url, origin, sizeof(origin))) {
-        stats->failed += stats->sources_discovered - loader->next_source;
-        loader->active = false;
-        font_loader_update_elapsed(loader, stats);
-        return true;
-    }
-
-    if (loader->request_id != 0) {
-        FetchPumpQuota quota = {
-            .maximum_body_callbacks = 2,
-            .maximum_body_bytes = 32u * 1024u,
-            .maximum_time_us = 2000
-        };
-        FetchPumpMetrics metrics = {0};
-        (void) fetch_scheduler_pump_bounded(
-            scheduler, 1, maximum_wait_ms > 10 ? 10 : maximum_wait_ms,
-            &quota, &metrics);
-        FetchRequestProgress progress = {0};
-        if (!fetch_scheduler_request_progress(
-                scheduler, loader->request_id, &progress)
-            || !progress.complete) {
-            if (resource_now_ms() >= loader->deadline_ms) {
-                font_loader_expire(loader, scheduler, stats);
-            } else {
-                font_loader_update_elapsed(loader, stats);
-            }
-            return true;
-        }
-        FetchResult *fetched = fetch_result_create(budget);
-        if (fetched == NULL) {
-            (void) fetch_scheduler_discard(
-                scheduler, loader->request_id);
-            loader->request_id = 0;
-            loader->processed_sources |= UINT64_C(1) << loader->pending_source;
-            loader->active = font_loader_next(loader, sheet);
-            stats->failed++;
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        bool success = false;
-        if (!fetch_scheduler_take(
-                scheduler, loader->request_id, &success, fetched)) {
-            fetch_result_free(fetched);
-            if (resource_now_ms() >= loader->deadline_ms) {
-                font_loader_expire(loader, scheduler, stats);
-            } else {
-                font_loader_update_elapsed(loader, stats);
-            }
-            return true;
-        }
-        size_t settled_index = loader->pending_source;
-        loader->request_id = 0;
-        loader->processed_sources |= UINT64_C(1) << settled_index;
-        loader->active = font_loader_next(loader, sheet);
-        StylesheetWebFontSource source = {0};
-        FontFace *destination = NULL;
-        const char *referrer_source = NULL;
-        const char *source_referrer_policy = NULL;
-        char resolved[4096];
-        if (!font_loader_resolve_source(
-                sheet, settled_index, document_base_url, document_url,
-                referrer_policy, &source, &destination, &referrer_source,
-                &source_referrer_policy, resolved)) {
-            stats->failed++;
-            fetch_result_free(fetched);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        size_t source_bytes_charged = font_charge_encoded_bytes(
-            stats, fetched->received_body_bytes,
-            maximum_total_encoded_bytes);
-        if (!success) {
-            if (fetched->timed_out) stats->deadline_exceeded = true;
-            stats->failed++;
-            fetch_result_free(fetched);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        TilefinchRequestContext request_context = {
-            .target_url = resolved,
-            .initiator_url = document_url,
-            .top_level_url = document_url,
-            .method = "GET",
-            .mode = TILEFINCH_REQUEST_MODE_CORS,
-            .credentials = TILEFINCH_CREDENTIALS_SAME_ORIGIN,
-            .destination = TILEFINCH_DESTINATION_FONT
-        };
-        font_accept_response_cookies(
-            session, &request_context, resolved, fetched);
-        if (fetched->status_code < 200 || fetched->status_code > 299) {
-            stats->failed++;
-            fetch_result_free(fetched);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        size_t additional_bytes =
-            fetched->length > source_bytes_charged
-                ? fetched->length - source_bytes_charged : 0;
-        size_t request_maximum =
-            maximum_total_encoded_bytes >=
-                    stats->encoded_bytes - source_bytes_charged
-                ? maximum_total_encoded_bytes
-                    - (stats->encoded_bytes - source_bytes_charged)
-                : 0;
-        if (request_maximum > maximum_single_encoded_bytes) {
-            request_maximum = maximum_single_encoded_bytes;
-        }
-        if (fetched->length > request_maximum
-            || additional_bytes > maximum_total_encoded_bytes
-                                   - stats->encoded_bytes) {
-            stats->skipped_limit++;
-            fetch_result_free(fetched);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        if (additional_bytes != 0) {
-            (void) font_charge_encoded_bytes(
-                stats, additional_bytes, maximum_total_encoded_bytes);
-        }
-        font_loader_publish_encoded(sheet, destination, budget, &source,
-            (const unsigned char *) fetched->data, fetched->length,
-            maximum_face_backend_bytes, stats, face_loaded);
-        fetch_result_free(fetched);
-        font_loader_update_elapsed(loader, stats);
-        return true;
-    }
-
-    unsigned source_turns = 0;
-    while (source_turns++ < STYLE_WEB_FONT_TOTAL_SOURCE_LIMIT
-           && font_loader_next(loader, sheet)) {
-        if (resource_now_ms() >= loader->deadline_ms) {
-            font_loader_expire(loader, scheduler, stats);
-            return true;
-        }
-        size_t index = loader->next_source;
-        if ((loader->processed_sources & (UINT64_C(1) << index)) != 0) {
-            loader->next_source++;
-            continue;
-        }
-        StylesheetWebFontSource candidate = {0};
-        if (loader->usage_filter && stylesheet_web_font_source(sheet, index, &candidate)
-            && !font_loader_source_required(loader, sheet, &candidate)) {
-            loader->next_source++;
-            continue;
-        }
-        loader->processed_sources |= UINT64_C(1) << index;
-        StylesheetWebFontSource source = {0};
-        FontFace *destination = NULL;
-        const char *referrer_source = NULL;
-        const char *source_referrer_policy = NULL;
-        char resolved[4096];
-        if (!font_loader_resolve_source(
-                sheet, index, document_base_url, document_url,
-                referrer_policy, &source, &destination, &referrer_source,
-                &source_referrer_policy, resolved)) {
-            stats->failed++;
-            loader->next_source++;
-            continue;
-        }
-        bool embedded = strncasecmp(source.reference, "data:", 5) == 0;
-        if (!tilefinch_csp_allows_request(
-                csp, TILEFINCH_DESTINATION_FONT,
-                embedded ? source.reference : resolved)) {
-            stats->failed++;
-            loader->next_source++;
-            continue;
-        }
-        if (destination->loaded) {
-            stats->duplicate_sources++;
-            loader->next_source++;
-            continue;
-        }
-        if (stats->attempted >= maximum_attempts
-            || stats->encoded_bytes >= maximum_total_encoded_bytes) {
-            stats->skipped_limit++;
-            loader->next_source++;
-            continue;
-        }
-        size_t remaining_bytes = maximum_total_encoded_bytes
-                                 - stats->encoded_bytes;
-        size_t maximum = maximum_single_encoded_bytes < remaining_bytes
-                         ? maximum_single_encoded_bytes : remaining_bytes;
-        if (maximum == 0) {
-            stats->skipped_limit++;
-            loader->next_source++;
-            continue;
-        }
-        if (embedded) {
-            unsigned char *bytes = NULL;
-            size_t length = 0;
-            char media_type[128];
-            stats->attempted++;
-            DataUrlDecodeResult decoded = data_url_decode(budget,
-                source.reference, strlen(source.reference), maximum,
-                &bytes, &length, media_type, sizeof(media_type));
-            if (decoded == DATA_URL_DECODED) {
-                (void) font_charge_encoded_bytes(stats, length,
-                                                  maximum_total_encoded_bytes);
-                font_loader_publish_encoded(sheet, destination, budget, &source,
-                    bytes, length, maximum_face_backend_bytes, stats, face_loaded);
-            } else if (decoded == DATA_URL_TOO_LARGE) {
-                stats->skipped_limit++;
-            } else {
-                stats->failed++;
-                if (decoded != DATA_URL_NO_MEMORY) stats->unsupported++;
-            }
-            budget_free(budget, bytes);
-            loader->next_source++;
-            loader->active = font_loader_next(loader, sheet);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        /* A full scheduler reports both capacity pressure and policy refusal
-           as a zero request id.  Settle blocker refusals here so the font
-           continuation does not mistake a permanent decision for transient
-           backpressure and retry it until the stage deadline. */
-        if (session != NULL
-            && content_blocker_would_block(
-                   session->content_blocker, resolved, document_url,
-                   "font", "cors")) {
-            (void) content_blocker_should_block(
-                session->content_blocker, resolved, document_url,
-                "font", "cors");
-            stats->attempted++;
-            stats->failed++;
-            loader->next_source++;
-            continue;
-        }
-        /* The shared HTTP cache is intentionally not consulted here.  Its
-           generic entries do not yet retain the request origin, CORS result,
-           credentials mode, and redirect-origin taint needed to prove that a
-           cached representation is reusable by this font request.  In
-           particular, a same-origin cache key may hold a no-CORS response
-           reached through a cross-origin redirect.  Page-local decoded faces
-           remain retained by the stylesheet, so repeated glyph use is still
-           allocation- and network-free. */
-        TilefinchRequestContext request_context = {
-            .target_url = resolved,
-            .initiator_url = document_url,
-            .top_level_url = document_url,
-            .method = "GET",
-            .mode = TILEFINCH_REQUEST_MODE_CORS,
-            .credentials = TILEFINCH_CREDENTIALS_SAME_ORIGIN,
-            .destination = TILEFINCH_DESTINATION_FONT
-        };
-        FetchRequest transport = {
-            .allow_http_errors = true,
-            .accept = "font/woff,application/font-woff;q=0.9,*/*;q=0.1",
-        };
-        FetchPreparedPageRequest *prepared = budget_malloc_category(
-            budget, BUDGET_CATEGORY_RESOURCE, sizeof(*prepared));
-        if (prepared == NULL) {
-            loader->processed_sources &= ~(UINT64_C(1) << index);
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        if (!fetch_prepare_page_request_context(
-                &request_context, referrer_source, source_referrer_policy,
-                session, csp, NULL, &transport, prepared, NULL)) {
-            budget_free(budget, prepared);
-            stats->failed++;
-            loader->next_source++;
-            continue;
-        }
-        const FetchRequest *request = fetch_prepared_page_request(prepared);
-        double remaining_ms = loader->deadline_ms - resource_now_ms();
-        long request_timeout = remaining_ms < 1.0
-            ? 1 : (long) remaining_ms;
-        uint64_t request_id = fetch_scheduler_enqueue(
-            scheduler, resolved, request, maximum, request_timeout);
-        budget_free(budget, prepared);
-        if (request_id == 0) {
-            loader->processed_sources &= ~(UINT64_C(1) << index);
-            /* A shared page scheduler can be temporarily full. Preserve
-               source order and retry this source during the next idle slice. */
-            font_loader_update_elapsed(loader, stats);
-            return true;
-        }
-        stats->attempted++;
-        loader->pending_source = index;
-        loader->request_id = request_id;
-        font_loader_update_elapsed(loader, stats);
-        return true;
-    }
-    loader->active = false;
-    font_loader_update_elapsed(loader, stats);
-    return true;
-}
-
-bool fonts_load_external(Stylesheet *sheet, Budget *budget,
-                         const char *document_base_url,
-                         const char *document_url,
-                         const char *referrer_policy,
-                         size_t maximum_attempts,
-                         size_t maximum_total_encoded_bytes,
-                         size_t maximum_single_encoded_bytes,
-                         size_t maximum_face_backend_bytes,
-                         long timeout_ms, FetchScheduler *scheduler,
-                         BrowserSession *session,
-                         const TilefinchContentSecurityPolicy *csp,
-                         ExternalFontStats *stats)
-{
-    if (timeout_ms <= 0 || stats == NULL || budget == NULL) return false;
-    bool owns_scheduler = scheduler == NULL;
-    if (owns_scheduler) {
-        scheduler = fetch_scheduler_create(
-            budget, 1, maximum_single_encoded_bytes);
-        if (scheduler == NULL) return false;
-    }
-    if (!font_loader_arguments_valid(
-            sheet, budget, document_base_url, document_url,
-            maximum_attempts, maximum_total_encoded_bytes,
-            maximum_single_encoded_bytes, maximum_face_backend_bytes,
-            scheduler, stats)) {
-        if (owns_scheduler) fetch_scheduler_destroy(scheduler);
-        return false;
-    }
-    ExternalFontLoader loader = {0};
-    bool ok = fonts_external_loader_begin(
-        &loader, sheet, timeout_ms, stats);
-    while (ok && fonts_external_loader_pending(&loader)) {
-        bool face_loaded = false;
-        ok = fonts_external_loader_step(
-            &loader, sheet, budget, document_base_url, document_url,
-            referrer_policy, maximum_attempts,
-            maximum_total_encoded_bytes, maximum_single_encoded_bytes,
-            maximum_face_backend_bytes, scheduler, session, csp, stats, 10,
-            &face_loaded);
-    }
-    if (!ok) {
-        fonts_external_loader_cancel(&loader, scheduler, stats);
-    }
-    if (owns_scheduler) fetch_scheduler_destroy(scheduler);
-    return ok;
 }
 
 void stylesheet_document_resources_destroy(

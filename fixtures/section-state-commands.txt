@@ -1,6 +1,0 @@
-focus-id section-input
-type B
-anchor gamma
-anchor alpha
-control-value section-input
-status

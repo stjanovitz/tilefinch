@@ -244,6 +244,21 @@ static inline bool document_is_declared_video_card(
             || node == document->reader_declared_video_card_node);
 }
 
+/* Whether `node` is an element whose local name is the static lexbor tag
+   `tag`. Every element's local name is interned lower-case and a name in
+   lexbor's static table always takes that table's id, so this is exactly
+   the old test of document_element_name() against the tag's lower-case
+   name, with or without case folding, in any namespace (SVG <a> is
+   LXB_TAG_A like HTML <a>); a custom element never has a static id.
+   tests/test_layout_shared_models.c checks that equivalence for every
+   static tag. */
+static inline bool document_node_is_tag(const lxb_dom_node_t *node,
+                                        lxb_tag_id_t tag)
+{
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && node->local_name == tag;
+}
+
 typedef bool (*DocumentBodySnapshotReplaceCallback)(
     void *opaque, PocDocument *document,
     const char *markup, size_t length);

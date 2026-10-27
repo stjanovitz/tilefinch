@@ -678,7 +678,7 @@ during a run; per-event flushing is reserved for localizing crashes.
 ## Focused suites
 
 The aggregate `tilefinch-tests` executable is available for an explicit
-whole-program qualification run. Its test program has three
+whole-program qualification run. Its test program has two
 registered filters, and the layout suite lives in its own executable next to
 the layout translation units it exercises:
 
@@ -686,14 +686,13 @@ the layout translation units it exercises:
 ./build-preset-dev/tilefinch-tests --list
 ./build-preset-dev/tilefinch-tests --filter foundation
 ./build-preset-dev/tilefinch-tests --filter web-runtime
-./build-preset-dev/tilefinch-tests --filter sections
 ./build-preset-dev/tilefinch-layout-tests
 ```
 
 `core` is an alias for foundation and web-runtime (`scripts/dev.sh unit core`
 also runs the layout executable). CTest exposes the same suites as
-`tilefinch-foundation-tests`, `tilefinch-web-runtime-tests`,
-`tilefinch-layout-tests`, and `tilefinch-section-tests`, plus focused executables for
+`tilefinch-foundation-tests`, `tilefinch-web-runtime-tests`, and
+`tilefinch-layout-tests`, plus focused executables for
 URL/security, session security, fetch streaming, the engine facade, JavaScript
 responsiveness, pumpable navigation, and supported loopback redirect behavior.
 For example:
@@ -1533,8 +1532,8 @@ reproducible rather than dependent on hand-edited C flags.
 ## Source and target boundaries
 
 `include/tilefinch/` contains the exposed Tilefinch contracts. Most subsystem
-headers have a same-named implementation in `src/`; `remote_selector.h` and
-`budget_quickjs.h` are intentionally header-only shared types/adapters. New
+headers have a same-named implementation in `src/`; `budget_quickjs.h` is an
+intentionally header-only shared adapter. New
 frontend code should prefer `browser_engine.h`; direct subsystem headers remain
 available primarily for tests and the compatibility seams described in
 `ARCHITECTURE.md`.

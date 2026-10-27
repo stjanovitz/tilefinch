@@ -13,6 +13,7 @@ set(TILEFINCH_CORE_SOURCES
     src/content_security_policy.c
     src/controller.c
     src/media_discovery.c
+    src/json_scan.c
     src/linked_video_preview.c
     src/danzeff_input.c
     src/data_url.c
@@ -38,13 +39,14 @@ set(TILEFINCH_CORE_SOURCES
     src/generated/js_bootstrap.c
     src/generated/js_bootstrap_bytecode.c
     src/js_dom_bindings.c
+    src/js_game_audio.c
     src/js_canvas_bridge.c
+    src/js_computed_style.c
     src/js_webgl_bridge.c
     src/js_wasm_bridge.c
     src/js_fetch_cors.c
     src/js_lazy_webpack.c
     src/js_module_loader.c
-    src/js_remote_bindings.c
     src/js_runtime.c
     src/layout.c
     src/layout_bidi.c
@@ -59,11 +61,17 @@ set(TILEFINCH_CORE_SOURCES
     src/layout_block_geometry.c
     src/layout_block_grid.c
     src/layout_block_margins.c
+    src/layout_block_replaced.c
     src/layout_controls.c
     src/layout_float.c
     src/layout_flex.c
+    src/layout_grid_placement.c
     src/layout_inline.c
+    src/layout_intrinsic.c
     src/layout_paint.c
+    src/layout_replaced.c
+    src/layout_reuse.c
+    src/layout_text_cache.c
     src/layout_scroll.c
     src/layout_table.c
     src/navigation.c
@@ -93,14 +101,13 @@ set(TILEFINCH_CORE_SOURCES
     src/request_context.c
     src/resource_integrity.c
     src/resources.c
-    src/section_pager.c
-    src/section_router.c
-    src/section_store.c
+    src/resources_fonts.c
     src/sha256.c
     src/script_admission.c
     src/script_lazy.c
     src/script_loader.c
     src/session.c
+    src/session_cookies.c
     src/session_persistence.c
     src/session_lazy_bundle.c
     src/session_script_disk.c
@@ -108,13 +115,18 @@ set(TILEFINCH_CORE_SOURCES
     src/site_adapter.c
     src/site_identity.c
     src/style.c
+    src/style_focus.c
+    src/style_compat_reveal.c
     src/style_has_invalidation.c
     src/style_match.c
     src/style_math.c
     src/style_properties.c
     src/style_queries.c
     src/style_resolve.c
+    src/style_retained_matches.c
+    src/style_scopes.c
     src/style_selector_program.c
+    src/style_spans.c
     src/style_sheet.c
     src/style_values.c
     src/swdec_component_store.c

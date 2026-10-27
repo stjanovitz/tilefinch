@@ -3763,45 +3763,37 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
     return true;
 }
 
+/* Network natives; the network primitives can be replaced by tests (see
+   JS_RT_NATIVE_TEST_OVERRIDABLE). */
+static const JsRtNative fetch_cors_natives[] = {
+    { "__tilefinchFetchSync",
+      js_fetch_sync, 11, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchFetchAsync",
+      js_fetch_async, 16, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchCancelNetwork",
+      js_fetch_cancel, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchEventSourceStart", js_event_source_start, 3, 0 },
+    { "__tilefinchEventSourceClose", js_event_source_close, 1, 0 },
+    { "__tilefinchWebSocketStart",
+      js_websocket_start, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchWebSocketSend",
+      js_websocket_send, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchWebSocketClose",
+      js_websocket_close, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchMultiplayerStart",
+      js_multiplayer_start, 4, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchMultiplayerSend",
+      js_multiplayer_send, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchMultiplayerAccept",
+      js_multiplayer_accept, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchMultiplayerAddRemoteCode",
+      js_multiplayer_add_remote_code, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchMultiplayerClose",
+      js_multiplayer_close, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchScheduleDynamicScript", js_schedule_dynamic_script, 1, 0 },
+};
+
 bool js_fetch_cors_install(JSContext *context, JSValue global)
 {
-    return js_rt_install_function(context, global, "__tilefinchFetchSync",
-                                  js_fetch_sync, 11)
-        && js_rt_install_function(context, global, "__tilefinchFetchAsync",
-                                  js_fetch_async, 16)
-        && js_rt_install_function(context, global, "__tilefinchCancelNetwork",
-                                  js_fetch_cancel, 2)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchEventSourceStart",
-                                  js_event_source_start, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchEventSourceClose",
-                                  js_event_source_close, 1)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchWebSocketStart",
-                                  js_websocket_start, 2)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchWebSocketSend",
-                                  js_websocket_send, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchWebSocketClose",
-                                  js_websocket_close, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchMultiplayerStart",
-                                  js_multiplayer_start, 4)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchMultiplayerSend",
-                                  js_multiplayer_send, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchMultiplayerAccept",
-                                  js_multiplayer_accept, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchMultiplayerAddRemoteCode",
-                                  js_multiplayer_add_remote_code, 2)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchMultiplayerClose",
-                                  js_multiplayer_close, 3)
-        && js_rt_install_function(context, global,
-                                  "__tilefinchScheduleDynamicScript",
-                                  js_schedule_dynamic_script, 1);
+    return JS_RT_INSTALL_NATIVES(context, global, fetch_cors_natives);
 }

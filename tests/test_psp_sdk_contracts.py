@@ -192,8 +192,10 @@ int main(void) {
     def test_video_timing_window_avoids_live_loop_formatting(self):
         source = without_comments(
             (ROOT / "src/psp_script_main.c").read_text())
-        begin = source.index("void psp_webgl_measurement_main_frame(void)")
-        window = source[begin:source.index(
+        cadence = without_comments(
+            (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text())
+        begin = cadence.index("void psp_webgl_measurement_main_frame(void)")
+        window = cadence[begin:cadence.index(
             "void psp_webgl_measurement_mark(", begin)]
         self.assertIn("psp_validation_video_timing_window = "
                       "psp_log_begin_timing_window()", window)
@@ -201,8 +203,9 @@ int main(void) {
         self.assertIn("psp_validation_video_suppressed_publications = 0", window)
         self.assertIn("suppressed-loops=%u", window)
         self.assertIn("psp_log_end_timing_window()", window)
-        begin = source.index("static void psp_loop_timing_end(void)")
-        timing = source[begin:source.index(
+        loop = without_comments((ROOT / "src/psp_app/psp_app_validation_loop.c").read_text())
+        begin = loop.index("void psp_loop_timing_end(void)")
+        timing = loop[begin:loop.index(
             "static PspBrowserResources *psp_loop_timing_browser", begin)]
         begin = timing.index("if (psp_validation_video_timing_window) {")
         quiet = timing[begin:timing.index("\n    }", begin)]
@@ -211,8 +214,8 @@ int main(void) {
         self.assertIn("return;", quiet)
         self.assertNotIn("printf", quiet)
         self.assertLess(begin, timing.index('printf("tilefinch-loop-timing:'))
-        begin = source.index('printf("tilefinch-page-publication:')
-        guard = source[source.rindex("#ifdef TILEFINCH_PSP_VALIDATION_LOG", 0, begin):begin]
+        begin = cadence.index('printf("tilefinch-page-publication:')
+        guard = cadence[cadence.rindex("void psp_vprobe_present_end(", 0, begin):begin]
         self.assertIn("&& !psp_validation_video_timing_window", guard)
         self.assertIn("psp_validation_video_suppressed_publications++", guard)
 
@@ -928,7 +931,8 @@ int main(void) {
             self.assertLessEqual(int(x) + len(json.loads(text)) * 6, 480)
 
     def test_player_first_picture_measurement_is_bounded_and_deferred(self):
-        source = (ROOT / "src/psp_app/psp_app_runtime.c").read_text()
+        source = (ROOT / "src/psp_app/psp_app_runtime.c").read_text() \
+            + (ROOT / "src/psp_app/psp_app_validation_present.c").read_text()
         self.assertIn("PspMenuPhaseClock clocks[8][5]", source)
         self.assertIn("psp_player_start.count < 8u", source)
         self.assertIn("*samples < 4u", source)
@@ -939,7 +943,10 @@ int main(void) {
         present = source[source.index("static bool psp_present_video_surface("):
                          source.index("static bool psp_media_seek_holds_scanout(")]
         self.assertNotIn("psp_player_start_report(", present)
-        self.assertIn("psp_player_start_clocks[4] = psp_menu_phase_clock();", present)
+        self.assertIn("psp_vprobe_video_publish_returned(published)", present)
+        returned = source[source.index("void psp_vprobe_video_publish_returned("):]
+        returned = returned[:returned.index("\n}\n")]
+        self.assertIn("psp_player_start_clocks[4] = psp_menu_phase_clock();", returned)
 
     def test_entropy_warmup_is_bounded_and_requires_unchanged_credit(self):
         compiler = shutil.which("cc")
@@ -1183,8 +1190,11 @@ typedef struct { bool transport_prepare_pending;unsigned transport_prepare_phase
 typedef struct { int status;bool inet_initialized; } PspNetwork;
 typedef struct { struct { struct { int screen; } ui; } presentation; } Process;
 typedef struct { struct { struct { const char *document_url; } page; } *navigation; } Views;
-typedef struct { void *budget; } Browser;
+typedef struct BrowserEngine BrowserEngine;
+typedef struct { void *budget; BrowserEngine *engine; } Browser;
 typedef struct { PspInteractiveState *interactive;PspNetwork *network;void *network_lifecycle;Process *process;Views *views;Browser *browser; } PspApp;
+#define NAVIGATION_URL_LIMIT 64
+static bool browser_engine_page_document_url(const BrowserEngine *e,char *u,size_t n){(void)e;snprintf(u,n,"%s","https://example.test/");return true;}
 static bool started=true, native=true, allow=true, ca_complete=true, ok=true;
 static PspEntropyPreparation entropy=PSP_ENTROPY_PREPARE_READY;
 static unsigned calls[4], cancels, admissions;
@@ -1418,8 +1428,8 @@ int main(void) {
         self.assertIn('.name = "tilefinch-youtube-signin.txt"', qr)
         settings = without_comments(
             (ROOT / "src/psp_app/psp_app_settings.c").read_text())
-        toggle = settings[settings.index("if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS)"):
-                          settings.index("if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_TOPICS)")]
+        start = settings.index("static void psp_setting_youtube_signin_diagnostics(")
+        toggle = settings[start:settings.index("\n}\n", start)]
         self.assertIn("browser_engine_set_youtube_signin_diagnostics(engine, enabled)", toggle)
         self.assertIn("tilefinch_diagnostic_qr_destroy", toggle)
         self.assertNotIn("browser_profile_", toggle)
@@ -1429,7 +1439,7 @@ int main(void) {
             (ROOT / "src/psp_app/psp_app_actions.c").read_text())
         start = actions.index("static bool psp_history_open_internal(")
         routing = actions[start:actions.index(
-            "    const NavigationEntry *moved_entry", start)]
+            "    int restored_scroll = 0;", start)]
         fixture = r'''
 #include <stdbool.h>
 #include <string.h>
@@ -1445,20 +1455,11 @@ typedef struct { BrowserEngine *engine; BrowserProfile *profile; BrowserTabs *ta
 typedef struct { struct { int ui; } presentation; } Process;
 typedef struct { Browser *browser; Process *process; } PspApp;
 typedef int PspAppFrameState;
+typedef struct { PspUiCollectionSection section; PspProfilePageKind profile_page; } PspLocalRoute;
+typedef enum { PSP_LOCAL_OPEN_WEB, PSP_LOCAL_OPEN_NATIVE_HOME, PSP_LOCAL_OPEN_COLLECTIONS,
+    PSP_LOCAL_OPEN_SCREENSHOTS, PSP_LOCAL_OPEN_PROFILE_PAGE, PSP_LOCAL_OPEN_OFFLINE,
+    PSP_LOCAL_OPEN_UNAVAILABLE } PspLocalOpen;
 static int unavailable;
-static bool psp_offline_url(const char *url) {
-    const char *root = "https://tilefinch.local/offline";
-    size_t n = strlen(root);
-    return url && !strncmp(url, root, n) && (!url[n] || url[n] == '/');
-}
-static bool psp_ui_native_home_url(const char *url) { (void)url; return false; }
-static bool psp_ui_legacy_collection_url(const char *url, int *section) {
-    (void)url; (void)section; return false;
-}
-static int psp_profile_page_kind(const char *url) { (void)url; return 0; }
-static bool psp_ui_internal_url(const char *url) {
-    return !strncmp(url, "https://tilefinch.local/", 23);
-}
 static void psp_ui_show_status(int *ui, const char *text, int frames) {
     (void)ui; (void)text; (void)frames; unavailable++;
 }
@@ -1467,15 +1468,15 @@ static void psp_ui_show_status(int *ui, const char *text, int frames) {
 int main(void) {
     Browser browser = {0}; Process process = {0}; PspAppFrameState frame = 0;
     PspApp app = {&browser, &process};
-    const char *urls[] = {"https://tilefinch.local/offline",
-        "https://tilefinch.local/offline/app?id=1",
-        "https://tilefinch.local/offline/article?id=2"};
-    for (unsigned i = 0; i < 3; i++)
-        if (psp_history_open_internal(&app, &frame, false, urls[i]) || unavailable) return 1;
-    if (!psp_history_open_internal(&app, &frame, false,
-            "https://tilefinch.local/unknown") || unavailable != 1) return 2;
-    if (psp_history_open_internal(&app, &frame, false,
-            "https://example.test/") || unavailable != 1) return 3;
+    /* tilefinch-psp-local-route-tests pins which URLs classify as OFFLINE,
+       UNAVAILABLE and WEB at the history origin. */
+    PspLocalRoute route = {0};
+    if (psp_history_open_internal(&app, &frame, false, &route,
+            PSP_LOCAL_OPEN_OFFLINE) || unavailable) return 1;
+    if (!psp_history_open_internal(&app, &frame, false, &route,
+            PSP_LOCAL_OPEN_UNAVAILABLE) || unavailable != 1) return 2;
+    if (psp_history_open_internal(&app, &frame, false, &route,
+            PSP_LOCAL_OPEN_WEB) || unavailable != 1) return 3;
     return 0;
 }
 '''
@@ -1529,7 +1530,7 @@ int main(void) {
                 self.assertLess(len(mark.encode("utf-8")), 20, mark)
             self.assertEqual(script.count("mark-live video-measure-start"),
                              script.count("mark-live video-measure-end"))
-        source = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        source = without_comments((ROOT / "src/psp_app/psp_app_validation_present.c").read_text())
         self.assertIn("!psp_video_scanout_measuring", source)
         measure = source[source.index("void psp_video_scanout_measurement("):
                          source.index("static void psp_cadence_composed(")]
@@ -1537,9 +1538,9 @@ int main(void) {
         self.assertIn("psp_video_scanout_note_discontinuity()", measure)
         self.assertNotIn("psp_active_media->", measure)
         publish = source[source.index("static void psp_cadence_video_published("):
-                         source.index("static bool psp_media_frame_presentable(")]
+                         source.index("\n}\n", source.index("static void psp_cadence_video_published("))]
         self.assertIn("psp_video_measure_begin = psp_video_measure_end", publish)
-        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        main = without_comments((ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text())
         owner = main[main.index("void psp_webgl_measurement_main_frame(void)"):
                      main.index("void psp_webgl_measurement_mark(")]
         self.assertIn("atomic_exchange(&psp_validation_video_window_requested, 0)", owner)
@@ -1584,12 +1585,20 @@ static const uint16_t *expected_frame, *replacement_frame;
 static const uint16_t **cancel_frame_slot;
 static int psp_profile_page_kind(const char *url) { return strcmp(url, "profile") == 0; }
 static bool psp_offline_url(const char *url) { return strcmp(url, "offline") == 0; }
+#define PSP_LOCAL_ROUTE_WEB 0
+#define PSP_LOCAL_ROUTE_OFFLINE 5
+typedef struct { int kind; int profile_page; } PspLocalRoute;
+static PspLocalRoute psp_local_route_classify(const char *url) {
+    PspLocalRoute route = {psp_offline_url(url) ? PSP_LOCAL_ROUTE_OFFLINE : PSP_LOCAL_ROUTE_WEB,
+                           psp_profile_page_kind(url)};
+    return route;
+}
 static bool browser_engine_navigation_pending(void *engine) { (void)engine; return pending; }
 static void browser_engine_cancel_navigation(void *engine, const char *reason) {
     (void)engine; if (strcmp(reason, "cancel") != 0) abort(); cancels++;
     if (cancel_frame_slot) *cancel_frame_slot = replacement_frame;
 }
-static uint64_t sceKernelGetSystemTimeWide(void) { clocks++; return 1234; }
+static uint64_t psp_time_us(void *context) { (void) context; clocks++; return 1234; }
 static bool psp_begin_page_load(void *engine, Ui *ui, void *profile, const uint16_t *frame,
                                 int *input, const char *url, bool history, size_t cap, int timeout) {
     (void)engine; (void)profile; (void)input;
@@ -2042,9 +2051,9 @@ int main(void) {
                       frame[retract:retract + 200])
 
     def test_activation_cooperates_and_acknowledges_only_a_successful_latch(self):
-        actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text())
+        actions = without_comments((ROOT / "src/psp_app/psp_app_activation.c").read_text())
         begin = actions.index("bool activation_scope =")
-        end = actions.index("if (activated) {", begin)
+        end = actions.index("activation->activated = activated;", begin)
         scope = actions[begin:end]
         self.assertIn("!psp_navigation_cooperate_active()", scope)
         self.assertIn("!app->process->presentation.ui.page_gamepad_capture", scope)
@@ -2073,8 +2082,9 @@ int main(void) {
                         final.index("psp_dump_final_frame(argv0)"))
         self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG", final)
         self.assertIn("if (process.config.dump_frame != 0)", final)
-        helper_start = main.index("static void psp_dump_final_frame(")
-        helper = main[helper_start:main.index("\n}\n", helper_start)]
+        qualify = (ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text()
+        helper_start = qualify.index("void psp_dump_final_frame(")
+        helper = qualify[helper_start:qualify.index("\n}\n", helper_start)]
         self.assertIn('"frame-device-final.ppm"', helper)
         self.assertIn("psp_display_front_buffer(&psp_display)", helper)
         self.assertNotIn("malloc", final + helper)
@@ -2129,7 +2139,10 @@ int main(void) {
         self.assertLess(advance.index("browser_engine_advance_runtime("),
                         advance.index("psp_runtime_cooperate_end("))
         self.assertIn("app->views->frame", advance)
-        self.assertIn("timed_runtime = timed_navigation == NULL ? NULL", advance)
+        probe = without_comments((ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8"))
+        probe = probe[probe.index("void psp_vprobe_runtime_end("):]
+        probe = probe[:probe.index("\n}\n")]
+        self.assertIn("timed_runtime = timed_navigation == NULL ? NULL", probe)
         # GE submissions are synchronous and never expose a cooperation hook
         # while a list is under construction or in flight.
         webgl = without_comments(
@@ -2711,7 +2724,7 @@ int main(void) {
         self.assertIn("if (!media->backend_stats_snapshot_valid)", snapshot)
         self.assertIn("*stats = media->backend_stats_snapshot", snapshot)
         main = without_comments(
-            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+            (ROOT / "src/psp_app/psp_app_validation_loop.c").read_text(encoding="utf-8"))
         finish = main[
             main.index("psp_finish_media_stability("):
             main.index("psp_media_stability_schedule_seeks(")]
@@ -3052,8 +3065,9 @@ int main(void) {
         definition = source.index("unsigned media_elapsed_ms = ui_elapsed_ms;")
         measured = source.index("uint64_t ui_elapsed_us =")
         self.assertLess(measured, definition)
-        override = source.find("ui_elapsed_ms = 16u;")
+        override = source.find("psp_validation_scripted_frame(")
         self.assertNotEqual(override, -1)
+        self.assertIn("*ui_elapsed_ms = 16u;", (ROOT / "src/psp_app/psp_app_validation_loop.c").read_text(encoding="utf-8"))
         self.assertLess(
             definition, override,
             "media_elapsed_ms must be captured before the scripted harness "
@@ -3345,20 +3359,24 @@ int main(void) {
             main.index("psp_log_checkpoint(\"network-begin\")") - 700:
             main.index("psp_log_checkpoint(\"network-begin\")")]
         self.assertIn("!psp_offline_url(startup_url)", initial_network)
-        initial_load = main[
-            main.index("if (native_home_boot) {"):
-            main.index("psp_validation_cancel_after_ms = 0;")]
+        boot = without_comments(
+            (ROOT / "src/psp_app/psp_app_boot.c").read_text(encoding="utf-8"))
+        initial_load = boot[
+            boot.index("if (native_home_boot) {"):
+            boot.index("psp_validation_cancel_after_ms = 0;")]
         self.assertIn("psp_offline_store_handle_url(", initial_load)
 
     def test_native_home_backing_document_does_not_start_transport(self):
         source = without_comments((ROOT / "src/psp_script_main.c").read_text())
-        home = source[source.index("if (native_home_boot) {"):]
+        boot = without_comments(
+            (ROOT / "src/psp_app/psp_app_boot.c").read_text())
+        home = boot[boot.index("if (native_home_boot) {"):]
         home = home[:home.index("} else if (")]
         self.assertIn("browser_engine_commit_empty_document(", home)
         self.assertNotIn("browser_engine_commit_html(", home)
         self.assertLess(home.index("psp_present("), home.index(
             'PSP_BOOT_TIMING_MARK("native-home-presented")'))
-        run = source[source.index("PSP_BOOT_TIMING_MARK(\"native-home-presented\")"):]
+        run = source[source.index("psp_boot_initial_navigation("):]
         self.assertIn("psp_app_run_interactive(", run)
         warmup = source[source.index("if (background_network_allowed"):
                         source.index("tilefinch-network-warmup: status=started")]
@@ -4124,7 +4142,7 @@ int main(void) {
         loop = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         exit_console = loop[
-            loop.index("static TILEFINCH_COLD_PATH void "
+            loop.index("PSP_VALIDATION_SHARED TILEFINCH_COLD_PATH void "
                        "psp_exit_console("):]
         exit_console = exit_console[:exit_console.index("sceKernelExitGame()")]
         self.assertIn("psp_display_video_end(&psp_display)", exit_console)
@@ -4236,19 +4254,24 @@ int main(void) {
             psp_media_session_sources()))
         # And where the engine read its texture from, which is the largest
         # term in a frame, is reported rather than assumed.
-        self.assertIn("psp_display_in_edram(&psp_display", runtime)
-        self.assertIn("sampled=%s@%s", runtime)
+        probes = without_comments((ROOT / "src/psp_app/psp_app_validation_present.c").read_text(encoding="utf-8"))
+        self.assertIn("psp_display_in_edram(&psp_display", probes)
+        self.assertIn("sampled=%s@%s", probes)
         # And the video presents are back in the cadence accounting: they were
         # the most expensive frames in the run and the line could not see them.
-        self.assertIn("psp_cadence_composed(", runtime)
+        self.assertIn("psp_cadence_composed(", probes)
         surface = runtime[
             runtime.index("static bool psp_present_video_surface("):
             runtime.index("bool psp_present_internal(")]
-        self.assertIn("psp_cadence_composed(", surface)
-        self.assertIn("psp_cadence_published(", surface)
-        self.assertIn("psp_cadence_video_published(", surface)
-        self.assertIn("tilefinch-video-scanout:", runtime)
-        self.assertIn("video_scanout_identity == frame->identity", runtime)
+        self.assertIn("psp_vprobe_video_composed(", surface)
+        self.assertIn("psp_vprobe_video_published(", surface)
+        video = probes[probes.index("void psp_vprobe_video_composed("):
+                       probes.index("void psp_vprobe_player_start(")]
+        self.assertIn("psp_cadence_composed(", video)
+        self.assertIn("psp_cadence_published(", video)
+        self.assertIn("psp_cadence_video_published(", video)
+        self.assertIn("tilefinch-video-scanout:", probes)
+        self.assertIn("video_scanout_identity == frame->identity", probes)
     def test_the_engine_reads_a_staged_texture_staged_per_picture(self):
         """The device measured a linear 2 KiB-pitch texture at 47.4ms of wait
         per frame (ge-submit=1832us against ge-sync=1612292us over 34 frames)
@@ -4326,7 +4349,8 @@ int main(void) {
         # And the probe measures the read playback performs, from the same
         # EDRAM, or its texture-sync number describes nothing that ships.
         loop = without_comments(
-            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+            (ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text(
+                encoding="utf-8"))
         self.assertIn("psp_display_video_texture(&psp_display)", loop)
         # And the probe certifies the layout playback actually draws from.
         presenter = without_comments(
@@ -6891,9 +6915,9 @@ int main(void) {
 
     def test_stability_restart_preserves_playlist_end_policy(self):
         main = without_comments(
-            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
-        start = main.rindex("static TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(")
-        driver = main[start:main.index("static TILEFINCH_HOT_BOUNDARY void psp_loop_media_frame(", start)]
+            (ROOT / "src/psp_app/psp_app_validation_loop.c").read_text(encoding="utf-8"))
+        start = main.rindex("TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(")
+        driver = main[start:main.index("\n}\n", start)]
         self.assertRegex(driver, r"if\s*\(browser->media\.playlist\s*==\s*NULL\s*&&\s*"
                          r"browser->media\.ui\.ended\s*&&\s*browser->media\.playback\s*!=\s*NULL")
         self.assertIn("tilefinch-media-stability: event=loop", driver)
@@ -7010,7 +7034,7 @@ int main(void) {
         self.assertIn("psp_media_display_key", verdict)
 
         main = without_comments(
-            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+            (ROOT / "src/psp_app/psp_app_validation_loop.c").read_text(encoding="utf-8"))
         self.assertIn("pipeline-skips=%zu", main)
         self.assertIn("display-drops=%zu", main)
         self.assertIn("quiesce-drops=%zu", main)
@@ -7679,9 +7703,9 @@ int main(void) {
             '#define PSP_MEDIA_AU_DUMP_PATH "ms0:', completion)
 
     def test_canvas_raster_attribution_uses_per_frame_counter_deltas(self):
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
-        render = main[main.rindex("unsigned psp_loop_render_job("):
-                      main.rindex("unsigned psp_loop_render_job(") + 8500]
+        main = (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
+        render = main[main.index("void psp_vprobe_render_begin("):
+                      main.index("void psp_vprobe_frame_begin(")]
         self.assertIn("canvas_fast_raster_us - canvas_raster_before", render)
         self.assertIn("canvas_fast_overlay_us - canvas_overlay_before", render)
         self.assertIn("canvas_render && psp_canvas_cadence.causal_window", render)
@@ -7706,7 +7730,7 @@ int main(void) {
         self.assertNotIn("fwrite", retained)
         self.assertIn("if (!timing_window && flushed != 0", log)
         self.assertIn("forced-flushes=%zu", log)
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
         self.assertIn("psp_log_begin_timing_window()", main)
         self.assertIn("psp_log_end_timing_window();", main)
         self.assertIn("|| psp_validation_canvas_live_trace)", main)
@@ -7714,25 +7738,25 @@ int main(void) {
         self.assertIn("!runtime->checkpoint_trace_suppressed;", checkpoint)
 
     def test_canvas_copy_and_conversion_attribution_report_actual_work(self):
-        runtime = (ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8")
+        runtime = (ROOT / "src/psp_app/psp_app_validation_present.c").read_text(encoding="utf-8")
         query = runtime[runtime.index("static bool psp_present_thread_cpu("):
                         runtime.index("bool psp_present_validation_last_timing(")]
         self.assertIn("sceKernelReferThreadRunStatus", query)
         self.assertIn("< 0)", query)
         self.assertIn("return false;", query)
-        present = runtime[runtime.index("bool psp_present_internal("):
-                          runtime.index("bool psp_present_internal(") + 12000]
+        present = runtime[runtime.index("void psp_vprobe_phase_begin("):
+                          runtime.index("\n}\n", runtime.index("void psp_vprobe_phase_published("))]
         self.assertIn("base_cpu_before_valid && base_cpu_after_valid", present)
         self.assertIn("base_cpu_after >= base_cpu_before", present)
         self.assertIn("psp_present_cpu_measurement\n", present)
         self.assertIn("copy_end > opaque_top ? copy_end - opaque_top : 0u", present)
-        render = (ROOT / "src/render.c").read_text(encoding="utf-8")
+        render = (ROOT / "src/render/canvas_frame.inc").read_text(encoding="utf-8")
         raster = render[render.index("static void rasterize_opaque_canvas_fast("):
                         render.index("RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(")]
         for path in ("kernel_rows++", "general_rows++", "repeat_rows++", "skipped_rows++"):
             self.assertIn(path, raster)
         self.assertIn("source_address = (uintptr_t) source_pixels", raster)
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
         self.assertIn("canvas_fast_frames > canvas_frames_before", main)
         self.assertIn("psp_present_validation_measure_cpu(true);", main)
         self.assertIn("psp_present_validation_measure_cpu(false);", main)
@@ -7743,7 +7767,7 @@ int main(void) {
         # Compile the actual two dump loops with sampling already disabled.
         # The final report must use each buffered record, not the live sampler
         # count/enable bit which canvas-thread-off clears before shutdown.
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
         peer = main.index('printf("tilefinch-canvas-peer-cpu:')
         begin = main.rindex('        printf("\\n");', 0, peer)
         begin = main.index("\n", begin) + 1
@@ -7791,16 +7815,18 @@ int main(void) {
             ])
 
     def test_intrusive_audio_attribution_does_not_repeat_author_coercion(self):
-        source = (ROOT / "src/js_dom_bindings.c").read_text(encoding="utf-8")
+        source = (ROOT / "src/js_game_audio.c").read_text(encoding="utf-8")
         wrapper = source[source.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG\nJSValue js_game_audio_command("):
-                         source.index("void bridge_invalidate_node_slot(")]
+                         source.index("#endif /* TILEFINCH_GAME_AUDIO_REFERENCE */")]
         self.assertNotIn("JS_ToInt", wrapper)
         self.assertIn("JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT", wrapper)
         self.assertIn("if (!game_audio_native_measurement)", wrapper)
         self.assertIn("game_audio_native_depth++ == 0", wrapper)
         self.assertIn("game_audio_native_depth--;", wrapper)
         self.assertIn("native_metrics.nested_calls++", wrapper)
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8") \
+            + (ROOT / "src/psp_app/psp_app_boot.c").read_text(encoding="utf-8") \
+            + (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
         self.assertIn('strcmp(mark, "canvas-audio-on")', main)
         for mark in ("canvas-audio-on", "canvas-audio-off"):
             self.assertLess(len(mark), 20)
@@ -7810,14 +7836,14 @@ int main(void) {
         # Validation builds keep shipping's native slots unless boot.cfg
         # explicitly selects the reference.
         self.assertIn(
-            "    if (process.config.validation_game_audio_reference == 1)\n"
+            "    if (process->config.validation_game_audio_reference == 1)\n"
             "        engine_config->javascript.game_audio_internal_slots = false;",
             main)
         self.assertNotIn("validation_game_audio_slots", main)
         self.assertIn("tilefinch-canvas-audio: n=%lu command=%u", main)
 
     def test_validation_vfpu_conversion_is_guarded_and_preserves_state(self):
-        render = (ROOT / "src/render.c").read_text(encoding="utf-8")
+        render = (ROOT / "src/render/canvas_frame.inc").read_text(encoding="utf-8")
         block = render[render.index("#if defined(_MIPS_ARCH_ALLEGREX)\n/* vt5650.q"):
                        render.index("static bool canvas_fast_frame_candidate_impl(")]
         self.assertIn("enabled && canvas_validation_vfpu_usable", block)
@@ -7843,7 +7869,7 @@ int main(void) {
         self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG\n                && canvas_validation_vfpu_conversion", raster)
         self.assertIn("source_row % 16u", raster)
         self.assertIn("vfpu_rows++", raster)
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_app/psp_app_validation_cadence.c").read_text(encoding="utf-8")
         for mark in ("canvas-vfpu-check", "canvas-vfpu-on", "canvas-vfpu-off"):
             self.assertLess(len(mark), 20)
             self.assertIn(f'strcmp(mark, "{mark}")', main)
@@ -8019,7 +8045,7 @@ int main(void) {
         self.assertLess(reserved, main.index('psp_log_checkpoint("boot-ready'))
         self.assertLess(
             reserved, main.index("psp_report_heap_capacity_lower_bound();"))
-        self.assertLess(reserved, main.index("psp_boot_config_defaults("))
+        self.assertLess(reserved, main.index("psp_boot_load_config("))
         self.assertLess(reserved, main.index("browser_engine_create("))
         # Shipping builds get the pool too: only the log lines are gated.
         self.assertNotIn(
@@ -8676,6 +8702,8 @@ int main(void) {
                 encoding="utf-8"))
         actions = without_comments(
             (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8")
+            + (ROOT / "src/psp_app/psp_app_activation.c").read_text(
                 encoding="utf-8"))
         session = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(
@@ -8986,10 +9014,12 @@ int main(void) {
 
         actions = without_comments(
             (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8")
+            + (ROOT / "src/psp_app/psp_app_activation.c").read_text(
                 encoding="utf-8"))
         handoff = actions[
-            actions.index("bool opened = entry != NULL"):
-            actions.index("action.prefer_native_media = false;")]
+            actions.index("bool opened = entry_url != NULL"):
+            actions.index("action->prefer_native_media = false;")]
         opened = handoff[handoff.index("if (opened) {"):]
         self.assertIn("browser_engine_cancel_network_work(", opened)
         self.assertIn("provider_handoff_present_pending", opened)
@@ -8998,7 +9028,7 @@ int main(void) {
             opened.index("provider_handoff_present_pending ="))
         self.assertIn(
             "provider_handoff_present_pending =\n"
-            "                            true;",
+            "                true;",
             opened)
         self.assertIn(
             "browser_engine_prepare_optional_memory_reclaim(", opened)
@@ -9428,8 +9458,9 @@ int main(void) {
         self.assertIn("psp_boot_report_handoff(", main)
         self.assertIn("psp_boot_timing_clock(&validation_entry_tick)", main)
         self.assertIn("psp_boot_timing_clock(&validation_surface_tick)", main)
-        self.assertIn("psp_boot_timing_decode(", browser)
-        self.assertIn("handoff-to-scanout-us=%lluus", browser)
+        qualify = without_comments((ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text(encoding="utf-8"))
+        self.assertIn("psp_boot_timing_decode(", qualify)
+        self.assertIn("handoff-to-scanout-us=%lluus", qualify)
         self.assertIn("$<TARGET_FILE:tilefinch-launcher>.unstripped",
                       launcher_target)
         self.assertIn('"${PSPDEV}/bin/psp-strip"', launcher_target)
@@ -9462,12 +9493,15 @@ int main(void) {
         # Every mode that stops the process reaches the funnel: the six
         # validation qualifications plus the ordinary clean exit. Scan past the
         # funnel's own definition, which is above every caller.
+        qualify = without_comments(
+            (ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text(
+                encoding="utf-8"))
         callers = re.findall(
-            r"psp_exit_console\(([^;]*)\);", main[sites[0]:])
+            r"psp_exit_console\(([^;]*)\);", main[sites[0]:] + qualify)
         self.assertEqual(
             sorted(argument.strip() for argument in callers),
             sorted([
-                "process.config.exit_to",
+                "process->config.exit_to",
                 "config->exit_to",
                 "exit_to",
                 "exit_to",
@@ -9489,7 +9523,9 @@ int main(void) {
         # The load replaces the process, so anything the log still owes the
         # card at that point is lost. Every exit must have finished its log
         # before it reaches the handoff.
-        callers = main[main.index("sceKernelExitGame"):]
+        callers = main[main.index("sceKernelExitGame"):] + without_comments(
+            (ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text(
+                encoding="utf-8"))
         self.assertTrue(re.search(r"psp_exit_console\(", callers))
         close = main[
             main.index("static TILEFINCH_COLD_PATH PspShutdownReport "
@@ -9644,8 +9680,8 @@ int main(void) {
             (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
                 encoding="utf-8"))
         declaration = runtime[
-            runtime.index("static PspMediaPresentRecord"):
-            runtime.index("static int psp_media_present_reported_mode")]
+            runtime.index("PSP_VALIDATION_SHARED PspMediaPresentRecord"):
+            runtime.index("static PspUiMediaTrackMenuCache psp_media_track_menu_cache")]
         self.assertIn(
             "psp_media_present_records[PSP_DISPLAY_PAGE_BUFFER_COUNT]",
             declaration)
@@ -9734,7 +9770,12 @@ int main(void) {
         tab_case = heavy.index("case PSP_UI_ACTION_SWITCH_TAB:")
         self.assertLess(remap, switch)
         self.assertLess(switch, tab_case)
-        self.assertIn("psp_tabs_request(", heavy[tab_case:])
+        self.assertIn("psp_app_tab_request(", heavy[tab_case:])
+        surfaces = without_comments(
+            (ROOT / "src/psp_app/psp_app_surfaces.c").read_text(
+                encoding="utf-8"))
+        handler = surfaces[surfaces.index("void psp_app_tab_request("):]
+        self.assertIn("psp_tabs_request(", handler)
 
     def test_focus_feedback_composes_before_publishing_and_clearing_dirty(self):
         actions = without_comments(
@@ -9780,18 +9821,21 @@ int main(void) {
         self.assertIn("? &cooperate->supervisor_ui : cooperate->ui", present)
         self.assertIn("psp_present_internal(pixels, shown_ui, false)", present)
         cooperate = runtime[runtime.index("bool psp_platform_cooperate("):]
-        self.assertIn('strcmp(phase, "render-compose")', cooperate)
+        self.assertIn("(boundary & TILEFINCH_COOPERATE_RENDER_COMPOSE) != 0", cooperate)
         self.assertLess(cooperate.index("if (psp_runtime_cooperate.painting) return true"),
                         cooperate.index("psp_work_ui_tick(true)"))
-        self.assertIn('strncmp(phase, "render-", 7u) != 0', cooperate)
-        self.assertIn('strcmp(phase, "page-task-boundary")', cooperate)
-        self.assertIn('strcmp(phase, "render-input-boundary")', cooperate)
-        admission = cooperate.index('strcmp(phase, "image-admission-boundary")')
+        self.assertIn("(boundary & TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED) == 0", cooperate)
+        yield_boundary = runtime[runtime.index("#define PSP_COOPERATE_YIELD_BOUNDARY"):
+                                 runtime.index("bool psp_platform_cooperate(")]
+        for flag in ("PAGE_TASK", "RENDER_INPUT", "IMAGE_ADMISSION"):
+            self.assertIn("TILEFINCH_COOPERATE_" + flag, yield_boundary)
+        admission = cooperate.index("(boundary & TILEFINCH_COOPERATE_IMAGE_ADMISSION) != 0")
         lazy_arm = cooperate.index('now - psp_runtime_cooperate.started_us >= UINT64_C(8000)')
         self.assertLess(admission, lazy_arm)
         self.assertIn("psp_runtime_cooperate_activate(cooperate);",
                       cooperate[admission:admission + 350])
-        self.assertEqual(cooperate.count('strcmp(phase, "image-admission-boundary")'), 3)
+        self.assertEqual(cooperate.count("TILEFINCH_COOPERATE_IMAGE_ADMISSION"), 1)
+        self.assertEqual(cooperate.count("PSP_COOPERATE_YIELD_BOUNDARY"), 2)
         self.assertIn("psp_completed_supervisor_page_input_count == 0", cooperate)
         fill = runtime[runtime.index("static void psp_runtime_serve_completion_scroll("):
                        runtime.index("void psp_show_page_script_clock(")]
@@ -9812,7 +9856,7 @@ int main(void) {
 
     def test_optional_images_yield_to_already_queued_input(self):
         runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
-        begin = 'if (strcmp(phase, "optional-image-publication") == 0'
+        begin = "if ((boundary & TILEFINCH_COOPERATE_IMAGE_PUBLICATION) != 0"
         self.assertIn(begin, runtime)
         start = runtime.index(begin)
         guard = runtime[start:runtime.index("return false;", start) + len("return false;")]
@@ -9868,8 +9912,9 @@ int main(void) {
         self.assertLess(focus.index("psp_runtime_cooperate_end("),
                         focus.index("psp_app_finish_focus_action("))
         runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
-        start = runtime.index('strcmp(phase, "page-focus-feedback")')
-        feedback = runtime[start:runtime.index('strcmp(phase, "page-scroll-servable")', start)]
+        start = runtime.index("(boundary & TILEFINCH_COOPERATE_FOCUS_FEEDBACK) != 0")
+        feedback = runtime[start:runtime.index(
+            "(boundary & TILEFINCH_COOPERATE_SCROLL_SERVABLE) != 0", start)]
         self.assertIn("browser_engine_frontend_snapshot(engine, &snapshot)", feedback)
         self.assertNotIn("browser_engine_navigation_view", feedback)
         self.assertIn("browser_engine_focus_indicator_rect(", feedback)
@@ -9885,13 +9930,16 @@ int main(void) {
         self.assertLess(feedback.index("psp_present_internal("),
                         feedback.index("cooperate->presenting = 0"))
         self.assertNotIn("browser_engine_render_frame", feedback)
-        native_receipt = feedback.index("tilefinch-focus-first-visible:")
+        native_receipt = feedback.index("psp_vprobe_focus_first_visible(")
         self.assertLess(feedback.index("psp_runtime_cooperate_activate(cooperate)"),
                         feedback.index("__sync_bool_compare_and_swap("))
         self.assertLess(feedback.index("if (psp_present_internal("), native_receipt)
-        self.assertIn("psp_focus_feedback.generation == nav->generation", feedback)
-        self.assertIn("psp_focus_feedback.first_visible_us == 0", feedback)
-        self.assertIn("!psp_focus_feedback_page_action", feedback)
+        receipt = without_comments((ROOT / "src/psp_app/psp_app_validation_present.c").read_text(encoding="utf-8"))
+        receipt = receipt[receipt.index("void psp_vprobe_focus_first_visible("):]
+        self.assertIn("tilefinch-focus-first-visible:", receipt)
+        self.assertIn("psp_focus_feedback.generation == nav->generation", receipt)
+        self.assertIn("psp_focus_feedback.first_visible_us == 0", receipt)
+        self.assertIn("!psp_focus_feedback_page_action", receipt)
         self.assertLess(runtime.index("sceKernelGetThreadId() != atomic_load_explicit(",
                                       runtime.index("bool psp_platform_cooperate(")), start)
 
@@ -9901,17 +9949,20 @@ int main(void) {
         self.assertIn("#define PSP_RENDER_JOB_MAXIMUM_TILES 4u", header)
         runtime = without_comments(
             (ROOT / "src/psp_app/psp_app_runtime.c").read_text(encoding="utf-8"))
-        probe = runtime[runtime.index("static void psp_focus_feedback_published("):
-                        runtime.index("bool psp_present_internal(")]
-        self.assertIn("navigation->generation != psp_focus_feedback.generation", probe)
+        probes = without_comments((ROOT / "src/psp_app/psp_app_validation_present.c").read_text(encoding="utf-8"))
+        probe = probes[probes.index("static void psp_focus_feedback_published("):
+                       probes.index("\n}\n", probes.index("static void psp_focus_feedback_published("))]
+        self.assertIn("counters.generation != psp_focus_feedback.generation", probe)
         self.assertIn("render->frames_rendered <= psp_focus_feedback.rendered_frames", probe)
         self.assertIn("browser_engine_render_frame_pending(engine)", probe)
         self.assertIn("frame != browser_engine_framebuffer(engine, NULL)", probe)
         publish = runtime.index("bool psp_present_internal(")
         body = runtime[publish:runtime.index("static unsigned psp_local_hour", publish)]
         self.assertLess(body.index("psp_display_publish("),
-                        body.index("psp_focus_feedback_published(frame, ui)"))
-        self.assertIn("if (published && !media_visible) psp_focus_feedback_published", body)
+                        body.index("psp_vprobe_phase_published("))
+        published = probes[probes.index("void psp_vprobe_phase_published("):]
+        published = published[:published.index("\n}\n")]
+        self.assertIn("if (published && !media_visible) psp_focus_feedback_published", published)
         main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
         self.assertLess(main.index("psp_focus_feedback_begin(NULL, 0, 0)"),
                         main.index("browser_engine_destroy(browser->engine)"))
@@ -9958,10 +10009,12 @@ int main(void) {
         back = heavy.index("case PSP_UI_ACTION_BACK:")
         self.assertLess(remap, switch)
         self.assertLess(switch, back)
-        back_branch = heavy[back:heavy.index(
-            "case PSP_UI_ACTION_VOICE_FOCUSED_TEXT:", back)]
+        self.assertIn("psp_app_history_step(", heavy[back:heavy.index(
+            "case PSP_UI_ACTION_VOICE_FOCUSED_TEXT:", back)])
+        step = actions.index("static void psp_app_history_step(")
+        back_branch = actions[step:actions.index("\n}\n", step)]
         self.assertIn("browser_engine_begin_navigation_history(", back_branch)
-        self.assertIn("navigation_back(", back_branch)
+        self.assertIn("browser_engine_history_step(", back_branch)
         local_fragment = back_branch.index(
             "navigation_url_is_same_document(")
         self.assertIn("browser_engine_history_move(engine, forward)",
@@ -9989,7 +10042,7 @@ int main(void) {
             "case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:"):
             heavy.index("case PSP_UI_ACTION_RECOVERY_READER:")]
         self.assertIn("lifecycle_retry_url", disable)
-        self.assertIn("goto recovery_reload", disable)
+        self.assertIn("psp_app_reload(app, frame, engine_frame)", disable)
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         ordinary_failure = main[
@@ -10064,11 +10117,11 @@ int main(void) {
 
     def test_successful_saved_app_launch_clears_library_toast(self):
         actions = without_comments(
-            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+            (ROOT / "src/psp_app/psp_app_surfaces.c").read_text(
                 encoding="utf-8"))
         branch = actions[
             actions.index("char offline_url[NAVIGATION_URL_LIMIT]"):
-            actions.index("break;", actions.index("bool offline_opened ="))]
+            actions.index("return;", actions.index("bool offline_opened ="))]
         opened = branch[branch.index("if (offline_opened) {"):]
         self.assertIn("presentation.ui.status[0] = '\\0'", opened)
         self.assertIn("presentation.ui.toast_frames = 0u", opened)
@@ -10088,8 +10141,8 @@ int main(void) {
             (ROOT / "src/psp_app/psp_app_settings.c").read_text(
                 encoding="utf-8"))
         branch = settings[
-            settings.index("PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED"):
-            settings.index("PSP_UI_SETTING_COOKIE_BANNER_HIDDEN")]
+            settings.index("static void psp_setting_content_blocker_site_allowed("):
+            settings.index("static void psp_setting_cookie_banner_hidden(")]
         self.assertIn("psp_app_reload_for_site_security_setting(", branch)
         self.assertNotIn("psp_begin_page_load(", branch)
         helper = settings[
@@ -10111,19 +10164,6 @@ int main(void) {
         self.assertIn("generic_ok = true", check)
         self.assertIn("else if (generic_ok", check)
         self.assertIn("memcmp(got_everest, got_generic, 32)", check)
-
-    def test_experimental_resume_reverses_failed_history_move(self):
-        commands = without_comments(
-            (ROOT / "src/interactive/commands.inc").read_text(
-                encoding="utf-8"))
-        resume = commands[
-            commands.index("static bool experimental_resume_history("):
-            commands.index("static bool loop_history(")]
-        rebuild = resume.index("bool rebuilt = experimental_rebuild_document(")
-        rollback = resume.index("if (!rebuilt)", rebuild)
-        self.assertIn("forward ? navigation_back", resume[rollback:])
-        self.assertIn(": navigation_forward", resume[rollback:])
-        self.assertIn("return rebuilt", resume[rollback:])
 
     def test_dom_event_counter_tolerates_reduced_bridge_state(self):
         bindings = without_comments(
@@ -10156,12 +10196,14 @@ int main(void) {
     def test_invalid_rtc_does_not_halt_local_startup(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
-        clock = main[main.index(
+        boot = without_comments(
+            (ROOT / "src/psp_app/psp_app_boot.c").read_text(encoding="utf-8"))
+        clock = boot[boot.index(
             "PspTimeStatus rtc_status = psp_time_read_utc_fields("):]
         clock = clock[:clock.index("psp_log_checkpoint(\"tls-assets-ready\")")]
         invalid = clock[clock.index("if (rtc_status != PSP_TIME_OK)"):]
         self.assertIn("action=continue-offline", invalid)
-        self.assertNotIn("goto sleep_forever", invalid)
+        self.assertNotIn("psp_startup_failure(", invalid)
         halted = main[main.index("sleep_forever:"):]
         self.assertIn("psp_report_startup_failure(", halted)
         helper = main[
@@ -10243,11 +10285,11 @@ int main(void) {
         self.assertNotIn("install_paths->slotted", begin)
 
     def test_validation_ca_diagnostic_cannot_brick_local_startup(self):
-        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/psp_app/psp_app_boot.c").read_text(encoding="utf-8")
         probe = main[main.index("if (!psp_probe_file("):]
         probe = probe[:probe.index("#endif", probe.index("if (!psp_probe_file("))]
         self.assertIn("trust bundle diagnostic unavailable", probe)
-        self.assertNotIn("goto sleep_forever", probe)
+        self.assertNotIn("psp_startup_failure(", probe)
 
     def test_psp_ca_blob_loader_does_not_seek_device_files(self):
         fetch = (ROOT / "src/fetch.c").read_text(encoding="utf-8")
@@ -10269,7 +10311,7 @@ int main(void) {
     def test_validation_preloads_ca_after_media_pool_reservation(self):
         main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
         call = "psp_preload_validation_ca_bundle(&process.install_paths);"
-        self.assertIn("fetch_prepare_ca_bundle()", main)
+        self.assertIn("fetch_prepare_ca_bundle()", (ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text(encoding="utf-8"))
         self.assertGreater(main.index(call),
                            main.index("media_psp_backend_reserve_pool();"))
         fetch = (ROOT / "src/fetch.c").read_text(encoding="utf-8")
@@ -10716,114 +10758,6 @@ int main(void) {
             if count:
                 sites[path.relative_to(ROOT).as_posix()] = count
         self.assertEqual({"src/install_paths.c": 2}, sites)
-
-    def test_youtube_login_always_from_settings_takes_effect(self):
-        source = (ROOT / "src/psp_app/psp_app_youtube.c").read_text()
-        start = source.index("bool psp_app_youtube_login_clear(")
-        consent = source[start:source.index("bool psp_app_youtube_login_poll(")]
-        start = source.index("void psp_app_youtube_login_action(")
-        consent += source[start:source.index(
-            "static void psp_youtube_preresolve_increment(")]
-        # Compile the production consent functions against a fake PSP
-        # boundary: their control flow, not a parallel implementation.
-        fixture = r'''
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <time.h>
-enum { YOUTUBE_LOGIN_ASK, YOUTUBE_LOGIN_ALWAYS, YOUTUBE_LOGIN_NEVER };
-enum { PSP_UI_ACTION_NONE, PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
-       PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS, PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW,
-       PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER };
-typedef struct { int offer_visible; uint8_t youtube_login_policy; } PspUiState;
-typedef struct { int action; } PspUiIntent;
-typedef struct { uint64_t ui_sample_us; } PspAppFrameState;
-typedef struct { int dirty; } PspProfileStore;
-typedef struct { int policy; } BrowserProfile;
-typedef struct {
-    bool persistent_site_data_available;
-    struct { char youtube_login[64]; } storage;
-    struct { PspUiState ui; } presentation;
-} PspProcessResources;
-typedef struct {
-    void *engine, *session; BrowserProfile *profile; PspProfileStore profile_store;
-    bool youtube_login_pending; uint64_t youtube_login_offer_identity;
-    uint64_t youtube_login_restored_identity;
-} PspBrowserResources;
-typedef struct { PspProcessResources *process; PspBrowserResources *browser; } PspApp;
-static uint64_t verified_identity, session_identity;
-static int saves, removes;
-static const char *status;
-static uint64_t browser_engine_youtube_login_identity(void *engine) { (void)engine; return verified_identity; }
-static bool youtube_lite_session_signed_in(void *session) { (void)session; return session_identity != 0; }
-static bool youtube_login_save(void *session, const char *path, int64_t now) {
-    (void)session; (void)path; (void)now; saves++; return true;
-}
-static bool youtube_login_remove(const char *path) { (void)path; removes++; return true; }
-static void psp_ui_show_status(PspUiState *ui, const char *text, int duration) {
-    (void)ui; (void)duration; status = text;
-}
-static void psp_ui_show_youtube_login_offer(PspUiState *ui) { ui->offer_visible = 1; }
-static void browser_profile_set_youtube_login_policy(BrowserProfile *p, unsigned v) { p->policy = (int)v; }
-static unsigned browser_profile_youtube_login_policy(const BrowserProfile *p) { return (unsigned)p->policy; }
-static void psp_profile_store_mark_dirty(PspProfileStore *store, uint64_t now) { (void)now; store->dirty++; }
-void psp_app_youtube_login_setting(PspApp *, PspAppFrameState *, unsigned);
-'''
-        fixture += consent + r'''
-static PspProcessResources process;
-static PspBrowserResources browser;
-static BrowserProfile profile;
-static int answer(uint64_t verified, uint64_t at_answer, int action) {
-    PspApp app = {&process, &browser};
-    PspAppFrameState frame = {1};
-    memset(&process, 0, sizeof(process)); memset(&browser, 0, sizeof(browser));
-    process.persistent_site_data_available = true;
-    browser.profile = &profile; profile.policy = YOUTUBE_LOGIN_ASK;
-    verified_identity = session_identity = verified;
-    saves = removes = 0; status = NULL;
-    psp_app_youtube_login_setting(&app, &frame, YOUTUBE_LOGIN_ALWAYS);
-    /* Always waits for the warning's confirmation. */
-    if (!process.presentation.ui.offer_visible || profile.policy != YOUTUBE_LOGIN_ASK) return -1;
-    verified_identity = session_identity = at_answer;
-    PspUiIntent intent = {action};
-    psp_app_youtube_login_action(&app, &frame, &intent);
-    if (browser.youtube_login_offer_identity != 0
-        || process.presentation.ui.youtube_login_policy != profile.policy) return -1;
-    return profile.policy;
-}
-int main(void) {
-    /* Signed in: both save answers write the verified login. */
-    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ALWAYS
-        || saves != 1 || strcmp(status, "YOUTUBE LOGIN SAVED")) return 1;
-    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE) != YOUTUBE_LOGIN_ASK
-        || saves != 1 || strcmp(status, "YOUTUBE LOGIN SAVED")) return 2;
-    /* Signed out: nothing to write, but Always is remembered so the next
-       verified sign-in saves without asking. */
-    if (answer(0, 0, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ALWAYS
-        || saves != 0 || status != NULL) return 3;
-    /* A different login by the time of the answer is never saved. */
-    if (answer(7, 8, PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS) != YOUTUBE_LOGIN_ASK
-        || saves != 0 || strcmp(status, "LOGIN NOT SAVED - SESSION STILL WORKS")) return 4;
-    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_NOT_NOW) != YOUTUBE_LOGIN_ASK || saves != 0) return 5;
-    if (answer(7, 7, PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER) != YOUTUBE_LOGIN_NEVER
-        || saves != 0 || removes != 1) return 6;
-    return 0;
-}
-'''
-        compiler = shutil.which("cc")
-        if compiler is None:
-            self.skipTest("host C compiler unavailable")
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary)
-            (path / "login.c").write_text(fixture)
-            compiled = subprocess.run(
-                [compiler, "-std=c11", "-Wall", "-Werror", str(path / "login.c"),
-                 "-o", str(path / "login")], capture_output=True)
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-            run = subprocess.run([str(path / "login")], capture_output=True)
-            self.assertEqual(run.returncode, 0, run.stderr)
 
     def test_interface_language_row_returns_to_the_saved_language(self):
         source = (ROOT / "src/psp_app/psp_app_ui_language.c").read_text()

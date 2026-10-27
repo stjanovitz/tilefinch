@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CENSUS = ROOT / "tools/site-census"
 sys.path.insert(0, str(CENSUS))
 import census  # noqa: E402
+import compare  # noqa: E402
 import extract  # noqa: E402
 import classify  # noqa: E402
 
@@ -43,13 +44,23 @@ Promise.reject(new TypeError('census rejection'));
 """
 
 
-def run(lab, root, name, env_extra, probe, source=None):
+LINKS = """<!doctype html><html><head><title>links</title></head><body>
+<p><a href="#a">first</a> text <a href="#b">second</a></p>
+<p><a href="#c">third</a> text <a href="#d">fourth</a></p>
+</body></html>
+"""
+
+
+def run(lab, root, name, env_extra, probe, source=None, focus_moves=0,
+        focus_hashes="each"):
     run_dir = root / name
     if run_dir.exists():
         shutil.rmtree(run_dir)
     (run_dir / "frames").mkdir(parents=True)
     (run_dir / "commands").write_text(
-        census.command_script(str(run_dir / "frames"), probe))
+        census.command_script(str(run_dir / "frames"), probe,
+                              focus_moves=focus_moves,
+                              focus_hashes=focus_hashes))
     env = {k: v for k, v in os.environ.items()
            if k not in ("TILEFINCH_TRACE_CENSUS", "TILEFINCH_LAB_INIT_SCRIPT")}
     env.update(env_extra)
@@ -63,6 +74,95 @@ def run(lab, root, name, env_extra, probe, source=None):
         {"name": name, "url": "https://fixture.test/", "tags": ["test"],
          "mode": "test", "exit": 0, "wall_s": 0}))
     return run_dir
+
+
+def without_lines(run_dir, target, keep):
+    """A copy of a run whose lab.log lacks the lines `keep` rejects."""
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(run_dir, target)
+    lines = (run_dir / "lab.log").read_text().splitlines(True)
+    (target / "lab.log").write_text("".join(l for l in lines if keep(l)))
+    return target
+
+
+def check_focus_moves(lab, root):
+    """--focus-moves: the lab's two frame hashes agree on one frame, every
+    focus field survives moves that present nothing, and compare.py keys
+    the hashes by label and says when one side has none."""
+    (root / "links.html").write_text(LINKS)
+    source = ["--fixture", str(root / "links.html")]
+    focus = run(lab, root, "focus", {}, False, source, focus_moves=3)
+    record = extract.extract(str(focus))
+    assert record["focus_issued"] == 3 and record["focus_hashes"] == "each", record
+    assert record["timing"]["focus_moves"] == 3, record["timing"]
+    moves, after = record["focus_move_hashes"], record["focus_after_hashes"]
+    assert sorted(after) == ["focus-1", "focus-2", "focus-3", "focus-final"], after
+    assert sorted(moves) == ["focus-1", "focus-2", "focus-3"], moves
+    # One FNV-1a over the frame at both lab sites: the presented move and
+    # the frame-hash render of the same state hash alike.
+    for label, value in moves.items():
+        assert value and value == after[label], (label, moves, after)
+    assert len(set(moves.values())) == 3, moves
+    assert compare.focus_changes(record, record) == []
+
+    # Moves that present nothing (a no-op focus-next) print no
+    # interaction-latency lines; the record still carries the moves issued
+    # and the after-move frames, and the comparison says what is missing.
+    noop = extract.extract(str(without_lines(
+        focus, root / "focus-noop",
+        lambda l: not l.startswith("interaction-latency command=focus-next "))))
+    assert noop["focus_issued"] == 3, noop
+    assert noop["timing"]["focus_moves"] == 0, noop["timing"]
+    assert noop["focus_move_hashes"] == {}, noop
+    assert noop["focus_after_hashes"] == after, noop
+    notes = compare.focus_changes(record, noop)
+    assert "focus moves presented 3 -> 0" in notes, notes
+    assert any("MOVE HASHES ON ONE SIDE ONLY at 1(base),2(base),3(base)" in n
+               for n in notes), notes
+
+    # One move missing shifts nothing: only that label is reported.
+    first = [True]
+
+    def drop_first(line):
+        if first[0] and line.startswith("interaction-latency command=focus-next "):
+            first[0] = False
+            return False
+        return True
+    shifted = extract.extract(str(without_lines(focus, root / "focus-shift", drop_first)))
+    notes = compare.focus_changes(record, shifted)
+    assert [n for n in notes if "differ" in n] == [], notes
+    assert any(n.endswith("ONE SIDE ONLY at 1(base)") for n in notes), notes
+
+    # A run that left no focus data at all is reported, not skipped.
+    bare = dict(record)
+    for key in ("focus_issued", "focus_hashes", "focus_move_hashes",
+                "focus_after_hashes"):
+        bare.pop(key)
+    bare["timing"] = {k: v for k, v in record["timing"].items()
+                      if not k.startswith("focus_")}
+    assert compare.focus_changes(record, bare) == ["FOCUS DATA ON BASE SIDE ONLY"]
+
+    # Records from before the per-label keys still compare: their
+    # loop-frame-hash half against the after-move frames.
+    legacy = dict(bare)
+    legacy["timing"] = dict(record["timing"])
+    legacy["focus_frames"] = ["0" * 16] * 3 + [after[k] for k in
+        ("focus-1", "focus-2", "focus-3", "focus-final")]
+    assert compare.focus_changes(legacy, record) == []
+    legacy["focus_frames"][4] = "1" * 16
+    assert compare.focus_changes(legacy, record) == [
+        "focus after frames differ at 2"], compare.focus_changes(legacy, record)
+
+    # --focus-hashes final: no per-move renders, so no move hashes, and a
+    # comparison with an `each` run warns that the timings differ in kind.
+    final = extract.extract(str(run(lab, root, "focus-final", {}, False, source,
+                                    focus_moves=3, focus_hashes="final")))
+    assert final["focus_hashes"] == "final" and final["focus_move_hashes"] is None
+    assert sorted(final["focus_after_hashes"]) == ["focus-final"], final
+    assert final["focus_after_hashes"]["focus-final"] == after["focus-final"]
+    assert any("not like-for-like" in line for line in compare.focus_modes(
+        {"p": record}, {"p": final}, ["p"]))
 
 
 def main():
@@ -151,6 +251,8 @@ def main():
         assert all(s["first_t_ms"] is not None for s in record["script_list"])
         # URL loads stream, so they carry the load timeline.
         assert record["timing"]["loaded_ms"] is not None, record["timing"]
+
+        check_focus_moves(lab, root)
 
 
 if __name__ == "__main__":

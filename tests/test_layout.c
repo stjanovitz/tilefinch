@@ -246,6 +246,7 @@ static const char responsive_page[] =
 #include "suites/layout_news_compat.inc"
 #include "suites/layout_site_parity.inc"
 #include "suites/layout_picture_paint.inc"
+#include "suites/layout_text_cache.inc"
 
 static int test_inline_border_command_parity(void)
 {
@@ -305,6 +306,77 @@ static int test_inline_border_command_parity(void)
     return 0;
 }
 
+/* A column flex or display:table container with more than four distinct
+   order values moves its order plan out of the inline array onto the
+   budget. Every refusal while the block's children and generated ::after
+   content flow must release that plan, so each refused build returns the
+   budget to its warmed level. The filler count walks the display list
+   across its 128-command growth step, so for some filler count the
+   refusal lands on the ::after text itself. */
+static int test_column_order_plan_refusal_release(void)
+{
+    static const char *const containers[] = {
+        "display:flex;flex-direction:column", "display:table"};
+    char page[4096];
+    for (size_t kind = 0; kind < 2u; kind++) {
+        for (size_t fillers = 96u; fillers <= 136u; fillers++) {
+            int used = snprintf(page, sizeof(page),
+                "<!doctype html><style>body{margin:0}"
+                "#c{%s;width:400px}#c::after{content:'a b c d e f g h i j "
+                "k l m n o p q r s t u v w x y z'}</style><body><div id=c>"
+                "<div style=order:5>e</div><div style=order:4>d</div>"
+                "<div style=order:3>c</div><div style=order:2>b</div>"
+                "<div style=order:1>",
+                containers[kind]);
+            CHECK(used > 0 && (size_t) used < sizeof(page));
+            for (size_t i = 0; i < fillers; i++) {
+                CHECK((size_t) used + 3u < sizeof(page));
+                memcpy(page + used, "x ", 2);
+                used += 2;
+            }
+            CHECK((size_t) used + 32u < sizeof(page));
+            used += snprintf(page + used, sizeof(page) - (size_t) used,
+                             "</div></div></body>");
+            Budget budget;
+            budget_init(&budget, 4u * MIB);
+            CHECK(budget_install_lexbor(&budget));
+            PocDocument document;
+            Stylesheet sheet;
+            LayoutDocument layout = {0};
+            CHECK(document_parse(&document, &budget, page, (size_t) used, 42)
+                  && stylesheet_build(&sheet, &budget, &document, 480)
+                  && layout_build(&layout, &budget, &document, &sheet,
+                                  NULL, NULL, 480));
+            layout_destroy(&layout);
+            size_t warmed = budget.current;
+            bool completed = false;
+            for (size_t refused_after = 0;
+                 refused_after < 4096u && !completed; refused_after++) {
+                budget_inject_failure_after(&budget, refused_after);
+                bool built = layout_build(&layout, &budget, &document,
+                                          &sheet, NULL, NULL, 480);
+                /* The sweep ends at the first build that never reached
+                   the injected refusal. */
+                completed = built && budget.failure_injection_enabled;
+                budget_clear_failure_injection(&budget);
+                layout_destroy(&layout);
+                if (budget.current != warmed) {
+                    fprintf(stderr, "column order refusal leak: kind=%zu "
+                            "fillers=%zu refused_after=%zu leaked=%zu\n",
+                            kind, fillers, refused_after,
+                            budget.current - warmed);
+                }
+                CHECK(budget.current == warmed);
+            }
+            CHECK(completed);
+            stylesheet_destroy(&sheet);
+            document_destroy(&document);
+            CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
+        }
+    }
+    return 0;
+}
+
 #include "suites/layout_humanist_ink.inc"
 
 static int test_layout(void)
@@ -313,6 +385,154 @@ static int test_layout(void)
 #include "suites/layout_regression_structure.inc"
 #include "suites/layout_regression_positioning.inc"
 #include "suites/layout_regression_fonts.inc"
+
+typedef struct {
+    const char *id;
+    int x;
+    int y;
+    int width;
+} GridTrackExpectation;
+
+static int check_grid_track_page(const char *page, int viewport,
+                                 const GridTrackExpectation *expected,
+                                 size_t expected_count)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, strlen(page), 17)
+          && stylesheet_build(&sheet, &budget, &document, viewport)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL,
+                          viewport));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    int failures = 0;
+    for (size_t i = 0; i < expected_count; i++) {
+        const LayoutNodeBox *box = layout_box_for_node(
+            &layout, find_id(root, expected[i].id));
+        if (box == NULL || box->x != expected[i].x
+            || box->y != expected[i].y
+            || (expected[i].width >= 0
+                && box->width != expected[i].width)) {
+            fprintf(stderr, "grid track %s: got %d,%d w%d, want %d,%d w%d\n",
+                    expected[i].id, box ? box->x : -1, box ? box->y : -1,
+                    box ? box->width : -1, expected[i].x, expected[i].y,
+                    expected[i].width);
+            failures++;
+        }
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
+    CHECK(failures == 0);
+    return 0;
+}
+
+/* grid-auto-rows/columns size every implicit track, cycling through the
+   track list (CSS Grid 7.6), and an auto-fill/auto-fit minmax() floor
+   resolves its percentage against the grid container's inline size. */
+static int test_grid_implicit_tracks_and_repeat_floors(void)
+{
+    static const char implicit_page[] =
+        "<!doctype html><style>body{margin:0}div{margin:0}"
+        ".g{display:grid;width:300px;height:auto}"
+        ".g i{display:block;height:20px;width:20px}"
+        "#rows-one{grid-auto-rows:100px}"
+        "#rows-two{grid-auto-rows:100px 50px}"
+        "#rows-same{grid-auto-rows:100px 100px}"
+        "#cols-one{grid-auto-flow:column;grid-auto-columns:100px}"
+        "#cols-two{grid-auto-flow:column;grid-auto-columns:100px 50px}"
+        "#overflow{grid-auto-flow:column;grid-auto-columns:10px;"
+        "grid-auto-rows:100px;justify-content:center}"
+        "</style>"
+        "<div id=rows-one class=g><i id=ro1></i><i id=ro2></i>"
+        "<i id=ro3></i></div>"
+        "<div id=rows-two class=g><i id=rt1></i><i id=rt2></i>"
+        "<i id=rt3></i></div>"
+        "<div id=rows-same class=g><i id=rs1></i><i id=rs2></i>"
+        "<i id=rs3></i></div>"
+        "<div id=cols-one class=g><i id=co1></i><i id=co2></i>"
+        "<i id=co3></i></div>"
+        "<div id=cols-two class=g><i id=ct1></i><i id=ct2></i>"
+        "<i id=ct3></i></div>"
+        "<div id=overflow class=g>"
+        "<i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>"
+        "<i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>"
+        "<div id=after-overflow></div>";
+    static const GridTrackExpectation implicit_expected[] = {
+        { "rows-one", 0, 0, 300 },
+        { "ro1", 0, 0, -1 }, { "ro2", 0, 100, -1 }, { "ro3", 0, 200, -1 },
+        { "rows-two", 0, 300, 300 },
+        { "rt1", 0, 300, -1 }, { "rt2", 0, 400, -1 }, { "rt3", 0, 450, -1 },
+        { "rows-same", 0, 550, 300 },
+        { "rs1", 0, 550, -1 }, { "rs2", 0, 650, -1 }, { "rs3", 0, 750, -1 },
+        { "cols-one", 0, 850, 300 },
+        { "co1", 0, 850, -1 }, { "co2", 100, 850, -1 },
+        { "co3", 200, 850, -1 },
+        { "cols-two", 0, 870, 300 },
+        { "ct1", 0, 870, -1 }, { "ct2", 100, 870, -1 },
+        { "ct3", 150, 870, -1 },
+        /* More column-flow items than the bounded track table: the extra
+           items share the overflow cell in the last placement row. The
+           rows they skip are not tracks and must not take 100px each
+           (amazon's review carousel grew by 6,200px). */
+        { "after-overflow", 0, 890 + 100 + 20, -1 },
+    };
+    CHECK(check_grid_track_page(
+        implicit_page, 480, implicit_expected,
+        sizeof(implicit_expected) / sizeof(implicit_expected[0])) == 0);
+
+    /* 25% of the container is four columns at any width (it was read as
+       25px: sixteen or thirty-two columns, capped at the six items). A
+       mixed floor, min(100%, 20rem), is 320px in a 700px container. */
+    static const char floor_page[] =
+        "<!doctype html><style>body{margin:0}div{margin:0}"
+        ".g{display:grid}.g i{display:block;height:20px}"
+        "#fill-400{width:400px;"
+        "grid-template-columns:repeat(auto-fill,minmax(25%,1fr))}"
+        "#fill-800{width:800px;"
+        "grid-template-columns:repeat(auto-fill,minmax(25%,1fr))}"
+        "#fit-400{width:400px;"
+        "grid-template-columns:repeat(auto-fit,minmax(25%,1fr))}"
+        "#fill-gap{width:410px;column-gap:10px;"
+        "grid-template-columns:repeat(auto-fill,minmax(30%,1fr))}"
+        "#mixed-700{width:700px;"
+        "grid-template-columns:repeat(auto-fill,minmax(min(100%,20rem),1fr))}"
+        "#mixed-300{width:300px;"
+        "grid-template-columns:repeat(auto-fill,minmax(min(100%,20rem),1fr))}"
+        "</style>"
+        "<div id=fill-400 class=g><i id=a1></i><i id=a2></i><i id=a3></i>"
+        "<i id=a4></i><i id=a5></i><i id=a6></i></div>"
+        "<div id=fill-800 class=g><i id=b1></i><i id=b2></i><i id=b3></i>"
+        "<i id=b4></i><i id=b5></i><i id=b6></i></div>"
+        "<div id=fit-400 class=g><i id=c1></i><i id=c2></i><i id=c3></i>"
+        "<i id=c4></i><i id=c5></i><i id=c6></i></div>"
+        "<div id=fill-gap class=g><i id=d1></i><i id=d2></i><i id=d3></i>"
+        "<i id=d4></i></div>"
+        "<div id=mixed-700 class=g><i id=e1></i><i id=e2></i>"
+        "<i id=e3></i></div>"
+        "<div id=mixed-300 class=g><i id=f1></i><i id=f2></i></div>";
+    static const GridTrackExpectation floor_expected[] = {
+        { "a1", 0, 0, 100 }, { "a2", 100, 0, 100 }, { "a4", 300, 0, 100 },
+        { "a5", 0, 20, 100 }, { "a6", 100, 20, 100 },
+        { "b1", 0, 40, 200 }, { "b2", 200, 40, 200 },
+        { "b4", 600, 40, 200 }, { "b5", 0, 60, 200 },
+        { "c1", 0, 80, 100 }, { "c4", 300, 80, 100 },
+        { "c5", 0, 100, 100 },
+        { "d1", 0, 120, 130 }, { "d2", 140, 120, 130 },
+        { "d3", 280, 120, 130 }, { "d4", 0, 140, 130 },
+        { "e1", 0, 160, 350 }, { "e2", 350, 160, 350 },
+        { "e3", 0, 180, 350 },
+        { "f1", 0, 200, 300 }, { "f2", 0, 220, 300 },
+    };
+    CHECK(check_grid_track_page(
+        floor_page, 1000, floor_expected,
+        sizeof(floor_expected) / sizeof(floor_expected[0])) == 0);
+    return 0;
+}
 
 static int test_column_flex_scroller_height(void)
 {
@@ -622,6 +842,15 @@ static int test_legacy_mobile_style_fallbacks(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--text-measure-cache-only") == 0) {
+        int keys = test_text_measure_cache_keys();
+        int yields = test_text_measure_cache_yields();
+        int layout = test_text_measure_cache_layout();
+        return keys != 0 || yields != 0 || layout != 0;
+    }
+    CHECK(test_text_measure_cache_keys() == 0);
+    CHECK(test_text_measure_cache_yields() == 0);
+    CHECK(test_text_measure_cache_layout() == 0);
     if (argc == 2 && strcmp(argv[1], "--legacy-mobile-styles-only") == 0)
         return test_legacy_mobile_style_fallbacks();
     CHECK(test_legacy_mobile_style_fallbacks() == 0);
@@ -632,8 +861,11 @@ int main(int argc, char **argv)
         return test_individual_calc_translate();
     if (argc == 2 && strcmp(argv[1], "--column-scroller-only") == 0)
         return test_column_flex_scroller_height();
+    if (argc == 2 && strcmp(argv[1], "--grid-implicit-tracks-only") == 0)
+        return test_grid_implicit_tracks_and_repeat_floors();
     CHECK(test_individual_calc_translate() == 0);
     CHECK(test_column_flex_scroller_height() == 0);
+    CHECK(test_grid_implicit_tracks_and_repeat_floors() == 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && strcmp(argv[1], "--page-font-leading-only") == 0)
         return test_page_font_normal_leading();
@@ -722,6 +954,9 @@ int main(int argc, char **argv)
     puts("test: picture paints a replaced image through clipping");
     CHECK(test_picture_replaced_paint() == 0);
     CHECK(test_inline_border_command_parity() == 0);
+    if (argc == 2 && strcmp(argv[1], "--column-order-refusal-only") == 0)
+        return test_column_order_plan_refusal_release();
+    CHECK(test_column_order_plan_refusal_release() == 0);
     CHECK(test_news_compat() == 0);
     CHECK(test_site_parity() == 0);
     return test_layout();

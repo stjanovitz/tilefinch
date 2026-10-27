@@ -201,8 +201,17 @@ int main(void)
         CHECK(!ferror(file) && fclose(file) == 0 && length < sizeof(bytes));
         bytes[length] = 0;
         size_t before = budget.current;
+        size_t style_before = budget.categories[BUDGET_CATEGORY_STYLE].current;
+        size_t plain_before =
+            budget.categories[BUDGET_CATEGORY_UNCATEGORIZED].current;
         TilefinchUiTranslation *t = tilefinch_ui_translation_create(&budget, language, bytes, length);
         CHECK(t);
+        /* The interface catalog (and Arabic's display cache) is not style
+           memory: borrowing the style hash must not borrow style's budget
+           category with it. */
+        CHECK(budget.categories[BUDGET_CATEGORY_STYLE].current == style_before);
+        CHECK(budget.categories[BUDGET_CATEGORY_UNCATEGORIZED].current
+              - plain_before == budget.current - before);
         /* A loaded catalog holds its file's hashes, key lengths and values
            plus a 16-bit offset per row it actually has (and, for Arabic,
            the display text): nothing scales with the row bound. */

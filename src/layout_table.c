@@ -110,16 +110,16 @@ static size_t table_declared_column_count(lxb_dom_node_t *table)
     for (lxb_dom_node_t *child = table->first_child;
          child != NULL && count < 16; child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (layout_node_name_is(child, "col")) {
+        if (document_node_is_tag(child, LXB_TAG_COL)) {
             count += table_bounded_span_attribute(child, "span");
             continue;
         }
-        if (!layout_node_name_is(child, "colgroup")) continue;
+        if (!document_node_is_tag(child, LXB_TAG_COLGROUP)) continue;
         size_t nested = 0;
         for (lxb_dom_node_t *col = child->first_child;
              col != NULL && count + nested < 16; col = col->next) {
             if (col->type == LXB_DOM_NODE_TYPE_ELEMENT
-                && layout_node_name_is(col, "col")) {
+                && document_node_is_tag(col, LXB_TAG_COL)) {
                 nested += table_bounded_span_attribute(col, "span");
             }
         }
@@ -394,7 +394,7 @@ static bool table_collapsed_boundaries(
             || row.style.display != DISPLAY_TABLE_ROW) continue;
         if (context->preview_y_limit > 0
             && measured_rows >= LAYOUT_PREVIEW_TABLE_ROW_LIMIT) {
-            context->preview_truncated = true;
+            layout_note_preview_cut(context, true);
             break;
         }
         if (!layout_cooperate(context, row.node)) break;
@@ -562,8 +562,8 @@ static void table_measure_columns(
     for (lxb_dom_node_t *child = table->first_child;
          child != NULL && column < 16; child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        bool group = layout_node_name_is(child, "colgroup");
-        bool single = layout_node_name_is(child, "col");
+        bool group = document_node_is_tag(child, LXB_TAG_COLGROUP);
+        bool single = document_node_is_tag(child, LXB_TAG_COL);
         if (!group && !single) continue;
         ComputedStyle group_style = layout_style_for_node(
             context, child, table_style);
@@ -580,7 +580,7 @@ static void table_measure_columns(
         for (lxb_dom_node_t *col = child->first_child;
              col != NULL && column < 16; col = col->next) {
             if (col->type != LXB_DOM_NODE_TYPE_ELEMENT
-                || !layout_node_name_is(col, "col")) continue;
+                || !document_node_is_tag(col, LXB_TAG_COL)) continue;
             have_columns = true;
             size_t span = table_bounded_span_attribute(col, "span");
             ComputedStyle col_style = layout_style_for_node(
@@ -624,7 +624,7 @@ static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
             || row.style.display != DISPLAY_TABLE_ROW) continue;
         if (context->preview_y_limit > 0
             && measured_rows >= LAYOUT_PREVIEW_TABLE_ROW_LIMIT) {
-            context->preview_truncated = true;
+            layout_note_preview_cut(context, true);
             break;
         }
         if (!layout_cooperate(context, row.node)) return false;
@@ -664,7 +664,7 @@ static void table_measure_anonymous_row(
     const ComputedStyle *table_style, int available_width,
     int preferred[16], size_t *column_count)
 {
-    if (layout_node_name_is(table, "table")) return;
+    if (document_node_is_tag(table, LXB_TAG_TABLE)) return;
     int widths[16] = {0};
     size_t cells = 0;
     FlatItemIterator items;
@@ -764,7 +764,7 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
     for (lxb_dom_node_t *child = table->first_child; child != NULL;
          child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || !layout_node_name_is(child, "caption")) continue;
+            || !document_node_is_tag(child, LXB_TAG_CAPTION)) continue;
         int caption = intrinsic_text_width(
             context, child, table_style, available_width);
         if (caption > width) width = caption;
@@ -1010,7 +1010,7 @@ const TableTracks *table_tracks_for_row(
     LayoutContext *context, lxb_dom_node_t *row, int available_width)
 {
     lxb_dom_node_t *table = row == NULL ? NULL : row->parent;
-    while (table != NULL && !layout_node_name_is(table, "table")) {
+    while (table != NULL && !document_node_is_tag(table, LXB_TAG_TABLE)) {
         table = table->parent;
     }
     if (table == NULL) return NULL;
@@ -1028,7 +1028,7 @@ bool table_cell_uses_collapsed_geometry(
 {
     if (context == NULL || cell == NULL) return false;
     lxb_dom_node_t *table = cell->parent;
-    while (table != NULL && !layout_node_name_is(table, "table")) {
+    while (table != NULL && !document_node_is_tag(table, LXB_TAG_TABLE)) {
         table = table->parent;
     }
     if (table == NULL) return false;

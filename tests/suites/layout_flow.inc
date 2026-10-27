@@ -1228,6 +1228,108 @@ static int test_wrapped_flex_preview_stops_at_limit(Budget *budget)
     return 0;
 }
 
+/* A provisional cut's contract (layout_note_preview_cut): what it recorded
+   before the cut is the complete layout's own, unless it marked the cut
+   inexact. Containers that move their items after the loop by totals the
+   cut left partial (column-flex reversal and distribution, a grid whose
+   later item sizes an earlier row) must mark it. */
+static bool preview_prefix_holds(const LayoutDocument *preview,
+                                 const LayoutDocument *complete,
+                                 const char *label)
+{
+    if (preview->preview_inexact) return true;
+    size_t links = preview->preview_cut_link_count;
+    if (links > preview->link_count) links = preview->link_count;
+    for (size_t i = 0; i < links; i++) {
+        bool control = false;
+        size_t index = 0;
+        if (!layout_focus_for_node(complete, preview->links[i].node,
+                                   &control, &index) || control
+            || complete->links[index].y != preview->links[i].y
+            || complete->links[index].x != preview->links[i].x) {
+            fprintf(stderr, "%s: link %zu at %d, complete at %d\n", label,
+                    i, preview->links[i].y,
+                    control ? -1 : complete->links[index].y);
+            return false;
+        }
+    }
+    size_t boxes = preview->preview_cut_box_count;
+    if (boxes > preview->node_box_count) boxes = preview->node_box_count;
+    for (size_t i = 0; i < boxes; i++) {
+        const LayoutNodeBox *a = &preview->node_boxes[i];
+        const LayoutNodeBox *b = a->node == NULL ? NULL
+            : layout_box_for_node(complete, a->node);
+        if (a->node != NULL && (b == NULL || a->y != b->y || a->x != b->x
+                                || a->height != b->height)) {
+            fprintf(stderr, "%s: box %zu at %d, complete at %d\n", label,
+                    i, a->y, b == NULL ? -1 : b->y);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int test_preview_cut_repositioning_marks_inexact(Budget *budget)
+{
+    static const char *const containers[] = {
+        "column-reverse",
+        "column-distributed",
+        "grid-late-row",
+        "grid-stretched-row-mate",
+    };
+    for (size_t kind = 0; kind < 4; kind++) {
+        static char page[24000];
+        size_t used = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><style>html,body{margin:0}"
+            "a{display:block;height:20px}"
+            ".rev{display:flex;flex-direction:column-reverse}"
+            ".dist{display:flex;flex-direction:column;height:3000px;"
+            "justify-content:center}"
+            ".grid{display:grid;grid-template-columns:1fr 1fr}"
+            ".late{grid-row:1;grid-column:2;height:900px}"
+            ".mate{display:flex;flex-direction:column;"
+            "justify-content:center}"
+            "</style><body><div class=%s>%s",
+            kind == 0 ? "rev" : kind == 1 ? "dist" : "grid",
+            kind == 3 ? "<div class=mate><a href='#mid'>Mid</a></div>"
+                        "<div>" : "");
+        for (int i = 0; i < 60 && used < sizeof(page) - 200; i++)
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                kind == 2 ? "<a href='#%d' style='grid-column:1'>Link %d</a>"
+                          : "<a href='#%d'>Link %d</a>", i, i);
+        if (kind == 2)
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "<div class=late><a href='#late'>Late</a></div>");
+        if (kind == 3)
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                      "</div>");
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "</div><p>after</p></body>");
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument preview = {0}, complete = {0};
+        ViewportContext viewport = {0};
+        CHECK(document_parse(&document, budget, page, used, 24)
+              && stylesheet_build(&sheet, budget, &document, 480)
+              && viewport_context_init(&viewport, 480, 272, 480, 272));
+        bool truncated = false, complete_truncated = true;
+        CHECK(layout_build_context_preview(
+                  &preview, budget, &document, &sheet, NULL, NULL,
+                  &viewport, NULL, 544, &truncated)
+              && truncated);
+        CHECK(layout_build_context_preview(
+                  &complete, budget, &document, &sheet, NULL, NULL,
+                  &viewport, NULL, INT_MAX, &complete_truncated)
+              && !complete_truncated);
+        CHECK(preview_prefix_holds(&preview, &complete, containers[kind]));
+        layout_destroy(&preview);
+        layout_destroy(&complete);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    return 0;
+}
+
 static int test_resumable_authoritative_layout(Budget *budget)
 {
     static const char page[] =
@@ -2960,7 +3062,10 @@ static int test_checked_invalidation_cancel_drops_lists(Budget *budget)
     static char html[16384];
     int used = snprintf(html, sizeof(html),
         "<!doctype html><style>p{color:#111111}.drawer{display:none}"
-        ".toggle:checked ~ .drawer{display:block;color:#123456}");
+        ".toggle:checked ~ .drawer{display:block;color:#123456}"
+        /* A ::before/::after rule that can generate content: each element's
+           (empty) pseudo lists are retained too, as on real pages. */
+        ".never::before,.never::after{content:'x'}");
     for (unsigned i = 0; used > 0 && i < 64; i++) {
         used += snprintf(html + used, sizeof(html) - (size_t) used,
                          ".pad%u{margin:0}", i);

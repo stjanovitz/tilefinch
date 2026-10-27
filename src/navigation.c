@@ -38,7 +38,6 @@
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_NAVIGATION, (p), (s))
 
 #define NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT 65536u
-#define NAVIGATION_SCRIPT_SNAPSHOT_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY
 
 
 /* The frame and page capability traces are host-lab instrumentation: only
@@ -89,11 +88,45 @@ static void navigation_note_layout_failure(
 }
 
 #include "navigation/page_lifecycle.inc"
+#include "navigation/frames.inc"
 #include "navigation/declarative_refresh.inc"
 #include "navigation/configuration.inc"
 #include "navigation/document_stream.inc"
+#include "navigation/stylesheet_checkpoint.inc"
+#include "navigation/stream_runtime.inc"
+#include "navigation/parser_script_checkpoint.inc"
+/* Candidate adoption is a distinct transactional boundary. */
+#include "navigation/commit_transaction.inc"
+#include "navigation/progressive_preview.inc"
+#include "navigation/commit_html.inc"
 #include "navigation/load_state.inc"
-#include "navigation/history_runtime.inc"
+#include "navigation/history.inc"
+#include "navigation/mutation_classify.inc"
+#include "navigation/style_sources.inc"
+#include "navigation/layout_reuse.inc"
+#include "navigation/relayout.inc"
+#include "navigation/deferred_images.inc"
+#include "navigation/runtime_advance.inc"
+#include "navigation/events.inc"
+
+void navigation_destroy(NavigationSession *session)
+{
+    if (session == NULL) return;
+    page_destroy(session);
+    /* Direct NavigationSession owners do not pass through BrowserEngine's
+       teardown coordinator. Reap the process-wide JPEG slot here as well so
+       its retained body and arena cannot outlive this session's Budget. */
+    (void) images_decode_worker_shutdown(session->budget);
+    navigation_compiled_stylesheet_cache_discard(session);
+    if (session->budget != NULL) {
+        for (size_t i = 0; i < session->history_count; i++) {
+            entry_destroy(session->budget, &session->history[i]);
+        }
+        budget_free(session->budget, session->history);
+        budget_free(session->budget, session->user_css);
+    }
+    memset(session, 0, sizeof(*session));
+}
 
 #ifndef __PSP__
 /* Exercise the transfer/retirement ordering without a site fixture or an

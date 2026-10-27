@@ -1,2 +1,0 @@
-anchor alpha
-node-text geometry-result

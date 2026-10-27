@@ -6,7 +6,6 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/render.h"
 #include "tilefinch/script_loader.h"
-#include "tilefinch/section_store.h"
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
 #include "../src/image_decode_internal.h"
@@ -4914,14 +4913,6 @@ static bool redirected_critical_ch_replay_begin(void)
     char error[256] = {0};
     return fetch_trace_replay_begin(
         TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-critical-ch-redirect", error,
-        sizeof(error));
-}
-
-static bool remote_isolation_replay_begin(void)
-{
-    char error[256] = {0};
-    return fetch_trace_replay_begin(
-        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-remote-isolation", error,
         sizeof(error));
 }
 

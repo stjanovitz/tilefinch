@@ -1,6 +1,7 @@
 /* CSS calc()/math expression parsing and evaluation, plus the base
    length parsers built on it.  Split out of style.c. */
 
+#include "style_budget_category.h"
 #include "style_internal.h"
 
 #include <math.h>

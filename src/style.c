@@ -1,3 +1,4 @@
+#include "style_budget_category.h"
 #include "tilefinch/style.h"
 
 #include "style_internal.h"
@@ -127,6 +128,7 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
             * sizeof(*sheet->has_custom_rule_indices)
         + sheet->has_class_hash_count * sizeof(*sheet->has_class_hashes)
         + style_has_plan_bytes(sheet)
+        + stylesheet_inline_scan_bytes(sheet)
         + sheet->selector_attribute_name_bytes
         + sheet->declaration_capacity * sizeof(*sheet->declarations)
         + sheet->declaration_value_capacity

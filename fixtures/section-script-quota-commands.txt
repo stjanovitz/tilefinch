@@ -1,3 +1,0 @@
-node-text alpha-result
-anchor beta
-node-text beta-result

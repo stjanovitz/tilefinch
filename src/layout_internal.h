@@ -13,8 +13,6 @@
 
 #include <limits.h>
 
-bool layout_node_name_is(lxb_dom_node_t *node, const char *wanted);
-
 
 /* DRAW_IMAGE does not use its text member. A fixed raster <img> may borrow
    its node identity there (text_length stays zero), allowing allocation-free
@@ -25,7 +23,7 @@ static inline bool layout_fixed_image_slot(lxb_dom_node_t *node,
                                            const ComputedStyle *style,
                                            const ComputedStyle *parent)
 {
-    return layout_node_name_is(node, "img")
+    return document_node_is_tag(node, LXB_TAG_IMG)
         && style->has_width && style->has_height
         && style->width > 0 && style->height > 0
         && style->width <= STYLE_LENGTH_DIRECT_LIMIT
@@ -350,6 +348,40 @@ typedef struct {
     lxb_dom_node_t *node;
     uint8_t reset_id, set_id, increment_id, depth;
 } LayoutCounterEntry;
+
+/* One retained run measurement (layout_text_cache.c): every input of
+   measured_flow_text_width_fixed, the run's bytes, and its result. The
+   face is named by its lifetime serial, which a reload or replacement of
+   the face renews. */
+#define LAYOUT_TEXT_MEASURE_BYTES 32u
+#define LAYOUT_TEXT_MEASURE_WAYS 4u
+/* A table starts at 16 KiB and doubles, up to 256 KiB, when a build
+   replaced more than an eighth of its live entries. */
+#define LAYOUT_TEXT_MEASURE_INITIAL_CAPACITY 256u
+#define LAYOUT_TEXT_MEASURE_CAPACITY_LIMIT 4096u
+typedef struct {
+    uint64_t face_serial;
+    uint32_t hash; /* zero: empty */
+    uint32_t stamp;
+    int32_t width;
+    int32_t font_size_fixed;
+    int16_t letter_spacing;
+    int16_t scale;
+    uint8_t length;
+    uint8_t metric_family;
+    uint8_t transform;
+    uint8_t flags;
+    char text[LAYOUT_TEXT_MEASURE_BYTES];
+} LayoutTextMeasureEntry;
+_Static_assert(LAYOUT_TEXT_MEASURE_BYTES <= UINT8_MAX,
+    "retained run lengths must fit a byte");
+_Static_assert((LAYOUT_TEXT_MEASURE_INITIAL_CAPACITY
+                & (LAYOUT_TEXT_MEASURE_INITIAL_CAPACITY - 1u)) == 0
+               && (LAYOUT_TEXT_MEASURE_CAPACITY_LIMIT
+                   & (LAYOUT_TEXT_MEASURE_CAPACITY_LIMIT - 1u)) == 0
+               && LAYOUT_TEXT_MEASURE_INITIAL_CAPACITY
+                  >= LAYOUT_TEXT_MEASURE_WAYS,
+    "run measurement sets must be a power of two");
 _Static_assert(sizeof(LayoutCounterEntry) * LAYOUT_COUNTER_NODE_LIMIT <= 65536u,
     "counter prefix must remain at most 64 KiB (32 KiB on the PSP)");
 
@@ -486,6 +518,19 @@ struct LayoutReuseCache {
     bool pending_active;
     bool pending_overflow;
     bool pending_parent_scope;
+    /* Retained run measurements (layout_text_cache.c), allocated on first
+       use with the style payloads' headroom and released with them under
+       pressure; `text_measure_generation` is the optional-glyph generation
+       they were measured under, and `text_measure_build_evictions` the
+       live entries this build replaced. */
+    LayoutTextMeasureEntry *text_measures;
+    uint64_t text_measure_generation;
+    uint32_t text_measure_capacity;
+    uint32_t text_measure_clock;
+    uint32_t text_measure_build_evictions;
+    bool text_measure_refused;
+    /* layout_reuse_cache_yield_text_measures: never admitted again. */
+    bool text_measure_yielded;
 };
 
 /* Atomic inline boxes (inline-blocks, replaced elements, form controls)
@@ -726,6 +771,11 @@ static inline const ImageResource *layout_replaced_image(
         : images_find_node(context->images, node);
 }
 
+/* Shared between the layout job (layout.c) and the reuse cache
+   (layout_reuse.c): release the retained counter entries, and drop what a
+   container-state change makes stale. */
+void layout_reuse_clear_counters(LayoutReuseCache *cache);
+void layout_reuse_container_state_changed(LayoutReuseCache *cache);
 /* A pseudo-element of `node` known, from the reuse cache, to generate
    nothing when resolved from `parent` (its element's style): layout skips
    resolving it again. Callers read only generated_content of an absent
@@ -765,8 +815,12 @@ static inline ComputedStyle layout_style_for_pseudo(
     LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
     const ComputedStyle *parent)
 {
-    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
     context->pseudo_resolutions++;
+    if (!style_pseudo_may_generate(context->sheet, pseudo)) {
+        context->pseudo_absence_hits++;
+        return (ComputedStyle) {0};
+    }
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
     if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
                                    pseudo, parent)) {
         context->pseudo_absence_hits++;
@@ -793,8 +847,9 @@ static inline ComputedStyle layout_style_for_pseudo(
     LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
     const ComputedStyle *parent)
 {
-    if (layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
-                                   pseudo, parent))
+    if (!style_pseudo_may_generate(context->sheet, pseudo)
+        || layout_reuse_pseudo_absent(context->reuse, context->sheet, node,
+                                      pseudo, parent))
         return (ComputedStyle) {0};
     ((Stylesheet *) context->sheet)->variable_read_names = 0;
     ComputedStyle result =
@@ -809,12 +864,28 @@ void layout_note_unresolved_external_visual(
     LayoutContext *context, lxb_dom_node_t *node, const char *source,
     uint8_t kind, PseudoElement pseudo);
 
+/* The first stop records the traversal prefix (LayoutDocument
+   preview_cut_*): everything recorded before it is laid out exactly as the
+   complete build lays it out. */
+static inline void layout_note_preview_cut(LayoutContext *context,
+                                           bool inexact)
+{
+    LayoutDocument *layout = context->layout;
+    if (!context->preview_truncated && layout != NULL) {
+        layout->preview_cut_link_count = layout->link_count;
+        layout->preview_cut_control_count = layout->control_count;
+        layout->preview_cut_box_count = layout->node_box_count;
+    }
+    if (inexact && layout != NULL) layout->preview_inexact = true;
+    context->preview_truncated = true;
+}
+
 static inline bool layout_preview_limit_reached(LayoutContext *context,
                                                 int y)
 {
     if (context == NULL || context->preview_y_limit <= 0
         || y < context->preview_y_limit) return false;
-    context->preview_truncated = true;
+    layout_note_preview_cut(context, false);
     return true;
 }
 
@@ -1319,6 +1390,43 @@ bool layout_paint_audio_control(
 bool layout_paint_video_control(
     LayoutContext *context, lxb_dom_node_t *node,
     int x, int y, int width, int height);
+const char *layout_control_value_text(lxb_dom_node_t *node, bool input,
+                                      ControlType input_type,
+                                      size_t *length, bool *placeholder);
+bool layout_control_add_resize_grip(LayoutContext *context,
+                                    lxb_dom_node_t *node,
+                                    const ComputedStyle *style,
+                                    int x, int y, int width, int height);
+bool layout_block_control_paint(LayoutContext *context, lxb_dom_node_t *node,
+                                const ComputedStyle *style, int outer_x,
+                                int outer_y, int outer_width,
+                                int border_height, int content_bottom);
+static inline bool layout_audio_has_controls(lxb_dom_node_t *node)
+{
+    return node->local_name == LXB_TAG_AUDIO
+        && lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) "controls", 8);
+}
+/* Exactly the block elements layout_block_control_paint acts on: native
+   controls and media faces, the declared video card, and editing hosts.
+   `node` is an element. */
+static inline bool layout_block_may_paint_control(
+    LayoutContext *context, lxb_dom_node_t *node)
+{
+    switch (node->local_name) {
+    case LXB_TAG_INPUT: case LXB_TAG_TEXTAREA: case LXB_TAG_BUTTON:
+    case LXB_TAG_SELECT: case LXB_TAG_LABEL: case LXB_TAG_SUMMARY:
+    case LXB_TAG_VIDEO: case LXB_TAG_IFRAME:
+        return true;
+    default:
+        return layout_audio_has_controls(node)
+            || document_is_declared_video_card(context->document, node)
+            || lxb_dom_element_has_attribute(
+                   lxb_dom_interface_element(node),
+                   (const lxb_char_t *) "contenteditable", 15);
+    }
+}
 bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
                      size_t command_index, const char *url,
                      size_t url_length, lxb_dom_node_t *node);
@@ -1349,7 +1457,6 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
                             const DrawCommand *commands, size_t count);
 bool layout_insert_command(LayoutContext *context, size_t index,
                            DrawCommand command);
-bool layout_node_name_is(lxb_dom_node_t *node, const char *wanted);
 bool layout_node_within(const lxb_dom_node_t *node, const lxb_dom_node_t *ancestor);
 bool layout_positioned_command_escapes_clip(
     const LayoutDocument *layout, size_t command_index,
@@ -1390,6 +1497,15 @@ int grid_item_minimum_contribution(
     LayoutContext *context, const FlatItem *item, int available,
     int start, int span, const uint8_t track_types[GRID_TRACK_LIMIT]);
 int intrinsic_min_text_width(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, int limit);
+/* Shared by layout_intrinsic.c and the flex minimum-size rules in
+   layout_flex.c. */
+int intrinsic_min_text_width_internal(LayoutContext *context,
+                                      lxb_dom_node_t *node,
+                                      const ComputedStyle *parent,
+                                      int limit, bool ignore_own_width);
+int intrinsic_replaced_width(LayoutContext *context, lxb_dom_node_t *node,
+                             const ComputedStyle *parent,
+                             const ComputedStyle *style);
 int intrinsic_min_text_width_ignoring_own_width(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, int limit);
@@ -1421,6 +1537,60 @@ int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_famil
 int measured_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_flow_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
 int measured_flow_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
+/* measured_flow_text_width_fixed, and whether the face measured the run
+   (false: the per-character estimate stood in). */
+int measured_flow_text_width_fixed_checked(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning, bool *exact);
+/* --- layout_text_cache.c: retained run measurements ------------------- */
+/* measured_flow_text_width_fixed of a short run, answered from `cache`'s
+   retained measurements when it holds this exact run (NULL: measures). */
+int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
+                        FontFamily metric_family, const char *text,
+                        size_t length, int font_size_fixed,
+                        bool synthetic_bold, bool metric_bold, int scale,
+                        int letter_spacing, TextTransformMode transform,
+                        bool kerning);
+/* Discards every retained measurement and frees the table. */
+size_t layout_text_measure_release(LayoutReuseCache *cache);
+/* Once per build (layout_reuse_cache_prepare): retry a refused table,
+   and grow one whose last build replaced live entries. */
+void layout_text_measure_prepare(LayoutReuseCache *cache);
+/* --- layout_replaced.c: one intrinsic model for replaced elements ----- */
+/* An element is replaced when style->generated_image is set or
+   layout_replaced_element_tag() holds; the info is meaningful only then. */
+typedef struct LayoutReplacedInfo {
+    const ImageResource *image;  /* layout_replaced_image(); may be NULL */
+    /* The natural size when `available`; otherwise the 300x150 (controlled
+       audio 300x54) default of video, iframe, canvas and audio[controls];
+       otherwise 0. */
+    int natural_width;
+    int natural_height;
+    bool available;              /* decoded with a positive size */
+    bool canvas;
+    bool audio_controls;
+    /* The default box is two independent lengths rather than a ratio
+       (video, iframe, audio[controls] without an image or aspect-ratio). */
+    bool fallback_dimensions;
+} LayoutReplacedInfo;
+static inline bool layout_replaced_element_tag(const lxb_dom_node_t *node)
+{
+    switch (node->local_name) {
+    case LXB_TAG_IMG: case LXB_TAG_SVG: case LXB_TAG_VIDEO:
+    case LXB_TAG_AUDIO: case LXB_TAG_CANVAS: case LXB_TAG_IFRAME:
+        return node->type == LXB_DOM_NODE_TYPE_ELEMENT;
+    default:
+        return false;
+    }
+}
+void layout_replaced_info(LayoutContext *context, lxb_dom_node_t *node,
+                          const ComputedStyle *style,
+                          LayoutReplacedInfo *info);
+/* Queues the missing image of an unavailable CSS replacement or <img src>
+   for priority loading. Flow paths call it; intrinsic measurement does
+   not. */
+void layout_replaced_note_unresolved(LayoutContext *context,
+                                     lxb_dom_node_t *node,
+                                     const ComputedStyle *style,
+                                     const LayoutReplacedInfo *info);
 bool layout_add_replaced_alt_text(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height);

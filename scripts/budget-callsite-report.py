@@ -34,8 +34,8 @@ REFUSAL = re.compile(r"budget-refused-site\s+(.+?):([0-9]+)(?:\s|$)")
 # claim that every allocator below the subsystem (QuickJS, codecs, libc) is
 # inventoried or that one injected refusal covers every recovery branch.
 COVERAGE_TARGETS = {
-    "resource": ("src/resources.c", "src/image*.c", "src/image*.inc",
-                 "src/image_decode/*.inc", "src/font.c"),
+    "resource": ("src/resources.c", "src/resources_fonts.c", "src/image*.c",
+                 "src/image*.inc", "src/image_decode/*.inc", "src/font.c"),
     "module": ("src/js_module_loader.c", "src/script_lazy.c",
                "src/session_lazy_bundle.c", "src/session_script_disk.c"),
     "media": ("src/media*.c", "src/host_media.c"),

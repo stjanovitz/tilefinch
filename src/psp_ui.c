@@ -369,75 +369,145 @@ static UiOptionId ui_option_id(size_t selection)
         selection < UI_OPTIONS_ITEM_COUNT ? selection : 0u];
 }
 
+/*
+ * Each Options row's fixed label, its one-line description, and the
+ * category (Options group) that lists it. A row whose label depends on
+ * state has a NULL label and sets it in ui_option_row_presentation, which
+ * also renders every row's value. No Options category lists a
+ * UI_OPTION_NO_GROUP row.
+ */
+#define UI_OPTION_NO_GROUP ((uint8_t) UI_SETTINGS_GROUP_COUNT)
+typedef struct {
+    const char *label;
+    const char *description;
+    uint8_t group;
+} UiOptionDesc;
+
+static const UiOptionDesc ui_option_descs[] = {
+    [UI_OPTION_BROWSER_UI_SCALE] = {"Browser UI",
+        "Changes browser controls, not page text", 0},
+    [UI_OPTION_PAGE_FONT_PERCENT] = {NULL,
+        "Larger page text means more scrolling", 0},
+    [UI_OPTION_READER_FONT] = {"Reader font",
+        "Typeface used by Reader mode", 0},
+    [UI_OPTION_REMEMBER_READER_SCALE] = {"Remember size",
+        "Remember Reader size for this site", 0},
+    [UI_OPTION_CUSTOM_HOMEPAGE] = {"Home page",
+        "Use your bookmark launch page", 1},
+    [UI_OPTION_HISTORY] = {"URL history",
+        "Keep at most 100 recent addresses", 1},
+    [UI_OPTION_RESTORE_LAST_PAGE] = {"Restore page",
+        "Restore tabs after a controlled exit", 1},
+    [UI_OPTION_TAB_HIBERNATION] = {"Hibernate tab",
+        "Trade Memory Stick latency for free RAM", 1},
+    [UI_OPTION_EXPERIMENTAL] = {"Experimental",
+        "Optional features still being validated", 6},
+    [UI_OPTION_TEXT_ENTRY] = {"Keyboard",
+        "Danzeff uses analog groups and face buttons", 1},
+    [UI_OPTION_ANALOG_CURSOR] = {"Analog cursor",
+        "Move a pointer with the analog stick", 1},
+    [UI_OPTION_JAVASCRIPT] = {"JavaScript",
+        "Run scripts on pages across all sites", 1},
+    [UI_OPTION_SITE_JAVASCRIPT] = {"This site JS",
+        "Override scripts for the current website", UI_OPTION_NO_GROUP},
+    [UI_OPTION_SEARCH_ENGINE] = {"Search",
+        "Used when the address is not a URL", 1},
+    [UI_OPTION_COLOR_MODE] = {"Night mode",
+        "Auto follows the PSP clock", 0},
+    [UI_OPTION_CHROME_THEME] = {"Theme",
+        "X chooses built-in or data/themes file", 0},
+    [UI_OPTION_LANGUAGE_AND_EMOJI] = {"Language & emoji",
+        "Optional signed packs; embedded fallback remains", 0},
+    [UI_OPTION_VIDEO_SCALING] = {"Video scaling",
+        "Smooth uses the graphics chip; Sharp the CPU", 2},
+    [UI_OPTION_YOUTUBE_QUALITY] = {"YouTube",
+        "360p is sharper; 240p uses less memory", 2},
+    [UI_OPTION_YOUTUBE_AUDIO_ONLY] = {"Audio-only",
+        "Skip video downloads and decoding on YouTube", 2},
+    [UI_OPTION_YOUTUBE_RESULTS] = {"YouTube results",
+        "Choose detailed cards or denser rows", 2},
+    [UI_OPTION_VIDEO_STARTUP_BUFFERING] = {"Video start",
+        "Wait for a stable source prefix before play", 2},
+    [UI_OPTION_RESUME_DOWNLOADS] = {"Resume saves",
+        "Continue queued saves after startup", 2},
+    [UI_OPTION_CONTENT_BLOCKER] = {"Content blocker",
+        "Block common ad and tracking requests", 3},
+    [UI_OPTION_COSMETIC_HIDING] = {"Hide page ads",
+        "Hide empty ad spaces in page layout", 3},
+    [UI_OPTION_COOKIE_BANNERS] = {"Cookie notices",
+        "Hide common cookie notices on this site", UI_OPTION_NO_GROUP},
+    [UI_OPTION_ALLOW_SITE] = {"Allow site",
+        "Allow this site and reload its content", UI_OPTION_NO_GROUP},
+    [UI_OPTION_LOAD_ALLOWLIST] = {"Load allowlist",
+        "Read more allowed sites from the stick", 3},
+    [UI_OPTION_SITE_DATA_ALLOWED] = {"Cookies & storage",
+        "Allow cookies and web storage globally", 3},
+    [UI_OPTION_TLS_SESSION_PERSISTENCE] = {"TLS ticket saving",
+        "Keep short-lived TLS tickets between starts", 3},
+    [UI_OPTION_MIXED_CONTENT_SITE] = {"Mixed HTTP (session)",
+        "Compatibility: allow HTTP resources here", UI_OPTION_NO_GROUP},
+    [UI_OPTION_THIRD_PARTY_COOKIES_SITE] = {"Third-party cookies",
+        "Compatibility: allow unpartitioned cookies here", UI_OPTION_NO_GROUP},
+    [UI_OPTION_NETWORK_PROFILE] = {"Wi-Fi profile",
+        "Left/right choose; X saves next connection", 4},
+    [UI_OPTION_DIAGNOSTIC_QR] = {"Diagnostic QR",
+        "Photograph logs without removing the stick", UI_OPTION_NO_GROUP},
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+    [UI_OPTION_POWER_TEST] = {"Power test",
+        "Run the controlled clocking test", 4},
+    [UI_OPTION_MEDIA_TEST] = {"Video test",
+        "Run the controlled video test", 4},
+#endif
+    [UI_OPTION_UPDATE_CHECK] = {"Update check",
+        "Look for new releases once a week", 5},
+    [UI_OPTION_UPDATE] = {"Version and update",
+        "Check and install a signed release", 5},
+    [UI_OPTION_SITE_DATA] = {"Site data & storage",
+        "Sites' storage, caches, and clearing", 4},
+    [UI_OPTION_READER_AUTO_MODE] = {"Auto Reader",
+        "Use Reader automatically on clear matches", 0},
+    [UI_OPTION_VIDEO_LANGUAGE] = {"Audio & subtitles",
+        "Rank YouTube audio and subtitle tracks", 2},
+    [UI_OPTION_GAMEPAD_FACE_MAPPING] = {"Game buttons",
+        "Primary face button while Page controls are on", 1},
+    [UI_OPTION_SAVE_PLAYBACK_POSITIONS] = {"Save playback position",
+        "Remember video positions; Off clears them", 2},
+    [UI_OPTION_CLEAR_PLAYBACK_POSITIONS] = {"Clear playback positions",
+        "Forget all saved video positions", 2},
+    [UI_OPTION_SAVE_DIAGNOSTIC_REPORTS] = {"Save error reports",
+        "Write failure details to the Memory Stick", 4},
+    [UI_OPTION_BASIC_FALLBACK] = {"Basic view fallback",
+        "When page scripts fail and leave it blank", 1},
+    [UI_OPTION_HEAVY_PAGES] = {"Heavy pages",
+        "When a site needs a large app to start", 1},
+    [UI_OPTION_WIFI_DIAGNOSTICS] = {"Wi-Fi diagnostics",
+        "Keep connection details in RAM for Diagnostic QR", 4},
+    [UI_OPTION_YOUTUBE_TOPICS] = {"YouTube home topics",
+        "Load Explore topics after the YouTube search box", 2},
+    [UI_OPTION_YOUTUBE_LOGIN] = {"Save YouTube login",
+        "Ask, always save, or never save YouTube login", 2},
+    [UI_OPTION_ROTATE_HINT] = {"Rotate hint",
+        "Auto checks the first five seconds of playback", 2},
+    [UI_OPTION_WEB_FONTS] = {"Website fonts",
+        "Smart uses built-in fonts when memory is low", 0},
+    [UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS] = {"YouTube sign-in diagnostics",
+        "Session-only counts; QR excludes browsing logs", 4},
+};
+_Static_assert(sizeof(ui_option_descs) / sizeof(ui_option_descs[0])
+                   == (size_t) UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS + 1u,
+               "every UiOptionId needs a UiOptionDesc");
+
+static const UiOptionDesc *ui_option_desc(UiOptionId option)
+{
+    static const UiOptionDesc none = {NULL, "", 0u};
+    return (size_t) option
+            < sizeof(ui_option_descs) / sizeof(ui_option_descs[0])
+        ? &ui_option_descs[option] : &none;
+}
+
 static size_t ui_option_group_index(UiOptionId option)
 {
-    switch (option) {
-        case UI_OPTION_BROWSER_UI_SCALE:
-        case UI_OPTION_PAGE_FONT_PERCENT:
-        case UI_OPTION_READER_FONT:
-        case UI_OPTION_REMEMBER_READER_SCALE:
-        case UI_OPTION_READER_AUTO_MODE:
-        case UI_OPTION_COLOR_MODE:
-        case UI_OPTION_CHROME_THEME:
-        case UI_OPTION_LANGUAGE_AND_EMOJI:
-        case UI_OPTION_WEB_FONTS:
-            return 0u;
-        case UI_OPTION_CUSTOM_HOMEPAGE:
-        case UI_OPTION_HISTORY:
-        case UI_OPTION_RESTORE_LAST_PAGE:
-        case UI_OPTION_TAB_HIBERNATION:
-        case UI_OPTION_TEXT_ENTRY:
-        case UI_OPTION_ANALOG_CURSOR:
-        case UI_OPTION_GAMEPAD_FACE_MAPPING:
-        case UI_OPTION_JAVASCRIPT:
-        case UI_OPTION_SEARCH_ENGINE:
-        case UI_OPTION_BASIC_FALLBACK:
-        case UI_OPTION_HEAVY_PAGES:
-            return 1u;
-        case UI_OPTION_VIDEO_SCALING:
-        case UI_OPTION_ROTATE_HINT:
-        case UI_OPTION_YOUTUBE_QUALITY:
-        case UI_OPTION_VIDEO_LANGUAGE:
-        case UI_OPTION_YOUTUBE_AUDIO_ONLY:
-        case UI_OPTION_YOUTUBE_RESULTS:
-        case UI_OPTION_VIDEO_STARTUP_BUFFERING:
-        case UI_OPTION_YOUTUBE_TOPICS:
-        case UI_OPTION_YOUTUBE_LOGIN:
-        case UI_OPTION_RESUME_DOWNLOADS:
-        case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
-        case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
-            return 2u;
-        case UI_OPTION_CONTENT_BLOCKER:
-        case UI_OPTION_COSMETIC_HIDING:
-        case UI_OPTION_LOAD_ALLOWLIST:
-        case UI_OPTION_SITE_DATA_ALLOWED:
-        case UI_OPTION_TLS_SESSION_PERSISTENCE:
-            return 3u;
-        case UI_OPTION_SITE_JAVASCRIPT:
-        case UI_OPTION_COOKIE_BANNERS:
-        case UI_OPTION_ALLOW_SITE:
-        case UI_OPTION_MIXED_CONTENT_SITE:
-        case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-            return UI_SETTINGS_GROUP_COUNT;
-#ifdef TILEFINCH_PSP_POWER_TEST_MENU
-        case UI_OPTION_POWER_TEST:
-        case UI_OPTION_MEDIA_TEST:
-#endif
-        case UI_OPTION_NETWORK_PROFILE:
-        case UI_OPTION_WIFI_DIAGNOSTICS:
-        case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
-        case UI_OPTION_SITE_DATA:
-        case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
-            return 4u;
-        case UI_OPTION_UPDATE_CHECK:
-        case UI_OPTION_UPDATE:
-            return 5u;
-        case UI_OPTION_DIAGNOSTIC_QR:
-            return UI_SETTINGS_GROUP_COUNT;
-        case UI_OPTION_EXPERIMENTAL:
-            return 6u;
-    }
-    return 0u;
+    return ui_option_desc(option)->group;
 }
 
 static const char *ui_option_group_at(size_t group)
@@ -483,117 +553,7 @@ static size_t ui_option_step_in_group(size_t selection, int direction)
 
 static const char *ui_option_description(UiOptionId option)
 {
-    switch (option) {
-        case UI_OPTION_BROWSER_UI_SCALE:
-            return "Changes browser controls, not page text";
-        case UI_OPTION_PAGE_FONT_PERCENT:
-            return "Larger page text means more scrolling";
-        case UI_OPTION_READER_FONT:
-            return "Typeface used by Reader mode";
-        case UI_OPTION_WEB_FONTS:
-            return "Smart uses built-in fonts when memory is low";
-        case UI_OPTION_REMEMBER_READER_SCALE:
-            return "Remember Reader size for this site";
-        case UI_OPTION_READER_AUTO_MODE:
-            return "Use Reader automatically on clear matches";
-        case UI_OPTION_BASIC_FALLBACK:
-            return "When page scripts fail and leave it blank";
-        case UI_OPTION_HEAVY_PAGES:
-            return "When a site needs a large app to start";
-        case UI_OPTION_CUSTOM_HOMEPAGE:
-            return "Use your bookmark launch page";
-        case UI_OPTION_HISTORY:
-            return "Keep at most 100 recent addresses";
-        case UI_OPTION_RESTORE_LAST_PAGE:
-            return "Restore tabs after a controlled exit";
-        case UI_OPTION_TAB_HIBERNATION:
-            return "Trade Memory Stick latency for free RAM";
-        case UI_OPTION_EXPERIMENTAL:
-            return "Optional features still being validated";
-        case UI_OPTION_TEXT_ENTRY:
-            return "Danzeff uses analog groups and face buttons";
-        case UI_OPTION_ANALOG_CURSOR:
-            return "Move a pointer with the analog stick";
-        case UI_OPTION_GAMEPAD_FACE_MAPPING:
-            return "Primary face button while Page controls are on";
-        case UI_OPTION_JAVASCRIPT:
-            return "Run scripts on pages across all sites";
-        case UI_OPTION_SITE_JAVASCRIPT:
-            return "Override scripts for the current website";
-        case UI_OPTION_SEARCH_ENGINE:
-            return "Used when the address is not a URL";
-        case UI_OPTION_COLOR_MODE:
-            return "Auto follows the PSP clock";
-        case UI_OPTION_CHROME_THEME:
-            return "X chooses built-in or data/themes file";
-        case UI_OPTION_VIDEO_SCALING:
-            return "Smooth uses the graphics chip; Sharp the CPU";
-        case UI_OPTION_ROTATE_HINT:
-            return "Auto checks the first five seconds of playback";
-        case UI_OPTION_LANGUAGE_AND_EMOJI:
-            return "Optional signed packs; embedded fallback remains";
-        case UI_OPTION_YOUTUBE_QUALITY:
-            return "360p is sharper; 240p uses less memory";
-        case UI_OPTION_VIDEO_LANGUAGE:
-            return "Rank YouTube audio and subtitle tracks";
-        case UI_OPTION_YOUTUBE_AUDIO_ONLY:
-            return "Skip video downloads and decoding on YouTube";
-        case UI_OPTION_YOUTUBE_RESULTS:
-            return "Choose detailed cards or denser rows";
-        case UI_OPTION_VIDEO_STARTUP_BUFFERING:
-            return "Wait for a stable source prefix before play";
-        case UI_OPTION_RESUME_DOWNLOADS:
-            return "Continue queued saves after startup";
-        case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
-            return "Remember video positions; Off clears them";
-        case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
-            return "Forget all saved video positions";
-        case UI_OPTION_CONTENT_BLOCKER:
-            return "Block common ad and tracking requests";
-        case UI_OPTION_COSMETIC_HIDING:
-            return "Hide empty ad spaces in page layout";
-        case UI_OPTION_COOKIE_BANNERS:
-            return "Hide common cookie notices on this site";
-        case UI_OPTION_ALLOW_SITE:
-            return "Allow this site and reload its content";
-        case UI_OPTION_LOAD_ALLOWLIST:
-            return "Read more allowed sites from the stick";
-        case UI_OPTION_SITE_DATA_ALLOWED:
-            return "Allow cookies and web storage globally";
-        case UI_OPTION_TLS_SESSION_PERSISTENCE:
-            return "Keep short-lived TLS tickets between starts";
-        case UI_OPTION_MIXED_CONTENT_SITE:
-            return "Compatibility: allow HTTP resources here";
-        case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-            return "Compatibility: allow unpartitioned cookies here";
-        case UI_OPTION_NETWORK_PROFILE:
-            return "Left/right choose; X saves next connection";
-        case UI_OPTION_DIAGNOSTIC_QR:
-            return "Photograph logs without removing the stick";
-#ifdef TILEFINCH_PSP_POWER_TEST_MENU
-        case UI_OPTION_POWER_TEST:
-            return "Run the controlled clocking test";
-        case UI_OPTION_MEDIA_TEST:
-            return "Run the controlled video test";
-#endif
-        case UI_OPTION_UPDATE_CHECK:
-            return "Look for new releases once a week";
-        case UI_OPTION_UPDATE:
-            return "Check and install a signed release";
-        case UI_OPTION_SITE_DATA:
-            return "Sites' storage, caches, and clearing";
-        case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
-            return "Write failure details to the Memory Stick";
-        case UI_OPTION_WIFI_DIAGNOSTICS:
-            return "Keep connection details in RAM for Diagnostic QR";
-        case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
-            return "Session-only counts; QR excludes browsing logs";
-        case UI_OPTION_YOUTUBE_TOPICS:
-            return "Load Explore topics after the YouTube search box";
-        case UI_OPTION_YOUTUBE_LOGIN:
-            return "Ask, always save, or never save YouTube login";
-    }
-    return "";
+    return ui_option_desc(option)->description;
 }
 
 static const char *ui_search_engine_name(BrowserSearchEngine engine)
@@ -6327,12 +6287,13 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
     const PspUiState *ui, size_t selection, const char **label,
     const char **value, char *formatted, size_t formatted_size)
 {
-    *label = "";
+    UiOptionId option = ui_option_id(selection);
+    const char *fixed_label = ui_option_desc(option)->label;
+    *label = fixed_label == NULL ? "" : fixed_label;
     *value = "";
     if (formatted_size != 0u) formatted[0] = '\0';
-    switch (ui_option_id(selection)) {
+    switch (option) {
         case UI_OPTION_BROWSER_UI_SCALE:
-            *label = "Browser UI";
             *value = ui->browser_ui_scale >= 2u ? "Large" : "Compact";
             break;
         case UI_OPTION_PAGE_FONT_PERCENT:
@@ -6342,139 +6303,108 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *value = formatted;
             break;
         case UI_OPTION_READER_FONT:
-            *label = "Reader font";
             *value = ui->reader_font_serif ? "Serif" : "Sans";
             break;
         case UI_OPTION_WEB_FONTS:
-            *label = "Website fonts";
             *value = ui->web_font_mode == WEB_FONTS_ON ? "On"
                 : ui->web_font_mode == WEB_FONTS_OFF ? "Off" : "Smart";
             break;
         case UI_OPTION_REMEMBER_READER_SCALE:
-            *label = "Remember size";
             *value = ui->remember_reader_site_scale ? "Per site" : "Off";
             break;
         case UI_OPTION_READER_AUTO_MODE:
-            *label = "Auto Reader";
             *value = ui->reader_auto_mode ? "On" : "Off";
             break;
         case UI_OPTION_HEAVY_PAGES:
-            *label = "Heavy pages";
             *value = ui->heavy_pages_mode == BROWSER_HEAVY_PAGES_RUN
                 ? "Run"
                 : (ui->heavy_pages_mode == BROWSER_HEAVY_PAGES_BASIC
                        ? "Basic view" : "Ask");
             break;
         case UI_OPTION_BASIC_FALLBACK:
-            *label = "Basic view fallback";
             *value = ui->basic_fallback_mode == BROWSER_BASIC_FALLBACK_ASK
                 ? "Ask"
                 : (ui->basic_fallback_mode == BROWSER_BASIC_FALLBACK_OFF
                        ? "Off" : "Automatic");
             break;
         case UI_OPTION_CUSTOM_HOMEPAGE:
-            *label = "Home page";
             *value = ui->custom_homepage_enabled ? "My links" : "Built-in";
             break;
         case UI_OPTION_HISTORY:
-            *label = "URL history";
             *value = ui->history_enabled ? "On" : "Off";
             break;
         case UI_OPTION_RESTORE_LAST_PAGE:
-            *label = "Restore page";
             *value = ui->restore_last_page ? "On" : "Off";
             break;
         case UI_OPTION_TAB_HIBERNATION:
-            *label = "Hibernate tab";
             *value = ui->tab_hibernation_enabled ? "On" : "Off";
             break;
         case UI_OPTION_EXPERIMENTAL:
-            *label = "Experimental";
             *value = ">";
             break;
         case UI_OPTION_ANALOG_CURSOR:
-            *label = "Analog cursor";
             *value = ui->analog_cursor_enabled ? "On" : "Off";
             break;
         case UI_OPTION_JAVASCRIPT:
-            *label = "JavaScript";
             *value = ui->javascript_enabled ? "On" : "Off";
             break;
         case UI_OPTION_SITE_JAVASCRIPT:
-            *label = "This site JS";
             *value = !ui->javascript_enabled
                 ? "Global off" : (ui->site_javascript_enabled ? "On" : "Off");
             break;
         case UI_OPTION_TEXT_ENTRY:
-            *label = "Keyboard";
             *value = ui->danzeff_text_input ? "Danzeff" : "PSP OSK";
             break;
         case UI_OPTION_GAMEPAD_FACE_MAPPING:
-            *label = "Game buttons";
             *value = ui->gamepad_circle_primary ? "O primary" : "X primary";
             break;
         case UI_OPTION_SEARCH_ENGINE:
-            *label = "Search";
             *value = ui_search_engine_name(ui->search_engine);
             break;
         case UI_OPTION_COLOR_MODE:
-            *label = "Night mode";
             *value = ui->color_mode == BROWSER_COLOR_MODE_DARK
                 ? "Dark" : (ui->color_mode == BROWSER_COLOR_MODE_LIGHT
                                 ? "Light" : "Auto");
             break;
         case UI_OPTION_CHROME_THEME:
-            *label = "Theme";
             *value = ui_chrome_theme_name((BrowserChromeTheme) ui->chrome_theme);
             break;
         case UI_OPTION_LANGUAGE_AND_EMOJI:
-            *label = "Language & emoji";
             *value = ">";
             break;
         case UI_OPTION_VIDEO_SCALING:
-            *label = "Video scaling";
             *value = ui->video_scaling_sharp ? "Sharp" : "Smooth";
             break;
         case UI_OPTION_ROTATE_HINT:
-            *label = "Rotate hint";
             *value = ui->rotate_hint_always ? "Always" : "Auto";
             break;
         case UI_OPTION_YOUTUBE_QUALITY:
-            *label = "YouTube";
             snprintf(formatted, formatted_size, "%up",
                      ui->youtube_240p ? 240u : 360u);
             *value = formatted;
             break;
         case UI_OPTION_VIDEO_LANGUAGE:
-            *label = "Audio & subtitles";
             *value = ">";
             break;
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
-            *label = "Audio-only";
             *value = ui->youtube_audio_only ? "On" : "Off";
             break;
         case UI_OPTION_YOUTUBE_RESULTS:
-            *label = "YouTube results";
             *value = ui->youtube_compact_results ? "Compact" : "Detailed";
             break;
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
-            *label = "Video start";
             *value = ui->video_startup_buffering ? "Buffered" : "Immediate";
             break;
         case UI_OPTION_RESUME_DOWNLOADS:
-            *label = "Resume saves";
             *value = ui->resume_offline_downloads ? "On" : "Off";
             break;
         case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
-            *label = "Save playback position";
             *value = ui->save_playback_positions ? "On" : "Off";
             break;
         case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
-            *label = "Clear playback positions";
             *value = ">";
             break;
         case UI_OPTION_CONTENT_BLOCKER: {
-            *label = "Content blocker";
             const char *mode = ui->content_blocker_mode == CONTENT_BLOCKER_BASIC
                 ? "Basic" : (ui->content_blocker_mode == CONTENT_BLOCKER_CUSTOM
                                 ? "Custom" : "Off");
@@ -6493,42 +6423,33 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             break;
         }
         case UI_OPTION_COSMETIC_HIDING:
-            *label = "Hide page ads";
             *value = ui->content_blocker_cosmetic_hiding ? "On" : "Off";
             break;
         case UI_OPTION_COOKIE_BANNERS:
-            *label = "Cookie notices";
             *value = !ui_content_blocker_site_available(ui)
                 ? "N/A" : (ui->cookie_banner_hidden ? "Hidden" : "Shown");
             break;
         case UI_OPTION_ALLOW_SITE:
-            *label = "Allow site";
             *value = ui->content_blocker_mode == CONTENT_BLOCKER_OFF
                     || !ui_content_blocker_site_available(ui)
                 ? "N/A" : (ui->content_blocker_site_allowed ? "Yes" : "No");
             break;
         case UI_OPTION_LOAD_ALLOWLIST:
-            *label = "Load allowlist";
             *value = ">";
             break;
         case UI_OPTION_SITE_DATA_ALLOWED:
-            *label = "Cookies & storage";
             *value = ui->site_data_allowed ? "Allow" : "Block";
             break;
         case UI_OPTION_TLS_SESSION_PERSISTENCE:
-            *label = "TLS ticket saving";
             *value = ui->tls_session_persistence ? "On" : "Off";
             break;
         case UI_OPTION_MIXED_CONTENT_SITE:
-            *label = "Mixed HTTP (session)";
             *value = ui->mixed_content_site_allowed ? "Allow" : "Block";
             break;
         case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-            *label = "Third-party cookies";
             *value = ui->third_party_cookie_site_allowed ? "Allow" : "Block";
             break;
         case UI_OPTION_NETWORK_PROFILE:
-            *label = "Wi-Fi profile";
             if (ui->network_profile_label_valid) {
                 *value = ui->network_profile_label;
             } else {
@@ -6539,51 +6460,40 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             }
             break;
         case UI_OPTION_DIAGNOSTIC_QR:
-            *label = "Diagnostic QR";
             *value = ">";
             break;
         case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
-            *label = "Save error reports";
             *value = ui->save_diagnostic_reports ? "On" : "Off";
             break;
         case UI_OPTION_WIFI_DIAGNOSTICS:
-            *label = "Wi-Fi diagnostics";
             *value = ui->wifi_diagnostics ? "Verbose (RAM)" : "Off";
             break;
         case UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS:
-            *label = "YouTube sign-in diagnostics";
             *value = ui->youtube_signin_diagnostics ? "On (RAM)" : "Off";
             break;
         case UI_OPTION_YOUTUBE_TOPICS:
-            *label = "YouTube home topics";
             *value = ui->youtube_topics ? "On" : "Off";
             break;
         case UI_OPTION_YOUTUBE_LOGIN:
-            *label = "Save YouTube login";
             *value = ui->youtube_login_policy == 1u ? "Always"
                 : ui->youtube_login_policy == 2u ? "Never" : "Ask";
             break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
-            *label = "Power test";
             *value = ui->validation_power_test_phase != 0
                 ? "Running" : "2 min auto";
             break;
         case UI_OPTION_MEDIA_TEST:
-            *label = "Video test";
             *value = ui->validation_media_test_phase != 0 ? "Running" : "Auto";
             break;
 #endif
         case UI_OPTION_UPDATE_CHECK:
-            *label = "Update check";
             *value = ui->update_check_enabled ? "On" : "Off";
             break;
         case UI_OPTION_UPDATE:
-            *label = "Version and update";
             *value = ui->update_release_available ? "New" : ">";
             break;
         case UI_OPTION_SITE_DATA:
-            *label = "Site data & storage";
             *value = ">";
             break;
     }

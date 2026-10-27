@@ -187,8 +187,6 @@ static bool dynamic_task_activate(
         task->sequence = ++bridge->dynamic_script_sequence;
     }
     task->node = node;
-    task->owner_document_identity =
-        bridge->node_owner_document_identities[slot];
     task->node_handle = handle;
     task->request_url = request_url;
     task->module = module;

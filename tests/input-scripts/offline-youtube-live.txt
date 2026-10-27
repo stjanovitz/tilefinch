@@ -7,8 +7,9 @@
 # PPSSPP stops at the firmware decoder boundary, so this needs hardware; it
 # exists so player work can be tested repeatedly without the network.
 #
-# In order: Down focuses Play, Cross opens the video (the offline route
-# autoplays); a 10 s preview while playing, cancelled with Circle; three
+# In order: Down, Down focuses Play (the first Down lands on the page's
+# "Installed homebrew" link, which ca676d9d put above the items), Cross
+# opens the video (the offline route autoplays); a 10 s preview while playing, cancelled with Circle; three
 # previews committed with Cross (about +30 s); a rewind to 0, large enough
 # to rebuild the decoder (threshold 30 s), with Right, Right, Cross pressed
 # while it reopens (lands near 20 s, playing); Cross pauses; a preview is
@@ -17,6 +18,8 @@
 # mark. No screenshot step: that writes to the Memory Stick.
 wait-live 120
 mark-live library
+tap-live down
+wait-live 20
 tap-live down
 wait-live 20
 tap-live cross

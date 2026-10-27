@@ -159,71 +159,6 @@
     navigation_destroy(&repeated_realm_navigation);
     CHECK(budget.current == 0);
 
-    puts("test: section document replacement preserves the JavaScript realm");
-    static const char realm_a[] =
-        "<!doctype html><title>Realm A</title><body><p id=old>OLD</p>"
-        "<script>globalThis.sectionState=41;globalThis.oldSectionNode="
-        "document.getElementById('old');globalThis.hashEvents=[];"
-        "addEventListener('hashchange',event=>hashEvents.push("
-        "event.oldURL+'>'+event.newURL))</script></body>";
-    static const char realm_b[] =
-        "<!doctype html><title>Realm B</title><body><p id=new>NEW</p></body>";
-    static NavigationSession realm_navigation;
-    CHECK(navigation_init(&realm_navigation, &budget, 4));
-    navigation_enable_scripts(&realm_navigation, 4 * MIB, 1000);
-    uint64_t realm_generation = navigation_begin(&realm_navigation);
-    CHECK(navigation_commit_html(
-        &realm_navigation, realm_generation, "https://example.test/realm",
-        realm_a, strlen(realm_a), 480, NULL, NULL, true));
-    ScriptRuntime *retained_realm = realm_navigation.page.runtime;
-    realm_generation = navigation_begin(&realm_navigation);
-    CHECK(navigation_commit_html_preserve_runtime(
-        &realm_navigation, realm_generation, "https://example.test/realm",
-        realm_b, strlen(realm_b), 480, NULL, NULL, false));
-    CHECK(realm_navigation.page.runtime == retained_realm);
-    size_t realm_swap_baseline = budget.current;
-    for (size_t realm_swap = 0; realm_swap < 8; realm_swap++) {
-        static const char wrapper_probe[] =
-            "document.querySelectorAll('*');globalThis.sectionState++";
-        CHECK(script_runtime_evaluate_diagnostic(
-            realm_navigation.page.runtime, wrapper_probe,
-            "<realm-wrapper-probe>", &realm_navigation.page.script_result));
-        realm_generation = navigation_begin(&realm_navigation);
-        CHECK(navigation_commit_html_preserve_runtime(
-            &realm_navigation, realm_generation,
-            "https://example.test/realm", realm_b, strlen(realm_b), 480,
-            NULL, NULL, false));
-        CHECK(realm_navigation.page.runtime == retained_realm);
-    }
-    /* The broader standards bootstrap moves QuickJS's allocator across one
-       additional 32 KiB slab during this artificial eight-rebind wrapper
-       stress. Measured growth is 287,296 bytes; this host-only ratchet does
-       not change the runtime heap or wrapper caps. */
-    if (budget.current > realm_swap_baseline + 320u * 1024u)
-        fprintf(stderr,
-                "realm swap retained=%zu baseline=%zu growth=%zu\n",
-                budget.current, realm_swap_baseline,
-                budget.current - realm_swap_baseline);
-    CHECK(budget.current <= realm_swap_baseline + 320u * 1024u);
-    CHECK(navigation_commit_same_document_url(
-              &realm_navigation, "https://example.test/realm#new")
-          && realm_navigation.history_count == 2
-          && strcmp(navigation_current(&realm_navigation)->url,
-                    "https://example.test/realm#new") == 0);
-    static const char realm_probe[] =
-        "globalThis.pocSummary=String(globalThis.sectionState)+':' +"
-        "document.getElementById('new').textContent+':' +"
-        "String(globalThis.oldSectionNode.textContent)+':' +"
-        "document.body.textContent+':' +location.hash+':' +history.length+':' +"
-        "globalThis.hashEvents.length";
-    CHECK(script_runtime_evaluate_diagnostic(
-              realm_navigation.page.runtime, realm_probe, "<realm-probe>",
-              &realm_navigation.page.script_result)
-          && strcmp(realm_navigation.page.script_result.summary,
-                    "49:NEW::NEW:#new:2:1") == 0);
-    navigation_destroy(&realm_navigation);
-    CHECK(budget.current == 0);
-
     puts("test: submit observes click geometry and microtasks");
     for (unsigned variant = 0; variant < 4; variant++) {
         static NavigationSession activation_navigation;
@@ -2069,6 +2004,8 @@
     CHECK(test_cssom_author_bounds(&budget));
     CHECK(test_cssom_override_refusal(&budget));
     CHECK(test_constructed_sheet_without_rule_cap(&budget));
+    puts("test: a user-CSS transaction frees the parked sheet's inline memo");
+    CHECK(test_user_css_transaction_drops_inline_memo(&budget));
     puts("test: constructed stylesheets apply their prefix past the bound");
     CHECK(test_constructed_sheet_text_bound_prefix(&budget));
     puts("test: constructed stylesheet chunks preserve quota and EOF semantics");
@@ -3591,6 +3528,331 @@
         CHECK(budget.current == 0);
     }
 
+    for (unsigned variant = 0; variant < 2; variant++) {
+        /* Border colour, shadow ring and pseudo-element skips patch
+           retained commands without a relayout. A later relayout from an
+           unrelated cause must paint the live focus state, both when the
+           element's retained style entry would hit (variant 0: a sibling's
+           height changes) and when only its retained match list would
+           replay (variant 1: 64+ rules keep match lists, and an inherited
+           ancestor change re-keys every style below it). */
+        puts(variant == 0
+             ? "test: paint-only focus skips survive an unrelated relayout"
+             : "test: paint-only focus skips survive a re-keyed relayout");
+        char page[12288];
+        int used = snprintf(page, sizeof(page), "<!doctype html><style>body{margin:0}"
+            "a{display:inline-block;width:80px;height:24px;margin:4px;"
+            "border:2px solid #888888;border-radius:4px;outline:none}"
+            "a.b:focus{border-color:#cc0000}"
+            "a.o:focus{box-shadow:0 0 0 3px #0000cc}"
+            "a.i:focus{box-shadow:inset 0 0 0 3px #00cc00}"
+            "a.t{position:relative;overflow:hidden}"
+            "a.t::after{content:'';display:block;position:absolute;left:0;"
+            "right:0;bottom:0;margin-bottom:-5px;height:5px;background:#cc0000}"
+            "a.t:focus::after{transform:translateY(-5px)}"
+            "a.v::after{content:'#';position:absolute;color:#cc0000}"
+            "a.v:not(:focus)::after{visibility:hidden}"
+            "a.l:focus{outline:2px solid #00cc00}");
+        CHECK(used > 0);
+        for (unsigned rule = 0; variant == 1 && rule < 80u; rule++) {
+            int more = snprintf(page + used, sizeof(page) - (size_t) used,
+                ".unused%u{color:#%06x}", rule, rule);
+            CHECK(more > 0 && (size_t) more < sizeof(page) - (size_t) used);
+            used += more;
+        }
+        int tail = snprintf(page + used, sizeof(page) - (size_t) used,
+            "</style><body><div id=wrap>"
+            "<a id=b1 class=b href=/b1>B1</a><a id=b2 class=b href=/b2>B2</a>"
+            "<a id=o1 class=o href=/o1>O1</a><a id=i1 class=i href=/i1>I1</a>"
+            "<a id=t1 class=t href=/t1>T1</a><a id=v1 class=v href=/v1>V1</a>"
+            "<a id=l1 class=l href=/l1>L1</a><a id=l2 class=l href=/l2>L2</a></div><div id=other style='height:200px'></div>");
+        CHECK(tail > 0 && (size_t) tail < sizeof(page) - (size_t) used);
+        used += tail;
+        /* The reuse cache exists only from 256 document nodes. */
+        for (unsigned filler = 0; filler < 300u; filler++) {
+            CHECK(sizeof(page) - (size_t) used > sizeof("<p></p>"));
+            memcpy(page + used, "<p></p>", sizeof("<p></p>") - 1u);
+            used += (int) sizeof("<p></p>") - 1;
+        }
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/stale-style", page, (size_t) used, 480,
+            NULL, NULL, true));
+        CHECK(session.page.layout_reuse != NULL);
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast != NULL && full != NULL);
+        /* A move between l1 and l2 is outline-only; every other move blurs
+           or focuses a patched element and so is a paint skip. */
+        static const char *const order[] = {"b1", "b2", "o1", "i1", "t1", "v1",
+                                            "l1", "l2", "b1", "i1", "o1", "v1",
+                                            "t1", "l2", "l1", "b2"};
+        unsigned failures = 0;
+        for (unsigned move = 0; move < sizeof(order) / sizeof(order[0]); move++) {
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            size_t relayouts = session.incremental_relayouts;
+            size_t paint_skips = session.performance.focus_paint_relayout_skips;
+            size_t outline_skips = session.performance.focus_outline_relayout_skips;
+            CHECK(controller_focus_node(&controller, find_id(root, order[move]))
+                  && session.incremental_relayouts == relayouts);
+            if (order[move][0] == 'l' && move != 0 && order[move - 1u][0] == 'l') {
+                /* Between two outline-only targets nothing is repainted. */
+                CHECK(session.performance.focus_outline_relayout_skips
+                          == outline_skips + 1u
+                      && session.performance.focus_paint_relayout_skips
+                          == paint_skips);
+            } else {
+                CHECK(session.performance.focus_paint_relayout_skips
+                          == paint_skips + 1u
+                      && session.focus_paint_damage_valid
+                      && tile_cache_sync_layout_paint(&fast_cache,
+                          session.focus_paint_damage_left, session.focus_paint_damage_top,
+                          session.focus_paint_damage_right, session.focus_paint_damage_bottom));
+            }
+            CHECK(tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            tile_cache_destroy(&fast_cache);
+            char script[160];
+            if (variant == 0)
+                snprintf(script, sizeof(script),
+                    "document.getElementById('other').style.height='%upx'",
+                    201u + move);
+            else
+                snprintf(script, sizeof(script),
+                    "document.getElementById('wrap').style.color='#%06x'",
+                    0x101010u + move);
+            CHECK(script_runtime_evaluate_diagnostic(session.page.runtime, script,
+                      "<focus-stale-style>", &session.page.script_result)
+                  && script_runtime_consume_relayout(session.page.runtime)
+                  && navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL));
+            bool same_incremental = memcmp(fast, full, pixels * sizeof(*fast)) == 0;
+            tile_cache_destroy(&full_cache);
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL));
+            bool same_full = memcmp(fast, full, pixels * sizeof(*fast)) == 0;
+            tile_cache_destroy(&full_cache);
+            if (!same_incremental || !same_full) {
+                fprintf(stderr, "stale focus style variant %u move %u (%s): "
+                        "frame differs (incremental %d, full %d)\n", variant,
+                        move, order[move], (int) same_incremental,
+                        (int) same_full);
+                failures++;
+            }
+        }
+        budget_free(&budget, full);
+        budget_free(&budget, fast);
+        navigation_destroy(&session);
+        CHECK(failures == 0 && budget.current == 0);
+    }
+
+    {
+        /* The retained display list holds a focused element's outline
+           unless the move is outline-only. A move that recolours text, a
+           border or a shadow ring in place must not leave the blurred
+           element's outline (or a currentColor outline's old colour)
+           behind. */
+        puts("test: paint-only focus moves leave no stale outline");
+        static const char page[] = "<!doctype html><style>body{margin:0}"
+            "a{display:inline-block;width:80px;height:24px;margin:8px;"
+            "color:#123456;outline:none}"
+            "a.c:focus{color:#cc0000;outline:2px solid #cc0000}"
+            "a.b{border:2px solid #888888;border-radius:4px}"
+            "a.b:focus{border-color:#cc0000;outline:2px solid #00cc00}"
+            "a.s:focus{box-shadow:0 0 0 3px #0000cc;outline:2px solid #00cc00}"
+            "a.k{outline:2px solid currentColor}a.k:focus{color:#cc0000}"
+            "</style><body>"
+            "<a id=c1 class=c href=/c1>C1</a><a id=c2 class=c href=/c2>C2</a><br>"
+            "<a id=b1 class=b href=/b1>B1</a><a id=b2 class=b href=/b2>B2</a><br>"
+            "<a id=s1 class=s href=/s1>S1</a><a id=s2 class=s href=/s2>S2</a><br>"
+            "<a id=k1 class=k href=/k1>K1</a><a id=k2 class=k href=/k2>K2</a>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/stale-outline", page, sizeof(page) - 1u, 480,
+            NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast != NULL && full != NULL);
+        static const char *const pairs[][2] = {
+            {"c1", "c2"}, {"b1", "b2"}, {"s1", "s2"}, {"k1", "k2"}
+        };
+        unsigned failures = 0;
+        for (unsigned pair = 0; pair < 4; pair++) {
+            /* The outline of the element focused at a full layout is baked
+               into the retained display list. */
+            CHECK(controller_focus_node(&controller, find_id(root, pairs[pair][0])));
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session));
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_node(&controller, find_id(root, pairs[pair][1])));
+            bool skipped = session.incremental_relayouts == relayouts;
+            if (skipped) {
+                CHECK(session.focus_paint_damage_valid
+                      && tile_cache_sync_layout_paint(&fast_cache,
+                          session.focus_paint_damage_left, session.focus_paint_damage_top,
+                          session.focus_paint_damage_right, session.focus_paint_damage_bottom)
+                      && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            } else {
+                tile_cache_destroy(&fast_cache);
+                CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                      && tile_cache_set_frame(&fast_cache, fast, pixels)
+                      && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            }
+            tile_cache_destroy(&fast_cache);
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL));
+            tile_cache_destroy(&full_cache);
+            if (memcmp(fast, full, pixels * sizeof(*fast)) != 0) {
+                fprintf(stderr, "stale focus outline %s -> %s: frame differs "
+                        "(skipped %d)\n", pairs[pair][0], pairs[pair][1],
+                        (int) skipped);
+                failures++;
+            }
+        }
+        budget_free(&budget, full);
+        budget_free(&budget, fast);
+        navigation_destroy(&session);
+        CHECK(failures == 0 && budget.current == 0);
+    }
+
+    {
+        puts("test: colour and background focus paint matches full layout");
+        static const char page[] = "<!doctype html><style>body{margin:0}"
+            "a{color:#123456;outline:none}a:focus{color:#cc0000}"
+            ".own{color:#0a7a0a}"
+            "button{background:#eeeeee;border:1px solid #888888;outline:none}"
+            "button:focus{background:#ccddff}"
+            ".deco{text-decoration:none}.deco:focus{text-decoration:underline}"
+            "</style><body><p><a id=one href=/one>One link</a> and "
+            "<a id=two href=/two>Two <b>bold</b> <span class=own>own</span></a>"
+            "</p><p><button id=three>Three</button> "
+            "<a id=four class=deco href=/four>Four</a></p>"
+            "<p><a id=five href=/five>Five <img alt=ALT width=40 height=12></a>"
+            " <a id=six href=/six>Six <img class=own alt=OWN width=40 height=12>"
+            "</a></p><div id=other style='height:300px'></div>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(&session, navigation_begin(&session),
+            "https://focus.test/color", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root = lxb_dom_interface_node(session.page.document.html);
+        size_t pixels = 480u * 272u;
+        uint16_t *fast = budget_malloc(&budget, pixels * sizeof(*fast));
+        uint16_t *full = budget_malloc(&budget, pixels * sizeof(*full));
+        CHECK(fast != NULL && full != NULL);
+        static const char *const order[] = {"one", "two", "three", "one",
+                                            "four", "two", "five", "six",
+                                            "five", "one"};
+        /* The underline toggles a relayout (its runs widen across word
+           spaces); the others recolour retained paint. An undecoded image's
+           boxed alt text follows the link colour (five) or keeps its own
+           (six) without borrowing a text node; it is recoloured or kept by
+           its img. */
+        static const int skips[] = {1, 1, 1, 1, 0, 0, 1, 1, 1, 1};
+        for (unsigned move = 0; move < 10; move++) {
+            TileCache fast_cache = {0}, full_cache = {0};
+            CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&fast_cache, fast, pixels)
+                  && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            size_t relayouts = session.incremental_relayouts;
+            size_t paint_skips = session.performance.focus_paint_relayout_skips;
+            tilefinch_test_faults()->focus_color_command_visits = 0;
+            CHECK(controller_focus_node(&controller, find_id(root, order[move])));
+            bool skipped = session.incremental_relayouts == relayouts;
+            if (skips[move] != 2 && (int) skipped != skips[move]) {
+                fprintf(stderr, "colour focus move %u (%s): skipped=%d\n",
+                        move, order[move], (int) skipped);
+                return 1;
+            }
+            /* One display-list scan per recoloured element (its dry run);
+               the apply visits only the runs that scan listed. */
+            unsigned long long visits =
+                tilefinch_test_faults()->focus_color_command_visits;
+            if (skipped && visits > 2u * session.page.layout.count + 16u) {
+                fprintf(stderr, "colour focus move %u (%s): %llu command "
+                        "visits for %zu commands\n", move, order[move],
+                        visits, session.page.layout.count);
+                return 1;
+            }
+            if (skipped) {
+                CHECK(session.performance.focus_paint_relayout_skips
+                          == paint_skips + 1u
+                      && session.focus_paint_damage_valid
+                      && tile_cache_sync_layout_paint(&fast_cache,
+                          session.focus_paint_damage_left,
+                          session.focus_paint_damage_top,
+                          session.focus_paint_damage_right,
+                          session.focus_paint_damage_bottom)
+                      && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            } else {
+                tile_cache_destroy(&fast_cache);
+                CHECK(tile_cache_init(&fast_cache, &budget, &session.page.layout, 8)
+                      && tile_cache_set_frame(&fast_cache, fast, pixels)
+                      && tile_cache_render_frame(&fast_cache, 0, 480, 272, NULL));
+            }
+            tile_cache_destroy(&fast_cache);
+            /* An unrelated relayout after the recolour must not reuse the
+               element's style from the other state. */
+            char script[128];
+            snprintf(script, sizeof(script),
+                "document.getElementById('other').style.height='%upx'", 301u + move);
+            CHECK(script_runtime_evaluate_diagnostic(session.page.runtime, script,
+                      "<focus-colour>", &session.page.script_result)
+                  && script_runtime_consume_relayout(session.page.runtime)
+                  && navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL));
+            bool same_incremental = memcmp(fast, full, pixels * sizeof(*fast)) == 0;
+            tile_cache_destroy(&full_cache);
+            session.style_rebuild_required = true;
+            CHECK(navigation_relayout(&session)
+                  && tile_cache_init(&full_cache, &budget, &session.page.layout, 8)
+                  && tile_cache_set_frame(&full_cache, full, pixels)
+                  && tile_cache_render_frame(&full_cache, 0, 480, 272, NULL));
+            bool same_full = memcmp(fast, full, pixels * sizeof(*fast)) == 0;
+            tile_cache_destroy(&full_cache);
+            if (!same_incremental || !same_full) {
+                fprintf(stderr, "colour focus move %u (%s): frame differs "
+                        "(incremental %d, full %d)\n", move, order[move],
+                        (int) same_incremental, (int) same_full);
+                return 1;
+            }
+        }
+        budget_free(&budget, full);
+        budget_free(&budget, fast);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
     {
         puts("test: layered focus rings retain unchanged shadows and control geometry");
         static const char page[] = "<!doctype html><style>body{margin:0;height:900px}"
@@ -3788,8 +4050,12 @@
                 CHECK(controller_focus_node(&controller,
                     move % 2 ? find_id(root, "outside") : inside));
                 layout_reuse_cache_stats(session.page.layout_reuse, &after);
+                /* A bounded focus relayout resolves only its region's
+                   paragraphs (about forty); a complete one all 300. */
                 if (variant == 0) CHECK(after.full_resets == before.full_resets
-                    && after.style_hits > before.style_hits + 200u);
+                    && after.style_hits > before.style_hits
+                        + (navigation_bounded_focus_region_end(&session) != 0
+                           ? 20u : 200u));
                 TileCache cache = {0};
                 CHECK(tile_cache_init(&cache, &budget, &session.page.layout, 8)
                       && tile_cache_set_frame(&cache, fast, pixels)
@@ -3821,7 +4087,8 @@
                 "<style>body{margin:0;height:2400px}button{border:0;border-radius:0;"
                 "padding:6px;width:80px;height:30px}"
                 "button:focus{outline:2px solid var(--outline,blue);box-shadow:none}"
-                ".ring{display:inline-block}.ring:focus{box-shadow:inset 0 0 0 2px blue}"
+                ".ring{display:inline-block}"
+                ".ring:focus{box-shadow:inset 0 0 0 2px blue;outline:none}"
                 "</style><body>%s",
                 variant ? "<div style='height:2000px'></div>" : "");
             /* Large-page reuse owns the viewport admission hint (small pages
@@ -4621,6 +4888,115 @@
           && smooth_scroll_navigation.page.layout.scroll_snap_candidate_count
              == 1);
     navigation_destroy(&smooth_scroll_navigation);
+    CHECK(budget.current == 0);
+
+    /* No stylesheet rule mentions a sparse scroll or cursor property: a
+       CSSOM write alone must admit them to layout. */
+    puts("test: sparse properties written only through CSSOM");
+    static const char cssom_sparse_page[] =
+        "<!doctype html><style>body{margin:0}</style><body>"
+        "<div id=shell style=\"display:block;width:120px;height:50px;"
+        "overflow:auto\"><div id=target style=\"display:block;"
+        "height:180px\">TARGET</div></div><script>"
+        "const shell=document.getElementById('shell'),"
+        "target=document.getElementById('target');"
+        "shell.style.scrollSnapType='y mandatory';"
+        "target.style.scrollSnapAlign='start';"
+        "target.style.cursor='pointer';"
+        "target.style.userSelect='none';"
+        "globalThis.pocSummary=getComputedStyle(shell).scrollSnapType"
+        "</script></body>";
+    static NavigationSession cssom_sparse_navigation;
+    CHECK(navigation_init(&cssom_sparse_navigation, &budget, 2));
+    navigation_enable_scripts(&cssom_sparse_navigation, 4 * MIB, 1000);
+    uint64_t cssom_sparse_generation =
+        navigation_begin(&cssom_sparse_navigation);
+    CHECK(navigation_commit_html(
+        &cssom_sparse_navigation, cssom_sparse_generation,
+        "https://sparse.test/", cssom_sparse_page,
+        strlen(cssom_sparse_page), 160, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++) {
+        CHECK(navigation_advance_runtime(
+            &cssom_sparse_navigation, 16, 8));
+    }
+    lxb_dom_node_t *cssom_sparse_target = find_id(
+        lxb_dom_interface_node(cssom_sparse_navigation.page.document.html),
+        "target");
+    CHECK(strcmp(cssom_sparse_navigation.page.script_result.summary,
+                 "y mandatory") == 0
+          && cssom_sparse_navigation.page.layout.scroll_container_count == 1);
+    CHECK(layout_cursor_for_node(
+              &cssom_sparse_navigation.page.stylesheet,
+              cssom_sparse_target) == LAYOUT_CURSOR_POINTER);
+    CHECK(cssom_sparse_navigation.page.layout.scroll_snap_candidate_count
+          == 1);
+    navigation_destroy(&cssom_sparse_navigation);
+    CHECK(budget.current == 0);
+
+    /* No stylesheet rule names a modern-resolver property. A parse-time
+       CSSOM write (#parse) and style attributes set after load through
+       setAttribute (#attr) and cssText (#text) must still reach layout. */
+    puts("test: modern properties from scripted style attributes");
+    static const char inline_modern_page[] =
+        "<!doctype html><style>body{margin:0}</style><body>"
+        "<div id=parse>PARSE</div><script>"
+        "const parse=document.getElementById('parse');"
+        "parse.style.userSelect='none';parse.style.rotate='90deg';"
+        "globalThis.pocSummary='';"
+        "setTimeout(()=>{"
+        "document.getElementById('attr').setAttribute('style',"
+        "'display:block;width:40px;height:20px;position:sticky;top:0;"
+        "background:#123456;translate:10px 5px;backdrop-filter:blur(4px);"
+        "border-start-start-radius:7px');"
+        "document.getElementById('text').style.cssText="
+        "'display:block;user-select:none;rotate:90deg;text-wrap:balance;"
+        "text-size-adjust:50%;font-size:20px';"
+        "setTimeout(()=>{const p=getComputedStyle(parse),"
+        "t=getComputedStyle(document.getElementById('text'));"
+        "globalThis.pocSummary=[p.userSelect,t.userSelect,t.textWrap,"
+        "t.textSizeAdjust].join('|')},40)},20)"
+        "</script><div id=attr></div><div id=text>TEXT</div></body>";
+    static NavigationSession inline_modern_navigation;
+    CHECK(navigation_init(&inline_modern_navigation, &budget, 2));
+    navigation_enable_scripts(&inline_modern_navigation, 4 * MIB, 1000);
+    uint64_t inline_modern_generation =
+        navigation_begin(&inline_modern_navigation);
+    CHECK(navigation_commit_html(
+        &inline_modern_navigation, inline_modern_generation,
+        "https://modern.test/", inline_modern_page,
+        strlen(inline_modern_page), 160, NULL, NULL, true));
+    for (size_t frame = 0; frame < 12; frame++) {
+        CHECK(navigation_advance_runtime(
+            &inline_modern_navigation, 16, 8));
+    }
+    const LayoutDocument *inline_modern_layout =
+        &inline_modern_navigation.page.layout;
+    const DrawCommand *inline_modern_fill = NULL;
+    const DrawCommand *inline_modern_parse = NULL;
+    const DrawCommand *inline_modern_text = NULL;
+    for (size_t i = 0; i < inline_modern_layout->count; i++) {
+        const DrawCommand *command = &inline_modern_layout->commands[i];
+        if (command->type == DRAW_FILL_RECT && command->color == 0x123456)
+            inline_modern_fill = command;
+        if (command->type == DRAW_TEXT && command->text_length == 5
+            && memcmp(command->text, "PARSE", 5) == 0)
+            inline_modern_parse = command;
+        if (command->type == DRAW_TEXT && command->text_length == 4
+            && memcmp(command->text, "TEXT", 4) == 0)
+            inline_modern_text = command;
+    }
+    CHECK(strcmp(inline_modern_navigation.page.script_result.summary,
+                 "none|none|balance|50%") == 0);
+    CHECK(inline_modern_parse != NULL
+          && draw_command_rotation_quadrants(inline_modern_parse) == 1u);
+    CHECK(inline_modern_fill != NULL && inline_modern_fill->x == 10
+          && draw_command_backdrop_blur(inline_modern_fill) == 3u
+          && style_border_radius_corner(inline_modern_fill->radius, 0)
+             == 7);
+    CHECK(inline_modern_text != NULL
+          && draw_command_rotation_quadrants(inline_modern_text) == 1u
+          && inline_modern_text->font_size == 10);
+    navigation_destroy(&inline_modern_navigation);
     CHECK(budget.current == 0);
 
     /* `name in element.style` answers the CSS properties Tilefinch

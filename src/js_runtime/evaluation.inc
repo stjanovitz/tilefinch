@@ -2558,12 +2558,9 @@ static bool document_current_script_get(JSContext *context,
     (void) result;
     if (scope == NULL) return false;
     scope->value = JS_UNDEFINED;
-    scope->owner_document_identity = 0;
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL) return false;
     scope->value = JS_DupValue(context, bridge->current_script);
-    scope->owner_document_identity =
-        bridge->current_script_owner_document_identity;
     return true;
 }
 
@@ -2579,7 +2576,6 @@ static bool document_current_script_set(JSContext *context, JSValue value,
     }
     JS_FreeValue(context, bridge->current_script);
     bridge->current_script = value;
-    bridge->current_script_owner_document_identity = 0;
     return true;
 }
 
@@ -2588,40 +2584,12 @@ static bool set_current_script(JSContext *context, lxb_dom_node_t *node,
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL) return false;
-    bool source_override = bridge != NULL
-        && bridge->current_script_source_active;
-    const char *source_key = source_override
-        ? bridge->current_script_source_key : NULL;
-    size_t source_section = source_override
-        ? bridge->current_script_source_section : 0;
-    if (!source_override && bridge != NULL) {
-        for (size_t i = 0; i < bridge->script_source_node_count; i++) {
-            ScriptSourceNode *source = &bridge->script_source_nodes[i];
-            if (source->node == node) {
-                source_override = true;
-                source_key = source->key;
-                source_section = source->section;
-                break;
-            }
-        }
-    }
-    int64_t handle = source_override ? 0 : js_rt_bridge_register_node(bridge, node);
-    JSValue wrap = source_override
-        ? bridge->trusted_stable_script_wrap : bridge->trusted_node_wrap;
+    int64_t handle = js_rt_bridge_register_node(bridge, node);
+    JSValue wrap = js_rt_bridge_trusted_hook(bridge, SCRIPT_HOST_WRAP_NODE);
     if (!JS_IsFunction(context, wrap)) return false;
-    JSValue arguments[2];
-    int argument_count = 1;
-    if (source_override) {
-        arguments[0] = JS_NewString(context, source_key);
-        arguments[1] = JS_NewInt64(
-            context, (int64_t) source_section);
-        argument_count = 2;
-    } else arguments[0] = JS_NewInt64(context, handle);
-    JSValue current = JS_Call(
-        context, wrap, JS_UNDEFINED, argument_count, arguments);
-    for (int index = 0; index < argument_count; index++) {
-        JS_FreeValue(context, arguments[index]);
-    }
+    JSValue argument = JS_NewInt64(context, handle);
+    JSValue current = JS_Call(context, wrap, JS_UNDEFINED, 1, &argument);
+    JS_FreeValue(context, argument);
     bool current_exception = JS_IsException(current);
     bool current_set = !current_exception
         && document_current_script_set(context, current, result);
@@ -2630,7 +2598,6 @@ static bool set_current_script(JSContext *context, lxb_dom_node_t *node,
         if (current_exception) js_rt_record_exception(context, result);
         return false;
     }
-    bridge->current_script_owner_document_identity = js_rt_node_owner_identity(node);
     return true;
 }
 
@@ -2659,16 +2626,12 @@ bool js_rt_current_script_scope_begin(JSContext *context,
         (void) document_current_script_set(
             context, JS_DupValue(context, previous->value), result);
         DomBridge *bridge = JS_GetContextOpaque(context);
-        if (bridge != NULL) {
-            bridge->current_script_owner_document_identity =
-                previous->owner_document_identity;
-            /* A failed scope must not leave this script's CSP grant behind
-               for later classic import() calls. */
+        /* A failed scope must not leave this script's CSP grant behind for
+           later classic import() calls. */
+        if (bridge != NULL)
             bridge->current_script_csp_grant = previous->csp_grant;
-        }
         JS_FreeValue(context, previous->value);
         previous->value = JS_UNDEFINED;
-        previous->owner_document_identity = 0;
     }
     return set;
 }
@@ -2681,14 +2644,9 @@ bool js_rt_current_script_scope_end(JSContext *context,
     bool restored = document_current_script_set(
         context, JS_DupValue(context, previous->value), result);
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (restored && bridge != NULL) {
-        bridge->current_script_owner_document_identity =
-            previous->owner_document_identity;
-    }
     if (bridge != NULL) bridge->current_script_csp_grant = previous->csp_grant;
     JS_FreeValue(context, previous->value);
     previous->value = JS_UNDEFINED;
-    previous->owner_document_identity = 0;
     return restored;
 }
 

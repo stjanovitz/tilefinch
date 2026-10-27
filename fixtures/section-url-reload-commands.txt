@@ -1,4 +1,0 @@
-anchor beta
-node-text beta-result
-reload
-node-text beta-result

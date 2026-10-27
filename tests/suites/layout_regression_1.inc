@@ -6,6 +6,7 @@
     CHECK(test_layout_elapsed_input_checkpoint(&budget) == 0);
     CHECK(test_scroll_extent_linear_and_interruptible(&budget) == 0);
     CHECK(test_focus_within_unrelated_branches(&budget) == 0);
+    CHECK(test_focus_override_reaches_marker_selectors(&budget) == 0);
     CHECK(test_focus_shadowed_opacity_and_empty_images(&budget) == 0);
     CHECK(test_spatial_ranges_service_input_before_finishing(&budget) == 0);
     CHECK(test_long_text_input_checkpoint(&budget) == 0);
@@ -53,6 +54,15 @@
     puts("test: modern mobile interaction and presentation CSS");
     CHECK(test_modern_mobile_css_interaction_and_presentation(&budget) == 0);
 
+    puts("test: sparse properties set only by style attributes");
+    CHECK(test_sparse_properties_from_inline_style(&budget) == 0);
+
+    puts("test: modern properties set only by style attributes");
+    CHECK(test_modern_properties_from_inline_style(&budget) == 0);
+
+    puts("test: vendor aliases in style attributes");
+    CHECK(test_vendor_aliases_in_style_attribute(&budget) == 0);
+
     puts("test: calculated unitless line-height multipliers");
     CHECK(test_calculated_unitless_line_height(&budget) == 0);
 
@@ -98,6 +108,7 @@
     puts("test: resumable authoritative layout is exact and transactional");
     CHECK(test_resumable_authoritative_layout(&budget) == 0);
     CHECK(test_wrapped_flex_preview_stops_at_limit(&budget) == 0);
+    CHECK(test_preview_cut_repositioning_marks_inexact(&budget) == 0);
 
     puts("test: table column constraints, rowspan placement, and captions");
     CHECK(test_table_column_and_rowspan_construction(&budget) == 0);
@@ -822,25 +833,41 @@
     CHECK(document_attribute(
                  focus_probe, "data-tilefinch-focus",
                  &focus_marker_length) == NULL);
-    /* A failed probe toggle is unsafe; the restoration still runs. */
-    tilefinch_test_faults()->focus_marker_remove_failures = 1;
-    CHECK(style_focus_change_classify(
-              &mobile_sheet, focus_probe, &focus_host_style,
-              &focus_normal, &focus_active) == STYLE_FOCUS_CHANGE_UNSAFE
-          && document_attribute(
-                 focus_probe, "data-tilefinch-focus",
-                 &focus_marker_length) == NULL);
-    /* A failed restoration is reported as a document style change. */
+    /* The probe reads the other focus state through the matcher's focus
+       override and never writes the DOM: the marker keeps its value and
+       its place among the element's attributes (a remove-and-restore
+       toggle re-added it last), and no style change is reported. */
+    CHECK(lxb_dom_element_set_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "data-tilefinch-focus",
+              sizeof("data-tilefinch-focus") - 1u,
+              (const lxb_char_t *) "original",
+              sizeof("original") - 1u) != NULL
+          && lxb_dom_element_set_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "title", sizeof("title") - 1u,
+              (const lxb_char_t *) "after", sizeof("after") - 1u) != NULL);
     (void) document_style_generation();
     uint64_t focus_generation = document_style_generation();
-    tilefinch_test_faults()->focus_marker_remove_failures = 2;
-    CHECK(style_focus_change_classify(
-              &mobile_sheet, focus_probe, &focus_host_style,
-              &focus_normal, &focus_active) == STYLE_FOCUS_CHANGE_UNSAFE
-          && document_attribute(
-                 focus_probe, "data-tilefinch-focus",
-                 &focus_marker_length) != NULL
-          && document_style_generation() != focus_generation);
+    (void) style_focus_change_classify(
+        &mobile_sheet, focus_probe, &focus_host_style,
+        &focus_normal, &focus_active);
+    size_t last_attribute_length = 0;
+    const lxb_char_t *last_attribute = lxb_dom_attr_local_name(
+        lxb_dom_element_last_attribute(
+            lxb_dom_interface_element(focus_probe)),
+        &last_attribute_length);
+    CHECK(document_style_generation() == focus_generation
+          && last_attribute != NULL
+          && last_attribute_length == sizeof("title") - 1u
+          && memcmp(last_attribute, "title", sizeof("title") - 1u) == 0
+          && document_attribute(focus_probe, "data-tilefinch-focus",
+                                &focus_marker_length) != NULL
+          && focus_marker_length == sizeof("original") - 1u);
+    CHECK(lxb_dom_element_remove_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "title", sizeof("title") - 1u)
+          == LXB_STATUS_OK);
     CHECK(lxb_dom_element_remove_attribute(
               lxb_dom_interface_element(focus_probe),
               (const lxb_char_t *) "data-tilefinch-focus",

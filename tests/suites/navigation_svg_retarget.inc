@@ -660,6 +660,49 @@ static bool test_svg_oversize_initial_raster_preserves_intrinsic_size(void)
         && budget.current == 0;
 }
 
+/* Nesting past the parser's depth limits (32 nested <svg> viewports, or
+   NSVG_MAX_ATTR = 128 nested elements) is this engine's limit, not markup
+   no decoder takes: the decode reports *limited, so the image counts as a
+   limit skip with no error event (image.c). It used to report markup. */
+static bool svg_nesting_limited(const char *open, const char *close,
+                                unsigned levels)
+{
+    static char markup[8192];
+    size_t used = (size_t) snprintf(
+        markup, sizeof(markup),
+        "<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'>");
+    for (unsigned i = 0; i < levels; i++)
+        used += (size_t) snprintf(markup + used, sizeof(markup) - used,
+                                  "%s", open);
+    used += (size_t) snprintf(markup + used, sizeof(markup) - used,
+                              "<rect width='8' height='8'/>");
+    for (unsigned i = 0; i < levels; i++)
+        used += (size_t) snprintf(markup + used, sizeof(markup) - used,
+                                  "%s", close);
+    used += (size_t) snprintf(markup + used, sizeof(markup) - used, "</svg>");
+    if (used >= sizeof(markup)) return false;
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    bool limited = false;
+    unsigned char *pixels = image_svg_decode_bounded(
+        markup, used, &budget, MIB, &width, &height, NULL, NULL, NULL, NULL,
+        &limited);
+    bool refused = pixels == NULL;
+    budget_free(&budget, pixels);
+    if (!refused || !limited)
+        printf("svg nesting %s x%u: refused=%d limited=%d\n", open, levels,
+               refused, limited);
+    return refused && limited && budget.current == 0
+        && !image_svg_decode_busy();
+}
+
+static bool test_svg_nesting_limits_are_limits(void)
+{
+    return svg_nesting_limited("<svg width='8' height='8'>", "</svg>", 40u)
+        && svg_nesting_limited("<g>", "</g>", 140u);
+}
+
 static bool test_svg_retarget_rasterizes_at_painted_size(void)
 {
     static const char html[] =

@@ -258,6 +258,11 @@ void psp_boot_config_defaults(PspBootConfig *config);
  * harness to the controller, not another input source to merge with it.
  */
 void psp_boot_config_disable_automation(PspBootConfig *config);
+/* True when any key psp_boot_config_disable_automation resets is away from
+   its reset value: a trace replay or capture, an input script, ticks, a
+   validation probe. Always false in a shipping EBOOT once boot has
+   disabled automation. */
+bool psp_boot_config_automated(const PspBootConfig *config);
 
 bool psp_boot_config_load(
     PspBootConfig *config, const char *path,

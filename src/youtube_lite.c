@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/json_scan.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
@@ -344,62 +345,19 @@ static void lite_clamp_snippet(char *text, size_t capacity, size_t budget)
     memcpy(text + length, marker, marker_length + 1u);
 }
 
+/* Provider JSON is read with the shared bounded scanner
+   (tilefinch/json_scan.h): its string decoding, and its validated value
+   spans nested at most this deep. */
+#define LITE_JSON_DEPTH 48u
+
 static bool lite_json_string_bounded(const char *at, const char *end,
                                      char *output, size_t output_size,
                                      bool truncate)
 {
-    if (at >= end || *at++ != '"' || output_size == 0) return false;
-    size_t used = 0;
-    bool full = false;
-    while (at < end) {
-        unsigned char byte = (unsigned char) *at++;
-        if (byte == '"') {
-            if (full) used = lite_utf8_complete_prefix(output, used);
-            output[used] = '\0';
-            return true;
-        }
-        if (byte < 0x20u) return false;
-        if (byte != '\\') {
-            if (used >= output_size - 1u) {
-                if (!truncate) return false;
-                full = true;
-            } else if (!full) {
-                output[used++] = (char) byte;
-            }
-            continue;
-        }
-        if (at >= end) return false;
-        char escape = *at++;
-        char simple = '\0';
-        if (escape == '"') simple = '"';
-        else if (escape == '\\') simple = '\\';
-        else if (escape == '/') simple = '/';
-        else if (escape == 'b') simple = '\b';
-        else if (escape == 'f') simple = '\f';
-        else if (escape == 'n') simple = '\n';
-        else if (escape == 'r') simple = '\r';
-        else if (escape == 't') simple = '\t';
-        else if (escape == 'u') {
-            unsigned codepoint = 0;
-            if (!lite_decode_escape_codepoint(&at, end, 'u', &codepoint))
-                return false;
-            if (!full && !lite_append_utf8(
-                    output, output_size, &used, codepoint)) {
-                if (!truncate) return false;
-                full = true;
-            }
-            continue;
-        } else {
-            return false;
-        }
-        if (used >= output_size - 1u) {
-            if (!truncate) return false;
-            full = true;
-        } else if (!full) {
-            output[used++] = simple;
-        }
-    }
-    return false;
+    JsonCursor json = {at, end};
+    return at < end && *at == '"'
+        && json_scan_string_copy(&json, output, output_size,
+                                 truncate ? JSON_SCAN_TRUNCATE : 0u, NULL);
 }
 
 static bool lite_json_string(const char *at, const char *end,
@@ -412,57 +370,17 @@ static bool lite_json_string(const char *at, const char *end,
 static bool lite_json_span(const char *at, const char *end,
                            YoutubeLiteSpan *span)
 {
-    while (at < end && isspace((unsigned char) *at)) at++;
-    if (at >= end) return false;
-    const char *start = at;
-    if (*at == '"') {
-        at++;
-        while (at < end) {
-            if (*at == '\\') {
-                at += (size_t) (end - at) >= 2u ? 2 : 1;
-                continue;
-            }
-            if (*at++ == '"') {
-                *span = (YoutubeLiteSpan) {start, at};
-                return true;
-            }
-        }
-        return false;
-    }
-    if (*at != '{' && *at != '[') {
-        while (at < end && *at != ',' && *at != '}' && *at != ']'
-               && !isspace((unsigned char) *at)) at++;
-        *span = (YoutubeLiteSpan) {start, at};
-        return at > start;
-    }
-    char stack[48];
-    size_t depth = 0;
-    stack[depth++] = *at == '{' ? '}' : ']';
-    bool in_string = false;
-    bool escaped = false;
-    for (at++; at < end; at++) {
-        char byte = *at;
-        if (in_string) {
-            if (escaped) escaped = false;
-            else if (byte == '\\') escaped = true;
-            else if (byte == '"') in_string = false;
-            continue;
-        }
-        if (byte == '"') {
-            in_string = true;
-        } else if (byte == '{' || byte == '[') {
-            if (depth >= sizeof(stack)) return false;
-            stack[depth++] = byte == '{' ? '}' : ']';
-        } else if (byte == '}' || byte == ']') {
-            if (depth == 0 || stack[depth - 1u] != byte) return false;
-            depth--;
-            if (depth == 0) {
-                *span = (YoutubeLiteSpan) {start, at + 1};
-                return true;
-            }
-        }
-    }
-    return false;
+    JsonCursor json = {at, end}, value;
+    if (!json_scan_value_span(&json, LITE_JSON_DEPTH, &value)) return false;
+    *span = (YoutubeLiteSpan) {value.at, value.end};
+    return true;
+}
+
+static const char *lite_json_space(const char *at, const char *end)
+{
+    JsonCursor json = {at, end};
+    json_scan_space(&json);
+    return json.at;
 }
 
 static bool lite_json_key(const YoutubeLiteSpan *scope, const char *key,
@@ -484,9 +402,8 @@ static bool lite_json_key(const YoutubeLiteSpan *scope, const char *key,
                 back--;
             }
             if ((slashes & 1u) == 0) {
-                const char *colon = found + key_length + 1;
-                while (colon < scope->end
-                       && isspace((unsigned char) *colon)) colon++;
+                const char *colon = lite_json_space(
+                    found + key_length + 1, scope->end);
                 if (colon < scope->end && *colon == ':'
                     && lite_json_span(colon + 1, scope->end, value)) {
                     return true;
@@ -540,10 +457,9 @@ static bool lite_json_key_string_at(
     if ((slashes & 1u) != 0) return false;
     const char *colon = source + at + key_length + 1u;
     const char *end = source + source_length;
-    while (colon < end && isspace((unsigned char) *colon)) colon++;
+    colon = lite_json_space(colon, end);
     if (colon >= end || *colon != ':') return false;
-    colon++;
-    while (colon < end && isspace((unsigned char) *colon)) colon++;
+    colon = lite_json_space(colon + 1, end);
     return colon < end && *colon == '"'
         && lite_json_string(colon, end, output, output_size);
 }
@@ -741,25 +657,10 @@ static bool lite_json_member(const YoutubeLiteSpan *object, const char *name,
 {
     if (object == NULL || object->start == object->end
         || *object->start != '{') return false;
-    const char *at = object->start + 1;
-    for (unsigned members = 0; members < 256u; members++) {
-        while (at < object->end && isspace((unsigned char) *at)) at++;
-        if (at == object->end || *at == '}') return false;
-        YoutubeLiteSpan key;
-        if (*at != '"' || !lite_json_span(at, object->end, &key))
-            return false;
-        at = key.end;
-        while (at < object->end && isspace((unsigned char) *at)) at++;
-        if (at == object->end || *at++ != ':') return false;
-        if (!lite_json_span(at, object->end, value)) return false;
-        char decoded[64];
-        if (lite_json_string(key.start, key.end, decoded, sizeof(decoded))
-            && strcmp(decoded, name) == 0) return true;
-        at = value->end;
-        while (at < object->end && isspace((unsigned char) *at)) at++;
-        if (at == object->end || *at++ != ',') return false;
-    }
-    return false;
+    JsonCursor at;
+    return json_scan_member((JsonCursor) {object->start, object->end},
+                            name, LITE_JSON_DEPTH, 256u, &at)
+        && lite_json_span(at.at, at.end, value);
 }
 
 static bool lite_member_string(const YoutubeLiteSpan *object, const char *name,
@@ -775,10 +676,10 @@ static bool lite_array_next(const YoutubeLiteSpan *array, const char **cursor,
                             YoutubeLiteSpan *value)
 {
     if (array->start == array->end || *array->start != '[') return false;
-    const char *at = *cursor == NULL ? array->start + 1 : *cursor;
-    while (at < array->end && isspace((unsigned char) *at)) at++;
+    const char *at = lite_json_space(
+        *cursor == NULL ? array->start + 1 : *cursor, array->end);
     if (at < array->end && *at == ',') at++;
-    while (at < array->end && isspace((unsigned char) *at)) at++;
+    at = lite_json_space(at, array->end);
     if (at == array->end || *at == ']'
         || !lite_json_span(at, array->end, value)) return false;
     *cursor = value->end;
@@ -990,9 +891,7 @@ static bool lite_next_video_renderer(
                            key_length) != 0) {
                     continue;
                 }
-                const char *colon = key_end + 1;
-                while (colon < scope->end
-                       && isspace((unsigned char) *colon)) colon++;
+                const char *colon = lite_json_space(key_end + 1, scope->end);
                 if (colon < scope->end && *colon == ':'
                     && lite_json_span(colon + 1, scope->end, renderer)) {
                     *kind = candidate;
@@ -1470,7 +1369,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         && lite_html_ui_markup(html,
             "<a class=account href=\"https://www.youtube.com/feed/subscriptions\">{{Subscriptions}}</a>")
         && (!signed_in || lite_html_ui_markup(html,
-            "<a id=yt-signout-action class=account href=\"#tilefinch-signout\">{{Sign out}}</a>"))
+            "<a id=yt-signout-action class=account href=\"" YOUTUBE_LITE_FRAGMENT_SIGNOUT "\">{{Sign out}}</a>"))
         && lite_html_ui_markup(html, search_form)
         && lite_html_escape(html, query)
         /* Close the value attribute before autofocus. A quote glued to the
@@ -1927,7 +1826,7 @@ static bool lite_feed_requested(const char *url)
 static bool lite_html_feed_refresh(YoutubeLiteHtml *html)
 {
     return lite_html_ui_markup(html,
-        "<a id=yt-feed-refresh class=feed-refresh href=\"#tilefinch-refresh\">{{Refresh suggestions}}</a>");
+        "<a id=yt-feed-refresh class=feed-refresh href=\"" YOUTUBE_LITE_FRAGMENT_REFRESH "\">{{Refresh suggestions}}</a>");
 }
 
 static bool lite_html_feed_notice(YoutubeLiteHtml *html, bool defer_refresh,
@@ -2092,7 +1991,7 @@ static bool lite_html_watch_intro(
         ok = (watch->channel_id[0] == '\0'
                 || lite_html_account_action(html, YOUTUBE_LITE_ACTION_SUBSCRIBE,
                     watch->channel_id, "", "Subscribe", "yt-subscribe-action", "bell"))
-            && lite_html_text(html, "<a id=yt-like-action class=\"comments-link icon-action\" href=\"#tilefinch-like\" ")
+            && lite_html_text(html, "<a id=yt-like-action class=\"comments-link icon-action\" href=\"" YOUTUBE_LITE_FRAGMENT_LIKE "\" ")
             && lite_html_action_content(html, "Like", "like") && lite_html_text(html, "</a>")
             && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_ADD,
                 "WL", watch->video.id, "Watch Later", "yt-watch-later-add", "clock")
@@ -2117,7 +2016,7 @@ static bool lite_html_watch_intro(
             && (watch->channel_id[0] == '\0'
                 || lite_html_account_action(html, YOUTUBE_LITE_ACTION_UNSUBSCRIBE,
                     watch->channel_id, "", "Unsubscribe", "yt-unsubscribe-action", NULL))
-            && lite_html_ui_markup(html, "<a id=yt-unlike-action class=comments-link href=\"#tilefinch-unlike\">{{Unlike}}</a> ")
+            && lite_html_ui_markup(html, "<a id=yt-unlike-action class=comments-link href=\"" YOUTUBE_LITE_FRAGMENT_UNLIKE "\">{{Unlike}}</a> ")
             && lite_html_account_action(html, YOUTUBE_LITE_ACTION_PLAYLIST_REMOVE,
                 "WL", watch->video.id, "Remove from Watch Later", "yt-watch-later-remove", NULL)
             && lite_html_text(html, "</p></div></details>");

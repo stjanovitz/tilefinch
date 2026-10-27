@@ -49,6 +49,44 @@ def last_line(lines, prefix):
     return found
 
 
+def focus_commands(run_dir):
+    """(focus-next commands issued, frame-hash mode) from the census
+    command script: mode "each" when every move is followed by a labelled
+    frame-hash, "final" when only the idle turns are, "none" without."""
+    try:
+        commands = open(os.path.join(run_dir, "commands")).read().splitlines()
+    except OSError:
+        return 0, "none"
+    issued = sum(1 for c in commands if c.strip() == "focus-next")
+    hashes = [c for c in commands if c.startswith("frame-hash focus-")]
+    if any(c != "frame-hash focus-final" for c in hashes):
+        mode = "each"
+    else:
+        mode = "final" if hashes else "none"
+    return issued, mode
+
+
+def focus_frame_hashes(lines):
+    """({label: move hash}, {label: after hash}). A move's interaction-latency
+    line comes before the `frame-hash focus-N` the census issues after it,
+    so the move hash is filed under that label; a move that presented
+    nothing has no entry. An empty hash (a lab without traces) is kept as
+    "" and means not measured."""
+    moves, after = {}, {}
+    pending = None
+    for line in lines:
+        if line.startswith("interaction-latency command=focus-next "):
+            pending = fields(line).get("frame-fnv1a", "")
+        elif line.startswith("loop-frame-hash label=focus-"):
+            f = fields(line)
+            label = f.get("label", "")
+            after[label] = f.get("hash", "")
+            if pending is not None:
+                moves[label] = pending
+                pending = None
+    return moves, after
+
+
 def loop_js_values(lines):
     """Values printed by `js` commands, in order. A record runs until the
     next lab line that the command loop prints after every command; its
@@ -188,13 +226,40 @@ def extract(run_dir, name=None, url=None, tags=None):
     }
     # census.py --focus-moves: the D-pad focus moves' latency, and whether
     # they kept the layout-reuse cache (scoped invalidation) or reset it.
-    focus_us = [num(fields(line).get("total-us")) for line in lines
-                if line.startswith("interaction-latency command=focus-next ")]
-    if focus_us:
+    # The lab prints an interaction-latency line only for a move that
+    # changed something, so the moves issued come from the command script
+    # and every focus field below is recorded whenever moves were issued:
+    # a regression that turns moves into no-ops shows as fewer presented
+    # moves and missing move hashes, not as a page with no focus data.
+    issued, hash_mode = focus_commands(run_dir)
+    focus_lines = [fields(line) for line in lines
+                   if line.startswith("interaction-latency command=focus-next ")]
+    if issued or focus_lines:
+        focus_us = [num(f.get("total-us")) for f in focus_lines]
+        rec["focus_issued"] = issued
+        rec["focus_hashes"] = hash_mode
         rec["timing"]["focus_moves"] = len(focus_us)
         rec["timing"]["focus_ms"] = round(sum(focus_us) / 1000.0, 1)
+        # Moves that ran a relayout.
+        rec["timing"]["focus_relayout_moves"] = sum(
+            1 for f in focus_lines if num(f.get("relayout-us")) > 0)
+        rec["timing"]["focus_relayout_ms"] = round(
+            sum(num(f.get("relayout-us")) for f in focus_lines) / 1000.0, 1)
+        moves, after = focus_frame_hashes(lines)
+        # Each presented move's frame (interaction-latency frame-fnv1a,
+        # lab builds with traces), keyed by the move's frame-hash label;
+        # only --focus-hashes each gives the moves labels.
+        rec["focus_move_hashes"] = moves if hash_mode == "each" else None
+        # The frame-hash command's frame after each move and after the idle
+        # turns that follow, so a completion that changes pixels shows up.
+        rec["focus_after_hashes"] = after
         reuse = fields(last_line(lines, "layout-reuse ") or "")
         rec["focus_full_resets"] = num(reuse.get("full-resets"))
+        idle = fields(last_line(lines, "idle provisional=") or "")
+        rec["focus_bounded"] = num(idle.get("bounded"))
+        rec["focus_bounded_fallbacks"] = num(idle.get("bounded-fallbacks"))
+        rec["focus_bounded_script"] = num(idle.get("bounded-script"))
+        rec["focus_bounded_input"] = num(idle.get("bounded-input"))
     resp = fields(last_line(lines, "responsiveness max-slice-us=") or "")
     rec["timing"]["longest_step_ms"] = round(num(resp.get("max-slice-us")) / 1000.0, 1)
     rec["timing"]["longest_step_phase"] = resp.get("phase", "")

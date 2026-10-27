@@ -49,6 +49,11 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-compact-controls-tests COMMAND tilefinch-compact-controls-tests)
     set_tests_properties(tilefinch-compact-controls-tests PROPERTIES
         LABELS "tilefinch;unit;layout;controls" TIMEOUT 20)
+    tilefinch_add_test_binary(tilefinch-layout-shared-model-tests tests/test_layout_shared_models.c)
+    target_link_libraries(tilefinch-layout-shared-model-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-layout-shared-model-tests COMMAND tilefinch-layout-shared-model-tests)
+    set_tests_properties(tilefinch-layout-shared-model-tests PROPERTIES
+        LABELS "tilefinch;unit;layout;controls" TIMEOUT 20)
     tilefinch_add_test_binary(tilefinch-media-queries-tests tests/test_media_queries.c)
     target_link_libraries(tilefinch-media-queries-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-media-queries-tests COMMAND tilefinch-media-queries-tests)
@@ -532,7 +537,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     endfunction()
 
     # Keep the aggregate executable/CLI for compatibility, but do not register
-    # it in default CTest: the four suites below cover the same inventory and
+    # it in default CTest: the three suites below cover the same inventory and
     # would otherwise make every large test run twice.
     tilefinch_add_unit_suite(tilefinch-foundation-tests foundation)
     tilefinch_add_unit_suite(tilefinch-web-runtime-tests web-runtime)
@@ -540,7 +545,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-layout-tests PROPERTIES
         LABELS "tilefinch;unit"
         TIMEOUT 120)
-    tilefinch_add_unit_suite(tilefinch-section-tests sections)
 
     tilefinch_add_test_binary(tilefinch-url-tests tests/test_url.c)
     target_link_libraries(tilefinch-url-tests PRIVATE tilefinch_core)
@@ -787,7 +791,8 @@ if(PSP_BROWSER_BUILD_TESTS)
         src/screenshot_png.c
         tests/test_browser_engine_journeys.c
         tests/test_browser_engine_interruptions.c
-        tests/test_browser_engine_cleanups.c)
+        tests/test_browser_engine_cleanups.c
+        tests/test_cooperate_boundaries.c)
     tilefinch_add_test_binary(tilefinch-memory-pressure-tests tests/test_memory_pressure.c)
     target_link_libraries(tilefinch-memory-pressure-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-memory-pressure-tests COMMAND tilefinch-memory-pressure-tests)
@@ -802,6 +807,10 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;architecture;lifecycle"
         ENVIRONMENT "TILEFINCH_TRACE_TASKS=1"
         TIMEOUT 30)
+    add_test(NAME tilefinch-cooperate-boundary-tests
+        COMMAND tilefinch-browser-engine-tests --cooperate-boundary-only)
+    set_tests_properties(tilefinch-cooperate-boundary-tests PROPERTIES
+        LABELS "tilefinch;unit;architecture;input" TIMEOUT 60)
     # Incremental commit frees the candidate session before rebinding the
     # live runtime. Keep this small ownership journey in the sanitizer lane:
     # set_layout must not snapshot the candidate's freed inline stylesheet.
@@ -1005,6 +1014,26 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-psp-basic-fallback-tests
         COMMAND tilefinch-psp-basic-fallback-tests)
     set_tests_properties(tilefinch-psp-basic-fallback-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;ui"
+        TIMEOUT 10)
+
+    tilefinch_add_test_binary(tilefinch-psp-youtube-login-consent-tests
+        tests/test_psp_youtube_login_consent.c)
+    target_link_libraries(tilefinch-psp-youtube-login-consent-tests
+        PRIVATE tilefinch_psp_ui)
+    add_test(NAME tilefinch-psp-youtube-login-consent-tests
+        COMMAND tilefinch-psp-youtube-login-consent-tests)
+    set_tests_properties(tilefinch-psp-youtube-login-consent-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;ui"
+        TIMEOUT 10)
+
+    tilefinch_add_test_binary(tilefinch-psp-local-route-tests
+        tests/test_psp_local_route.c)
+    target_link_libraries(tilefinch-psp-local-route-tests
+        PRIVATE tilefinch_psp_ui)
+    add_test(NAME tilefinch-psp-local-route-tests
+        COMMAND tilefinch-psp-local-route-tests)
+    set_tests_properties(tilefinch-psp-local-route-tests PROPERTIES
         LABELS "tilefinch;unit;psp;ui"
         TIMEOUT 10)
 
@@ -1247,6 +1276,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;image;memory"
         TIMEOUT 60)
 
+    tilefinch_add_test_binary(tilefinch-json-scan-tests
+        tests/test_json_scan.c)
+    target_link_libraries(tilefinch-json-scan-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-json-scan-tests
+        COMMAND tilefinch-json-scan-tests)
+    set_tests_properties(tilefinch-json-scan-tests PROPERTIES
+        LABELS "tilefinch;unit;security" TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-text-encoding-tests
         tests/test_text_encoding.c)
     target_link_libraries(tilefinch-text-encoding-tests PRIVATE tilefinch_core)
@@ -1264,6 +1301,13 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-js-responsiveness-tests)
     set_tests_properties(tilefinch-js-responsiveness-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;responsiveness"
+        TIMEOUT 30)
+    # Script profiling is read once per process, so the refused-context
+    # profile check runs in a process of its own.
+    add_test(NAME tilefinch-js-runtime-abandon-profile-tests
+        COMMAND tilefinch-js-responsiveness-tests --profile-abandon-only)
+    set_tests_properties(tilefinch-js-runtime-abandon-profile-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;memory"
         TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-game-audio-slots-tests
@@ -1550,6 +1594,15 @@ if(PSP_BROWSER_BUILD_TESTS)
         TIMEOUT 30)
 
     if(PSP_BROWSER_USE_BELLARD_QUICKJS)
+        tilefinch_add_test_binary(tilefinch-quickjs-read-refusal-tests
+            tests/test_quickjs_read_refusal.c)
+        target_link_libraries(tilefinch-quickjs-read-refusal-tests PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-read-refusal-tests
+            COMMAND tilefinch-quickjs-read-refusal-tests)
+        set_tests_properties(tilefinch-quickjs-read-refusal-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;allocator;sanitizer"
+            TIMEOUT 10)
+
         tilefinch_add_test_binary(tilefinch-quickjs-oom-tests
             tests/test_quickjs_oom.c)
         target_link_libraries(tilefinch-quickjs-oom-tests PRIVATE tilefinch_core)
@@ -2286,99 +2339,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         PASS_REGULAR_EXPRESSION "reader profile=wikipedia"
         TIMEOUT 30)
 
-    add_test(NAME experimental-compressed-section-opt-in
-        COMMAND psp-browser-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1 --no-render)
-    set_tests_properties(experimental-compressed-section-opt-in PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-section-store.*sections="
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-pager-interactive
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-pager-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-pager-final.ppm)
-    set_tests_properties(experimental-section-pager-interactive PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-pager status=active.*swaps=5"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-anchor-interactive
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-anchor-final.ppm)
-    set_tests_properties(experimental-section-anchor-interactive PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-anchor id=\"alpha\" section=0"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-link-activation
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor-link-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-link-final.ppm)
-    set_tests_properties(experimental-section-link-activation PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-anchor id=\"alpha\" section=0"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-reload
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-reload-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-reload-final.ppm)
-    set_tests_properties(experimental-section-reload PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-reload section=2/3.*scroll="
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-history
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-history-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-history-final.ppm)
-    set_tests_properties(experimental-section-history PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-history direction=forward index=1 section=2"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-focus
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-focus-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-focus-final.ppm)
-    set_tests_properties(experimental-section-focus PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-focus restored id=\"jump-gamma\" section=0"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-state-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-state-final.ppm)
-    set_tests_properties(experimental-section-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-control id=\"section-input\" value=\"AB\""
-        TIMEOUT 30)
-
     # The lab's realistic profile is the PSP app's own configuration
     # (BROWSER_PSP_APP_* shared with src/psp_boot_config.c).
     add_test(NAME lab-psp-realistic-profile-matches-app
@@ -2389,6 +2349,18 @@ if(PSP_BROWSER_BUILD_TESTS)
             --output ${CMAKE_CURRENT_BINARY_DIR}/lab-psp-realistic-profile.ppm)
     set_tests_properties(lab-psp-realistic-profile-matches-app PROPERTIES
         PASS_REGULAR_EXPRESSION "runtime-profile=realistic limit-mb=32 adaptive=yes history=4 session-cache=655360 tiles=24 navigation=transactional\nruntime-policy scripts=256 source-bytes=16777216 file-bytes=4194304 heap-bytes=5242880 stylesheets=32 css-bytes=3145728 css-file-bytes=786432"
+        TIMEOUT 30)
+    # The lab derives script limits through the app's own helper, so a
+    # per-file limit above the total is clamped to the total here too.
+    add_test(NAME lab-script-file-limit-clamped-to-total
+        COMMAND psp-browser-interactive-lab
+            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
+            --psp-profile realistic
+            --script-total-mb 1 --script-file-kb 2048
+            --no-loop-capture
+            --output ${CMAKE_CURRENT_BINARY_DIR}/lab-script-file-limit.ppm)
+    set_tests_properties(lab-script-file-limit-clamped-to-total PROPERTIES
+        PASS_REGULAR_EXPRESSION "runtime-policy scripts=[0-9]+ source-bytes=1048576 file-bytes=1048576 "
         TIMEOUT 30)
 
     # A top-level DataDome 403 (sanitized from a news-site capture) must
@@ -2406,117 +2378,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         PASS_REGULAR_EXPRESSION "bot-wall detected=yes site=\"nytimes.com\" vendor=\"DataDome\" status=403 blank-refused-script=no notice=\"nytimes.com blocked Tilefinch[|]Bot protection: this site may not work\""
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-image-cache
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-image.html
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-image-cap
-            --deterministic-replay-seed 42
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-resource-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-image-final.ppm)
-    set_tests_properties(experimental-section-image-cache PROPERTIES
-        PASS_REGULAR_EXPRESSION "session .*cache-hits=[1-9]"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-external-layout
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-external-layout.html
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-external-layout
-            --deterministic-replay-seed 42
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-external-layout-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-external-layout-final.ppm)
-    set_tests_properties(experimental-section-external-layout PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-layout-reindex status=applied selectors=1 sections=3->2 selected=0"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-cross-document-history
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anchor.html
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-stream
-            --deterministic-replay-seed 42
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-cross-document-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-cross-document-final.ppm)
-    set_tests_properties(experimental-section-cross-document-history PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-resume section=2/3"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-url-resume
-        COMMAND psp-browser-interactive-lab
-            --url https://section-history.test/a
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-cross-document
-            --deterministic-replay-seed 42
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-cross-document-url-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-url-resume-final.ppm)
-    set_tests_properties(experimental-section-url-resume PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-resume section=1/2.*chunks=1"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-listener-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-listener.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-listener-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-listener-final.ppm)
-    set_tests_properties(experimental-section-listener-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-control id=\"listener-result\" value=\"AB\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-mutation-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-mutation.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-mutation-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-mutation-final.ppm)
-    set_tests_properties(experimental-section-mutation-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"mutation-target\" text=\"Changed\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-lazy-scripts
-        COMMAND psp-browser-interactive-lab
-            --url https://section-scripts.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-lazy-scripts
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-lazy-script-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-lazy-script-final.ppm)
-    set_tests_properties(experimental-section-lazy-scripts PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"order-result\" text=\"head>alpha>beta>module:visibility=yes:relations=yes\""
-        FAIL_REGULAR_EXPRESSION "text=\"102\";text=\"121\";text=\"201\";text=\"211\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-document-script-order-late-start
-        COMMAND psp-browser-interactive-lab
-            --url https://section-scripts.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-lazy-scripts
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-lazy-script-late-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-script-late-final.ppm)
-    set_tests_properties(experimental-section-document-script-order-late-start
-        PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"order-result\" text=\"head>alpha>beta>module:visibility=yes:relations=yes\""
-        FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-script-order-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-scripts.test/page
@@ -2529,37 +2390,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(full-document-script-order-reference PROPERTIES
         PASS_REGULAR_EXPRESSION "experimental-node id=\"order-result\" text=\"head>alpha>beta>module:visibility=yes:relations=yes\""
         FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-parser-raw-visibility
-        COMMAND psp-browser-interactive-lab
-            --url https://section-parser-raw.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-parser-raw
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-parser-raw-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-parser-raw.ppm)
-    set_tests_properties(experimental-section-parser-raw-visibility PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-parser-result\" text=\"RAW-PARSER-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-PARSER-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-parser-raw-visibility-late-start
-        COMMAND psp-browser-interactive-lab
-            --url https://section-parser-raw.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-parser-raw
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-parser-raw-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-parser-raw-late.ppm)
-    set_tests_properties(experimental-section-parser-raw-visibility-late-start
-        PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-parser-result\" text=\"RAW-PARSER-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-PARSER-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
     add_test(NAME full-document-parser-raw-visibility-reference
@@ -2576,33 +2406,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "RAW-PARSER-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-raw-relations
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relations.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0 --ticks 2
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relation-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-raw-relations.ppm)
-    set_tests_properties(experimental-section-raw-relations PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-result\" text=\"RAW-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-raw-relations-late-start
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relations.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1 --ticks 2
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relation-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-raw-relations-late.ppm)
-    set_tests_properties(experimental-section-raw-relations-late-start
-        PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-result\" text=\"RAW-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-raw-relations-reference
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relations.html
@@ -2615,33 +2418,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "RAW-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-remote-geometry
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0 --ticks 2
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-remote-geometry.ppm)
-    set_tests_properties(experimental-section-remote-geometry PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"geometry-result\" text=\"GEOMETRY-PASS\""
-        FAIL_REGULAR_EXPRESSION "GEOMETRY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-remote-geometry-late-start
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 1 --ticks 2
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-remote-geometry-late.ppm)
-    set_tests_properties(experimental-section-remote-geometry-late-start
-        PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"geometry-result\" text=\"GEOMETRY-PASS\""
-        FAIL_REGULAR_EXPRESSION "GEOMETRY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-remote-geometry-reference
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry.html
@@ -2652,53 +2428,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(full-document-remote-geometry-reference PROPERTIES
         PASS_REGULAR_EXPRESSION "experimental-node id=\"geometry-result\" text=\"GEOMETRY-PASS\""
         FAIL_REGULAR_EXPRESSION "GEOMETRY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-document-script-quota
-        COMMAND psp-browser-interactive-lab
-            --url https://section-scripts.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-lazy-scripts
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts --script-count 2
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-script-quota-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-script-quota-final.ppm)
-    set_tests_properties(experimental-section-document-script-quota PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"beta-result\" text=\"original-b\""
-        FAIL_REGULAR_EXPRESSION "experimental-node id=\"beta-result\" text=\"111\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-remote-id
-        COMMAND psp-browser-interactive-lab
-            --url https://section-remote.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-remote-id
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-id-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-remote-id-final.ppm)
-    set_tests_properties(experimental-section-remote-id PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"remote-result\" text=\"REMOTE-PASS\""
-        FAIL_REGULAR_EXPRESSION "REMOTE-FAIL;loop command-failed"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-query-order
-        COMMAND psp-browser-interactive-lab
-            --url https://section-query-order.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-query-order
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections
-            --experimental-section 2
-            --ticks 2
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-query-order-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-query-order-final.ppm)
-    set_tests_properties(experimental-section-query-order PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"query-order-result\" text=\"ORDER-PASS\""
-        FAIL_REGULAR_EXPRESSION "ORDER-FAIL;loop command-failed"
         TIMEOUT 30)
 
     add_test(NAME full-document-query-order-reference
@@ -2716,36 +2445,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "ORDER-FAIL;loop command-failed"
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-wide-query
-        COMMAND psp-browser-interactive-lab
-            --url https://section-wide-query.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-wide-query
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-wide-query-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-wide-query.ppm)
-    set_tests_properties(experimental-section-wide-query PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"wide-query-result\" text=\"WIDE-QUERY-PASS\""
-        FAIL_REGULAR_EXPRESSION "WIDE-QUERY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-wide-query-late-start
-        COMMAND psp-browser-interactive-lab
-            --url https://section-wide-query.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-wide-query
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 1
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-wide-query-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-wide-query-late.ppm)
-    set_tests_properties(experimental-section-wide-query-late-start PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"wide-query-result\" text=\"WIDE-QUERY-PASS\""
-        FAIL_REGULAR_EXPRESSION "WIDE-QUERY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-wide-query-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-wide-query.test/page
@@ -2758,21 +2457,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(full-document-wide-query-reference PROPERTIES
         PASS_REGULAR_EXPRESSION "experimental-node id=\"wide-query-result\" text=\"WIDE-QUERY-PASS\""
         FAIL_REGULAR_EXPRESSION "WIDE-QUERY-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-root-mutation
-        COMMAND psp-browser-interactive-lab
-            --url https://section-root-mutation.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-mutation
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-mutation-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-mutation.ppm)
-    set_tests_properties(experimental-section-root-mutation PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"root-result\" text=\"ROOT-MUTATION-PASS\";experimental-walk start=0 distance=0 end=0"
-        FAIL_REGULAR_EXPRESSION "ROOT-MUTATION-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
     add_test(NAME full-document-root-mutation-reference
@@ -2789,21 +2473,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "ROOT-MUTATION-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-root-attributes
-        COMMAND psp-browser-interactive-lab
-            --url https://section-root-attributes.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-attributes
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-attributes-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-attributes.ppm)
-    set_tests_properties(experimental-section-root-attributes PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node-attribute id=\"root-html\" name=\"data-root-state\" value=\"html-kept\";experimental-node-attribute id=\"root-head\" name=\"data-root-state\" value=\"head-kept\";experimental-node-attribute id=\"root-body\" name=\"data-root-state\" value=\"body-kept\""
-        FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-root-attributes-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-root-attributes.test/page
@@ -2818,21 +2487,6 @@ if(PSP_BROWSER_BUILD_TESTS)
         FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME experimental-section-root-text
-        COMMAND psp-browser-interactive-lab
-            --url https://section-root-text.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-text
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-text-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-text.ppm)
-    set_tests_properties(experimental-section-root-text PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"root-text-result\" text=\"ROOT-TEXT-PASS\""
-        FAIL_REGULAR_EXPRESSION "ROOT-TEXT-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
     add_test(NAME full-document-root-text-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-root-text.test/page
@@ -2845,77 +2499,6 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(full-document-root-text-reference PROPERTIES
         PASS_REGULAR_EXPRESSION "experimental-node id=\"root-text-result\" text=\"ROOT-TEXT-PASS\""
         FAIL_REGULAR_EXPRESSION "ROOT-TEXT-FAIL;loop command-failed;interactive failure"
-        TIMEOUT 30)
-
-    # Each bounded section-retention table overflows except the stable-key
-    # event-target maps, which grow within the heap's execution reserve:
-    # their 140 listener and handler targets drop nothing.
-    add_test(NAME experimental-section-retention-caps
-        COMMAND psp-browser-interactive-lab
-            --url https://section-retention-cap.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-retention-cap
-            --deterministic-replay-seed 42
-            --psp-profile realistic --fetch-scripts
-            --script-heap-mb 12 --script-total-mb 16
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-retention-cap-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-retention-cap-final.ppm)
-    set_tests_properties(experimental-section-retention-caps PROPERTIES
-        PASS_REGULAR_EXPRESSION "javascript-section-retention wrapper-evictions=[1-9][0-9]* listener-drops=0 handler-drops=0 observer-drops=[1-9][0-9]* record-drops=[1-9][0-9]* dirty-drops=[1-9][0-9]* state-evictions=[1-9][0-9]* control-drops=[1-9][0-9]*"
-        FAIL_REGULAR_EXPRESSION "loop command-failed;status=FAIL"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-anonymous-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anonymous-state.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-anonymous-state-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-anonymous-state-final.ppm)
-    set_tests_properties(experimental-section-anonymous-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-focus restored key=\"s:0:.*experimental-control id=\"anonymous-result\" value=\"HLOHLO\""
-        FAIL_REGULAR_EXPRESSION "value=\"X;loop command-failed"
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-property-handler-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-onhandler.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-onhandler-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-onhandler-final.ppm)
-    set_tests_properties(experimental-section-property-handler-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-control id=\"handler-result\" value=\"AB\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-observer-selection-state
-        COMMAND psp-browser-interactive-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-observer-selection.html
-            --psp-profile strict --experimental-compressed-sections
-            --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-observer-selection-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-observer-selection-final.ppm)
-    set_tests_properties(experimental-section-observer-selection-state PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-control id=\"observer-result\" value=\"A:1-3-forwardO\""
-        TIMEOUT 30)
-
-    add_test(NAME experimental-section-url-reload
-        COMMAND psp-browser-interactive-lab
-            --url https://section-scripts.test/page
-            --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-lazy-scripts
-            --deterministic-replay-seed 42
-            --psp-profile strict --fetch-scripts
-            --experimental-compressed-sections --experimental-section 0
-            --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-url-reload-commands.txt
-            --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-url-reload-final.ppm)
-    set_tests_properties(experimental-section-url-reload PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"beta-result\" text=\"110\""
-        FAIL_REGULAR_EXPRESSION "interactive failure"
         TIMEOUT 30)
 
     get_property(_tilefinch_lab_scenarios DIRECTORY PROPERTY TESTS)

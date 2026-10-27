@@ -39,6 +39,136 @@ static void original_commit(void *opaque)
     (void) opaque;
 }
 
+/* navigation_commit_document runs in phases separated by named
+   checkpoints. A refusal at the end of each phase (a supervisor cancel at
+   the checkpoint, or a cancelled layout build in the final phase) must
+   leave the incumbent page, its realm and display list, its history entry
+   and the session state the commit replaced exactly as they were. */
+typedef struct {
+    const char *phase;
+    bool prefix;
+    bool refused;
+} CommitPhaseRefusal;
+
+static bool refuse_commit_phase(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    CommitPhaseRefusal *refusal = opaque;
+    if (refusal->refused || phase == NULL) return true;
+    bool match = refusal->prefix
+        ? strncmp(phase, refusal->phase, strlen(refusal->phase)) == 0
+        : strcmp(phase, refusal->phase) == 0;
+    if (!match) return true;
+    refusal->refused = true;
+    return false;
+}
+
+static bool commit_phase_refusal_keeps_incumbent(const char *phase,
+                                                 bool prefix)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    if (!budget_install_lexbor(&budget)) return false;
+    NavigationSession navigation;
+    static const char incumbent_html[] =
+        "<!doctype html><title>Prior</title>"
+        "<style>p{color:#123456}</style>"
+        "<script>window.kept = 1;</script><body><p>retained</p>";
+    uint64_t generation = 0;
+    bool ok = navigation_init(&navigation, &budget, 4);
+    if (ok) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        generation = navigation_begin(&navigation);
+        ok = navigation_commit_html(
+            &navigation, generation, "https://prior.test/#old",
+            incumbent_html, sizeof(incumbent_html) - 1, 480, NULL, NULL,
+            true);
+    }
+    lxb_html_document_t *document = navigation.page.document.html;
+    ScriptRuntime *runtime = navigation.page.runtime;
+    DrawCommand *commands = navigation.page.layout.commands;
+    size_t command_count = navigation.page.layout.count;
+    size_t history_count = navigation.history_count;
+    size_t history_index = navigation.history_index;
+    ViewportContext viewport = navigation.viewport;
+    const FontSet *fonts = navigation.fonts;
+    const ImageResources *images = navigation.images;
+    uint64_t fingerprint = navigation.resource_fingerprint;
+    bool style_rebuild_required = navigation.style_rebuild_required;
+    size_t committed = navigation.loads_committed;
+    ok = ok && runtime != NULL && commands != NULL;
+
+    static const char candidate[] =
+        "<!doctype html><title>Refused candidate</title>"
+        "<meta name=viewport content='width=device-width'>"
+        "<style>p{color:red;margin:3em}</style>"
+        "<script>document.title = 'Refused script';</script>"
+        "<body><p>replacement</p><p>second</p>";
+    CommitPhaseRefusal refusal = {.phase = phase, .prefix = prefix};
+    TilefinchPlatformServices services = {
+        .context = &refusal, .cooperate = refuse_commit_phase
+    };
+    if (ok) {
+        generation = navigation_begin(&navigation);
+        tilefinch_platform_set_services(&services);
+        ok = !navigation_commit_html(
+            &navigation, generation, "https://candidate.test/", candidate,
+            sizeof(candidate) - 1, 480, NULL, NULL, true);
+        tilefinch_platform_set_services(NULL);
+    }
+    ok = ok && refusal.refused
+        && navigation.page.loaded
+        && navigation.page.document.html == document
+        && navigation.page.runtime == runtime
+        && navigation.page.layout.commands == commands
+        && navigation.page.layout.count == command_count
+        && strcmp(navigation.page.document.title, "Prior") == 0
+        && strcmp(navigation.page.document_url, "https://prior.test/#old") == 0
+        && navigation.history_count == history_count
+        && navigation.history_index == history_index
+        && memcmp(&navigation.viewport, &viewport, sizeof(viewport)) == 0
+        && navigation.fonts == fonts && navigation.images == images
+        && navigation.resource_fingerprint == fingerprint
+        && navigation.style_rebuild_required == style_rebuild_required
+        && navigation.loads_committed == committed
+        && incumbent_is_renderable(&navigation);
+    if (!ok) fprintf(stderr, "commit refusal at %s%s left the incumbent "
+                     "changed (refused=%d)\n", phase, prefix ? "*" : "",
+                     (int) refusal.refused);
+    navigation_destroy(&navigation);
+    ok = ok && budget.current == 0 && budget_categories_reconcile(&budget);
+    return budget_uninstall_lexbor(&budget) && ok;
+}
+
+static bool test_commit_phase_refusals_keep_incumbent(void)
+{
+    static const struct {
+        const char *phase;
+        bool prefix;
+    } phases[] = {
+        { "navigation-setup", false },
+        { "navigation-style", false },
+        { "navigation-stylesheets", false },
+        { "navigation-scripts", false },
+        { "navigation-post-script-style", false },
+        { "navigation-final-style", false },
+        { "navigation-fonts", false },
+        { "navigation-images", false },
+        /* The layout-and-publish phase: its authoritative build, then the
+           finalize checkpoint that follows it. */
+        { "layout", true },
+        { "navigation-finalize", false }
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        ok = commit_phase_refusal_keeps_incumbent(
+                 phases[i].phase, phases[i].prefix) && ok;
+    }
+    return ok;
+}
+
 static bool test_candidate_hook_set_is_transactional(void)
 {
     Budget budget;
@@ -1384,8 +1514,8 @@ static bool test_style_append_past_source_bound_keeps_confinement(void)
     /* 47 document sources and the shadow-only constructed sheet. */
     ok = ok && sheet->style_source_count == STYLE_SOURCE_NODE_LIMIT
         && !sheet->style_sources_bounded_out
-        && sheet->adopted_source_count == 1
-        && sheet->adopted_shadow_only_mask == 1
+        && sheet->scopes.adopted_source_count == 1
+        && sheet->scopes.adopted_shadow_only_mask == 1
         && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
         && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233;
     ok = ok && append_order_mutate(&navigation,
@@ -1397,8 +1527,8 @@ static bool test_style_append_past_source_bound_keeps_confinement(void)
         "bounded=%d adopted=%zu mask=%llx outside=%06x error=%s\n",
         (size_t) sheet->style_source_count,
         (int) sheet->style_sources_bounded_out,
-        (size_t) sheet->adopted_source_count,
-        (unsigned long long) sheet->adopted_shadow_only_mask,
+        (size_t) sheet->scopes.adopted_source_count,
+        (unsigned long long) sheet->scopes.adopted_shadow_only_mask,
         (unsigned) append_order_text_color(&navigation.page.layout, "Outside"),
         navigation.last_error);
     if (ready) navigation_destroy(&navigation);
@@ -1444,8 +1574,8 @@ static bool retired_style_source_case(bool indexed)
         480, NULL, NULL, true);
     Stylesheet *sheet = &navigation.page.stylesheet;
     ok = ok && !sheet->style_sources_bounded_out
-        && sheet->adopted_source_count == 1
-        && sheet->adopted_shadow_only_mask == 1
+        && sheet->scopes.adopted_source_count == 1
+        && sheet->scopes.adopted_shadow_only_mask == 1
         && append_order_text_color(&navigation.page.layout, "Outside") == 0x010203
         && append_order_text_color(&navigation.page.layout, "InsideA") == 0x112233;
     /* What the retirement observer does when a recorded source dies. This
@@ -1513,7 +1643,7 @@ static bool required_style_rebuild_case(bool focus_first)
         "https://retired-semantic.test/", html, sizeof(html) - 1,
         480, NULL, NULL, true);
     Stylesheet *sheet = &navigation.page.stylesheet;
-    ok = ok && sheet->adopted_shadow_only_mask == 1;
+    ok = ok && sheet->scopes.adopted_shadow_only_mask == 1;
     /* What the retirement observer does when a recorded source dies. */
     if (ok) sheet->style_sources_bounded_out = true;
     ScriptResult result = {0};

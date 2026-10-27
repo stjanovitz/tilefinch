@@ -6176,6 +6176,187 @@ static int test_youtube_home_topics_are_lazy(void)
     return 0;
 }
 
+/* The settings failure policy (psp_ui_settings.h) against a real engine:
+   both halves take an accepted value, and a refusal by either leaves the
+   engine and the profile agreeing. A shut-down engine is the engine's own
+   refusal of the YouTube and Night mode setters. */
+static int test_settings_failure_policy_with_engine(void)
+{
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 8;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+    memset(&ui, 0, sizeof(ui));
+
+    /* Website fonts: a profile that refuses must not leave the engine on
+       the new mode. Only a missing profile refuses a valid mode. */
+    CHECK(browser_engine_set_web_font_mode(engine, WEB_FONTS_ON));
+    CHECK(psp_web_font_setting_apply(NULL, engine, &ui, WEB_FONTS_OFF)
+          == PSP_SETTING_PROFILE_REFUSED);
+    CHECK(browser_engine_config(engine)->resources.web_font_mode == WEB_FONTS_ON);
+    CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_ON));
+    CHECK(psp_web_font_setting_apply(profile, engine, &ui, WEB_FONTS_OFF)
+          == PSP_SETTING_APPLIED);
+    CHECK(browser_engine_config(engine)->resources.web_font_mode == WEB_FONTS_OFF
+          && browser_profile_web_font_mode(profile) == WEB_FONTS_OFF
+          && ui.web_font_mode == WEB_FONTS_OFF
+          && strcmp(ui.status, "WEBSITE FONTS OFF") == 0);
+
+    static const PspUiSettingId engine_rows[] = {
+        PSP_UI_SETTING_YOUTUBE_TOPICS, PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS
+    };
+    for (size_t row = 0; row < 2u; row++) {
+        const PspBoolSetting *setting = psp_bool_setting_find(engine_rows[row]);
+        CHECK(setting != NULL && setting->engine_set != NULL);
+        bool wanted = !setting->profile_get(profile);
+        CHECK(psp_bool_setting_apply(setting, profile, engine, &ui, wanted)
+              == PSP_SETTING_APPLIED);
+        CHECK(setting->profile_get(profile) == wanted
+              && strcmp(ui.status, wanted ? setting->on_status
+                                          : setting->off_status) == 0);
+    }
+    ui.color_mode = BROWSER_COLOR_MODE_DARK;
+    ui.page_dark = true;
+    CHECK(psp_color_mode_setting_apply(
+              profile, engine, &ui, BROWSER_COLOR_MODE_DARK, false)
+          == PSP_SETTING_APPLIED);
+    CHECK(browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_DARK
+          && ui.color_mode == BROWSER_COLOR_MODE_DARK && ui.page_dark
+          && strcmp(ui.status, "NIGHT MODE DARK") == 0);
+
+    CHECK(browser_engine_shutdown(engine));
+    for (size_t row = 0; row < 2u; row++) {
+        const PspBoolSetting *setting = psp_bool_setting_find(engine_rows[row]);
+        bool before = setting->profile_get(profile);
+        setting->ui_set(&ui, !before);
+        CHECK(psp_bool_setting_apply(setting, profile, engine, &ui, !before)
+              == PSP_SETTING_ENGINE_REFUSED);
+        CHECK(setting->profile_get(profile) == before
+              && strcmp(ui.status, before ? setting->on_status
+                                          : setting->off_status) == 0);
+        static PspUiState expected;
+        expected = ui;
+        setting->ui_set(&expected, before);
+        CHECK(memcmp(&expected, &ui, sizeof(ui)) == 0);
+    }
+    ui.color_mode = BROWSER_COLOR_MODE_LIGHT;
+    ui.page_dark = false;
+    CHECK(psp_color_mode_setting_apply(
+              profile, engine, &ui, BROWSER_COLOR_MODE_LIGHT, true)
+          == PSP_SETTING_ENGINE_REFUSED);
+    CHECK(browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_DARK
+          && ui.color_mode == BROWSER_COLOR_MODE_DARK && ui.page_dark
+          && strcmp(ui.status, "NIGHT MODE DARK") == 0);
+    browser_engine_destroy(engine);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+/* Boot, Night mode's clock refresh and the site JavaScript switch against a
+   live engine: accepted values reach it, and once it is shut down (its own
+   refusal) the profile and the chrome take the values it kept. */
+static int test_settings_boot_and_refresh_with_engine(void)
+{
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 8;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    static PspUiState ui;
+
+    /* Accepted at boot: the engine takes the profile's values. */
+    CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_OFF));
+    CHECK(psp_web_font_setting_boot(profile, engine) == PSP_SETTING_APPLIED);
+    CHECK(browser_engine_config(engine)->resources.web_font_mode == WEB_FONTS_OFF);
+    browser_profile_set_youtube_compact_results(profile, true);
+    browser_profile_set_youtube_topics(profile, false);
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
+    memset(&ui, 0, sizeof(ui));
+    psp_app_ui_sync_from_profile(&ui, profile);
+    ui.page_dark = true;
+    CHECK(psp_engine_settings_boot(profile, engine, &ui) == 0u);
+    CHECK(browser_engine_forced_dark(engine)
+          && browser_engine_youtube_compact_results(engine)
+          && !browser_engine_youtube_topics(engine)
+          && ui.page_dark && ui.status[0] == '\0');
+
+    /* The clock refresh: an accepted change repaints. */
+    ui.page_dark = false;
+    CHECK(psp_color_mode_refresh_apply(engine, &ui, true));
+    CHECK(!browser_engine_forced_dark(engine) && !ui.page_dark);
+    ui.page_dark = true;
+    CHECK(psp_color_mode_refresh_apply(engine, &ui, false));
+    CHECK(browser_engine_forced_dark(engine));
+
+    /* Site JavaScript: a change both halves take. */
+    snprintf(ui.url, sizeof(ui.url), "%s", "https://example.com/");
+    ui.site_javascript_enabled = false;
+    CHECK(psp_site_javascript_setting_apply(profile, engine, &ui, false)
+          == PSP_SETTING_APPLIED);
+    CHECK(!browser_profile_site_javascript_enabled(profile, ui.url)
+          && !browser_engine_config(engine)->javascript.enabled);
+    /* During a load: a value already in effect leaves the load running
+       (it used to be cancelled first and then nothing reloaded), and a
+       change cancels it, since the engine takes no policy mid-load, and
+       the caller reloads. */
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "https://example.com/next", 64u * 1024u, 1000, true)
+          && browser_engine_navigation_pending(engine));
+    CHECK(psp_site_javascript_setting_apply(profile, engine, &ui, false)
+          == PSP_SETTING_UNCHANGED);
+    CHECK(browser_engine_navigation_pending(engine));
+    CHECK(psp_site_javascript_setting_apply(profile, engine, &ui, true)
+          == PSP_SETTING_APPLIED);
+    CHECK(!browser_engine_navigation_pending(engine)
+          && browser_profile_site_javascript_enabled(profile, ui.url)
+          && browser_engine_config(engine)->javascript.enabled);
+
+    /* Shut down, the engine refuses and keeps dark, compact and no topics.
+       A profile asking for the opposite is brought back to them. */
+    CHECK(browser_engine_shutdown(engine));
+    browser_profile_set_youtube_compact_results(profile, false);
+    browser_profile_set_youtube_topics(profile, true);
+    browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_LIGHT);
+    memset(&ui, 0, sizeof(ui));
+    psp_app_ui_sync_from_profile(&ui, profile);
+    ui.page_dark = false;
+    CHECK(psp_engine_settings_boot(profile, engine, &ui) == 3u);
+    CHECK(browser_profile_youtube_compact_results(profile)
+          && !browser_profile_youtube_topics(profile)
+          && ui.youtube_compact_results && !ui.youtube_topics
+          && browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_DARK
+          && ui.color_mode == BROWSER_COLOR_MODE_DARK && ui.page_dark
+          && ui.status[0] == '\0');
+    /* The refresh's refusal keeps the dark page the engine still paints. */
+    ui.page_dark = false;
+    CHECK(!psp_color_mode_refresh_apply(engine, &ui, true) && ui.page_dark);
+    browser_engine_destroy(engine);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 /* A response whose body carries no initial-data marker (consent
    interstitial, error page, size-truncated capture) leaves the decode with
    nothing to hand forward.  The phase machine never consults timeout_ms, so

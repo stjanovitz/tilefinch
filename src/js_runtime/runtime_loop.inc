@@ -841,7 +841,8 @@ static bool runtime_dispatch_page_visibility_edge(ScriptRuntime *runtime)
     JSValue argument = JS_NewBool(runtime->context, visible);
     bool ok = !JS_IsException(argument)
         && runtime_call_captured(
-               runtime, runtime->page_visibility_host_apply,
+               runtime,
+               runtime->host_callbacks[SCRIPT_HOST_APPLY_PAGE_VISIBILITY],
                "page visibility", 1, &argument, NULL);
     JS_FreeValue(runtime->context, argument);
     return ok;
@@ -871,7 +872,8 @@ static bool runtime_dispatch_image_load(ScriptRuntime *runtime, bool *dispatched
         state->delivered = true;
         JSValue arguments[2] = {JS_NewInt64(runtime->context, state->handle),
                                 JS_NewString(runtime->context, "load")};
-        bool ok = runtime_call_captured(runtime, runtime->dispatch_handle,
+        bool ok = runtime_call_captured(
+            runtime, runtime->host_callbacks[SCRIPT_HOST_DISPATCH_HANDLE],
             "image load", 2, arguments, NULL);
         JS_FreeValue(runtime->context, arguments[0]);
         JS_FreeValue(runtime->context, arguments[1]);
@@ -914,7 +916,9 @@ static bool runtime_task_slice_available(const ScriptRuntime *runtime,
     /* This is a task boundary, after the preceding microtask checkpoint.
        A frontend refusal means defer, not an author exception or watchdog
        cancellation. Never interrupt an executing task to dispatch input. */
-    if (!tilefinch_platform_cooperate("page-task-boundary", budget - remaining))
+    if (!tilefinch_platform_cooperate_at("page-task-boundary",
+                                         budget - remaining,
+                                         TILEFINCH_COOPERATE_PAGE_TASK))
         return false;
     uint64_t limit = runtime->bridge.execution_policy.maximum_advance_time_us;
     /* Make at least one task's progress even when preparation itself is
@@ -1108,8 +1112,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
        classic script must remain the only author task until it completes. */
     if (!classic_continuation
         && runtime->host_state[SCRIPT_HOST_STATE_SCROLL_PENDING] != 0
-        && !runtime_call_captured(runtime, runtime->page_scroll_flush,
-                                  "page scroll dispatch", 0, NULL, NULL)) {
+        && !runtime_call_captured(
+               runtime, runtime->host_callbacks[SCRIPT_HOST_FLUSH_PAGE_SCROLL],
+               "page scroll dispatch", 0, NULL, NULL)) {
         runtime->result.success = false;
         js_rt_runtime_update_frame_result(runtime, result);
         return false;

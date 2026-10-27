@@ -499,6 +499,257 @@ static int test_layout_scoped_selector_work(void)
     return 0;
 }
 
+/* The sheet-wide ::before/::after content screen: only a pseudo rule whose
+   declarations can supply content (a generating value, inherit, or a
+   var()) admits that pseudo, and appended CSS is seen. */
+static int test_pseudo_may_generate(void)
+{
+    static const struct {
+        const char *css;
+        bool before, after;
+    } cases[] = {
+        {"p{color:red}a:hover{color:blue}", false, false},
+        {"p::before{color:red;background:blue}b::after{content:none}",
+         false, false},
+        {"p::after{content:''}", false, true},
+        {"p:before{content:'x'}", true, false},
+        {"i::before{--mark:'V';content:var(--mark)}", true, false},
+        {"i::after{content:inherit}", false, true},
+        {"input::placeholder{color:red}", false, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        static const char html[] = "<p>prose</p>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+        Stylesheet sheet = {0};
+        CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+        CHECK(stylesheet_add_css(&sheet, cases[i].css, strlen(cases[i].css)));
+        if (style_pseudo_may_generate(&sheet, PSEUDO_BEFORE) != cases[i].before
+            || style_pseudo_may_generate(&sheet, PSEUDO_AFTER)
+                != cases[i].after) {
+            fprintf(stderr, "pseudo screen case %zu (%s)\n", i, cases[i].css);
+            return 1;
+        }
+        CHECK(style_pseudo_may_generate(&sheet, PSEUDO_PLACEHOLDER)
+              && style_pseudo_may_generate(&sheet, PSEUDO_NONE));
+        /* A later sheet is seen without any explicit invalidation. */
+        static const char more[] = "q::before{content:open-quote}"
+            "q::after{content:close-quote}";
+        CHECK(stylesheet_add_css(&sheet, more, sizeof(more) - 1u));
+        CHECK(style_pseudo_may_generate(&sheet, PSEUDO_BEFORE)
+              && style_pseudo_may_generate(&sheet, PSEUDO_AFTER));
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* A focus change of colour or background colour alone is paint the
+   retained text and background can take; any other consumer of the colour,
+   or content the recolour cannot reach, is not. */
+static int test_focus_color_paint_classification(void)
+{
+    static const struct {
+        const char *css, *body;
+        StyleFocusChange change;
+        int texts, kept;  /* -1: style_focus_color_texts refuses */
+    } cases[] = {
+        {"a{color:#111111}a:focus{color:#cc0000}",
+         "<a id=t href=#>x<span>y</span></a>",
+         STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, 2, 0},
+        {"a{color:#111111}a:focus{color:#cc0000}.k{color:#00ff00}",
+         "<a id=t href=#>x<span class=k>y</span></a>",
+         STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, 1, 1},
+        {"a{color:#111111;border:1px solid}a:focus{color:#cc0000}",
+         "<a id=t href=#>x</a>", STYLE_FOCUS_CHANGE_UNSAFE, 0, 0},
+        {"a{color:#111111;border:1px solid #000}a:focus{color:#cc0000}",
+         "<a id=t href=#>x</a>", STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, 1, 0},
+        {"a{color:#111111;box-shadow:0 0 0 1px}a:focus{color:#cc0000}",
+         "<a id=t href=#>x</a>", STYLE_FOCUS_CHANGE_UNSAFE, 0, 0},
+        {"a{color:#111111}a:focus{color:#cc0000;padding:1px}",
+         "<a id=t href=#>x</a>", STYLE_FOCUS_CHANGE_UNSAFE, 0, 0},
+        {"a{color:#111111}a:focus{color:#cc0000}a::after{content:'>'}",
+         "<a id=t href=#>x</a>", STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, -1, 0},
+        {"a{color:#111111}a:focus{color:#cc0000}",
+         "<a id=t href=#>x<img alt=y></a>",
+         STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, 2, 0},
+        {"a{color:#111111}a:focus{color:#cc0000}",
+         "<a id=t href=#>x<input value=y></a>",
+         STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, -1, 0},
+        {"button{background:#eeeeee}button:focus{background:#ccccff}",
+         "<button id=t>B</button>", STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY, 0, 0},
+        {"li:focus{color:#cc0000}", "<ul><li id=t tabindex=0>x</li></ul>",
+         STYLE_FOCUS_CHANGE_UNSAFE, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        char html[512];
+        int length = snprintf(html, sizeof(html), "<style>%s</style>%s",
+                              cases[i].css, cases[i].body);
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        CHECK(document_parse(&document, &budget, html, (size_t) length, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "t");
+        CHECK(node != NULL);
+        ComputedStyle normal, focused;
+        StyleFocusChange change = style_focus_change_classify(
+            &sheet, node, NULL, &normal, &focused);
+        StyleFocusColorTexts texts;
+        int text_count = 0, kept_count = 0;
+        if (change == STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY) {
+            bool ok = style_focus_color_texts(&sheet, node, &normal, &focused,
+                                              &texts);
+            text_count = ok ? (int) texts.text_count : -1;
+            kept_count = ok ? (int) texts.kept_count : 0;
+        }
+        if (change != cases[i].change || text_count != cases[i].texts
+            || kept_count != cases[i].kept) {
+            fprintf(stderr, "focus colour case %zu: change %d texts %d kept %d\n",
+                    i, (int) change, text_count, kept_count);
+            return 1;
+        }
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* A style attribute scanned once is answered from the sheet's memo of
+   texts; the sheet flags it sets, and the logical/font-relative answers,
+   are those a fresh scan gives, for repeated and new texts alike. */
+static int test_inline_scan_memo(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<div id=a style='color:red; cursor:pointer'>a</div>"
+        "<div id=b style='margin-inline-start:2em'>b</div>"
+        "<div id=c style='columns:2'>c</div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b");
+    lxb_dom_node_t *c = find_id(root, "c");
+    CHECK(a != NULL && b != NULL && c != NULL);
+    ComputedStyle parent = style_for_node(&sheet, root, NULL);
+    for (unsigned round = 0; round < 3; round++) {
+        ComputedStyle style = style_for_node(&sheet, a, &parent);
+        CHECK(style.color == 0xff0000 && sheet.has_cursor_rules);
+        ComputedStyle first = style_for_node(&sheet, b, &parent);
+        ComputedStyle again = style_for_node(&sheet, b, &parent);
+        CHECK(memcmp(&first, &again, sizeof(first)) == 0
+              && first.margin.left == 32);
+    }
+    CHECK(!sheet.has_multicolumn_rules);
+    (void) style_for_node(&sheet, c, &parent);
+    CHECK(sheet.has_multicolumn_rules);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+typedef struct {
+    Budget *budget;
+    Stylesheet *sheet;
+    void *ballast;
+} InlineScanYield;
+
+/* What the engine's reclaim hook does: give back room (here a ballast
+   block) and yield the sheet's memo, possibly during the memo's own
+   allocation. */
+static size_t inline_scan_yield_hook(void *opaque, size_t needed_bytes)
+{
+    (void) needed_bytes;
+    InlineScanYield *yield = opaque;
+    size_t released = stylesheet_yield_inline_scans(yield->sheet);
+    if (yield->ballast != NULL) {
+        budget_free(yield->budget, yield->ballast);
+        yield->ballast = NULL;
+        released += 16384u;
+    }
+    return released;
+}
+
+/* The style-attribute memo is optional memory: the Budget's reclaim hook
+   frees it, it stays off for the sheet's life, and a hook that fires
+   inside the memo's own allocation leaves no memo behind. Either way the
+   sheet flags and resolved styles are those of a fresh scan. */
+static int test_inline_scan_memo_yields(void)
+{
+    for (int during = 0; during < 2; during++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        static const char html[] =
+            "<div id=a style='color:red; cursor:pointer'>a</div>"
+            "<div id=c style='columns:2'>c</div>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *a = find_id(root, "a"), *c = find_id(root, "c");
+        CHECK(a != NULL && c != NULL);
+        ComputedStyle parent = style_for_node(&sheet, root, NULL);
+        InlineScanYield yield = {&budget, &sheet, NULL};
+        if (!during) {
+            (void) style_for_node(&sheet, a, &parent);
+            CHECK(sheet.inline_scans != NULL);
+            size_t current = budget.current;
+            size_t retained = stylesheet_retained_bytes(&sheet);
+            budget_set_reclaim_hook(&budget, inline_scan_yield_hook, &yield);
+            CHECK(!budget_make_room(&budget, budget_remaining(&budget) + 65536u));
+            CHECK(budget.current < current);
+            /* The sheet's retained figure (the compiled-sheet cache admits
+               by it) counted the memo it just gave back, less the Budget's
+               own block header. */
+            size_t fell = retained - stylesheet_retained_bytes(&sheet);
+            size_t freed = current - budget.current;
+            if (fell > freed || fell + 64u < freed) {
+                fprintf(stderr, "inline memo: retained fell %zu, freed %zu\n",
+                        fell, freed);
+                return 1;
+            }
+        } else {
+            /* The memo's first allocation finds the Budget full; the hook
+               frees the ballast (room enough) and yields the memo. */
+            yield.ballast = budget_malloc(&budget, 16384u);
+            CHECK(yield.ballast != NULL);
+            budget.limit = budget.current + 64u;
+            budget_set_reclaim_hook(&budget, inline_scan_yield_hook, &yield);
+            ComputedStyle style = style_for_node(&sheet, a, &parent);
+            CHECK(style.color == 0xff0000 && sheet.has_cursor_rules
+                  && yield.ballast == NULL);
+            budget.limit = 8u * MIB;
+        }
+        budget_set_reclaim_hook(&budget, NULL, NULL);
+        CHECK(sheet.inline_scans == NULL && sheet.inline_scans_yielded);
+        for (unsigned round = 0; round < 2; round++) {
+            ComputedStyle style = style_for_node(&sheet, a, &parent);
+            CHECK(style.color == 0xff0000 && sheet.has_cursor_rules);
+        }
+        CHECK(!sheet.has_multicolumn_rules);
+        (void) style_for_node(&sheet, c, &parent);
+        CHECK(sheet.has_multicolumn_rules && sheet.inline_scans == NULL);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
 static int test_pseudo_absence_proof(void)
 {
     Budget budget;
@@ -2478,6 +2729,11 @@ static int test_grid_minmax_arguments(void)
         {"minmax(foo, 1fr)", false, 0, 0, 0},
         {"minmax(1fr, 100px)", false, 0, 0, 0},
         {"minmax(-5px, 1fr)", false, 0, 0, 0},
+        /* Inside a math function a negative floor is not a parse error:
+           CSS Values 4 range checking clamps it (to 0) at computed time,
+           so the track stays valid (review 1026 S4 asked otherwise). */
+        {"minmax(calc(-1px), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
+        {"minmax(min(-5px, 10%), 1fr)", true, GRID_TRACK_FLEX, 1000, 0},
         {"minmax(, 1fr)", false, 0, 0, 0},
         {"minmax(10px)", false, 0, 0, 0},
         {"minmax(1px, 2px, 3px)", false, 0, 0, 0},
@@ -3605,6 +3861,103 @@ static int test_retained_nested_selector_invalidation(void)
     return 0;
 }
 
+typedef struct {
+    lxb_dom_node_t *nodes[8];
+    size_t count;
+} HasDropLog;
+
+static void has_drop_log(void *opaque, lxb_dom_node_t *node)
+{
+    HasDropLog *log = opaque;
+    if (log->count < sizeof(log->nodes) / sizeof(log->nodes[0]))
+        log->nodes[log->count++] = node;
+}
+
+/* Whether the scoped :has() plan sends `subject` for restyle after an
+   attribute change named `attribute` on `changed` (an unbounded change
+   resets every style, which reaches it too). */
+static bool has_plan_change_reaches(const Stylesheet *sheet,
+                                    lxb_dom_node_t *changed,
+                                    const char *attribute,
+                                    lxb_dom_node_t *subject)
+{
+    StyleHasPending pending;
+    memset(&pending, 0, sizeof(pending));
+    HasDropLog log = {0};
+    if (!style_has_note_change(sheet, changed, false, attribute, NULL, 0,
+                               &pending, has_drop_log, &log, NULL))
+        return true;
+    for (size_t i = 0; i < log.count; i++)
+        if (log.nodes[i] == subject) return true;
+    return style_has_pending_selects(sheet, &pending, subject);
+}
+
+/* The two halves of :has() invalidation ask one question, "does this
+   selector read attribute X?": the whole-sheet screen for a setAttribute
+   (stylesheet_attribute_change_may_affect_has, exact names) and the scoped
+   plan (style_has_note_change, which also sees journal names that may be
+   truncated prefixes). Each case is an input their scanners once answered
+   differently. */
+static int test_has_attribute_readers_agree(void)
+{
+    static const struct {
+        const char *rule;     /* argument of .watch:has(...) */
+        const char *name;     /* changed attribute */
+        bool exact;           /* screen answer for that exact name */
+        bool plan;            /* plan reaches .watch */
+    } cases[] = {
+        /* An escaped name is only resolved by the full selector parser:
+           both fail open. */
+        {"[s\\74 yle*='red']", "style", true, true},
+        /* So is a namespace-qualified one. */
+        {"[*|style]", "style", true, true},
+        /* A plain exact name. */
+        {"[data-on]", "data-on", true, true},
+        /* A prefix of a longer name: an exact setAttribute name cannot be
+           it, but a journal name may be a truncated prefix of it. */
+        {"[data-one]", "data-on", false, true},
+        /* A pseudo-class that reads the attribute, in either case. */
+        {":any-link", "href", true, true},
+        {":ANY-LINK", "href", true, true},
+        /* An unrelated attribute stays out on both sides. */
+        {"[data-on]", "title", false, false},
+    };
+    bool failed = false;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        char html[256];
+        int length = snprintf(html, sizeof(html),
+            "<style>.watch{color:blue}.watch:has(%s){color:red}</style>"
+            "<div class=watch id=watch><a id=edit>x</a></div>",
+            cases[i].rule);
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        CHECK(document_parse(&document, &budget, html, (size_t) length, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *watch = find_id(root, "watch");
+        lxb_dom_node_t *edit = find_id(root, "edit");
+        CHECK(watch != NULL && edit != NULL);
+        const char *name = cases[i].name;
+        bool exact = stylesheet_attribute_change_may_affect_has(
+            &sheet, name, strlen(name), NULL, 0, "x", 1);
+        bool plan = has_plan_change_reaches(&sheet, edit, name, watch);
+        if (exact != cases[i].exact || plan != cases[i].plan) {
+            fprintf(stderr, "has attribute case %zu (%s / %s): screen %d "
+                    "(want %d), plan %d (want %d)\n", i, cases[i].rule,
+                    name, exact, cases[i].exact, plan, cases[i].plan);
+            failed = true;
+        }
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return failed ? 1 : 0;
+}
+
 static int test_retained_focus_descendants(void)
 {
     Budget budget;
@@ -3687,7 +4040,7 @@ static int test_bounded_out_sheet_keeps_focus_fast_path(void)
             stylesheet_prepare_for_document_reuse(&sheet);
         }
         CHECK(sheet.style_sources_bounded_out
-              && sheet.adopted_source_count == 0);
+              && sheet.scopes.adopted_source_count == 0);
         lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
         lxb_dom_node_t *input = find_id(root, "input");
         lxb_dom_node_t *label = find_id(root, "label");
@@ -3725,6 +4078,314 @@ static int test_bounded_out_sheet_keeps_focus_fast_path(void)
         stylesheet_destroy(&sheet);
         document_destroy(&document);
         CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+static void set_focus_marker(PocDocument *document, lxb_dom_node_t *node)
+{
+    BudgetAllocationOwner owner = document_allocation_owner_enter(document);
+    (void) lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+        (const lxb_char_t *) "data-tilefinch-focus", 20,
+        (const lxb_char_t *) "", 0);
+    document_allocation_owner_leave(document, owner);
+}
+
+/* A sibling focus rule (input:focus + label) whose focus is read only on
+   the moved element restyles only that element's subtree and its later
+   siblings' subtrees: an earlier row's label keeps its retained style and
+   its row's intrinsic width. A rule that reaches elsewhere (:focus-within
+   on an ancestor, a :has() on an earlier sibling) still drops every
+   element it may select. */
+static int test_sibling_focus_invalidation_scope(void)
+{
+    static const struct {
+        const char *css;
+        const char *changed;  /* id that must take #654321 */
+        bool keeps_earlier;   /* the earlier row's label stays a hit */
+    } cases[] = {
+        {"input:focus + label{color:#654321}", "l1", true},
+        {"input:focus ~ * label{color:#654321}", "l1x", true},
+        {":not(:focus) + label{color:#123456}"
+         "input:focus + label{color:#654321}", "l1", true},
+        {"input:focus + label{color:#654321}"
+         ".row:focus-within ~ p{color:#654321}", "tail", false},
+        {"input:focus + label{color:#654321}"
+         "label:has(+ input:focus){color:#654321}", "l1", false},
+        {"label:has(+ input:focus){color:#654321}"
+         "input:focus + label{color:#654321}", "lead", false},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        char html[1024];
+        int length = snprintf(html, sizeof(html),
+            "<style>label{color:#123456}p{color:#123456}%s</style>"
+            "<div class=row id=r0><input id=i0><label id=l0>A</label></div>"
+            "<div class=row id=r1><label id=lead>Z</label><input id=i1>"
+            "<label id=l1>B</label><div><label id=l1x>C</label></div></div>"
+            "<p id=tail>T</p>", cases[c].css);
+        CHECK(length > 0 && (size_t) length < sizeof(html));
+        CHECK(document_parse(&document, &budget, html, (size_t) length, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        static const char *const ids[] = {
+            "r0", "i0", "l0", "r1", "lead", "i1", "l1", "l1x", "tail"};
+        lxb_dom_node_t *nodes[9];
+        for (size_t i = 0; i < 9; i++) {
+            nodes[i] = find_id(root, ids[i]);
+            CHECK(nodes[i] != NULL);
+        }
+        lxb_dom_node_t *input = find_id(root, "i1");
+        lxb_dom_node_t *changed = find_id(root, cases[c].changed);
+        lxb_dom_node_t *earlier = find_id(root, "l0");
+        LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+        CHECK(reuse != NULL);
+        layout_reuse_cache_enable_retained_matches(reuse);
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        ComputedStyle style;
+        for (size_t i = 0; i < 9; i++)
+            (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                                    nodes[i], NULL, &style);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, changed,
+                                                NULL, &style);
+        CHECK(style.color == 0x123456);
+        set_focus_marker(&document, input);
+        layout_reuse_cache_invalidate_focus(reuse, input);
+        LayoutReuseStats stats = {0};
+        layout_reuse_cache_stats(reuse, &stats);
+        CHECK(stats.full_resets == 0);
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        bool hit = layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                                    earlier, NULL, &style);
+        CHECK(style.color == 0x123456);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, changed,
+                                                NULL, &style);
+        if (style.color != 0x654321 || hit != cases[c].keeps_earlier) {
+            fprintf(stderr, "sibling focus case %zu: color %06x, earlier "
+                    "label %s\n", c, (unsigned) style.color,
+                    hit ? "kept" : "dropped");
+            return 1;
+        }
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* A sheet with more focus rules than the bounded proof takes (real pages
+   carry hundreds) keeps its retained lists through a sibling focus move,
+   instead of resetting the whole cache, and still restyles correctly. */
+static int test_many_focus_rules_keep_lists(void)
+{
+    for (int has = 0; has < 2; has++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        static const char html[] = "<style>label{color:#123456}"
+            "input:focus + label{color:#654321}p{color:#111111}</style>"
+            "<div><input id=i><label id=l>L</label></div><p id=p>T</p>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480));
+        for (unsigned i = 0; i < 160; i++) {
+            char css[64];
+            int length = snprintf(css, sizeof(css),
+                                  ".f%u:focus{color:#0000%02x}", i, i & 0xffu);
+            CHECK(length > 0 && stylesheet_add_css(&sheet, css, (size_t) length));
+        }
+        if (has) {
+            static const char css[] = ".g:has(:focus){color:red}";
+            CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+        }
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *input = find_id(root, "i"), *label = find_id(root, "l");
+        lxb_dom_node_t *p = find_id(root, "p");
+        LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+        CHECK(input != NULL && label != NULL && p != NULL && reuse != NULL);
+        layout_reuse_cache_enable_retained_matches(reuse);
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        ComputedStyle style;
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, label, NULL, &style);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, p, NULL, &style);
+        CHECK(style.color == 0x111111);
+        LayoutReuseStats before = {0}, after = {0};
+        layout_reuse_cache_stats(reuse, &before);
+        set_focus_marker(&document, input);
+        layout_reuse_cache_invalidate_focus(reuse, input);
+        layout_reuse_cache_stats(reuse, &after);
+        CHECK(after.full_resets == before.full_resets + (has ? 1u : 0u));
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, label, NULL, &style);
+        CHECK(style.color == 0x654321);
+        layout_reuse_cache_stats(reuse, &before);
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, p, NULL, &style);
+        layout_reuse_cache_stats(reuse, &after);
+        CHECK(style.color == 0x111111);
+        /* The paragraph's list replayed rather than being matched again. */
+        if (!has) CHECK(after.matched_hits == before.matched_hits + 1u);
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* A focus rule that reaches forward (sibling/descendant) is harmless when
+   nothing in the moved element's reach matches it in either state: the
+   move stays local and names no reaching rule. */
+static int test_focus_vacuous_forward_rules(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>input:focus + label{font-weight:bold}"
+        "a:focus + .tip{display:block}a:focus .icon{color:red}"
+        "a:focus{outline:1px solid red}</style>"
+        "<div><a id=a href=#>x</a><span>y</span></div>"
+        "<div><input id=i><label>L</label></div>"
+        "<div><a id=b href=#>x</a><span class=tip>t</span></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_id(root, "a"), *i = find_id(root, "i");
+    lxb_dom_node_t *b = find_id(root, "b");
+    CHECK(a != NULL && i != NULL && b != NULL);
+    uint32_t rules[128];
+    CHECK(style_focus_change_is_local(&sheet, a)
+          && style_focus_nonlocal_rules(&sheet, a, rules, 128u) == 0);
+    CHECK(!style_focus_change_is_local(&sheet, i)
+          && style_focus_nonlocal_rules(&sheet, i, rules, 128u) == 1u);
+    CHECK(!style_focus_change_is_local(&sheet, b)
+          && style_focus_nonlocal_rules(&sheet, b, rules, 128u) == 1u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A forward rule that reads focus on two elements matched only in the
+   pre-move joint state (A focused, B not). Neither per-record probe sees
+   that state, so the vacuity proof must not drop it: after a move from A to
+   B, replaying both focus records restyles the badge. */
+static int test_focus_two_reads_not_vacuous(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>.badge{color:#123456}"
+        ".item:focus ~ .item:not(:focus) ~ .badge{color:#654321}</style>"
+        "<div><a class=item id=a href=#>A</a><a class=item id=b href=#>B</a>"
+        "<span class=badge id=t>T</span></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b");
+    lxb_dom_node_t *t = find_id(root, "t");
+    CHECK(a != NULL && b != NULL && t != NULL);
+    set_focus_marker(&document, a);
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    ComputedStyle style;
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, t, NULL,
+                                            &style);
+    CHECK(style.color == 0x654321);
+    /* The move, then its journal: one focus record per element. */
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(a),
+        (const lxb_char_t *) "data-tilefinch-focus", 20) == LXB_STATUS_OK);
+    document_allocation_owner_leave(&document, owner);
+    set_focus_marker(&document, b);
+    layout_reuse_cache_invalidate_focus(reuse, a);
+    layout_reuse_cache_invalidate_focus(reuse, b);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, t, NULL,
+                                            &style);
+    if (style.color != 0x123456) {
+        fprintf(stderr, "two-read focus rule: badge kept %06x\n",
+                (unsigned) style.color);
+        return 1;
+    }
+    uint32_t rules[128];
+    CHECK(style_focus_nonlocal_rules(&sheet, a, rules, 128u) == 1u);
+    CHECK(style_focus_nonlocal_rules(&sheet, b, rules, 128u) == 1u);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A forward rule that reads focus on two elements is never declared local
+   from probes of one node: with focus moving from A to B, the badge matched
+   only in the pre-move state (A focused, B not), which neither probe sees.
+   B carries the focus marker: the journal probes run after the move. */
+static int test_focus_two_read_forward_rules_stay_nonlocal(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>"
+        ".item:focus ~ .item:not(:focus) ~ .badge{color:red}"
+        "a:focus{outline:1px solid red}</style>"
+        "<div><a id=a class=item href=#>a</a>"
+        "<a id=b class=item data-tilefinch-focus href=#>b</a>"
+        "<span class=badge>t</span></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *a = find_id(root, "a"), *b = find_id(root, "b");
+    CHECK(a != NULL && b != NULL);
+    CHECK(!style_focus_change_is_local(&sheet, a));
+    CHECK(!style_focus_change_is_local(&sheet, b));
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The selector shapes whose focus reach is bounded to the moved element's
+   subtree and its later siblings' subtrees. */
+static int test_focus_selector_forward_reach(void)
+{
+    static const struct { const char *selector; bool forward; } cases[] = {
+        {"input:focus + label", true},
+        {"input:focus ~ .hint", true},
+        {".form input:focus ~ div > span", true},
+        {"a:focus-visible + b", true},
+        {":not(:focus) + label", true},
+        {":is(input:focus, select:focus) + label::before", true},
+        {"[data-tilefinch-focus] + label", true},
+        {".g:focus-within ~ p", false},
+        {"label:has(+ input:focus)", false},
+        {"li:nth-child(1 of :focus) ~ li", false},
+        {":host(:focus) + x", false},
+        {"x:focus + y::slotted(z)", false},
+        {"a\\:focus + b:focus + c", false},
+        {"a:focus + b)", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (style_focus_selector_reaches_forward(cases[i].selector)
+            != cases[i].forward) {
+            fprintf(stderr, "forward reach %s: want %d\n", cases[i].selector,
+                    cases[i].forward);
+            return 1;
+        }
     }
     return 0;
 }
@@ -5614,7 +6275,7 @@ static int test_shadow_scope_allocation_refusal(void)
     CHECK(saw_refusal);
     Stylesheet complete = {0};
     CHECK(stylesheet_build(&complete, &budget, &document, 480));
-    CHECK(complete.shadow_scope_count == 1u);
+    CHECK(complete.scopes.shadow_scope_count == 1u);
     CHECK(style_for_node(&complete, inside, NULL).color == 0xff0000u);
     CHECK(style_for_node(&complete, outside, NULL).color == 0x000000u);
     stylesheet_destroy(&complete);
@@ -6328,6 +6989,8 @@ int main(int argc, char **argv)
         return test_quoted_pseudo_element_punctuation();
     if (argc == 2 && strcmp(argv[1], "--retained-focus-only") == 0)
         return test_retained_focus_descendants();
+    if (argc == 2 && strcmp(argv[1], "--has-attribute-only") == 0)
+        return test_has_attribute_readers_agree();
     if (argc == 2 && strcmp(argv[1], "--declaration-footprint-only") == 0)
         return test_unmatched_declaration_footprint();
     if (argc == 2 && strcmp(argv[1], "--custom-footprint-only") == 0)
@@ -6379,9 +7042,18 @@ int main(int argc, char **argv)
     CHECK(test_retained_nested_selector_invalidation() == 0);
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
+    CHECK(test_has_attribute_readers_agree() == 0);
     if (argc == 2 && strcmp(argv[1], "--bounded-out-focus-only") == 0)
         return test_bounded_out_sheet_keeps_focus_fast_path();
     CHECK(test_bounded_out_sheet_keeps_focus_fast_path() == 0);
+    if (argc == 2 && strcmp(argv[1], "--sibling-focus-scope-only") == 0)
+        return test_sibling_focus_invalidation_scope();
+    CHECK(test_focus_selector_forward_reach() == 0);
+    CHECK(test_sibling_focus_invalidation_scope() == 0);
+    CHECK(test_many_focus_rules_keep_lists() == 0);
+    CHECK(test_focus_vacuous_forward_rules() == 0);
+    CHECK(test_focus_two_reads_not_vacuous() == 0);
+    CHECK(test_focus_two_read_forward_rules_stay_nonlocal() == 0);
     CHECK(test_retained_keyless_lost_match() == 0);
     CHECK(test_retained_scoped_invalidation() == 0);
     CHECK(test_ancestor_filter_canonical_tokens() == 0);
@@ -6390,6 +7062,10 @@ int main(int argc, char **argv)
     CHECK(test_pseudo_state_work() == 0);
     CHECK(test_layout_scoped_selector_work() == 0);
     CHECK(test_pseudo_absence_proof() == 0);
+    CHECK(test_pseudo_may_generate() == 0);
+    CHECK(test_inline_scan_memo() == 0);
+    CHECK(test_inline_scan_memo_yields() == 0);
+    CHECK(test_focus_color_paint_classification() == 0);
     CHECK(test_deferred_expansion_reuse() == 0);
     CHECK(test_head_script_dependency_cache() == 0);
     CHECK(test_unmatched_declaration_footprint() == 0);

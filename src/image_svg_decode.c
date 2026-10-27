@@ -11,6 +11,9 @@
 static Budget *svg_budget;
 static unsigned svg_allocations;
 static bool svg_allocation_failed;
+/* The parse stopped at this engine's nesting limits (image_svg_viewport.inc):
+   a limit, like a refused allocation, not markup no decoder takes. */
+static bool svg_limit_refused;
 static uint64_t svg_slice_started_us;
 static void svg_raster_shape(void *shape, int width, int height, float scale);
 static bool svg_raster_coverage(void *rasterizer, unsigned char *coverage,
@@ -107,6 +110,7 @@ unsigned char *image_svg_decode_bounded(
     if (!budget_allocation_owner_create(budget, &scratch_owner)) return NULL;
     svg_allocations = 0;
     svg_allocation_failed = false;
+    svg_limit_refused = false;
     svg_slice_started_us = tilefinch_platform_monotonic_time_us();
     BudgetAllocationOwner previous_owner =
         budget_allocation_owner_enter(budget, scratch_owner);
@@ -127,7 +131,7 @@ unsigned char *image_svg_decode_bounded(
     int intrinsic_width = 0, intrinsic_height = 0;
     /* Markup that parses to nothing, or to no positive size, fails the same
        way every time; every other refusal below is a limit. */
-    bool markup_rejected = !svg_allocation_failed
+    bool markup_rejected = !svg_allocation_failed && !svg_limit_refused
         && (svg == NULL || !(svg->width > 0.0f && svg->height > 0.0f));
     if (svg != NULL && !svg_allocation_failed
         && svg->width > 0.0f && svg->height > 0.0f

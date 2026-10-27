@@ -468,8 +468,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                         /* Native editable controls have a separate late
                            cross-size/text-centering path and no ordinary
                            percentage-height child formatting context. */
-                        && !layout_node_name_is(item->node, "input")
-                        && !layout_node_name_is(item->node, "textarea")
+                        && !document_node_is_tag(item->node, LXB_TAG_INPUT)
+                        && !document_node_is_tag(item->node, LXB_TAG_TEXTAREA)
                         && !child_style->margin_top_auto
                         && !child_style->margin_bottom_auto
                         && flex_item_alignment(style, child_style)

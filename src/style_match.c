@@ -2,9 +2,11 @@
    descendant selector evaluation, and the public selector-match entry
    point.  Split out of style.c. */
 
+#include "style_budget_category.h"
 #include "style_internal.h"
 #include "style_cache_internal.h"
 #include "tilefinch/platform.h"
+#include "tilefinch_compiler.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -37,8 +39,9 @@ static bool style_selector_cooperate_visit(
            Service native UI without admitting author/DOM reentry or
            publishing an incomplete match as a cached result. */
         if ((++mutable_sheet->selector_cooperate_visits & 127u) == 0)
-            (void) tilefinch_platform_cooperate("style-prepare",
-                sheet->selector_cooperate_visits);
+            (void) tilefinch_platform_cooperate_at("style-prepare",
+                sheet->selector_cooperate_visits,
+                TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED);
         return true;
     }
     mutable_sheet->selector_cooperate_visits++;
@@ -99,6 +102,68 @@ bool style_tag_is(lxb_dom_node_t *node, const char *wanted)
     size_t length = 0;
     const char *name = document_element_name(node, &length);
     return name != NULL && span_equal(name, length, wanted);
+}
+
+/* The focus probes' override (style_focus_override_swap). The browser
+   resolves style on one thread. */
+static StyleFocusOverride style_focus_override;
+
+StyleFocusOverride style_focus_override_swap(StyleFocusOverride next)
+{
+    StyleFocusOverride previous = style_focus_override;
+    style_focus_override = next;
+    return previous;
+}
+
+/* For the override's own element: 1 or 0 when the override decides
+   attribute `name` (the focus marker), -1 when the DOM does. Out of line:
+   the matcher's call sites keep only the element compare. */
+static TILEFINCH_OUT_OF_LINE int style_focus_override_attribute(
+    const char *name, size_t length)
+{
+    if (length == SIZE_MAX) length = strlen(name);
+    if (length != sizeof(STYLE_FOCUS_MARKER) - 1u
+        || !span_case_equal(name, length, STYLE_FOCUS_MARKER)) return -1;
+    return style_focus_override.focused ? 1 : 0;
+}
+
+/* lxb_dom_element_has_attribute on an element, seen through the override.
+   Elements are never NULL here, so with no override active the guard is
+   one compare against NULL that never matches. */
+static inline __attribute__((always_inline)) bool style_element_has_attribute(
+    lxb_dom_node_t *node, const lxb_char_t *name, size_t length)
+{
+    if (__builtin_expect(node == style_focus_override.node, 0)) {
+        int decided = style_focus_override_attribute((const char *) name,
+                                                     length);
+        if (decided >= 0) return decided != 0;
+    }
+    return lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                                         name, length);
+}
+
+/* document_attribute seen through the override: a focused override reads
+   as the marker with an empty value, as the probes used to set it. */
+static inline __attribute__((always_inline)) const char *
+style_element_attribute(lxb_dom_node_t *node, const char *name,
+                        size_t *length)
+{
+    if (__builtin_expect(node == style_focus_override.node, 0)) {
+        int decided = style_focus_override_attribute(name, SIZE_MAX);
+        if (decided >= 0) {
+            if (length != NULL) *length = 0;
+            return decided != 0 ? "" : NULL;
+        }
+    }
+    return document_attribute(node, name, length);
+}
+
+bool style_node_has_focus_marker(lxb_dom_node_t *node)
+{
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && style_element_has_attribute(
+               node, (const lxb_char_t *) STYLE_FOCUS_MARKER,
+               sizeof(STYLE_FOCUS_MARKER) - 1);
 }
 
 static bool style_node_descends_from(lxb_dom_node_t *node,
@@ -539,14 +604,13 @@ static bool attribute_matches(lxb_dom_node_t *node, const char *text,
         name[i] = (char) tolower((unsigned char) name[i]);
     }
     bool exists = node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
-        && lxb_dom_element_has_attribute(
-               lxb_dom_interface_element(node),
-               (const lxb_char_t *) name, name_length);
+        && style_element_has_attribute(
+               node, (const lxb_char_t *) name, name_length);
     if (!exists) return false;
     size_t at = name_end;
     while (at < length && isspace((unsigned char) text[at])) at++;
     if (at == length) return true;
-    const char *actual = document_attribute(node, name, &value_length);
+    const char *actual = style_element_attribute(node, name, &value_length);
     if (actual == NULL) actual = "";
     if (at + 1 < length && text[at + 1] == '=') {
         switch (text[at]) {
@@ -804,13 +868,7 @@ static bool node_or_descendant_has_focus(lxb_dom_node_t *node)
     if (node == NULL) return false;
     lxb_dom_node_t *current = node;
     while (current != NULL) {
-        if (current->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(current),
-                (const lxb_char_t *) STYLE_FOCUS_MARKER,
-                sizeof(STYLE_FOCUS_MARKER) - 1)) {
-            return true;
-        }
+        if (style_node_has_focus_marker(current)) return true;
         if (current->first_child != NULL) {
             current = current->first_child;
             continue;
@@ -1399,13 +1457,7 @@ static bool simple_pseudo_matches(const Stylesheet *sheet,
     bool open_pseudo = kind == STYLE_PSEUDO_OPEN;
     bool modal_pseudo = kind == STYLE_PSEUDO_MODAL;
     bool popover_open_pseudo = kind == STYLE_PSEUDO_POPOVER_OPEN;
-    if (focus_pseudo
-        && !lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(node),
-            (const lxb_char_t *) STYLE_FOCUS_MARKER,
-            sizeof(STYLE_FOCUS_MARKER) - 1)) {
-        return false;
-    }
+    if (focus_pseudo && !style_node_has_focus_marker(node)) return false;
     if (focus_within_pseudo
         && !node_or_descendant_has_focus(node)) return false;
     if (fullscreen_pseudo
@@ -1979,23 +2031,22 @@ static bool style_selector_program_matches_uncached(
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_ATTRIBUTE_PRESENT) {
-            if (!lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) wanted, wanted_length)) return false;
+            if (!style_element_has_attribute(
+                    node, (const lxb_char_t *) wanted, wanted_length))
+                return false;
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_ATTRIBUTE_NAME) {
             char name[64];
             if (wanted_length >= sizeof(name)
-                || !lxb_dom_element_has_attribute(
-                       lxb_dom_interface_element(node),
-                       (const lxb_char_t *) wanted, wanted_length)) {
+                || !style_element_has_attribute(
+                       node, (const lxb_char_t *) wanted, wanted_length)) {
                 return false;
             }
             memcpy(name, wanted, wanted_length);
             name[wanted_length] = '\0';
             attribute_value_length = 0;
-            attribute_value = document_attribute(
+            attribute_value = style_element_attribute(
                 node, name, &attribute_value_length);
             if (attribute_value == NULL) attribute_value = "";
             attribute_loaded = true;
@@ -2131,244 +2182,6 @@ static bool style_selector_program_matches_at(
     return matched;
 }
 
-/* The adopted sources of the nearest shadow tree. An outer adopting root
-   does not style descendants inside a nested tree, even if that tree has
-   no adopted sheets of its own. Host/slotted subjects pass their carrier
-   explicitly in style_shadow_scope_admits. */
-static uint64_t style_node_adopted_scope(const Stylesheet *sheet,
-                                         const lxb_dom_node_t *node)
-{
-    StyleResolveScratch *scratch = sheet->resolve_scratch;
-    const StyleClassTokenCache *tokens = sheet->class_tokens;
-    bool memo = scratch != NULL && tokens != NULL
-        && scratch->class_tokens_depth != 0;
-    if (memo && scratch->adopted_scope_node == node
-        && scratch->adopted_scope_tokens_scope == tokens->scope)
-        return scratch->adopted_scope_mask;
-    uint64_t mask = 0;
-    size_t depth = 0;
-    for (const lxb_dom_node_t *at = node; at != NULL && depth < 4096u;
-         at = at->parent, depth++) {
-        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        const StyleAdoptedScopeRoot *entry = style_adopted_scope_root_lookup(
-            sheet->adopted_scope_roots, sheet->adopted_scope_root_count, at);
-        if (entry != NULL) mask |= entry->mask;
-        if (document_node_is_shadow_carrier(at)) break;
-    }
-    if (memo) {
-        scratch->adopted_scope_node = node;
-        scratch->adopted_scope_tokens_scope = tokens->scope;
-        scratch->adopted_scope_mask = mask;
-    }
-    return mask;
-}
-
-uint64_t style_adopted_source_bit(const Stylesheet *sheet, unsigned order)
-{
-    size_t count = sheet->adopted_source_count;
-    /* Orders stay valid while the sources are bounded out: retiring a
-       source frees no rule, and an append (which renumbers) is refused
-       until the rebuild. Admission then fails confined bits closed
-       (style_adopted_scopes_document_only). */
-    if (count == 0 || count > sheet->style_source_count
-        || order >= sheet->adopted_rule_order_end) return 0;
-    size_t base = sheet->style_source_count - count;
-    const unsigned *first = &sheet->style_source_first_order[base];
-    if (order < first[0]) return 0;
-    /* The last adopted source starting at or before `order` holds it. */
-    size_t low = 0, high = count;
-    while (high - low > 1u) {
-        size_t middle = low + (high - low) / 2u;
-        if (first[middle] <= order) low = middle;
-        else high = middle;
-    }
-    return low < 64u ? UINT64_C(1) << low : 0;
-}
-
-uint64_t style_subject_adopted_scope(const Stylesheet *sheet,
-                                     const StyleMatchSubject *subject,
-                                     const lxb_dom_node_t *node)
-{
-    if (node == NULL) return 0;
-    if (subject != NULL && subject->node == node) {
-        /* The subject is the caller's, prepared for this one element. */
-        StyleMatchSubject *memo = (StyleMatchSubject *) subject;
-        if (!memo->adopted_scope_known) {
-            memo->adopted_scope = style_node_adopted_scope(sheet, node);
-            memo->adopted_scope_known = true;
-        }
-        return memo->adopted_scope;
-    }
-    return style_node_adopted_scope(sheet, node);
-}
-
-bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
-                                const lxb_dom_node_t *node,
-                                const StyleMatchSubject *subject)
-{
-    uint64_t bit = style_adopted_source_bit(sheet, order);
-    if (bit != 0 && style_adopted_scopes_document_only(sheet))
-        return (sheet->adopted_document_mask & bit) != 0;
-    if ((sheet->adopted_shadow_only_mask & bit) == 0) return true;
-    return (style_subject_adopted_scope(sheet, subject, node) & bit) != 0;
-}
-
-uint64_t style_adopted_cascade_order(const Stylesheet *sheet,
-                                    const lxb_dom_node_t *node, unsigned order)
-{
-    StyleAdoptedOrderContext context = {0};
-    return style_adopted_cascade_order_in(sheet, node, &context, order);
-}
-
-uint64_t style_adopted_cascade_order_in(const Stylesheet *sheet,
-                                        const lxb_dom_node_t *node,
-                                        StyleAdoptedOrderContext *context,
-                                        unsigned order)
-{
-    uint64_t bit = style_adopted_source_bit(sheet, order);
-    if (bit == 0) return order;
-    size_t source = 0;
-    while ((bit >> source) != 1u) source++;
-    unsigned rank = (unsigned) source + 1u;
-    if (style_adopted_scopes_document_only(sheet)) {
-        if (sheet->adopted_document_order[source] != 0)
-            rank = sheet->adopted_document_order[source];
-        size_t base = sheet->style_source_count - sheet->adopted_source_count;
-        return ((uint64_t) rank << 32)
-            | (order - sheet->style_source_first_order[base + source]);
-    }
-    if (!context->ready) {
-        /* Nearest adopting carrier first; :host/::slotted subjects may
-           instead refer to the carrier attached to the element or its
-           parent. Roots are unique, and the document's (NULL) sorts first. */
-        const lxb_dom_node_t *carrier =
-            document_shadow_carrier_containing(node);
-        if (carrier == NULL) carrier = document_shadow_carrier_of_host(node);
-        if (carrier == NULL && node != NULL)
-            carrier = document_shadow_carrier_of_host(node->parent);
-        context->carrier = carrier == NULL ? NULL
-            : style_adopted_scope_root_lookup(sheet->adopted_scope_roots,
-                  sheet->adopted_scope_root_count, carrier);
-        context->document = sheet->adopted_scope_root_count != 0
-            && sheet->adopted_scope_roots[0].root == NULL
-            ? &sheet->adopted_scope_roots[0] : NULL;
-        context->ready = true;
-    }
-    if (context->carrier != NULL && context->carrier->order[source] != 0)
-        rank = context->carrier->order[source];
-    else if (context->document != NULL
-             && context->document->order[source] != 0)
-        rank = context->document->order[source];
-    size_t base = sheet->style_source_count - sheet->adopted_source_count;
-    return ((uint64_t) rank << 32)
-        | (order - sheet->style_source_first_order[base + source]);
-}
-
-typedef enum {
-    STYLE_SHADOW_RULE_INSIDE,
-    STYLE_SHADOW_RULE_HOST,
-    STYLE_SHADOW_RULE_SLOTTED
-} StyleShadowRuleKind;
-
-/* Where a shadow-confined selector's subject lives, read from its text as
-   style_shadow_selector_rewrite left it: a rightmost compound beginning
-   with :host targets the host; the rewritten `:host > :is(X)` form of
-   ::slotted() targets the host's light children. */
-static StyleShadowRuleKind style_shadow_rule_kind(const char *selector,
-                                                  size_t length)
-{
-    if (selector == NULL || length < 5) return STYLE_SHADOW_RULE_INSIDE;
-    size_t rightmost = 0;
-    int depth = 0;
-    char quote = 0;
-    for (size_t i = 0; i < length; i++) {
-        char c = selector[i];
-        if (quote != 0) {
-            if (c == '\\' && i + 1 < length) i++;
-            else if (c == quote) quote = 0;
-            continue;
-        }
-        if (c == '"' || c == '\'') quote = c;
-        else if (c == '(' || c == '[') depth++;
-        else if ((c == ')' || c == ']') && depth > 0) depth--;
-        else if (depth == 0 && (c == ' ' || c == '>' || c == '+'
-                                || c == '~')) rightmost = i + 1;
-    }
-    if (length - rightmost >= 5
-        && memcmp(selector + rightmost, ":host", 5) == 0
-        && (length - rightmost == 5
-            || !(isalnum((unsigned char) selector[rightmost + 5])
-                 || selector[rightmost + 5] == '-'))) {
-        return STYLE_SHADOW_RULE_HOST;
-    }
-    if (length > 12 && memcmp(selector, ":host > :is(", 12) == 0
-        && rightmost == 8) {
-        return STYLE_SHADOW_RULE_SLOTTED;
-    }
-    return STYLE_SHADOW_RULE_INSIDE;
-}
-
-static const StyleShadowScope *style_shadow_scope_for_order(
-    const Stylesheet *sheet, unsigned order)
-{
-    size_t low = 0, high = sheet->shadow_scope_count;
-    while (low < high) {
-        size_t middle = low + (high - low) / 2u;
-        const StyleShadowScope *scope = &sheet->shadow_scopes[middle];
-        if (order < scope->begin) high = middle;
-        else if (order >= scope->end) low = middle + 1u;
-        else return scope;
-    }
-    return NULL;
-}
-
-bool style_subject_near_shadow_tree(const StyleMatchSubject *subject)
-{
-    const lxb_dom_node_t *node = subject == NULL ? NULL : subject->node;
-    return node != NULL
-        && (document_shadow_carrier_of_host(node) != NULL
-            || (node->parent != NULL
-                && document_shadow_carrier_of_host(node->parent) != NULL));
-}
-
-bool style_shadow_scope_admits(const Stylesheet *sheet, unsigned order,
-                               const char *selector, size_t selector_length,
-                               const lxb_dom_node_t *node,
-                               const StyleMatchSubject *subject)
-{
-    bool document_only = style_adopted_scopes_document_only(sheet);
-    if (document_only
-        && (style_adopted_source_bit(sheet, order)
-            & ~sheet->adopted_document_mask) != 0) return false;
-    uint64_t bit = document_only
-        || sheet->adopted_shadow_only_mask == 0 ? 0
-        : style_adopted_source_bit(sheet, order)
-          & sheet->adopted_shadow_only_mask;
-    const StyleShadowScope *scope = bit != 0 || sheet->shadow_scope_count == 0
-        ? NULL : style_shadow_scope_for_order(sheet, order);
-    if (bit == 0 && scope == NULL) return true;
-    StyleShadowRuleKind kind = style_shadow_rule_kind(
-        selector, selector_length);
-    if (kind == STYLE_SHADOW_RULE_INSIDE) {
-        if (bit != 0) {
-            return (style_subject_adopted_scope(sheet, subject, node) & bit)
-                != 0;
-        }
-        /* The nearest tree: an outer shadow tree's style does not reach
-           into a component nested inside it. */
-        return document_shadow_carrier_containing(node) == scope->carrier;
-    }
-    const lxb_dom_node_t *host = kind == STYLE_SHADOW_RULE_HOST
-        ? node : (node == NULL ? NULL : node->parent);
-    const lxb_dom_node_t *carrier = document_shadow_carrier_of_host(host);
-    if (carrier == NULL) return false;
-    if (kind == STYLE_SHADOW_RULE_SLOTTED
-        && !document_shadow_light_child_rendered(
-               carrier, (lxb_dom_node_t *) node)) return false;
-    if (bit != 0) return (style_node_adopted_scope(sheet, carrier) & bit) != 0;
-    return carrier == scope->carrier;
-}
-
 bool style_rule_selector_matches_subject(
     const Stylesheet *sheet, size_t rule_index, lxb_dom_node_t *node,
     const StyleMatchSubject *subject)
@@ -2459,9 +2272,8 @@ bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
             if (item->complete_key) return true;
         }
         if (item->attribute_length != 0) {
-            if (!lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) item->attribute,
+            if (!style_element_has_attribute(
+                    node, (const lxb_char_t *) item->attribute,
                     item->attribute_length)) continue;
             if (item->complete_attribute) return true;
         }
@@ -2469,9 +2281,8 @@ bool style_query_selector_list_matches(const StyleQuerySelectorList *list,
             bool carries = false;
             for (uint8_t a = 0; a < item->any_attribute_count && !carries;
                  a++) {
-                carries = lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) item->text
+                carries = style_element_has_attribute(
+                    node, (const lxb_char_t *) item->text
                         + item->any_attribute_offset[a],
                     item->any_attribute_length[a]);
             }

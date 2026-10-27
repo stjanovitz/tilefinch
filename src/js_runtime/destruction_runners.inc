@@ -76,7 +76,6 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     fetch_scheduler_domain_release(
         runtime->bridge.fetch_scheduler_domain);
     runtime->bridge.fetch_scheduler_domain = NULL;
-    script_runtime_clear_script_source_nodes(runtime);
     js_rt_runtime_module_metadata_clear(runtime);
 #if defined(CONFIG_EXECUTION_PROFILE)
     if (runtime->runtime != NULL &&
@@ -112,15 +111,6 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         script_runtime_flush_pending_bytecode(
             runtime, SCRIPT_BYTECODE_TEARDOWN_FLUSH_BYTES);
         js_lazy_webpack_bundles_destroy(runtime);
-        JS_FreeValue(runtime->context,
-                     runtime->bridge.trusted_stable_script_wrap);
-        JS_FreeValue(runtime->context,
-                     runtime->bridge.trusted_retire_native_node_state);
-        JS_FreeValue(runtime->context,
-                     runtime->bridge.trusted_hold_event_state);
-        JS_FreeValue(runtime->context,
-                     runtime->bridge.trusted_release_event_holders);
-        JS_FreeValue(runtime->context, runtime->bridge.trusted_node_wrap);
         JS_FreeValue(runtime->context, runtime->bridge.current_script);
         JS_FreeValue(runtime->context, runtime->function_to_string);
         for (size_t callback = 0; callback < SCRIPT_HOST_CALLBACK_COUNT;
@@ -137,54 +127,24 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->xhr_diagnostics_install);
         runtime->xhr_diagnostics_install = JS_UNDEFINED;
 #endif
-        JS_FreeValue(runtime->context, runtime->dispatch_submit_handle);
-        JS_FreeValue(
-            runtime->context, runtime->dom_content_loaded_dispatch);
-        JS_FreeValue(runtime->context, runtime->media_state_for);
         JS_FreeValue(runtime->context, runtime->media_update);
-        JS_FreeValue(runtime->context,
-                     runtime->page_visibility_host_apply);
-        JS_FreeValue(runtime->context, runtime->fullscreen_host_exit);
         JS_FreeValue(runtime->context, runtime->document_all_cache);
         JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
         JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
         JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
-        JS_FreeValue(runtime->context, runtime->dispatch_input_handle);
-        JS_FreeValue(runtime->context,
-                     runtime->dispatch_activation_handle);
-        JS_FreeValue(runtime->context, runtime->dispatch_handle);
-        JS_FreeValue(runtime->context, runtime->dispatch_at);
-        JS_FreeValue(runtime->context, runtime->page_scroll_flush);
-        JS_FreeValue(runtime->context, runtime->page_scroll_apply);
         JS_FreeValue(runtime->context, runtime->host_network_queue_stats);
         JS_FreeValue(runtime->context, runtime->host_indexed_db_stats);
         JS_FreeValue(runtime->context, runtime->motion_style_flushed);
-        runtime->page_scroll_flush = JS_UNDEFINED;
-        runtime->page_scroll_apply = JS_UNDEFINED;
         runtime->host_network_queue_stats = JS_UNDEFINED;
         runtime->host_indexed_db_stats = JS_UNDEFINED;
         runtime->motion_style_flushed = JS_UNDEFINED;
         runtime->function_to_string = JS_UNDEFINED;
-        runtime->dispatch_submit_handle = JS_UNDEFINED;
-        runtime->dom_content_loaded_dispatch = JS_UNDEFINED;
-        runtime->media_state_for = JS_UNDEFINED;
         runtime->media_update = JS_UNDEFINED;
-        runtime->page_visibility_host_apply = JS_UNDEFINED;
-        runtime->fullscreen_host_exit = JS_UNDEFINED;
         runtime->document_all_cache = JS_UNDEFINED;
         runtime->opfs_storage_manager = JS_UNDEFINED;
         runtime->game_audio_host_suspend = JS_UNDEFINED;
         runtime->game_audio_host_complete = JS_UNDEFINED;
         audio_slots_release_values(runtime);
-        runtime->dispatch_input_handle = JS_UNDEFINED;
-        runtime->dispatch_activation_handle = JS_UNDEFINED;
-        runtime->dispatch_handle = JS_UNDEFINED;
-        runtime->dispatch_at = JS_UNDEFINED;
-        runtime->bridge.trusted_stable_script_wrap = JS_UNDEFINED;
-        runtime->bridge.trusted_retire_native_node_state = JS_UNDEFINED;
-        runtime->bridge.trusted_hold_event_state = JS_UNDEFINED;
-        runtime->bridge.trusted_release_event_holders = JS_UNDEFINED;
-        runtime->bridge.trusted_node_wrap = JS_UNDEFINED;
         runtime->bridge.current_script = JS_NULL;
         for (size_t slot = 0; slot < SCRIPT_WORKER_REALM_LIMIT; slot++) {
             if (runtime->worker_realms[slot].context == NULL) continue;

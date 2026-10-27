@@ -294,14 +294,10 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
         JS_FreeValue(runtime->context, value);                               \
     } while (0)
     if (JS_IsObject(retention)) {
-        READ_RETENTION(retention_wrapper_evictions, "wrapperEvictions");
         READ_RETENTION(retention_listener_drops, "listenerDrops");
         READ_RETENTION(retention_handler_drops, "handlerDrops");
         READ_RETENTION(retention_observer_drops, "observerDrops");
         READ_RETENTION(retention_record_drops, "recordDrops");
-        READ_RETENTION(retention_dirty_drops, "dirtyDrops");
-        READ_RETENTION(retention_state_evictions, "stateEvictions");
-        READ_RETENTION(retention_control_drops, "controlDrops");
     }
 #undef READ_RETENTION
     JS_FreeValue(runtime->context, retention);
@@ -318,9 +314,6 @@ static void js_rt_runtime_update_telemetry(ScriptRuntime *runtime,
     if (JS_IsObject(roots)) {
         READ_ROOT(root_timers, "timers");
         READ_ROOT(root_node_wrappers, "nodeWrappers");
-        READ_ROOT(root_stable_wrappers, "stableWrappers");
-        READ_ROOT(root_stable_listener_targets, "stableListenerTargets");
-        READ_ROOT(root_stable_handler_targets, "stableHandlerTargets");
         READ_ROOT(root_mutation_observers, "mutationObservers");
         READ_ROOT(root_pending_network, "pendingNetwork");
         READ_ROOT(root_frame_windows, "frameWindows");

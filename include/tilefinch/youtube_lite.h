@@ -30,6 +30,15 @@
 #define YOUTUBE_LITE_ACCOUNT_CHOOSER_URL \
     "https://accounts.google.com/AccountChooser?" YOUTUBE_LITE_SIGNIN_CONTINUE
 
+/* Same-document fragments of the provider's native controls. The page
+   generator links its controls to them, and BrowserEngine handles an
+   activation of one of them instead of scrolling to a fragment. */
+#define YOUTUBE_LITE_FRAGMENT_ACCOUNT_ACTION "#tilefinch-account-action"
+#define YOUTUBE_LITE_FRAGMENT_SIGNOUT "#tilefinch-signout"
+#define YOUTUBE_LITE_FRAGMENT_LIKE "#tilefinch-like"
+#define YOUTUBE_LITE_FRAGMENT_UNLIKE "#tilefinch-unlike"
+#define YOUTUBE_LITE_FRAGMENT_REFRESH "#tilefinch-refresh"
+
 typedef enum {
     YOUTUBE_LITE_ROUTE_NONE = 0,
     YOUTUBE_LITE_ROUTE_HOME,

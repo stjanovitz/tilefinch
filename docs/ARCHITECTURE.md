@@ -228,10 +228,12 @@ surface over it (retry, Reader retry, and only the context actions that can
 help); Return simply shows the incumbent again, and no action publishes half
 a candidate with stale controller or render state.
 
-The experimental compressed-section mode is the named exception: replacing a
-resident section may retire its old DOM before materializing its neighbor, to
-keep the memory saving. Its narrower guarantee is documented in
-[streaming navigation](engineering/STREAMING_NAVIGATION.md).
+The experimental compressed-section mode was the one exception to this rule.
+It cut a large page into LZ-compressed sections of about 512 elements, kept
+one section as live DOM, and paged between them, so replacing a section could
+retire its DOM first. It was never enabled on the PSP and was retired on
+2026-10-25; commit `c05276c8` is the last tree that has it (its lab flags are
+in that tree's `docs/engineering/LAB_USAGE.md`).
 
 ### 4. Work is budgeted in time as well as bytes
 
@@ -593,7 +595,7 @@ refusal is the same clean `RangeError` a full table reports.
 supports, and only those: a disconnected element has an empty declaration
 block, and an unsupported name is absent rather than answered from a table of
 initial values. A single X-macro list, `COMPUTED_STYLE_PROPERTIES` in
-`src/js_dom_bindings.c`, generates the property table, the identifiers the
+`src/js_computed_style.c`, generates the property table, the identifiers the
 getter dispatches on, and per-row flags, so no value can resolve for an
 unlisted property. Values are serialized from `ComputedStyle` fields, never
 from authored text, so `inherit`, `var()`, relative units, and `!important`
@@ -1156,15 +1158,50 @@ recovery rules.
 
 The main ownership boundaries are deliberately visible:
 
-- `src/browser_engine.c`: public engine lifetime and facade;
-- `src/navigation.c` and `src/navigation/`: candidate loads and commit;
+- `src/browser_engine.c`: public engine lifetime and facade, with feature
+  regions in `src/browser_engine/`, each included where it sits in the facade:
+  - `provisional.inc`: provisional preview painting and capture;
+  - `history_focus.inc`: history focus and form-control restore,
+    same-document history actions, autofocus;
+  - `provisional_input.inc`: provisional preview viewport, scroll, focus,
+    activation;
+  - `find.inc`: find in page and text anchors;
+  - `reader_recovery.inc`: Reader and Basic views, blank-page recovery,
+    declared media card;
+  - `youtube.inc`: YouTube provider state machines, native controls and
+    idle pumps (state in `BrowserEngineYoutube`);
+- `src/navigation.c` and `src/navigation/`: candidate loads and commit. The
+  owner includes each file once, in this order:
+  - `page_lifecycle.inc`: timing slices, stylesheet and layout builds,
+    script realm creation and retirement, resource fingerprint, damage;
+  - `frames.inc`: child frames, cross-frame messaging, frame presentation;
+  - `declarative_refresh.inc`: `<meta http-equiv="refresh">` and `Refresh`;
+  - `configuration.inc`: session setup, hooks and policy setters;
+  - `document_stream.inc`: the streaming parse and speculative preloads;
+  - `stylesheet_checkpoint.inc`: render-blocking stylesheet checkpoints;
+  - `stream_runtime.inc`: stream staging teardown and the streaming realm;
+  - `parser_script_checkpoint.inc`: parser-blocking scripts and refusals;
+  - `commit_transaction.inc`: candidate adoption (`navigation_commit_document`);
+  - `progressive_preview.inc`: progressive and retained previews;
+  - `commit_html.inc`: whole-document commit entry points;
+  - `load_state.inc`: the load job, response handling and retries;
+  - `history.inc`: history, same-document URLs, fragments, scroll;
+  - `mutation_classify.inc`: script mutation journal classification;
+  - `style_sources.inc`: incremental style-source append;
+  - `layout_reuse.inc`: layout reuse cache around a relayout;
+  - `relayout.inc`: relayout, layout completion, user CSS transaction;
+  - `deferred_images.inc`: retarget, web-font fallback, deferred images,
+    background resources;
+  - `runtime_advance.inc`: blank-page recovery and the runtime advance;
+  - `events.inc`: event dispatch and frame activation;
 - `src/style*.c`, `src/layout*.c`, `src/render.c`, `src/render/`: the visual
   pipeline;
 - `src/js_runtime.c`, `src/js_*`, `src/bootstrap/`: JavaScript and Web APIs;
 - `third_party/quickjs/`: the vendored, in-place-modified engine and the list
   of changes it carries; `patches/`: inputs for lab variants;
 - `src/fetch.c`, `src/fetch/`, `src/request_context.c`, `src/session.c`:
-  transport policy and browser session state;
+  transport policy and browser session state; `src/session_cookies.c`: the
+  cookie jar and request overlay; `src/session_site_storage.c`: site storage;
 - `src/media_*.c`, `src/psp_media_*.c`, `src/media_backend_psp.c`: media;
 - `src/frame_pumps.c`: the declared admission policy for optional frame work,
   whose facts `src/psp_app/psp_app_frame_pumps.c` samples;

@@ -394,9 +394,9 @@ zero-font fallback.
 
 The interactive lab's `--reader-mode` option instead exercises the product's
 bounded content-shape classifier and generic Reader stylesheet after the page
-has committed. It cannot be combined with `--user-css`,
-`--hide-cookie-banners`, or experimental compressed sections, keeping the
-capture's presentation source unambiguous.
+has committed. It cannot be combined with `--user-css` or
+`--hide-cookie-banners`, keeping the capture's presentation source
+unambiguous.
 
 `--fetch-images` separately enables bounded raster/SVG, CSS-background, and CSS-mask loading. Defaults bound the pass to 64 unique attempts, 512 KiB aggregate encoded input, 256 KiB per response, and 512 KiB retained decoded SVG/mask data. Raster files remain compressed and are decoded one at a time through the tile cache; a source decode may use at most four times the output quota, capped at 8 MiB for sub-8-MiB profiles, and is repeatedly halved before painting when its RGBA target exceeds the quota. Larger decompression candidates are skipped before allocation. Responsive `<picture>` and width-descriptor `srcset` select a viewport-sized supported source. Change the limits with `--max-images`, `--max-image-kb`, `--max-image-file-kb`, and `--max-decoded-image-kb`. Duplicate URLs share resources, element and pseudo-element masks and CSS background images use the same quotas, unsupported or failed optional resources do not abort the page, and every retained buffer uses the shared page budget. Background `cover` and `contain` use centered bounded sampling; repetition is supported, and the common two-gradient layered-background form paints in source order. Arbitrary layer counts and independent per-layer URL positioning remain unsupported. External stylesheets may recursively import up to four levels while sharing the same URL-count, byte, timeout, cache, and page-memory limits; conditional imports use the bounded media/supports evaluators. Quoted and single-`attr(name)` pseudo-element content is decoded locally under a 64-string/63-byte-per-string cap; live attribute values reuse bounded DOM bytes. When external resources are enabled and FreeType 2.14.3 or newer is available, page fonts are limited to eight attempts, 256 KiB aggregate encoded input, 96 KiB per response, eight regular/bold family identities (the eight-attempt and encoded-byte budgets remain unchanged), two ordered sources per face, and 256 KiB of backend allocation per face. Unsupported WOFF2, collections, CFF outlines, inline data URLs, failed CORS requests, and quota misses fall back without aborting the page. The interactive lab has a separate quota-controlled external-script pipeline.
 
@@ -420,83 +420,6 @@ A bounded mobile-CSS run is:
 `--scroll-all` walks from top to bottom in half-viewport increments, writes `scroll-manifest.tsv`, rejects blank frames, and verifies that the top frame is identical after tile eviction. It saves top/middle/bottom PPMs; repeatable `--save-scroll Y` options add semantic checkpoints. `--viewport-width` and `--viewport-height` select the device render surface within guarded ranges; page viewport metadata selects the CSS layout viewport. `--no-render` runs fetch/parse/style/layout/link analysis while retaining the framebuffer reservation but writing no images.
 
 `--psp-profile strict` selects a 16 MiB content ceiling, 4 MiB JavaScript ceiling, 1 MiB cumulative script-source allowance, and eight tiles. `--psp-profile realistic` is the PSP application's own configuration, taken from the `BROWSER_PSP_APP_*` constants that `src/psp_boot_config.c` and the PSP app use (`browser_config_apply_psp_app_defaults()`): a 32 MiB page envelope, a 5 MiB JavaScript heap with the app's 4 MiB boot window, GC growth and array-cap engine knobs (an explicit environment value wins), 256 scripts, memory-based script admission with a 16 MiB source ceiling and 4 MiB per file, a 60-second script timeout, an 8 MiB document cap, four history entries, a 640 KiB session cache, 24 tiles, and the app's stylesheet and image limits. A lab replay therefore admits what the device admits without explicit limit flags. The VM value is a ceiling rather than an up-front reservation. The public `BrowserEngine` profile additionally records an 8 MiB minimum non-page reserve for UI, stacks, TLS/backend state, sockets, libc metadata, and fragmentation; that reserve is deliberately unavailable to page content. `browser_config_apply_psp_memory_profile()` applies the same strict or realistic policy to embedders (realistic there is `browser_config_apply_psp_app_defaults()` too). Both profiles enable generic allocation-pressure adaptation: as owned memory approaches guarded stage reserves, the loader may skip JavaScript, reduce stylesheet and image quotas, or retain four rather than eight tiles. Each decision is logged, depends only on remaining budget, and can be selected or disabled explicitly with `--adaptive-resources` or `--no-adaptive-resources`. Explicit `--limit-mb`, `--js-limit-mb`, or `--tile-count` values override the selected profile. `--navigation-stress N` repeatedly replaces a page through the bounded navigation owner and fails if teardown does not return to the pre-stress allocation level. `--resource-stage-ms` bounds each complete external CSS or image phase (100–60000 ms); requests inside the phase remain four-way concurrent and preserve document order when applied. CSS telemetry reports batches, the usable first batch, deadline cancellation, and total elapsed time.
-
-Very large static documents can exercise the separate, explicitly experimental
-path without changing the default architecture. With no explicit section,
-the option is adaptive: it delegates documents whose estimated full-document
-working set fits the current budget to the existing pipeline and selects the
-compressed path only after a bounded prefix crosses generic byte/markup
-pressure thresholds. `--experimental-section N` forces sectional mode for
-diagnostics and arbitrary-section selection:
-
-```sh
-./build-preset-release/psp-browser-lab \
-  --url https://html.spec.whatwg.org/ \
-  --max-download-kb 32768 \
-  --psp-profile strict \
-  --experimental-compressed-sections \
-  --experimental-section 619 \
-  --output-dir frames/whatwg-section-619
-```
-
-The run reports the generic section and exact-anchor indexes. Sectioned network
-responses go directly through a 16 KiB delivery buffer into exact-sized,
-independently allocated compressed blocks; fixtures are read normally and then
-converted. Small adaptive responses are retained only until the router commits
-to the ordinary full-document pipeline. Each materialization
-reconstructs the original document prefix and bounded ancestor context, then
-uses the ordinary DOM, CSS, resource, layout, JavaScript, controller, and tile
-pipelines. The interactive lab swaps at scroll boundaries and supports exact
-fragment jumps, history, reload, and refetched cross-document return. A 512 KiB
-hard cap bounds heading-free spans, and the lexical index avoids natural
-heading splits inside tables, lists, form groups, inline flex/grid islands, and
-simple tag/class/ID layout islands declared by bounded embedded CSS.
-Bounded external CSS is preflighted with a style-only probe, rather than a
-throwaway page/layout commit, and can transactionally refine those
-layout-island boundaries before the observable commit. A late island starts a
-fresh section when half the current allowance is already occupied.
-For source-backed JavaScript queries, the selector Bloom index only rejects
-sections that cannot match; candidate sections still use the normal semantic
-matcher so node identity and source order remain exact. The Bloom index is
-built lazily, and document-root matches remain local because `html`, `head`,
-and `body` precede every sectional body descendant.
-
-Structural indexing cooperates and can cancel at each independently decoded
-block. The interactive lab uses those same boundaries to make the requested
-section provisionally raster-ready before the remaining structural index is
-complete, then performs the ordinary script/resource-enabled final commit.
-`experimental-initial-load` reports transfer, first-section, provisional
-commit/paint, full-index, and final-ready timestamps; `experimental-store-timing`
-reports structural index work, yields, and maximum slice latency separately
-from time spent in provisional-paint progress callbacks.
-
-The retained compact/medium paired corpus can be compared with three median
-runs per path using `./benchmarks/run-experimental-paired.sh`. Its defaults use
-`benchmarks/experimental-paired-acceptance.tsv` and the matching interactive
-replay corpus; every case rejects a missing or undersized captured main body
-before timing either path.
-
-The JavaScript realm survives adjacent swaps. Bounded stable-ID and anonymous
-structural focus, form, selection, listener, handler, observer, and dirty-DOM
-state is restored. Scripts execute in source document order with parser
-visibility, `document.currentScript` identity, defer/module ordering, and
-document-wide count/byte quotas. Simple and complex selectors search the
-logical source in document order up to the existing 128-result DOM bound;
-`NodeIterator`, `TreeWalker`, cross-section node relations, and bounded root
-`textContent` use the same source-backed view. Bounded `html`, `head`, and
-`body` attributes persist across destructive swaps; body or document-element
-content replacement immediately retires the stale logical source without
-discarding the compressed store. Retention-table
-overflow follows logged, deterministic LRU/FIFO degradation, and a forced hard
-split can still break cross-boundary layout relationships. Incompressible input
-uses raw independent blocks and can be rejected by the shared memory budget.
-The experiment remains opt-in; omitting
-`--experimental-compressed-sections` follows the full-document architecture.
-Speculative expanded HTML is deferred until after paint and only enabled after
-sustained directional movement. Each swap logs state capture, decode,
-teardown, conditional JavaScript collection, parse/build, restoration,
-scroll readiness, and first-tile latency. Aggregate average/max fields make
-the same run useful in the host lab and in physical PSP validation.
 
 Mobile viewport telemetry distinguishes `width=device-width`, numeric widths,
 and the standards-compatible 980 px legacy layout viewport for pages without a

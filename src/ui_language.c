@@ -10,7 +10,7 @@
 #include <fcntl.h>
 
 #include "generated/ui_languages.inc"
-#include "style_internal.h"
+#include "fnv1a.h"
 
 /* Interface translations live in the models repository beside the signed
    glyph packs, so a build that overrides that repository fetches both from

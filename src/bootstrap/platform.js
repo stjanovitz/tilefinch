@@ -57,7 +57,6 @@
     trustedMapEntries = Function.call.bind(Map.prototype.entries),
     trustedSetValues = Function.call.bind(Set.prototype.values),
     trustedSetAdd = Function.call.bind(Set.prototype.add),
-    trustedSetHas = Function.call.bind(Set.prototype.has),
     trustedDateTime = Function.call.bind(Date.prototype.getTime),
     trustedRegExpSource = Function.call.bind(
       Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get,
@@ -422,11 +421,7 @@
       },
       sameElement = (left, right) =>
         left === right ||
-        (!!left &&
-          !!right &&
-          (left.__handle === right.__handle ||
-            (!!left.__tilefinchStableKey &&
-              left.__tilefinchStableKey === right.__tilefinchStableKey))),
+        (!!left && !!right && left.__handle === right.__handle),
       specialQuery = (root, selector) => {
         const scoped = selector.match(/^:scope\s*>\s*([\s\S]+)$/);
         if (scoped && root instanceof Element)
@@ -562,10 +557,8 @@
           !scoped &&
           !scriptMatchedSelectors.has(compact) &&
           !scriptMatchedSelectors.has(trimmed) &&
-          !__tilefinchRealmGlobal.__tilefinchHasRemoteNodeWriter &&
           !this.__tilefinchDetachedParent &&
-          Number(this.__handle) > 0 &&
-          !__tilefinchRealmGlobal.__tilefinchIsVirtualRemote?.(this)
+          Number(this.__handle) > 0
         ) {
           const found = Number(__tilefinchClosest(this.__handle, value));
           if (found === Number(this.__handle)) return this;
@@ -2340,16 +2333,7 @@
       return ["submit", "reset", "button"].includes(raw) ? raw : "submit";
     return inputTypes.has(raw) ? raw : "text";
   };
-  const inputValues = new Map(),
-    nativeControlValues = new Map(),
-    nativeControlKeys = (control) => {
-      const keys = [],
-        stable = String(control?.__tilefinchStableKey || ""),
-        id = control?.id ? "i:" + String(control.id) : "";
-      if (stable) keys.push(stable);
-      if (id && id !== stable) keys.push(id);
-      return keys;
-    };
+  const inputValues = new Map();
   __tilefinchRealmGlobal.__tilefinchInputValue = (input) => {
     const type = __tilefinchControlType(input),
       attribute = input.getAttribute("value");
@@ -2413,12 +2397,6 @@
   };
   __tilefinchRealmGlobal.__tilefinchSyncNativeControlValue = (control, value) => {
     const tag = String(control?.localName || control?.tagName).toLowerCase();
-    for (const key of nativeControlKeys(control)) {
-      if (nativeControlValues.has(key)) nativeControlValues.delete(key);
-      while (nativeControlValues.size >= 256)
-        nativeControlValues.delete(nativeControlValues.keys().next().value);
-      nativeControlValues.set(key, String(value ?? ""));
-    }
     if (tag === "input")
       controlStateSet(inputValues, control, String(value ?? ""));
     else if (tag === "textarea")
@@ -6974,205 +6952,6 @@
     };
   }
   headWrapper = wrap(__tilefinchQuery("head"));
-  __tilefinchRealmGlobal.__tilefinchRebindDocument = () => {
-    __tilefinchRealmGlobal.__tilefinchClearNodeCache();
-    __tilefinchSuppressRemoteLookup(true);
-    try {
-      /* Re-pin the root wrappers of the new document. Rebinding
-         an existing runtime is not an authored body replacement, so the
-         public body setter (and its replaceChild() traversal of the retired
-         document) is not involved. */
-      rootElementWrapper = wrap(__tilefinchDocumentElement());
-      bodyWrapper = wrap(__tilefinchBody());
-      headWrapper = document.querySelector("head");
-    } finally {
-      __tilefinchSuppressRemoteLookup(false);
-    }
-    __tilefinchRealmGlobal.__tilefinchRebindStableNodes();
-    __tilefinchRealmGlobal.__tilefinchActiveElement = document.body;
-    selection._range = null;
-  };
-  {
-    const states = new Map(),
-      limit = 32,
-      dirtyLimit = 64,
-      dirtyIds = new Set();
-    /* Every mutation of a keyed subtree lands here, but only a section save
-       drains the set, and a page which never changes section would otherwise
-       grow it by every distinct id it touches. The save serializes at most
-       the first sixteen keys in insertion order, so keeping the first
-       sixty-four leaves room for keys whose nodes are gone by then while
-       bounding retention; later keys count as dropped exactly as the save's
-       own overflow does. */
-    dirtyIds.add = (key) => {
-      if (trustedSetSize(dirtyIds) < dirtyLimit || trustedSetHas(dirtyIds, key))
-        trustedSetAdd(dirtyIds, key);
-      else retentionStats.dirtyDrops++;
-      return dirtyIds;
-    };
-    const controlSelector = "input,textarea,select,option";
-    const sectionControlValue = (item) => {
-      const tag = String(item?.localName || item?.tagName).toLowerCase();
-      for (const key of nativeControlKeys(item))
-        if (nativeControlValues.has(key)) return nativeControlValues.get(key);
-      if (tag === "input") {
-        const native = String(
-            __tilefinchGetAttribute(item.__handle, "value") ?? "",
-          ),
-          reflected = String(item.getAttribute("value") ?? "");
-        if (native !== reflected) return native;
-      } else if (tag === "textarea") {
-        const native = String(__tilefinchGetText(item.__handle) ?? ""),
-          reflected = String(item.textContent ?? "");
-        if (native !== reflected) return native;
-      }
-      return item.value === undefined || item.value === null ? "" : item.value;
-    };
-    const controls = () => {
-      __tilefinchSuppressRemoteLookup(true);
-      try {
-        /* Avoid materializing an unbounded public NodeList just to preserve
-           section state. Sixty-four controls still covers dense forms while
-           bounding wrapper/object retention to a practical PSP footprint.
-           The 65th-match probe records that truncation occurred without
-           walking or allocating the rest of a hostile form. */
-        const count = __tilefinchQueryCount(controlSelector, 65);
-        if (count > 64) retentionStats.controlDrops += count - 64;
-        /* Do not turn state preservation into the allocation which kills a
-           nearly exhausted page. The current section remains rendered and
-           usable; only this optional restore snapshot is skipped. */
-        if (__tilefinchHeapRemaining() < 512 * 1024) {
-          retentionStats.controlDrops += Math.min(count, 64);
-          return [];
-        }
-        const handles = __tilefinchQueryAll(controlSelector, 0, 64);
-        return handles.map(__tilefinchWrap);
-      } finally {
-        __tilefinchSuppressRemoteLookup(false);
-      }
-    };
-    __tilefinchRealmGlobal.__tilefinchDirtyNodeIds = dirtyIds;
-    __tilefinchRealmGlobal.__tilefinchRestoringSection = false;
-    __tilefinchRealmGlobal.__tilefinchSaveSectionState = (key) => {
-      key = Number(key);
-      const list = controls(),
-        saved = [];
-      for (let index = 0; index < list.length; index++) {
-        const item = list[index],
-          raw = sectionControlValue(item),
-          value = String(raw).slice(0, 512),
-          selectionStart = Number.isInteger(item.selectionStart)
-            ? item.selectionStart
-            : null,
-          selectionEnd = Number.isInteger(item.selectionEnd)
-            ? item.selectionEnd
-            : null,
-          selectionDirection =
-            selectionStart === null
-              ? null
-              : String(item.selectionDirection || "none"),
-          stableKey = String(item.__tilefinchStableKey || "").slice(0, 192);
-        saved.push({
-          stableKey,
-          index,
-          value,
-          checked: !!item.checked,
-          selected: !!item.selected,
-          selectionStart,
-          selectionEnd,
-          selectionDirection,
-        });
-      }
-      const nodes = [];
-      for (const stableKey of dirtyIds) {
-        if (nodes.length >= 16) {
-          retentionStats.dirtyDrops++;
-          continue;
-        }
-        const item = __tilefinchNodeForStableKey(stableKey);
-        if (!item) continue;
-        const attributes = item.attributes.slice(0, 16).map((attribute) => ({
-          name: String(attribute.name).slice(0, 64),
-          value: String(attribute.value).slice(0, 256),
-        }));
-        let html = null;
-        try {
-          const serialized = String(item.innerHTML);
-          if (serialized.length <= 512) html = serialized;
-          else retentionStats.dirtyDrops++;
-        } catch (_) {
-          retentionStats.dirtyDrops++;
-        }
-        nodes.push({
-          stableKey: String(stableKey).slice(0, 192),
-          attributes,
-          html,
-        });
-      }
-      dirtyIds.clear();
-      if (states.has(key)) states.delete(key);
-      while (states.size >= limit) {
-        states.delete(states.keys().next().value);
-        retentionStats.stateEvictions++;
-      }
-      states.set(key, { controls: saved, nodes });
-      nativeControlValues.clear();
-      return saved.length + nodes.length;
-    };
-    __tilefinchRealmGlobal.__tilefinchRestoreSectionState = (key) => {
-      const state = states.get(Number(key));
-      if (!state) return 0;
-      __tilefinchRealmGlobal.__tilefinchRestoringSection = true;
-      let restored = 0;
-      try {
-        for (const saved of state.nodes || []) {
-          const item = __tilefinchNodeForStableKey(saved.stableKey);
-          if (!item) continue;
-          const names = new Set(
-            saved.attributes.map((attribute) => attribute.name),
-          );
-          for (const attribute of [...item.attributes])
-            if (!names.has(attribute.name))
-              item.removeAttribute(attribute.name);
-          for (const attribute of saved.attributes)
-            item.setAttribute(attribute.name, attribute.value);
-          if (saved.html !== null) item.innerHTML = saved.html;
-          restored++;
-        }
-        const list = controls();
-        for (const saved of state.controls || []) {
-          const item = saved.stableKey
-            ? __tilefinchNodeForStableKey(saved.stableKey)
-            : list[saved.index];
-          if (!item) continue;
-          item.value = saved.value;
-          const tag = String(
-            item.localName || item.tagName,
-          ).toLowerCase();
-          if (tag === "input")
-            __tilefinchSetAttribute(item.__handle, "value", saved.value);
-          else if (tag === "textarea")
-            __tilefinchSetText(item.__handle, saved.value);
-          if ("checked" in item) item.checked = saved.checked;
-          if ("selected" in item) item.selected = saved.selected;
-          if (
-            saved.selectionStart !== null &&
-            typeof item.setSelectionRange === "function"
-          )
-            item.setSelectionRange(
-              saved.selectionStart,
-              saved.selectionEnd,
-              saved.selectionDirection,
-            );
-          restored++;
-        }
-      } finally {
-        __tilefinchRealmGlobal.__tilefinchRestoringSection = false;
-        dirtyIds.clear();
-      }
-      return restored;
-    };
-  }
   document.getElementById = __tilefinchDocumentGetElementById;
   document.getElementsByTagName = (tag) => {
     tag = String(tag);

@@ -68,6 +68,7 @@
 #include "tilefinch/psp_boot_config.h"
 #include "tilefinch/psp_boot_order.h"
 #include "tilefinch/psp_clock_worker.h"
+#include "tilefinch/psp_local_route.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/psp_lifecycle.h"
 #include "tilefinch/psp_media_present.h"
@@ -78,6 +79,7 @@
 #include "tilefinch/psp_profile_store.h"
 #include "tilefinch/psp_text_input.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_ui_settings.h"
 #include "tilefinch/psp_basic_fallback.h"
 #include "tilefinch/psp_reader_policy.h"
 #include "tilefinch/psp_update_session.h"
@@ -185,12 +187,6 @@ _Static_assert(
 /* ---- private executable-wide declarations ---------------------------- */
 
 /* src/psp_script_main.c */
-typedef enum {
-    PSP_PROFILE_PAGE_NONE = 0,
-    PSP_PROFILE_PAGE_BOOKMARKS,
-    PSP_PROFILE_PAGE_HISTORY,
-    PSP_PROFILE_PAGE_HOMEPAGE
-} PspProfilePageKind;
 
 bool psp_write_failure_report(
     const char *stage, const char *detail, const char *url,
@@ -206,8 +202,6 @@ bool psp_write_navigation_failure_report(
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 bool psp_write_network_failure_report(const PspNetwork *network);
 #endif
-bool psp_offline_url(const char *url);
-bool psp_internal_action_url(const char *url, const char *name);
 bool psp_request_omnibox(
     PspTextInputService *text_input, const uint16_t *engine_frame,
     PspUiState *ui, const BrowserProfile *profile,
@@ -215,7 +209,6 @@ bool psp_request_omnibox(
     char *destination, size_t destination_capacity);
 
 /* src/psp_app/psp_app_page.c */
-PspProfilePageKind psp_profile_page_kind(const char *url);
 bool psp_set_presentation_css(
     BrowserEngine *engine, const PspUiState *ui,
     const BrowserProfile *profile, bool reader_mode,
@@ -285,10 +278,10 @@ void psp_report_background_transport_metrics(void);
 void psp_report_budget_counters(const Budget *budget, const char *phase);
 void psp_profile_record_current(
     BrowserProfile *profile, PspProfileStore *store,
-    const NavigationSession *navigation, uint64_t now_us);
+    const BrowserEngine *engine, uint64_t now_us);
 bool psp_recovery_record_current(
     const BrowserProfile *profile, const char *path,
-    const NavigationSession *navigation);
+    const BrowserEngine *engine);
 bool psp_profile_open_page(
     BrowserEngine *engine, PspUiState *ui, BrowserProfile *profile,
     PspProfilePageKind kind);
@@ -433,6 +426,8 @@ bool psp_present_internal(
 bool psp_media_menu_feedback_pending(void);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
+/* Validation: report the last focus move's settled frame (tilefinch-focus-frame). */
+void psp_focus_frame_settle(const BrowserEngine *engine);
 void psp_media_menu_feedback_input(const PspUiMediaState *media,
     bool was_open, unsigned old_tab, uint32_t started_us);
 void psp_load_experience_report(const char *scope, BrowserEngine *engine,
@@ -454,8 +449,11 @@ bool psp_platform_present(
     void *context, const uint16_t *pixels, size_t width,
     size_t height, size_t stride_pixels);
 void psp_show_page_script_clock(PspUiState *ui, const BrowserEngine *engine);
+/* The engine's cooperate_at service: BOUNDARY is the checkpoint's
+   TilefinchCooperateBoundary flags; PHASE names it for the log only. */
 bool psp_platform_cooperate(
-    void *context, const char *phase, size_t completed_work_units);
+    void *context, const char *phase, size_t completed_work_units,
+    unsigned boundary);
 void psp_platform_retire_frame(void *context, const uint16_t *pixels);
 void psp_work_cooperate_begin(
     PspUiState *ui, const uint16_t *frame,
@@ -727,8 +725,6 @@ void psp_content_blocker_restore_allowed_site_count(
     BrowserProfile *profile, size_t count);
 void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
                  const BrowserProfile *profile);
-void psp_sync_video_preferences(
-    PspUiState *ui, const BrowserProfile *profile);
 
 /* src/psp_app/psp_app_surfaces.c -- tab strip */
 typedef struct {
@@ -857,7 +853,6 @@ typedef struct {
 /* One operation record, rather than six pointers to main's locals. This is
    persistent loop state, not lifecycle authority. */
 typedef struct {
-    const NavigationEntry *entry;
     int observed_scroll;
     uint64_t observed_generation;
     uint64_t last_change_us;
@@ -871,9 +866,11 @@ typedef struct {
     unsigned reported_tenth;
 } PspScreenshotJob;
 
-/* Ephemeral copied view of engine-owned state. Refresh the whole record after
-   every mutating engine operation; its members are never independently
-   sampled or retained across a mutation. */
+/* Ephemeral view of engine-owned state. `navigation` and `controller` are
+   const aliases of the engine's live records, not copies, so a mutating engine
+   operation can change or invalidate what they point at. Refresh the whole
+   record after every mutating engine operation; its members are never
+   independently sampled or retained across a mutation. */
 typedef struct {
     const uint16_t *frame;
     size_t frame_pixels;
@@ -883,6 +880,16 @@ typedef struct {
 
 bool psp_engine_views_refresh(
     PspEngineViews *views, const BrowserEngine *engine);
+
+/* The current history entry's URL, copied into `buffer` (size it
+   NAVIGATION_URL_LIMIT), or NULL when there is no current entry. The copy
+   stays valid across engine mutations, unlike a borrowed NavigationEntry. */
+static inline const char *psp_app_current_url(
+    const BrowserEngine *engine, char *buffer, size_t capacity)
+{
+    return browser_engine_current_entry(engine, buffer, capacity, NULL)
+        ? buffer : NULL;
+}
 
 typedef enum {
     PSP_YOUTUBE_PRERESOLVE_IDLE = 0,
@@ -1283,6 +1290,53 @@ void psp_app_youtube_preresolve_tick(
    definitions for why the classifier and the routing must stay paired. */
 void psp_show_native_home(PspApp *app);
 bool psp_route_native_home(PspApp *app, const char *url);
+/* Show native COLLECTIONS on `section` with its rows synced: the open half
+   of every route that lands there. `reopen` re-enters the surface even when
+   it is already showing (resetting its selection); without it an open
+   surface only changes section rows. */
+void psp_open_native_collections(
+    PspApp *app, PspUiCollectionSection section, bool reopen);
+
+/* src/psp_app/psp_app_actions.c */
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+/* Brings the network up for an action about to fetch url; false when the
+   caller must abandon the action. */
+bool psp_action_network_ready(PspApp *app, const char *method,
+                              const char *url,
+                              const uint16_t *engine_frame);
+#endif
+/* Offers a file download for url (NULL: nothing to offer). */
+void psp_app_offer_file(PspApp *app, PspAppFrameState *frame,
+                        const char *url, const char *failure_status);
+
+/* psp_app_surfaces.c: Opens the selected COLLECTIONS row (bookmark, history entry, saved page, download or offline app). */
+void psp_app_collection_activate(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent, const uint16_t *engine_frame);
+/* psp_app_surfaces.c: Opens, switches to or closes a tab and lands on its destination. */
+void psp_app_tab_request(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent, const uint16_t *engine_frame);
+/* psp_app_page.c: Page tools -> Reader: enter or leave the extracted Reader presentation for the current page. */
+void psp_app_toggle_reader(
+    PspApp *app, PspAppFrameState *frame);
+/* psp_app_input.c: Captures the visible frame and starts the bounded PNG writer. */
+void psp_app_take_screenshot(
+    PspApp *app, const uint16_t *engine_frame);
+/* src/psp_app/psp_app_activation.c: a Cross/Enter press on the page. */
+typedef struct {
+    ControllerAction action;
+    bool activated;
+    bool preview;
+    size_t activations_before;
+} PspPageActivation;
+bool psp_app_activate_page(
+    PspApp *app, PspAppFrameState *frame, bool enter_only,
+    const uint16_t *engine_frame, PspPageActivation *activation);
+void psp_app_route_controller_action(
+    PspApp *app, PspAppFrameState *frame, const uint16_t *engine_frame,
+    ControllerAction *action);
+void psp_app_dispatch_activation(
+    PspApp *app, PspAppFrameState *frame, bool enter_only,
+    const uint16_t *engine_frame);
 
 /* src/psp_app/psp_app_actions.c */
 void psp_app_dispatch_action(

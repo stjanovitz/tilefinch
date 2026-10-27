@@ -451,10 +451,13 @@ static const char *stylesheet_store_selector(Stylesheet *sheet,
 
 /* The winning declaration of `name` in the element's style attribute, as
    a span of the attribute text (stable while the DOM is). A value of
-   `limit` bytes or more is ignored, as an oversized rule value is. */
+   `limit` bytes or more is ignored, as an oversized rule value is. A
+   non-NULL alias is a vendor spelling of the same property: either
+   spelling counts, and the usual order and importance pick the winner. */
 static bool inline_variable_value(const Stylesheet *sheet,
                                   lxb_dom_node_t *node, const char *name,
-                                  size_t name_length, size_t limit,
+                                  size_t name_length, const char *alias,
+                                  size_t limit,
                                   const char **value_output,
                                   size_t *length_output,
                                   bool *important_output)
@@ -486,11 +489,13 @@ static bool inline_variable_value(const Stylesheet *sheet,
             }
             bool custom_property = name_length > 2
                 && name[0] == '-' && name[1] == '-';
-            if (candidate_length == name_length
+            bool matches = candidate_length == name_length
                 && (custom_property
                     ? memcmp(candidate, name, name_length) == 0
-                    : strncasecmp(candidate, name, name_length) == 0)
-                && value_length < limit
+                    : strncasecmp(candidate, name, name_length) == 0);
+            if (!matches && alias != NULL)
+                matches = span_case_equal(candidate, candidate_length, alias);
+            if (matches && value_length < limit
                 && (!found || important || !found_important)) {
                 *value_output = value;
                 *length_output = value_length;
@@ -530,7 +535,7 @@ static bool custom_rule_later(const Stylesheet *sheet, const lxb_dom_node_t *nod
     if (candidate->specificity != current->specificity) {
         return candidate->specificity > current->specificity;
     }
-    if (!sheet->adopted_order_varies)
+    if (!sheet->scopes.adopted_order_varies)
         return candidate->order >= current->order;
     uint64_t a = style_adopted_cascade_order(sheet, node, candidate->order >> 8);
     uint64_t b = style_adopted_cascade_order(sheet, node, current->order >> 8);
@@ -1230,7 +1235,7 @@ static bool local_variable_value(
     bool inline_wins = false;
     bool inline_found = wanted_pseudo == PSEUDO_NONE
         && inline_variable_value(
-            sheet, node, name, name_length, STYLE_CUSTOM_VALUE_CAPACITY,
+            sheet, node, name, name_length, NULL, STYLE_CUSTOM_VALUE_CAPACITY,
             value, value_length, &inline_important);
     if (inline_found) {
         inline_rule.important = inline_important;
@@ -1712,6 +1717,8 @@ bool style_resolve_value_on_node(
 static bool style_retained_property_value_scoped(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *name, size_t name_length, char *output, size_t output_size);
+static const char *style_sparse_property_alias(const char *name,
+                                               size_t name_length);
 
 /* Resolved once per retained property of every element: each candidate
    rule's class key is tested against the element's tokenized class list. */
@@ -1750,8 +1757,12 @@ static bool style_retained_property_value_scoped(
     bool inline_important = false;
     bool custom_property = name_length > 2 && name[0] == '-'
         && name[1] == '-';
+    /* Sheet rules retain a vendor alias under the standard name; a style
+       attribute keeps the spelling it was written with. */
     if (inline_variable_value(
             sheet, node, name, name_length,
+            custom_property ? NULL
+                            : style_sparse_property_alias(name, name_length),
             custom_property ? STYLE_CUSTOM_VALUE_CAPACITY
                             : STYLE_RETAINED_VALUE_CAPACITY,
             &inline_value, &inline_length, &inline_important)) {
@@ -3345,65 +3356,140 @@ static bool declaration_span(const char *text, size_t length,
     return true;
 }
 
-/* Properties the cascade does not decode into ComputedStyle but retains as
-   authored text for a later consumer (layout, getComputedStyle, the sparse
-   "modern" resolver). This one table decides what is retained and what
-   @supports reports as implemented; a name added here must also get a value
-   validator in supports_retained_layout_value(). Vendor aliases are stored
-   under their standard name. */
-static const char *const style_retained_layout_properties[] = {
-    "container", "container-name", "container-type",
-    "columns", "column-count", "column-width", "column-gap",
-    "break-inside",
-    "cursor",
-    "overscroll-behavior", "overscroll-behavior-x",
-    "overscroll-behavior-y", "overscroll-behavior-inline",
-    "overscroll-behavior-block",
-    "scroll-behavior",
-    "scroll-margin", "scroll-margin-top", "scroll-margin-right",
-    "scroll-margin-bottom", "scroll-margin-left",
-    "scroll-padding", "scroll-padding-top", "scroll-padding-right",
-    "scroll-padding-bottom", "scroll-padding-left",
-    "scroll-snap-align", "scroll-snap-stop", "scroll-snap-type",
-    "scrollbar-color", "scrollbar-width",
-    "user-select", "touch-action", "text-size-adjust", "resize",
-    "text-wrap", "text-wrap-style",
-    "hyphens", "tab-size", "font-kerning", "text-rendering",
-    "contain-intrinsic-size",
-    "translate", "rotate", "scale", "isolation", "mix-blend-mode",
-    "backface-visibility", "transform-style", "color-scheme",
-    "border-image", "border-image-source", "border-image-slice",
-    "border-image-width", "border-image-outset", "border-image-repeat",
-    "backdrop-filter",
-    "border-start-start-radius", "border-start-end-radius",
-    "border-end-start-radius", "border-end-end-radius"
+/* Properties the cascade does not decode into ComputedStyle but retain as
+   authored text for a later consumer: the rows of STYLE_SPARSE_PROPERTIES
+   (style_sparse_properties.h). That one table decides what is retained and
+   what @supports reports as implemented. Vendor aliases are stored under
+   their standard name. */
+enum {
+    STYLE_SPARSE_PRESENCE_NONE = 0,
+    STYLE_SPARSE_PRESENCE_MULTICOLUMN,
+    STYLE_SPARSE_PRESENCE_CURSOR,
+    STYLE_SPARSE_PRESENCE_SCROLL
 };
+
+typedef struct {
+    const char *name;
+    const char *alias;
+    uint32_t modern;
+    uint8_t name_length;
+    uint8_t typography;
+    uint8_t presence;
+} StyleSparseProperty;
+
+static const StyleSparseProperty style_sparse_properties[] = {
+#define STYLE_SPARSE_ROW(name, alias, modern, typography, presence, \
+                         validator) \
+    { name, alias, modern, sizeof(name) - 1u, typography, \
+      STYLE_SPARSE_PRESENCE_##presence },
+    STYLE_SPARSE_PROPERTIES(STYLE_SPARSE_ROW)
+#undef STYLE_SPARSE_ROW
+};
+
+enum {
+    STYLE_SPARSE_PROPERTY_COUNT =
+        sizeof(style_sparse_properties) / sizeof(style_sparse_properties[0])
+};
+
+/* The STYLE_SPARSE_PROPERTIES row of a standard name or vendor alias, or
+   -1. A name that starts with '-' is only ever an alias. */
+static int style_sparse_property_index(const char *name, size_t name_length)
+{
+    if (name_length > 8 && name[0] == '-') {
+        for (size_t i = 0; i < STYLE_SPARSE_PROPERTY_COUNT; i++) {
+            const char *alias = style_sparse_properties[i].alias;
+            if (alias != NULL && span_case_equal(name, name_length, alias))
+                return (int) i;
+        }
+        return -1;
+    }
+    for (size_t i = 0; i < STYLE_SPARSE_PROPERTY_COUNT; i++) {
+        const StyleSparseProperty *property = &style_sparse_properties[i];
+        if (property->name_length == name_length
+            && span_case_equal(name, name_length, property->name))
+            return (int) i;
+    }
+    return -1;
+}
+
+/* The vendor alias of a standard sparse property name, or NULL. */
+static const char *style_sparse_property_alias(const char *name,
+                                               size_t name_length)
+{
+    int index = name_length > 0 && name[0] != '-'
+        ? style_sparse_property_index(name, name_length) : -1;
+    return index < 0 ? NULL : style_sparse_properties[index].alias;
+}
 
 /* The stored (standard) name of a retained layout property, or NULL. */
 static const char *retained_layout_property(const char *name,
                                             size_t name_length)
 {
-    static const struct { const char *alias; const char *standard; }
-        aliases[] = {
-            { "-webkit-user-select", "user-select" },
-            { "-webkit-text-size-adjust", "text-size-adjust" },
-            { "-webkit-backdrop-filter", "backdrop-filter" }
-        };
-    if (name_length > 8 && name[0] == '-') {
-        for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
-            if (span_case_equal(name, name_length, aliases[i].alias))
-                return aliases[i].standard;
+    int index = style_sparse_property_index(name, name_length);
+    return index < 0 ? NULL : style_sparse_properties[index].name;
+}
+
+/* The sheet's monotonic presence summary for one sparse property: the
+   modern resolver's bits and the layout gates. Every route that can
+   introduce a sparse declaration (sheet rules, style attributes) records
+   it here. */
+static void style_sparse_property_mark(Stylesheet *sheet, int index)
+{
+    const StyleSparseProperty *property = &style_sparse_properties[index];
+    sheet->modern_property_mask |= property->modern;
+    sheet->modern_typography_mask |= property->typography;
+    switch (property->presence) {
+    case STYLE_SPARSE_PRESENCE_MULTICOLUMN:
+        sheet->has_multicolumn_rules = true;
+        break;
+    case STYLE_SPARSE_PRESENCE_CURSOR:
+        sheet->has_cursor_rules = true;
+        break;
+    case STYLE_SPARSE_PRESENCE_SCROLL:
+        sheet->has_scroll_interaction_rules = true;
+        break;
+    default:
+        break;
+    }
+}
+
+/* Every bit the table can set: once a sheet has them all, a style
+   attribute cannot add anything. */
+#define STYLE_SPARSE_MODERN_BIT(name, alias, modern, typography, presence, \
+                                validator) | (modern)
+#define STYLE_SPARSE_TYPOGRAPHY_BIT(name, alias, modern, typography, \
+                                    presence, validator) | (typography)
+static const uint32_t style_sparse_modern_all =
+    0u STYLE_SPARSE_PROPERTIES(STYLE_SPARSE_MODERN_BIT);
+static const uint8_t style_sparse_typography_all = (uint8_t) (
+    0u STYLE_SPARSE_PROPERTIES(STYLE_SPARSE_TYPOGRAPHY_BIT));
+#undef STYLE_SPARSE_TYPOGRAPHY_BIT
+#undef STYLE_SPARSE_MODERN_BIT
+
+void style_sparse_note_inline(const Stylesheet *sheet, const char *text,
+                              size_t length)
+{
+    if (sheet == NULL || text == NULL
+        || (sheet->has_multicolumn_rules && sheet->has_cursor_rules
+            && sheet->has_scroll_interaction_rules
+            && sheet->modern_property_mask == style_sparse_modern_all
+            && sheet->modern_typography_mask
+                   == style_sparse_typography_all)) return;
+    for (size_t at = 0; at < length;) {
+        size_t end;
+        if (!declaration_span(text, length, &at, &end)) break;
+        size_t colon = at;
+        while (colon < end && text[colon] != ':') colon++;
+        if (colon < end) {
+            const char *name = text + at;
+            size_t name_length = colon - at;
+            trim(&name, &name_length);
+            int index = style_sparse_property_index(name, name_length);
+            if (index >= 0)
+                style_sparse_property_mark((Stylesheet *) sheet, index);
         }
-        return NULL;
+        at = end + (end < length);
     }
-    for (size_t i = 0;
-         i < sizeof(style_retained_layout_properties)
-             / sizeof(style_retained_layout_properties[0]); i++) {
-        if (span_case_equal(name, name_length,
-                            style_retained_layout_properties[i]))
-            return style_retained_layout_properties[i];
-    }
-    return NULL;
 }
 
 static int transition_declaration_kind(const char *name, size_t length);
@@ -3460,12 +3546,6 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 && name[0] == '-' && name[1] == '-';
             const char *stored_name = name;
             size_t stored_name_length = name_length;
-            if (!retained
-                && span_case_equal(name, name_length, "color-scheme")) {
-                retained = true;
-                stored_name = "color-scheme";
-                stored_name_length = sizeof("color-scheme") - 1u;
-            }
             if (!retained) {
                 const char *canonical = retained_presentation_property(
                     name, name_length);
@@ -3476,121 +3556,13 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 }
             }
             if (!retained) {
-                const char *standard =
-                    retained_layout_property(name, name_length);
-                if (standard != NULL) {
+                int sparse = style_sparse_property_index(name, name_length);
+                if (sparse >= 0) {
                     retained = true;
-                    stored_name = standard;
-                    stored_name_length = strlen(standard);
+                    stored_name = style_sparse_properties[sparse].name;
+                    stored_name_length = strlen(stored_name);
+                    style_sparse_property_mark(sheet, sparse);
                 }
-            }
-            if (retained
-                && (span_case_equal(stored_name, stored_name_length,
-                                    "columns")
-                    || span_case_equal(stored_name, stored_name_length,
-                                       "column-count")
-                    || span_case_equal(stored_name, stored_name_length,
-                                       "column-width"))) {
-                sheet->has_multicolumn_rules = true;
-            }
-            if (retained
-                && span_case_equal(
-                    stored_name, stored_name_length, "cursor")) {
-                sheet->has_cursor_rules = true;
-            }
-            if (retained
-                && ((stored_name_length >= 6
-                     && strncasecmp(stored_name, "scroll", 6) == 0)
-                    || (stored_name_length >= 11
-                        && strncasecmp(
-                               stored_name, "overscroll-", 11) == 0))) {
-                sheet->has_scroll_interaction_rules = true;
-            }
-            if (retained) {
-                uint32_t modern = 0;
-                if (span_case_equal(stored_name, stored_name_length,
-                                    "user-select")) {
-                    modern = STYLE_MODERN_USER_SELECT;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "touch-action")) {
-                    modern = STYLE_MODERN_TOUCH_ACTION;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "text-size-adjust")) {
-                    modern = STYLE_MODERN_TEXT_SIZE_ADJUST;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "resize")) {
-                    modern = STYLE_MODERN_RESIZE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "text-wrap")
-                           || span_case_equal(stored_name, stored_name_length,
-                                              "text-wrap-style")) {
-                    modern = STYLE_MODERN_TEXT_WRAP;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "translate")) {
-                    modern = STYLE_MODERN_TRANSLATE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "rotate")) {
-                    modern = STYLE_MODERN_ROTATE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "scale")) {
-                    modern = STYLE_MODERN_SCALE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "isolation")) {
-                    modern = STYLE_MODERN_ISOLATION;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "hyphens")
-                           || span_case_equal(stored_name, stored_name_length,
-                                              "tab-size")
-                           || span_case_equal(stored_name, stored_name_length,
-                                              "font-kerning")
-                           || span_case_equal(stored_name, stored_name_length,
-                                              "text-rendering")) {
-                    modern = STYLE_MODERN_TYPOGRAPHY;
-                    if (span_case_equal(stored_name, stored_name_length,
-                                        "hyphens")) {
-                        sheet->modern_typography_mask
-                            |= STYLE_MODERN_TYPOGRAPHY_HYPHENS;
-                    } else if (span_case_equal(
-                                   stored_name, stored_name_length,
-                                   "tab-size")) {
-                        sheet->modern_typography_mask
-                            |= STYLE_MODERN_TYPOGRAPHY_TAB_SIZE;
-                    } else if (span_case_equal(
-                                   stored_name, stored_name_length,
-                                   "font-kerning")) {
-                        sheet->modern_typography_mask
-                            |= STYLE_MODERN_TYPOGRAPHY_KERNING;
-                    } else {
-                        sheet->modern_typography_mask
-                            |= STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING;
-                    }
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "mix-blend-mode")) {
-                    modern = STYLE_MODERN_MIX_BLEND;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "backface-visibility")) {
-                    modern = STYLE_MODERN_BACKFACE_VISIBILITY;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "transform-style")) {
-                    modern = STYLE_MODERN_TRANSFORM_STYLE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "color-scheme")) {
-                    modern = STYLE_MODERN_COLOR_SCHEME;
-                } else if (stored_name_length >= 12u
-                           && strncasecmp(
-                                  stored_name, "border-image", 12u) == 0) {
-                    modern = STYLE_MODERN_BORDER_IMAGE;
-                } else if (span_case_equal(stored_name, stored_name_length,
-                                           "backdrop-filter")) {
-                    modern = STYLE_MODERN_BACKDROP_FILTER;
-                } else if (stored_name_length >= 18
-                           && strncasecmp(stored_name, "border-", 7) == 0
-                           && strncasecmp(
-                                  stored_name + stored_name_length - 7,
-                                  "-radius", 7) == 0) {
-                    modern = STYLE_MODERN_LOGICAL_RADIUS;
-                }
-                sheet->modern_property_mask |= modern;
             }
             if (retained
                 && !add_custom_rule(sheet, selector, selector_length,

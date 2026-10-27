@@ -388,7 +388,8 @@ bool script_runtime_finish_loading(ScriptRuntime *runtime,
        boundary.  That transient compilation could exhaust a tight 2 MiB
        realm even though the dispatcher and author script both fit. */
     bool evaluated = runtime_call_captured(
-        runtime, runtime->dom_content_loaded_dispatch,
+        runtime,
+        runtime->host_callbacks[SCRIPT_HOST_DISPATCH_DOM_CONTENT_LOADED],
         "__tilefinchDispatchDOMContentLoaded", 0, NULL, NULL);
     js_lazy_webpack_recover_failure(runtime);
     if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);

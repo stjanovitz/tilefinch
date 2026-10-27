@@ -211,6 +211,56 @@ static int test_focus_within_unrelated_branches(Budget *budget)
     return 0;
 }
 
+/* Focus probes answer through the matcher's focus override, which must
+   reach every reader of the marker: :focus, :focus-within, and attribute
+   selectors that name the marker (a focused override reads as the marker
+   with an empty value, as the old DOM toggle wrote it). */
+static int test_focus_override_reaches_marker_selectors(Budget *budget)
+{
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    const char *html = "<style>a:focus{outline:2px solid red}"
+        "#literal[data-tilefinch-focus]{padding-left:3px}"
+        "#valued[data-tilefinch-focus='']{margin-left:2px}"
+        "#other[data-tilefinch-focus='x']{margin-left:5px}"
+        ".box:focus-within{padding-top:4px}"
+        "</style><a id='plain' href='#'>Plain</a>"
+        "<a id='literal' href='#'>Literal</a>"
+        "<a id='valued' href='#'>Valued</a>"
+        "<a id='other' href='#'>Other</a>"
+        "<div class='box' id='box'><a id='inner' href='#'>Inner</a></div>";
+    CHECK(document_parse(&document, budget, html, strlen(html), 31));
+    CHECK(stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const char *ids[] = {"plain", "literal", "valued", "other", "inner"};
+    const StyleFocusChange expected[] = {
+        STYLE_FOCUS_CHANGE_OUTLINE_ONLY, STYLE_FOCUS_CHANGE_UNSAFE,
+        STYLE_FOCUS_CHANGE_UNSAFE, STYLE_FOCUS_CHANGE_OUTLINE_ONLY,
+        STYLE_FOCUS_CHANGE_UNSAFE};
+    for (size_t i = 0u; i < 5u; i++) {
+        lxb_dom_node_t *node = find_id(root, ids[i]);
+        ComputedStyle normal = {0}, focused = {0};
+        CHECK(node != NULL);
+        StyleFocusChange change = style_focus_change_classify(
+            &sheet, node, NULL, &normal, &focused);
+        if (change != expected[i])
+            fprintf(stderr, "focus-override id=%s change=%d\n", ids[i], change);
+        CHECK(change == expected[i]);
+        if (i == 1u) CHECK(focused.padding.left == 3 && normal.padding.left == 0);
+        if (i == 2u) CHECK(focused.margin.left == 2 && normal.margin.left == 0);
+        CHECK(document_attribute(node, "data-tilefinch-focus",
+                                 &(size_t){0}) == NULL);
+    }
+    /* Outside a probe the matcher reads the attribute again. */
+    ComputedStyle box = style_for_node(&sheet, find_id(root, "box"), NULL);
+    CHECK(box.padding.top == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 typedef struct { size_t calls, cancel_after; } ScrollExtentProbe;
 
 static bool scroll_extent_poll(void *opaque, const char *phase, size_t work)
@@ -4073,6 +4123,260 @@ static int test_hidden_markup_costs_nothing(Budget *budget)
         CHECK(cost.found_text && cost.boxes > base.boxes
               && cost.text_commands > base.text_commands);
     }
+    return 0;
+}
+
+/* Sparse properties set only by style attributes: no stylesheet rule
+   mentions scroll snapping or the cursor, so only the inline declarations
+   can open the sheet's layout presence gates for them. */
+static int test_sparse_properties_from_inline_style(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}</style><body>"
+        "<div id=scroller style=\"display:block;width:120px;height:80px;"
+        "overflow:auto;scroll-snap-type:y mandatory\">"
+        "<div style=\"display:block;height:60px\"></div>"
+        "<div id=target style=\"display:block;height:60px;"
+        "scroll-snap-align:start;cursor:pointer\">T</div>"
+        "<div style=\"display:block;height:60px\"></div></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 94)
+          && stylesheet_build(&sheet, budget, &document, 160)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                          160));
+    lxb_dom_node_t *target = find_id(
+        lxb_dom_interface_node(document.html), "target");
+    CHECK(target != NULL && layout.scroll_container_count == 1);
+    CHECK(layout_cursor_for_node(&sheet, target) == LAYOUT_CURSOR_POINTER);
+    CHECK(layout.scroll_snap_candidate_count == 1
+          && sheet.has_scroll_interaction_rules && sheet.has_cursor_rules);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+static const DrawCommand *inline_modern_command(
+    const LayoutDocument *layout, uint8_t type, uint32_t color,
+    const char *text)
+{
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != type) continue;
+        if (text != NULL
+            ? command->text != NULL
+              && command->text_length == strlen(text)
+              && memcmp(command->text, text, strlen(text)) == 0
+            : command->color == color) return command;
+    }
+    return NULL;
+}
+
+/* Width of the last text line inside one box. */
+static int inline_modern_last_line_width(const LayoutDocument *layout,
+                                         const LayoutNodeBox *box)
+{
+    int last_y = INT_MIN, width = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_TEXT || command->y < box->y
+            || command->y >= box->y + box->height) continue;
+        if (command->y > last_y) {
+            last_y = command->y;
+            width = 0;
+        }
+        if (command->y == last_y && command->x + command->width - box->x
+                                        > width)
+            width = command->x + command->width - box->x;
+    }
+    return last_y == INT_MIN ? -1 : width;
+}
+
+static bool inline_modern_layouts_equal(const LayoutDocument *first,
+                                        const LayoutDocument *second)
+{
+    if (first->count != second->count) return false;
+    for (size_t i = 0; i < first->count; i++) {
+        const DrawCommand *a = &first->commands[i];
+        const DrawCommand *b = &second->commands[i];
+        if (a->type != b->type || a->x != b->x || a->y != b->y
+            || a->width != b->width || a->height != b->height
+            || a->color != b->color || a->radius != b->radius
+            || a->scale != b->scale || a->font_size != b->font_size
+            || a->z_index != b->z_index
+            || a->opacity_scale != b->opacity_scale
+            || a->font_family != b->font_family
+            || a->font_weight != b->font_weight
+            || a->font_italic != b->font_italic
+            || a->letter_spacing != b->letter_spacing
+            || a->image_fit != b->image_fit
+            || a->text_length != b->text_length) {
+            fprintf(stderr, "inline modern: command %zu differs\n", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Properties the modern resolver handles, set only by style attributes:
+   no stylesheet rule names any of them, so only the inline declarations
+   can turn on the sheet's modern summary bits. The bits turn on during the
+   first style pass, at the first element that declares one; that pass must
+   lay out exactly like one whose sheet had every bit on from the start
+   (text-size-adjust is the inherited case: #adjusted resolves against the
+   percentage its parent declares, #before and #after are unaffected). */
+static int test_modern_properties_from_inline_style(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}"
+        ".copy{display:block;width:120px;font-size:12px;line-height:14px}"
+        ".sized{font-size:16px}</style><body>"
+        "<div id=before class=sized>BEFORE</div>"
+        "<div id=select style=\"user-select:none\">SELECT</div>"
+        "<div id=move style=\"display:block;width:40px;height:20px;"
+        "background:#123456;translate:10px 5px\"></div>"
+        "<div id=turn style=\"display:block;width:40px;height:20px;"
+        "rotate:90deg\">TURN</div>"
+        "<div id=frost style=\"display:block;width:40px;height:20px;"
+        "position:sticky;top:0;background:#abcdef;"
+        "backdrop-filter:blur(4px)\"></div>"
+        "<div id=corner style=\"display:block;width:40px;height:20px;"
+        "background:#654321;border-start-start-radius:7px\"></div>"
+        "<p id=normal class=copy>one two three four five six seven eight"
+        " nine ten</p>"
+        "<p id=balanced class=copy style=\"text-wrap:balance\">one two"
+        " three four five six seven eight nine ten</p>"
+        "<div id=adjust style=\"text-size-adjust:50%;font-size:20px\">"
+        "ADJUST<span id=adjusted class=sized>CHILD</span></div>"
+        "<div id=after class=sized>AFTER</div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    Stylesheet preset = {0};
+    LayoutDocument layout = {0};
+    LayoutDocument preset_layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 95)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && stylesheet_build(&preset, budget, &document, 480));
+    CHECK(sheet.modern_property_mask == 0
+          && sheet.modern_typography_mask == 0);
+    preset.modern_property_mask = UINT32_MAX;
+    preset.modern_typography_mask = UINT8_MAX;
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout_build(&preset_layout, budget, &document, &preset,
+                          NULL, NULL, 480));
+    CHECK(inline_modern_layouts_equal(&layout, &preset_layout));
+
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *body_node = document_body_node(&document);
+    ComputedStyle html_style = style_for_node(&sheet, body_node->parent,
+                                              NULL);
+    ComputedStyle body = style_for_node(&sheet, body_node, &html_style);
+    ComputedStyle select = style_for_node(
+        &sheet, find_id(root, "select"), &body);
+    CHECK(computed_style_user_select(&select) == STYLE_USER_SELECT_NONE);
+
+    const DrawCommand *move = inline_modern_command(
+        &layout, DRAW_FILL_RECT, 0x123456, NULL);
+    const LayoutNodeBox *move_box = layout_box_for_node(
+        &layout, find_id(root, "move"));
+    const DrawCommand *turn = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "TURN");
+    const DrawCommand *frost = inline_modern_command(
+        &layout, DRAW_FILL_RECT, 0xabcdef, NULL);
+    const DrawCommand *corner = inline_modern_command(
+        &layout, DRAW_FILL_RECT, 0x654321, NULL);
+    const LayoutNodeBox *normal_box = layout_box_for_node(
+        &layout, find_id(root, "normal"));
+    const LayoutNodeBox *balanced_box = layout_box_for_node(
+        &layout, find_id(root, "balanced"));
+    const DrawCommand *before = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "BEFORE");
+    const DrawCommand *adjust = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "ADJUST");
+    const DrawCommand *adjusted = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "CHILD");
+    const DrawCommand *after = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "AFTER");
+    CHECK(move != NULL && move_box != NULL && turn != NULL
+          && frost != NULL && corner != NULL && normal_box != NULL
+          && balanced_box != NULL && before != NULL && adjust != NULL
+          && adjusted != NULL && after != NULL);
+    /* #move sits 40px (#turn, #frost) above #frost when untranslated. */
+    CHECK(move->x == 10 && move->y == frost->y - 40 + 5
+          && move_box->x == 10);
+    CHECK(draw_command_rotation_quadrants(turn) == 1u);
+    CHECK(draw_command_backdrop_blur(frost) == 3u);
+    CHECK(style_border_radius_corner(corner->radius, 0) == 7
+          && style_border_radius_corner(corner->radius, 1) == 0);
+    CHECK(inline_modern_last_line_width(&layout, balanced_box)
+          > inline_modern_last_line_width(&layout, normal_box));
+    CHECK(before->font_size == 16 && adjust->font_size == 10
+          && adjusted->font_size == 8 && after->font_size == 16);
+
+    layout_destroy(&preset_layout);
+    layout_destroy(&layout);
+    stylesheet_destroy(&preset);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* Sheet rules retain a vendor alias under the standard name, but a style
+   attribute keeps its spelling: the inline lookup must accept either, the
+   later declaration winning as usual. */
+static int test_vendor_aliases_in_style_attribute(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}</style><body>"
+        "<div id=alias style=\"-webkit-user-select:none\">A</div>"
+        "<div id=later style=\"user-select:none;-webkit-user-select:text\">"
+        "B</div>"
+        "<div id=earlier style=\"-webkit-user-select:all;user-select:none\">"
+        "C</div>"
+        "<div id=frost style=\"display:block;width:40px;height:20px;"
+        "position:sticky;top:0;background:#abcdef;"
+        "-webkit-backdrop-filter:blur(2px)\"></div>"
+        "<div style=\"-webkit-text-size-adjust:50%;font-size:20px\">"
+        "ADJUST</div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 96)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                          480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *body_node = document_body_node(&document);
+    ComputedStyle html_style = style_for_node(&sheet, body_node->parent,
+                                              NULL);
+    ComputedStyle body = style_for_node(&sheet, body_node, &html_style);
+    ComputedStyle alias = style_for_node(
+        &sheet, find_id(root, "alias"), &body);
+    ComputedStyle later = style_for_node(
+        &sheet, find_id(root, "later"), &body);
+    ComputedStyle earlier = style_for_node(
+        &sheet, find_id(root, "earlier"), &body);
+    CHECK(computed_style_user_select(&alias) == STYLE_USER_SELECT_NONE
+          && computed_style_user_select(&later) == STYLE_USER_SELECT_TEXT
+          && computed_style_user_select(&earlier)
+             == STYLE_USER_SELECT_NONE);
+    const DrawCommand *frost = inline_modern_command(
+        &layout, DRAW_FILL_RECT, 0xabcdef, NULL);
+    const DrawCommand *adjust = inline_modern_command(
+        &layout, DRAW_TEXT, 0, "ADJUST");
+    CHECK(frost != NULL && draw_command_backdrop_blur(frost) == 2u
+          && adjust != NULL && adjust->font_size == 10);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
     return 0;
 }
 

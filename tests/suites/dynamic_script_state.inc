@@ -80,7 +80,6 @@ static bool test_native_script_element_state(Budget *budget)
         "globalThis.__tilefinchScheduleDynamicScript=()=>{throw new Error("
         "'poison native scheduler');};"
         "globalThis.__tilefinchWrap=()=>({id:'poison-wrap'});"
-        "globalThis.__tilefinchCurrentScriptForStable=()=>({id:'poison-stable'});"
         "globalThis.lateRuns=0;globalThis.nestedSyncOk=false;"
         "globalThis.lateScript=document.createElement('script');"
         "document.head.appendChild(lateScript);"

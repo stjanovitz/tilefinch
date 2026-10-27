@@ -46,5 +46,9 @@ int test_deferred_startup_journey(void);
 int test_deferred_image_admission_yields_to_input(void);
 int test_deferred_image_publication_survives_rebuild(void);
 int test_deferred_images_skip_oversized_pages(void);
+int test_cooperate_boundary_dispatch(void);
+int test_cooperate_boundary_phase_names(void);
+int test_cooperate_boundaries_reach_frontend(void);
+int test_raster_decode_checkpoints_borrow_render_shell(void);
 
 #endif

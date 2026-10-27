@@ -38,7 +38,8 @@ bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
     };
     JSValue returned = JS_UNDEFINED;
     bool ok = runtime_call_captured(
-        runtime, runtime->dispatch_at, "__tilefinchDispatchAt", 2,
+        runtime, runtime->host_callbacks[SCRIPT_HOST_DISPATCH_AT],
+        "__tilefinchDispatchAt", 2,
         arguments, &returned);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
@@ -86,7 +87,8 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
     uint64_t dispatch_begin = trace_dispatch
         ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
-        runtime, runtime->dispatch_handle, "__tilefinchDispatchHandle", 2,
+        runtime, runtime->host_callbacks[SCRIPT_HOST_DISPATCH_HANDLE],
+        "__tilefinchDispatchHandle", 2,
         arguments, &returned);
     uint64_t dispatch_call = trace_dispatch
         ? tilefinch_platform_monotonic_time_us() : 0;
@@ -161,7 +163,8 @@ bool script_runtime_dispatch_pointer_node(
     uint64_t pointer_begin_us = trace_dispatch
         ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
-        runtime, runtime->dispatch_activation_handle,
+        runtime,
+        runtime->host_callbacks[SCRIPT_HOST_DISPATCH_ACTIVATION_HANDLE],
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
     for (size_t i = 0; i < 7; i++)
         JS_FreeValue(runtime->context, arguments[i]);
@@ -200,12 +203,15 @@ static bool runtime_clear_page_fullscreen(ScriptRuntime *runtime,
     }
     if (had_fullscreen) runtime->relayout_dirty = true;
     if (!had_fullscreen || !dispatch_event || runtime->context == NULL
-        || !JS_IsFunction(runtime->context, runtime->fullscreen_host_exit)) {
+        || !JS_IsFunction(
+               runtime->context,
+               runtime->host_callbacks[SCRIPT_HOST_EXIT_FULLSCREEN])) {
         return had_fullscreen;
     }
-    JSValue returned = JS_Call(runtime->context,
-                               runtime->fullscreen_host_exit,
-                               JS_UNDEFINED, 0, NULL);
+    JSValue returned = JS_Call(
+        runtime->context,
+        runtime->host_callbacks[SCRIPT_HOST_EXIT_FULLSCREEN],
+        JS_UNDEFINED, 0, NULL);
     bool ok = !JS_IsException(returned);
     if (!ok) {
         JSValue exception = JS_GetException(runtime->context);
@@ -314,7 +320,8 @@ bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
     };
     JSValue returned = JS_UNDEFINED;
     bool ok = runtime_call_captured(
-        runtime, runtime->dispatch_input_handle,
+        runtime,
+        runtime->host_callbacks[SCRIPT_HOST_DISPATCH_INPUT_HANDLE],
         "__tilefinchDispatchInputHandle", 5, arguments, &returned);
     for (size_t i = 0; i < 5; i++) JS_FreeValue(runtime->context, arguments[i]);
     if (ok) runtime->result.last_event_cancelled =
@@ -354,7 +361,8 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
     bool trace_dispatch = runtime_trace_dispatch_enabled();
     uint64_t begin = trace_dispatch ? tilefinch_platform_monotonic_time_us() : 0;
     bool ok = runtime_call_captured(
-        runtime, runtime->dispatch_submit_handle,
+        runtime,
+        runtime->host_callbacks[SCRIPT_HOST_DISPATCH_SUBMIT_HANDLE],
         "__tilefinchDispatchSubmitHandle", 2, arguments, &returned);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
@@ -531,8 +539,10 @@ bool script_runtime_update_media_state(
             return false;
         }
         JSValue factory_arguments[2] = {
-            JS_DupValue(context, runtime->media_state_for),
-            JS_DupValue(context, runtime->bridge.trusted_node_wrap)
+            JS_DupValue(context,
+                        runtime->host_callbacks[SCRIPT_HOST_MEDIA_STATE_FOR]),
+            JS_DupValue(context,
+                        runtime->host_callbacks[SCRIPT_HOST_WRAP_NODE])
         };
         JSValue installed = JS_UNDEFINED;
         bool installed_ok = runtime_call_captured(
@@ -601,6 +611,7 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
         runtime->geometry_incumbent = NULL;
     }
     runtime->bridge.layout = layout;
+    runtime->bridge.layout_region_end = 0;
     runtime->geometry_incumbent = NULL;
     runtime->geometry_paint_stale = false;
     geometry_inputs_capture(runtime);
@@ -647,6 +658,12 @@ static bool geometry_layout_current(const ScriptRuntime *runtime,
             == runtime->bridge.document->content_generation;
 }
 
+void script_runtime_set_layout_region(ScriptRuntime *runtime, int region_end)
+{
+    if (runtime != NULL)
+        runtime->bridge.layout_region_end = region_end > 0 ? region_end : 0;
+}
+
 bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
                                          const ViewportContext *viewport,
                                          LayoutDocument *layout)
@@ -690,8 +707,12 @@ bool script_runtime_flush_geometry_layout_reuse(
         : prepare(opaque, bridge->mutations.count != 0
             || bridge->mutations.overflowed ? &bridge->mutations : NULL,
             geometry_environment_current(runtime, viewport, bridge->layout)
+                && bridge->layout->content_limit_y == 0
                 ? &unchanged : NULL);
-    if (unchanged && bridge->layout != NULL && bridge->layout->budget != NULL) {
+    /* A truncated layout is never borrowed as script's geometry (see
+       js_rt_bridge_layout): it is completed into the scratch below. */
+    if (unchanged && bridge->layout != NULL && bridge->layout->budget != NULL
+        && bridge->layout->content_limit_y == 0) {
         /* Borrow only: never install this old paint as a fresh publication.
            The existing input generations cache the proof across subsequent
            reads in this turn; any new DOM/style/font/viewport input breaks it. */
@@ -1041,8 +1062,10 @@ bool script_runtime_set_page_scroll(ScriptRuntime *runtime, int scroll_y)
     };
     bool ok = !JS_IsException(arguments[0])
         && !JS_IsException(arguments[1])
-        && runtime_call_captured(runtime, runtime->page_scroll_apply,
-                                 "page scroll update", 2, arguments, NULL);
+        && runtime_call_captured(
+               runtime,
+               runtime->host_callbacks[SCRIPT_HOST_APPLY_PAGE_SCROLL],
+               "page scroll update", 2, arguments, NULL);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
     if (ok) runtime->bridge.page_scroll_y = next;

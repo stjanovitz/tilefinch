@@ -1681,7 +1681,7 @@
       wrapHandle = globalThis.__tilefinchWrap,
       /* Is `node` an inclusive ancestor of `parent`: one native walk to
          parent's tree root; a root with a script-side detached parent, or a
-         tree the native leaves to script (shadow, remote), takes the bounded
+         tree the native leaves to script (shadow), takes the bounded
          walk, which throws on a cycle or an over-deep chain. */
       isAncestor = (node, parent) => {
         if (
@@ -3866,17 +3866,6 @@
     if (notify) reject(reason);
     queueMicrotask(pumpNetworkQueue);
     return true;
-  };
-  globalThis.__tilefinchDetachNetwork = () => {
-    const reason = new TypeError("document detached");
-    /* Snapshot the keys: cancelNetwork mutates both maps and may start a
-       queued successor after each cancellation. Repeating to a fixed bound
-       drains successors too without trusting author-modified iteration. */
-    for (let pass = 0; pass < networkQueueLimit && pendingNetwork.size; pass++) {
-      const ids = Array.from(pendingNetwork.keys()).slice(0, networkQueueLimit);
-      for (const id of ids) cancelNetwork(id, reason, true);
-    }
-    return pendingNetwork.size === 0;
   };
   globalThis.__tilefinchDeliverNetwork = (
     id,

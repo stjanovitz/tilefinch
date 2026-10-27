@@ -11,9 +11,8 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/json_scan.h"
 #include "tilefinch/public_suffix.h"
-#include "tilefinch/section_router.h"
-#include "tilefinch/section_store.h"
 #include "tilefinch/session.h"
 #include "tilefinch/style.h"
 #include "tilefinch/url.h"
@@ -191,6 +190,34 @@ static size_t mutate_input(TestRandom *random, unsigned char *data,
     return length;
 }
 
+/* The bounded JSON scanner over raw bytes: every entry point must stay
+   inside [data, data + length) and leave a consistent cursor. */
+static bool exercise_json_scan(const unsigned char *data, size_t length)
+{
+    const char *start = (const char *) data, *end = start + length;
+    JsonCursor json = {start, end};
+    bool skipped = json_scan_skip_value(&json, 48u);
+    if (json.at < start || json.at > end) return false;
+    (void) skipped;
+    JsonCursor value = {start, end};
+    if (json_scan_member((JsonCursor) {start, end}, "a", 16u, 256u, &value)
+        && (value.at < start || value.at > end)) return false;
+    char text[32];
+    bool truncated = false;
+    for (const char *at = start; at < end; at++) {
+        if (*at != '"') continue;
+        JsonCursor string = {at, end};
+        if (json_scan_string_copy(&string, text, sizeof(text),
+                                  JSON_SCAN_TRUNCATE, &truncated)
+            && (string.at > end || strlen(text) >= sizeof(text)))
+            return false;
+        JsonCursor span = {at, end}, out;
+        if (json_scan_value_span(&span, 8u, &out)
+            && (out.at != at || out.end > end)) return false;
+    }
+    return true;
+}
+
 static bool exercise_input(const unsigned char *data, size_t length,
                            size_t iteration, uint64_t seed)
 {
@@ -208,24 +235,6 @@ static bool exercise_input(const unsigned char *data, size_t length,
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
 
-    SectionRouteStream route = {
-        .budget = &budget,
-        .byte_threshold = section_route_stream_threshold(&budget)
-    };
-    size_t offset = 0;
-    while (offset < length) {
-        size_t chunk = 1 + ((offset + iteration) % 31);
-        if (chunk > length - offset) chunk = length - offset;
-        section_route_stream_scan(&route, data + offset, chunk);
-        offset += chunk;
-    }
-    section_route_stream_abort(&route);
-
-    CompressedSectionStore store = {0};
-    (void) section_store_build(&store, &budget, (const char *) data, length,
-                               4096, 8192);
-    section_store_destroy(&store);
-
     BrowserSession session = {0};
     if (browser_session_init(&session, &budget, 64 * 1024)) {
         char cookie[512] = "fuzz=";
@@ -242,6 +251,11 @@ static bool exercise_input(const unsigned char *data, size_t length,
         browser_session_destroy(&session);
     }
 
+    if (!exercise_json_scan(data, length)) {
+        fprintf(stderr, "hostile-parser json-scan bound seed=%" PRIu64
+                " iteration=%zu\n", seed, iteration);
+        return false;
+    }
     exercise_url_parser(data, length);
     exercise_public_suffix(data, length);
     (void) exercise_set_cookie(&budget, data, length, iteration);
@@ -322,7 +336,34 @@ static bool known_answer_checks(void)
         browser_session_destroy(&session);
     }
     bool balanced = budget.current == 0;
-    return cookies_ok && balanced;
+    /* Hostile JSON: every prefix of nested and escaped input is refused in
+       bounds, and nesting past the bound is refused without recursion. */
+    static const char *const json_cases[] = {
+        "{\"a\":[1,-2.5e3,true,null,\"\\ud83d\\ude00\\u00e9\"],"
+        "\"b\":{\"c\":{}}}",
+        "[\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"]",
+    };
+    bool json_ok = true;
+    for (size_t c = 0; c < sizeof(json_cases) / sizeof(json_cases[0]); c++) {
+        size_t length = strlen(json_cases[c]);
+        for (size_t cut = 0; cut <= length; cut++) {
+            char *copy = malloc(cut == 0 ? 1u : cut);
+            if (copy == NULL) return false;
+            memcpy(copy, json_cases[c], cut);
+            JsonCursor json = {copy, copy + cut};
+            bool ok = json_scan_skip_value(&json, 16u);
+            if (ok != (cut == length) || json.at > copy + cut) json_ok = false;
+            free(copy);
+        }
+    }
+    char *deep = malloc(200000u);
+    if (deep == NULL) return false;
+    memset(deep, '[', 100000u);
+    memset(deep + 100000u, ']', 100000u);
+    JsonCursor nested = {deep, deep + 200000u};
+    if (json_scan_skip_value(&nested, 1000000u)) json_ok = false;
+    free(deep);
+    return cookies_ok && balanced && json_ok;
 }
 
 int main(int argc, char **argv)

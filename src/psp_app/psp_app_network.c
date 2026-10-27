@@ -1000,8 +1000,10 @@ static bool psp_ensure_network_for_navigation_prepared(
     const char *method, const char *url, bool present_destination,
     const uint16_t *frame, PspUiState *ui, PspApp *preparation_app)
 {
-    if (psp_ui_native_home_url(url)) return true;
-    if (psp_profile_page_kind(url) != PSP_PROFILE_PAGE_NONE) return true;
+    /* Native HOME and the generated profile pages need no network. */
+    PspLocalRoute route = psp_local_route_classify(url);
+    if (route.kind == PSP_LOCAL_ROUTE_NATIVE_HOME
+        || route.profile_page != PSP_PROFILE_PAGE_NONE) return true;
     if (!site_adapter_navigation_requires_network(method, url)) return true;
     /* Association is part of this navigation's loading experience. Show the
        accepted destination throughout it instead of the incumbent address. */
@@ -1052,10 +1054,12 @@ void psp_app_prepare_transport(PspApp *app, uint32_t facts, bool connection_wait
         owner->transport_prepare_pending = false;
         return;
     }
-    if (!connection_wait) {
-        if (app->process->presentation.ui.screen != PSP_UI_SCREEN_HOME
-            && !site_adapter_handles_navigation("GET",
-                   app->views->navigation->page.document_url)) {
+    if (!connection_wait
+        && app->process->presentation.ui.screen != PSP_UI_SCREEN_HOME) {
+        char document_url[NAVIGATION_URL_LIMIT];
+        (void) browser_engine_page_document_url(
+            app->browser->engine, document_url, sizeof(document_url));
+        if (!site_adapter_handles_navigation("GET", document_url)) {
             fetch_cancel_ca_bundle_preparation();
             owner->transport_prepare_pending = false;
             return;

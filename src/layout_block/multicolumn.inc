@@ -123,6 +123,8 @@ static void multicolumn_parse_shorthand(const ComputedStyle *style,
     }
 }
 
+/* Out of line: inlined, its frame would join the recursive block frame. */
+__attribute__((noinline))
 static MulticolumnLayout multicolumn_prepare(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int content_width)
@@ -235,6 +237,7 @@ static bool multicolumn_items_fit(const int *heights, size_t count,
     return true;
 }
 
+__attribute__((noinline))
 static bool multicolumn_redistribute(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, const MulticolumnLayout *multi,

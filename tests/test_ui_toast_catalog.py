@@ -80,7 +80,8 @@ SOURCES = ("src/psp_app/*.c", "src/psp_script_main.c", "src/psp_ui.c",
            "src/psp_ui_theme.c", "src/psp_media_session.c",
            "src/psp_media_open.c", "src/psp_media_seek.c",
            "src/psp_update_session.c", "src/update_client.c",
-           "src/update_installer.c", "src/psp_ui_language_repair.c")
+           "src/update_installer.c", "src/psp_ui_language_repair.c",
+           "src/psp_ui_settings.c")
 
 # Functions whose returned literals the caller shows as a toast.
 STATUS_RETURNS = ("psp_offline_store_route_cancel_status",
@@ -126,6 +127,10 @@ RETURN_EXPRESSION = re.compile(r'\breturn\b((?:[^;"]|"(?:[^"\\]|\\.)*")*);')
 # empty-list line are UiSiteDataLine literals with a negative row.
 PAINTED_TABLES = {"psp_ui.c": ("ui_site_storage_states", "explanations",
                                "fixed", "site_info_actions")}
+# A plain on/off setting's two confirmations, initialized by name in its
+# descriptor (psp_ui_settings.c) and shown by the app's generic handler.
+STATUS_FIELD = re.compile(
+    r'\.(?:on|off)_status\s*=\s*((?:"(?:[^"\\]|\\.)*"\s*)+)')
 SITE_DATA_HEADING = re.compile(
     r'\(UiSiteDataLine\)\s*\{\s*("(?:[^"\\]|\\.)*")\s*,\s*-')
 
@@ -326,11 +331,26 @@ def job_message_expressions(source):
             if not expression.rstrip().endswith('..."')]
 
 
+def validation_only_sources():
+    """Files CMake compiles only into the validation psp-browser-script.
+
+    Read from the target_sources block that adds the scripted-input harness,
+    so a unit moved there stops counting as shipped without a second list."""
+    cmake = (ROOT / "cmake/TilefinchTargets.cmake").read_text(encoding="utf-8")
+    for block in re.findall(r"target_sources\(psp-browser-script PRIVATE(.*?)\)",
+                            cmake, re.S):
+        if "src/psp_app/psp_app_input_script.c" in block:
+            return {ROOT / name for name in re.findall(r"src/[\w/]+\.c", block)}
+    raise AssertionError("validation-only psp-browser-script sources not found")
+
+
 def shipped_toasts():
     macros = {}
     sources = []
+    validation_only = validation_only_sources()
     for pattern in SOURCES + JOB_MESSAGE_SOURCES:
-        sources += sorted(ROOT.glob(pattern))
+        sources += [path for path in sorted(ROOT.glob(pattern))
+                    if path not in validation_only]
     sources += sorted(ROOT.glob("src/psp_app/*.h"))
     for path in sources:
         source = without_comments(path.read_text(encoding="utf-8"))
@@ -376,6 +396,7 @@ def shipped_toasts():
                     % re.escape(name), source):
                 expressions.append(match.group(1))
         expressions += SITE_DATA_HEADING.findall(source)
+        expressions += STATUS_FIELD.findall(source)
         for function in STATUS_RETURNS:
             body = function_body(source, function)
             expressions += [m.group(1)
@@ -464,6 +485,10 @@ class UiToastCatalogTests(unittest.TestCase):
                     "VIDEO DECODER NEEDS APP RESTART", "Restarting decoder",
                     "NETWORK NOT READY FOR FONT PACK"):
             self.assertIn(key, toasts)
+        # A plain on/off setting's confirmations, from its descriptor.
+        for key in ("URL HISTORY ON", "URL HISTORY OFF", "ROTATE HINT AUTO",
+                    "YOUTUBE RESULTS COMPACT - RELOAD TO APPLY"):
+            self.assertIn(key, toasts)
         # Site data & storage: a storage choice, its explanation, a row,
         # a section heading and the empty-list line.
         for key in ("This session", "On the Memory Stick until you exit.",
@@ -483,6 +508,11 @@ class UiToastCatalogTests(unittest.TestCase):
         self.assertNotIn("FINALIZING FONT PACK...", toasts)
         # The test menu exists only in the validation build.
         self.assertNotIn("POWER TEST CHANGING...", toasts)
+        # So do the validation-only units CMake adds to psp-browser-script.
+        self.assertIn(ROOT / "src/psp_app/psp_app_validation_loop.c",
+                      validation_only_sources())
+        self.assertNotIn("POWER TEST STOPPED", toasts)
+        self.assertNotIn("UNPLUG AC POWER, THEN START TEST", toasts)
 
     def test_arguments_split_outside_literals(self):
         self.assertEqual(['ui', '"A, B (C"', 'f(1, 2)'],

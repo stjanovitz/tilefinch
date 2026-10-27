@@ -73,12 +73,12 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->network_profile = 1;
 }
 
-void psp_boot_config_disable_automation(PspBootConfig *config)
+bool psp_boot_config_automated(const PspBootConfig *config)
 {
-    if (config == NULL) return;
-    /* Any key reset below away from its reset value marks a boot.cfg an
-       automated run left behind, whose url is not the user's. */
-    bool was_automated = strcmp(config->trace, "none") != 0
+    if (config == NULL) return false;
+    /* Every key psp_boot_config_disable_automation resets, away from its
+       reset value. */
+    return strcmp(config->trace, "none") != 0
         || config->trace_keyed != 0
         || config->trace_capture[0] != '\0'
         || config->ticks != 0
@@ -118,6 +118,14 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         || config->validation_update_url[0] != '\0'
         || config->input_script[0] != '\0'
         || config->exit_to[0] != '\0';
+}
+
+void psp_boot_config_disable_automation(PspBootConfig *config)
+{
+    if (config == NULL) return;
+    /* Any key reset below away from its reset value marks a boot.cfg an
+       automated run left behind, whose url is not the user's. */
+    bool was_automated = psp_boot_config_automated(config);
     if (was_automated)
         snprintf(config->url, sizeof(config->url), "%s",
                  TILEFINCH_HOMEPAGE_URL);

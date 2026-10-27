@@ -10,12 +10,7 @@
   *libtilefinch_core.a:style_match.c.obj(.text.class_contains_length)  /* class_contains_length */
   *libtilefinch_core.a:style_match.c.obj(.text.decode_css_identifier.constprop.0)  /* decode_css_identifier.constprop.0 */
   *libtilefinch_core.a:style_sheet.c.obj(.text.skip_selector_identifier)  /* skip_selector_identifier */
-  *libtilefinch_core.a:style_match.c.obj(.text.trim)  /* trim */
-  *libtilefinch_core.a:style_math.c.obj(.text.trim)  /* trim */
-  *libtilefinch_core.a:style_selector_program.c.obj(.text.trim)  /* trim */
-  *libtilefinch_core.a:style_sheet.c.obj(.text.trim)  /* trim */
-  *libtilefinch_core.a:style_values.c.obj(.text.trim)  /* trim */
-  *libtilefinch_core.a:style_properties.c.obj(.text.trim)  /* trim */
+  *libtilefinch_core.a:style_spans.c.obj(.text.style_trim)  /* style_trim */
   *libc.a:libc_a-strchr.o(.text)  /* strchr */
   *libtilefinch_core.a:style_match.c.obj(.text.style_selector_list_option_end)  /* style_selector_list_option_end */
   *libtilefinch_core.a:style_match.c.obj(.text.style_match_subject_prepare)  /* style_match_subject_prepare */
@@ -34,6 +29,7 @@
   *libqjs.a:quickjs.c.obj(.text.map_hash_key)  /* map_hash_key */
   *libtilefinch_core.a:script_loader.c.obj(.text.pipeline_module_load)  /* pipeline_module_load */
   *libtilefinch_core.a:platform.c.obj(.text.tilefinch_platform_cooperate)  /* tilefinch_platform_cooperate */
+  *libtilefinch_core.a:platform.c.obj(.text.tilefinch_platform_cooperate_at)  /* tilefinch_platform_cooperate_at */
   *libqjs.a:quickjs.c.obj(.text.JS_NewObjectProtoClass)  /* JS_NewObjectProtoClass */
   *libqjs.a:quickjs.c.obj(.text.js_new_shape2.constprop.0)  /* js_new_shape2.constprop.0 */
   *libqjs.a:quickjs.c.obj(.text.add_property)  /* add_property */
@@ -126,7 +122,6 @@
   *libtilefinch_core.a:js_runtime.c.obj(.text.JS_ToCStringLen)  /* JS_ToCStringLen */
   *libtilefinch_core.a:js_dom_bindings.c.obj(.text.JS_ToCStringLen)  /* JS_ToCStringLen */
   *libtilefinch_core.a:js_fetch_cors.c.obj(.text.JS_ToCStringLen)  /* JS_ToCStringLen */
-  *libtilefinch_core.a:js_remote_bindings.c.obj(.text.JS_ToCStringLen)  /* JS_ToCStringLen */
   *libtilefinch_core.a:js_runtime.c.obj(.text.base64_digit)  /* base64_digit */
   *libtilefinch_core.a:data_url.c.obj(.text.base64_digit)  /* base64_digit */
   *libqjs.a:quickjs.c.obj(.text.js_array_mark)  /* js_array_mark */
@@ -145,7 +140,6 @@
   *libtilefinch_core.a:js_fetch_cors.c.obj(.text.JS_FreeValue)  /* JS_FreeValue */
   *libtilefinch_core.a:js_lazy_webpack.c.obj(.text.JS_FreeValue)  /* JS_FreeValue */
   *libtilefinch_core.a:js_module_loader.c.obj(.text.JS_FreeValue)  /* JS_FreeValue */
-  *libtilefinch_core.a:js_remote_bindings.c.obj(.text.JS_FreeValue)  /* JS_FreeValue */
   *libqjs.a:quickjs.c.obj(.text.JS_FreeValue)  /* JS_FreeValue */
   *libtilefinch_core.a:js_dom_bindings.c.obj(.text.js_dom_fast_getter)  /* js_dom_fast_getter */
   *libtilefinch_core.a:js_dom_bindings.c.obj(.text.fast_getter_receiver.constprop.0)  /* fast_getter_receiver.constprop.0 */
@@ -155,7 +149,7 @@
   *libqjs.a:quickjs.c.obj(.text.free_gc_object)  /* free_gc_object */
   *libqjs.a:quickjs.c.obj(.text.free_property)  /* free_property */
   *libtilefinch_core.a:fetch.c.obj(.text.fetch_scheduler_wait_enqueued)  /* fetch_scheduler_wait_enqueued */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.style_retained_matches_invalidate_rules)  /* style_retained_matches_invalidate_rules */
+  *libtilefinch_core.a:style_retained_matches.c.obj(.text.style_retained_matches_invalidate_rules)  /* style_retained_matches_invalidate_rules */
   *libtilefinch_core.a:style_sheet.c.obj(.text.style_rule_fast_key)  /* style_rule_fast_key */
   *libtilefinch_core.a:style_resolve.c.obj(.text.rule_fast_matches)  /* rule_fast_matches */
   *libtilefinch_core.a:budget.c.obj(.text.bellard_pool_realloc)  /* bellard_pool_realloc */
@@ -164,6 +158,8 @@
   *libtilefinch_core.a:render.c.obj(.text.tile_cache_render_frame)  /* tile_cache_render_frame */
   *libtilefinch_core.a:render.c.obj(.text.paint_cached_fixed_overlays)  /* paint_cached_fixed_overlays */
   *libtilefinch_core.a:render.c.obj(.text.rasterize_tile)  /* rasterize_tile */
+  *libtilefinch_core.a:platform.c.obj(.text.tilefinch_platform_render_shell_borrow_begin)  /* tilefinch_platform_render_shell_borrow_begin */
+  *libtilefinch_core.a:platform.c.obj(.text.tilefinch_platform_render_shell_borrow_end)  /* tilefinch_platform_render_shell_borrow_end */
   *libtilefinch_core.a:render.c.obj(.text.checkerboard_tile_to_frame.isra.0)  /* checkerboard_tile_to_frame.isra.0 */
   *libtilefinch_core.a:render.c.obj(.text.forced_dark_color.part.0)  /* forced_dark_color.part.0 */
   *libtilefinch_core.a:render.c.obj(.text.overflow_cached_geometry.isra.0)  /* overflow_cached_geometry.isra.0 */
@@ -181,10 +177,10 @@
   *libtilefinch_core.a:style_sheet.c.obj(.text.variable_resolve_at_declaration)  /* variable_resolve_at_declaration */
   *libtilefinch_core.a:style_sheet.c.obj(.text.variable_cache_lookup)  /* variable_cache_lookup */
   *libgcc.a:_ge_df.o(.text)  /* __gedf2 */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.stylesheet_attribute_change_may_affect_has)  /* stylesheet_attribute_change_may_affect_has */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.has_selector_attribute_change_sensitive)  /* has_selector_attribute_change_sensitive */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.has_selector_mentions_attribute)  /* has_selector_mentions_attribute */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.has_class_list_contains)  /* has_class_list_contains */
+  *libtilefinch_core.a:style_has_invalidation.c.obj(.text.stylesheet_attribute_change_may_affect_has)  /* stylesheet_attribute_change_may_affect_has */
+  *libtilefinch_core.a:style_has_invalidation.c.obj(.text.has_selector_attribute_change_sensitive)  /* has_selector_attribute_change_sensitive */
+  *libtilefinch_core.a:style_has_invalidation.c.obj(.text.has_selector_reads_attribute)  /* has_selector_reads_attribute (was has_selector_mentions_attribute) */
+  *libtilefinch_core.a:style_has_invalidation.c.obj(.text.has_class_list_contains)  /* has_class_list_contains */
   *libqjs.a:quickjs.c.obj(.text.expand_fast_array)  /* expand_fast_array */
   *libqjs.a:quickjs.c.obj(.text.__js_malloc_usable_size)  /* __js_malloc_usable_size */
   *libqjs.a:quickjs.c.obj(.text.code_match)  /* code_match */
@@ -269,7 +265,7 @@
   *libtilefinch_psp_entropy.a:psp_entropy.c.obj(.text.psp_entropy_fill)  /* psp_entropy_fill */
   *libtilefinch_core.a:style_resolve.c.obj(.text.style_apply_node_cascade)  /* style_apply_node_cascade */
   *libtilefinch_core.a:style_resolve.c.obj(.text.style_apply_matching_range)  /* style_apply_matching_range */
-  *libtilefinch_core.a:style_resolve.c.obj(.text.rule_matches)  /* rule_matches */
+  *libtilefinch_core.a:style_retained_matches.c.obj(.text.rule_matches)  /* rule_matches */
   *libtilefinch_core.a:style_match.c.obj(.text.style_rule_selector_matches_subject)  /* style_rule_selector_matches_subject */
   *libtilefinch_core.a:style_match.c.obj(.text.style_selector_program_matches_at)  /* style_selector_program_matches_at */
   *libtilefinch_core.a:style_resolve.c.obj(.text.style_rule_index_plan)  /* style_rule_index_plan */
@@ -311,6 +307,7 @@
   *libtilefinch_core.a:style_has_invalidation.c.obj(.text.has_complex_structure)  /* has_complex_structure */
   *libqjs.a:quickjs.c.obj(.text.js_parse_string)  /* js_parse_string */
   *libtilefinch_core.a:style_resolve.c.obj(.text.style_for_node)  /* style_for_node */
+  *libtilefinch_core.a:style_compat_reveal.c.obj(.text.style_compat_post_cascade)  /* style_compat_post_cascade: split out of style_for_node */
   *libtilefinch_core.a:style_sheet.c.obj(.text.stylesheet_prepare_rule_index)  /* stylesheet_prepare_rule_index */
   *libtilefinch_core.a:style_sheet.c.obj(.text.custom_rule_name_hash)  /* custom_rule_name_hash */
   *libtilefinch_core.a:style_sheet.c.obj(.text.style_rule_find_bucket)  /* style_rule_find_bucket */
@@ -331,7 +328,7 @@
   *libtilefinch_core.a:navigation.c.obj(.text.navigation_record_slice)  /* navigation_record_slice */
   *libtilefinch_core.a:navigation.c.obj(.text.navigation_stream_headers)  /* navigation_stream_headers */
   *libqjs.a:quickjs.c.obj(.text.js_array_every)  /* js_array_every */
-  *libtilefinch_core.a:layout_inline.c.obj(.text.measured_text_width_fixed_mode)  /* measured_text_width_fixed_mode */
+  *libtilefinch_core.a:layout_inline.c.obj(.text.measured_text_width_fixed_checked)  /* measured_text_width_fixed_checked */
   *libtilefinch_core.a:document.c.obj(.text.document_body_snapshot_receive)  /* document_body_snapshot_receive */
   *libqjs.a:quickjs.c.obj(.text.JS_CallConstructorInternal)  /* JS_CallConstructorInternal */
   *libtilefinch_core.a:style_sheet.c.obj(.text.compare_rules)  /* compare_rules */
@@ -372,8 +369,8 @@
   *libqjs.a:quickjs.c.obj(.text.js_parse_statement_or_decl)  /* js_parse_statement_or_decl */
   *libqjs.a:quickjs.c.obj(.text.js_parse_var)  /* js_parse_var */
   *libqjs.a:quickjs.c.obj(.text.js_parse_destructuring_element)  /* js_parse_destructuring_element */
-  *libtilefinch_core.a:js_dom_bindings.c.obj(.text.js_computed_style_get)  /* js_computed_style_get */
-  *libtilefinch_core.a:js_dom_bindings.c.obj(.text.computed_style_cache_find)  /* computed_style_cache_find */
+  *libtilefinch_core.a:js_computed_style.c.obj(.text.js_computed_style_get)  /* js_computed_style_get */
+  *libtilefinch_core.a:js_computed_style.c.obj(.text.computed_style_cache_find)  /* computed_style_cache_find */
   *libqjs.a:libregexp.c.obj(.text.re_parse_alternative)  /* re_parse_alternative */
   *libtilefinch_core.a:js_runtime.c.obj(.text.js_rt_runtime_update_telemetry)  /* js_rt_runtime_update_telemetry */
   *libtilefinch_core.a:navigation.c.obj(.text.navigation_commit_document)  /* navigation_commit_document */

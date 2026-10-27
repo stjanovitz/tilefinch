@@ -121,12 +121,15 @@ endif()
 
 add_library(tilefinch_psp_ui STATIC
     src/psp_basic_fallback.c
+    src/psp_local_route.c
     src/psp_reader_policy.c
+    src/psp_youtube_login_consent.c
     src/psp_ui.c
     src/psp_ui_action.c
     src/psp_ui_theme.c
     src/psp_ui_menu.c
     src/psp_ui_media_8888.c
+    src/psp_ui_settings.c
     src/psp_power_policy.c)
 target_include_directories(tilefinch_psp_ui PUBLIC include)
 target_link_libraries(tilefinch_psp_ui PUBLIC tilefinch_core)
@@ -414,6 +417,8 @@ if(PSP)
         add_executable(psp-browser-script
             src/psp_script_main.c
             src/psp_app/psp_app_actions.c
+            src/psp_app/psp_app_boot.c
+            src/psp_app/psp_app_activation.c
             src/psp_app/psp_app_captive_portal.c
             src/psp_app/psp_app_input.c
             src/psp_app/psp_app_settings.c
@@ -570,13 +575,19 @@ if(PSP)
                 target_compile_definitions(psp-browser-script PRIVATE
                     TILEFINCH_PSP_MEDIA_PICTURE_TRACE=1)
             endif()
-            # The scripted-input harness. Added here rather than to a shared
-            # library so a shipping EBOOT links neither the parser nor the
-            # name tables it prints; main()'s only calls into it are inside
-            # the same TILEFINCH_PSP_VALIDATION_LOG guard.
+            # The scripted-input harness and the validation instrumentation
+            # units (psp_app_validation_*.c). Added here rather than to a
+            # shared library so a shipping EBOOT links neither the parser nor
+            # the measurement code; production files reach them only through
+            # TILEFINCH_PSP_VALIDATION_LOG guards or the no-op hooks in
+            # src/psp_app/psp_app_validation.h.
             target_sources(psp-browser-script PRIVATE
                 src/psp_input_script.c
                 src/psp_app/psp_app_input_script.c
+                src/psp_app/psp_app_validation_qualify.c
+                src/psp_app/psp_app_validation_cadence.c
+                src/psp_app/psp_app_validation_loop.c
+                src/psp_app/psp_app_validation_present.c
                 src/psp_webgl_ge_probe.c
                 src/js_bench.c
                 src/psp_media_fixture.c
@@ -749,7 +760,7 @@ if(PSP)
                 # the separately-ratcheted resident loop. Its limit is a
                 # growth tripwire, not an I-cache claim. Validation retains
                 # extra room for its boot qualifications and log setup.
-                -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,17408,10752>
+                -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11264,6144>
                 -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
                 -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
                 -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>
@@ -1044,7 +1055,7 @@ if(PSP)
                 COMMAND ${CMAKE_COMMAND}
                     -DPSP_NM=${CMAKE_NM}
                     -DPSP_ELF=$<TARGET_FILE:psp-browser-script-dev-prx>
-                    -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,17408,10752>
+                    -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11264,6144>
                     -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
                     -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
                     -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>

@@ -1934,8 +1934,8 @@
                             nested_outer_page,
                             sizeof(nested_outer_page) - 1, 16));
     /* The outer document's realm also hosts the inner frame's WindowProxy
-       realm; 2 MiB left under 100 KiB once the bootstrap grew (see the
-       remote binding isolation test), which this test is not about. */
+       realm; 2 MiB left under 100 KiB once the bootstrap grew, which this
+       test is not about. */
     outer_frame->runtime = script_runtime_create_deferred(
         &outer_frame->document, &budget, 3 * MIB, 1000,
         "https://nested-frame.test/outer.html", NULL,
@@ -2176,25 +2176,19 @@
     navigation_enable_scripts(&pressure_navigation, 3 * MIB, 1000);
     navigation_enable_document_scripts(&pressure_navigation, 2,
                                        64 * 1024, 32 * 1024, 1000);
-    pressure_navigation.defer_document_script_pipeline = true;
+    TestScriptPressureSeam pressure_seam = {
+        .navigation = &pressure_navigation,
+        .reservation = &pressure_reservation,
+        .leave_free = 256 * 1024
+    };
+    pressure_navigation.heavy_policy_resolver = test_script_pressure_at_realm;
+    pressure_navigation.heavy_policy_opaque = &pressure_seam;
     uint64_t pressure_generation = navigation_begin(&pressure_navigation);
-    CHECK(navigation_commit_html(
-              &pressure_navigation, pressure_generation,
-              "https://pressure.test/", pressure_script_page,
-              strlen(pressure_script_page), 480, NULL, NULL, true)
-          && pressure_navigation.script_discovered == 0);
-    (void) script_runtime_collect_and_trim(pressure_navigation.page.runtime);
-    size_t pressure_remaining = budget_remaining(&budget);
-    CHECK(pressure_remaining > 2 * MIB
-          && budget_reservation_acquire(
-              &pressure_reservation, &budget, BUDGET_CATEGORY_RESOURCE,
-              pressure_remaining - 256 * 1024));
-    size_t pressure_failures_before = budget.failure_count;
-    size_t pressure_decisions_before =
-        budget.pressure[BUDGET_PRESSURE_JAVASCRIPT].decisions;
-    bool pressure_executed = navigation_execute_document_scripts_from(
-        &pressure_navigation, &pressure_navigation.page.document);
-    bool pressure_diagnostic = pressure_executed
+    bool pressure_committed = navigation_commit_html(
+        &pressure_navigation, pressure_generation,
+        "https://pressure.test/", pressure_script_page,
+        strlen(pressure_script_page), 480, NULL, NULL, true);
+    bool pressure_diagnostic = pressure_committed
         && script_runtime_evaluate_diagnostic(
             pressure_navigation.page.runtime,
             "globalThis.pocSummary="
@@ -2202,7 +2196,20 @@
             "'inline-pressure-ran':'inline-pressure-missing'",
             "https://pressure.test/verify-inline.js",
             &pressure_navigation.page.script_result);
-    CHECK(pressure_diagnostic
+    if (!pressure_diagnostic || !pressure_seam.reserved
+        || pressure_navigation.script_skipped_pressure != 2
+        || budget.failure_count != pressure_seam.failures_before) {
+        fprintf(stderr, "script pressure: committed=%d reserved=%d "
+                "skipped=%zu attempted=%zu collections=%zu failures=%zu/%zu "
+                "error=%s\n",
+                pressure_committed, pressure_seam.reserved,
+                pressure_navigation.script_skipped_pressure,
+                pressure_navigation.script_attempted,
+                pressure_navigation.script_pressure_collections,
+                budget.failure_count, pressure_seam.failures_before,
+                pressure_navigation.last_error);
+    }
+    CHECK(pressure_diagnostic && pressure_seam.reserved
           && pressure_navigation.script_discovered == 2
           && pressure_navigation.script_attempted == 0
           && pressure_navigation.script_loaded == 0
@@ -2210,9 +2217,9 @@
           && pressure_navigation.script_skipped_quota == 0
           && pressure_navigation.script_skipped_pressure == 2
           && pressure_navigation.script_pressure_collections == 1
-          && budget.failure_count == pressure_failures_before
+          && budget.failure_count == pressure_seam.failures_before
           && budget.pressure[BUDGET_PRESSURE_JAVASCRIPT].decisions
-                 == pressure_decisions_before + 2
+                 == pressure_seam.decisions_before + 2
           && budget.pressure[BUDGET_PRESSURE_JAVASCRIPT].avoided_bytes
                  != 0
           && strcmp(pressure_navigation.page.script_result.summary,
@@ -2241,13 +2248,6 @@
     navigation_enable_scripts(&table_navigation, 3 * MIB, 1000);
     navigation_enable_document_scripts(&table_navigation, 2,
                                        64 * 1024, 32 * 1024, 1000);
-    table_navigation.defer_document_script_pipeline = true;
-    uint64_t table_generation = navigation_begin(&table_navigation);
-    CHECK(navigation_commit_html(
-              &table_navigation, table_generation,
-              "https://pressure.test/", pressure_script_page,
-              strlen(pressure_script_page), 480, NULL, NULL, true));
-    (void) script_runtime_collect_and_trim(table_navigation.page.runtime);
     browser_session_script_bytecode_set_limit(
         &table_browser_session, BROWSER_SCRIPT_BYTECODE_CLASSIC, 6 * MIB);
     uint32_t table_realm = browser_session_module_bytecode_generation(
@@ -2269,38 +2269,45 @@
             &table_key, table_realm, table_bytecode,
             sizeof(table_bytecode)));
     }
-    size_t table_remaining = budget_remaining(&budget);
-    CHECK(table_remaining > 2 * MIB
-          && budget_reservation_acquire(
-              &table_reservation, &budget, BUDGET_CATEGORY_RESOURCE,
-              table_remaining - 256 * 1024));
-    budget_set_reclaim_hook(&budget, test_reclaim_script_bytecode,
-                            &table_browser_session);
-    size_t table_failures_before = budget.failure_count;
-    bool table_executed = navigation_execute_document_scripts_from(
-        &table_navigation, &table_navigation.page.document);
-    bool table_diagnostic = table_executed
+    TestScriptPressureSeam table_seam = {
+        .navigation = &table_navigation,
+        .reservation = &table_reservation,
+        .leave_free = 256 * 1024,
+        .reclaim = test_reclaim_script_bytecode,
+        .reclaim_opaque = &table_browser_session
+    };
+    table_navigation.heavy_policy_resolver = test_script_pressure_at_realm;
+    table_navigation.heavy_policy_opaque = &table_seam;
+    uint64_t table_generation = navigation_begin(&table_navigation);
+    bool table_committed = navigation_commit_html(
+        &table_navigation, table_generation,
+        "https://pressure.test/", pressure_script_page,
+        strlen(pressure_script_page), 480, NULL, NULL, true);
+    bool table_diagnostic = table_committed
         && script_runtime_evaluate_diagnostic(
             table_navigation.page.runtime,
             "globalThis.pocSummary=globalThis.inlinePressureScriptRan?"
             "'inline-pressure-ran':'inline-pressure-missing'",
             "https://pressure.test/verify-inline.js",
             &table_navigation.page.script_result);
-    if (!table_diagnostic || table_navigation.script_skipped_pressure != 0) {
-        fprintf(stderr, "table pressure: skipped=%zu loaded=%zu "
-                "entries=%zu summary=%s\n",
+    if (!table_diagnostic || !table_seam.reserved
+        || table_navigation.script_skipped_pressure != 0) {
+        fprintf(stderr, "table pressure: committed=%d reserved=%d "
+                "skipped=%zu loaded=%zu entries=%zu summary=%s error=%s\n",
+                table_committed, table_seam.reserved,
                 table_navigation.script_skipped_pressure,
                 table_navigation.script_loaded,
                 browser_session_script_bytecode_entries(
                     &table_browser_session,
                     BROWSER_SCRIPT_BYTECODE_CLASSIC),
-                table_navigation.page.script_result.summary);
+                table_navigation.page.script_result.summary,
+                table_navigation.last_error);
     }
-    CHECK(table_diagnostic
+    CHECK(table_diagnostic && table_seam.reserved
           && table_navigation.script_discovered == 2
           && table_navigation.script_skipped_pressure == 0
           && table_navigation.script_loaded == 1
-          && budget.failure_count == table_failures_before
+          && budget.failure_count == table_seam.failures_before
           && browser_session_script_bytecode_entries(
                  &table_browser_session,
                  BROWSER_SCRIPT_BYTECODE_CLASSIC) < 4
@@ -2497,21 +2504,19 @@
         UINT32_C(1) << (heading_first & 31u);
     split_bloom[heading_second / 32u] |=
         UINT32_C(1) << (heading_second & 31u);
-    split_sheet.source_rule_head_limit_end = split_start + 1u;
-    split_sheet.source_rule_relevant_limit_end = split_start + 4u;
-    split_sheet.source_rule_limit_end = split_start + 5u;
-    split_sheet.source_rule_token_bloom = split_bloom;
-    split_sheet.source_rule_token_bloom_words = 64u;
-    split_sheet.source_rule_tail_begin = strstr(split_css, ".tail");
-    CHECK(split_sheet.source_rule_tail_begin != NULL
-          && stylesheet_add_css(&split_sheet, split_css,
-                                sizeof(split_css) - 1u));
-    split_sheet.source_rule_limit_end = 0;
-    split_sheet.source_rule_head_limit_end = 0;
-    split_sheet.source_rule_relevant_limit_end = 0;
-    split_sheet.source_rule_token_bloom = NULL;
-    split_sheet.source_rule_token_bloom_words = 0;
-    split_sheet.source_rule_tail_begin = NULL;
+    StyleSourceOptions split_source = {
+        .rule_head_limit_end = split_start + 1u,
+        .rule_relevant_limit_end = split_start + 4u,
+        .rule_limit_end = split_start + 5u,
+        .rule_token_bloom = split_bloom,
+        .rule_token_bloom_words = 64u,
+        .rule_tail_begin = strstr(split_css, ".tail")
+    };
+    CHECK(split_source.rule_tail_begin != NULL
+          && stylesheet_add_css_from_context(
+                 &split_sheet, split_css, sizeof(split_css) - 1u, NULL, NULL,
+                 &split_source)
+          && !style_source_options_active(&split_sheet.source));
     lxb_dom_node_t *split = find_id(
         lxb_dom_interface_node(split_document.html), "split");
     lxb_dom_node_t *heading = find_id(
@@ -2660,19 +2665,17 @@
                  &attribute_sheet, &budget, &attribute_document, 480));
     size_t attribute_start = attribute_sheet.count;
     uint32_t empty_bloom[2] = {0};
-    attribute_sheet.source_rule_head_limit_end = attribute_start;
-    attribute_sheet.source_rule_relevant_limit_end = attribute_start + 1u;
-    attribute_sheet.source_rule_limit_end = attribute_start + 1u;
-    attribute_sheet.source_rule_token_bloom = empty_bloom;
-    attribute_sheet.source_rule_token_bloom_words = 2u;
-    CHECK(stylesheet_add_css(
+    StyleSourceOptions attribute_source = {
+        .rule_head_limit_end = attribute_start,
+        .rule_relevant_limit_end = attribute_start + 1u,
+        .rule_limit_end = attribute_start + 1u,
+        .rule_token_bloom = empty_bloom,
+        .rule_token_bloom_words = 2u
+    };
+    CHECK(stylesheet_add_css_from_context(
               &attribute_sheet, "[data-probe]{padding-left:11px}",
-              strlen("[data-probe]{padding-left:11px}")));
-    attribute_sheet.source_rule_limit_end = 0;
-    attribute_sheet.source_rule_head_limit_end = 0;
-    attribute_sheet.source_rule_relevant_limit_end = 0;
-    attribute_sheet.source_rule_token_bloom = NULL;
-    attribute_sheet.source_rule_token_bloom_words = 0;
+              strlen("[data-probe]{padding-left:11px}"), NULL, NULL,
+              &attribute_source));
     lxb_dom_node_t *attribute = find_id(
         lxb_dom_interface_node(attribute_document.html), "attribute");
     ComputedStyle attribute_style = style_for_node(
@@ -6964,52 +6967,12 @@
     MessageTestTarget message_target = {
         parent_message_runtime, &parent_message_result
     };
-    TestRemoteSelectorProbe legacy_child_backing_probe = {0};
-    ScriptRemoteDocumentBinding legacy_child_binding = {
-        .selector_lookup = test_bound_remote_selector_lookup,
-        .selector_opaque = &legacy_child_backing_probe
-    };
-    char legacy_remote_identifier[129] = {0};
-    size_t legacy_remote_section = SIZE_MAX;
     CHECK(parent_message_runtime != NULL && child_message_runtime != NULL
-          /* Convenience constructors begin top-level for compatibility. A
-             later child messaging configuration must irreversibly sanitize
-             that legacy realm and its already-queued backing work. */
-          && script_runtime_rebind_remote_document(
-                 child_message_runtime, &legacy_child_binding)
-          && script_runtime_evaluate_diagnostic(
-                 child_message_runtime,
-                 "globalThis.pocSummary=document.querySelector('aside')"
-                 "?'legacy-bound':'legacy-missing'",
-                 "<legacy-child-before-scope>", &child_message_result)
-          && strcmp(child_message_result.summary, "legacy-bound") == 0
-          && script_runtime_take_remote_element_request(
-                 child_message_runtime, legacy_remote_identifier,
-                 sizeof(legacy_remote_identifier), &legacy_remote_section)
-          && legacy_remote_section == 1
-          && script_runtime_evaluate_diagnostic(
-                 child_message_runtime, "document.querySelector('aside')",
-                 "<legacy-child-pending-scope>", &child_message_result)
           && script_runtime_configure_messaging(
               child_message_runtime, true, false, false, true,
               forward_test_message,
-              &message_target)
-          && !script_runtime_take_remote_element_request(
-                 child_message_runtime, legacy_remote_identifier,
-                 sizeof(legacy_remote_identifier), &legacy_remote_section)
-          && !script_runtime_rebind_remote_document(
-                 child_message_runtime, &legacy_child_binding)
-          && !script_runtime_set_section_identity(
-                 child_message_runtime, 2));
-    size_t legacy_child_calls = legacy_child_backing_probe.calls;
-    CHECK(script_runtime_evaluate_diagnostic(
-              child_message_runtime,
-              "globalThis.pocSummary=document.querySelector('aside')"
-              "===null?'child-isolated':'child-leaked'",
-              "<legacy-child-after-scope>", &child_message_result)
-          && strcmp(child_message_result.summary, "child-isolated") == 0
-          && legacy_child_backing_probe.calls == legacy_child_calls
-          && !script_runtime_configure_messaging(
+              &message_target));
+    CHECK(!script_runtime_configure_messaging(
                  child_message_runtime, false, true, false, true,
                  forward_test_message,
                  &message_target));
@@ -7153,11 +7116,7 @@
     CHECK(!failed_message_configured);
     free(failed_message_opaque);
     failed_message_opaque = NULL;
-    CHECK(!script_runtime_rebind_remote_document(
-              failed_message_runtime, &legacy_child_binding)
-          && !script_runtime_set_section_identity(
-                 failed_message_runtime, 2)
-          && !script_runtime_configure_messaging(
+    CHECK(!script_runtime_configure_messaging(
                  failed_message_runtime, false, true, false, true,
                  count_test_message, NULL)
           && script_runtime_evaluate_diagnostic(
@@ -7178,7 +7137,16 @@
     /* Last: it installs its own budget for the parser. */
     CHECK(test_hidden_mutation_relayouts() == 0);
     CHECK(test_relayout_style_reuse() == 0);
+    CHECK(test_bounded_focus_relayout() == 0);
+    CHECK(test_bounded_focus_consecutive_region() == 0);
+    CHECK(test_bounded_focus_observer_pass_deferred() == 0);
+    CHECK(test_bounded_focus_image_reveal_classifier() == 0);
+    CHECK(test_bounded_focus_late_paint() == 0);
+    CHECK(test_bounded_focus_reveal() == 0);
+    CHECK(test_bounded_focus_shift() == 0);
+    CHECK(test_bounded_focus_float_columns() == 0);
     CHECK(test_relayout_style_table_sizing() == 0);
     CHECK(test_full_rebuild_shares_discovery_styles() == 0);
+    CHECK(test_tiny_budget_rejection() == 0);
     return 0;
 }

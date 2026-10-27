@@ -1858,7 +1858,7 @@ bool layout_add_control(LayoutDocument *layout, int x, int y,
                         lxb_dom_node_t *node)
 {
     if (document_node_is_inert(node)) return true;
-    if (!layout_node_name_is(node, "label") && node_effectively_disabled(node)) {
+    if (!document_node_is_tag(node, LXB_TAG_LABEL) && node_effectively_disabled(node)) {
         return true;
     }
     if (layout->control_count == layout->control_capacity) {
@@ -2312,7 +2312,7 @@ static int atomic_block_baseline(const LayoutContext *context,
                                  int top, int height)
 {
     const LayoutDocument *layout = context->layout;
-    bool first = layout_node_name_is(node, "button")
+    bool first = document_node_is_tag(node, LXB_TAG_BUTTON)
         || style->display == DISPLAY_INLINE_FLEX
         || style->display == DISPLAY_INLINE_GRID;
     /* Only a block container's baseline falls back to its margin edge when
@@ -2361,11 +2361,11 @@ static int atomic_block_baseline(const LayoutContext *context,
         const LayoutNodeBox *descendant = &layout->node_boxes[i];
         if (descendant->command_start < box->command_start) break;
         if (descendant->node == NULL || descendant->height <= 0
-            || !(layout_node_name_is(descendant->node, "img")
-                 || layout_node_name_is(descendant->node, "svg")
-                 || layout_node_name_is(descendant->node, "video")
-                 || layout_node_name_is(descendant->node, "canvas")
-                 || layout_node_name_is(descendant->node, "iframe"))) {
+            || !(document_node_is_tag(descendant->node, LXB_TAG_IMG)
+                 || document_node_is_tag(descendant->node, LXB_TAG_SVG)
+                 || document_node_is_tag(descendant->node, LXB_TAG_VIDEO)
+                 || document_node_is_tag(descendant->node, LXB_TAG_CANVAS)
+                 || document_node_is_tag(descendant->node, LXB_TAG_IFRAME))) {
             continue;
         }
         int candidate = descendant->y + descendant->height - top;
@@ -2376,7 +2376,7 @@ static int atomic_block_baseline(const LayoutContext *context,
     }
     /* A button's flow-root baseline is synthesized at its content edge
        when there is no in-flow line. Padding is not part of that baseline. */
-    if (!found && layout_node_name_is(node, "button"))
+    if (!found && document_node_is_tag(node, LXB_TAG_BUTTON))
         return height - style->margin.bottom - style->border.bottom
                       - style->padding.bottom;
     if (!found || baseline < 0 || baseline > height) return height;
@@ -3244,17 +3244,19 @@ static size_t text_spacing_units(const char *text, size_t length)
     return units;
 }
 
-int measured_text_width_fixed_mode(const FontFace *face,
-                                     FontFamily metric_family,
-                                     const char *text, size_t length,
-                                     int font_size_fixed,
-                                     bool synthetic_bold, bool metric_bold,
-                                     int scale, int letter_spacing,
-                                     bool kerning)
+/* `exact`, when given, reports whether the face measured the run: false
+   when it could not (a missing face, a refused size or variation change)
+   and the advance is the 6px-per-character estimate. */
+static int measured_text_width_fixed_checked(
+    const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    bool kerning, bool *exact)
 {
     int width = font_text_width_for_family_at_size_fixed_mode(
         face, metric_family, text, length, font_size_fixed,
         synthetic_bold, metric_bold, kerning);
+    if (exact != NULL) *exact = width >= 0;
     /* With valid nonnegative advances and no tracking, the character-based
        minimum cannot exceed width. No second grapheme walk is needed. */
     if (width >= 0 && letter_spacing == 0) return width;
@@ -3277,6 +3279,19 @@ int measured_text_width_fixed_mode(const FontFace *face,
     }
     if (width < minimum) width = minimum;
     return width;
+}
+
+int measured_text_width_fixed_mode(const FontFace *face,
+                                     FontFamily metric_family,
+                                     const char *text, size_t length,
+                                     int font_size_fixed,
+                                     bool synthetic_bold, bool metric_bold,
+                                     int scale, int letter_spacing,
+                                     bool kerning)
+{
+    return measured_text_width_fixed_checked(
+        face, metric_family, text, length, font_size_fixed, synthetic_bold,
+        metric_bold, scale, letter_spacing, kerning, NULL);
 }
 
 int measured_text_width_fixed(const FontFace *face,
@@ -3304,16 +3319,17 @@ int measured_text_width(const FontFace *face,
     return fixed > INT_MAX - 32 ? INT_MAX / 64 : (fixed + 32) / 64;
 }
 
-int measured_flow_text_width_fixed(
+int measured_flow_text_width_fixed_checked(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform, bool kerning)
+    TextTransformMode transform, bool kerning, bool *exact)
 {
     if (transform == TEXT_TRANSFORM_NONE || length > 511) {
-        return measured_text_width_fixed_mode(
+        return measured_text_width_fixed_checked(
             face, metric_family, text, length, font_size_fixed,
-            synthetic_bold, metric_bold, scale, letter_spacing, kerning);
+            synthetic_bold, metric_bold, scale, letter_spacing, kerning,
+            exact);
     }
     char transformed[512];
     memcpy(transformed, text, length);
@@ -3328,9 +3344,20 @@ int measured_flow_text_width_fixed(
             transformed[i] = (char) (value - 'A' + 'a');
         }
     }
-    return measured_text_width_fixed_mode(
+    return measured_text_width_fixed_checked(
         face, metric_family, transformed, length, font_size_fixed,
-        synthetic_bold, metric_bold, scale, letter_spacing, kerning);
+        synthetic_bold, metric_bold, scale, letter_spacing, kerning, exact);
+}
+
+int measured_flow_text_width_fixed(
+    const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    TextTransformMode transform, bool kerning)
+{
+    return measured_flow_text_width_fixed_checked(
+        face, metric_family, text, length, font_size_fixed, synthetic_bold,
+        metric_bold, scale, letter_spacing, transform, kerning, NULL);
 }
 
 int measured_flow_text_width(
@@ -3405,7 +3432,8 @@ static size_t fitting_text_prefix(const FontFace *face,
 }
 
 static int measured_line_text_width_fixed(
-    LineState *line, const FontFace *face, FontFamily metric_family,
+    LineState *line, LayoutReuseCache *reuse, const FontFace *face,
+    FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
     TextTransformMode transform, bool kerning)
@@ -3415,8 +3443,8 @@ static int measured_line_text_width_fixed(
             line, face, metric_family, text, length, font_size_fixed,
             synthetic_bold, metric_bold, letter_spacing, transform,
             kerning, &shaped)) return shaped;
-    return measured_flow_text_width_fixed(
-        face, metric_family, text, length, font_size_fixed,
+    return layout_text_measure(
+        reuse, face, metric_family, text, length, font_size_fixed,
         synthetic_bold, metric_bold, scale, letter_spacing,
         transform, kerning);
 }
@@ -3424,7 +3452,8 @@ static int measured_line_text_width_fixed(
 /* Keep the bounded balancing scratch off the ordinary text-flow stack. */
 __attribute__((noinline))
 static int measured_balanced_text_width_fixed(
-    LineState *line, const FontFace *face, FontFamily metric_family,
+    LineState *line, LayoutReuseCache *reuse, const FontFace *face,
+    FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
     TextTransformMode transform, bool kerning, uint8_t white_space)
@@ -3450,7 +3479,7 @@ static int measured_balanced_text_width_fixed(
         length = used;
     }
     return measured_line_text_width_fixed(
-        line, face, metric_family, text, length, font_size_fixed,
+        line, reuse, face, metric_family, text, length, font_size_fixed,
         synthetic_bold, metric_bold, scale, letter_spacing, transform,
         kerning);
 }
@@ -3477,7 +3506,8 @@ static unsigned balanced_word_lines(const int *words, size_t count,
    Short, collapsed text gets one metric pass, then integer-only partitions. */
 __attribute__((noinline))
 static int balanced_text_target_width(
-    LineState *line, const FontFace *face, FontFamily metric_family,
+    LineState *line, LayoutReuseCache *reuse, const FontFace *face,
+    FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
     int space_width_fixed, TextTransformMode transform, bool kerning,
@@ -3495,7 +3525,7 @@ static int balanced_text_target_width(
         while (at < length && !isspace((unsigned char) text[at])) at++;
         if (begin == at) break;
         int word = measured_line_text_width_fixed(
-            line, face, metric_family, text + begin, at - begin,
+            line, reuse, face, metric_family, text + begin, at - begin,
             font_size_fixed, synthetic_bold, metric_bold, scale,
             letter_spacing, transform, kerning);
         /* Emergency word splitting and invalid metrics keep normal flow. */
@@ -3544,7 +3574,7 @@ bool layout_unloaded_image_ratio(lxb_dom_node_t *node,
 {
     *ratio_width = 0;
     *ratio_height = 0;
-    if (node == NULL || style == NULL || !layout_node_name_is(node, "img")
+    if (node == NULL || style == NULL || !document_node_is_tag(node, LXB_TAG_IMG)
         || (!style->has_width && !style->has_height)) return false;
     int width = style->aspect_width, height = style->aspect_height;
     if (width <= 0 || height <= 0) {
@@ -3574,7 +3604,7 @@ bool layout_add_replaced_alt_text(
     const ComputedStyle *style, int x, int y, int width, int height)
 {
     if (context == NULL || node == NULL || style == NULL
-        || !layout_node_name_is(node, "img") || width < 3 || height < 3) {
+        || !document_node_is_tag(node, LXB_TAG_IMG) || width < 3 || height < 3) {
         return true;
     }
     size_t length = 0;
@@ -3673,10 +3703,11 @@ bool flow_text(LayoutContext *context, LineState *line,
         context->web_fonts, style->font_family, face);
     bool synthetic_bold = style_uses_synthetic_weight(
         context->fonts, context->web_fonts, style, face);
-    int space_width_fixed = font_text_width_for_family_at_size_fixed(
-        face, metric_family, " ", 1, font_size_fixed,
-        synthetic_bold, metric_bold);
-    if (space_width_fixed < 0) space_width_fixed = 6 * scale * 64;
+    /* The space's own advance; its estimate stands in, as for any run,
+       when the face cannot measure it. */
+    int space_width_fixed = layout_text_measure(
+        context->reuse, face, metric_family, " ", 1, font_size_fixed,
+        synthetic_bold, metric_bold, scale, 0, TEXT_TRANSFORM_NONE, true);
     space_width_fixed = layout_fixed_add(
         space_width_fixed,
         layout_fixed_from_integer(style->word_spacing));
@@ -3700,7 +3731,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                == layout_fixed_from_integer(line->start_x)
         && available_pixels > 0 && length <= 512u) {
         int total_fixed = measured_balanced_text_width_fixed(
-            line, face, metric_family, text, length, font_size_fixed,
+            line, context->reuse,
+            face, metric_family, text, length, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing_fixed,
             style->text_transform, !computed_style_kerning_none(style),
             style->white_space_mode);
@@ -3729,7 +3761,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                     && style->white_space_mode == WHITE_SPACE_NORMAL
                     && computed_style_word_break(style) != WORD_BREAK_ALL) {
                     target = balanced_text_target_width(
-                        line, face, metric_family, text, length,
+                        line, context->reuse, face, metric_family, text, length,
                         font_size_fixed, synthetic_bold, metric_bold, scale,
                         style->letter_spacing_fixed, space_width_fixed,
                         style->text_transform,
@@ -3921,7 +3953,8 @@ bool flow_text(LayoutContext *context, LineState *line,
             continue;
         }
         int word_width_fixed = measured_line_text_width_fixed(
-            line, face, metric_family, text + at, end - at, font_size_fixed,
+            line, context->reuse,
+            face, metric_family, text + at, end - at, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing_fixed,
             style->text_transform, !computed_style_kerning_none(style));
         int boundary_fixed = line->has_text_character
@@ -4030,7 +4063,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                 piece_end = piece_at + prefix;
                 if (piece_end > end) piece_end = end;
                 width_fixed = measured_line_text_width_fixed(
-                    line, face, metric_family, text + piece_at,
+                    line, context->reuse, face, metric_family, text + piece_at,
                     piece_end - piece_at, font_size_fixed,
                     synthetic_bold, metric_bold, scale,
                     style->letter_spacing_fixed, style->text_transform,
@@ -4056,7 +4089,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                     piece_end = piece_at + prefix;
                     if (piece_end > end) piece_end = end;
                     width_fixed = measured_line_text_width_fixed(
-                        line, face, metric_family, text + piece_at,
+                        line, context->reuse,
+                        face, metric_family, text + piece_at,
                         piece_end - piece_at, font_size_fixed,
                         synthetic_bold, metric_bold, scale,
                         style->letter_spacing_fixed, style->text_transform,
@@ -4069,7 +4103,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                            > layout_fixed_from_integer(wrap_right)) {
                     static const char marker[] = "\xe2\x80\xa6";
                     int marker_width = measured_line_text_width_fixed(
-                        line, face, metric_family, marker, sizeof(marker) - 1,
+                        line, context->reuse,
+                        face, metric_family, marker, sizeof(marker) - 1,
                         font_size_fixed, synthetic_bold, metric_bold,
                         scale, style->letter_spacing_fixed,
                         TEXT_TRANSFORM_NONE,
@@ -4093,7 +4128,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                     piece_end = piece_at + prefix;
                     width_fixed = prefix == 0 ? 0
                         : measured_line_text_width_fixed(
-                              line, face, metric_family, text + piece_at,
+                              line, context->reuse,
+                              face, metric_family, text + piece_at,
                               prefix, font_size_fixed, synthetic_bold,
                               metric_bold, scale, style->letter_spacing_fixed,
                               style->text_transform,
@@ -4331,9 +4367,9 @@ bool flow_subtree_fallback(LayoutContext *context,
                 || node_style.hidden;
         }
         bool skip_subtree = node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && (layout_node_name_is(node, "script") || layout_node_name_is(node, "style")
-                || layout_node_name_is(node, "template")
-                || layout_node_name_is(node, "head")
+            && (document_node_is_tag(node, LXB_TAG_SCRIPT) || document_node_is_tag(node, LXB_TAG_STYLE)
+                || document_node_is_tag(node, LXB_TAG_TEMPLATE)
+                || document_node_is_tag(node, LXB_TAG_HEAD)
                 || style_hides_subtree
                 || lxb_dom_element_has_attribute(
                        lxb_dom_interface_element(node),
@@ -4343,7 +4379,7 @@ bool flow_subtree_fallback(LayoutContext *context,
             continue;
         }
         if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && layout_node_name_is(node, "br")) {
+            && document_node_is_tag(node, LXB_TAG_BR)) {
             force_line_break(context, line, style);
             node = layout_fallback_next(node, root, false);
             continue;
@@ -4366,7 +4402,7 @@ bool flow_subtree_fallback(LayoutContext *context,
             /* A comb-shaped deep tree can otherwise turn one bounded node
                walk into quadratic unaccounted ancestry work. */
             if (!layout_fallback_consume_work(context, at)) return false;
-            if (layout_node_name_is(at, "a")) {
+            if (document_node_is_tag(at, LXB_TAG_A)) {
                 size_t href_length = 0;
                 const char *href = document_attribute(
                     at, "href", &href_length);
@@ -4617,7 +4653,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                             containing_width, containing_height, false,
                             &line->positioned_box, &ignored_bottom);
     }
-    if (layout_node_name_is(node, "br")) {
+    if (document_node_is_tag(node, LXB_TAG_BR)) {
         /*
          * `clear` applies to a BR's forced break.  Merely flushing a normal
          * line leaves the cursor in a float exclusion band, so the next
@@ -4637,7 +4673,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         force_line_break(context, line, parent);
         return true;
     }
-    if (layout_node_name_is(node, "a")) {
+    if (document_node_is_tag(node, LXB_TAG_A)) {
         size_t href_length = 0;
         const char *href = document_attribute(node, "href", &href_length);
         if (href != NULL && href_length != 0) {
@@ -4646,11 +4682,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             link_node = node;
         }
     }
-    bool input_control = layout_node_name_is(node, "input");
-    bool textarea_control = layout_node_name_is(node, "textarea");
-    bool button_control = layout_node_name_is(node, "button");
-    bool select_control = layout_node_name_is(node, "select");
-    bool label_control = layout_node_name_is(node, "label");
+    bool input_control = document_node_is_tag(node, LXB_TAG_INPUT);
+    bool textarea_control = document_node_is_tag(node, LXB_TAG_TEXTAREA);
+    bool button_control = document_node_is_tag(node, LXB_TAG_BUTTON);
+    bool select_control = document_node_is_tag(node, LXB_TAG_SELECT);
+    bool label_control = document_node_is_tag(node, LXB_TAG_LABEL);
     size_t editable_length = 0;
     const char *editable_value = document_attribute(
         node, "contenteditable", &editable_length);
@@ -4706,12 +4742,12 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             context, node, parent, &style, line,
             line->positioned_box.height);
     }
-    bool replaced_element = style.generated_image || layout_node_name_is(node, "img")
-        || layout_node_name_is(node, "svg")
-        || layout_node_name_is(node, "video")
-        || layout_node_name_is(node, "audio")
-        || layout_node_name_is(node, "canvas")
-        || layout_node_name_is(node, "iframe");
+    bool replaced_element = style.generated_image || document_node_is_tag(node, LXB_TAG_IMG)
+        || document_node_is_tag(node, LXB_TAG_SVG)
+        || document_node_is_tag(node, LXB_TAG_VIDEO)
+        || document_node_is_tag(node, LXB_TAG_AUDIO)
+        || document_node_is_tag(node, LXB_TAG_CANVAS)
+        || document_node_is_tag(node, LXB_TAG_IFRAME);
     /* Button contents form an atomic control face even when an author
        requests inline display; its vertical padding still belongs to the
        face, rather than ordinary non-replaced inline line-height. */
@@ -4890,7 +4926,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             size_t label_length = 0;
             const char *label = document_attribute(node, "value",
                                                    &label_length);
-            if (label == NULL || label_length == 0) {
+            if (label == NULL) {
                 label = type_length == 5 ? "RESET"
                     : (strncasecmp(input_type, "submit", 6) == 0
                        ? "SUBMIT" : "");
@@ -5048,49 +5084,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             return false;
         }
         size_t value_length = 0;
-        const char *value = document_control_value(node, &value_length);
         bool placeholder_value = false;
-        if (value == NULL) {
-            value = input_control
-                ? document_attribute(node, "value", &value_length)
-                : first_text_data(node, &value_length);
-        }
-        if (input_control_type == CONTROL_TOGGLE
-            || input_control_type == CONTROL_RANGE) {
-            value = NULL;
-            value_length = 0;
-        } else if (value == NULL || value_length == 0) {
-            value = document_attribute(node, "placeholder", &value_length);
-            placeholder_value = value != NULL && value_length != 0;
-        }
-        if ((value == NULL || value_length == 0)
-            && input_control_type == CONTROL_BUTTON
-            && input_type != NULL) {
-            if (type_length == 4
-                && strncasecmp(input_type, "file", 4) == 0) {
-                value = "CHOOSE FILE";
-                value_length = 11;
-            } else if ((type_length == 6
-                        && strncasecmp(input_type, "submit", 6) == 0)
-                       || (type_length == 5
-                           && strncasecmp(input_type, "image", 5) == 0)) {
-                value = "SUBMIT";
-                value_length = 6;
-            } else if (type_length == 5
-                       && strncasecmp(input_type, "reset", 5) == 0) {
-                value = "RESET";
-                value_length = 5;
-            }
-        }
-        static const char password_mask[] = "********************************";
-        if (input_type != NULL && type_length == 8
-            && memcmp(input_type, "password", 8) == 0
-            && value != NULL && value_length != 0) {
-            if (value_length > sizeof(password_mask) - 1) {
-                value_length = sizeof(password_mask) - 1;
-            }
-            value = password_mask;
-        }
+        const char *value = layout_control_value_text(
+            node, input_control, input_control_type, &value_length,
+            &placeholder_value);
         if (value != NULL && value_length != 0) {
             if (value_length > UINT32_MAX) return false;
             int text_indent = 0;
@@ -5124,18 +5121,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         if (!layout_add_control(context->layout, outer_x, outer_y,
                          outer_width, outer_height,
                          control_type, node)) return false;
-        if (textarea_control && style.resize_mode != STYLE_RESIZE_NONE) {
-            int handle = 12;
-            if (!layout_add_control(
-                    context->layout,
-                    outer_x + (outer_width > handle
-                               ? outer_width - handle : 0),
-                    outer_y + (outer_height > handle
-                               ? outer_height - handle : 0),
-                    outer_width < handle ? outer_width : handle,
-                    outer_height < handle ? outer_height : handle,
-                    CONTROL_RESIZE, node)) return false;
-        }
+        if (textarea_control && style.resize_mode != STYLE_RESIZE_NONE
+            && !layout_control_add_resize_grip(
+                   context, node, &style, outer_x, outer_y,
+                   outer_width, outer_height)) return false;
         /* Like inline replaced elements, inline form controls need a
            queryable box: textarea autosizers read scrollHeight and
            getBoundingClientRect, which answered zero height here. */
@@ -5196,52 +5185,24 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         line_note_atomic(line, parent);
         return true;
     }
-    if (style.generated_image || layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
-        || layout_node_name_is(node, "video")
-        || layout_node_name_is(node, "audio")
-        || layout_node_name_is(node, "canvas")
-        || layout_node_name_is(node, "iframe")) {
-        bool canvas_element = layout_node_name_is(node, "canvas");
-        bool audio_element = layout_node_name_is(node, "audio");
-        bool audio_controls = audio_element
-            && lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(node),
-                (const lxb_char_t *) "controls", 8);
+    if (style.generated_image || document_node_is_tag(node, LXB_TAG_IMG) || document_node_is_tag(node, LXB_TAG_SVG)
+        || document_node_is_tag(node, LXB_TAG_VIDEO)
+        || document_node_is_tag(node, LXB_TAG_AUDIO)
+        || document_node_is_tag(node, LXB_TAG_CANVAS)
+        || document_node_is_tag(node, LXB_TAG_IFRAME)) {
+        LayoutReplacedInfo replaced;
+        layout_replaced_info(context, node, &style, &replaced);
+        bool canvas_element = replaced.canvas;
+        bool audio_controls = replaced.audio_controls;
         bool declared_media_card = document_is_declared_video_card(
             context->document, node);
         size_t replaced_link_start = context->layout->link_count;
         size_t replaced_control_start = context->layout->control_count;
-        const ImageResource *image = layout_replaced_image(context, node, &style);
-        if (style.generated_image && !image_resource_available(image))
-            layout_note_unresolved_external_visual(context, node,
-                style.generated_text, IMAGE_PRIORITY_KIND_BACKGROUND, PSEUDO_NONE);
-        bool image_available = image_resource_available(image)
-                               && image->width > 0 && image->height > 0;
-        if (layout_node_name_is(node, "img") && !image_available) {
-            size_t source_length = 0;
-            const char *source = document_attribute(
-                node, "src", &source_length);
-            if (source == NULL || source_length == 0) {
-                source = document_attribute(
-                    node, "srcset", &source_length);
-            }
-            if (source != NULL && source_length != 0) {
-                layout_note_unresolved_external_visual(
-                    context, node, NULL, IMAGE_PRIORITY_KIND_DOCUMENT,
-                    PSEUDO_NONE);
-            }
-        }
-        int width = image_available
-            ? image_resource_intrinsic_width(image) : 0;
-        int height = image_available
-            ? image_resource_intrinsic_height(image) : 0;
-        if ((layout_node_name_is(node, "video") || canvas_element
-             || audio_controls
-             || layout_node_name_is(node, "iframe"))
-            && (width <= 0 || height <= 0)) {
-            width = 300;
-            height = audio_controls ? 54 : 150;
-        }
+        const ImageResource *image = replaced.image;
+        layout_replaced_note_unresolved(context, node, &style, &replaced);
+        bool image_available = replaced.available;
+        int width = replaced.natural_width;
+        int height = replaced.natural_height;
         int horizontal_edges = style.padding.left + style.padding.right
                                + style.border.left + style.border.right;
         int vertical_edges = style.padding.top + style.padding.bottom
@@ -5276,13 +5237,13 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             declared_box = true;
         }
         if (!image_available && !declared_box && !zero_width_spacer
-            && !layout_node_name_is(node, "svg")
-            && !layout_node_name_is(node, "video")
-            && !layout_node_name_is(node, "audio")
+            && !document_node_is_tag(node, LXB_TAG_SVG)
+            && !document_node_is_tag(node, LXB_TAG_VIDEO)
+            && !document_node_is_tag(node, LXB_TAG_AUDIO)
             && !canvas_element
-            && !layout_node_name_is(node, "iframe")) {
+            && !document_node_is_tag(node, LXB_TAG_IFRAME)) {
             size_t alt_length = 0;
-            const char *alt = layout_node_name_is(node, "img")
+            const char *alt = document_node_is_tag(node, LXB_TAG_IMG)
                 ? document_attribute(node, "alt", &alt_length) : NULL;
             ComputedStyle alt_style = layout_alt_text_flow_style(&style);
             return alt == NULL || alt_length == 0
@@ -5291,10 +5252,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         /* The 300x150 video/iframe fallback is two independent default
            dimensions, not intrinsic media metadata or an aspect ratio. */
-        bool fallback_dimensions = !image_available
-            && (layout_node_name_is(node, "video")
-                || layout_node_name_is(node, "iframe") || audio_controls)
-            && !(style.aspect_width > 0 && style.aspect_height > 0);
+        bool fallback_dimensions = replaced.fallback_dimensions;
         bool styled_width = style.has_width;
         if (styled_width) {
             int styled_width = resolve_declared_length(
@@ -5350,7 +5308,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             &width, &height);
         if ((width <= 0 && !zero_width_spacer) || height <= 0) {
             size_t alt_length = 0;
-            const char *alt = layout_node_name_is(node, "img")
+            const char *alt = document_node_is_tag(node, LXB_TAG_IMG)
                 ? document_attribute(node, "alt", &alt_length) : NULL;
             ComputedStyle alt_style = layout_alt_text_flow_style(&style);
             return alt == NULL || alt_length == 0
@@ -5441,7 +5399,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             && !layout_paint_audio_control(
                 context, &style, outer_x, outer_y,
                 outer_width, outer_height)) return false;
-        if ((layout_node_name_is(node, "video") || declared_media_card)
+        if ((document_node_is_tag(node, LXB_TAG_VIDEO) || declared_media_card)
             && !layout_paint_video_control(
                 context, node, outer_x, outer_y,
                 outer_width, outer_height)) {
@@ -5450,12 +5408,12 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         /* Page media is a single native-player activation target. It uses
            the existing retained control map so d-pad focus and pointer taps
            share the same DOM activation/cancellation path as buttons. */
-        if ((layout_node_name_is(node, "video") || audio_controls
-             || declared_media_card || layout_node_name_is(node, "iframe"))
+        if ((document_node_is_tag(node, LXB_TAG_VIDEO) || audio_controls
+             || declared_media_card || document_node_is_tag(node, LXB_TAG_IFRAME))
             && !layout_add_control(
                    context->layout, outer_x, outer_y,
                    outer_width, outer_height,
-                   layout_node_name_is(node, "iframe")
+                   document_node_is_tag(node, LXB_TAG_IFRAME)
                        ? CONTROL_FRAME : CONTROL_BUTTON,
                    node)) {
             return false;

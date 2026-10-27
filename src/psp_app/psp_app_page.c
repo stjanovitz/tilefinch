@@ -4,18 +4,6 @@
  */
 #include "psp_app_internal.h"
 
-PspProfilePageKind psp_profile_page_kind(const char *url)
-{
-    if (url == NULL) return PSP_PROFILE_PAGE_NONE;
-    if (strcmp(url, BROWSER_PROFILE_HOMEPAGE_URL) == 0)
-        return PSP_PROFILE_PAGE_HOMEPAGE;
-    if (strcmp(url, "https://tilefinch.local/bookmarks") == 0)
-        return PSP_PROFILE_PAGE_BOOKMARKS;
-    if (strcmp(url, "https://tilefinch.local/history") == 0)
-        return PSP_PROFILE_PAGE_HISTORY;
-    return PSP_PROFILE_PAGE_NONE;
-}
-
 bool psp_set_presentation_css(
     BrowserEngine *engine, const PspUiState *ui,
     const BrowserProfile *profile, bool reader_mode,
@@ -925,31 +913,32 @@ void psp_report_budget_counters(const Budget *budget,
 
 void psp_profile_record_current(
     BrowserProfile *profile, PspProfileStore *store,
-    const NavigationSession *navigation, uint64_t now_us)
+    const BrowserEngine *engine, uint64_t now_us)
 {
-    const NavigationEntry *entry = navigation_current(navigation);
-    if (entry == NULL || entry->url == NULL
-        || strncmp(entry->url, "tilefinch://", 12u) == 0
-        || psp_ui_internal_url(entry->url))
+    BrowserHistoryEntryText entry;
+    if (!browser_engine_current_entry_text(engine, &entry, NULL)
+        || strncmp(entry.url, "tilefinch://", 12u) == 0
+        || psp_ui_internal_url(entry.url))
         return;
     if (browser_profile_record_history(
-            profile, entry->url, entry->title))
+            profile, entry.url, entry.title))
         psp_profile_store_mark_dirty(store, now_us);
 }
 
 bool psp_recovery_record_current(
     const BrowserProfile *profile, const char *path,
-    const NavigationSession *navigation)
+    const BrowserEngine *engine)
 {
     if (!browser_profile_restore_last_page(profile)
-        || path == NULL || navigation == NULL) return false;
-    const NavigationEntry *entry = navigation_current(navigation);
-    if (entry == NULL || entry->url == NULL
-        || psp_ui_internal_url(entry->url)) {
+        || path == NULL) return false;
+    char url[NAVIGATION_URL_LIMIT];
+    int scroll_y = 0;
+    if (!browser_engine_current_entry(engine, url, sizeof(url), &scroll_y)
+        || psp_ui_internal_url(url)) {
         return false;
     }
     bool saved = browser_recovery_save(
-        path, entry->url, entry->scroll_y);
+        path, url, scroll_y);
     if (!saved) {
         printf("tilefinch-recovery: save failed\n");
     }
@@ -993,4 +982,84 @@ bool psp_profile_open_page(
 {
     return psp_profile_open_page_history(
         engine, ui, profile, kind, true);
+}
+
+/* Page tools -> Reader: enter or leave the extracted Reader presentation for the current page. */
+__attribute__((noinline))
+void psp_app_toggle_reader(
+    PspApp *app, PspAppFrameState *frame)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    char reader_buffer[NAVIGATION_URL_LIMIT];
+    const char *reader_url = psp_app_current_url(
+        engine, reader_buffer, sizeof(reader_buffer));
+    if (app->process->presentation.ui.basic_mode) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "TURN BASIC VIEW OFF BEFORE READER", 180);
+        return;
+    }
+    bool old_mode = app->process->presentation.ui.reader_mode;
+    unsigned old_percent = app->process->presentation.ui.page_font_percent;
+    bool enable = !old_mode;
+    unsigned target_percent =
+        browser_profile_page_font_percent(profile);
+    char reader_anchor[BROWSER_TEXT_ANCHOR_LIMIT + 1u];
+    int reader_anchor_y = 0;
+    bool have_reader_anchor =
+        browser_engine_capture_text_anchor(
+            engine, reader_anchor, &reader_anchor_y);
+    ReaderDocumentAnalysis reader_analysis = {0};
+    if (enable && !browser_engine_prepare_reader(
+            engine, &reader_analysis)) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "READER MODE UNAVAILABLE", 180);
+        return;
+    }
+    if (enable && app->process->presentation.ui.remember_reader_site_scale) {
+        (void) browser_profile_reader_site_font_percent(
+            profile, reader_url, &target_percent);
+    }
+    bool presentation_applied = psp_set_presentation_css(
+        engine, &app->process->presentation.ui, profile, enable,
+        reader_url, target_percent, true);
+    if (presentation_applied
+        && (!enable || browser_engine_activate_reader_view(engine))) {
+        /* A user's Reader is sticky; turning it off also ends an
+           automatically engaged one. */
+        if (enable) {
+            psp_reader_mark_engaged(
+                &app->process->presentation.ui, false);
+        } else {
+            psp_reader_mark_left(&app->process->presentation.ui);
+        }
+        app->process->presentation.ui.basic_mode = false;
+        browser_engine_set_reader_candidate_mode(engine, enable);
+        app->process->presentation.ui.page_font_percent = target_percent;
+        (void) psp_engine_views_refresh(app->views, engine);
+        BrowserController *controller =
+            browser_engine_controller(engine);
+        if (controller != NULL)
+            (void) controller_rebind_focus(controller);
+        if (have_reader_anchor)
+            (void) browser_engine_restore_text_anchor(
+                engine, reader_anchor, reader_anchor_y);
+        frame->page_dirty = true;
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enable ? "READER MODE ON" : "READER MODE OFF",
+            180);
+    } else {
+        (void) psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile, old_mode, reader_url,
+            old_percent, true);
+        app->process->presentation.ui.reader_mode = old_mode;
+        app->process->presentation.ui.page_font_percent = old_percent;
+        psp_ui_show_status(
+            &app->process->presentation.ui, enable ? "READER MODE UNAVAILABLE"
+                        : "READER MODE COULD NOT CLOSE",
+            240);
+    }
 }

@@ -1,6 +1,0 @@
-anchor gamma
-anchor alpha
-back
-back
-forward
-status

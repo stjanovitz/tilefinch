@@ -3289,26 +3289,3 @@ bool document_scripts_execute(PocDocument *document,
         scheduler, NULL, lxb_dom_interface_node(document->html), metrics,
         result);
 }
-
-bool document_body_scripts_execute(PocDocument *document,
-                                   ScriptRuntime *runtime, Budget *budget,
-                                   BrowserSession *session,
-                                   const char *base_url,
-                                   const char *document_url,
-                                   const char *referrer_policy,
-                                   size_t maximum_scripts,
-                                   size_t maximum_total_bytes,
-                                   size_t maximum_file_bytes,
-                                   long timeout_ms,
-                                   FetchScheduler *scheduler,
-                                   ExternalScriptMetrics *metrics,
-                                   ScriptResult *result)
-{
-    lxb_dom_node_t *body = document == NULL ? NULL
-                                           : document_body_node(document);
-    return document_scripts_execute_internal(
-        document, runtime, budget, session, base_url, document_url,
-        referrer_policy, maximum_scripts, maximum_total_bytes,
-        maximum_file_bytes, timeout_ms, scheduler, NULL, body, metrics,
-        result);
-}

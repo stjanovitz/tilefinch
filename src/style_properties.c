@@ -2,6 +2,7 @@
    writes parsed values into a ComputedStyle + presence mask.
    Split out of style.c. */
 
+#include "style_budget_category.h"
 #include "style_internal.h"
 
 #include <math.h>

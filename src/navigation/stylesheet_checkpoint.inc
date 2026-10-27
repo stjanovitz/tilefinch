@@ -193,7 +193,7 @@ static bool navigation_stream_continue_stylesheet_suffix(
         || stream->stylesheet_input_overflow) return false;
     /* A suffix appends at the end of the sheet, but adopted sheets must
        stay after every document source: rebuild instead. */
-    if (stream->blocking_stylesheet.adopted_source_count != 0
+    if (stream->blocking_stylesheet.scopes.adopted_source_count != 0
         || document_adopted_sheets_signature(document) != 0) return false;
     /* Media queries are evaluated at parse against the sheet's viewport. A
        later metadata scan (a <meta name=viewport> after the first blocking

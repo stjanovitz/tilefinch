@@ -595,6 +595,8 @@ void psp_input_script_observe_page(
     const NavigationSession *navigation = views == NULL ? NULL : views->navigation;
     if (navigation != NULL) psp_input_script_test_until(navigation);
     const char *mark = psp_input_script_mark(&psp_input_script);
+    /* A mark closes the last focus move's settled-frame record. */
+    if (mark != NULL) psp_focus_frame_settle(engine);
     if (mark == NULL || navigation == NULL) return;
     const NavigationPage *page = &navigation->page;
     const BrowserController *controller = views->controller;
@@ -669,6 +671,51 @@ void psp_input_script_observe_page(
            navigation_current(navigation) == NULL ? 0
                : navigation_current(navigation)->scroll_y,
            page_url == NULL ? "" : page_url);
+    /* Where the page's stylesheet came from, and the layout-reuse resets
+       focus moves caused: the device evidence for SC-1 (f3b7438c). A sheet
+       restored from the compiled-stylesheet cache is bounded out with no
+       style sources (stylesheet_prepare_for_document_reuse); past
+       STYLE_SOURCE_NODE_LIMIT sources it is bounded out with 48. The
+       compiled-cache, layout-reuse and relayout counters are cumulative for
+       the session; ir= and fragments= are the page's external-sheet stats,
+       which a restored sheet carries over from the visit that stored it. */
+    {
+        const NavigationPerformance *perf = &navigation->performance;
+        const Stylesheet *sheet = &page->stylesheet;
+        const ExternalStylesheetStats *css = &page->external_stylesheets;
+        printf("tilefinch-input-stylesheets: mark=%s generation=%llu "
+               "compiled-cache=%zu/%zu/%zu evictions=%zu "
+               "skips=%zu/%zu/%zu/%zu ir=%zu/%zu/%zu fragments=%zu/%zu "
+               "sheet-restored=%u bounded-out=%u style-sources=%u "
+               "adopted-sources=%u adopted-failed=%u rules=%zu "
+               "reuse-full-resets=%zu reuse-scoped=%zu "
+               "reuse-styles=%zu/%zu relayouts=%zu/%zu "
+               "focus-skips=%zu/%zu\n",
+               mark, (unsigned long long) navigation->generation,
+               perf->compiled_stylesheet_cache_hits,
+               perf->compiled_stylesheet_cache_misses,
+               perf->compiled_stylesheet_cache_stores,
+               perf->compiled_stylesheet_cache_evictions,
+               perf->compiled_stylesheet_cache_unmarked_skips,
+               perf->compiled_stylesheet_cache_generation_skips,
+               perf->compiled_stylesheet_cache_size_skips,
+               perf->compiled_stylesheet_cache_pressure_skips,
+               css->parsed_ir_hits, css->parsed_ir_misses,
+               css->parsed_ir_stores, css->compiled_fragment_hits,
+               css->compiled_fragment_misses,
+               sheet->style_sources_bounded_out
+                   && sheet->style_source_count == 0 ? 1u : 0u,
+               sheet->style_sources_bounded_out ? 1u : 0u,
+               (unsigned) sheet->style_source_count,
+               (unsigned) sheet->scopes.adopted_source_count,
+               sheet->scopes.adopted_scopes_failed ? 1u : 0u, sheet->count,
+               perf->layout_reuse_full_resets,
+               perf->layout_reuse_scoped_invalidations,
+               perf->layout_reuse_style_hits, perf->layout_reuse_style_misses,
+               perf->fast_relayouts, perf->full_relayouts,
+               perf->focus_outline_relayout_skips,
+               perf->focus_paint_relayout_skips);
+    }
     printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "
            "dynamic=%zu/%zu/%zu/%zu/%zu/%zu/%zu pending=%zu "

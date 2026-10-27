@@ -9,23 +9,13 @@
 #include "tilefinch/youtube_lite.h"
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_ui_settings.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-typedef struct {
-    size_t selector_calls;
-    size_t section_index;
-    size_t writer_calls;
-    size_t writer_section;
-    ScriptRemoteNodeWriteKind writer_kind;
-    char writer_key[96];
-    char writer_name[64];
-    char writer_value[64];
-} BackingProbe;
 
 static char *read_test_file(const char *path, size_t *length)
 {
@@ -271,50 +261,6 @@ static bool capture_provisional_present(
     return true;
 }
 
-static bool backing_selector_lookup(
-    void *opaque, const char *selector, size_t length,
-    size_t *section_index, char tag_name[32], char identifier[129],
-    char stable_key[96])
-{
-    BackingProbe *probe = opaque;
-    probe->selector_calls++;
-    bool local_probe = length == 6 && memcmp(selector, "#probe", 6) == 0;
-    bool deferred_probe = (length == 9
-        && memcmp(selector, "#deferred", 9) == 0)
-        || (length == 5 && memcmp(selector, "aside", 5) == 0);
-    if (!local_probe && !deferred_probe) return false;
-    *section_index = probe->section_index;
-    snprintf(tag_name, 32, "div");
-    snprintf(identifier, 129, "%s",
-             deferred_probe ? "deferred" : "probe");
-    snprintf(stable_key, 96, "id:%s",
-             deferred_probe ? "deferred" : "probe");
-    return true;
-}
-
-static bool backing_node_write(
-    void *opaque, const char *stable_key, size_t stable_key_length,
-    size_t section_index, ScriptRemoteNodeWriteKind kind,
-    const char *name, size_t name_length,
-    const char *value, size_t value_length)
-{
-    BackingProbe *probe = opaque;
-    if (probe == NULL || stable_key == NULL
-        || stable_key_length >= sizeof(probe->writer_key)
-        || name_length >= sizeof(probe->writer_name)
-        || value_length >= sizeof(probe->writer_value)) return false;
-    probe->writer_calls++;
-    probe->writer_section = section_index;
-    probe->writer_kind = kind;
-    memcpy(probe->writer_key, stable_key, stable_key_length);
-    probe->writer_key[stable_key_length] = '\0';
-    if (name != NULL) memcpy(probe->writer_name, name, name_length);
-    probe->writer_name[name_length] = '\0';
-    if (value != NULL) memcpy(probe->writer_value, value, value_length);
-    probe->writer_value[value_length] = '\0';
-    return true;
-}
-
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
@@ -337,6 +283,12 @@ int main(int argc, char **argv)
         CHECK(test_history_disclosures_leave_room_for_form_state() == 0);
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--history-step-only") == 0)
+        return test_native_history_step_cancels_idle_work();
+    if (argc == 2 && strcmp(argv[1], "--script-limits-only") == 0)
+        return test_script_limit_derivation();
+    if (argc == 2 && strcmp(argv[1], "--page-queries-only") == 0)
+        return test_frontend_page_queries_copy_engine_state();
     if (argc == 2 && strcmp(argv[1], "--empty-document-only") == 0)
         return test_empty_native_document();
     if (argc == 2 && strcmp(argv[1], "--fixed-images-only") == 0)
@@ -396,6 +348,9 @@ int main(int argc, char **argv)
             || test_optional_bold_faces_follow_page_families();
     if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
         return test_native_text_sync_does_not_relayout_twice();
+    if (argc == 2 && strcmp(argv[1], "--settings-policy-only") == 0)
+        return test_settings_failure_policy_with_engine()
+            || test_settings_boot_and_refresh_with_engine();
     if (argc == 2 && strcmp(argv[1], "--youtube-home-only") == 0)
         return test_youtube_initial_tiles_are_coalesced()
             || test_youtube_home_topics_are_lazy()
@@ -446,6 +401,11 @@ int main(int argc, char **argv)
         return test_deferred_startup_journey();
     if (argc == 2 && strcmp(argv[1], "--image-admission-only") == 0)
         return test_deferred_image_admission_yields_to_input();
+    if (argc == 2 && strcmp(argv[1], "--cooperate-boundary-only") == 0)
+        return test_cooperate_boundary_dispatch()
+            || test_cooperate_boundary_phase_names()
+            || test_cooperate_boundaries_reach_frontend()
+            || test_raster_decode_checkpoints_borrow_render_shell();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
         return test_loading_interaction_journey();
     if (argc == 2 && strcmp(argv[1], "--text-memory-only") == 0)
@@ -505,6 +465,10 @@ int main(int argc, char **argv)
     CHECK(test_background_interruption_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
     CHECK(test_deferred_image_admission_yields_to_input() == 0);
+    CHECK(test_cooperate_boundary_dispatch() == 0);
+    CHECK(test_cooperate_boundary_phase_names() == 0);
+    CHECK(test_cooperate_boundaries_reach_frontend() == 0);
+    CHECK(test_raster_decode_checkpoints_borrow_render_shell() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
     CHECK(test_deferred_images_skip_oversized_pages() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
@@ -513,6 +477,10 @@ int main(int argc, char **argv)
     CHECK(test_author_relayout_refusal_retires_shell() == 0);
     CHECK(test_history_restores_bounded_form_state() == 0);
     CHECK(test_history_disclosures_leave_room_for_form_state() == 0);
+    CHECK(test_native_history_step_cancels_idle_work() == 0);
+    CHECK(test_idle_step_order() == 0);
+    CHECK(test_script_limit_derivation() == 0);
+    CHECK(test_frontend_page_queries_copy_engine_state() == 0);
     CHECK(test_post_mutation_document_refresh_refusal_retires_shell() == 0);
     CHECK(test_page_video_activation() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
@@ -557,6 +525,8 @@ int main(int argc, char **argv)
     CHECK(test_provisional_preview_retries_and_refreshes(true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
+    CHECK(test_bounded_focus_frontend_settles() == 0);
+    CHECK(test_bounded_focus_pending_mutations_settle() == 0);
     CHECK(test_preview_scrolls_ahead_during_load() == 0);
     CHECK(test_preview_focus_and_activation() == 0);
     CHECK(test_preview_waits_out_style_run() == 0);
@@ -565,6 +535,8 @@ int main(int argc, char **argv)
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_initial_tiles_are_coalesced() == 0);
     CHECK(test_youtube_home_topics_are_lazy() == 0);
+    CHECK(test_settings_failure_policy_with_engine() == 0);
+    CHECK(test_settings_boot_and_refresh_with_engine() == 0);
     CHECK(test_youtube_personalized_home() == 0);
     CHECK(test_youtube_resume_metadata() == 0);
     CHECK(test_youtube_recent_history() == 0);

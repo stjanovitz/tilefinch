@@ -121,16 +121,11 @@ start-page	engine-memory.peak	band:4096	5060412
 start-page	engine-memory.reserve	exact	8388608
 start-page	engine-memory.system-free	exact	2326528
 start-page	engine-memory.system-largest	exact	2097152
-start-page	js-retention.control-drops	exact	0
-start-page	js-retention.handlers	exact	0
 start-page	js-retention.handles	exact	7/7
-start-page	js-retention.listeners	exact	0
 start-page	js-retention.network	exact	0
 start-page	js-retention.observer-drops	exact	0
 start-page	js-retention.observers	exact	0
-start-page	js-retention.stable	exact	0
 start-page	js-retention.timers	exact	0
-start-page	js-retention.wrapper-evictions	exact	0
 start-page	render-job.budget-exhausted	exact	0
 start-page	render-job.cancelled	exact	0
 start-page	render-job.completed	exact	0

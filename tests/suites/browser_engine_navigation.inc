@@ -436,6 +436,259 @@ static bool record_provisional_phase(void *context, const char *phase,
     return true;
 }
 
+/* The frontend half of the bounded focus rule
+   (browser_engine_settle_bounded_layout): a focus move the controller
+   proves confined to the bounded layout's region is answered from it;
+   every other input, and find, completes the layout first, so it answers
+   exactly as from the complete layout. */
+static bool bounded_focus_engine_focused(BrowserEngine *engine,
+                                         const char *id)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *node = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), id);
+    static const lxb_char_t marker[] = "data-tilefinch-focus";
+    return node != NULL && lxb_dom_element_has_attribute(
+        lxb_dom_interface_element(node), marker, sizeof(marker) - 1u);
+}
+
+static int test_bounded_focus_frontend_settles(void)
+{
+    puts("test: frontend input settles a bounded focus layout unless "
+         "the move is proven inside its region");
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 4;
+    config.resources.enabled = false;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 2u * MIB;
+    static char page[16384];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}input{display:block;height:20px;margin:0}"
+        ".hint{display:none;height:17px}input:focus+.hint{display:block}"
+        "p{margin:0;height:20px}</style>"
+        "<input id=a><div class=hint>A</div><input id=b><div class=hint>B"
+        "</div><input id=c><div class=hint>C</div>");
+    for (unsigned i = 0; i < 150; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p>Paragraph %u</p>", i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "<input id=late><script>var ready=1;</script>");
+    CHECK(used < sizeof(page));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL
+          && browser_engine_commit_html(engine, "https://bounded.test/",
+                                        page, used, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.runtime != NULL);
+    /* The first move (from no focus) relayouts against a complete layout:
+       nothing to settle, and its relayout is bounded. */
+    CHECK(browser_engine_focus_move(engine, true)
+          && bounded_focus_engine_focused(engine, "a")
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    /* The next input lies inside the region: answered without settling. */
+    size_t settles = navigation->performance.bounded_focus_input_settles;
+    CHECK(browser_engine_focus_move(engine, true)
+          && bounded_focus_engine_focused(engine, "b")
+          && navigation->performance.bounded_focus_input_settles == settles
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+          && bounded_focus_engine_focused(engine, "c")
+          && navigation->performance.bounded_focus_input_settles == settles
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    /* The next control lies past the cut: the move completes the layout
+       first, then lands where the complete layout puts it. */
+    CHECK(browser_engine_focus_move(engine, true)
+          && bounded_focus_engine_focused(engine, "late")
+          && navigation->performance.bounded_focus_input_settles
+                 == settles + 1u);
+    /* Scrolling reads the page's extent: settled first. (The move back
+       from #late lays out down to where #late was; the next is bounded.) */
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "a"))
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "b"))
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    settles = navigation->performance.bounded_focus_input_settles;
+    CHECK(browser_engine_scroll_page(engine, 1)
+          && navigation->performance.bounded_focus_input_settles
+                 == settles + 1u
+          && !navigation->page.layout_provisional);
+    /* Find matches text past the cut: completed first. */
+    CHECK(browser_engine_scroll_to_edge(engine, false)
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "c"))
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    BrowserFindSnapshot snapshot;
+    CHECK(browser_engine_find_begin(engine, "Paragraph 149", &snapshot)
+          && snapshot.match_count == 1
+          && !navigation->page.layout_provisional);
+    browser_engine_find_clear(engine);
+    /* Navigating away while a completion is pending drops it. */
+    CHECK(browser_engine_scroll_to_edge(engine, false)
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "a"))
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "b"))
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    static const char next_page[] = "<!doctype html><p>next</p>";
+    CHECK(browser_engine_commit_html(engine, "https://bounded.test/next",
+                                     next_page, strlen(next_page), true)
+          && !navigation->page.layout_provisional
+          && navigation_bounded_focus_region_end(navigation) == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Author mutations pending over a bounded focus layout (a task changed
+   the DOM and the relayout of the next runtime turn has not run): the
+   completion waits for them, so input that settles publishes them first
+   instead of being dropped, find never answers from the bounded layout,
+   and idle work does not stop at the waiting completion. */
+static bool record_bounded_pending_phase(void *context, const char *phase,
+                                         size_t completed_work_units)
+{
+    unsigned *completion_checkpoints = context;
+    if (phase != NULL && completed_work_units != 0
+        && strncmp(phase, "optional-layout", 15) == 0)
+        (*completion_checkpoints)++;
+    return true;
+}
+
+static bool bounded_pending_mutation(BrowserEngine *engine,
+                                     const char *source)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    return script_runtime_evaluate_diagnostic(navigation->page.runtime,
+               source, "<bounded-pending>",
+               &navigation->page.script_result)
+        && script_runtime_has_pending_mutations(navigation->page.runtime);
+}
+
+static int test_bounded_focus_pending_mutations_settle(void)
+{
+    puts("test: input over a bounded focus layout with pending author "
+         "mutations publishes them and completes, not refused");
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 4;
+    config.resources.enabled = false;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 2u * MIB;
+    static char page[16384];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}input{display:block;height:20px;margin:0}"
+        ".hint{display:none;height:17px}input:focus+.hint{display:block}"
+        "p{margin:0;height:20px}</style>"
+        "<input id=a><div class=hint>A</div><input id=b><div class=hint>B"
+        "</div><input id=c><div class=hint>C</div>");
+    for (unsigned i = 0; i < 150; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p id=p%u>Paragraph %u</p>", i, i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "<input id=late><script>var ready=1;</script>");
+    CHECK(used < sizeof(page));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL
+          && browser_engine_commit_html(engine, "https://bounded.test/",
+                                        page, used, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.runtime != NULL);
+
+    /* A page-down settles: the pending change is published, the layout
+       completed, and the press moves the page. */
+    CHECK(browser_engine_focus_move(engine, true)
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    CHECK(bounded_pending_mutation(engine,
+        "document.getElementById('p3').setAttribute('data-x','1')"));
+    const NavigationEntry *entry = navigation_current(navigation);
+    int scroll_before = entry == NULL ? -1 : entry->scroll_y;
+    bool paged = browser_engine_scroll_page(engine, 1);
+    entry = navigation_current(navigation);
+    if (!paged)
+        fprintf(stderr, "bounded pending: page-down refused (%s)\n",
+                browser_engine_last_error(engine));
+    CHECK(paged && !navigation->page.layout_provisional
+          && !script_runtime_has_pending_mutations(navigation->page.runtime)
+          && entry != NULL && entry->scroll_y > scroll_before);
+
+    /* Find over a bounded layout whose completion waits: never answered
+       from the bounded layout's first screens. */
+    CHECK(browser_engine_scroll_to_edge(engine, false)
+          && browser_engine_focus_move(engine, true)
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    CHECK(bounded_pending_mutation(engine,
+        "document.getElementById('p4').setAttribute('data-x','1')"));
+    BrowserFindSnapshot snapshot;
+    CHECK(browser_engine_find_begin(engine, "Paragraph 149", &snapshot));
+    if (snapshot.match_count != 1)
+        fprintf(stderr, "bounded pending: find saw %zu matches\n",
+                (size_t) snapshot.match_count);
+    CHECK(snapshot.match_count == 1 && !navigation->page.layout_provisional);
+    browser_engine_find_clear(engine);
+
+    /* Idle work: the waiting completion does not stop the turn before the
+       later steps (tiles and the rest). */
+    CHECK(browser_engine_scroll_to_edge(engine, false)
+          && browser_engine_focus_move(engine, true)
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    CHECK(bounded_pending_mutation(engine,
+        "document.getElementById('p5').setAttribute('data-x','1')"));
+    unsigned completion_checkpoints = 0;
+    TilefinchPlatformServices services = {
+        .context = &completion_checkpoints,
+        .cooperate = record_bounded_pending_phase };
+    tilefinch_platform_set_services(&services);
+    bool visual = false;
+    (void) browser_engine_run_idle_work(engine, &visual);
+    tilefinch_platform_set_services(NULL);
+    if (completion_checkpoints != 0)
+        fprintf(stderr, "bounded pending: idle stopped at the waiting "
+                "completion\n");
+    CHECK(completion_checkpoints == 0 && navigation->page.layout_provisional);
+
+    /* A completion the budget refuses: find refuses rather than matching
+       only the bounded layout's first screens, and so does a settled
+       press, with an error saying why. */
+    CHECK(browser_engine_scroll_page(engine, 1)
+          && browser_engine_scroll_to_edge(engine, false)
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "a"))
+          && browser_engine_focus_node(engine, test_reader_find_id(
+              lxb_dom_interface_node(navigation->page.document.html), "b"))
+          && navigation_bounded_focus_region_end(navigation) != 0);
+    tilefinch_test_faults()->refuse_next_layout_completion = true;
+    bool found = browser_engine_find_begin(engine, "Paragraph 149",
+                                           &snapshot);
+    tilefinch_test_faults()->refuse_next_layout_completion = false;
+    if (found)
+        fprintf(stderr, "bounded refused: find answered %zu matches\n",
+                (size_t) snapshot.match_count);
+    CHECK(!found && navigation->page.layout_provisional);
+    browser_engine_find_clear(engine);
+    tilefinch_test_faults()->refuse_next_layout_completion = true;
+    paged = browser_engine_scroll_page(engine, 1);
+    tilefinch_test_faults()->refuse_next_layout_completion = false;
+    CHECK(!paged && strstr(browser_engine_last_error(engine),
+                           "could not be completed") != NULL);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_large_static_page_commits_provisionally(void)
 {
     BrowserDeviceProfile profile;

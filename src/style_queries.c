@@ -5,6 +5,7 @@
  * per-node ComputedStyle unchanged on the PSP.
  */
 
+#include "style_budget_category.h"
 #include "style_internal.h"
 
 #include <stdlib.h>

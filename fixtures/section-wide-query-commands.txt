@@ -1,2 +1,0 @@
-anchor wide-query-result
-node-text wide-query-result

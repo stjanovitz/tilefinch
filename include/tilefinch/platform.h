@@ -30,6 +30,39 @@ enum {
     TILEFINCH_PLATFORM_BUTTON_RTRIGGER = 1u << 7
 };
 
+/* What a cooperate checkpoint means to a frontend, beyond its phase name
+   (which is for logs only). A checkpoint carries any combination. */
+typedef enum {
+    /* Resumable owner boundaries: a frontend may defer the next unit of
+       work (return false) and keep completed work. */
+    TILEFINCH_COOPERATE_PAGE_TASK = 1u << 0,        /* between author tasks */
+    TILEFINCH_COOPERATE_RENDER_INPUT = 1u << 1,     /* between raster units */
+    TILEFINCH_COOPERATE_IMAGE_ADMISSION = 1u << 2,  /* before image requests */
+    /* A focus move's first safe point: native focus feedback may present. */
+    TILEFINCH_COOPERATE_FOCUS_FEEDBACK = 1u << 3,
+    /* Brackets (work units 1, then 0) a relayout beside a committed layout
+       that page scrolling may keep serving. */
+    TILEFINCH_COOPERATE_SCROLL_SERVABLE = 1u << 4,
+    /* Brackets optional work that holds no author state (a font or image
+       publication); a frontend may abandon it for input and it reruns. */
+    TILEFINCH_COOPERATE_OPTIONAL_PUBLICATION = 1u << 5,
+    /* With OPTIONAL_PUBLICATION: an image publication, which also yields to
+       page input queued during the decode before it. */
+    TILEFINCH_COOPERATE_IMAGE_PUBLICATION = 1u << 6,
+    /* Brackets a provisional page's layout completion, whose checkpoints
+       may serve page scrolling; EXTENSION_AWAITED when a reader waits at
+       the bottom for the screens it adds. */
+    TILEFINCH_COOPERATE_LAYOUT_COMPLETION = 1u << 7,
+    TILEFINCH_COOPERATE_EXTENSION_AWAITED = 1u << 8,
+    /* Brackets (1, then 0) composition writes during which the incumbent
+       frame may not be sampled. */
+    TILEFINCH_COOPERATE_RENDER_COMPOSE = 1u << 9,
+    /* The document or render shell is borrowed by the work this checkpoint
+       interrupts: a frontend may present immutable incumbent pixels but
+       must not mutate or reenter it. */
+    TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED = 1u << 10
+} TilefinchCooperateBoundary;
+
 typedef struct {
     void *context;
     uint64_t (*wall_time_ns)(void *context);
@@ -59,13 +92,19 @@ typedef struct {
     void (*retire_frame)(void *context, const uint16_t *pixels);
     /* Called at deterministic engine work boundaries. Returning false asks
        the current operation to cancel without committing partial state.
-       At page-task-boundary, render-input-boundary and image-admission-boundary
-       it instead defers the next resumable unit, retaining completed work. render-prepare
-       and style-prepare may present immutable incumbent pixels but must not
-       mutate/reenter the borrowed document/render shell; render-compose brackets writes
-       during which that incumbent may not be sampled. */
+       At a PAGE_TASK, RENDER_INPUT or IMAGE_ADMISSION boundary it instead
+       defers the next resumable unit, retaining completed work. A
+       RENDER_SHELL_BORROWED checkpoint may present immutable incumbent
+       pixels but must not mutate/reenter the borrowed document/render
+       shell; RENDER_COMPOSE brackets writes during which that incumbent may
+       not be sampled (TilefinchCooperateBoundary). A frontend that needs
+       the flags installs cooperate_at. */
     bool (*cooperate)(void *context, const char *phase,
                       size_t completed_work_units);
+    /* Optional: the same checkpoint with its TilefinchCooperateBoundary
+       flags. When installed it is called instead of cooperate. */
+    bool (*cooperate_at)(void *context, const char *phase,
+                         size_t completed_work_units, unsigned boundary);
     void (*log_message)(void *context, const char *message);
 } TilefinchPlatformServices;
 
@@ -84,8 +123,20 @@ bool tilefinch_platform_poll_input(TilefinchPlatformInput *input);
 bool tilefinch_platform_present_rgb565(const uint16_t *pixels, size_t width,
                                     size_t height, size_t stride_pixels);
 void tilefinch_platform_retire_frame(const uint16_t *pixels);
+/* A checkpoint with no boundary meaning: work a frontend may only pace. */
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units);
+/* A checkpoint whose meaning is BOUNDARY (TilefinchCooperateBoundary
+   flags); PHASE names it for logs. */
+bool tilefinch_platform_cooperate_at(const char *phase,
+                                     size_t completed_work_units,
+                                     unsigned boundary);
+/* The render shell brackets its own raster and composition with these.
+   Every checkpoint reached inside -- an image decoder's or a font's, under
+   whatever name -- then carries TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED.
+   Brackets nest; the engine's owner thread only. */
+void tilefinch_platform_render_shell_borrow_begin(void);
+void tilefinch_platform_render_shell_borrow_end(void);
 void tilefinch_platform_log_message(const char *message);
 /* Publishes the closed file TEMPORARY under PATH on a filesystem whose
    rename may refuse to replace an existing file (the PSP's FAT).

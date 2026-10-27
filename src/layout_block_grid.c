@@ -75,6 +75,19 @@ static void grid_defined_row_track(
            : stylesheet_grid_track_value(sheet, style, true, row));
 }
 
+/* The fixed size of implicit row `implicit` (counted from the end of the
+   explicit grid), or 0 when grid-auto-rows leaves it content-sized. */
+static int grid_implicit_fixed_row_height(
+    const ComputedStyle *style, uint16_t second_auto_row, int implicit)
+{
+    bool second = second_auto_row != 0 && (implicit & 1) != 0;
+    uint8_t type = second ? grid_auto_second_type(second_auto_row)
+                          : style->grid_auto_row_type;
+    unsigned value = second ? grid_auto_second_value(second_auto_row)
+                            : style->grid_auto_row_value;
+    return type == GRID_TRACK_FIXED ? (int) value : 0;
+}
+
 static int grid_inherited_named_line(
     const LayoutContext *context, lxb_dom_node_t *container,
     bool rows, uint8_t name)
@@ -691,11 +704,20 @@ bool layout_block_grid_section(LayoutContext *context,
         int columns = grid_max_column - grid_min_column;
         int grid_column_origin = -grid_min_column;
         int grid_row_origin = -grid_min_row;
-        bool adaptive_columns = columns == 0
-                                && style->grid_min_column_width > 0;
-        if (columns == 0 && style->grid_min_column_width > 0) {
+        /* The auto-fill/auto-fit floor counts the repetitions; a
+           percentage resolves against the container's inline size. */
+        int repeat_floor = 0;
+        if (columns == 0 && style->grid_min_column_width > 0
+            && (!style_length_resolve(
+                    context->sheet, style->grid_min_column_width,
+                    content_width, &repeat_floor)
+                || repeat_floor < 0)) {
+            repeat_floor = 0;
+        }
+        bool adaptive_columns = repeat_floor > 0;
+        if (adaptive_columns) {
             columns = (content_width + grid_column_gap)
-                      / (style->grid_min_column_width + grid_column_gap);
+                      / (repeat_floor + grid_column_gap);
         }
         /* Column tracks that really exist. A grid whose only children are
            absolutely positioned has none, but layout still runs one
@@ -776,7 +798,7 @@ bool layout_block_grid_section(LayoutContext *context,
                       : stylesheet_grid_track_value(
                           context->sheet, style, false,
                           (unsigned) explicit_column)));
-            int minimum = adaptive_columns ? style->grid_min_column_width
+            int minimum = adaptive_columns ? repeat_floor
                           : (auto_sized_column ? 0
                              : (int) stylesheet_grid_track_minimum(
                                  context->sheet, style, false,
@@ -1574,6 +1596,8 @@ bool layout_block_grid_section(LayoutContext *context,
         bool reshare_possible = !inherited_grid_rows
             && flex_track_space_definite;
         size_t repeated_columns = 0;
+        bool cut_before = context->preview_truncated;
+        bool own_cut = false;
         flex_iterator_init(iterator, context, node, style, grid_order);
         while (flex_iterator_next(iterator, item)) {
             grid_resolve_item_placement(
@@ -1590,6 +1614,21 @@ bool layout_block_grid_section(LayoutContext *context,
                 repeated_columns++;
             }
             int grid_row = item_placement.row;
+            /* Auto-placement adds rows past placement_rows as items
+               arrive. Each takes its grid-auto-rows size, cycling through
+               the track list (CSS Grid 7.6). An item that found no cell
+               lands in the overflow cell at the last row instead; the rows
+               it skips are not real tracks and stay empty. */
+            if (placed) {
+                for (int row = initialized_rows > placement_rows
+                                   ? initialized_rows : placement_rows;
+                     row < grid_row + item_placement.row_span
+                     && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
+                    row_track_heights[row] = grid_implicit_fixed_row_height(
+                        style, second_implicit_row,
+                        row - grid_row_origin - explicit_grid_rows);
+                }
+            }
             while (initialized_rows <= grid_row) {
                 int previous = initialized_rows - 1;
                 row_starts[initialized_rows] = layout_add_coordinate(
@@ -1600,7 +1639,11 @@ bool layout_block_grid_section(LayoutContext *context,
                 initialized_rows++;
             }
             int row_top = row_starts[grid_row];
-            if (layout_preview_limit_reached(context, row_top)) break;
+            bool truncated_inside = context->preview_truncated;
+            if (layout_preview_limit_reached(context, row_top)) {
+                own_cut = !truncated_inside;
+                break;
+            }
             if (laid.items != NULL) {
                 if (laid.count < laid.capacity) {
                     laid.items[laid.count++] = (GridLaidItem) {
@@ -2083,6 +2126,39 @@ bool layout_block_grid_section(LayoutContext *context,
             if (grid_row > laid_out_row) laid_out_row = grid_row;
         }
         grid_laid_items_release(context, &laid);
+        /* A provisional (preview) cut inside the grid leaves its rows
+           partial. Items laid out before it stay the complete layout's
+           own (layout_note_preview_cut) only when nothing below moves
+           them by what the cut skipped: fr resharing, deferred alignment
+           and align-content use the final rows; a cut inside an item
+           leaves that item's row partial, and its row-mates are stretched
+           to it; and a later item placed in a row already laid out grows
+           it and shifts the rows after it. */
+        if (!cut_before && context->preview_truncated) {
+            bool moved = reshare_possible || span_align_count != 0
+                || (flex_track_space_definite
+                    && (style->align_content == JUSTIFY_CENTER
+                        || style->align_content == JUSTIFY_END))
+                || (!own_cut && columns != 1);
+            /* Only explicitly placed items can go back to a row already
+               laid out. Placement alone, for a bounded number of them. */
+            for (size_t scanned = 0; !moved && grid_locked_children != 0
+                 && flex_iterator_next(iterator, item); scanned++) {
+                if (scanned == 256) {
+                    moved = true;
+                    break;
+                }
+                grid_resolve_item_placement(
+                    context, node, style, &item->style);
+                if (item->style.out_of_flow || item->style.fixed_position)
+                    continue;
+                GridItemPlacement later;
+                moved = grid_place_item(&placement_state, &item->style,
+                                        &later)
+                    && later.row <= laid_out_row;
+            }
+            if (moved) layout_note_preview_cut(context, true);
+        }
         if (reshare_possible)
             grid_resolve_final_rows(
                 context, style, row_starts, row_extents, initialized_rows,

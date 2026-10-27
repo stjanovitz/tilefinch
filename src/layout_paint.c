@@ -2347,8 +2347,8 @@ static bool apply_visual_span(LayoutContext *context, lxb_dom_node_t *node,
                 LAYOUT_COMMAND_POSITIONED_PHASE;
         }
     }
-    bool root_context = !generated_pseudo && layout_node_name_is(node, "body")
-        && node->parent != NULL && layout_node_name_is(node->parent, "html");
+    bool root_context = !generated_pseudo && document_node_is_tag(node, LXB_TAG_BODY)
+        && node->parent != NULL && document_node_is_tag(node->parent, LXB_TAG_HTML);
     bool positioned_context = style->fixed_position
         || style->sticky_position
         || style->has_filter

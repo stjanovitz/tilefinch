@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Keep the computed-style registry and the getter's dispatch in agreement.
 
-`COMPUTED_STYLE_PROPERTIES` in src/js_dom_bindings.c is the single answer to
+`COMPUTED_STYLE_PROPERTIES` in src/js_computed_style.c is the single answer to
 which properties a computed style has: `name in style`, `length`, `item()`,
 enumeration, and the identifiers the getter (computed_style_value(), behind
-__tilefinchComputedStyleGet and __tilefinchComputedStyleRead) dispatches on are all
+__tilefinchComputedStyleGet and __tilefinchComputedStyleRead, which resolves a
+read and hands it to computed_style_serialize()) dispatches on are all
 generated from it. A serializer for an unregistered property therefore does
 not compile. What the compiler cannot see is checked here:
 
@@ -39,7 +40,7 @@ def function_body(source: str, signature: str) -> str:
 
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
-    source = (root / "src" / "js_dom_bindings.c").read_text(encoding="utf-8")
+    source = (root / "src" / "js_computed_style.c").read_text(encoding="utf-8")
     failures: list[str] = []
 
     table = source[source.index("#define COMPUTED_STYLE_PROPERTIES(X)"):]
@@ -71,12 +72,14 @@ def main() -> int:
     handled: set[str] = set()
     for signature in (
             "static JSValue computed_style_value(",
+            "static bool computed_style_resolve(",
+            "static void computed_style_serialize(",
             "static bool computed_style_transition_id(",
             "bool computed_style_serialize_retained(",
             "const char *computed_style_sparse_modern_initial("):
         body = function_body(source, signature)
         handled |= set(re.findall(r"\bCSP_([A-Z0-9_]+)\b", body))
-        if re.search(r"property_equal\(\s*name\b", body):
+        if re.search(r"property(?:_name)?_equal\(\s*name\b", body):
             failures.append(
                 f"{signature.split('(')[0].split()[-1]} matches a property "
                 "by string again; dispatch on its CSP_ identifier so an "

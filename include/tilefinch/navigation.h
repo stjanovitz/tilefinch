@@ -14,7 +14,6 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/resources.h"
-#include "tilefinch/section_router.h"
 #include "tilefinch/style.h"
 
 #define NAVIGATION_URL_LIMIT 2048
@@ -135,9 +134,6 @@ typedef struct {
     char *json;
     char *target_origin;
 } NavigationMessage;
-
-typedef void (*NavigationScriptFrontierCallback)(
-    void *opaque, size_t script_index, bool active);
 
 typedef struct {
     uint16_t control_index;
@@ -386,11 +382,35 @@ typedef struct {
     bool layout_provisional;
     /* Build cost of the last complete layout, which predicts the next. */
     uint64_t layout_complete_us;
+    /* The last complete layout's size, which predicts the complete build a
+       bounded focus layout owes (a truncated one holds a few screens). */
+    size_t layout_complete_commands;
+    size_t layout_complete_node_boxes;
     /* Consecutive refused completion builds, and when idle work may try
        again: the wait doubles from half a second to sixteen, since memory
        pressure passes (tiles and images are reclaimable). */
     uint8_t layout_completion_failures;
     uint64_t layout_completion_retry_us;
+    /* A bounded focus relayout (navigation_relayout_plan) published a
+       provisional layout on a page with a script realm: nonzero, it is the
+       y above which that layout is proven to be the complete layout's own
+       (its region); 0 otherwise. Script never reads it (js_rt_bridge_layout),
+       and frontend input settles it first unless the input provably reads
+       only the region (browser_engine_settle_bounded_layout). */
+    int bounded_focus_region_end;
+    /* The page stopped taking bounded focus relayouts: one failed its region
+       check, or script completed them before idle work did (it read
+       geometry right after each move, so bounding only added a build). */
+    bool bounded_focus_refused;
+    uint8_t bounded_focus_script_completions;
+    /* This bounded layout's completion by script is counted already: the
+       latch counts layouts script completed, not geometry reads. */
+    bool bounded_focus_completion_counted;
+    /* The complete build script's geometry read asked for over this
+       bounded layout was refused (memory): later reads answer from its
+       proven region (js_rt_bridge_proven_box) without building again,
+       until the next publication. */
+    bool bounded_focus_geometry_refused;
     /* Committed without the whole-document image walk: the first complete
        layout records its unresolved images, backgrounds and masks, which
        then load nearest-first through the deferred image queue. */
@@ -547,6 +567,14 @@ typedef struct {
     size_t provisional_extensions;
     size_t provisional_completions;
     size_t provisional_cancellations;
+    /* Focus-only relayouts that took the bounded (viewport plus two
+       screens) build, those whose region check failed and fell back to
+       the complete build, provisional layouts script completed before idle
+       work did, and those frontend input completed first. */
+    size_t bounded_focus_relayouts;
+    size_t bounded_focus_fallbacks;
+    size_t bounded_focus_script_completions;
+    size_t bounded_focus_input_settles;
     size_t resource_fingerprint_scans;
     size_t blocking_stylesheet_builds;
     size_t blocking_stylesheet_reuses;
@@ -730,14 +758,6 @@ typedef struct {
     size_t max_slice_work_units;
     NavigationSlicePhase max_slice_phase;
     NavigationSliceStats slices[NAVIGATION_SLICE_COUNT];
-    uint64_t last_swap_teardown_us;
-    uint64_t last_swap_gc_us;
-    uint64_t last_swap_parse_us;
-    uint64_t last_swap_commit_us;
-    size_t swap_gc_runs;
-    size_t swap_gc_skips;
-    size_t swap_gc_trimmed_bytes;
-    size_t swaps_since_gc;
     size_t low_memory_replacements_started;
     size_t low_memory_replacements_succeeded;
     size_t low_memory_replacements_failed;
@@ -864,25 +884,9 @@ struct NavigationSession {
     int focus_paint_damage_right;
     int focus_paint_damage_bottom;
     BrowserSession *browser_session;
-    ScriptRemoteElementLookupCallback remote_element_lookup;
-    void *remote_element_opaque;
-    ScriptRemoteSelectorLookupCallback remote_selector_lookup;
-    void *remote_selector_opaque;
-    ScriptRemoteSelectorCollectCallback remote_selector_collect;
-    void *remote_selector_collect_opaque;
-    ScriptRemoteDescendantCollectCallback remote_descendant_collect;
-    void *remote_descendant_collect_opaque;
-    ScriptRemoteNodeReadCallback remote_node_read;
-    void *remote_node_read_opaque;
-    ScriptRemoteNodeWriteCallback remote_node_write;
-    void *remote_node_write_opaque;
-    ScriptNodeVisibilityCallback node_visibility;
-    void *node_visibility_opaque;
-    size_t runtime_section_identity;
     bool document_scripts_enabled;
     /* Immutable selection for runtimes created by the shared page/frame factory. */
     bool game_audio_internal_slots;
-    bool defer_document_script_pipeline;
     size_t maximum_scripts;
     size_t maximum_script_bytes;
     size_t maximum_script_file_bytes;
@@ -1125,8 +1129,6 @@ typedef struct {
     size_t finalize_yields;
     size_t finalize_phase;
     bool finalize_quota_exceeded;
-    size_t safe_sections_ready;
-    size_t safe_section_source_bytes;
     FetchStreamMetrics stream;
     /* Monotonic count that moves whenever the load does anything useful:
        document bytes, finalize steps, and the candidate page's scripts
@@ -1184,8 +1186,8 @@ bool navigation_set_progressive_preview_lookahead(
    and cannot overwrite or retain pointers into the incumbent page. */
 void navigation_set_progressive_paint_preserves_incumbent(
     NavigationSession *session, bool preserves);
-/* This is never enabled implicitly. It affects only subsequent streamed,
-   non-sectioned cross-document URL loads which replace a live page. */
+/* This is never enabled implicitly. It affects only subsequent streamed
+   cross-document URL loads which replace a live page. */
 bool navigation_set_replacement_mode(
     NavigationSession *session, NavigationReplacementMode mode);
 /* Installs or clears the complete optional visual freeze/outcome pair.
@@ -1193,18 +1195,6 @@ bool navigation_set_replacement_mode(
 bool navigation_set_replacement_hooks(
     NavigationSession *session, NavigationReplacementFreezeCallback freeze,
     NavigationReplacementOutcomeCallback outcome, void *opaque);
-/* Replaces the complete remote-document contract and immediately rebinds the
-   already-live top-level runtime. NULL clears callbacks, opaque values,
-   section identity, and pending remote materialization requests together.
-   Child-frame runtimes are deliberately outside this scope. */
-bool navigation_rebind_top_level_remote_document(
-    NavigationSession *session,
-    const ScriptRemoteDocumentBinding *binding);
-void navigation_set_remote_selector_lookup(
-    NavigationSession *session, ScriptRemoteSelectorLookupCallback callback,
-    void *opaque);
-bool navigation_set_runtime_section_identity(NavigationSession *session,
-                                             size_t section_identity);
 void navigation_enable_document_scripts(
     NavigationSession *session, size_t maximum_scripts,
     size_t maximum_total_bytes, size_t maximum_file_bytes,
@@ -1280,11 +1270,6 @@ bool navigation_commit_static_html(
     const char *url, const char *html, size_t html_length,
     int viewport_width, const FontSet *fonts,
     const ImageResources *images, bool record_history);
-bool navigation_commit_html_preserve_runtime(
-    NavigationSession *session, uint64_t generation, const char *url,
-    const char *html, size_t html_length, int viewport_width,
-    const FontSet *fonts, const ImageResources *images, bool record_history);
-bool navigation_execute_current_body_scripts(NavigationSession *session);
 bool navigation_load_url(NavigationSession *session, uint64_t generation,
                          const char *url, size_t maximum_bytes,
                          long timeout_ms, int viewport_width,
@@ -1315,16 +1300,6 @@ NavigationLoad *navigation_load_begin_request(
     const char *content_type, size_t maximum_bytes, long timeout_ms,
     int viewport_width, const FontSet *fonts,
     const ImageResources *images, bool record_history);
-/* Section-routed loads share the exact fetch pump. The caller owns store and
-   builder; on success they contain the completed backing store. Before EOF,
-   only sections explicitly reported as safe by the store are observable. */
-NavigationLoad *navigation_load_begin_sectioned(
-    NavigationSession *session, uint64_t generation, const char *url,
-    size_t maximum_bytes, long timeout_ms, int viewport_width,
-    const FontSet *fonts, const ImageResources *images, bool record_history,
-    CompressedSectionStore *store, SectionStoreStreamBuilder *builder,
-    size_t block_bytes, size_t maximum_section_bytes,
-    size_t initial_section);
 NavigationLoadStatus navigation_load_pump(
     NavigationLoad *load, const NavigationLoadQuota *quota);
 NavigationLoadStatus navigation_load_status(const NavigationLoad *load);
@@ -1482,7 +1457,42 @@ bool navigation_url_is_challenge_platform(const char *url);
 size_t navigation_script_heap_limit(const NavigationSession *session,
                                     ScriptDocumentScope document_scope,
                                     const char *url);
+/* A relayout's decisions (navigation_relayout): first classified from the
+   session's rebuild state and the consumed mutation journal, then refined
+   as the relayout's own work reports back. */
+typedef struct {
+    /* The relayout consumed an author mutation journal. */
+    bool mutation_driven;
+    /* The sheet's sources were bounded out by a script-realm retirement
+       while it holds shadow-only adopted rules: it must be rebuilt. */
+    bool rebuild_bounded_out_sheet;
+    /* The journal cannot itemize resource changes: fingerprint the DOM. */
+    bool conservative_scan;
+    /* Rebuild the stylesheet, external resources and layout from scratch. */
+    bool full_rebuild;
+    /* Re-derive the image table alone, keeping the sheet. */
+    bool image_rebuild;
+    /* Try appending changed style sources in place of a full rebuild. */
+    bool style_append_tried;
+    /* Requeue detached-image preloads before resources change. */
+    bool pause_image_preloads;
+    /* Discover images added by the mutations (or by an appended sheet). */
+    bool image_resource_scan;
+    /* Re-rasterize the image nodes the journal names. */
+    bool image_resource_refresh;
+    /* A focus-only journal on a page with a script realm: lay out the
+       viewport plus two screens and leave the rest to idle completion
+       (navigation_relayout_incremental checks the result's region and
+       falls back to the complete build when it cannot prove it). */
+    bool bounded_focus;
+} NavigationRelayoutPlan;
+
 #if !defined(__PSP__)
+/* The relayout plan navigation_relayout would start from for this session
+   and journal, without running any of it. */
+NavigationRelayoutPlan navigation_test_relayout_plan(
+    const NavigationSession *session, const ScriptMutationJournal *mutations,
+    bool mutation_driven);
 /* Deterministic host-only seams for the streaming parser's typed outcome
    boundary. Optional checkpoint faults must preserve the server DOM; a feed
    fault must remain a hard navigation failure. */
@@ -1549,6 +1559,16 @@ bool navigation_prioritize_deferred_image(
    is rebuilt. Completed cancellations are consumed by their normal owners. */
 size_t navigation_cancel_network_work(
     NavigationSession *session, const char *reason);
+/* Budget reclaim: frees the retained run measurements of the page's layout
+   reuse cache and of `load`'s streaming preview cache (either may be NULL),
+   and keeps them off for those caches' lifetimes. Frees only. */
+size_t navigation_yield_layout_text_measures(NavigationSession *session,
+                                             NavigationLoad *load);
+/* Budget reclaim: frees the style-attribute scan memos of every sheet the
+   session or `load` (may be NULL) can still resolve styles with, and keeps
+   them off for those sheets' lives. Frees only. */
+size_t navigation_yield_style_memos(NavigationSession *session,
+                                    NavigationLoad *load);
 bool navigation_dispatch_event(NavigationSession *session,
                                const char *selector,
                                const char *event_type);
@@ -1616,11 +1636,9 @@ NavigationLayoutCompletion navigation_complete_layout(
    (find, fragment scrolling). False only when the build failed or was
    cancelled; the provisional layout then stays in place. */
 bool navigation_complete_layout_sync(NavigationSession *session);
-bool navigation_execute_document_scripts_from(
-    NavigationSession *session, PocDocument *document);
-bool navigation_execute_document_scripts_streaming_from(
-    NavigationSession *session, PocDocument *document,
-    NavigationScriptFrontierCallback frontier, void *frontier_opaque);
+/* The region end of the page's bounded focus layout (see NavigationPage
+   bounded_focus_region_end), or 0 when its layout is not one. */
+int navigation_bounded_focus_region_end(const NavigationSession *session);
 void navigation_destroy(NavigationSession *session);
 const char *navigation_slice_phase_name(NavigationSlicePhase phase);
 

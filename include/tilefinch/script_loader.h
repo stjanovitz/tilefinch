@@ -160,19 +160,6 @@ bool document_scripts_execute(PocDocument *document,
                               FetchScheduler *scheduler,
                               ExternalScriptMetrics *metrics,
                               ScriptResult *result);
-bool document_body_scripts_execute(PocDocument *document,
-                                   ScriptRuntime *runtime, Budget *budget,
-                                   BrowserSession *session,
-                                   const char *base_url,
-                                   const char *document_url,
-                                   const char *referrer_policy,
-                                   size_t maximum_scripts,
-                                   size_t maximum_total_bytes,
-                                   size_t maximum_file_bytes,
-                                   long timeout_ms,
-                                   FetchScheduler *scheduler,
-                                   ExternalScriptMetrics *metrics,
-                                   ScriptResult *result);
 
 /* Process-wide module dependency prefetches started and consumed, for
    diagnostics. */

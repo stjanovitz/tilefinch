@@ -37,7 +37,6 @@ static void usage(const char *program)
             "--replay-http DIR | --replay-http-response-keyed DIR] "
             "[--deterministic-replay-seed N] "
             "[--diagnostic-frame-safari] "
-            "[--experimental-compressed-sections] [--experimental-section N] "
             "[--commands FILE | --interactive] [--loop-output-dir DIR] "
             "[--dump-text-metrics FILE] "
             "[--no-loop-capture] [--platform-sim]\n",
@@ -344,97 +343,6 @@ static lxb_dom_node_t *find_element_id(lxb_dom_node_t *node,
         if (found != NULL) return found;
     }
     return NULL;
-}
-
-static bool experimental_element_ordinal_walk(lxb_dom_node_t *node,
-                                              lxb_dom_node_t *target,
-                                              size_t *ordinal,
-                                              size_t *target_ordinal)
-{
-    for (; node != NULL; node = node->next) {
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (node == target) {
-                *target_ordinal = *ordinal;
-                return true;
-            }
-            (*ordinal)++;
-        }
-        if (experimental_element_ordinal_walk(node->first_child, target,
-                                              ordinal, target_ordinal)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static lxb_dom_node_t *experimental_element_at_ordinal(lxb_dom_node_t *node,
-                                                       size_t wanted,
-                                                       size_t *ordinal)
-{
-    for (; node != NULL; node = node->next) {
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            if (*ordinal == wanted) return node;
-            (*ordinal)++;
-        }
-        lxb_dom_node_t *found = experimental_element_at_ordinal(
-            node->first_child, wanted, ordinal);
-        if (found != NULL) return found;
-    }
-    return NULL;
-}
-
-static bool experimental_focus_key(const PocDocument *document,
-                                   size_t section, lxb_dom_node_t *node,
-                                   char key[256], size_t *length)
-{
-    *length = 0;
-    if (node == NULL) return true;
-    size_t id_length = 0;
-    const char *id = document_attribute(node, "id", &id_length);
-    if (id != NULL && id_length != 0 && id_length <= 253) {
-        key[0] = 'i';
-        key[1] = ':';
-        memcpy(key + 2, id, id_length);
-        key[id_length + 2] = '\0';
-        *length = id_length + 2;
-        return true;
-    }
-    size_t ordinal = 0, target_ordinal = 0, name_length = 0;
-    const char *name = document_element_name(node, &name_length);
-    if (document == NULL || document->html == NULL || name == NULL
-        || name_length == 0 || name_length >= 32
-        || !experimental_element_ordinal_walk(
-               lxb_dom_interface_node(document->html), node, &ordinal,
-               &target_ordinal)) return false;
-    int written = snprintf(key, 256, "s:%zu:%zu:%.*s", section,
-                           target_ordinal, (int) name_length, name);
-    if (written <= 0 || written >= 256) return false;
-    *length = (size_t) written;
-    return true;
-}
-
-static lxb_dom_node_t *experimental_find_focus_key(
-    const PocDocument *document, size_t section, const char *key)
-{
-    if (document == NULL || document->html == NULL || key == NULL)
-        return NULL;
-    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
-    if (key[0] == 'i' && key[1] == ':' && key[2] != '\0')
-        return find_element_id(root, key + 2);
-    size_t key_section = 0, wanted = 0;
-    char tag_name[32] = {0};
-    int consumed = 0;
-    if (sscanf(key, "s:%zu:%zu:%31s%n", &key_section, &wanted,
-               tag_name, &consumed) != 3
-        || consumed < 0 || key[(size_t) consumed] != '\0'
-        || key_section != section) return NULL;
-    size_t ordinal = 0, name_length = 0;
-    lxb_dom_node_t *node = experimental_element_at_ordinal(
-        root, wanted, &ordinal);
-    const char *name = document_element_name(node, &name_length);
-    if (name == NULL || strlen(tag_name) != name_length
-        || strncasecmp(name, tag_name, name_length) != 0) return NULL;
-    return node;
 }
 
 static void collect_node_text(lxb_dom_node_t *node, char *output,

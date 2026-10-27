@@ -6,6 +6,7 @@
  * slot means rapid focus changes can only cancel or replace one operation.
  */
 #include "psp_app_internal.h"
+#include "tilefinch/psp_youtube_login_consent.h"
 #include "tilefinch/youtube_lite.h"
 #include <time.h>
 
@@ -35,10 +36,11 @@ bool psp_app_youtube_login_clear(PspApp *app)
 static bool psp_app_youtube_login_save(PspApp *app)
 {
     bool saved = app->process->persistent_site_data_available
-        && app->browser->youtube_login_offer_identity != 0
-        && app->browser->youtube_login_offer_identity
-            == browser_engine_youtube_login_identity(app->browser->engine)
-        && youtube_lite_session_signed_in(app->browser->session)
+        && psp_youtube_login_save_allowed(
+            app->process->persistent_site_data_available,
+            app->browser->youtube_login_offer_identity,
+            browser_engine_youtube_login_identity(app->browser->engine),
+            youtube_lite_session_signed_in(app->browser->session))
         && youtube_login_save(app->browser->session,
             app->process->storage.youtube_login, (int64_t) time(NULL));
     psp_ui_show_status(&app->process->presentation.ui,
@@ -105,24 +107,11 @@ bool psp_app_youtube_login_poll(PspApp *app)
 void psp_app_youtube_login_action(PspApp *app, PspAppFrameState *frame,
                                 const PspUiIntent *intent)
 {
-    unsigned policy = YOUTUBE_LOGIN_ASK;
-    bool save = false;
-    switch (intent->action) {
-        case PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE: save = true; break;
-        /* With no verified login bound to the offer (chosen from Settings
-           while signed out) there is nothing to write yet: remember Always,
-           and the next verified sign-in saves under it. */
-        case PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS:
-            policy = YOUTUBE_LOGIN_ALWAYS;
-            save = app->browser->youtube_login_offer_identity != 0;
-            break;
-        case PSP_UI_ACTION_YOUTUBE_LOGIN_NEVER: policy = YOUTUBE_LOGIN_NEVER; break;
-        default: break;
-    }
-    bool saved = !save || psp_app_youtube_login_save(app);
-    /* Never remember an Always answer whose credential write failed. */
-    if (policy == YOUTUBE_LOGIN_ALWAYS && !saved)
-        policy = YOUTUBE_LOGIN_ASK;
+    /* The consent rules are host-tested (psp_youtube_login_consent.h). */
+    PspYoutubeLoginAnswer answer = psp_youtube_login_answer(
+        intent->action, app->browser->youtube_login_offer_identity != 0);
+    bool saved = !answer.save || psp_app_youtube_login_save(app);
+    unsigned policy = psp_youtube_login_answer_policy(answer, saved);
     if (policy == YOUTUBE_LOGIN_NEVER && !psp_app_youtube_login_clear(app))
         psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
     unsigned previous = browser_profile_youtube_login_policy(app->browser->profile);
@@ -142,13 +131,14 @@ void psp_app_youtube_login_setting(PspApp *app, PspAppFrameState *frame,
 {
     if (policy > YOUTUBE_LOGIN_NEVER) return;
     BrowserProfile *profile = app->browser->profile;
-    browser_profile_set_youtube_login_policy(profile, policy);
-    if (policy == YOUTUBE_LOGIN_NEVER) {
+    PspYoutubeLoginSetting setting = psp_youtube_login_setting(policy);
+    browser_profile_set_youtube_login_policy(profile, setting.stored_policy);
+    if (setting.clear_saved) {
         if (!psp_app_youtube_login_clear(app))
             psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
-    } else if (policy == YOUTUBE_LOGIN_ALWAYS) {
-        browser_profile_set_youtube_login_policy(profile, YOUTUBE_LOGIN_ASK);
-        app->process->presentation.ui.youtube_login_policy = YOUTUBE_LOGIN_ASK;
+    } else if (setting.open_offer) {
+        app->process->presentation.ui.youtube_login_policy =
+            (uint8_t) setting.stored_policy;
         app->browser->youtube_login_offer_identity =
             browser_engine_youtube_login_identity(app->browser->engine);
         psp_ui_show_youtube_login_offer(&app->process->presentation.ui);
@@ -461,7 +451,7 @@ void psp_app_youtube_preresolve_tick(
     PspYoutubePreresolve *preresolve =
         &app->browser->youtube_preresolve;
     const BrowserController *controller = app->views->controller;
-    uint64_t generation = app->views->navigation->generation;
+    uint64_t generation = browser_engine_page_generation(app->browser->engine);
     size_t focus_moves = controller == NULL ? 0 : controller->focus_moves;
     size_t focus_index = controller == NULL ? 0 : controller->focus_index;
     ControllerFocusKind focus_kind = controller == NULL
@@ -513,11 +503,12 @@ void psp_app_youtube_preresolve_tick(
                 ? "settled" : "pending");
     }
 #endif
-    const NavigationEntry *current =
-        navigation_current(app->views->navigation);
+    char current_buffer[NAVIGATION_URL_LIMIT];
+    const char *current_url = psp_app_current_url(
+        app->browser->engine, current_buffer, sizeof(current_buffer));
     bool eligible = focused_provider_result
         && app->process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
-        && current != NULL
+        && current_url != NULL
         && !browser_engine_navigation_pending(app->browser->engine)
         && !app->browser->media.ui.visible
         && !psp_media_open_work_pending(&app->browser->media)

@@ -88,6 +88,20 @@ static int test_game_audio_reference_selector(void)
     CHECK(!psp_boot_config_validate(&config, &invalid));
     CHECK(strcmp(invalid, "validation_game_audio_reference") == 0);
 
+    /* Automation is any automation key away from its reset value: an input
+       script counts as much as a trace replay (the missing-catalog offer
+       is suppressed for both), and the defaults and a scrubbed
+       configuration are not automated. */
+    psp_boot_config_defaults(&config);
+    CHECK(!psp_boot_config_automated(&config));
+    snprintf(config.input_script, sizeof(config.input_script), "%s",
+             "steps.txt");
+    CHECK(psp_boot_config_automated(&config));
+    psp_boot_config_disable_automation(&config);
+    CHECK(!psp_boot_config_automated(&config));
+    snprintf(config.trace, sizeof(config.trace), "%s", "replay");
+    CHECK(psp_boot_config_automated(&config));
+
     /* This selector alone makes a copied boot file a validation configuration;
        shipping must clear both it and the validation landing URL. */
     psp_boot_config_defaults(&config);

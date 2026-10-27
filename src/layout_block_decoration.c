@@ -4,7 +4,6 @@
    communicate through LayoutBlockPaintPlan. Split out of layout_block.c. */
 
 #include "layout_block_internal.h"
-#include "style_internal.h"
 
 #include <stdio.h>
 

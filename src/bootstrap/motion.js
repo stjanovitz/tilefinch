@@ -666,8 +666,7 @@
         retainedStyles = 0,
         totalKeyframes = 0,
         totalRules = 0;
-      const nativeInline = typeof globalThis.__tilefinchQueryAll === "function"
-        && !globalThis.__tilefinchHasRemoteNodeWriter,
+      const nativeInline = typeof globalThis.__tilefinchQueryAll === "function",
         roots = yield* collectTreeRoots(nativeInline),
         candidates = new Map(),
         candidateFrames = new Map();

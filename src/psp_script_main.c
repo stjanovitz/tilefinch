@@ -9,6 +9,9 @@
  */
 
 #include "psp_app/psp_app_internal.h"
+#include "psp_app/psp_app_boot.h"
+#include "psp_app/psp_app_loop.h"
+#include "psp_app/psp_app_validation.h"
 #include "tilefinch/psp_fpu.h"
 #include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
@@ -37,11 +40,7 @@
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 #include <stdatomic.h>
-#include "tilefinch/psp_media_fixture.h"
-#include "tilefinch/psp_media_range_probe.h"
 #include "tilefinch/psp_raster_fixture.h"
-#include "psp_webgl_ge_probe.h"
-#include "tilefinch/js_bench.h"
 /* After the tilefinch headers: the media policy header is written against
    fixed-width types the public headers have already established. */
 #include "media_backend_psp_policy.h"
@@ -56,131 +55,6 @@ static char psp_wifi_report[4096];
 
 const char *psp_wifi_diagnostic_report(void) { return psp_wifi_report; }
 void psp_wifi_diagnostic_clear(void) { psp_wifi_report[0] = '\0'; }
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static const PspDisplayBackend *psp_validation_display_inner;
-static bool psp_validation_canvas_followup_enabled = true;
-static bool psp_validation_canvas_live_trace;
-static PspDisplayBackendTiming psp_validation_display_timing;
-/* Observations only: publication order and framebuffer ownership stay in
-   psp_display.c. Vcounts distinguish a missed scanout from time spent waiting. */
-static uint64_t psp_validation_display_ready_us;
-static uint64_t psp_validation_display_latched_us;
-static uint32_t psp_validation_display_ready_vcount;
-static uint32_t psp_validation_display_latched_vcount;
-
-static void *psp_validation_display_compose_base(void)
-{
-    return psp_validation_display_inner->compose_base();
-}
-
-static void psp_validation_display_flush(void *address, size_t bytes)
-{
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    psp_validation_display_inner->flush_range(address, bytes);
-    psp_validation_display_timing.flush_us +=
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    psp_validation_display_timing.flush_calls++;
-}
-
-static int psp_validation_display_set_mode(
-    int mode, int width, int height)
-{
-    return psp_validation_display_inner->set_mode(mode, width, height);
-}
-
-static int psp_validation_display_set_framebuffer(
-    void *address, int stride, int format, int sync)
-{
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    psp_validation_display_ready_us = started_us;
-    psp_validation_display_ready_vcount = (uint32_t) sceDisplayGetVcount();
-    int result = psp_validation_display_inner->set_frame_buffer(
-        address, stride, format, sync);
-    psp_validation_display_timing.set_framebuffer_us +=
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    psp_validation_display_timing.set_framebuffer_calls++;
-    return result;
-}
-
-static void psp_validation_display_wait_vblank(void)
-{
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    /* Owner-thread publications only: the ledger ignores the callback
-       presenter. */
-    unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
-    psp_validation_display_inner->wait_vblank();
-    psp_validation_display_latched_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
-    psp_validation_display_latched_vcount = (uint32_t) sceDisplayGetVcount();
-    work_ledger_leave(ledger);
-    psp_validation_display_timing.vblank_us +=
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    psp_validation_display_timing.vblank_calls++;
-}
-
-static void psp_validation_display_wait_vblank_serviced(
-    void *buffer, int stride, int format,
-    PspDisplayWaitService service, void *context)
-{
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    /* This interval includes useful decoder work, not only sleep. Do not
-       charge the complete serviced wait to WORK_LEDGER_SLEEP. */
-    if (psp_validation_display_inner->wait_vblank_serviced != NULL)
-        psp_validation_display_inner->wait_vblank_serviced(
-            buffer, stride, format, service, context);
-    else
-        psp_validation_display_inner->wait_vblank();
-    psp_validation_display_latched_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
-    psp_validation_display_latched_vcount = (uint32_t) sceDisplayGetVcount();
-    psp_validation_display_timing.vblank_us +=
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    psp_validation_display_timing.vblank_calls++;
-}
-
-static const PspDisplayBackend psp_validation_display_backend = {
-    .compose_base = psp_validation_display_compose_base,
-    .flush_range = psp_validation_display_flush,
-    .set_mode = psp_validation_display_set_mode,
-    .set_frame_buffer = psp_validation_display_set_framebuffer,
-    .wait_vblank = psp_validation_display_wait_vblank,
-    .wait_vblank_serviced = psp_validation_display_wait_vblank_serviced
-};
-
-static const PspDisplayBackend *psp_validation_display_wrap(
-    const PspDisplayBackend *inner)
-{
-    psp_validation_display_inner = inner;
-    memset(&psp_validation_display_timing, 0,
-           sizeof(psp_validation_display_timing));
-    return inner == NULL ? NULL : &psp_validation_display_backend;
-}
-
-bool psp_display_validation_timing_snapshot(PspDisplayBackendTiming *timing)
-{
-    if (timing == NULL || psp_validation_display_inner == NULL) return false;
-    *timing = psp_validation_display_timing;
-    return true;
-}
-
-static TILEFINCH_COLD_PATH void psp_log_engine_creation(
-    const BrowserEngine *engine)
-{
-    BrowserEngineCreationMetrics metrics = {0};
-    if (!browser_engine_creation_metrics(engine, &metrics)) return;
-    psp_log_printf(
-        "tilefinch-engine-create: control=%lluus session=%lluus "
-        "blocker=%lluus navigation=%lluus fonts=%lluus "
-        "framebuffer=%lluus\n",
-        (unsigned long long) metrics.control_ready_us,
-        (unsigned long long) metrics.session_ready_us,
-        (unsigned long long) metrics.blocker_ready_us,
-        (unsigned long long) metrics.navigation_ready_us,
-        (unsigned long long) metrics.fonts_ready_us,
-        (unsigned long long) metrics.framebuffer_ready_us);
-}
-#endif
 
 typedef struct {
     bool transport_present;
@@ -468,14 +342,6 @@ bool psp_write_network_failure_report(const PspNetwork *network)
 }
 #endif
 
-bool psp_offline_url(const char *url)
-{
-    static const char root[] = "https://tilefinch.local/offline";
-    return url != NULL && strncmp(url, root, sizeof(root) - 1u) == 0
-        && (url[sizeof(root) - 1u] == '\0'
-            || url[sizeof(root) - 1u] == '/');
-}
-
 PSP_MODULE_INFO("Tilefinch", 0, 0, 1);
 /* The complete device priority ladder and its measured invariants live in
    psp_threads.h; do not tune this thread independently. */
@@ -492,11 +358,6 @@ PSP_MAIN_THREAD_STACK_SIZE_KB(2560);
    initializes its heap. */
 PSP_HEAP_SIZE_KB(-1);
 PSP_HEAP_THRESHOLD_SIZE_KB(2048);
-
-/* Stability telemetry excludes the first two seconds after priming, seeking,
-   or buffering from its steady-state skew maximum. The all-phase maximum is
-   retained beside it so discontinuities remain visible rather than hidden. */
-#define PSP_MEDIA_STABILITY_STEADY_DELAY_US UINT64_C(2000000)
 
 static uint64_t psp_media_platform_now_us(void *context)
 {
@@ -571,20 +432,6 @@ bool psp_request_omnibox(
         destination, destination_capacity);
 }
 
-bool psp_internal_action_url(const char *url, const char *name)
-{
-    if (url == NULL || name == NULL) return false;
-    char expected[64];
-    int length = snprintf(
-        expected, sizeof(expected), "tilefinch://%s", name);
-    if (length <= 0 || (size_t) length >= sizeof(expected)) return false;
-    size_t expected_length = (size_t) length;
-    return strncmp(url, expected, expected_length) == 0
-        && (url[expected_length] == '\0'
-            || (url[expected_length] == '/'
-                && url[expected_length + 1u] == '\0'));
-}
-
 /*
  * The one place this EBOOT stops.
  *
@@ -600,7 +447,7 @@ bool psp_internal_action_url(const char *url, const char *name)
  * Callers must have finished their log first: the load replaces the process, so
  * anything left unwritten is lost.
  */
-static TILEFINCH_COLD_PATH void psp_exit_console(
+PSP_VALIDATION_SHARED TILEFINCH_COLD_PATH void psp_exit_console(
     const char *exit_to)
 {
     /*
@@ -618,688 +465,6 @@ static TILEFINCH_COLD_PATH void psp_exit_console(
     (void) exit_to;
 #endif
     sceKernelExitGame();
-}
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static TILEFINCH_COLD_PATH void psp_js_bench_emit(void *opaque,
-                                                  const char *line)
-{
-    (void) opaque;
-    psp_log_printf("%s\n", line);
-}
-
-/* The JavaScript engine micro-benchmark (boot.cfg validation_js_bench=N):
-   runs before the first HOME frame on the same clock, allocator and engine
-   build as page script, then boot continues so the input script can end the
-   run in the ordinary way. */
-static TILEFINCH_COLD_PATH void psp_run_js_bench(const char *argv0,
-                                                 const PspBootConfig *config)
-{
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TIMING JAVASCRIPT ENGINE", 720);
-    JsBenchOptions options;
-    js_bench_default_options(&options);
-    options.scale = (unsigned) config->validation_js_bench;
-    options.only = config->js_bench_only[0] != '\0'
-        ? config->js_bench_only : NULL;
-    char trace_path[512];
-    const char *dir = config->js_bench_dir[0] != '\0' ? config->js_bench_dir
-        : strcmp(config->trace, "none") != 0 ? config->trace : NULL;
-    if (dir != NULL) {
-        psp_sibling_path(trace_path, sizeof(trace_path), argv0, dir);
-        options.trace_dir = trace_path;
-    }
-    psp_log_checkpoint("js-bench-begin");
-    int failed = js_bench_run(&options, psp_js_bench_emit, NULL);
-    psp_log_printf("tilefinch-js-bench: outcome=%s\n",
-                   failed == 0 ? "complete" : "failed");
-    psp_log_checkpoint("js-bench-complete");
-}
-
-static TILEFINCH_COLD_PATH int psp_run_webgl_ge_qualification(
-    BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
-    const char *exit_to)
-{
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TESTING WEBGL GE COST", 720);
-    PspWebglGeProbeReport report;
-    uint16_t *page = psp_display_back_buffer(&psp_display);
-    size_t frame_pixels = 0;
-    uint16_t *frame = browser_engine_framebuffer(engine, &frame_pixels);
-    bool passed = psp_webgl_ge_probe_run(
-        page, frame, frame_pixels, &report);
-    if (passed) passed = psp_display_publish(&psp_display);
-    printf(
-        "tilefinch-webgl-ge-probe: memory color=%zu depth=%zu "
-        "texture-cache=%zu context-inits=%u syncs=%u\n",
-        report.color_bytes, report.depth_bytes, report.texture_cache_bytes,
-        report.context_initializations, report.synchronizations);
-    for (unsigned at = 0; at < PSP_WEBGL_GE_PROBE_SCENE_COUNT; at++) {
-        const PspWebglGeProbeScene *scene = &report.scenes[at];
-        if (scene->name == NULL || scene->frames == 0) continue;
-        printf(
-            "tilefinch-webgl-ge-probe: scene=%s frames=%u draws=%u "
-            "vertices=%u upload-bytes=%zu prepare-avg=%lluus "
-            "emit-avg=%lluus wait-avg=%lluus total-avg=%lluus "
-            "total-max=%lluus list-avg=%zu list-max=%zu "
-            "checksum=0x%08x outcome=%s\n",
-            scene->name, scene->frames, scene->draw_calls_per_frame,
-            scene->vertices_per_frame, scene->upload_bytes_per_frame,
-            (unsigned long long) (scene->prepare_us / scene->frames),
-            (unsigned long long) (scene->emit_us / scene->frames),
-            (unsigned long long) (scene->wait_us / scene->frames),
-            (unsigned long long) (scene->total_us / scene->frames),
-            (unsigned long long) scene->maximum_frame_us,
-            scene->list_bytes / scene->frames,
-            scene->maximum_list_bytes, (unsigned) scene->checksum,
-            scene->passed ? "pass" : "fail");
-    }
-    const PspWebglGeConversionProbe *conversion = &report.conversion;
-    printf(
-        "tilefinch-webgl-ge-probe: conversion=320x180-to-480x272 "
-        "frames=%u cpu-convert-avg=%lluus cpu-convert-max=%lluus "
-        "cpu-copy-avg=%lluus cpu-copy-max=%lluus "
-        "ge-submit-avg=%lluus ge-wait-avg=%lluus "
-        "ge-total-avg=%lluus ge-total-max=%lluus "
-        "pixels=%zu mismatches=%zu cpu=0x%08x ge=0x%08x "
-        "pixel-exact=%s available=%s\n",
-        conversion->frames,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->cpu_convert_us / conversion->frames),
-        (unsigned long long) conversion->cpu_convert_max_us,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->cpu_copy_us / conversion->frames),
-        (unsigned long long) conversion->cpu_copy_max_us,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_submit_us / conversion->frames),
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_wait_us / conversion->frames),
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_total_us / conversion->frames),
-        (unsigned long long) conversion->ge_total_max_us,
-        conversion->compared_pixels, conversion->mismatched_pixels,
-        (unsigned) conversion->cpu_checksum,
-        (unsigned) conversion->ge_checksum,
-        conversion->pixel_exact ? "yes" : "no",
-        conversion->available ? "yes" : "no");
-    for (unsigned variant = 0; variant < conversion->strip_variants;
-         variant++) {
-        printf(
-            "tilefinch-webgl-ge-probe: strip-texels=%u frames=%u "
-            "ge-wait-avg=%lluus ge-total-avg=%lluus ge-total-max=%lluus "
-            "mismatches=%zu\n",
-            conversion->strip_texels[variant], conversion->frames,
-            (unsigned long long) (conversion->frames == 0 ? 0
-                : conversion->strip_wait_us[variant] / conversion->frames),
-            (unsigned long long) (conversion->frames == 0 ? 0
-                : conversion->strip_total_us[variant] / conversion->frames),
-            (unsigned long long) conversion->strip_total_max_us[variant],
-            conversion->strip_mismatches[variant]);
-    }
-    printf("tilefinch-webgl-ge-probe: dcache-wbinv-all=%lluus\n",
-           (unsigned long long) conversion->dcache_all_us);
-    printf("tilefinch-webgl-ge-probe: event=%s detail=\"%s\"\n",
-           passed ? "pass" : "fail", report.detail);
-    psp_report_budget_counters(budget, "webgl-ge-probe-exit");
-    browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf("tilefinch-validation: outcome=%s qualification=%s\n",
-           passed ? "clean-exit" : "qualification-failed",
-           passed ? "webgl-ge-pass" : "webgl-ge-fail");
-    psp_log_checkpoint("webgl-ge-probe-complete");
-    psp_log_finish(
-        passed ? "webgl-ge-probe-pass" : "webgl-ge-probe-fail");
-    psp_exit_console(exit_to);
-    return passed ? 0 : 1;
-}
-
-static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
-    BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
-    const char *exit_to)
-{
-    /*
-     * The one way the graphics-engine presenter can be exercised without
-     * a decoder. It supplies its own pictures, so it reaches everything
-     * in that path except the firmware that would normally produce them:
-     * context setup, the framebuffer address, texture format and stride,
-     * the UV mapping, the wide-frame split, the completion wait, and the
-     * cache handshake either side of the draw.
-     */
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TESTING VIDEO PRESENTATION", 860);
-    void *probe_scratch = budget_calloc_category(
-        budget, BUDGET_CATEGORY_SESSION, 1,
-        PSP_MEDIA_PRESENT_PROBE_SCRATCH_BYTES);
-    /*
-     * The probe draws into the 32-bit video surface, because that is the
-     * surface a Smooth present draws into and the passthrough it checks is a
-     * property of both ends being 8888. Switching here also exercises the
-     * mode change itself, which the emulator runs as faithfully as a game
-     * does.
-     */
-    bool surface_entered = psp_display_video_begin(&psp_display);
-    char probe_detail[192];
-    snprintf(probe_detail, sizeof(probe_detail),
-             surface_entered ? "scratch unavailable"
-                             : "video surface unavailable");
-    PspMediaPresentProbeCase probe_cases[PSP_MEDIA_PRESENT_PROBE_CASES] = {0};
-    /* Staged into the display's own EDRAM texture, which is what playback
-       samples: a probe that measured a main-memory read would be timing a
-       pipeline nothing runs. */
-    bool probe_passed = probe_scratch != NULL && surface_entered
-        && psp_media_present_ge_probe(
-               probe_scratch, PSP_MEDIA_PRESENT_PROBE_SCRATCH_BYTES,
-               psp_display_video_texture(&psp_display),
-               PSP_DISPLAY_VIDEO_TEXTURE_BYTES,
-               psp_display_video_back_buffer(&psp_display),
-               probe_cases, probe_detail, sizeof(probe_detail));
-    bool surface_left = psp_display_video_end(&psp_display);
-    /*
-     * The per-case lines, logged here rather than in the presenter. That
-     * translation unit's stdout is the PSP console, which nothing collects,
-     * so its own printf never reached the validation log the truth cycle
-     * reads -- and the emulator runner asks for exactly these lines.
-     */
-    for (unsigned at = 0; at < PSP_MEDIA_PRESENT_PROBE_CASES; at++) {
-        const PspMediaPresentProbeCase *probe_case = &probe_cases[at];
-        if (probe_case->source_width == 0) continue;
-        /* sync is the real staged draw; output-sync is the same rectangle
-           from a cache-resident texture, so texture-read = sync - output-sync.
-           On device that split says whether the remaining GE cost is the
-           texture read (chase it) or the 8888 output write (irreducible). */
-        uint64_t texture_sync_us =
-            probe_case->sync_us > probe_case->output_sync_us
-                ? probe_case->sync_us - probe_case->output_sync_us : 0;
-        printf("tilefinch-media-present-probe: case=%dx%d stride=%d quads=%u "
-               "slot=%u clockwise=%d crop=%d "
-               "output=%dx%d texture=%s flat=0x%06x halves=0x%06x/0x%06x "
-               "submit=%lluus sync=%lluus output-sync=%lluus "
-               "texture-sync=%lluus outcome=%s\n",
-               probe_case->source_width, probe_case->source_height,
-               probe_case->source_stride, probe_case->quads,
-               probe_case->slot, probe_case->clockwise ? 1 : 0,
-               probe_case->portrait_crop ? 1 : 0,
-               probe_case->output_width, probe_case->output_height,
-               probe_case->staged ? "edram" : "main",
-               (unsigned) probe_case->flat, (unsigned) probe_case->left,
-               (unsigned) probe_case->right,
-               (unsigned long long) probe_case->submit_us,
-               (unsigned long long) probe_case->sync_us,
-               (unsigned long long) probe_case->output_sync_us,
-               (unsigned long long) texture_sync_us,
-               probe_case->passed ? "pass" : "fail");
-    }
-    uint32_t probe_drawn = 0;
-    uint32_t probe_source = 0;
-    psp_media_present_ge_passthrough(&probe_drawn, &probe_source);
-    printf("tilefinch-media-present-probe: event=%s drawn=0x%08x "
-           "source=0x%08x passthrough=%s surface=%d/%d detail=\"%s\"\n",
-           probe_passed ? "pass" : "fail",
-           (unsigned) probe_drawn, (unsigned) probe_source,
-           probe_drawn != 0 && (probe_drawn & UINT32_C(0x00ffffff))
-                   == (probe_source & UINT32_C(0x00ffffff))
-               ? "yes" : "no",
-           surface_entered ? 1 : 0, surface_left ? 1 : 0,
-           probe_detail);
-    /*
-     * Where each surface byte landed, in both worlds. The engine column must
-     * repeat its own probe -- that is what passthrough means -- and the scaler
-     * column records the PSP-native 5650 mapping used by Sharp and chrome.
-     */
-    uint32_t probe_map_engine[PSP_MEDIA_PRESENT_CHANNEL_PROBES] = {0};
-    uint16_t probe_map_scaler[PSP_MEDIA_PRESENT_CHANNEL_PROBES] = {0};
-    psp_media_present_ge_channel_map(probe_map_engine, probe_map_scaler);
-    printf("tilefinch-media-present-probe: channel-map "
-           "byte0=0x%08x/0x%04x byte1=0x%08x/0x%04x byte2=0x%08x/0x%04x\n",
-           (unsigned) probe_map_engine[0], (unsigned) probe_map_scaler[0],
-           (unsigned) probe_map_engine[1], (unsigned) probe_map_scaler[1],
-           (unsigned) probe_map_engine[2], (unsigned) probe_map_scaler[2]);
-    budget_free(budget, probe_scratch);
-    psp_report_budget_counters(budget, "ge-present-probe-exit");
-    browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf("tilefinch-validation: outcome=%s qualification=%s\n",
-           probe_passed ? "clean-exit" : "qualification-failed",
-           probe_passed ? "ge-present-pass" : "ge-present-fail");
-    psp_log_checkpoint("ge-present-probe-complete");
-    psp_log_finish(
-        probe_passed ? "ge-present-probe-pass"
-                     : "ge-present-probe-fail");
-    psp_exit_console(exit_to);
-    return probe_passed ? 0 : 1;
-}
-
-static TILEFINCH_COLD_PATH int psp_run_csc_order_qualification(
-    BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
-    const char *exit_to)
-{
-    /*
-     * The experiment the present probe left owed to a device.
-     *
-     * Smooth and Sharp disagree about which surface byte holds which colour,
-     * no PSP pixel format can reconcile them, and the only remaining free
-     * variable is the byte order sceMpegBaseCscAvc writes -- hypothetically
-     * chosen by two mode words nothing readable here documents. This decodes
-     * one picture and re-converts it under each candidate, printing what the
-     * firmware wrote beside what the panel is proven to want. It is its own
-     * boot mode for a reason: no playback session may ever run this, because a
-     * candidate that succeeds leaves an unpresentable surface behind.
-     */
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TESTING VIDEO COLOUR ORDER", 860);
-    PspMediaCscOrderReport report = {0};
-    char probe_error[256] = {0};
-    bool probe_passed = psp_media_fixture_csc_order_probe(
-        budget, &report, probe_error, sizeof(probe_error));
-    /* The same boundary the embedded fixture reports: an emulator has no
-       raw-NAL decoder, so it never produces the picture this repeats, and that
-       is untested rather than failed. */
-    bool emulator_untested = !probe_passed
-        && (report.last_native_error
-                == MEDIA_BACKEND_RAW_NAL_BRIDGE_UNAVAILABLE
-            || strstr(probe_error, "raw-NAL") != NULL
-            || strstr(probe_error, "80010002") != NULL);
-    printf(
-        "tilefinch-media-csc-probe: event=%s error=\"%s\" candidates=%u "
-        "usable=%u refused=%u quarantine=%d native=0x%08X\n",
-        probe_passed ? "hardware-pass"
-            : (emulator_untested ? "emulator-untested" : "hardware-fail"),
-        probe_error, report.candidates_tried, report.candidates_usable,
-        report.candidates_refused, report.quarantined ? 1 : 0,
-        (unsigned) report.last_native_error);
-    psp_report_budget_counters(budget, "csc-order-probe-exit");
-    browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf("tilefinch-validation: outcome=%s qualification=%s\n",
-           probe_passed || emulator_untested
-               ? "clean-exit" : "qualification-failed",
-           probe_passed ? "csc-order-pass"
-               : (emulator_untested ? "emulator-untested"
-                                    : "csc-order-fail"));
-    psp_log_checkpoint("csc-order-probe-complete");
-    psp_log_finish(
-        probe_passed ? "csc-order-probe-pass"
-            : (emulator_untested ? "csc-order-probe-untested"
-                                 : "csc-order-probe-fail"));
-    psp_exit_console(exit_to);
-    return probe_passed || emulator_untested ? 0 : 1;
-}
-
-static TILEFINCH_COLD_PATH int psp_run_media_range_qualification(
-    BrowserEngine *engine, const PspBootConfig *config,
-    PspClockWorker *clock_worker, bool clock_worker_started)
-{
-    /*
-     * The transport half of a playback session with nothing behind it.
-     *
-     * A range or fragment-window regression can only be seen today inside the
-     * first second of a real playback session, where the resolver, the Media
-     * Engine pool, mpeg_vsh and a firmware decoder are all between the reader
-     * and the log. This runs the same resolve, the same two bounded windows,
-     * the same moov/sidx reads and the same sequential sample reads, far
-     * enough to cross fragment boundaries, and stops there. It needs the
-     * network and nothing else.
-     *
-     * Unlike the probes above it does not destroy the engine: it runs after
-     * the media session, text input and offline store have been built on the
-     * engine's budget, and tearing the budget out from under them would report
-     * a clean teardown this mode has not earned. The budget counters below are
-     * the honest half -- they say whether the probe returned its own bytes.
-     */
-    Budget *budget = browser_engine_budget(engine);
-    BrowserSession *session = browser_engine_session(engine);
-    PspMediaRangeProbeReport report = {0};
-    char probe_error[256] = {0};
-    bool passed = psp_media_range_probe_run(
-        budget, session, config->url, &report,
-        probe_error, sizeof(probe_error));
-    printf(
-        "tilefinch-media-range-probe: event=%s resolved=%d split=%d "
-        "video-boundaries=%u audio-boundaries=%u error=\"%s\"\n",
-        passed ? "pass" : "fail", report.resolved ? 1 : 0,
-        report.split ? 1 : 0, report.video.fragment_boundaries,
-        report.audio.fragment_boundaries, probe_error);
-    psp_report_budget_counters(budget, "media-range-probe-exit");
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf("tilefinch-validation: outcome=%s qualification=%s\n",
-           passed ? "clean-exit" : "qualification-failed",
-           passed ? "media-range-pass" : "media-range-fail");
-    psp_log_checkpoint("media-range-probe-complete");
-    psp_log_finish(
-        passed ? "media-range-probe-pass" : "media-range-probe-fail");
-    psp_exit_console(config->exit_to);
-    return passed ? 0 : 1;
-}
-
-static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
-    BrowserEngine *engine, Budget *budget, const char *argv0,
-    PspGlyphComponentSession *glyph_component,
-    PspClockWorker *clock_worker, bool clock_worker_started,
-    const char *exit_to)
-{
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TESTING PAGE RASTER", 860);
-    PspRasterFixtureReport report = {0};
-    char error[256] = {0};
-    bool passed = psp_raster_fixture_run(
-        engine, &report, error, sizeof(error));
-    unsigned pack_reads = 0;
-    bool regional_requested = false;
-    bool emoji_requested = false;
-    if (passed && glyph_component != NULL
-        && glyph_component->provider != NULL) {
-        static const unsigned regional_probes[] = {
-            0x6f22u, /* CJK */
-            0x0416u, /* Cyrillic */
-            0x1ed9u  /* Extended Latin */
-        };
-        uint32_t regional_key = 0, emoji_key = 0;
-        unsigned width = 0;
-        for (size_t probe = 0;
-             probe < sizeof(regional_probes) / sizeof(regional_probes[0]);
-             probe++) {
-            if (tilefinch_glyph_provider_has_codepoint(
-                    glyph_component->provider, regional_probes[probe],
-                    &regional_key, &width)
-                && tilefinch_glyph_provider_key_pending(
-                    glyph_component->provider, regional_key)) {
-                regional_requested = true;
-                break;
-            }
-        }
-        emoji_requested =
-            tilefinch_glyph_provider_has_codepoint(
-                glyph_component->provider, 0x1f600u,
-                &emoji_key, &width)
-            && tilefinch_glyph_provider_key_pending(
-                glyph_component->provider, emoji_key);
-        /* Each pass can expose another bounded block. Keep the qualification
-           deterministic and below the device write/read discipline: this is
-           at most eight 16 KiB reads, and the release player does no such
-           eager scan. */
-        for (unsigned pass = 0; pass < 8u; pass++) {
-            if (!psp_glyph_component_session_pump_runtime(
-                    glyph_component, engine)) break;
-            pack_reads++;
-            passed = psp_raster_fixture_rerender(
-                engine, &report, error, sizeof(error));
-            if (!passed) break;
-        }
-        const unsigned attached_pack_mask =
-            (1u << TILEFINCH_GLYPH_PACK_COUNT) - 1u;
-        const unsigned language_pack_mask = attached_pack_mask
-            & ~(1u << TILEFINCH_GLYPH_PACK_COLOR_EMOJI);
-        bool regional_attached =
-            (glyph_component->attached_mask & language_pack_mask) != 0;
-        bool emoji_attached =
-            (glyph_component->attached_mask
-             & (1u << TILEFINCH_GLYPH_PACK_COLOR_EMOJI)) != 0;
-        if ((regional_attached && !regional_requested)
-            || (emoji_attached
-                && (!emoji_requested
-                    || report.fallback_authored_color_pixels == 0))) {
-            passed = false;
-            snprintf(error, sizeof(error),
-                     "optional glyph raster not exercised regional=%u "
-                     "emoji=%u color=%zu",
-                     regional_requested ? 1u : 0u,
-                     emoji_requested ? 1u : 0u,
-                     report.fallback_authored_color_pixels);
-        }
-    }
-    BrowserFrameView frame = {0};
-    bool dumped = passed
-        && browser_engine_frame_view(engine, &frame)
-        && psp_dump_frame_strided_named(
-            argv0, "frame-raster.ppm", frame.pixels,
-            frame.pixel_count, (size_t) frame.stride);
-    printf(
-        "tilefinch-raster-fixture: event=%s hash=%016llx "
-        "round=%zu/%zu stroke=%zu/%zu fallback=%zu color=%zu "
-        "pack-reads=%u regional=%u emoji=%u italic=%zu/%d dump=%d "
-        "error=\"%s\"\n",
-        passed ? "psp-pass" : "psp-fail",
-        (unsigned long long) report.frame_hash,
-        report.rounded_interior_pixels, report.rounded_edge_pixels,
-        report.stroke_interior_pixels, report.stroke_edge_pixels,
-        report.fallback_ink_pixels,
-        report.fallback_authored_color_pixels, pack_reads,
-        regional_requested ? 1u : 0u, emoji_requested ? 1u : 0u,
-        report.italic_continuous_pairs,
-        report.italic_maximum_centroid_step, dumped ? 1 : 0, error);
-    psp_report_budget_counters(budget, "raster-fixture-exit");
-    psp_glyph_component_session_destroy(glyph_component);
-    browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf(
-        "tilefinch-validation: outcome=%s qualification=%s\n",
-        passed ? "clean-exit" : "qualification-failed",
-        passed ? "psp-raster-pass" : "psp-raster-fail");
-    psp_log_checkpoint("raster-fixture-complete");
-    psp_log_finish(
-        passed ? "raster-fixture-pass" : "raster-fixture-fail");
-    psp_exit_console(exit_to);
-    return passed ? 0 : 1;
-}
-#endif
-
-/* The stability report runs once at the end of an explicitly requested
-   device soak. Keep its formatting and teardown out of the interactive
-   loop's already-large instruction footprint. */
-static TILEFINCH_COLD_PATH void
-psp_finish_media_stability(PspApp *app, uint64_t elapsed_us)
-{
-    PspMediaSession *media = &app->browser->media;
-    const PspBootConfig *config = &app->process->config;
-    MediaBackendStats final_stats = {0};
-    bool final_stats_ready = psp_media_backend_stats_snapshot(
-        media, &final_stats);
-    size_t decoded = media->accumulated_decoded_video_frames
-        + final_stats.decoded_video_frames;
-    size_t pipeline_skips = media->accumulated_dropped_video_frames
-        + final_stats.dropped_video_frames;
-    size_t seek_preroll_skips =
-        media->accumulated_discarded_seek_video_frames
-        + final_stats.discarded_seek_video_frames;
-    size_t display_claims = media->accumulated_video_claims
-        + final_stats.video_claims;
-    size_t displayed = media->accumulated_video_claims_displayed
-        + final_stats.video_claims_displayed;
-    size_t display_drops = media->accumulated_video_claims_dropped
-        + final_stats.video_claims_dropped;
-    size_t quiesce_drops = media->accumulated_video_claims_quiesced
-        + final_stats.video_claims_quiesced;
-    size_t audio_packets = media->accumulated_audio_packets
-        + final_stats.submitted_audio_packets;
-    unsigned native_errors = media->accumulated_native_errors
-        + (final_stats.last_native_error != 0 ? 1u : 0u);
-    size_t peak_external = final_stats.external_bytes
-            > media->peak_external_bytes
-        ? final_stats.external_bytes : media->peak_external_bytes;
-    int ending_capacity = scePowerGetBatteryRemainCapacity();
-    int ending_percent = scePowerGetBatteryLifePercent();
-    int capacity_delta = ending_capacity >= 0
-            && app->interactive->media_stability_start_capacity >= 0
-        ? ending_capacity - app->interactive->media_stability_start_capacity
-        : INT_MIN;
-    int percent_delta = ending_percent >= 0
-            && app->interactive->media_stability_start_percent >= 0
-        ? ending_percent - app->interactive->media_stability_start_percent
-        : INT_MIN;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_power_log_battery(
-        "media-finish", PSP_POWER_TEST_FIXED_HIGH, elapsed_us / 1000u);
-#endif
-    printf(
-        "tilefinch-media-stability: event=skew-peak steady=%lluus "
-        "at=%lluus audio=%lluus video=%lluus no-frame-ms=%u\n",
-        (unsigned long long) app->interactive->media_stability_skew.steady_maximum_us,
-        (unsigned long long)
-            app->interactive->media_stability_skew.steady_peak_elapsed_us,
-        (unsigned long long) app->interactive->media_stability_skew.steady_peak_audio_us,
-        (unsigned long long) app->interactive->media_stability_skew.steady_peak_video_us,
-        app->interactive->media_stability_skew.steady_peak_no_frame_ms);
-    printf(
-        "tilefinch-media-stability: event=complete stats-ready=%d "
-        "elapsed=%lluus requested=%up actual=%dx%d decoded=%zu "
-        "pipeline-skips=%zu seek-preroll-skips=%zu "
-        "display-claims=%zu displayed=%zu "
-        "display-drops=%zu quiesce-drops=%zu audio-packets=%zu "
-        "native-errors=%u last-native=%d "
-        "seeks=%u loops=%u fallbacks=%u peak-external=%zu min-free=%u "
-        "min-largest=%u max-av-skew=%lluus steady-max-av-skew=%lluus "
-        "steady-skew-samples=%u capacity-start=%d "
-        "capacity-end=%d capacity-delta=%d percent-start=%d percent-end=%d "
-        "percent-delta=%d scale-frames=%zu scale-total=%lluus "
-        "scale-max=%lluus ge-frames=%zu ge-submit-total=%lluus "
-        "ge-sync-total=%lluus ge-sync-max=%lluus skipped=%zu\n",
-        final_stats_ready ? 1 : 0, (unsigned long long) elapsed_us,
-        (unsigned) browser_profile_youtube_quality(app->browser->profile),
-        media->stream.width, media->stream.height, decoded, pipeline_skips,
-        seek_preroll_skips,
-        display_claims, displayed, display_drops, quiesce_drops,
-        audio_packets, native_errors, final_stats.last_native_error,
-        media->seek_completions, app->interactive->media_stability_loops,
-        media->quality_fallbacks, peak_external,
-        app->interactive->media_stability_min_free,
-        app->interactive->media_stability_min_largest,
-        (unsigned long long) app->interactive->media_stability_skew.maximum_us,
-        (unsigned long long) app->interactive->media_stability_skew.steady_maximum_us,
-        app->interactive->media_stability_skew.steady_samples,
-        app->interactive->media_stability_start_capacity, ending_capacity,
-        capacity_delta, app->interactive->media_stability_start_percent, ending_percent,
-        percent_delta, media->present_scale_frames,
-        (unsigned long long) media->present_scale_total_us,
-        (unsigned long long) media->present_scale_max_us,
-        media->present_ge_frames,
-        (unsigned long long) media->present_ge_submit_total_us,
-        (unsigned long long) media->present_ge_sync_total_us,
-        (unsigned long long) media->present_ge_sync_max_us,
-        media->present_skipped_frames);
-    app->interactive->media_stability_active = false;
-    app->process->presentation.ui.validation_media_test_phase = 0;
-    media->ui.playing = false;
-    if (media->playback != NULL)
-        media_playback_set_playing(media->playback, false);
-    char completed_status[64];
-    snprintf(
-        completed_status, sizeof(completed_status),
-        "%ld SEC VIDEO TEST COMPLETE",
-        config->validation_media_stability_seconds);
-    psp_ui_show_status(&app->process->presentation.ui, completed_status, 600);
-    if (app->interactive->media_stability_auto_exit)
-        psp_exit_plan_request(
-            &app->interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-}
-
-static TILEFINCH_COLD_PATH void
-psp_sample_media_stability(PspApp *app, uint64_t now_us)
-{
-    PspMediaSession *media = &app->browser->media;
-    PspMediaStabilitySkew *skew = &app->interactive->media_stability_skew;
-    bool steady_candidate =
-        media->machine.state == PSP_MEDIA_SESSION_PLAYING
-        && media->job_phase == PSP_MEDIA_JOB_NONE
-        && !media->audio_hold.applied
-        && !media->ui.ended;
-    if (!steady_candidate) {
-        skew->steady_since_us = 0;
-    } else if (skew->steady_since_us == 0) {
-        skew->steady_since_us = now_us;
-    }
-    if (app->interactive->media_stability_started_us == 0
-        || now_us < app->interactive->media_stability_next_sample_us) return;
-
-    unsigned free_bytes = sceKernelTotalFreeMemSize();
-    unsigned largest_bytes = sceKernelMaxFreeMemSize();
-    if (free_bytes < app->interactive->media_stability_min_free)
-        app->interactive->media_stability_min_free = free_bytes;
-    if (largest_bytes < app->interactive->media_stability_min_largest)
-        app->interactive->media_stability_min_largest = largest_bytes;
-    MediaBackendStats live = {0};
-    uint64_t audio_us = 0;
-    if (media_playback_backend_stats(media->playback, &live)
-        && live.presented_video_us != 0
-        && media_playback_audio_cursor_us(media->playback, &audio_us)) {
-        /* Successful sceAudioOutputBlocking calls put blocks into the PSP's
-           firmware queue; they do not mean those samples are audible yet.
-           The session clock and teardown telemetry both use the elapsed,
-           queue-capped audio cursor. Sample that same clock here so startup
-           preroll and seek refill do not masquerade as hundreds of
-           milliseconds of steady A/V skew. */
-        uint64_t sample_us = audio_us > live.presented_video_us
-            ? audio_us - live.presented_video_us
-            : live.presented_video_us - audio_us;
-        if (sample_us > skew->maximum_us) skew->maximum_us = sample_us;
-        if (skew->steady_since_us != 0
-            && now_us - skew->steady_since_us
-                   >= PSP_MEDIA_STABILITY_STEADY_DELAY_US) {
-            if (sample_us > skew->steady_maximum_us) {
-                skew->steady_maximum_us = sample_us;
-                skew->steady_peak_elapsed_us =
-                    now_us - app->interactive->media_stability_started_us;
-                skew->steady_peak_audio_us = audio_us;
-                skew->steady_peak_video_us = live.presented_video_us;
-                skew->steady_peak_no_frame_ms = media->no_frame_ms;
-            }
-            if (skew->steady_samples != UINT_MAX) skew->steady_samples++;
-        }
-    }
-    app->interactive->media_stability_next_sample_us =
-        now_us + UINT64_C(250000);
-}
-
-static __attribute__((noinline)) void psp_media_stability_schedule_seeks(
-    PspApp *app, uint64_t elapsed_us, uint64_t duration_us)
-{
-    PspMediaSession *media = &app->browser->media;
-    int permille = (int) app->process->config.validation_media_seek_permille;
-    if (app->interactive->media_stability_started_us != 0 && permille != 0
-            && !app->interactive->media_stability_forward_seek
-            && elapsed_us >= UINT64_C(15000000)
-            && media->playback != NULL
-            && media->have_frame
-            && media->job_phase == PSP_MEDIA_JOB_NONE) {
-        uint64_t target_us = psp_media_stability_seek_target_us(
-            duration_us, permille);
-        if (psp_media_request_seek(media, target_us, false)) {
-            psp_video_scanout_note_discontinuity();
-            media->job_resume_playing = true;
-            app->interactive->media_stability_forward_seek = true;
-            app->interactive->media_stability_skew.steady_since_us = 0;
-            printf(
-                "tilefinch-media-stability: event=seek "
-                "direction=forward target=%lluus\n",
-                (unsigned long long) target_us);
-        }
-    }
-    if (app->interactive->media_stability_started_us != 0 && permille != 0
-            && !app->interactive->media_stability_backward_seek
-            && elapsed_us >= UINT64_C(45000000)
-            && media->playback != NULL
-            && media->have_frame
-            && media->job_phase == PSP_MEDIA_JOB_NONE) {
-        uint64_t target_us = duration_us > UINT64_C(6000000)
-            ? UINT64_C(3000000) : 0;
-        if (psp_media_request_seek(media, target_us, false)) {
-            psp_video_scanout_note_discontinuity();
-            media->job_resume_playing = true;
-            app->interactive->media_stability_backward_seek = true;
-            app->interactive->media_stability_skew.steady_since_us = 0;
-            printf(
-                "tilefinch-media-stability: event=seek "
-                "direction=backward target=%lluus\n",
-                (unsigned long long) target_us);
-        }
-    }
 }
 
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -1334,51 +499,6 @@ static TILEFINCH_COLD_PATH void psp_entropy_setup(
 #endif
 }
 #endif
-
-static TILEFINCH_COLD_PATH void psp_storage_paths_init(
-    PspStoragePaths *storage, const TilefinchInstallPaths *install_paths)
-{
-    if (storage == NULL || install_paths == NULL) return;
-    memset(storage, 0, sizeof(*storage));
-    tilefinch_install_data_path(
-        install_paths, "profile.cfg", storage->profile,
-        sizeof(storage->profile));
-    tilefinch_install_data_path(
-        install_paths, "tab-hibernation.bin", storage->tab_hibernation,
-        sizeof(storage->tab_hibernation));
-    tilefinch_install_data_path(
-        install_paths, "tabs-session.bin", storage->tab_session,
-        sizeof(storage->tab_session));
-    tilefinch_install_data_path(
-        install_paths, "recovery.cfg", storage->recovery,
-        sizeof(storage->recovery));
-    tilefinch_install_data_path(
-        install_paths, "http-cache.bin", storage->persistent_cache,
-        sizeof(storage->persistent_cache));
-    tilefinch_install_data_path(
-        install_paths, "local-storage.bin", storage->local_storage,
-        sizeof(storage->local_storage));
-    tilefinch_install_data_path(
-        install_paths, "tls-sessions.bin", storage->tls_sessions,
-        sizeof(storage->tls_sessions));
-    tilefinch_install_data_path(
-        install_paths, "adblock.txt", storage->content_blocker,
-        sizeof(storage->content_blocker));
-    tilefinch_install_data_path(
-        install_paths, "adblock-allow.txt", storage->content_allowlist,
-        sizeof(storage->content_allowlist));
-    tilefinch_install_data_path(
-        install_paths, "offline", storage->offline_library,
-        sizeof(storage->offline_library));
-    tilefinch_install_data_path(
-        install_paths, "site-storage", storage->site_storage,
-        sizeof(storage->site_storage));
-    tilefinch_install_data_path(
-        install_paths, "script-cache", storage->script_cache,
-        sizeof(storage->script_cache));
-    tilefinch_install_data_path(install_paths, "youtube-login.bin",
-        storage->youtube_login, sizeof(storage->youtube_login));
-}
 
 static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
     BrowserSession *session, const BrowserProfile *profile,
@@ -1687,15 +807,18 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
     }
     char visible_error[PSP_UI_STATUS_CAPACITY];
     TilefinchTlsGuidance tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
-    const char *visible_detail = status == BROWSER_NAVIGATION_JOB_CANCELLED
-        ? "PAGE LOAD STOPPED"
-        : psp_user_visible_error(
-              browser_engine_last_error(browser->engine),
-              views->navigation->last_tls_verify_result,
-              views->navigation->last_tls_verify_result_available,
-              views->navigation->last_tls_verification_failed,
-              &tls_guidance,
-              visible_error, sizeof(visible_error));
+    const char *visible_detail = "PAGE LOAD STOPPED";
+    if (status != BROWSER_NAVIGATION_JOB_CANCELLED) {
+        BrowserViewSnapshot failed_view;
+        (void) browser_engine_view_snapshot(browser->engine, &failed_view);
+        visible_detail = psp_user_visible_error(
+            browser_engine_last_error(browser->engine),
+            failed_view.tls_verify_result,
+            failed_view.tls_verify_result_available,
+            failed_view.tls_verification_failed,
+            &tls_guidance,
+            visible_error, sizeof(visible_error));
+    }
     bool wifi_sign_in = psp_navigation_suggests_wifi_sign_in(
             interactive, status, views->navigation,
             browser_engine_last_error(browser->engine),
@@ -1721,7 +844,7 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
             browser_profile_basic_fallback_mode(browser->profile), false,
             false,
             psp_basic_fallback_navigation_reloadable(
-                views->navigation->last_http_status,
+                browser_engine_last_http_status(browser->engine),
                 psp_ui_internal_url(interactive->lifecycle_retry_url)));
         if (wifi_sign_in) actions |= PSP_UI_FAILURE_WIFI;
         if (browser_profile_javascript_allowed_for_url(
@@ -1740,7 +863,7 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
     }
     psp_report_job_failure(
         "navigation", NULL, (int) status,
-        views->navigation->last_http_status,
+        browser_engine_last_http_status(browser->engine),
         browser_engine_last_error(browser->engine));
 }
 
@@ -1909,8 +1032,10 @@ void psp_present_heavy_recovery(PspApp *app, const char *loaded_url,
 }
 
 /* The Basic reload's commit, compared as request keys (normalized, without
-   the fragment). A redirect or a different navigation is not presented. */
-static bool psp_basic_reload_targets(const char *loaded, const char *wanted)
+   the fragment). A redirect or a different navigation is not presented.
+   Out of line so its two key buffers leave the stack before the caller
+   goes on into Basic view preparation. */
+static TILEFINCH_OUT_OF_LINE bool psp_basic_reload_targets(const char *loaded, const char *wanted)
 {
     char loaded_key[TILEFINCH_URL_SERIALIZED_LIMIT];
     char wanted_key[TILEFINCH_URL_SERIALIZED_LIMIT];
@@ -1931,10 +1056,11 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
        incumbent. Blank post-commit recovery below records the new target. */
     app->interactive->recovery_offer =
         psp_recovery_offer_without_return(app->interactive->recovery_offer);
-    const NavigationEntry *loaded_entry =
-        navigation_current(app->views->navigation);
-    const char *loaded_url = loaded_entry == NULL
-        ? ui->url : loaded_entry->url;
+    char loaded_entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *loaded_entry_url = psp_app_current_url(
+        app->browser->engine, loaded_entry_buffer, sizeof(loaded_entry_buffer));
+    const char *loaded_url = loaded_entry_url == NULL
+        ? ui->url : loaded_entry_url;
     if (app->interactive->basic_reload_pending) {
         /* The one script-free load is over: later loads follow the site's
            policy again. Only the requested address is presented in Basic
@@ -1972,7 +1098,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     if (media_card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED) {
         app->interactive->blank_reader_recovery_pending = true;
         app->interactive->blank_reader_recovery_generation =
-            app->views->navigation->generation;
+            browser_engine_page_generation(engine);
         return;
     }
     if (media_card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED) {
@@ -2002,7 +1128,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     case PSP_BASIC_FALLBACK_DEFER:
         app->interactive->blank_reader_recovery_pending = true;
         app->interactive->blank_reader_recovery_generation =
-            app->views->navigation->generation;
+            browser_engine_page_generation(engine);
         return;
     case PSP_BASIC_FALLBACK_SWITCH:
         app->interactive->blank_reader_recovery_pending = false;
@@ -2021,9 +1147,9 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
         app->interactive->blank_reader_recovery_pending = false;
         /* Once per page: a declined offer is not repeated. */
         if (app->interactive->basic_prompt_generation
-                != app->views->navigation->generation) {
+                != browser_engine_page_generation(engine)) {
             app->interactive->basic_prompt_generation =
-                app->views->navigation->generation;
+                browser_engine_page_generation(engine);
             psp_present_committed_recovery(
                 app, loaded_url,
                 "PAGE SCRIPTS STOPPED. BASIC VIEW CAN SHOW ITS CONTENT",
@@ -2057,7 +1183,7 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     if (degraded_recovery_deferred) {
         app->interactive->blank_reader_recovery_pending = true;
         app->interactive->blank_reader_recovery_generation =
-            app->views->navigation->generation;
+            browser_engine_page_generation(engine);
     } else {
         app->interactive->blank_reader_recovery_pending = false;
     }
@@ -2157,7 +1283,7 @@ static TILEFINCH_OUT_OF_LINE void psp_retry_deferred_blank_reader(
     if (app == NULL || app->interactive == NULL
         || !app->interactive->blank_reader_recovery_pending) return;
     (void) psp_engine_views_refresh(app->views, app->browser->engine);
-    if (app->views->navigation->generation
+    if (browser_engine_page_generation(app->browser->engine)
             != app->interactive->blank_reader_recovery_generation) {
         app->interactive->blank_reader_recovery_pending = false;
         return;
@@ -2317,1646 +1443,6 @@ static TILEFINCH_OUT_OF_LINE void psp_reconcile_page_render_before_raster(
     frame->page_dirty = false;
 }
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static uint64_t psp_runtime_advance_total_us;
-static uint64_t psp_runtime_advance_maximum_us;
-static size_t psp_runtime_advance_calls;
-static size_t psp_runtime_layout_changes;
-static size_t psp_runtime_render_deferrals;
-static size_t psp_runtime_handoff_deferrals;
-static size_t psp_runtime_reclaim_deferrals;
-
-/* One frame's runtime advances, summed for its tilefinch-loop-work record:
-   where an advance's time goes (the page realm's event-loop phases, child
-   frames, relayout, render damage, and the PSP shell around them), how
-   late its timer tasks ran, and why an advance was skipped. */
-static struct {
-    unsigned advances;
-    unsigned deferred_render, deferred_other;
-    uint64_t elapsed_us;      /* psp_advance_page_runtime's advance call */
-    uint64_t realm_us;        /* script_runtime_advance, page realm */
-    uint64_t prelude_us, timer_prepare_us, timer_us, jobs_us;
-    uint64_t network_us, refresh_us;
-    size_t timers;
-    uint64_t child_us, setup_us, messages_us, relayout_us, damage_us;
-    uint64_t late_us, late_max_us;
-    size_t late_frames;
-    size_t frame_callbacks;
-    uint64_t frame_callback_late_us;
-} psp_frame_runtime;
-
-#define PSP_CANVAS_CADENCE_SAMPLE_LIMIT 1024u
-#define PSP_CANVAS_CADENCE_SLOW_LIMIT 16u
-#define PSP_CANVAS_GAME_SAMPLE_LIMIT 512u
-#define PSP_CANVAS_GAME_WORDS 96u
-#define PSP_CANVAS_LOOP_PHASES 11u
-#define PSP_CANVAS_LOOP_GAP_LIMIT 64u
-_Static_assert(PSP_CANVAS_GAME_WORDS <= SCRIPT_VALIDATION_FRAME_WORD_LIMIT,
-               "canvas packet exceeds runtime observation bound");
-typedef struct {
-    uint64_t start_us, end_us;
-    uint32_t wait_us, runtime_us, callbacks;
-    int64_t due_us;
-    bool timer_known, timer_frame, fast_followup;
-} PspCanvasLoopGap;
-
-typedef struct {
-    uint64_t run_us;
-    uint64_t query_begin_us, query_end_us;
-    uint32_t interrupt_preempts, thread_preempts, releases;
-    bool valid;
-} PspCanvasCpuSample;
-
-/* Intrusive attribution only. Discover outside the timing window and sample
-   bounded peer CPU clocks at runtime boundaries, never inside JavaScript. */
-#define PSP_CANVAS_PEER_LIMIT 8u
-typedef struct {
-    uint64_t run_us[PSP_CANVAS_PEER_LIMIT];
-    uint64_t query_begin_us, query_end_us;
-    uint32_t valid_mask, span_us;
-} PspCanvasPeerSample;
-static SceUID psp_canvas_peer_ids[PSP_CANVAS_PEER_LIMIT];
-static size_t psp_canvas_peer_count;
-static bool psp_canvas_peer_enabled;
-
-static void psp_canvas_peer_begin(bool enabled)
-{
-    psp_canvas_peer_enabled = false;
-    psp_canvas_peer_count = 0;
-    if (!enabled) return;
-    SceUID ids[64];
-    int count = 0;
-    int result = sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, ids, 64, &count);
-    if (result < 0 || count < 0) {
-        printf("tilefinch-canvas-peer-list: available=0 result=0x%08lx\n",
-               (unsigned long) result);
-        return;
-    }
-    int visited = count > 64 ? 64 : count;
-    size_t omitted = 0;
-    SceUID owner = sceKernelGetThreadId();
-    for (int at = 0; at < visited; at++) {
-        SceKernelThreadInfo info;
-        if (psp_thread_snapshot(ids[at], &info) < 0) continue;
-        info.name[sizeof(info.name) - 1u] = '\0';
-        bool selected = ids[at] != owner
-            && (strstr(info.name, "tilefinch") != NULL
-                || strstr(info.name, "Tilefinch") != NULL
-                || strstr(info.name, "Callback") != NULL
-                || strcmp(info.name, "callbacks") == 0
-                || strcmp(info.name, "home-exit-watchdog") == 0
-                || strstr(info.name, "usbhost") != NULL
-                || strstr(info.name, "PSPLINK") != NULL);
-        printf("tilefinch-canvas-thread: id=0x%08lx name=\"%s\" priority=%d selected=%u\n",
-               (unsigned long) ids[at], info.name, info.currentPriority,
-               selected ? 1u : 0u);
-        if (!selected) continue;
-        if (psp_canvas_peer_count == PSP_CANVAS_PEER_LIMIT) { omitted++; continue; }
-        size_t slot = psp_canvas_peer_count++;
-        psp_canvas_peer_ids[slot] = ids[at];
-        printf("tilefinch-canvas-peer: slot=%lu id=0x%08lx name=\"%s\"\n",
-               (unsigned long) slot, (unsigned long) ids[at], info.name);
-    }
-    psp_canvas_peer_enabled = psp_canvas_peer_count != 0;
-    printf("tilefinch-canvas-peer-list: available=1 visited=%d total=%d peers=%lu omitted=%lu\n",
-           visited, count, (unsigned long) psp_canvas_peer_count, (unsigned long) omitted);
-}
-
-static __attribute__((noinline)) PspCanvasPeerSample psp_canvas_peer_sample(void)
-{
-    PspCanvasPeerSample sample = {0};
-    if (!psp_canvas_peer_enabled) return sample;
-    uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
-    sample.query_begin_us = started;
-    for (size_t at = 0; at < psp_canvas_peer_count; at++) {
-        SceKernelThreadRunStatus status = {.size = sizeof(status)};
-        if (sceKernelReferThreadRunStatus(psp_canvas_peer_ids[at], &status) < 0) continue;
-        sample.run_us[at] = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
-        sample.valid_mask |= UINT32_C(1) << at;
-    }
-    sample.query_end_us = (uint64_t) sceKernelGetSystemTimeWide();
-    uint64_t span = sample.query_end_us - started;
-    sample.span_us = span > UINT32_MAX ? UINT32_MAX : (uint32_t) span;
-    return sample;
-}
-
-static PspCanvasCpuSample psp_canvas_cpu_sample(void)
-{
-    SceKernelThreadRunStatus status = {.size = sizeof(status)};
-    PspCanvasCpuSample sample = {0};
-    sample.query_begin_us = (uint64_t) sceKernelGetSystemTimeWide();
-    int result = sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status);
-    sample.query_end_us = (uint64_t) sceKernelGetSystemTimeWide();
-    if (result < 0)
-        return sample;
-    /* runClocks is the firmware's microsecond run counter, not CPU cycles.
-       A failed query must remain unavailable, never appear as zero CPU. */
-    sample.run_us = ((uint64_t) status.runClocks.hi << 32)
-        | status.runClocks.low;
-    sample.interrupt_preempts = status.intrPreemptCount;
-    sample.thread_preempts = status.threadPreemptCount;
-    sample.releases = status.releaseCount;
-    sample.valid = true;
-    return sample;
-}
-
-/* Cumulative translator clocks already exist. Copy/difference them only at
-   runtime batch boundaries; do not introduce clocks per vertex/instance. The
-   instance matrix/color clocks are children of vertex, not sibling costs. */
-#define PSP_CANVAS_WEBGL_FIELDS(X) \
-    X(total_us, total) X(seed_us, seed) X(command_us, command) \
-    X(command_decode_us, decode) X(command_cache_us, cache) \
-    X(command_vertex_us, vertex) X(command_instance_matrix_us, matrix) \
-    X(command_instance_color_us, color) X(command_state_us, state) \
-    X(command_emit_us, emit) X(command_antialias_us, aa) \
-    X(command_writeback_us, writeback) X(command_finalize_us, finalize) \
-    X(sync_us, sync) X(readback_us, readback) X(frames, flushes) \
-    X(vertices, vertices) X(fast_vertices, fast) \
-    X(geometry_cache_hit_vertices, cached) X(geometry_cache_misses, misses) \
-    X(draw_calls, draws) X(matrix_loads, loads) \
-    X(matrix_loads_avoided, loads_saved) X(state_changes, changes) \
-    X(state_changes_avoided, changes_saved) X(display_list_bytes, list_bytes) \
-    X(antialias_draws, aa_draws) X(antialias_edge_indices, aa_indices)
-enum {
-#define PSP_CANVAS_WEBGL_ENUM(field, name) PSP_CANVAS_WEBGL_##name,
-    PSP_CANVAS_WEBGL_FIELDS(PSP_CANVAS_WEBGL_ENUM)
-#undef PSP_CANVAS_WEBGL_ENUM
-    PSP_CANVAS_WEBGL_FIELD_COUNT
-};
-static const char *const psp_canvas_webgl_names[] = {
-#define PSP_CANVAS_WEBGL_NAME(field, name) #name,
-    PSP_CANVAS_WEBGL_FIELDS(PSP_CANVAS_WEBGL_NAME)
-#undef PSP_CANVAS_WEBGL_NAME
-};
-typedef struct {
-    uint32_t value[PSP_CANVAS_WEBGL_FIELD_COUNT];
-    uint32_t samples, invalid;
-} PspCanvasWebglSample;
-
-typedef struct {
-    ScriptRuntimeCpuMetrics value;
-    uint32_t samples, invalid;
-} PspCanvasRuntimeCpuSample;
-
-typedef struct {
-    uint32_t ordinal;
-    uint16_t input_step;
-    uint16_t input_buttons;
-    uint32_t runtime_turns;
-    uint32_t render_slices;
-    uint32_t pipeline_us;
-    uint32_t runtime_us;
-    uint32_t runtime_cpu_us, runtime_cpu_samples;
-    uint32_t runtime_cpu_window_min_us, runtime_cpu_window_max_us;
-    uint32_t runtime_cpu_observer_us;
-    uint32_t peer_cpu_us[PSP_CANVAS_PEER_LIMIT], peer_samples[PSP_CANVAS_PEER_LIMIT];
-    uint32_t peer_span_us, peer_window_extra_us;
-    uint32_t runtime_interrupt_preempts, runtime_thread_preempts;
-    uint32_t runtime_releases;
-    uint32_t script_runtime_us;
-    uint32_t navigation_runtime_us;
-    uint32_t damage_apply_us;
-    uint32_t callback_us;
-    uint32_t webgl_us;
-    PspCanvasWebglSample webgl;
-    PspCanvasRuntimeCpuSample runtime_cpu;
-    uint32_t microtask_us;
-    uint32_t render_us;
-    uint32_t render_canvas_raster_us, render_canvas_overlay_us;
-    uint32_t render_cpu_us, render_cpu_samples;
-    uint64_t budget_begin_us, budget_end_us;
-    uint32_t budget_owner_cpu_us, budget_wall_min_us, budget_wall_max_us;
-    uint32_t budget_observer_us, budget_peer_span_us, budget_peer_extra_us;
-    uint32_t budget_peer_cpu_us[PSP_CANVAS_PEER_LIMIT], budget_peer_mask;
-    bool budget_valid;
-    RenderCanvasConversionMetrics conversion;
-    uint32_t conversion_samples;
-    ScriptGameAudioNativeMetrics audio_native;
-    uint32_t present_us;
-    uint32_t present_base_us;
-    uint32_t present_base_cpu_us, present_base_bytes;
-    bool present_base_cpu_valid;
-    uint32_t present_composite_us;
-    uint32_t present_publish_us;
-    uint32_t present_flush_us;
-    uint32_t present_set_framebuffer_us;
-    uint32_t present_vblank_us;
-    uint32_t ui_focus_scroll_us;
-    uint32_t ui_chrome_us;
-    uint32_t ui_cursor_us;
-    uint32_t ui_screen_us;
-    uint32_t ui_toast_us;
-    uint32_t ui_loading_us;
-    uint32_t js_allocations;
-    uint32_t js_frees;
-    uint32_t js_reallocations;
-    uint32_t js_allocated_bytes;
-    uint32_t js_freed_bytes;
-    uint32_t js_live_before;
-    uint32_t js_live_after;
-    uint64_t started_us, ready_us, latched_us, previous_latched_us;
-    uint64_t game_origin_us;
-    uint32_t ready_vcount, latched_vcount, previous_vcount;
-    uint32_t packet_read_us;
-    bool causal_window;
-    bool game_packet_valid;
-    uint64_t loop_start_us, loop_end_us;
-    uint32_t loop_phase_us[PSP_CANVAS_LOOP_PHASES];
-} PspCanvasPhaseSample;
-
-typedef struct {
-    uint32_t intervals_us[PSP_CANVAS_CADENCE_SAMPLE_LIMIT];
-    uint32_t pipeline_us[PSP_CANVAS_CADENCE_SAMPLE_LIMIT];
-    PspCanvasPhaseSample phases[PSP_CANVAS_CADENCE_SAMPLE_LIMIT];
-    uint32_t game_words[PSP_CANVAS_GAME_SAMPLE_LIMIT][PSP_CANVAS_GAME_WORDS];
-    uint32_t sorted_us[PSP_CANVAS_CADENCE_SAMPLE_LIMIT];
-    PspCanvasPhaseSample slow_phases[PSP_CANVAS_CADENCE_SLOW_LIMIT];
-    size_t interval_count;
-    size_t pipeline_count;
-    size_t slow_phase_count;
-    size_t pipeline_total;
-    size_t pipelines_over_34ms;
-    size_t presentations;
-    size_t interval_samples_dropped;
-    size_t pipeline_samples_dropped;
-    size_t intervals_at_60hz;
-    size_t intervals_at_30hz;
-    uint64_t previous_present_us;
-    uint64_t previous_latched_us;
-    uint32_t previous_vcount;
-    bool causal_window;
-    /* Set by webgl-measure-end: later presentations are not measured. */
-    bool window_closed;
-    size_t causal_loops_without_sample;
-    PspCanvasLoopGap causal_loop_gaps[PSP_CANVAS_LOOP_GAP_LIMIT];
-    uint64_t pending_started_us;
-    uint64_t pending_runtime_us;
-    uint64_t pending_runtime_cpu_us;
-    uint64_t pending_runtime_cpu_window_min_us, pending_runtime_cpu_window_max_us;
-    uint64_t pending_runtime_cpu_observer_us;
-    uint64_t pending_peer_cpu_us[PSP_CANVAS_PEER_LIMIT];
-    uint32_t pending_peer_samples[PSP_CANVAS_PEER_LIMIT];
-    uint64_t pending_peer_span_us;
-    uint64_t pending_peer_window_extra_us;
-    uint32_t pending_runtime_cpu_samples;
-    uint32_t pending_runtime_interrupt_preempts;
-    uint32_t pending_runtime_thread_preempts, pending_runtime_releases;
-    uint64_t pending_script_runtime_us;
-    uint64_t pending_navigation_runtime_us;
-    uint64_t pending_damage_apply_us;
-    uint32_t pending_runtime_turns;
-    uint32_t pending_render_slices;
-    uint64_t pending_callback_us;
-    uint64_t pending_webgl_us;
-    PspCanvasWebglSample pending_webgl;
-    PspCanvasRuntimeCpuSample pending_cpu;
-    uint64_t pending_microtask_us;
-    uint64_t pending_render_us;
-    uint64_t pending_render_canvas_raster_us, pending_render_canvas_overlay_us;
-    uint64_t pending_render_cpu_us;
-    uint32_t pending_render_cpu_samples;
-    RenderCanvasConversionMetrics pending_conversion;
-    uint32_t pending_conversion_samples;
-    uint64_t pending_js_allocations;
-    uint64_t pending_js_frees;
-    uint64_t pending_js_reallocations;
-    uint64_t pending_js_allocated_bytes;
-    uint64_t pending_js_freed_bytes;
-    size_t pending_js_live_before;
-    size_t pending_js_live_after;
-    uint16_t pending_input_step;
-    uint16_t pending_input_buttons;
-    uint64_t maximum_interval_us;
-    uint64_t maximum_pipeline_us;
-    PspCanvasPhaseSample maximum_phase;
-    bool maximum_phase_valid;
-} PspCanvasCadence;
-
-static PspCanvasCadence psp_canvas_cadence;
-static bool psp_validation_native_detail;
-static const NavigationSession *psp_webgl_measurement_navigation;
-/* Marks can arrive on the callback supervisor or during nested native UI.
-   They queue only an integer; live realm reads belong to loop entry below. */
-static atomic_uint psp_audio_slots_receipt_phase;
-
-static TILEFINCH_OUT_OF_LINE void psp_audio_slots_receipt(
-    const NavigationSession *navigation, bool requested_native)
-{
-    unsigned phase = atomic_exchange_explicit(
-        &psp_audio_slots_receipt_phase, 0u, memory_order_acquire);
-    if (phase == 0u) return;
-    const char *name = phase == 1u ? "pre" : phase == 2u ? "post" : "end";
-    const ScriptRuntime *runtime = navigation == NULL ? NULL : navigation->page.runtime;
-    ScriptGameAudioStatus status = {0};
-    bool available = script_runtime_game_audio_status(runtime, &status);
-    bool selected_matches = available && status.selected_native == requested_native;
-    bool ready = selected_matches && status.lazy_installed && !status.failed
-        && status.native_present == status.selected_native;
-    printf("tilefinch-audio-slots-status: phase=%s deferred=1 owner-checkpoint=1 "
-           "runtime=%p navigation-generation=%llu available=%u requested=%u selected=%u installed=%u "
-           "native=%u failed=%u selected-matches=%u ready=%u\n",
-           name, (const void *) runtime,
-           (unsigned long long) (navigation == NULL ? 0u : navigation->generation),
-           available ? 1u : 0u,
-           requested_native ? 1u : 0u, status.selected_native ? 1u : 0u,
-           status.lazy_installed ? 1u : 0u, status.native_present ? 1u : 0u,
-           status.failed ? 1u : 0u, selected_matches ? 1u : 0u, ready ? 1u : 0u);
-}
-
-typedef struct {
-    PspCanvasCpuSample owner;
-    PspCanvasPeerSample peers;
-    uint32_t sequence;
-} PspCanvasBudgetBoundary;
-static PspCanvasBudgetBoundary psp_canvas_budget_begin, psp_canvas_budget_end;
-
-static TILEFINCH_OUT_OF_LINE void psp_canvas_budget_pre_publish(uint32_t sequence)
-{
-    if (!psp_canvas_cadence.causal_window || !psp_canvas_peer_enabled
-        || psp_canvas_cadence.pending_started_us == 0u) return;
-    /* Peer counters contain the owner interval, just like runtime sampling.
-       There is no clock query inside a ray, vertex, or audio-sample loop. */
-    psp_canvas_budget_end.owner = psp_canvas_cpu_sample();
-    psp_canvas_budget_end.peers = psp_canvas_peer_sample();
-    psp_canvas_budget_end.sequence = sequence;
-}
-
-static TILEFINCH_OUT_OF_LINE void psp_canvas_budget_after_present(void)
-{
-    if (!psp_canvas_cadence.causal_window || !psp_canvas_peer_enabled) return;
-    /* Begin after the preceding presentation's bookkeeping. The report
-       keeps absolute query boundaries so the small omitted latch-to-start
-       and pre-publish-to-ready tails remain visible, not silently subtracted. */
-    psp_canvas_budget_begin.peers = psp_canvas_peer_sample();
-    psp_canvas_budget_begin.owner = psp_canvas_cpu_sample();
-    memset(&psp_canvas_budget_end, 0, sizeof(psp_canvas_budget_end));
-}
-static uint32_t psp_canvas_cadence_u32(uint64_t value)
-{
-    return value > UINT32_MAX ? UINT32_MAX : (uint32_t) value;
-}
-
-static TILEFINCH_OUT_OF_LINE void psp_canvas_budget_copy(
-    PspCanvasPhaseSample *sample, const PspPresentPhaseTiming *timing)
-{
-    const PspCanvasCpuSample *before = &psp_canvas_budget_begin.owner;
-    const PspCanvasCpuSample *after = &psp_canvas_budget_end.owner;
-    if (sample == NULL || timing == NULL || !before->valid || !after->valid
-        || timing->sequence != psp_canvas_budget_end.sequence
-        || after->run_us < before->run_us
-        || after->query_begin_us < before->query_end_us) return;
-    sample->budget_valid = true;
-    sample->budget_begin_us = before->query_end_us;
-    sample->budget_end_us = after->query_begin_us;
-    sample->budget_owner_cpu_us = psp_canvas_cadence_u32(after->run_us - before->run_us);
-    sample->budget_wall_min_us = psp_canvas_cadence_u32(
-        after->query_begin_us - before->query_end_us);
-    sample->budget_wall_max_us = psp_canvas_cadence_u32(
-        after->query_end_us - before->query_begin_us);
-    sample->budget_observer_us = psp_canvas_cadence_u32(
-        before->query_end_us - before->query_begin_us
-        + after->query_end_us - after->query_begin_us);
-    const PspCanvasPeerSample *peer_before = &psp_canvas_budget_begin.peers;
-    const PspCanvasPeerSample *peer_after = &psp_canvas_budget_end.peers;
-    sample->budget_peer_span_us = psp_canvas_cadence_u32(
-        (uint64_t) peer_before->span_us + peer_after->span_us);
-    if (peer_before->query_begin_us <= before->query_begin_us
-        && peer_after->query_end_us >= after->query_end_us)
-        sample->budget_peer_extra_us = psp_canvas_cadence_u32(
-            before->query_begin_us - peer_before->query_begin_us
-            + peer_after->query_end_us - after->query_end_us);
-    for (size_t at = 0; at < psp_canvas_peer_count; at++) {
-        uint32_t bit = UINT32_C(1) << at;
-        if ((peer_before->valid_mask & peer_after->valid_mask & bit) == 0u
-            || peer_after->run_us[at] < peer_before->run_us[at]) continue;
-        sample->budget_peer_mask |= bit;
-        sample->budget_peer_cpu_us[at] = psp_canvas_cadence_u32(
-            peer_after->run_us[at] - peer_before->run_us[at]);
-    }
-}
-
-static void psp_canvas_cadence_started(
-    uint64_t started_us, uint64_t runtime_us, uint64_t callback_us,
-    uint64_t webgl_us, uint64_t microtask_us, uint64_t script_runtime_us,
-    uint64_t navigation_runtime_us, uint64_t damage_apply_us,
-    uint64_t js_allocations, uint64_t js_frees,
-    uint64_t js_reallocations, uint64_t js_allocated_bytes,
-    uint64_t js_freed_bytes, size_t js_live_before, size_t js_live_after)
-{
-    if (psp_canvas_cadence.pending_started_us == 0) {
-        psp_canvas_cadence.pending_started_us = started_us;
-        psp_canvas_cadence.pending_runtime_turns = 1;
-        psp_canvas_cadence.pending_runtime_us = runtime_us;
-        psp_canvas_cadence.pending_script_runtime_us = script_runtime_us;
-        psp_canvas_cadence.pending_navigation_runtime_us =
-            navigation_runtime_us;
-        psp_canvas_cadence.pending_damage_apply_us = damage_apply_us;
-        psp_canvas_cadence.pending_callback_us = callback_us;
-        psp_canvas_cadence.pending_webgl_us = webgl_us;
-        psp_canvas_cadence.pending_microtask_us = microtask_us;
-        psp_canvas_cadence.pending_render_us = 0;
-        psp_canvas_cadence.pending_render_canvas_raster_us = 0;
-        psp_canvas_cadence.pending_render_canvas_overlay_us = 0;
-        psp_canvas_cadence.pending_render_cpu_us = 0;
-        psp_canvas_cadence.pending_render_cpu_samples = 0;
-        memset(&psp_canvas_cadence.pending_conversion, 0,
-               sizeof(psp_canvas_cadence.pending_conversion));
-        psp_canvas_cadence.pending_conversion_samples = 0;
-        psp_canvas_cadence.pending_js_allocations = js_allocations;
-        psp_canvas_cadence.pending_js_frees = js_frees;
-        psp_canvas_cadence.pending_js_reallocations = js_reallocations;
-        psp_canvas_cadence.pending_js_allocated_bytes = js_allocated_bytes;
-        psp_canvas_cadence.pending_js_freed_bytes = js_freed_bytes;
-        psp_canvas_cadence.pending_js_live_before = js_live_before;
-        psp_canvas_cadence.pending_js_live_after = js_live_after;
-        psp_canvas_cadence.pending_input_step =
-            psp_input_script_diagnostic_step();
-        psp_canvas_cadence.pending_input_buttons = (uint16_t)
-            psp_input_script_diagnostic_buttons();
-    } else {
-        /* Every turn contributes deltas, not cumulative totals. Previously
-           multi-turn frames counted turns but lost all later phase work. */
-        psp_canvas_cadence.pending_runtime_turns++;
-        psp_canvas_cadence.pending_runtime_us += runtime_us;
-        psp_canvas_cadence.pending_script_runtime_us += script_runtime_us;
-        psp_canvas_cadence.pending_navigation_runtime_us += navigation_runtime_us;
-        psp_canvas_cadence.pending_damage_apply_us += damage_apply_us;
-        psp_canvas_cadence.pending_callback_us += callback_us;
-        psp_canvas_cadence.pending_webgl_us += webgl_us;
-        psp_canvas_cadence.pending_microtask_us += microtask_us;
-        psp_canvas_cadence.pending_js_allocations += js_allocations;
-        psp_canvas_cadence.pending_js_frees += js_frees;
-        psp_canvas_cadence.pending_js_reallocations += js_reallocations;
-        psp_canvas_cadence.pending_js_allocated_bytes += js_allocated_bytes;
-        psp_canvas_cadence.pending_js_freed_bytes += js_freed_bytes;
-        psp_canvas_cadence.pending_js_live_after = js_live_after;
-    }
-}
-
-static void psp_canvas_cadence_webgl(
-    const ScriptWebglNativeMetrics *before,
-    const ScriptWebglNativeMetrics *after, bool available)
-{
-    if (!psp_canvas_cadence.causal_window) return;
-    PspCanvasWebglSample *sample = &psp_canvas_cadence.pending_webgl;
-    if (!available) { sample->invalid++; return; }
-#define PSP_CANVAS_WEBGL_CHECK(field, name) \
-    if (after->field < before->field \
-        || (uint64_t) (after->field - before->field) \
-            > UINT32_MAX - sample->value[PSP_CANVAS_WEBGL_##name]) { \
-        sample->invalid++; return; \
-    }
-    PSP_CANVAS_WEBGL_FIELDS(PSP_CANVAS_WEBGL_CHECK)
-#undef PSP_CANVAS_WEBGL_CHECK
-#define PSP_CANVAS_WEBGL_ADD(field, name) \
-    sample->value[PSP_CANVAS_WEBGL_##name] += \
-        (uint32_t) (after->field - before->field);
-    PSP_CANVAS_WEBGL_FIELDS(PSP_CANVAS_WEBGL_ADD)
-#undef PSP_CANVAS_WEBGL_ADD
-    sample->samples++;
-}
-
-static void psp_canvas_cadence_runtime_cpu(const ScriptRuntimeCpuMetrics *before,
-    const ScriptRuntimeCpuMetrics *after, bool available)
-{
-    if (!psp_canvas_cadence.causal_window) return;
-    PspCanvasRuntimeCpuSample *s = &psp_canvas_cadence.pending_cpu;
-    if (!available) return; /* Disabled measurement is not a bad clock. */
-    if (after->errors != before->errors) {s->invalid++; return;}
-    for (unsigned at = 0; at < SCRIPT_RUNTIME_CPU_PHASES; at++) {
-        if (after->inclusive_cpu_us[at] < before->inclusive_cpu_us[at]
-            || after->exclusive_cpu_us[at] < before->exclusive_cpu_us[at]
-            || after->calls[at] < before->calls[at]) {s->invalid++; return;}
-    }
-    for (unsigned at = 0; at < SCRIPT_RUNTIME_CPU_PHASES; at++) {
-        s->value.inclusive_cpu_us[at] += after->inclusive_cpu_us[at] - before->inclusive_cpu_us[at];
-        s->value.exclusive_cpu_us[at] += after->exclusive_cpu_us[at] - before->exclusive_cpu_us[at];
-        s->value.calls[at] += after->calls[at] - before->calls[at];
-    }
-    if (after->observer_us < before->observer_us) {s->invalid++; return;}
-    s->value.observer_us += after->observer_us - before->observer_us;
-    s->value.maximum_query_us = after->maximum_query_us;
-    s->samples++;
-}
-
-static void psp_canvas_cadence_rendered(
-    uint64_t render_us, uint64_t canvas_raster_us, uint64_t canvas_overlay_us,
-    const PspCanvasCpuSample *before, const PspCanvasCpuSample *after,
-    const RenderCanvasConversionMetrics *conversion)
-{
-    if (psp_canvas_cadence.pending_started_us != 0) {
-        psp_canvas_cadence.pending_render_us += render_us;
-        psp_canvas_cadence.pending_render_canvas_raster_us += canvas_raster_us;
-        psp_canvas_cadence.pending_render_canvas_overlay_us += canvas_overlay_us;
-        if (conversion != NULL) {
-            /* Last path metadata; samples identifies a multi-slice frame
-               where this is not the whole frame's row count. */
-            psp_canvas_cadence.pending_conversion = *conversion;
-            psp_canvas_cadence.pending_conversion_samples++;
-        }
-        if (before->valid && after->valid && after->run_us >= before->run_us) {
-            psp_canvas_cadence.pending_render_cpu_us += after->run_us - before->run_us;
-            psp_canvas_cadence.pending_render_cpu_samples++;
-        }
-        psp_canvas_cadence.pending_render_slices++;
-    }
-}
-
-static void psp_canvas_cadence_cpu(
-    const PspCanvasCpuSample *before, const PspCanvasCpuSample *after,
-    const PspCanvasPeerSample *peer_before, const PspCanvasPeerSample *peer_after)
-{
-    psp_canvas_cadence.pending_peer_span_us +=
-        (uint64_t) peer_before->span_us + peer_after->span_us;
-    if (before->valid && after->valid && peer_before->valid_mask != 0u
-        && peer_after->valid_mask != 0u) {
-        /* Peer counters bracket the owner queries too. Report that extra
-           window as uncertainty, never subtract observer time wholesale. */
-        psp_canvas_cadence.pending_peer_window_extra_us +=
-            before->query_begin_us - peer_before->query_begin_us
-            + peer_after->query_end_us - after->query_end_us;
-    }
-    for (size_t at = 0; at < psp_canvas_peer_count; at++) {
-        if ((peer_before->valid_mask & peer_after->valid_mask & (UINT32_C(1) << at)) == 0
-            || peer_after->run_us[at] < peer_before->run_us[at]) continue;
-        psp_canvas_cadence.pending_peer_cpu_us[at] += peer_after->run_us[at] - peer_before->run_us[at];
-        psp_canvas_cadence.pending_peer_samples[at]++;
-    }
-    if (!before->valid || !after->valid || after->run_us < before->run_us)
-        return;
-    /* Firmware reads runClocks somewhere inside each status query. These
-       matching wall bounds contain its actual interval; the midpoint is
-       only an estimate, with explicit bounds in the report. */
-    psp_canvas_cadence.pending_runtime_cpu_window_min_us +=
-        after->query_begin_us - before->query_end_us;
-    psp_canvas_cadence.pending_runtime_cpu_window_max_us +=
-        after->query_end_us - before->query_begin_us;
-    psp_canvas_cadence.pending_runtime_cpu_observer_us +=
-        before->query_end_us - before->query_begin_us
-        + after->query_end_us - after->query_begin_us;
-    psp_canvas_cadence.pending_runtime_cpu_us += after->run_us - before->run_us;
-    psp_canvas_cadence.pending_runtime_cpu_samples++;
-    psp_canvas_cadence.pending_runtime_interrupt_preempts +=
-        after->interrupt_preempts - before->interrupt_preempts;
-    psp_canvas_cadence.pending_runtime_thread_preempts +=
-        after->thread_preempts - before->thread_preempts;
-    psp_canvas_cadence.pending_runtime_releases += after->releases - before->releases;
-}
-
-static void psp_canvas_cadence_presented(
-    uint64_t presented_us, uint64_t present_us,
-    const PspPresentPhaseTiming *present_timing)
-{
-    PspCanvasCadence *metrics = &psp_canvas_cadence;
-    /* After webgl-measure-end, neither the end mark's own frame (which also
-       carries that mark's diagnostics) nor trailing script frames count. */
-    bool measured = !metrics->window_closed;
-    if (measured) metrics->presentations++;
-    if (measured && metrics->previous_present_us != 0
-        && presented_us >= metrics->previous_present_us) {
-        uint64_t interval = presented_us - metrics->previous_present_us;
-        if (interval > metrics->maximum_interval_us)
-            metrics->maximum_interval_us = interval;
-        if (interval <= UINT64_C(16667)) metrics->intervals_at_60hz++;
-        if (interval <= UINT64_C(33333)) metrics->intervals_at_30hz++;
-        if (metrics->interval_count < PSP_CANVAS_CADENCE_SAMPLE_LIMIT) {
-            metrics->intervals_us[metrics->interval_count++] =
-                interval > UINT32_MAX ? UINT32_MAX : (uint32_t) interval;
-        } else {
-            metrics->interval_samples_dropped++;
-        }
-    }
-    metrics->previous_present_us = presented_us;
-    if (measured && metrics->pending_started_us != 0
-        && presented_us >= metrics->pending_started_us) {
-        ScriptGameAudioNativeMetrics audio_native = {0};
-        script_runtime_game_audio_native_take(&audio_native);
-        uint64_t pipeline = presented_us - metrics->pending_started_us;
-        PspCanvasPhaseSample sample = {
-            .ordinal = psp_canvas_cadence_u32(metrics->pipeline_total + 1u),
-            .input_step = metrics->pending_input_step,
-            .input_buttons = metrics->pending_input_buttons,
-            .runtime_turns = metrics->pending_runtime_turns,
-            .render_slices = metrics->pending_render_slices,
-            .pipeline_us = psp_canvas_cadence_u32(pipeline),
-            .runtime_us = psp_canvas_cadence_u32(
-                metrics->pending_runtime_us),
-            .runtime_cpu_us = psp_canvas_cadence_u32(
-                metrics->pending_runtime_cpu_us),
-            .runtime_cpu_samples = metrics->pending_runtime_cpu_samples,
-            .runtime_cpu_window_min_us = psp_canvas_cadence_u32(
-                metrics->pending_runtime_cpu_window_min_us),
-            .runtime_cpu_window_max_us = psp_canvas_cadence_u32(
-                metrics->pending_runtime_cpu_window_max_us),
-            .runtime_cpu_observer_us = psp_canvas_cadence_u32(
-                metrics->pending_runtime_cpu_observer_us),
-            .peer_span_us = psp_canvas_cadence_u32(metrics->pending_peer_span_us),
-            .peer_window_extra_us = psp_canvas_cadence_u32(metrics->pending_peer_window_extra_us),
-            .runtime_interrupt_preempts = metrics->pending_runtime_interrupt_preempts,
-            .runtime_thread_preempts = metrics->pending_runtime_thread_preempts,
-            .runtime_releases = metrics->pending_runtime_releases,
-            .script_runtime_us = psp_canvas_cadence_u32(
-                metrics->pending_script_runtime_us),
-            .navigation_runtime_us = psp_canvas_cadence_u32(
-                metrics->pending_navigation_runtime_us),
-            .damage_apply_us = psp_canvas_cadence_u32(
-                metrics->pending_damage_apply_us),
-            .callback_us = psp_canvas_cadence_u32(
-                metrics->pending_callback_us),
-            .webgl_us = psp_canvas_cadence_u32(
-                metrics->pending_webgl_us),
-            .webgl = metrics->pending_webgl,
-            .runtime_cpu = metrics->pending_cpu,
-            .microtask_us = psp_canvas_cadence_u32(
-                metrics->pending_microtask_us),
-            .render_us = psp_canvas_cadence_u32(
-                metrics->pending_render_us),
-            .render_canvas_raster_us = psp_canvas_cadence_u32(
-                metrics->pending_render_canvas_raster_us),
-            .render_canvas_overlay_us = psp_canvas_cadence_u32(
-                metrics->pending_render_canvas_overlay_us),
-            .render_cpu_us = psp_canvas_cadence_u32(metrics->pending_render_cpu_us),
-            .render_cpu_samples = metrics->pending_render_cpu_samples,
-            .conversion = metrics->pending_conversion,
-            .conversion_samples = metrics->pending_conversion_samples,
-            .audio_native = audio_native,
-            .present_us = psp_canvas_cadence_u32(present_us),
-            .present_base_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->base_us),
-            .present_base_cpu_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->base_cpu_us),
-            .present_base_bytes = present_timing == NULL ? 0u
-                : present_timing->base_bytes,
-            .present_base_cpu_valid = present_timing != NULL
-                && present_timing->base_cpu_valid,
-            .present_composite_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->composite_us),
-            .present_publish_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->publish_us),
-            .present_flush_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(
-                    present_timing->publish_flush_us),
-            .present_set_framebuffer_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(
-                    present_timing->publish_set_framebuffer_us),
-            .present_vblank_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(
-                    present_timing->publish_vblank_us),
-            .ui_focus_scroll_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(
-                    present_timing->ui_focus_scroll_us),
-            .ui_chrome_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->ui_chrome_us),
-            .ui_cursor_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->ui_cursor_us),
-            .ui_screen_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->ui_screen_us),
-            .ui_toast_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->ui_toast_us),
-            .ui_loading_us = present_timing == NULL ? 0u
-                : psp_canvas_cadence_u32(present_timing->ui_loading_us),
-            .js_allocations = psp_canvas_cadence_u32(
-                metrics->pending_js_allocations),
-            .js_frees = psp_canvas_cadence_u32(
-                metrics->pending_js_frees),
-            .js_reallocations = psp_canvas_cadence_u32(
-                metrics->pending_js_reallocations),
-            .js_allocated_bytes = psp_canvas_cadence_u32(
-                metrics->pending_js_allocated_bytes),
-            .js_freed_bytes = psp_canvas_cadence_u32(
-                metrics->pending_js_freed_bytes),
-            .js_live_before = psp_canvas_cadence_u32(
-                metrics->pending_js_live_before),
-            .js_live_after = psp_canvas_cadence_u32(
-                metrics->pending_js_live_after),
-            .started_us = metrics->pending_started_us,
-            .ready_us = psp_validation_display_ready_us,
-            .latched_us = psp_validation_display_latched_us,
-            .previous_latched_us = metrics->previous_latched_us,
-            .ready_vcount = psp_validation_display_ready_vcount,
-            .latched_vcount = psp_validation_display_latched_vcount,
-            .previous_vcount = metrics->previous_vcount,
-            .causal_window = metrics->causal_window
-        };
-        psp_canvas_budget_copy(&sample, present_timing);
-        for (size_t at = 0; at < psp_canvas_peer_count; at++) {
-            sample.peer_cpu_us[at] = psp_canvas_cadence_u32(metrics->pending_peer_cpu_us[at]);
-            sample.peer_samples[at] = metrics->pending_peer_samples[at];
-        }
-        metrics->pipeline_total++;
-        if (pipeline > UINT64_C(34000)) {
-            metrics->pipelines_over_34ms++;
-            size_t insertion = metrics->slow_phase_count;
-            if (insertion == PSP_CANVAS_CADENCE_SLOW_LIMIT) {
-                if (sample.pipeline_us
-                        <= metrics->slow_phases[insertion - 1u].pipeline_us) {
-                    insertion = SIZE_MAX;
-                } else {
-                    insertion--;
-                }
-            } else {
-                metrics->slow_phase_count++;
-            }
-            if (insertion != SIZE_MAX) {
-                while (insertion != 0
-                       && metrics->slow_phases[insertion - 1u].pipeline_us
-                              < sample.pipeline_us) {
-                    metrics->slow_phases[insertion] =
-                        metrics->slow_phases[insertion - 1u];
-                    insertion--;
-                }
-                metrics->slow_phases[insertion] = sample;
-            }
-        }
-        if (!metrics->maximum_phase_valid
-            || pipeline > metrics->maximum_pipeline_us) {
-            metrics->maximum_pipeline_us = pipeline;
-            metrics->maximum_phase = sample;
-            metrics->maximum_phase_valid = true;
-        }
-        if (metrics->pipeline_count < PSP_CANVAS_CADENCE_SAMPLE_LIMIT) {
-            size_t at = metrics->pipeline_count++;
-            if (sample.causal_window && at < PSP_CANVAS_GAME_SAMPLE_LIMIT
-                && psp_webgl_measurement_navigation != NULL) {
-                uint64_t read_started = (uint64_t) sceKernelGetSystemTimeWide();
-                sample.game_packet_valid = script_runtime_copy_validation_frame_words(
-                    psp_webgl_measurement_navigation->page.runtime,
-                    metrics->game_words[at], PSP_CANVAS_GAME_WORDS,
-                    &sample.game_origin_us);
-                sample.packet_read_us = psp_canvas_cadence_u32(
-                    (uint64_t) sceKernelGetSystemTimeWide() - read_started);
-            }
-            metrics->pipeline_us[at] = psp_canvas_cadence_u32(pipeline);
-            metrics->phases[at] = sample;
-        } else {
-            metrics->pipeline_samples_dropped++;
-        }
-    }
-    metrics->previous_latched_us = psp_validation_display_latched_us;
-    metrics->previous_vcount = psp_validation_display_latched_vcount;
-    metrics->pending_started_us = 0;
-    metrics->pending_runtime_us = 0;
-    metrics->pending_runtime_cpu_us = 0;
-    metrics->pending_runtime_cpu_window_min_us = 0;
-    metrics->pending_runtime_cpu_window_max_us = 0;
-    metrics->pending_runtime_cpu_observer_us = 0;
-    metrics->pending_runtime_cpu_samples = 0;
-    memset(metrics->pending_peer_cpu_us, 0, sizeof(metrics->pending_peer_cpu_us));
-    memset(metrics->pending_peer_samples, 0, sizeof(metrics->pending_peer_samples));
-    metrics->pending_peer_span_us = 0;
-    metrics->pending_peer_window_extra_us = 0;
-    metrics->pending_runtime_interrupt_preempts = 0;
-    metrics->pending_runtime_thread_preempts = 0;
-    metrics->pending_runtime_releases = 0;
-    metrics->pending_script_runtime_us = 0;
-    metrics->pending_navigation_runtime_us = 0;
-    metrics->pending_damage_apply_us = 0;
-    metrics->pending_runtime_turns = 0;
-    metrics->pending_render_slices = 0;
-    metrics->pending_callback_us = 0;
-    metrics->pending_webgl_us = 0;
-    memset(&metrics->pending_webgl, 0, sizeof(metrics->pending_webgl));
-    memset(&metrics->pending_cpu, 0, sizeof(metrics->pending_cpu));
-    metrics->pending_microtask_us = 0;
-    metrics->pending_render_us = 0;
-    metrics->pending_render_canvas_raster_us = 0;
-    metrics->pending_render_canvas_overlay_us = 0;
-    metrics->pending_render_cpu_us = 0;
-    metrics->pending_render_cpu_samples = 0;
-    metrics->pending_js_allocations = 0;
-    metrics->pending_js_frees = 0;
-    metrics->pending_js_reallocations = 0;
-    metrics->pending_js_allocated_bytes = 0;
-    metrics->pending_js_freed_bytes = 0;
-    metrics->pending_js_live_before = 0;
-    metrics->pending_js_live_after = 0;
-    metrics->pending_input_step = 0;
-    metrics->pending_input_buttons = 0;
-    psp_canvas_budget_after_present();
-}
-
-static TILEFINCH_OUT_OF_LINE void psp_canvas_cadence_observe_present(
-    unsigned render_visual_state, unsigned presents_before,
-    uint64_t present_started_us, uint64_t present_finished_us)
-{
-    if (render_visual_state != 2u
-        || psp_display.presents == presents_before) return;
-    PspPresentPhaseTiming present_timing;
-    const PspPresentPhaseTiming *timing =
-        psp_present_validation_last_timing(&present_timing)
-            ? &present_timing : NULL;
-    psp_canvas_cadence_presented(present_finished_us,
-        present_finished_us >= present_started_us
-            ? present_finished_us - present_started_us : 0,
-        timing);
-}
-
-static uint32_t psp_canvas_cadence_percentile(
-    const uint32_t *samples, size_t count, unsigned percentile)
-{
-    if (samples == NULL || count == 0 || percentile > 100u) return 0;
-    memcpy(psp_canvas_cadence.sorted_us, samples,
-           count * sizeof(psp_canvas_cadence.sorted_us[0]));
-    for (size_t at = 1; at < count; at++) {
-        uint32_t value = psp_canvas_cadence.sorted_us[at];
-        size_t before = at;
-        while (before != 0
-               && psp_canvas_cadence.sorted_us[before - 1u] > value) {
-            psp_canvas_cadence.sorted_us[before] =
-                psp_canvas_cadence.sorted_us[before - 1u];
-            before--;
-        }
-        psp_canvas_cadence.sorted_us[before] = value;
-    }
-    size_t rank = (count * percentile + 99u) / 100u;
-    if (rank != 0) rank--;
-    if (rank >= count) rank = count - 1u;
-    return psp_canvas_cadence.sorted_us[rank];
-}
-
-static void psp_report_canvas_cadence(void)
-{
-    const PspCanvasCadence *metrics = &psp_canvas_cadence;
-    size_t gaps = metrics->causal_loops_without_sample;
-    if (gaps > PSP_CANVAS_LOOP_GAP_LIMIT) gaps = PSP_CANVAS_LOOP_GAP_LIMIT;
-    for (size_t at = 0; at < gaps; at++) {
-        const PspCanvasLoopGap *g = &metrics->causal_loop_gaps[at];
-        printf("tilefinch-canvas-loop-gap: begin-us=%llu end-us=%llu "
-            "wait=%lu runtime=%lu callbacks=%lu timer-known=%d "
-            "timer-frame=%d due-us=%lld fast-followup=%d\n",
-            (unsigned long long)g->start_us, (unsigned long long)g->end_us,
-            (unsigned long)g->wait_us, (unsigned long)g->runtime_us,
-            (unsigned long)g->callbacks, g->timer_known, g->timer_frame,
-            (long long)g->due_us, g->fast_followup);
-    }
-    /* Dump after measurement, never printf from the critical frame path.
-       runtime includes callback/microtasks; WebGL nests in microtasks. */
-    for (size_t at = 0; at < metrics->pipeline_count; at++) {
-        const PspCanvasPhaseSample *s = &metrics->phases[at];
-        if (!s->causal_window) continue;
-        if (s->loop_start_us != 0) {
-            const uint32_t *p = s->loop_phase_us;
-            printf("tilefinch-loop-timing: begin-us=%llu end-us=%llu "
-                "wait=%lu input=%lu action=%lu probe=%lu navigation=%lu "
-                "runtime=%lu idle=%lu raster=%lu present=%lu images=%lu tail=%lu\n",
-                (unsigned long long)s->loop_start_us,
-                (unsigned long long)s->loop_end_us,
-                (unsigned long)p[0],(unsigned long)p[1],(unsigned long)p[2],
-                (unsigned long)p[3],(unsigned long)p[4],(unsigned long)p[5],
-                (unsigned long)p[6],(unsigned long)p[7],(unsigned long)p[8],
-                (unsigned long)p[9],(unsigned long)p[10]);
-        }
-        printf("tilefinch-canvas-frame: n=%lu step=%u buttons=%u "
-            "start=%lluus ready=%lluus latch=%lluus previous=%lluus "
-            "vready=%lu vlatch=%lu vprevious=%lu turns=%lu slices=%lu "
-            "runtime=%lu callback=%lu microtask=%lu webgl=%lu render=%lu "
-            "base=%lu composite=%lu flush=%lu set=%lu wait=%lu "
-            "packet-read=%lu alloc=%lu bytes=%lu\n",
-            (unsigned long)s->ordinal, s->input_step, s->input_buttons,
-            (unsigned long long)s->started_us, (unsigned long long)s->ready_us,
-            (unsigned long long)s->latched_us,
-            (unsigned long long)s->previous_latched_us,
-            (unsigned long)s->ready_vcount, (unsigned long)s->latched_vcount,
-            (unsigned long)s->previous_vcount, (unsigned long)s->runtime_turns,
-            (unsigned long)s->render_slices, (unsigned long)s->runtime_us,
-            (unsigned long)s->callback_us, (unsigned long)s->microtask_us,
-            (unsigned long)s->webgl_us, (unsigned long)s->render_us,
-            (unsigned long)s->present_base_us, (unsigned long)s->present_composite_us,
-            (unsigned long)s->present_flush_us,
-            (unsigned long)s->present_set_framebuffer_us,
-            (unsigned long)s->present_vblank_us, (unsigned long)s->packet_read_us,
-            (unsigned long)s->js_allocations, (unsigned long)s->js_allocated_bytes);
-        printf("tilefinch-canvas-cpu: n=%lu samples=%lu runtime=%lu "
-            "cpu=%lu wall-min=%lu wall-max=%lu observer=%lu "
-            "interrupt-preempts=%lu thread-preempts=%lu releases=%lu\n",
-            (unsigned long)s->ordinal, (unsigned long)s->runtime_cpu_samples,
-            (unsigned long)s->runtime_us, (unsigned long)s->runtime_cpu_us,
-            (unsigned long)s->runtime_cpu_window_min_us,
-            (unsigned long)s->runtime_cpu_window_max_us,
-            (unsigned long)s->runtime_cpu_observer_us,
-            (unsigned long)s->runtime_interrupt_preempts,
-            (unsigned long)s->runtime_thread_preempts,
-            (unsigned long)s->runtime_releases);
-        printf("tilefinch-canvas-webgl: n=%lu samples=%lu invalid=%lu",
-            (unsigned long)s->ordinal, (unsigned long)s->webgl.samples,
-            (unsigned long)s->webgl.invalid);
-        for (size_t at = 0; at < PSP_CANVAS_WEBGL_FIELD_COUNT; at++)
-            printf(" %s=%lu", psp_canvas_webgl_names[at],
-                (unsigned long)s->webgl.value[at]);
-        printf("\n");
-        static const char *const cpu_names[] = {
-            "advance", "preparation", "callback", "jobs", "webgl", "refresh"
-        };
-        const PspCanvasRuntimeCpuSample *rc = &s->runtime_cpu;
-        printf("tilefinch-canvas-runtime-cpu: n=%lu samples=%lu invalid=%lu observer=%llu query-max=%llu",
-            (unsigned long)s->ordinal, (unsigned long)rc->samples, (unsigned long)rc->invalid,
-            (unsigned long long)rc->value.observer_us, (unsigned long long)rc->value.maximum_query_us);
-        for (unsigned at = 0; at < SCRIPT_RUNTIME_CPU_PHASES; at++)
-            printf(" %s=%llu/%llu/%llu", cpu_names[at],
-                (unsigned long long)rc->value.inclusive_cpu_us[at],
-                (unsigned long long)rc->value.exclusive_cpu_us[at],
-                (unsigned long long)rc->value.calls[at]);
-        printf("\n");
-        /* Stopping live sampling must not hide already buffered observations.
-           The sampler's enable bit/count may be cleared before this dump. */
-        for (size_t at = 0; at < PSP_CANVAS_PEER_LIMIT; at++)
-            if (s->peer_samples[at] != 0u)
-                printf("tilefinch-canvas-peer-cpu: n=%lu slot=%lu samples=%lu cpu=%lu span=%lu extra=%lu\n",
-                       (unsigned long) s->ordinal, (unsigned long) at,
-                       (unsigned long) s->peer_samples[at], (unsigned long) s->peer_cpu_us[at],
-                       (unsigned long) s->peer_span_us, (unsigned long) s->peer_window_extra_us);
-        printf("tilefinch-canvas-raster: n=%lu samples=%lu cpu=%lu "
-            "convert=%lu overlay=%lu\n",
-            (unsigned long)s->ordinal, (unsigned long)s->render_cpu_samples,
-            (unsigned long)s->render_cpu_us,
-            (unsigned long)s->render_canvas_raster_us,
-            (unsigned long)s->render_canvas_overlay_us);
-        printf("tilefinch-canvas-copy: n=%lu valid=%u cpu=%lu bytes=%lu\n",
-            (unsigned long)s->ordinal, s->present_base_cpu_valid ? 1u : 0u,
-            (unsigned long)s->present_base_cpu_us,
-            (unsigned long)s->present_base_bytes);
-        if (s->budget_valid) {
-            printf("tilefinch-canvas-budget: n=%lu begin=%llu end=%llu "
-                "cpu=%lu wall-min=%lu wall-max=%lu observer=%lu peer-span=%lu peer-extra=%lu mask=%lu\n",
-                (unsigned long)s->ordinal,
-                (unsigned long long)s->budget_begin_us, (unsigned long long)s->budget_end_us,
-                (unsigned long)s->budget_owner_cpu_us,
-                (unsigned long)s->budget_wall_min_us, (unsigned long)s->budget_wall_max_us,
-                (unsigned long)s->budget_observer_us, (unsigned long)s->budget_peer_span_us,
-                (unsigned long)s->budget_peer_extra_us, (unsigned long)s->budget_peer_mask);
-            for (size_t at = 0; at < PSP_CANVAS_PEER_LIMIT; at++)
-                if ((s->budget_peer_mask & (UINT32_C(1) << at)) != 0u)
-                    printf("tilefinch-canvas-budget-peer: n=%lu slot=%lu cpu=%lu\n",
-                        (unsigned long)s->ordinal, (unsigned long)at,
-                        (unsigned long)s->budget_peer_cpu_us[at]);
-        }
-        const RenderCanvasConversionMetrics *c = &s->conversion;
-        printf("tilefinch-canvas-conversion: n=%lu samples=%lu kernel=%lu "
-            "general=%lu repeat=%lu skipped=%lu vfpu=%lu pixels=%lu native=%u setup=%u "
-            "address=%lu stride=%lu width=%d height=%d out-width=%d out-height=%d\n",
-            (unsigned long)s->ordinal, (unsigned long)s->conversion_samples,
-            (unsigned long)c->kernel_rows, (unsigned long)c->general_rows,
-            (unsigned long)c->repeat_rows, (unsigned long)c->skipped_rows,
-            (unsigned long)c->vfpu_rows,
-            (unsigned long)c->source_pixels, c->native_source ? 1u : 0u,
-            c->setup_once ? 1u : 0u,
-            (unsigned long)c->source_address, (unsigned long)c->source_stride,
-            c->source_width, c->source_height, c->output_width, c->output_height);
-        for (unsigned command = 0; command < SCRIPT_GAME_AUDIO_NATIVE_COMMANDS;
-             command++) {
-            if (s->audio_native.command_calls[command] == 0) continue;
-            printf("tilefinch-canvas-audio: n=%lu command=%u calls=%lu us=%llu nested=%lu\n",
-                (unsigned long)s->ordinal, command,
-                (unsigned long)s->audio_native.command_calls[command],
-                (unsigned long long)s->audio_native.command_us[command],
-                (unsigned long)s->audio_native.nested_calls);
-        }
-        if (!s->game_packet_valid || at >= PSP_CANVAS_GAME_SAMPLE_LIMIT) continue;
-        char line[1536];
-        int used = snprintf(line, sizeof(line),
-            "tilefinch-canvas-game: n=%lu origin=%lluus words=",
-            (unsigned long)s->ordinal, (unsigned long long)s->game_origin_us);
-        if (used < 0 || (size_t)used >= sizeof(line)) continue;
-        bool complete = true;
-        for (size_t word = 0; word < PSP_CANVAS_GAME_WORDS; word++) {
-            int added = snprintf(line + used, sizeof(line) - (size_t)used,
-                "%s%lu", word == 0 ? "" : ",",
-                (unsigned long)metrics->game_words[at][word]);
-            if (added < 0 || (size_t)added >= sizeof(line) - (size_t)used) {
-                complete = false;
-                break;
-            }
-            used += added;
-        }
-        if (complete) printf("%s\n", line);
-    }
-    uint32_t interval_p99 = psp_canvas_cadence_percentile(
-        metrics->intervals_us, metrics->interval_count, 99u);
-    uint32_t pipeline_p95 = psp_canvas_cadence_percentile(
-        metrics->pipeline_us, metrics->pipeline_count, 95u);
-    uint32_t pipeline_p99 = psp_canvas_cadence_percentile(
-        metrics->pipeline_us, metrics->pipeline_count, 99u);
-    printf(
-        "tilefinch-canvas-cadence: presents=%zu intervals=%zu "
-        "interval-p50=%luus interval-p95=%luus interval-p99=%luus "
-        "interval-max=%lluus "
-        "within-16.67ms=%zu within-33.33ms=%zu pipeline-samples=%zu "
-        "pipeline-p50=%luus pipeline-p95=%luus pipeline-p99=%luus "
-        "pipeline-max=%lluus interval-dropped=%zu pipeline-dropped=%zu "
-        "causal-loops-without-sample=%zu\n",
-        metrics->presentations, metrics->interval_count,
-        (unsigned long) psp_canvas_cadence_percentile(
-            metrics->intervals_us, metrics->interval_count, 50u),
-        (unsigned long) psp_canvas_cadence_percentile(
-            metrics->intervals_us, metrics->interval_count, 95u),
-        (unsigned long) interval_p99,
-        (unsigned long long) metrics->maximum_interval_us,
-        metrics->intervals_at_60hz, metrics->intervals_at_30hz,
-        metrics->pipeline_count,
-        (unsigned long) psp_canvas_cadence_percentile(
-            metrics->pipeline_us, metrics->pipeline_count, 50u),
-        (unsigned long) pipeline_p95,
-        (unsigned long) pipeline_p99,
-        (unsigned long long) metrics->maximum_pipeline_us,
-        metrics->interval_samples_dropped,
-        metrics->pipeline_samples_dropped,
-        metrics->causal_loops_without_sample);
-    if (metrics->pipeline_count == 0) return;
-    size_t tail_count = 0;
-    uint64_t tail_runtime = 0, tail_callback = 0, tail_webgl = 0;
-    uint64_t tail_microtask = 0, tail_render = 0, tail_present = 0;
-    uint64_t tail_present_base = 0, tail_present_composite = 0;
-    uint64_t tail_present_publish = 0;
-    uint64_t tail_present_flush = 0, tail_present_set = 0;
-    uint64_t tail_present_vblank = 0;
-    uint64_t tail_ui_focus = 0, tail_ui_chrome = 0, tail_ui_cursor = 0;
-    uint64_t tail_ui_screen = 0, tail_ui_toast = 0, tail_ui_loading = 0;
-    uint64_t tail_other = 0;
-    size_t p99_index = SIZE_MAX, maximum_index = 0;
-    for (size_t at = 0; at < metrics->pipeline_count; at++) {
-        const PspCanvasPhaseSample *sample = &metrics->phases[at];
-        if (sample->pipeline_us >= pipeline_p95) {
-            uint64_t accounted = (uint64_t) sample->runtime_us
-                + sample->render_us + sample->present_us;
-            tail_count++;
-            tail_runtime += sample->runtime_us;
-            tail_callback += sample->callback_us;
-            tail_webgl += sample->webgl_us;
-            tail_microtask += sample->microtask_us;
-            tail_render += sample->render_us;
-            tail_present += sample->present_us;
-            tail_present_base += sample->present_base_us;
-            tail_present_composite += sample->present_composite_us;
-            tail_present_publish += sample->present_publish_us;
-            tail_present_flush += sample->present_flush_us;
-            tail_present_set += sample->present_set_framebuffer_us;
-            tail_present_vblank += sample->present_vblank_us;
-            tail_ui_focus += sample->ui_focus_scroll_us;
-            tail_ui_chrome += sample->ui_chrome_us;
-            tail_ui_cursor += sample->ui_cursor_us;
-            tail_ui_screen += sample->ui_screen_us;
-            tail_ui_toast += sample->ui_toast_us;
-            tail_ui_loading += sample->ui_loading_us;
-            if (sample->pipeline_us > accounted)
-                tail_other += sample->pipeline_us - accounted;
-        }
-        if (p99_index == SIZE_MAX && sample->pipeline_us == pipeline_p99)
-            p99_index = at;
-        if (sample->pipeline_us
-                > metrics->phases[maximum_index].pipeline_us)
-            maximum_index = at;
-    }
-    if (p99_index == SIZE_MAX) p99_index = maximum_index;
-    printf(
-        "tilefinch-canvas-tail: over-34ms=%zu/%zu p95-count=%zu "
-        "p95-avg-runtime=%lluus callback=%lluus webgl=%lluus "
-        "microtask=%lluus render=%lluus present=%lluus other=%lluus\n",
-        metrics->pipelines_over_34ms, metrics->pipeline_total, tail_count,
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_runtime / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_callback / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_webgl / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_microtask / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_render / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_other / tail_count));
-    printf(
-        "tilefinch-canvas-present-tail: p95-count=%zu "
-        "base=%lluus composite=%lluus publish=%lluus "
-        "flush=%lluus set=%lluus vblank=%lluus\n",
-        tail_count,
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_base / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_composite / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_publish / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_flush / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_set / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_present_vblank / tail_count));
-    printf(
-        "tilefinch-canvas-ui-tail: p95-count=%zu focus-scroll=%lluus "
-        "chrome=%lluus cursor=%lluus screen=%lluus toast=%lluus "
-        "loading=%lluus\n",
-        tail_count,
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_focus / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_chrome / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_cursor / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_screen / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_toast / tail_count),
-        (unsigned long long) (tail_count == 0 ? 0
-            : tail_ui_loading / tail_count));
-    const PspCanvasPhaseSample *p99 = &metrics->phases[p99_index];
-    const PspCanvasPhaseSample *maximum = metrics->maximum_phase_valid
-        ? &metrics->maximum_phase : &metrics->phases[maximum_index];
-    uint64_t p99_accounted = (uint64_t) p99->runtime_us
-        + p99->render_us + p99->present_us;
-    uint64_t maximum_accounted = (uint64_t) maximum->runtime_us
-        + maximum->render_us + maximum->present_us;
-    printf(
-        "tilefinch-canvas-p99-frame: total=%luus runtime=%luus "
-        "callback=%luus webgl=%luus microtask=%luus render=%luus "
-        "present=%luus base=%luus composite=%luus publish=%luus "
-        "flush=%luus set=%luus vblank=%luus "
-        "ui=%lu/%lu/%lu/%lu/%lu/%luus "
-        "other=%lluus\n",
-        (unsigned long) p99->pipeline_us,
-        (unsigned long) p99->runtime_us,
-        (unsigned long) p99->callback_us,
-        (unsigned long) p99->webgl_us,
-        (unsigned long) p99->microtask_us,
-        (unsigned long) p99->render_us,
-        (unsigned long) p99->present_us,
-        (unsigned long) p99->present_base_us,
-        (unsigned long) p99->present_composite_us,
-        (unsigned long) p99->present_publish_us,
-        (unsigned long) p99->present_flush_us,
-        (unsigned long) p99->present_set_framebuffer_us,
-        (unsigned long) p99->present_vblank_us,
-        (unsigned long) p99->ui_focus_scroll_us,
-        (unsigned long) p99->ui_chrome_us,
-        (unsigned long) p99->ui_cursor_us,
-        (unsigned long) p99->ui_screen_us,
-        (unsigned long) p99->ui_toast_us,
-        (unsigned long) p99->ui_loading_us,
-        (unsigned long long) (p99->pipeline_us > p99_accounted
-            ? p99->pipeline_us - p99_accounted : 0));
-    printf(
-        "tilefinch-canvas-worst-frame: total=%luus runtime=%luus "
-        "callback=%luus webgl=%luus microtask=%luus render=%luus "
-        "present=%luus base=%luus composite=%luus publish=%luus "
-        "flush=%luus set=%luus vblank=%luus "
-        "ui=%lu/%lu/%lu/%lu/%lu/%luus "
-        "other=%lluus\n",
-        (unsigned long) maximum->pipeline_us,
-        (unsigned long) maximum->runtime_us,
-        (unsigned long) maximum->callback_us,
-        (unsigned long) maximum->webgl_us,
-        (unsigned long) maximum->microtask_us,
-        (unsigned long) maximum->render_us,
-        (unsigned long) maximum->present_us,
-        (unsigned long) maximum->present_base_us,
-        (unsigned long) maximum->present_composite_us,
-        (unsigned long) maximum->present_publish_us,
-        (unsigned long) maximum->present_flush_us,
-        (unsigned long) maximum->present_set_framebuffer_us,
-        (unsigned long) maximum->present_vblank_us,
-        (unsigned long) maximum->ui_focus_scroll_us,
-        (unsigned long) maximum->ui_chrome_us,
-        (unsigned long) maximum->ui_cursor_us,
-        (unsigned long) maximum->ui_screen_us,
-        (unsigned long) maximum->ui_toast_us,
-        (unsigned long) maximum->ui_loading_us,
-        (unsigned long long) (maximum->pipeline_us > maximum_accounted
-            ? maximum->pipeline_us - maximum_accounted : 0));
-    for (size_t rank = 0; rank < metrics->slow_phase_count; rank++) {
-        const PspCanvasPhaseSample *slow = &metrics->slow_phases[rank];
-        uint64_t accounted = (uint64_t) slow->runtime_us
-            + slow->render_us + slow->present_us;
-        printf(
-            "tilefinch-canvas-over34: rank=%zu frame=%lu step=%u "
-            "buttons=0x%04x total=%luus "
-            "turns=%lu slices=%lu "
-            "runtime=%luus script=%luus navigation=%luus damage=%luus "
-            "callback=%luus webgl=%luus microtask=%luus "
-            "render=%luus present=%luus base=%luus composite=%luus "
-            "vblank=%luus other=%lluus alloc=%lu/%luB free=%lu/%luB "
-            "live=%lu->%luB\n",
-            rank + 1u, (unsigned long) slow->ordinal,
-            (unsigned) slow->input_step, (unsigned) slow->input_buttons,
-            (unsigned long) slow->pipeline_us,
-            (unsigned long) slow->runtime_turns,
-            (unsigned long) slow->render_slices,
-            (unsigned long) slow->runtime_us,
-            (unsigned long) slow->script_runtime_us,
-            (unsigned long) slow->navigation_runtime_us,
-            (unsigned long) slow->damage_apply_us,
-            (unsigned long) slow->callback_us,
-            (unsigned long) slow->webgl_us,
-            (unsigned long) slow->microtask_us,
-            (unsigned long) slow->render_us,
-            (unsigned long) slow->present_us,
-            (unsigned long) slow->present_base_us,
-            (unsigned long) slow->present_composite_us,
-            (unsigned long) slow->present_vblank_us,
-            (unsigned long long) (slow->pipeline_us > accounted
-                ? slow->pipeline_us - accounted : 0),
-            (unsigned long) slow->js_allocations,
-            (unsigned long) slow->js_allocated_bytes,
-            (unsigned long) slow->js_frees,
-            (unsigned long) slow->js_freed_bytes,
-            (unsigned long) slow->js_live_before,
-            (unsigned long) slow->js_live_after);
-    }
-    printf(
-        "tilefinch-canvas-js-p99: alloc=%lu/%luB free=%lu/%luB "
-        "realloc=%lu live=%lu->%luB\n",
-        (unsigned long) p99->js_allocations,
-        (unsigned long) p99->js_allocated_bytes,
-        (unsigned long) p99->js_frees,
-        (unsigned long) p99->js_freed_bytes,
-        (unsigned long) p99->js_reallocations,
-        (unsigned long) p99->js_live_before,
-        (unsigned long) p99->js_live_after);
-    printf(
-        "tilefinch-canvas-js-worst: alloc=%lu/%luB free=%lu/%luB "
-        "realloc=%lu live=%lu->%luB\n",
-        (unsigned long) maximum->js_allocations,
-        (unsigned long) maximum->js_allocated_bytes,
-        (unsigned long) maximum->js_frees,
-        (unsigned long) maximum->js_freed_bytes,
-        (unsigned long) maximum->js_reallocations,
-        (unsigned long) maximum->js_live_before,
-        (unsigned long) maximum->js_live_after);
-}
-
-static TILEFINCH_OUT_OF_LINE void psp_game_audio_report_blocks(
-    const TilefinchGameAudioMixMetrics *metrics)
-{
-    printf("tilefinch-audio-block-records: count=%lu overflow=%lu\n",
-        (unsigned long)metrics->block_records,
-        (unsigned long)metrics->record_overflow);
-    for (size_t at = 0; at < metrics->block_records; at++) {
-        TilefinchGameAudioBlockRecord record;
-        if (!tilefinch_game_audio_validation_mix_block(at, &record)) {
-            printf("tilefinch-audio-block-records: read-failed=%lu\n", (unsigned long)at);
-            return;
-        }
-        printf("tilefinch-audio-block-record: n=%lu output-frame=%lu frames=%lu "
-            "begin-min=%llu begin-max=%llu mix-min=%llu mix-max=%llu "
-            "end-min=%llu end-max=%llu cpu-begin=%llu cpu-mix=%llu cpu-end=%llu "
-            "silent=%lu audible=%lu constant=%lu automated=%lu fast-forwarded=%lu "
-            "result=%ld valid=%u counted=%u\n",
-            (unsigned long)at, (unsigned long)record.output_frame,
-            (unsigned long)record.frames,
-            (unsigned long long)record.begin_before_us,
-            (unsigned long long)record.begin_after_us,
-            (unsigned long long)record.mixed_before_us,
-            (unsigned long long)record.mixed_after_us,
-            (unsigned long long)record.submitted_before_us,
-            (unsigned long long)record.submitted_after_us,
-            (unsigned long long)record.begin_cpu_us,
-            (unsigned long long)record.mixed_cpu_us,
-            (unsigned long long)record.submitted_cpu_us,
-            (unsigned long)record.silent, (unsigned long)record.audible,
-            (unsigned long)record.constant, (unsigned long)record.automated,
-            (unsigned long)record.fast_forwarded, (long)record.output_result,
-            record.clocks_valid ? 1u : 0u, record.work_counted ? 1u : 0u);
-    }
-}
-
-/* Set by webgl-measure-start; the counters reset on the next frame. */
-static bool psp_webgl_measurement_reset_pending;
-
-static void psp_webgl_measurement_reset(const NavigationSession *navigation)
-{
-    memset(&psp_canvas_cadence, 0, sizeof(psp_canvas_cadence));
-    memset(&psp_canvas_budget_begin, 0, sizeof(psp_canvas_budget_begin));
-    memset(&psp_canvas_budget_end, 0, sizeof(psp_canvas_budget_end));
-    psp_canvas_cadence.causal_window = true;
-    psp_present_validation_pre_publish_hook(psp_canvas_peer_enabled
-        ? psp_canvas_budget_pre_publish : NULL);
-    psp_present_validation_measure_cpu(true);
-    script_runtime_game_audio_native_measure(psp_validation_native_detail);
-    psp_runtime_advance_total_us = 0;
-    psp_runtime_advance_maximum_us = 0;
-    psp_runtime_advance_calls = 0;
-    psp_runtime_layout_changes = 0;
-    psp_runtime_render_deferrals = 0;
-    psp_runtime_handoff_deferrals = 0;
-    psp_runtime_reclaim_deferrals = 0;
-    script_runtime_webgl_native_metrics_reset();
-    script_runtime_timing_metrics_reset(
-        navigation == NULL ? NULL : navigation->page.runtime);
-    printf("tilefinch-webgl-measurement: event=reset\n");
-    if (!psp_validation_canvas_live_trace) {
-        bool retained = psp_log_begin_timing_window();
-        script_runtime_suppress_checkpoint_trace(
-            navigation == NULL ? NULL : navigation->page.runtime, retained);
-        printf("tilefinch-webgl-measurement: buffered-log=%d\n", retained);
-    }
-}
-
-static bool psp_validation_video_timing_window;
-static unsigned psp_validation_video_suppressed_loops;
-static unsigned psp_validation_video_suppressed_publications;
-static atomic_int psp_validation_video_window_requested;
-static atomic_int psp_validation_video_copy_requested;
-
-/* The main loop's input step, before its script turn. Only here, never from
-   the busy-frame supervisor, so the reset cannot split a frame. */
-void psp_webgl_measurement_main_frame(void)
-{
-    /* Live marks can be consumed by the busy-frame supervisor. It may queue
-       a request, but must not reset owner-thread presentation counters or
-       change a GE copy while that owner's draw is in progress. */
-    int copy = atomic_exchange(&psp_validation_video_copy_requested, 0);
-    if (copy != 0) psp_media_present_ge_stage_rows_enabled(copy == 2);
-    int window = atomic_exchange(&psp_validation_video_window_requested, 0);
-    if (window == 1) {
-        psp_validation_video_timing_window = psp_log_begin_timing_window();
-        psp_validation_video_suppressed_loops = 0;
-        psp_validation_video_suppressed_publications = 0;
-        printf("tilefinch-video-timing: buffered=%d\n",
-               psp_validation_video_timing_window ? 1 : 0);
-        psp_video_scanout_measurement(true);
-    } else if (window == 2) {
-        psp_validation_video_timing_window = false;
-        /* Snapshots end at the last presentation. Flush before reporting so
-           a full diagnostic buffer cannot silently drop the summary. */
-        psp_log_end_timing_window();
-        printf("tilefinch-video-timing: suppressed-loops=%u "
-               "suppressed-publications=%u\n",
-               psp_validation_video_suppressed_loops,
-               psp_validation_video_suppressed_publications);
-        psp_video_scanout_measurement(false);
-        psp_report_presentation_cadence("video-window");
-    }
-    if (!psp_webgl_measurement_reset_pending) return;
-    psp_webgl_measurement_reset_pending = false;
-    psp_webgl_measurement_reset(psp_webgl_measurement_navigation);
-}
-
-void psp_webgl_measurement_mark(const char *mark)
-{
-    if (mark != NULL && strcmp(mark, "queue-perf") == 0) {
-        bool passed = psp_webgl_measurement_navigation != NULL
-            && psp_queue_menu_profile(psp_webgl_measurement_navigation->budget);
-        printf("tilefinch-menu-profile: outcome=%s\n", passed ? "pass" : "fail");
-    }
-    if (mark != NULL && strcmp(mark, "queue-shortcut") == 0) {
-        bool passed = psp_queue_shortcut_qualify();
-        printf("tilefinch-queue-shortcut: outcome=%s checked-states=%u\n",
-            passed ? "pass" : "fail", passed ? 4u : 0u);
-    }
-    if (mark != NULL && strcmp(mark, "copy-vfpu-on") == 0)
-        psp_present_validation_vfpu_copy(true, false);
-    else if (mark != NULL && strcmp(mark, "copy-vfpu-off") == 0)
-        psp_present_validation_vfpu_copy(false, false);
-    else if (mark != NULL && strcmp(mark, "copy-vfpu-check") == 0)
-        psp_present_validation_vfpu_copy(true, true);
-    else if (mark != NULL && strcmp(mark, "copy-vfpu-stat") == 0) {
-        uint32_t copies, checks, errors;
-        psp_present_validation_vfpu_copy_counts(&copies, &checks, &errors);
-        printf("tilefinch-copy-vfpu: copies=%lu checks=%lu errors=%lu\n",
-            (unsigned long) copies, (unsigned long) checks,
-            (unsigned long) errors);
-    }
-    if (mark != NULL && (strcmp(mark, "audio-slots-pre") == 0
-                        || strcmp(mark, "audio-slots-post") == 0
-                        || strcmp(mark, "audio-slots-end") == 0)) {
-        unsigned phase = strcmp(mark, "audio-slots-pre") == 0 ? 1u
-            : strcmp(mark, "audio-slots-post") == 0 ? 2u : 3u;
-        unsigned empty = 0u;
-        bool queued = atomic_compare_exchange_strong_explicit(
-            &psp_audio_slots_receipt_phase, &empty, phase,
-            memory_order_release, memory_order_relaxed);
-        printf("tilefinch-audio-slots-request: mark=%s deferred=1 queued=%u\n",
-               mark, queued ? 1u : 0u);
-        return;
-    }
-    if (mark != NULL && strcmp(mark, "webgl-tint-off") == 0)
-        script_runtime_webgl_validation_tint_share(false);
-    else if (mark != NULL && strcmp(mark, "webgl-tint-on") == 0)
-        script_runtime_webgl_validation_tint_share(true);
-    else if (mark != NULL && strcmp(mark, "webgl-direct-off") == 0)
-        script_runtime_webgl_validation_direct_geometry(false);
-    else if (mark != NULL && strcmp(mark, "webgl-direct-on") == 0)
-        script_runtime_webgl_validation_direct_geometry(true);
-    else if (mark != NULL && strcmp(mark, "webgl-tint-stat") == 0) {
-        uint64_t instances = 0, slices = 0, direct = 0, retired = 0;
-        script_runtime_webgl_validation_tint_counts(&instances, &slices);
-        script_runtime_webgl_validation_direct_counts(&direct, &retired);
-        printf("tilefinch-webgl-tint: instances=%llu slices=%llu "
-               "direct=%llu retired=%llu\n",
-               (unsigned long long) instances, (unsigned long long) slices,
-               (unsigned long long) direct, (unsigned long long) retired);
-    }
-    if (mark != NULL && strcmp(mark, "canvas-ge-on") == 0)
-        psp_present_canvas_ge_enable(true, false);
-    else if (mark != NULL && strcmp(mark, "canvas-ge-verify") == 0)
-        psp_present_canvas_ge_enable(true, true);
-    else if (mark != NULL && (strcmp(mark, "canvas-ge-off") == 0
-                              || strcmp(mark, "canvas-cpu") == 0))
-        psp_present_canvas_ge_enable(false, false);
-    else if (mark != NULL && strcmp(mark, "canvas-ge-stat") == 0) {
-        const CanvasGePresenterStats *ge = psp_present_canvas_ge_stats();
-        printf("tilefinch-canvas-ge: presents=%lu ge-refusals=%lu "
-               "failures=%lu foreign-refusals=%lu busy-refusals=%lu "
-               "materializations=%lu materialize-failures=%lu "
-               "verify-frames=%lu verify-bad-frames=%lu "
-               "verify-unavailable=%lu verify-pixels=%llu "
-               "verify-mismatches=%llu ge-avg=%lluus ge-max=%lluus "
-               "defer=%u\n",
-               (unsigned long) ge->presents, (unsigned long) ge->ge_refusals,
-               (unsigned long) ge->failures,
-               (unsigned long) ge->foreign_refusals,
-               (unsigned long) ge->busy_refusals,
-               (unsigned long) ge->materializations,
-               (unsigned long) ge->materialize_failures,
-               (unsigned long) ge->verify_frames,
-               (unsigned long) ge->verify_bad_frames,
-               (unsigned long) ge->verify_unavailable,
-               (unsigned long long) ge->verify_pixels,
-               (unsigned long long) ge->verify_mismatches,
-               (unsigned long long) (ge->presents == 0 ? 0
-                   : ge->ge_us / ge->presents),
-               (unsigned long long) ge->ge_max_us,
-               tile_cache_canvas_defer_enabled() ? 1u : 0u);
-    }
-    if (mark != NULL && strcmp(mark, "canvas-setup-on") == 0)
-        tile_cache_validation_canvas_setup(true);
-    else if (mark != NULL && strcmp(mark, "canvas-setup-off") == 0)
-        tile_cache_validation_canvas_setup(false);
-    else if (mark != NULL && strcmp(mark, "canvas-setup-probe") == 0)
-        tile_cache_validation_canvas_setup_probe(psp_log_file());
-    if (mark != NULL && strcmp(mark, "canvas-vfpu-on") == 0)
-        tile_cache_validation_vfpu_conversion(true);
-    else if (mark != NULL && strcmp(mark, "canvas-vfpu-off") == 0)
-        tile_cache_validation_vfpu_conversion(false);
-    else if (mark != NULL && strcmp(mark, "canvas-vfpu-check") == 0) {
-        RenderCanvasVfpuProbe probe = tile_cache_validation_probe_vfpu_conversion();
-        printf("tilefinch-canvas-vfpu-check: available=%u rows=%lu pixels=%lu "
-               "mismatches=%lu state-mismatches=%lu\n",
-               probe.available ? 1u : 0u, (unsigned long) probe.rows,
-               (unsigned long) probe.pixels, (unsigned long) probe.mismatches,
-               (unsigned long) probe.state_mismatches);
-    }
-    if (mark != NULL && strcmp(mark, "canvas-audio-on") == 0)
-        psp_validation_native_detail = true;
-    else if (mark != NULL && strcmp(mark, "canvas-audio-off") == 0)
-        psp_validation_native_detail = false;
-    if (mark != NULL && (strcmp(mark, "audio-mix-probe") == 0
-                        || strcmp(mark, "audio-const-probe") == 0
-                        || strcmp(mark, "audio-count-probe") == 0
-                        || strcmp(mark, "audio-auto-probe") == 0)) {
-        bool constant = strcmp(mark, "audio-const-probe") == 0;
-        bool automation = strcmp(mark, "audio-auto-probe") == 0;
-        bool observer = strcmp(mark, "audio-count-probe") == 0;
-        TilefinchGameAudioMixProbe probe;
-        bool okay = observer ? tilefinch_game_audio_validation_observer_probe(&probe)
-            : automation ? tilefinch_game_audio_validation_automation_probe(&probe)
-            : constant ? tilefinch_game_audio_validation_constant_probe(&probe)
-            : tilefinch_game_audio_validation_mix_probe(&probe);
-        if (observer) printf("tilefinch-audio-probe-kind: observer=1\n");
-        else if (automation) printf("tilefinch-audio-probe-kind: automation=1\n");
-        else printf("tilefinch-audio-probe-kind: constant=%u\n", constant ? 1u : 0u);
-        printf("tilefinch-audio-probe: okay=%u blocks=%lu pcm-mismatches=%lu state-mismatches=%lu\n",
-            okay ? 1u : 0u, (unsigned long) probe.blocks,
-            (unsigned long) probe.pcm_mismatches, (unsigned long) probe.state_mismatches);
-        for (size_t run = 0; run < 6u; run++)
-            printf("tilefinch-audio-probe-run: run=%lu %s=%u blocks=256 mix-cpu=%lu "
-                "mix-max=%lu observer=%lu\n", (unsigned long) run,
-                observer ? "counted" : automation ? "automation" : constant ? "constant" : "fast", (run & 1u) ? 1u : 0u,
-                (unsigned long) probe.mix_cpu_us[run], (unsigned long) probe.mix_max_us[run],
-                (unsigned long) probe.observer_us[run]);
-    }
-    if (mark != NULL && strcmp(mark, "audio-mix-on") == 0)
-        tilefinch_game_audio_validation_mix_fast(true);
-    else if (mark != NULL && strcmp(mark, "audio-mix-off") == 0)
-        tilefinch_game_audio_validation_mix_fast(false);
-    if (mark != NULL && strcmp(mark, "audio-const-on") == 0)
-        tilefinch_game_audio_validation_constant(true);
-    else if (mark != NULL && strcmp(mark, "audio-const-off") == 0)
-        tilefinch_game_audio_validation_constant(false);
-    if (mark != NULL && strcmp(mark, "audio-auto-on") == 0)
-        tilefinch_game_audio_validation_automation(true);
-    else if (mark != NULL && strcmp(mark, "audio-auto-off") == 0)
-        tilefinch_game_audio_validation_automation(false);
-    if (mark != NULL && strcmp(mark, "phase-stat") == 0) {
-        const NavigationSession *navigation = psp_webgl_measurement_navigation;
-        bool okay = script_runtime_validation_phase_report(
-            navigation == NULL ? NULL : navigation->page.runtime, psp_log_file());
-        printf("tilefinch-phase-report: okay=%u\n", okay ? 1u : 0u);
-    }
-    if (mark != NULL && (strcmp(mark, "runtime-cpu-on") == 0
-                         || strcmp(mark, "runtime-cpu-off") == 0)) {
-        const NavigationSession *n = psp_webgl_measurement_navigation;
-        bool enabled = strcmp(mark, "runtime-cpu-on") == 0;
-        bool okay = script_runtime_validation_cpu_measure(n == NULL ? NULL : n->page.runtime, enabled);
-        printf("tilefinch-runtime-cpu: enabled=%u okay=%u\n", enabled, okay);
-    }
-    if (mark != NULL && strcmp(mark, "phase-select-misses") == 0) {
-        /* Post-window selection only. The private replay hook stores a
-           fixed bitmap; no script evaluation occurs in the timed frame. */
-        const NavigationSession *n = psp_webgl_measurement_navigation;
-        bool okay = n != NULL && n->page.runtime != NULL
-            && psp_canvas_cadence.pipeline_samples_dropped == 0u;
-        unsigned misses = 0;
-        char source[128];
-        for (size_t at = 0; okay && at < psp_canvas_cadence.pipeline_count; at++) {
-            const PspCanvasPhaseSample *s = &psp_canvas_cadence.phases[at];
-            if (s->previous_latched_us == 0u
-                || s->ready_us <= s->previous_latched_us
-                || s->ready_us - s->previous_latched_us <= UINT64_C(33369)) continue;
-            /* One recorded callback/presentation per sequence is required
-               by this diagnostic hook, not assumed for arbitrary pages. */
-            if (s->runtime_turns != 1u || s->ordinal == 0u) {okay=false; break;}
-            snprintf(source, sizeof(source),
-                "__treadlineDebug.fixedSelectFrame(%lu)", (unsigned long)(s->ordinal - 1u));
-            okay = script_runtime_evaluate_probe(n->page.runtime, source,
-                "<tilefinch-validation-frame-select>", NULL);
-            misses++;
-        }
-        printf("tilefinch-phase-selection: okay=%u misses=%u\n", okay, misses);
-    }
-    if (mark != NULL && strcmp(mark, "canvas-stat") == 0)
-        psp_report_canvas_cadence();
-    if (mark != NULL && strcmp(mark, "audio-mix-start") == 0) {
-        bool started = tilefinch_game_audio_validation_mix_measure(true);
-        printf("tilefinch-audio-block: event=start okay=%u\n", started ? 1u : 0u);
-    } else if (mark != NULL && (strcmp(mark, "audio-work-on") == 0
-                              || strcmp(mark, "audio-work-off") == 0)) {
-        bool enabled = strcmp(mark, "audio-work-on") == 0;
-        bool okay = tilefinch_game_audio_validation_mix_work(enabled);
-        printf("tilefinch-audio-work: enabled=%u okay=%u\n", enabled, okay);
-    } else if (mark != NULL && strcmp(mark, "audio-mix-stat") == 0) {
-        (void) tilefinch_game_audio_validation_mix_measure(false);
-        TilefinchGameAudioMixMetrics m;
-        bool read = tilefinch_game_audio_validation_mix_metrics(&m);
-        printf("tilefinch-audio-block: event=stop okay=%u\n", read ? 1u : 0u);
-        if (read) {
-            printf("tilefinch-audio-block: blocks=%lu mix-cpu=%lu output-cpu=%lu "
-                "observer=%lu mix-max=%lu output-max=%lu failed=%lu dropped=%lu\n",
-                (unsigned long) m.blocks, (unsigned long) m.mix_cpu_us,
-                (unsigned long) m.output_cpu_us, (unsigned long) m.observer_us,
-                (unsigned long) m.mix_cpu_max_us, (unsigned long) m.output_cpu_max_us,
-                (unsigned long) m.failed_clock_samples, (unsigned long) m.dropped_blocks);
-            printf("tilefinch-audio-block-work: silent=%lu audible=%lu constant=%lu "
-                "automated=%lu fast-forwarded=%lu\n",
-                (unsigned long) m.silent_samples, (unsigned long) m.audible_samples,
-                (unsigned long) m.constant_samples, (unsigned long) m.automated_samples,
-                (unsigned long) m.fast_forwarded_samples);
-            for (size_t bin = 0; bin < TILEFINCH_GAME_AUDIO_CPU_HISTOGRAM_BINS; bin++)
-                if (m.mix_cpu_histogram[bin] != 0u)
-                    printf("tilefinch-audio-block-bin: lower-us=%lu count=%lu\n",
-                        (unsigned long) (bin * 100u),
-                        (unsigned long) m.mix_cpu_histogram[bin]);
-            psp_game_audio_report_blocks(&m);
-        }
-    }
-    if (mark != NULL && strcmp(mark, "canvas-thread-on") == 0)
-        psp_canvas_peer_begin(true);
-    else if (mark != NULL && strcmp(mark, "canvas-thread-off") == 0)
-        psp_canvas_peer_begin(false);
-    if (mark != NULL && strcmp(mark, "canvas-trace-live") == 0)
-        psp_validation_canvas_live_trace = true;
-    else if (mark != NULL && strcmp(mark, "canvas-trace-quiet") == 0)
-        psp_validation_canvas_live_trace = false;
-    if (mark != NULL && strcmp(mark, "canvas-followup-off") == 0)
-        psp_validation_canvas_followup_enabled = false;
-    else if (mark != NULL && strcmp(mark, "canvas-followup-on") == 0)
-        psp_validation_canvas_followup_enabled = true;
-    if (mark != NULL && strcmp(mark, "media-stage-cpu") == 0)
-        atomic_store(&psp_validation_video_copy_requested, 1);
-    else if (mark != NULL && strcmp(mark, "media-stage-ge") == 0)
-        atomic_store(&psp_validation_video_copy_requested, 2);
-    if (mark != NULL && strcmp(mark, "video-measure-start") == 0)
-        atomic_store(&psp_validation_video_window_requested, 1);
-    else if (mark != NULL && strcmp(mark, "video-measure-end") == 0)
-        atomic_store(&psp_validation_video_window_requested, 2);
-    /* The start mark's own loop frame also runs that mark's diagnostics
-       (page report, .mark.js) before its script turn; measuring from the
-       next frame keeps that work out of the window. The page's profile hook
-       still runs now, so a .mark.js on the same mark can override it. */
-    if (mark != NULL && strcmp(mark, "webgl-measure-start") == 0) {
-        const NavigationSession *navigation = psp_webgl_measurement_navigation;
-        if (navigation != NULL && navigation->page.runtime != NULL) {
-            (void) script_runtime_evaluate_diagnostic(
-                navigation->page.runtime,
-                "globalThis.__tilefinchStartInputProfile?.()",
-                "<tilefinch-validation-profile-start>",
-                NULL);
-        }
-        psp_webgl_measurement_reset_pending = true;
-    }
-    if (mark != NULL && strcmp(mark, "webgl-measure-end") == 0) {
-        psp_canvas_cadence.causal_window = false;
-        psp_canvas_cadence.window_closed = true;
-        psp_present_validation_pre_publish_hook(NULL);
-        psp_present_validation_measure_cpu(false);
-        script_runtime_game_audio_native_measure(false);
-        script_runtime_suppress_checkpoint_trace(
-            psp_webgl_measurement_navigation == NULL ? NULL
-                : psp_webgl_measurement_navigation->page.runtime, false);
-        psp_log_end_timing_window();
-    }
-}
-#endif
 
 /* The loading page's input in a supervised load: the supervisor forwards
    button edges; on the page it scrolls and cancels itself, so a held button
@@ -4051,18 +1537,12 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
        start another author task/reflow between successive menu presses. */
     if (psp_ui_page_work_paused(&app->process->presentation.ui)) return true;
     if (app->interactive->provider_handoff_present_pending) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_runtime_handoff_deferrals++;
-        psp_frame_runtime.deferred_other++;
-#endif
+        psp_vprobe_runtime_deferred(PSP_VPROBE_DEFER_HANDOFF);
         return true;
     }
     if (browser_engine_optional_memory_reclaim_pending(
             &app->interactive->provider_handoff_reclaim)) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_runtime_reclaim_deferrals++;
-        psp_frame_runtime.deferred_other++;
-#endif
+        psp_vprobe_runtime_deferred(PSP_VPROBE_DEFER_RECLAIM);
         return true;
     }
     /* A second animation callback would invalidate the tiles that are still
@@ -4070,41 +1550,11 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
        first; scheduler time advances by one ordinary tick when callbacks
        resume, so this neither builds a rAF backlog nor accelerates game time. */
     if (browser_engine_render_frame_pending(app->browser->engine)) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_runtime_render_deferrals++;
-        psp_frame_runtime.deferred_render++;
-#endif
+        psp_vprobe_runtime_deferred(PSP_VPROBE_DEFER_RENDER);
         return true;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    PspCanvasPeerSample peer_before = psp_canvas_cadence.causal_window
-        ? psp_canvas_peer_sample() : (PspCanvasPeerSample) {0};
-    PspCanvasCpuSample cpu_before = psp_canvas_cadence.causal_window
-        ? psp_canvas_cpu_sample() : (PspCanvasCpuSample) {0};
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    ScriptRuntimeTimingMetrics timing_before = {0};
-    ScriptRuntimeCpuMetrics runtime_cpu_before = {0};
-    ScriptWebglNativeMetrics webgl_before = {0};
-    bool webgl_before_valid = !psp_canvas_cadence.causal_window
-        || script_runtime_webgl_native_counters(&webgl_before);
-    NavigationSession *timed_navigation =
-        browser_engine_navigation(app->browser->engine);
-    uint64_t navigation_runtime_before = timed_navigation == NULL ? 0
-        : timed_navigation->performance.runtime_us;
-    ScriptRuntime *timed_runtime = timed_navigation == NULL
-        ? NULL : timed_navigation->page.runtime;
-    (void) script_runtime_timing_metrics(timed_runtime, &timing_before);
-    bool runtime_cpu_before_valid = script_runtime_validation_cpu_metrics(timed_runtime, &runtime_cpu_before);
-    uint64_t layout_before = timed_navigation == NULL ? 0
-        : timed_navigation->performance.layout_us;
-    uint64_t resource_before = timed_navigation == NULL ? 0
-        : timed_navigation->performance.resource_us;
-    NavigationPerformance phases_before = {0};
-    if (timed_navigation != NULL)
-        phases_before = timed_navigation->performance;
-    uint64_t fetch_wait_before = 0;
-    fetch_sync_wait_totals(&fetch_wait_before, NULL);
-#endif
+    PspVprobeRuntime probe;
+    psp_vprobe_runtime_begin(&probe, app->browser->engine);
     /* The engine framebuffer remains the last completed page during runtime
        mutation/layout. Only the owner thread may present it at cooperative
        checkpoints: arbitrary author tasks can also submit synchronous GE
@@ -4125,153 +1575,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
     uint32_t runtime_observed_buttons = 0;
     if (psp_runtime_cooperate_end(&runtime_observed_buttons))
         app->interactive->previous_buttons = psp_ui_buttons(runtime_observed_buttons);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t elapsed_us =
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    PspCanvasCpuSample cpu_after = psp_canvas_cadence.causal_window
-        ? psp_canvas_cpu_sample() : (PspCanvasCpuSample) {0};
-    PspCanvasPeerSample peer_after = psp_canvas_cadence.causal_window
-        ? psp_canvas_peer_sample() : (PspCanvasPeerSample) {0};
-    ScriptRuntimeTimingMetrics timing_after = {0};
-    ScriptRuntimeCpuMetrics runtime_cpu_after = {0};
-    ScriptWebglNativeMetrics webgl_after = {0};
-    bool webgl_after_valid = !psp_canvas_cadence.causal_window
-        || script_runtime_webgl_native_counters(&webgl_after);
-    /* Cancellation/allocation refusal can retire the runtime in this call. */
-    timed_runtime = timed_navigation == NULL ? NULL
-        : timed_navigation->page.runtime;
-    (void) script_runtime_timing_metrics(timed_runtime, &timing_after);
-    bool runtime_cpu_after_valid = script_runtime_validation_cpu_metrics(timed_runtime, &runtime_cpu_after);
-    uint64_t callback_us = timing_after.timer_callback_us
-            >= timing_before.timer_callback_us
-        ? timing_after.timer_callback_us - timing_before.timer_callback_us : 0;
-    uint64_t webgl_us = timing_after.webgl_native_us
-            >= timing_before.webgl_native_us
-        ? timing_after.webgl_native_us - timing_before.webgl_native_us : 0;
-    uint64_t microtask_us = timing_after.microtask_us
-            >= timing_before.microtask_us
-        ? timing_after.microtask_us - timing_before.microtask_us : 0;
-    uint64_t js_allocations = timing_after.js_allocation_calls
-            >= timing_before.js_allocation_calls
-        ? timing_after.js_allocation_calls
-            - timing_before.js_allocation_calls : 0;
-    uint64_t js_frees = timing_after.js_free_calls
-            >= timing_before.js_free_calls
-        ? timing_after.js_free_calls - timing_before.js_free_calls : 0;
-    uint64_t js_reallocations = timing_after.js_reallocation_calls
-            >= timing_before.js_reallocation_calls
-        ? timing_after.js_reallocation_calls
-            - timing_before.js_reallocation_calls : 0;
-    uint64_t js_allocated_bytes = timing_after.js_allocated_bytes
-            >= timing_before.js_allocated_bytes
-        ? timing_after.js_allocated_bytes - timing_before.js_allocated_bytes
-        : 0;
-    uint64_t js_freed_bytes = timing_after.js_freed_bytes
-            >= timing_before.js_freed_bytes
-        ? timing_after.js_freed_bytes - timing_before.js_freed_bytes : 0;
-    uint64_t script_runtime_us = timing_after.total_us
-            >= timing_before.total_us
-        ? timing_after.total_us - timing_before.total_us : 0;
-    uint64_t navigation_runtime_us = timed_navigation != NULL
-            && timed_navigation->performance.runtime_us
-                   >= navigation_runtime_before
-        ? timed_navigation->performance.runtime_us
-            - navigation_runtime_before : 0;
-    uint64_t damage_apply_us = elapsed_us > navigation_runtime_us
-        ? elapsed_us - navigation_runtime_us : 0;
-    uint64_t fetch_wait_after = 0;
-    fetch_sync_wait_totals(&fetch_wait_after, NULL);
-    if (elapsed_us > UINT64_C(100000)) {
-        const NavigationPerformance *after = timed_navigation == NULL
-            ? &phases_before : &timed_navigation->performance;
-        printf("tilefinch-page-slow-advance: call=%zu elapsed=%lluus "
-               "script=%lluus layout=%lluus resource=%lluus damage=%lluus "
-               "page-call=%lluus frames=%lluus frame-script=%lluus "
-               "messages=%lluus frame-setup=%lluus relayout=%lluus "
-               "navigation=%lluus fetch-wait=%lluus\n",
-               psp_runtime_advance_calls, (unsigned long long) elapsed_us,
-               (unsigned long long) script_runtime_us,
-               (unsigned long long) (timed_navigation == NULL ? 0
-                   : timed_navigation->performance.layout_us - layout_before),
-               (unsigned long long) (timed_navigation == NULL ? 0
-                   : timed_navigation->performance.resource_us - resource_before),
-               (unsigned long long) damage_apply_us,
-               (unsigned long long) (after->advance_page_script_us
-                   - phases_before.advance_page_script_us),
-               (unsigned long long) (after->advance_frames_us
-                   - phases_before.advance_frames_us),
-               (unsigned long long) (after->advance_frame_script_us
-                   - phases_before.advance_frame_script_us),
-               (unsigned long long) (after->advance_messages_us
-                   - phases_before.advance_messages_us),
-               (unsigned long long) (after->advance_frame_setup_us
-                   - phases_before.advance_frame_setup_us),
-               (unsigned long long) (after->advance_relayout_us
-                   - phases_before.advance_relayout_us),
-               (unsigned long long) navigation_runtime_us,
-               (unsigned long long) (fetch_wait_after - fetch_wait_before));
-    }
-    {
-        const NavigationPerformance *after = timed_navigation == NULL
-            ? &phases_before : &timed_navigation->performance;
-        psp_frame_runtime.advances++;
-        psp_frame_runtime.elapsed_us += elapsed_us;
-        psp_frame_runtime.realm_us += script_runtime_us;
-        psp_frame_runtime.prelude_us +=
-            timing_after.prelude_us - timing_before.prelude_us;
-        psp_frame_runtime.timer_prepare_us +=
-            timing_after.timer_prepare_us - timing_before.timer_prepare_us;
-        psp_frame_runtime.timer_us += callback_us;
-        psp_frame_runtime.timers +=
-            timing_after.timer_callbacks - timing_before.timer_callbacks;
-        psp_frame_runtime.jobs_us += microtask_us;
-        psp_frame_runtime.network_us +=
-            timing_after.network_us - timing_before.network_us;
-        psp_frame_runtime.refresh_us +=
-            timing_after.refresh_us - timing_before.refresh_us;
-        psp_frame_runtime.child_us += after->advance_frame_script_us
-            - phases_before.advance_frame_script_us;
-        psp_frame_runtime.setup_us += after->advance_frame_setup_us
-            - phases_before.advance_frame_setup_us;
-        psp_frame_runtime.messages_us += after->advance_messages_us
-            - phases_before.advance_messages_us;
-        psp_frame_runtime.relayout_us += after->advance_relayout_us
-            - phases_before.advance_relayout_us;
-        psp_frame_runtime.damage_us += damage_apply_us;
-        psp_frame_runtime.late_us +=
-            timing_after.timer_late_us - timing_before.timer_late_us;
-        if (timing_after.advance_timer_late_max_us
-                > psp_frame_runtime.late_max_us)
-            psp_frame_runtime.late_max_us =
-                timing_after.advance_timer_late_max_us;
-        psp_frame_runtime.late_frames +=
-            timing_after.timer_late_frames - timing_before.timer_late_frames;
-        psp_frame_runtime.frame_callbacks +=
-            timing_after.frame_callbacks - timing_before.frame_callbacks;
-        psp_frame_runtime.frame_callback_late_us +=
-            timing_after.frame_callback_late_us
-            - timing_before.frame_callback_late_us;
-    }
-    psp_runtime_advance_calls++;
-    psp_runtime_advance_total_us += elapsed_us;
-    if (elapsed_us > psp_runtime_advance_maximum_us)
-        psp_runtime_advance_maximum_us = elapsed_us;
-    if (layout_changed != NULL && *layout_changed)
-        psp_runtime_layout_changes++;
-    if (browser_engine_canvas_frame_pending(app->browser->engine)) {
-        psp_canvas_cadence_started(
-            started_us, elapsed_us, callback_us, webgl_us, microtask_us,
-            script_runtime_us, navigation_runtime_us, damage_apply_us,
-            js_allocations, js_frees, js_reallocations,
-            js_allocated_bytes, js_freed_bytes,
-            timing_before.js_live_bytes, timing_after.js_live_bytes);
-        psp_canvas_cadence_cpu(&cpu_before, &cpu_after, &peer_before, &peer_after);
-        psp_canvas_cadence_webgl(&webgl_before, &webgl_after,
-                                webgl_before_valid && webgl_after_valid);
-        psp_canvas_cadence_runtime_cpu(&runtime_cpu_before, &runtime_cpu_after,
-                                     runtime_cpu_before_valid && runtime_cpu_after_valid);
-    }
-#endif
+    psp_vprobe_runtime_end(&probe, app->browser->engine, layout_changed);
     return advanced;
 }
 
@@ -4354,12 +1658,12 @@ psp_advance_page_runtime_with_reader_recovery(
     bool runtime_ok = psp_advance_page_runtime(app, layout_changed);
     if (app != NULL && app->browser != NULL && app->interactive != NULL
         && app->process != NULL && app->views != NULL
-        && app->views->navigation != NULL
-        && app->views->navigation->page.loaded) {
+        && browser_engine_page_loaded(app->browser->engine)) {
         /* Pages are examined for the fallback at commit; one whose realm
            fails or is retired later (memory, a refused frame step) is
            examined once more for this navigation. */
-        const NavigationSession *navigation = app->views->navigation;
+        const BrowserEngine *engine = app->browser->engine;
+        uint64_t generation = browser_engine_page_generation(engine);
         const PspUiState *ui = &app->process->presentation.ui;
         if (psp_basic_fallback_recheck(
                 browser_profile_basic_fallback_mode(app->browser->profile),
@@ -4367,18 +1671,14 @@ psp_advance_page_runtime_with_reader_recovery(
                 app->interactive->blank_reader_recovery_pending, runtime_ok,
                 /* Current-page memory refusal or retirement, not ordinary
                    widget errors or JavaScript disabled for the site. */
-                navigation->page.script_memory_limited
-                    || navigation->page.script_result.host_compile_memory_refusals
-                           != 0u
-                    || (navigation->page.runtime == NULL
-                        && navigation->page.script_degradation_observed),
+                browser_engine_page_script_memory_failed(engine),
                 app->interactive->basic_failure_examined_generation
-                    == navigation->generation)) {
+                    == generation)) {
             app->interactive->basic_failure_examined_generation =
-                navigation->generation;
+                generation;
             app->interactive->blank_reader_recovery_pending = true;
             app->interactive->blank_reader_recovery_generation =
-                navigation->generation;
+                generation;
         }
     }
     if (app != NULL && app->browser != NULL && app->interactive != NULL
@@ -4501,7 +1801,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_update_page_gamepad(
         && !browser_engine_navigation_pending(app->browser->engine)
         && !(visual_changed && !ui->page_fullscreen)
         && browser_engine_page_gamepad_available(app->browser->engine);
-    uint64_t generation = app->views->navigation->generation;
+    uint64_t generation = browser_engine_page_generation(app->browser->engine);
     TilefinchGamepadCaptureEvent event = page_requested
         ? tilefinch_gamepad_capture_request(
               capture, page_available, generation)
@@ -4735,14 +2035,15 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
             browser->engine,
             browser_profile_javascript_enabled(browser->profile));
         psp_profile_store_mark_dirty(&browser->profile_store, sampled_us);
-        const NavigationEntry *entry =
-            navigation_current(engine_views->navigation);
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            browser->engine, entry_buffer, sizeof(entry_buffer));
         (void) psp_set_presentation_css(
             browser->engine, &process->presentation.ui,
             browser->profile,
             process->presentation.ui.reader_mode
                 || process->presentation.ui.basic_mode,
-            entry == NULL ? site_url : entry->url,
+            entry_url == NULL ? site_url : entry_url,
             process->presentation.ui.page_font_percent, true);
         (void) psp_engine_views_refresh(engine_views, browser->engine);
         *page_dirty = true;
@@ -4757,20 +2058,6 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
         240);
 }
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static TILEFINCH_OUT_OF_LINE void psp_boot_input_probe(uint64_t sample_us)
-{
-    static uint64_t started_us;
-    if (sample_us == 0) {
-        started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    } else if (started_us != 0) {
-        printf("tilefinch-boot-input: first-sample=%lluus entry-wait=%lluus\n",
-               (unsigned long long) sample_us,
-               (unsigned long long) (sample_us - started_us));
-        started_us = 0;
-    }
-}
-#endif
 
 /* The Update screen's primary button: install-and-restart, or begin the
    network check for the selected release. Rare and network-bound, so it
@@ -4996,14 +2283,15 @@ static TILEFINCH_COLD_PATH bool psp_load_content_blocker_allowlist(
         && browser_profile_content_blocker_site_allowed(
                browser->profile, process->presentation.ui.url);
     if (loaded) {
-        const NavigationEntry *entry =
-            navigation_current(engine_views->navigation);
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            browser->engine, entry_buffer, sizeof(entry_buffer));
         (void) psp_set_presentation_css(
             browser->engine, &process->presentation.ui,
             browser->profile,
             process->presentation.ui.reader_mode
                 || process->presentation.ui.basic_mode,
-            entry == NULL ? process->presentation.ui.url : entry->url,
+            entry_url == NULL ? process->presentation.ui.url : entry_url,
             process->presentation.ui.page_font_percent, true);
         (void) psp_engine_views_refresh(engine_views, browser->engine);
     }
@@ -5030,328 +2318,6 @@ static TILEFINCH_COLD_PATH bool psp_load_content_blocker_allowlist(
     return loaded;
 }
 
-/* What one frame of the interactive loop leaves for the next, plus the
-   borrowed owners and boot facts its steps need. It lives for one
-   psp_app_run_interactive call; per-frame facts stay in PspAppFrameState. */
-typedef struct {
-    PspApp app;
-    PspBootQueue *boot_queue;
-    FetchPreconnectDwell *home_preconnect_dwell;
-    PspPowerPolicy *power_policy;
-    bool loaded;
-    bool restoring_last_page;
-    bool initial_error_page;
-    /* Launcher trial of a freshly installed slot, confirmed on first use. */
-    TilefinchUpdateState trial_health_state;
-    TilefinchUpdateSlot running_slot;
-    bool trial_health_pending;
-    uint64_t trial_health_started_us;
-    uint64_t trial_health_next_attempt_us;
-#if defined(TILEFINCH_PSP_VALIDATION_LOG) \
-&& defined(TILEFINCH_PSP_LIVE_NETWORK)
-    PspUpdateE2E update_e2e;
-#endif
-    PspUpdateCheck update_check;
-    unsigned voice_pressure_ticks;
-    unsigned scroll_log_counter;
-    bool render_job_pending;
-    uint64_t render_job_last_progress_us;
-    /* A scrolled frame is on screen with checkerboard tiles still filling. */
-    bool render_placeholder_active;
-    size_t navigation_pump_boundaries;
-    size_t blocker_navigation_baseline;
-    bool blocker_navigation_active;
-    long interactive_validation_ticks;
-    /* The media-open scope is the only cooperate scope this loop holds
-       across frames, so the loop -- not a per-frame predicate -- has to
-       remember that it owns one. */
-    bool media_open_scope;
-    uint64_t media_stability_target_us;
-    bool media_stability_lifecycle_injected;
-    uint64_t loading_present_us;
-    uint64_t previous_ui_sample_us;
-    /* Sample the next input without another vblank wait (see
-       psp_wait_before_interactive_input). */
-    bool fast_page_followup;
-    uint64_t render_progress_present_us;
-    bool canvas_page_followup;
-    /* The previous iteration presented a focus move over a live canvas
-       and skipped the page's animation callbacks. */
-    bool focus_runtime_deferred;
-    /* The frame's wait found a page task already runnable and yielded
-       instead of waiting for vblank. */
-    bool page_task_yield;
-    uint64_t next_color_mode_check_us;
-    unsigned power_worker_completions;
-    unsigned power_worker_failures;
-    uint64_t power_high_ms;
-    uint64_t power_idle_ms;
-    uint64_t power_transition_ms;
-    size_t lifecycle_network_requests_cancelled;
-    bool lifecycle_network_was_started;
-    bool lifecycle_network_was_ready;
-} PspLoop;
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* Main-thread-only exclusive wall accounting. Closing in the caller covers
-   every early return; nested JS/native/curl timings remain separate views.
-   No URLs, DOM text or retained page pointers enter these records. */
-enum {
-    LOOP_WAIT, LOOP_INPUT, LOOP_ACTION, LOOP_PROBE, LOOP_NAVIGATION,
-    LOOP_RUNTIME, LOOP_IDLE, LOOP_RASTER, LOOP_PRESENT, LOOP_IMAGES,
-    LOOP_TAIL, LOOP_PHASE_COUNT
-};
-_Static_assert(LOOP_PHASE_COUNT == PSP_CANVAS_LOOP_PHASES,
-               "causal loop record must cover every phase");
-static struct {
-    uint64_t start, last, us[LOOP_PHASE_COUNT];
-    /* The work ledger's exclusive kinds inside each phase; what a phase
-       leaves unclaimed is browser bookkeeping. */
-    uint64_t kinds[LOOP_PHASE_COUNT][WORK_LEDGER_KIND_COUNT];
-    WorkLedgerTotals ledger;
-    unsigned phase;
-    bool active;
-    /* The frame's wait was the page-task yield, not a vblank. */
-    bool task_yield;
-    bool fast_followup;
-    bool timer_known, timer_frame;
-    int64_t due_us;
-} psp_loop_timing;
-
-static const char *const psp_loop_phase_names[LOOP_PHASE_COUNT] = {
-    "wait", "input", "action", "probe", "navigation", "runtime", "idle",
-    "raster", "present", "images", "tail"
-};
-
-static void psp_loop_ready_sample(void);
-
-static void psp_loop_timing_begin(void)
-{
-    memset(&psp_loop_timing, 0, sizeof(psp_loop_timing));
-    psp_loop_timing.active = psp_input_script_running()
-        && !psp_validation_video_timing_window;
-    work_ledger_set_enabled(psp_loop_timing.active);
-    if (psp_loop_timing.active) {
-        psp_loop_timing.start = psp_loop_timing.last =
-            (uint64_t) sceKernelGetSystemTimeWide();
-        work_ledger_snapshot(&psp_loop_timing.ledger);
-        psp_loop_ready_sample();
-    }
-}
-
-static void psp_loop_timing_phase(unsigned phase)
-{
-    if (!psp_loop_timing.active) return;
-    uint64_t now = (uint64_t) sceKernelGetSystemTimeWide();
-    psp_loop_timing.us[psp_loop_timing.phase] += now - psp_loop_timing.last;
-    psp_loop_timing.last = now;
-    WorkLedgerTotals ledger;
-    work_ledger_snapshot(&ledger);
-    for (unsigned kind = 0; kind < WORK_LEDGER_KIND_COUNT; kind++)
-        psp_loop_timing.kinds[psp_loop_timing.phase][kind] +=
-            ledger.us[kind] - psp_loop_timing.ledger.us[kind];
-    psp_loop_timing.ledger = ledger;
-    psp_loop_timing.phase = phase;
-}
-
-static void psp_loop_work_print(void);
-
-static void psp_loop_timing_end(void)
-{
-    if (!psp_loop_timing.active) return;
-    psp_loop_timing_phase(LOOP_TAIL);
-    /* Video cadence has its own bounded presentation records. Formatting
-       every owner turn adds CPU cost and fills the small RAM log, which then
-       loses diagnostics. Count deliberately suppressed routine rows; retain
-       all errors, checkpoints, media summaries and presentation measurements. */
-    if (psp_validation_video_timing_window) {
-        psp_validation_video_suppressed_loops++;
-        psp_loop_timing.active = false;
-        return;
-    }
-    /* Live USB log flushes can cost several milliseconds after publication
-       and steal the next frame's deadline. Retain causal-window loop rows
-       alongside their canvas sample; format them only in the final report. */
-    PspCanvasPhaseSample *sample = psp_canvas_cadence.pipeline_count == 0
-        ? NULL : &psp_canvas_cadence.phases[
-            psp_canvas_cadence.pipeline_count - 1u];
-    bool matches = sample != NULL && sample->causal_window
-        && sample->started_us >= psp_loop_timing.start
-        && sample->latched_us <= psp_loop_timing.last;
-    if (psp_canvas_cadence.causal_window || matches) {
-        if (matches) {
-            sample->loop_start_us = psp_loop_timing.start;
-            sample->loop_end_us = psp_loop_timing.last;
-            for (size_t phase = 0; phase < LOOP_PHASE_COUNT; phase++)
-                sample->loop_phase_us[phase] = psp_canvas_cadence_u32(
-                    psp_loop_timing.us[phase]);
-        } else {
-            size_t at = psp_canvas_cadence.causal_loops_without_sample++;
-            if (at < PSP_CANVAS_LOOP_GAP_LIMIT)
-                psp_canvas_cadence.causal_loop_gaps[at] = (PspCanvasLoopGap) {
-                    .start_us = psp_loop_timing.start,
-                    .end_us = psp_loop_timing.last,
-                    .wait_us = psp_canvas_cadence_u32(psp_loop_timing.us[LOOP_WAIT]),
-                    .runtime_us = psp_canvas_cadence_u32(psp_loop_timing.us[LOOP_RUNTIME]),
-                    .callbacks = psp_canvas_cadence_u32(psp_frame_runtime.frame_callbacks),
-                    .due_us = psp_loop_timing.due_us,
-                    .timer_known = psp_loop_timing.timer_known,
-                    .timer_frame = psp_loop_timing.timer_frame,
-                    .fast_followup = psp_loop_timing.fast_followup
-                };
-        }
-        psp_loop_timing.active = false;
-        return;
-    }
-    printf("tilefinch-loop-timing: begin-us=%llu end-us=%llu "
-           "wait=%llu input=%llu action=%llu probe=%llu navigation=%llu "
-           "runtime=%llu idle=%llu raster=%llu present=%llu images=%llu tail=%llu\n",
-           (unsigned long long) psp_loop_timing.start,
-           (unsigned long long) psp_loop_timing.last,
-           (unsigned long long) psp_loop_timing.us[LOOP_WAIT],
-           (unsigned long long) psp_loop_timing.us[LOOP_INPUT],
-           (unsigned long long) psp_loop_timing.us[LOOP_ACTION],
-           (unsigned long long) psp_loop_timing.us[LOOP_PROBE],
-           (unsigned long long) psp_loop_timing.us[LOOP_NAVIGATION],
-           (unsigned long long) psp_loop_timing.us[LOOP_RUNTIME],
-           (unsigned long long) psp_loop_timing.us[LOOP_IDLE],
-           (unsigned long long) psp_loop_timing.us[LOOP_RASTER],
-           (unsigned long long) psp_loop_timing.us[LOOP_PRESENT],
-           (unsigned long long) psp_loop_timing.us[LOOP_IMAGES],
-           (unsigned long long) psp_loop_timing.us[LOOP_TAIL]);
-    psp_loop_work_print();
-    psp_loop_timing.active = false;
-}
-/* The page's runnable work as the frame starts, before its wait: a wait
-   with work already due is the loop's delay, not the page's. */
-static PspBrowserResources *psp_loop_timing_browser;
-static bool psp_loop_ready_valid;
-static ScriptRunnableState psp_loop_ready;
-
-static void psp_loop_ready_sample(void)
-{
-    memset(&psp_frame_runtime, 0, sizeof(psp_frame_runtime));
-    psp_loop_ready_valid = psp_loop_timing_browser != NULL
-        && psp_loop_timing_browser->engine != NULL
-        && browser_engine_runnable_state(
-               psp_loop_timing_browser->engine, &psp_loop_ready);
-    if (psp_loop_ready_valid) {
-        psp_loop_timing.timer_known = psp_loop_ready.timer_known;
-        psp_loop_timing.timer_frame = psp_loop_ready.timer_frame_callback;
-        psp_loop_timing.due_us = psp_loop_ready.timer_due_in_us;
-    }
-}
-
-static int psp_loop_work_append(char *line, size_t capacity, int used,
-                                const char *format, ...)
-    __attribute__((format(__printf__, 4, 5)));
-static int psp_loop_work_append(char *line, size_t capacity, int used,
-                                const char *format, ...)
-{
-    if (used < 0 || (size_t) used >= capacity) return used;
-    va_list arguments;
-    va_start(arguments, format);
-    int wrote = vsnprintf(line + used, capacity - (size_t) used, format,
-                          arguments);
-    va_end(arguments);
-    return wrote < 0 ? used : used + wrote;
-}
-
-/* One line per frame, beside its tilefinch-loop-timing record (same
-   begin-us): for each phase that saw any, the work ledger's exclusive
-   script/native/layout/sleep microseconds (the phase's remainder is
-   bookkeeping); the runnable state sampled before the frame's wait; and
-   the frame's runtime advances broken down. Field reference:
-   docs/engineering/INPUT_SCRIPT_HARNESS.md, "Where a frame's time goes". */
-static void psp_loop_work_print(void)
-{
-    char line[1024];
-    const char *step_kind = NULL;
-    unsigned step = psp_input_script_step_now(&step_kind);
-    int used = snprintf(line, sizeof(line),
-                        "tilefinch-loop-work: begin-us=%llu step=%u:%s",
-                        (unsigned long long) psp_loop_timing.start, step,
-                        step_kind);
-    for (unsigned phase = 0; phase < LOOP_PHASE_COUNT; phase++) {
-        const uint64_t *kinds = psp_loop_timing.kinds[phase];
-        if (kinds[WORK_LEDGER_SCRIPT] == 0 && kinds[WORK_LEDGER_NATIVE] == 0
-            && kinds[WORK_LEDGER_LAYOUT] == 0 && kinds[WORK_LEDGER_SLEEP] == 0)
-            continue;
-        used = psp_loop_work_append(
-            line, sizeof(line), used, " %s=%llu/%llu/%llu/%llu",
-            psp_loop_phase_names[phase],
-            (unsigned long long) kinds[WORK_LEDGER_SCRIPT],
-            (unsigned long long) kinds[WORK_LEDGER_NATIVE],
-            (unsigned long long) kinds[WORK_LEDGER_LAYOUT],
-            (unsigned long long) kinds[WORK_LEDGER_SLEEP]);
-    }
-    if (psp_loop_ready_valid) {
-        used = psp_loop_work_append(
-            line, sizeof(line), used,
-            " timers=%u jobs=%d cleanup=%d ready=%u flight=%u cont=%d",
-            (unsigned) psp_loop_ready.timers,
-            psp_loop_ready.jobs_pending ? 1 : 0,
-            psp_loop_ready.cleanup_pending ? 1 : 0,
-            (unsigned) psp_loop_ready.responses_ready,
-            (unsigned) psp_loop_ready.requests_in_flight,
-            psp_loop_ready.continuation_pending ? 1 : 0);
-        if (psp_loop_ready.timer_known)
-            used = psp_loop_work_append(
-                line, sizeof(line), used, " due-us=%lld due-kind=%s",
-                (long long) psp_loop_ready.timer_due_in_us,
-                psp_loop_ready.timer_frame_callback ? "frame" : "task");
-        if (psp_loop_ready.task_known)
-            used = psp_loop_work_append(
-                line, sizeof(line), used, " task-due-us=%lld",
-                (long long) psp_loop_ready.task_due_in_us);
-        else
-            used = psp_loop_work_append(line, sizeof(line), used,
-                                        " task-due-us=none");
-    }
-    if (psp_loop_timing.task_yield)
-        used = psp_loop_work_append(line, sizeof(line), used,
-                                    " task-yield=1");
-    if (psp_frame_runtime.deferred_render != 0
-        || psp_frame_runtime.deferred_other != 0)
-        used = psp_loop_work_append(
-            line, sizeof(line), used, " deferred=%u/%u",
-            psp_frame_runtime.deferred_render,
-            psp_frame_runtime.deferred_other);
-    if (psp_frame_runtime.advances != 0)
-        used = psp_loop_work_append(
-            line, sizeof(line), used,
-            " advances=%u advance=%llu realm=%llu prelude=%llu "
-            "timer-prepare=%llu tasks=%u/%llu microtasks=%llu network=%llu "
-            "refresh=%llu child=%llu setup=%llu messages=%llu "
-            "relayout=%llu damage=%llu late=%llu/%llu/%u "
-            "frame-callbacks=%u/%llu",
-            psp_frame_runtime.advances,
-            (unsigned long long) psp_frame_runtime.elapsed_us,
-            (unsigned long long) psp_frame_runtime.realm_us,
-            (unsigned long long) psp_frame_runtime.prelude_us,
-            (unsigned long long) psp_frame_runtime.timer_prepare_us,
-            (unsigned) psp_frame_runtime.timers,
-            (unsigned long long) psp_frame_runtime.timer_us,
-            (unsigned long long) psp_frame_runtime.jobs_us,
-            (unsigned long long) psp_frame_runtime.network_us,
-            (unsigned long long) psp_frame_runtime.refresh_us,
-            (unsigned long long) psp_frame_runtime.child_us,
-            (unsigned long long) psp_frame_runtime.setup_us,
-            (unsigned long long) psp_frame_runtime.messages_us,
-            (unsigned long long) psp_frame_runtime.relayout_us,
-            (unsigned long long) psp_frame_runtime.damage_us,
-            (unsigned long long) psp_frame_runtime.late_us,
-            (unsigned long long) psp_frame_runtime.late_max_us,
-            (unsigned) psp_frame_runtime.late_frames,
-            (unsigned) psp_frame_runtime.frame_callbacks,
-            (unsigned long long) psp_frame_runtime.frame_callback_late_us);
-    if (used > 0) printf("%s\n", line);
-}
-#define PSP_LOOP_PHASE(phase) psp_loop_timing_phase(phase)
-#else
-#define PSP_LOOP_PHASE(phase) ((void) 0)
-#endif
-
 /* psp_loop_frame runs one frame as a fixed sequence of steps. Steps that a
    page or media frame runs every time are hot boundaries, measured together
    by the build's frame-set ratchets (cmake/CheckPspHotSymbolSizes.cmake);
@@ -5359,13 +2325,6 @@ static void psp_loop_work_print(void)
 static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop);
 
 /* Every page or media frame, in frame order. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static TILEFINCH_HOT_BOUNDARY bool psp_loop_scripted_input(
-    PspLoop *loop, PspUiInput *input, bool supervisor_page_input);
-static TILEFINCH_HOT_BOUNDARY bool psp_loop_power_test_tick(
-    PspLoop *loop, uint64_t now_us, unsigned ui_elapsed_ms,
-    PspClockWorkerSnapshot *power_snapshot, bool power_auto_abort_requested);
-#endif
 static TILEFINCH_HOT_BOUNDARY bool psp_loop_media_input(
     PspLoop *loop, PspUiInput *input);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -5383,19 +2342,24 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_media_frame(
 static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
     PspLoop *loop, PspAppFrameState *frame);
 static TILEFINCH_HOT_BOUNDARY void psp_loop_track_recovery(PspLoop *loop);
+static TILEFINCH_OUT_OF_LINE void psp_loop_recovery_moved(
+    PspLoop *loop, uint64_t generation, int entry_scroll, bool changed,
+    uint64_t recovery_now_us);
+/* A dirty record still for two seconds, and 30 since the last save. */
+static inline bool psp_recovery_save_due(const PspRecoveryTracker *recovery,
+                                         uint64_t now_us)
+{
+    return recovery->dirty
+        && now_us - recovery->last_change_us >= UINT64_C(2000000)
+        && (recovery->last_save_us == 0
+            || now_us - recovery->last_save_us >= UINT64_C(30000000));
+}
 
 /* Only when their check says so, in frame order. */
 static TILEFINCH_OUT_OF_LINE void psp_loop_start_boot_navigation(
     PspLoop *loop, const char *deferred_url);
-static TILEFINCH_OUT_OF_LINE void psp_loop_inject_media_lifecycle(
-    PspLoop *loop);
 static TILEFINCH_OUT_OF_LINE bool psp_loop_serve_lifecycle(
     PspLoop *loop, PspLifecycleAction lifecycle_action);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static TILEFINCH_OUT_OF_LINE bool psp_loop_power_test_input(
-    PspLoop *loop, PspUiInput *input, uint64_t now_us,
-    bool *abort_requested);
-#endif
 static TILEFINCH_OUT_OF_LINE void psp_loop_confirm_trial_health(
     PspLoop *loop, uint64_t now_us, uint32_t pressed);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -5413,14 +2377,11 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_pump_offline_download(
     PspLoop *loop, uint32_t offline_download_id);
 static TILEFINCH_OUT_OF_LINE void psp_loop_apply_media_request(
     PspLoop *loop, const ScriptMediaRequest *dom_media_request);
-static TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(
-    PspLoop *loop, bool *media_visual_changed);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 static TILEFINCH_OUT_OF_LINE void psp_loop_report_network_warmup(
     PspLoop *loop, bool network_was_warming,
     PspNetworkStatus previous_network_status);
 #endif
-static TILEFINCH_OUT_OF_LINE void psp_loop_count_validation_tick(PspLoop *loop);
 
 /* The resident frame loop. It borrows physical owners and returns only
    cleanup telemetry; lifecycle authority remains in the media and network
@@ -5542,12 +2503,11 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     loop->blocker_navigation_baseline =
         startup_blocked_requests;
     interactive->recovery = (PspRecoveryTracker) {
-        .entry = navigation_current(engine_views->navigation),
-        .observed_generation = engine_views->navigation->generation,
+        .observed_generation = browser_engine_page_generation(browser->engine),
         .last_change_us = (uint64_t) sceKernelGetSystemTimeWide()
     };
-    interactive->recovery.observed_scroll =
-        interactive->recovery.entry == NULL ? 0 : interactive->recovery.entry->scroll_y;
+    (void) browser_engine_current_entry(
+        browser->engine, NULL, 0u, &interactive->recovery.observed_scroll);
     /* Automated PPSSPP smoke runs use the normal report and cleanup
        paths without requiring controller injection to leave the app. */
     if (process->config.exit_after_report != 0)
@@ -5588,31 +2548,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     /* The saved profile number is already in UI state. Its name is only
        visible in Options; the normal lazy Options refresh below owns that
        firmware lookup, never Home's first input sample. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_loop_timing_browser = browser;
-    bool input_script_loaded = psp_input_script_begin(
-        &process->install_paths, argv0, process->config.input_script);
-    if (process->config.input_script[0] != '\0' && !input_script_loaded) {
-        /* A named scenario is an automation contract, not an optional
-           controller aid. Falling back to the real pad makes the PPSSPP
-           runner wait for its full timeout and can accidentally exercise
-           unrelated user input. Leave through normal cleanup instead;
-           the harness outcome makes the run fail immediately. */
-        printf("tilefinch-input-script: outcome=load-failed "
-               "script=%s\n", process->config.input_script);
-        psp_exit_plan_request(
-            &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-    }
-#endif
+    psp_validation_interactive_begin(process, browser, interactive, argv0);
     while (!psp_exit_plan_requested(&interactive->exit)
            && !psp_home_exit_pending()) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_loop_timing_begin();
-#endif
         psp_loop_frame(loop);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_loop_timing_end();
-#endif
     }
     if (!psp_exit_plan_requested(&interactive->exit)
         && psp_home_exit_pending()) {
@@ -5627,29 +2568,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     if (psp_navigation_cooperate_active())
         psp_navigation_cooperate_end(
             loop->media_open_scope ? "media-open-exit" : "interactive-exit");
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_input_script_summary();
-    if (interactive->power_test.phase != PSP_POWER_TEST_OFF) {
-        PspClockWorkerSnapshot current_power = {0};
-        if (process->clock_live)
-            psp_clock_worker_snapshot(
-                &process->clock_worker, &current_power);
-        uint64_t now_us =
-            (uint64_t) sceKernelGetSystemTimeWide();
-        PspPowerTestResult result = psp_power_test_finish(
-            &interactive->power_test,
-            now_us,
-            process->clock_live ? &current_power : NULL,
-            "browser-exit");
-        if (interactive->power_auto.active) {
-            psp_power_auto_accumulate(&interactive->power_auto, &result);
-            interactive->power_auto.active = false;
-            psp_power_auto_log_summary(
-                &interactive->power_auto, now_us, "browser-exit");
-        }
-        process->presentation.ui.validation_power_test_phase = 0;
-    }
-#endif
+    psp_validation_interactive_end(process, interactive);
     result.update_check_attempts = loop->update_check.attempts;
     result.update_check_ratelimited = loop->update_check.ratelimited;
     result.update_check_completed = loop->update_check.completed;
@@ -5692,9 +2611,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_loop_page_work_waiting(PspLoop *loop)
    retaining the presenter's existing fence and three-buffer ownership. */
 static TILEFINCH_OUT_OF_LINE uint32_t psp_canvas_followup_wait(PspLoop *loop)
 {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (!psp_validation_canvas_followup_enabled) return 0;
-#endif
+    if (psp_validation_canvas_followup_disabled()) return 0;
     PspApp *app = &loop->app;
     if (!loop->fast_page_followup || !loop->canvas_page_followup
         || app->browser->media.ui.visible
@@ -5727,15 +2644,12 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     PspPowerPolicy *const power_policy = loop->power_policy;
     /* Presentation identifies the active tab's engine frame by this. */
     psp_present_canvas_engine_bind(browser->engine);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Boot can hand off before its initial candidate becomes the active
        session. Measurement marks must follow the refreshed frontend view,
        not keep that boot-time session (which can have no page runtime). */
-    psp_webgl_measurement_navigation = engine_views->navigation;
-    /* The main owner has not entered this frame's JS/native work. A busy
-       supervisor must wait for this checkpoint, never inspect the realm. */
-    psp_audio_slots_receipt(engine_views->navigation,
+    psp_vprobe_frame_begin(engine_views->navigation,
         process->config.validation_game_audio_reference == 0);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (psp_input_script_report_pending()) {
         psp_exit_plan_request(
             &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
@@ -5812,8 +2726,8 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     loop->page_task_yield = !queued_page_input && !fullscreen_media_poll
         && !loop->fast_page_followup && psp_loop_page_work_waiting(loop);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_loop_timing.task_yield = loop->page_task_yield;
-    psp_loop_timing.fast_followup = loop->fast_page_followup;
+    psp_loop_timing_note_wait(
+        loop->page_task_yield, loop->fast_page_followup);
 #endif
     psp_wait_before_interactive_input(
         fullscreen_media_poll, loop->fast_page_followup || queued_page_input,
@@ -5838,20 +2752,15 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
     frame.runtime_deferred = loop->focus_runtime_deferred;
     frame.defer_runtime = false;
     frame_pumps_begin(&interactive->frame_pumps);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_boot_input_probe(frame.ui_sample_us);
-#endif
     bool color_mode_visual_changed = false;
     if (frame.ui_sample_us >= loop->next_color_mode_check_us) {
         bool was_dark = process->presentation.ui.page_dark;
         psp_refresh_page_color_mode(&process->presentation.ui);
         loop->next_color_mode_check_us =
             frame.ui_sample_us + UINT64_C(60000000);
-        if (process->presentation.ui.page_dark != was_dark) {
-            (void) browser_engine_set_forced_dark(
-                browser->engine, process->presentation.ui.page_dark);
-            color_mode_visual_changed = true;
-        }
+        color_mode_visual_changed = psp_color_mode_refresh_apply(
+            browser->engine, &process->presentation.ui, was_dark);
     }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     /* Refresh the cached wifi bar count on its own slow cadence;
@@ -5898,29 +2807,14 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
             &supervisor_page_pressed, &supervisor_page_pressed_us);
     if (supervisor_page_input)
         frame.replayed_press_us = supervisor_page_pressed_us;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     /*
      * The scripted source replaces the sampled pad outright, and only
      * steps forward on a frame the browser could actually have taken
-     * the press on. That readiness gate is what makes one script walk
-     * the identical sequence under PPSSPP and on a PSP-3000, where
-     * the same navigation costs a different number of frames.
+     * the press on (psp_validation_scripted_frame).
      */
-    if (psp_input_script_running()) {
-        if (!psp_loop_scripted_input(loop, &input, supervisor_page_input))
-            return;
-        if (input.pressed != 0 && frame.replayed_press_us == 0)
-            frame.replayed_press_us =
-                psp_input_script_request_time(frame.ui_sample_us);
-        /* The loop's own millisecond consumers -- the reader-mode
-           hold, the power policy -- read this rather than the input,
-           and a frame that took 800 ms under a loaded host would
-           otherwise turn a scripted tap into a long press.
-           The media presentation clock is deliberately NOT one of
-           them: see media_elapsed_ms below. */
-        ui_elapsed_ms = 16u;
-    }
-#endif
+    if (!psp_validation_scripted_frame(
+            loop, &input, supervisor_page_input, &frame, &ui_elapsed_ms))
+        return;
     if (supervisor_page_input) {
         input.pressed |= supervisor_page_pressed;
         input.held |= supervisor_page_pressed;
@@ -6427,36 +3321,15 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
                     || frame.page_dirty);
         } else if (!psp_navigation_cooperate_supervised()) {
             psp_log_set_phase(PSP_LOG_PHASE_RENDER);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-            unsigned presents_before = psp_display.presents;
-            uint64_t canvas_present_started_us =
-                (uint64_t) sceKernelGetSystemTimeWide();
-#endif
+            PspVprobePresent present_probe;
+            psp_vprobe_present_begin(&present_probe);
             bool published = psp_present(
                 engine_views->frame, &process->presentation.ui);
             if (published)
                 loop->render_progress_present_us = sceKernelGetSystemTimeWide();
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-            uint64_t canvas_present_finished_us =
-                (uint64_t) sceKernelGetSystemTimeWide();
-            psp_canvas_cadence_observe_present(
-                render_visual_state, presents_before,
-                canvas_present_started_us,
-                canvas_present_finished_us);
-            if (psp_input_script_running()
-                && psp_validation_video_timing_window)
-                psp_validation_video_suppressed_publications++;
-            if (psp_input_script_running()
-                && !psp_validation_video_timing_window
-                && (!psp_canvas_cadence.causal_window
-                    || psp_validation_canvas_live_trace))
-                printf("tilefinch-page-publication: at-us=%llu success=%d "
-                       "presents=%u layout-text=%llu\n",
-                       (unsigned long long) canvas_present_finished_us,
-                       published ? 1 : 0, psp_display.presents,
-                       (unsigned long long)
-                           engine_views->navigation->page.layout.text_fingerprint);
-#endif
+            psp_vprobe_present_end(
+                &present_probe, render_visual_state, published,
+                browser->engine);
             /* A partial scroll already waited for safe scanout publication.
                Do not wait a second vblank before its next bounded slice.
                The next turn still samples input before raster, and each
@@ -6575,40 +3448,6 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_start_boot_navigation(
         deferred_started ? 1 : 0);
 }
 
-/* A PSP cannot schedule its own wake from a user-mode suspend.
-   This validation-only cycle therefore publishes both callbacks
-   together: lifecycle_poll still orders QUIESCE before RECOVER,
-   exercising the exact media teardown/reopen, display rearm and
-   network revalidation paths without claiming to test firmware
-   sleep itself. Do not wait for an idle codec slot; split-state
-   teardown is part of the contract this probe exists to cover. */
-static TILEFINCH_OUT_OF_LINE void psp_loop_inject_media_lifecycle(
-    PspLoop *loop)
-{
-    PspProcessResources *const process = loop->app.process;
-    PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    if (process->config.validation_media_lifecycle_auto != 0
-        && interactive->media_stability_active
-        && !loop->media_stability_lifecycle_injected
-        && interactive->media_stability_started_us != 0
-        && (uint64_t) sceKernelGetSystemTimeWide()
-               - interactive->media_stability_started_us
-               >= UINT64_C(30000000)
-        && psp_lifecycle_state(&psp_lifecycle)
-               == PSP_LIFECYCLE_RUNNING) {
-        loop->media_stability_lifecycle_injected = true;
-        printf(
-            "tilefinch-media-stability: "
-            "event=lifecycle-injected kind=logical "
-            "clock=%lluus job=%d\n",
-            (unsigned long long) browser->media.clock_us,
-            (int) browser->media.job_phase);
-        psp_lifecycle_notify_suspend(&psp_lifecycle);
-        psp_lifecycle_notify_resume(&psp_lifecycle);
-    }
-}
-
 /* Serves a system suspend or resume the frame polled (lifecycle_action)
    and at most one more after it. True when a resume was completed: the
    frame then starts over. */
@@ -6702,7 +3541,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_loop_serve_lifecycle(
                     process->storage.tab_hibernation);
             bool recovery_saved =
                 psp_recovery_record_current(
-                    browser->profile, process->storage.recovery, engine_views->navigation);
+                    browser->profile, process->storage.recovery, browser->engine);
             bool profile_saved =
                 psp_profile_store_flush(&browser->profile_store);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -6860,214 +3699,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_loop_serve_lifecycle(
     return lifecycle_recovered;
 }
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* This frame's input from the running script, or the person who just
-   took over from it. False when the script has finished: the loop
-   then leaves through its exit plan. */
-static TILEFINCH_HOT_BOUNDARY bool psp_loop_scripted_input(
-    PspLoop *loop, PspUiInput *input, bool supervisor_page_input)
-{
-    PspProcessResources *const process = loop->app.process;
-    PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    PspEngineViews *const engine_views = loop->app.views;
-    /* The script is the sole controller source until a person
-       touches the real pad. A physical press is an explicit handoff:
-       stop every automatic driver and deliver that same press now.
-       Merging sources would let a later scripted Cross immediately
-       undo a manual Pause. */
-    if (input->held != 0u) {
-        psp_input_script_interrupt_by_user();
-        psp_boot_config_disable_automation(&process->config);
-        interactive->media_stability_active = false;
-        interactive->media_stability_auto_exit = false;
-        process->presentation.ui.validation_media_test_phase = 0;
-        input->pressed = input->held;
-    } else if (supervisor_page_input) {
-        /* The scripted edge was already advanced and captured by
-           the callback supervisor. Replay it before asking the
-           script for another command, preserving one receiver and
-           one browser action per authored edge. */
-        memset(input, 0, sizeof(*input));
-        input->analog_x = 128;
-        input->analog_y = 128;
-    } else {
-        uint32_t scripted_download_id = 0;
-        bool scripted_background_idle =
-            interactive->screenshot.writer.status
-                != SCREENSHOT_PNG_PENDING
-            && !psp_update_session_active(&browser->update_session)
-            && !offline_download_manager_active(
-                   &browser->offline_store.download,
-                   &scripted_download_id);
-        bool supervisor_owns_script =
-            psp_navigation_cooperate_supervised();
-        bool scripted_media_ready = browser->media.ui.visible
-            && !browser->media.ui.resolving
-            && !browser->media.ui.failed
-            && browser->media.playback != NULL;
-        bool scripted_surface_ready =
-            scripted_background_idle
-            && !process->presentation.ui.loading
-            && !loop->render_job_pending
-            && (!browser->media.ui.visible || scripted_media_ready)
-            && !browser_engine_navigation_pending(browser->engine);
-        bool scripted_page_ready = scripted_surface_ready
-            && process->presentation.ui.base_screen == PSP_UI_SCREEN_PAGE
-            && engine_views->navigation != NULL
-            && engine_views->navigation->page.loaded;
-        bool scripted_ready = scripted_surface_ready
-            && !navigation_background_resources_pending(
-                   engine_views->navigation);
-        if (supervisor_owns_script) {
-            psp_log_set_stage("frame-supervised-script");
-            memset(input, 0, sizeof(*input));
-            input->analog_x = 128;
-            input->analog_y = 128;
-        } else if (!psp_input_script_frame(
-                       input, scripted_ready, scripted_page_ready)) {
-            psp_exit_plan_request(
-                &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-            return false;
-        }
-    }
-    return true;
-}
-#endif
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* The automatic power test: starts it once the page is idle, and
-   while it runs keeps ordinary controls off the measured page
-   (Circle aborts). True when the test changed what is shown. */
-static TILEFINCH_OUT_OF_LINE bool psp_loop_power_test_input(
-    PspLoop *loop, PspUiInput *input, uint64_t now_us,
-    bool *abort_requested)
-{
-    PspProcessResources *const process = loop->app.process;
-    PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    PspEngineViews *const engine_views = loop->app.views;
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-    PspNetworkLifecycle *const network_lifecycle = loop->app.network_lifecycle;
-#endif
-    bool power_auto_started_visual = false;
-    bool power_auto_start_ready =
-        interactive->power_auto_boot_pending
-        && !process->presentation.ui.loading && !loop->render_job_pending
-        && !browser->media.ui.visible
-        && !browser_engine_navigation_pending(browser->engine)
-        && !navigation_background_resources_pending(engine_views->navigation)
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-        && !psp_network_lifecycle_warming(network_lifecycle)
-#endif
-        ;
-    if (power_auto_start_ready) {
-        PspClockWorkerSnapshot initial_power = {0};
-        if (process->clock_live)
-            psp_clock_worker_snapshot(
-                &process->clock_worker, &initial_power);
-        interactive->power_auto_boot_pending = false;
-        bool power_auto_started = psp_power_auto_start(
-            &interactive->power_auto, &interactive->power_test, now_us,
-            process->clock_live ? &initial_power : NULL,
-            &process->presentation.ui, process->config.validation_power_test_auto != 0,
-            process->config.validation_power_test_auto != 0
-                ? "boot-config" : "menu");
-        if (!power_auto_started)
-            process->presentation.ui.validation_power_test_phase = 0;
-        power_auto_started_visual = true;
-    }
-    bool power_auto_abort_requested = false;
-    if (interactive->power_auto_boot_pending || interactive->power_auto.active) {
-        power_auto_abort_requested =
-            (input->pressed & PSP_UI_BUTTON_CANCEL) != 0;
-        if (power_auto_abort_requested
-            && interactive->power_auto_boot_pending
-            && !interactive->power_auto.active) {
-            interactive->power_auto_boot_pending = false;
-            process->presentation.ui.validation_power_test_phase = 0;
-            psp_ui_show_status(
-                &process->presentation.ui, "POWER TEST STOPPED", 240);
-            power_auto_started_visual = true;
-            power_auto_abort_requested = false;
-        }
-        /* This benchmark isolates the idle-reading state. Ignore
-           ordinary controls so every segment presents the same page
-           and follows the same browser path; Circle remains an
-           immediate escape hatch. */
-        input->pressed = 0;
-        input->held = 0;
-        input->analog_x = 128;
-        input->analog_y = 128;
-    }
-    *abort_requested = power_auto_abort_requested;
-    return power_auto_started_visual;
-}
-#endif
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* Advances the power test; true when an automatic segment ended. */
-static TILEFINCH_HOT_BOUNDARY bool psp_loop_power_test_tick(
-    PspLoop *loop, uint64_t now_us, unsigned ui_elapsed_ms,
-    PspClockWorkerSnapshot *power_snapshot, bool power_auto_abort_requested)
-{
-    PspProcessResources *const process = loop->app.process;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    psp_power_test_tick(
-        &interactive->power_test, now_us, ui_elapsed_ms,
-        process->clock_live ? power_snapshot : NULL);
-    bool power_auto_visual_changed = false;
-    if (interactive->power_auto.active
-        && (power_auto_abort_requested
-            || now_us - interactive->power_test.started_us
-                   >= PSP_POWER_AUTO_SEGMENT_US)) {
-        PspPowerTestResult segment_result =
-            psp_power_test_finish(
-                &interactive->power_test, now_us,
-                process->clock_live ? power_snapshot : NULL,
-                power_auto_abort_requested
-                    ? "user-abort" : "automatic-segment");
-        psp_power_auto_accumulate(
-            &interactive->power_auto, &segment_result);
-        printf(
-            "tilefinch-power-auto: event=segment-finish "
-            "segment=%u/4 phase=%s\n",
-            interactive->power_auto.segment + 1u,
-            psp_power_test_phase_name(segment_result.phase));
-        if (power_auto_abort_requested) {
-            interactive->power_auto.active = false;
-            process->presentation.ui.validation_power_test_phase = 0;
-            psp_power_auto_log_summary(
-                &interactive->power_auto, now_us, "user-abort");
-            psp_ui_show_status(
-                &process->presentation.ui, "POWER TEST STOPPED", 240);
-        } else if (++interactive->power_auto.segment
-                   < PSP_POWER_AUTO_SEGMENTS) {
-            psp_power_auto_begin_segment(
-                &interactive->power_auto, &interactive->power_test, now_us,
-                process->clock_live ? power_snapshot : NULL,
-                &process->presentation.ui);
-        } else {
-            interactive->power_auto.active = false;
-            process->presentation.ui.validation_power_test_phase = 0;
-            psp_power_auto_log_summary(
-                &interactive->power_auto, now_us, "complete");
-            psp_ui_show_status(
-                &process->presentation.ui,
-                "2 MIN POWER TEST COMPLETE - EXIT TO SAVE LOG",
-                900);
-            if (process->config.validation_power_test_auto != 0) {
-                psp_log_checkpoint(
-                    "automatic-power-test-complete");
-                psp_exit_plan_request(
-                    &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-            }
-        }
-        power_auto_visual_changed = true;
-    }
-    return power_auto_visual_changed;
-}
-#endif
 
 /* A freshly installed slot runs on trial until the first input, or ten
    seconds, proves it usable; this records that in the update journal. */
@@ -7397,12 +4029,13 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
     loop->blocker_navigation_active = false;
     psp_navigation_cooperate_end("interactive");
     (void) psp_engine_views_refresh(engine_views, browser->engine);
-    const NavigationEntry *reader_entry =
-        navigation_current(engine_views->navigation);
+    char reader_entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *reader_entry_url = psp_app_current_url(
+        browser->engine, reader_entry_buffer, sizeof(reader_entry_buffer));
     psp_reader_navigation_finish(
         browser->engine, &process->presentation.ui,
         browser->profile, &interactive->reader_navigation,
-        reader_entry == NULL ? NULL : reader_entry->url,
+        reader_entry_url,
         navigation_status == BROWSER_NAVIGATION_JOB_SUCCEEDED);
     (void) psp_engine_views_refresh(engine_views, browser->engine);
     psp_ui_set_loading(
@@ -7450,17 +4083,15 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_finish_navigation(
         if (!isolated_portal_navigation) {
             psp_profile_record_current(
                 browser->profile, &browser->profile_store,
-                engine_views->navigation, frame->ui_sample_us);
+                browser->engine, frame->ui_sample_us);
             if (psp_recovery_record_current(
                 browser->profile, process->storage.recovery,
-                engine_views->navigation)) {
-                interactive->recovery.entry =
-                    navigation_current(engine_views->navigation);
-                interactive->recovery.observed_scroll =
-                    interactive->recovery.entry == NULL
-                        ? 0 : interactive->recovery.entry->scroll_y;
+                browser->engine)) {
+                (void) browser_engine_current_entry(
+                    browser->engine, NULL, 0u,
+                    &interactive->recovery.observed_scroll);
                 interactive->recovery.observed_generation =
-                    engine_views->navigation->generation;
+                    browser_engine_page_generation(browser->engine);
                 interactive->recovery.last_change_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
                 interactive->recovery.dirty = false;
@@ -7738,43 +4369,61 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_pump_offline_download(
 }
 
 /* The recovery record follows the page and its scroll position, saved
-   once they have been still for two seconds and at most every 30. */
+   once they have been still for two seconds and at most every 30. Each
+   frame reads only the generation and scroll; the URL is copied and
+   classified (psp_loop_recovery_moved) only when one of them moved or a
+   save is due. */
 static TILEFINCH_HOT_BOUNDARY void psp_loop_track_recovery(PspLoop *loop)
+{
+    PspRecoveryTracker *const recovery = &loop->app.interactive->recovery;
+    int entry_scroll = 0;
+    if (!browser_engine_current_entry(
+            loop->app.browser->engine, NULL, 0u, &entry_scroll)) return;
+    uint64_t generation =
+        browser_engine_page_generation(loop->app.browser->engine);
+    uint64_t recovery_now_us =
+        (uint64_t) sceKernelGetSystemTimeWide();
+    bool changed = generation != recovery->observed_generation
+        || entry_scroll != recovery->observed_scroll;
+    if (!changed && !psp_recovery_save_due(recovery, recovery_now_us))
+        return;
+    psp_loop_recovery_moved(loop, generation, entry_scroll, changed,
+                            recovery_now_us);
+}
+
+/* The page moved, or a save is due: copy and classify the URL. An
+   internal page is never recorded, so its generation and scroll are
+   simply observed, and any dirty state dropped: the next external page
+   is a new load (the page generation only grows), which marks the record
+   dirty again with a fresh timer, as before. */
+static TILEFINCH_OUT_OF_LINE void psp_loop_recovery_moved(
+    PspLoop *loop, uint64_t generation, int entry_scroll, bool changed,
+    uint64_t recovery_now_us)
 {
     PspProcessResources *const process = loop->app.process;
     PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    PspEngineViews *const engine_views = loop->app.views;
-    interactive->recovery.entry = navigation_current(engine_views->navigation);
-    uint64_t recovery_now_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
-    bool external_page =
-        interactive->recovery.entry != NULL
-        && interactive->recovery.entry->url != NULL
-        && !psp_ui_internal_url(interactive->recovery.entry->url);
-    if (external_page
-        && (engine_views->navigation->generation
-                != interactive->recovery.observed_generation
-            || interactive->recovery.entry->scroll_y
-                != interactive->recovery.observed_scroll)) {
-        interactive->recovery.dirty = true;
-        interactive->recovery.observed_generation =
-            engine_views->navigation->generation;
-        interactive->recovery.observed_scroll =
-            interactive->recovery.entry->scroll_y;
-        interactive->recovery.last_change_us = recovery_now_us;
+    PspRecoveryTracker *const recovery = &loop->app.interactive->recovery;
+    char entry_url[NAVIGATION_URL_LIMIT];
+    if (!browser_engine_current_entry(
+            browser->engine, entry_url, sizeof(entry_url), NULL)) return;
+    if (psp_ui_internal_url(entry_url)) {
+        recovery->observed_generation = generation;
+        recovery->observed_scroll = entry_scroll;
+        recovery->dirty = false;
+        return;
     }
-    if (interactive->recovery.dirty && external_page
-        && recovery_now_us - interactive->recovery.last_change_us
-               >= UINT64_C(2000000)
-        && (interactive->recovery.last_save_us == 0
-            || recovery_now_us - interactive->recovery.last_save_us
-                   >= UINT64_C(30000000))
+    if (changed) {
+        recovery->dirty = true;
+        recovery->observed_generation = generation;
+        recovery->observed_scroll = entry_scroll;
+        recovery->last_change_us = recovery_now_us;
+    }
+    if (psp_recovery_save_due(recovery, recovery_now_us)
         && psp_recovery_record_current(
-               browser->profile, process->storage.recovery, engine_views->navigation)) {
-        interactive->recovery.last_change_us = recovery_now_us;
-        interactive->recovery.last_save_us = recovery_now_us;
-        interactive->recovery.dirty = false;
+               browser->profile, process->storage.recovery, browser->engine)) {
+        recovery->last_change_us = recovery_now_us;
+        recovery->last_save_us = recovery_now_us;
+        recovery->dirty = false;
     }
 }
 
@@ -7845,214 +4494,6 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_report_network_warmup(
 }
 #endif
 
-static TILEFINCH_OUT_OF_LINE void psp_loop_count_validation_tick(PspLoop *loop)
-{
-    PspProcessResources *const process = loop->app.process;
-    PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    PspEngineViews *const engine_views = loop->app.views;
-    if (process->config.interactive_validation_ticks > 0
-        && ++loop->interactive_validation_ticks
-               >= process->config.interactive_validation_ticks) {
-        if (process->config.validation_media_play != 0
-            && !interactive->validation_media_play_confirmed) {
-            MediaBackendStats backend_stats = {0};
-            bool have_stats = media_playback_backend_stats(
-                browser->media.playback, &backend_stats);
-            printf("tilefinch-media-validation: "
-                   "playback-not-confirmed injected=%d "
-                   "clock=%lluus have-stats=%d video-frames=%zu "
-                   "audio-packets=%zu native-error=%d\n",
-                   interactive->validation_media_play_injected ? 1 : 0,
-                   (unsigned long long) browser->media.clock_us,
-                   have_stats ? 1 : 0,
-                   backend_stats.decoded_video_frames,
-                   backend_stats.submitted_audio_packets,
-                   backend_stats.last_native_error);
-        }
-        printf("tilefinch-validation: interactive-loops=%ld "
-               "background-pending=%d render-pending=%d\n",
-               loop->interactive_validation_ticks,
-               navigation_background_resources_pending(engine_views->navigation)
-                   ? 1 : 0,
-               loop->render_job_pending ? 1 : 0);
-        psp_log_checkpoint("interactive-validation-complete");
-        psp_exit_plan_request(
-            &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-    }
-}
-
-/* Validation-only media drivers: the play-after-open knob, its playback
-   confirmation, and the long-run stability test (loops, seeks, end). */
-static TILEFINCH_OUT_OF_LINE void psp_loop_media_validation(
-    PspLoop *loop, bool *media_visual_changed)
-{
-    PspApp *const app = &loop->app;
-    PspProcessResources *const process = loop->app.process;
-    PspBrowserResources *const browser = loop->app.browser;
-    PspInteractiveState *const interactive = loop->app.interactive;
-    bool stability_needs_play =
-        interactive->media_stability_active
-        && process->config.input_script[0] == '\0'
-        && browser->media.playback != NULL && browser->media.have_frame
-        && !browser->media.pause_boundary_pending && !browser->media.ui.playing
-        && browser->media.job_phase == PSP_MEDIA_JOB_NONE
-        && !browser->media.ui.ended;
-    /* Autoplay for the validation measurement engages the instant the
-       open settles -- playback live, no job in flight -- rather than
-       waiting for a first frame. The resume-open leg this path takes
-       decodes nothing on its own, so a have-frame gate here left
-       playing=0 forever and the panel never rendered, which is useless
-       to measure. PLAY_PAUSE clears pause-after-next-frame and starts
-       the decoder against the connection media-open already warmed, so
-       there is no idle gap and no handshake inside the measured window.
-       The injected flag and the not-already-playing gate keep this to a
-       single press even if a script also sends play. */
-    bool validation_autoplay =
-        process->config.validation_media_play != 0
-        && !interactive->validation_media_play_injected
-        && browser->media.playback != NULL
-        && browser->media.job_phase == PSP_MEDIA_JOB_NONE
-        && !browser->media.ui.playing
-        && !browser->media.ui.ended;
-    bool natural_autoplay_ready =
-        ((process->config.validation_media_play != 0
-          && !interactive->validation_media_play_injected)
-         || (interactive->media_stability_active
-             && interactive->media_stability_started_us == 0))
-        && browser->media.playback != NULL
-        && browser->media.job_phase == PSP_MEDIA_JOB_NONE
-        && browser->media.ui.playing
-        && !browser->media.ui.ended;
-    if (validation_autoplay || stability_needs_play
-        || natural_autoplay_ready) {
-        bool injected_play = validation_autoplay || stability_needs_play;
-        if (injected_play) {
-            PspUiMediaIntent play_intent = {
-                .action = PSP_UI_MEDIA_ACTION_PLAY_PAUSE
-            };
-            psp_media_execute_intent(&browser->media, play_intent);
-        }
-        if (process->config.validation_media_play != 0)
-            interactive->validation_media_play_injected = true;
-        if (interactive->media_stability_active
-            && interactive->media_stability_started_us == 0) {
-            interactive->media_stability_started_us =
-                (uint64_t) sceKernelGetSystemTimeWide();
-            interactive->media_stability_next_sample_us =
-                interactive->media_stability_started_us + UINT64_C(250000);
-            interactive->media_stability_start_capacity =
-                scePowerGetBatteryRemainCapacity();
-            interactive->media_stability_start_percent =
-                scePowerGetBatteryLifePercent();
-            unsigned starting_free = sceKernelTotalFreeMemSize();
-            unsigned starting_largest = sceKernelMaxFreeMemSize();
-            interactive->media_stability_min_free = starting_free;
-            interactive->media_stability_min_largest = starting_largest;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-            psp_power_log_battery(
-                "media-start", PSP_POWER_TEST_FIXED_HIGH, 0);
-#endif
-            printf(
-                "tilefinch-media-stability: event=started "
-                "requested=%up actual=%dx%d itag=%d "
-                "system-free=%u system-largest=%u\n",
-                (unsigned) browser->media.requested_quality,
-                browser->media.stream.width, browser->media.stream.height,
-                browser->media.stream.itag,
-                starting_free, starting_largest);
-        }
-        *media_visual_changed = true;
-        printf("tilefinch-media-validation: play-source=%s "
-               "after-open=1\n",
-               injected_play ? "validation-input" : "route-autoplay");
-    }
-    if (process->config.validation_media_play != 0
-        && !interactive->media_stability_active
-        && interactive->validation_media_play_injected
-        && !interactive->validation_media_play_confirmed
-        && browser->media.clock_us >= UINT64_C(500000)) {
-        MediaBackendStats backend_stats = {0};
-        if (media_playback_backend_stats(
-                browser->media.playback, &backend_stats)
-            && backend_stats.decoded_video_frames >= 2
-            && backend_stats.submitted_audio_packets != 0) {
-            interactive->validation_media_play_confirmed = true;
-            printf("tilefinch-media-validation: playback-confirmed "
-                   "clock=%lluus video-frames=%zu "
-                   "audio-packets=%zu video-us=%lluus "
-                   "audio-origin-us=%lluus audio-blocks=%lu "
-                   "audio-rate=%u native-error=%d\n",
-                   (unsigned long long) browser->media.clock_us,
-                   backend_stats.decoded_video_frames,
-                   backend_stats.submitted_audio_packets,
-                   (unsigned long long)
-                       backend_stats.presented_video_us,
-                   (unsigned long long)
-                       backend_stats.audio_origin_us,
-                   backend_stats.audio_output_blocks,
-                   backend_stats.audio_sample_rate,
-                   backend_stats.last_native_error);
-            psp_exit_plan_request(
-                &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-        }
-    }
-    if (interactive->media_stability_active) {
-        if (browser->media.ui.failed
-            && !psp_media_open_work_pending(&browser->media)
-            && browser->media.job_phase == PSP_MEDIA_JOB_NONE) {
-            printf(
-                "tilefinch-media-stability: event=failed "
-                "reason=\"%.160s\"\n",
-                browser->media.ui.status);
-            interactive->media_stability_active = false;
-            process->presentation.ui.validation_media_test_phase = 0;
-            if (interactive->media_stability_auto_exit)
-                psp_exit_plan_request(
-                    &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
-        }
-    }
-    if (interactive->media_stability_active) {
-        uint64_t stability_now_us =
-            (uint64_t) sceKernelGetSystemTimeWide();
-        uint64_t stability_elapsed_us =
-            interactive->media_stability_started_us == 0 ? 0
-                : stability_now_us - interactive->media_stability_started_us;
-        psp_sample_media_stability(app, stability_now_us);
-        uint64_t duration_us =
-            psp_media_duration_us(&browser->media);
-        psp_media_stability_schedule_seeks(
-            app, stability_elapsed_us, duration_us);
-        /* Loop the way a viewer restarts a finished video: Play at the end,
-           which rewinds to 0:00 and keeps playing. A clip of 30 s or more
-           makes that rewind a full backend reopen, whose resume state is
-           taken when the seek is requested -- so it must be asked for as
-           playing then, not patched into job_resume_playing afterwards. */
-        /* A playlist owns its end policy. The single-video soak must not
-           restart its incumbent before automatic-next can observe the end. */
-        if (browser->media.playlist == NULL
-            && browser->media.ui.ended && browser->media.playback != NULL
-            && browser->media.job_phase == PSP_MEDIA_JOB_NONE
-            && stability_elapsed_us
-                   < loop->media_stability_target_us) {
-            psp_media_execute_intent(&browser->media, (PspUiMediaIntent) {
-                .action = PSP_UI_MEDIA_ACTION_PLAY_PAUSE
-            });
-            interactive->media_stability_skew.steady_since_us = 0;
-            interactive->media_stability_loops++;
-            printf(
-                "tilefinch-media-stability: event=loop count=%u\n",
-                interactive->media_stability_loops);
-        }
-        if (interactive->media_stability_started_us != 0
-            && stability_elapsed_us
-                   >= loop->media_stability_target_us) {
-            psp_finish_media_stability(
-                app, stability_elapsed_us);
-        }
-    }
-}
-
 /* The media session's share of every frame, player open or not: route
    reconciliation, the open and decoder-submit cooperate scopes, the
    session advance (its surface housekeeping runs even when hidden),
@@ -8066,25 +4507,26 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_media_frame(
     PspBrowserResources *const browser = loop->app.browser;
     PspInteractiveState *const interactive = loop->app.interactive;
     PspEngineViews *const engine_views = loop->app.views;
-    const NavigationEntry *current_entry =
-        navigation_current(engine_views->navigation);
+    char current_url[NAVIGATION_URL_LIMIT];
+    bool has_current_entry = browser_engine_current_entry(
+        browser->engine, current_url, sizeof(current_url), NULL);
     /* Watch documents no longer autoplay: the thumbnail is the sole
        authored native-player target. The validation-only autoplay knob
        must therefore perform that activation explicitly instead of
        waiting for document route reconciliation to open media. Shipping
        configuration strips this knob before the interactive loop. */
     if (process->config.validation_media_play != 0
-        && current_entry != NULL
+        && has_current_entry
         && browser->media.source[0] == '\0') {
         (void) psp_media_open_provider_route(
-            &browser->media, current_entry->url,
-            engine_views->navigation->generation);
+            &browser->media, current_url,
+            browser_engine_page_generation(browser->engine));
     }
     bool media_open_was_pending =
         psp_media_open_work_pending(&browser->media);
     psp_media_prepare_route(
-        &browser->media, current_entry == NULL ? NULL : current_entry->url,
-        engine_views->navigation->generation);
+        &browser->media, has_current_entry ? current_url : NULL,
+        browser_engine_page_generation(browser->engine));
     if (!media_open_was_pending
         && psp_media_open_work_pending(&browser->media)) {
         /* A selected video replaces the page as the visible surface.
@@ -8233,9 +4675,10 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_apply_media_request(
     PspLoop *loop, const ScriptMediaRequest *dom_media_request)
 {
     PspBrowserResources *const browser = loop->app.browser;
-    PspEngineViews *const engine_views = loop->app.views;
-    const NavigationEntry *dom_entry =
-        navigation_current(engine_views->navigation);
+    char dom_url[NAVIGATION_URL_LIMIT];
+    bool has_dom_entry = browser_engine_current_entry(
+        browser->engine, dom_url, sizeof(dom_url), NULL);
+    uint64_t dom_generation = browser_engine_page_generation(browser->engine);
     bool same_page_media = browser->media.page_source
         && browser->media.page_audio
                == dom_media_request->audio_only
@@ -8250,13 +4693,13 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_apply_media_request(
         MediaDiscoveryKind kind = media_discovery_reference_kind(
             dom_media_request->source,
             strlen(dom_media_request->source));
-        same_page_media = dom_entry != NULL
+        same_page_media = has_dom_entry
             && (dom_media_request->audio_only
                 ? kind != MEDIA_DISCOVERY_HLS
                   && psp_media_open_page_audio(
                       &browser->media, dom_media_request->source,
-                      dom_entry->url,
-                      engine_views->navigation->generation,
+                      dom_url,
+                      dom_generation,
                       dom_media_request->node_handle,
                       dom_media_request->mode,
                       dom_media_request->credentials,
@@ -8267,8 +4710,8 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_apply_media_request(
                 : kind == MEDIA_DISCOVERY_HLS
                 ? psp_media_open_page_hls(
                     &browser->media, dom_media_request->source,
-                    dom_entry->url,
-                    engine_views->navigation->generation,
+                    dom_url,
+                    dom_generation,
                     dom_media_request->node_handle,
                     dom_media_request->mode,
                     dom_media_request->credentials,
@@ -8278,8 +4721,8 @@ static TILEFINCH_OUT_OF_LINE void psp_loop_apply_media_request(
                         == SCRIPT_MEDIA_COMMAND_LOAD)
                 : psp_media_open_page_source(
                     &browser->media, dom_media_request->source,
-                    dom_entry->url,
-                    engine_views->navigation->generation,
+                    dom_url,
+                    dom_generation,
                     dom_media_request->node_handle,
                     dom_media_request->mode,
                     dom_media_request->credentials,
@@ -8528,19 +4971,8 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
     }
     const TileCache *render_stats =
         browser_engine_render_metrics_view(browser->engine);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t canvas_raster_before = canvas_render && render_stats != NULL
-        ? render_stats->canvas_fast_raster_us : 0;
-    uint64_t canvas_overlay_before = canvas_render && render_stats != NULL
-        ? render_stats->canvas_fast_overlay_us : 0;
-    size_t canvas_frames_before = canvas_render && render_stats != NULL
-        ? render_stats->canvas_fast_frames : 0;
-    PspCanvasCpuSample render_cpu_before = {0};
-    if (canvas_render && psp_canvas_cadence.causal_window)
-        render_cpu_before = psp_canvas_cpu_sample();
-    uint64_t canvas_render_started_us = canvas_render
-        ? (uint64_t) sceKernelGetSystemTimeWide() : 0;
-#endif
+    PspVprobeRender render_probe;
+    psp_vprobe_render_begin(&render_probe, canvas_render, render_stats);
     size_t units_before = render_stats == NULL ? 0
         : render_stats->frame_job_units;
     BrowserRenderJobStatus render_status = psp_render_page_job(
@@ -8548,24 +4980,8 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
         render_scope ? psp_navigation_cancellation() : NULL);
     uint64_t render_now_us =
         (uint64_t) sceKernelGetSystemTimeWide();
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (canvas_render) {
-        PspCanvasCpuSample render_cpu_after = {0};
-        if (psp_canvas_cadence.causal_window)
-            render_cpu_after = psp_canvas_cpu_sample();
-        psp_canvas_cadence_rendered(
-            render_now_us - canvas_render_started_us,
-            render_stats == NULL
-                || render_stats->canvas_fast_raster_us < canvas_raster_before ? 0
-                : render_stats->canvas_fast_raster_us - canvas_raster_before,
-            render_stats == NULL
-                || render_stats->canvas_fast_overlay_us < canvas_overlay_before ? 0
-                : render_stats->canvas_fast_overlay_us - canvas_overlay_before,
-            &render_cpu_before, &render_cpu_after,
-            render_stats != NULL && render_stats->canvas_fast_frames > canvas_frames_before
-                ? &render_stats->canvas_fast_conversion : NULL);
-    }
-#endif
+    psp_vprobe_render_end(
+        &render_probe, canvas_render, render_stats, render_now_us);
     if (render_stats != NULL
         && render_stats->frame_job_units > units_before) {
         loop->render_job_last_progress_us = render_now_us;
@@ -8675,26 +5091,6 @@ static TILEFINCH_HOT_BOUNDARY unsigned psp_loop_render_job(
 /* Controlled browser teardown. State machines decide when their resources are
    releasable; this coordinator records any retained physical obligation and
    never overrides a quarantine or live transport lease. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static TILEFINCH_COLD_PATH void psp_report_frame_pumps(
-    const PspInteractiveState *interactive)
-{
-    if (interactive == NULL) return;
-    const FramePumpFrame *pumps = &interactive->frame_pumps;
-    printf("tilefinch-frame-pumps: order-violations=%lu "
-           "wiring-violations=%lu\n",
-           (unsigned long) pumps->order_violations,
-           (unsigned long) pumps->wiring_violations);
-    for (unsigned id = 0; id < FRAME_PUMP_COUNT; id++) {
-        printf("tilefinch-frame-pump: name=%s admissions=%lu slices=%lu "
-               "yields=%lu\n",
-               frame_pump_policy((FramePumpId) id)->name,
-               (unsigned long) pumps->admissions[id],
-               (unsigned long) pumps->slices[id],
-               (unsigned long) pumps->yields[id]);
-    }
-}
-#endif
 
 static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     PspProcessResources *process, PspBrowserResources *browser,
@@ -8726,15 +5122,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
            interactive_result->update_check_ratelimited,
            interactive_result->update_check_completed,
            interactive_result->update_check_available);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_report_frame_pumps(interactive);
-#if defined(TILEFINCH_OWNER_CHECKS)
-    /* Every worker thread exists only on this target, so this is where the
-       single-owner ledger rule meets real concurrency. */
-    printf("tilefinch-owner-checks: budget-violations=%lu\n",
-           budget_owner_violations());
-#endif
-#endif
     printf("tilefinch-validation: outcome=exit-requested "
            "free-mem=%d max-free=%d\n",
            sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
@@ -8773,11 +5161,14 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Whether a managed challenge frame received its larger script heap
        this session, and what the top-level response last said. */
-    if (engine_views != NULL && engine_views->navigation != NULL) {
+    BrowserValidationCounters challenge_counters;
+    if (engine_views != NULL && engine_views->navigation != NULL
+        && browser_engine_validation_counters(
+               browser->engine, &challenge_counters)) {
         printf("tilefinch-challenge: cf-mitigated=%s heap-raises=%zu\n",
-               engine_views->navigation->last_cf_mitigated[0] == '\0'
-                   ? "none" : engine_views->navigation->last_cf_mitigated,
-               engine_views->navigation->managed_challenge_heap_raises);
+               challenge_counters.last_cf_mitigated[0] == '\0'
+                   ? "none" : challenge_counters.last_cf_mitigated,
+               challenge_counters.managed_challenge_heap_raises);
     }
 #endif
     psp_log_operation_end(
@@ -8857,7 +5248,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
             browser->tabs, process->storage.tab_session,
             process->storage.tab_hibernation);
     (void) psp_recovery_record_current(
-        browser->profile, process->storage.recovery, engine_views->navigation);
+        browser->profile, process->storage.recovery, browser->engine);
     if (media_resume_changed)
         psp_profile_store_mark_dirty(
             &browser->profile_store,
@@ -8872,195 +5263,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
         profile_saved && tab_session_saved
             ? "saved" : "save-failed");
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    BrowserEngineMetrics exit_engine_metrics = {0};
-    if (browser_engine_metrics(browser->engine, &exit_engine_metrics)) {
-        printf("tilefinch-render-suppression: "
-               "unchanged-runtime-frames=%zu rendered-frames=%zu\n",
-               exit_engine_metrics.unchanged_runtime_frames_suppressed,
-               exit_engine_metrics.rendered_frames);
-    }
-    const TileCache *exit_render =
-        browser_engine_render_metrics_view(browser->engine);
-    if (exit_render != NULL) {
-        printf("tilefinch-animation-cadence: rendered=%zu scheduled=%zu "
-               "completed=%zu cancelled=%zu slices=%zu units=%zu "
-               "budget-exhausted=%zu max-slice=%lluus max-unit=%lluus "
-               "scaled-builds=%zu scaled-us=%lluus "
-               "canvas-fast=%zu/%lluus max=%lluus refusals=%zu "
-               "canvas-raster=%lluus canvas-overlay=%lluus "
-               "frame-us=%lluus tile-us=%lluus overflow-us=%lluus "
-               "fixed-us=%lluus\n",
-               exit_render->frames_rendered,
-               exit_render->frame_jobs_scheduled,
-               exit_render->frame_jobs_completed,
-               exit_render->frame_jobs_cancelled,
-               exit_render->frame_job_slices,
-               exit_render->frame_job_units,
-               exit_render->frame_job_budget_exhaustions,
-               (unsigned long long) exit_render->max_frame_job_slice_us,
-               (unsigned long long) exit_render->max_frame_job_unit_us,
-               exit_render->scaled_image_builds,
-               (unsigned long long) exit_render->scaled_image_us,
-               exit_render->canvas_fast_frames,
-               (unsigned long long) exit_render->canvas_fast_us,
-               (unsigned long long) exit_render->canvas_fast_max_us,
-               exit_render->canvas_fast_refusals,
-               (unsigned long long) exit_render->canvas_fast_raster_us,
-               (unsigned long long) exit_render->canvas_fast_overlay_us,
-               (unsigned long long) exit_render->frame_us,
-               (unsigned long long) exit_render->frame_tile_us,
-               (unsigned long long) exit_render->frame_overflow_us,
-               (unsigned long long) exit_render->frame_fixed_us);
-    }
-    ScriptWebglNativeMetrics webgl_metrics = {0};
-    if (script_runtime_webgl_native_metrics(&webgl_metrics)) {
-        printf("tilefinch-webgl-cadence: frames=%zu vertices=%zu "
-               "seed-avg=%lluus command-avg=%lluus sync-avg=%lluus "
-               "readback-avg=%lluus total-avg=%lluus total-max=%lluus "
-               "max-phases=%llu/%llu/%llu/%lluus max-vertices=%zu "
-               "max-aa=%zu/%zu "
-               "total-p50=%lluus total-p95=%lluus sampled=%zu "
-               "scratch-avg=%llu scratch-max=%zu owner-resets=%zu "
-               "capacity-resets=%zu texture-upload=%zu fast-vertices=%zu "
-               "geometry-hit-vertices=%zu geometry-misses=%zu "
-               "command-phases=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%lluus "
-               "instance-matrix-color=%llu/%lluus "
-               "commands=%zu draws=%zu matrices=%zu avoided=%zu "
-               "viewport-states=%zu avoided=%zu list-bytes=%zu max=%zu "
-               "antialias-draws=%zu antialias-edge-indices=%zu "
-               "aa-compact=%zu aa-radius-lt2-lt3-lt4=%zu/%zu/%zu\n",
-               webgl_metrics.frames, webgl_metrics.vertices,
-               (unsigned long long) (webgl_metrics.seed_us
-                   / webgl_metrics.frames),
-               (unsigned long long) (webgl_metrics.command_us
-                   / webgl_metrics.frames),
-               (unsigned long long) (webgl_metrics.sync_us
-                   / webgl_metrics.frames),
-               (unsigned long long) (webgl_metrics.readback_us
-                   / webgl_metrics.frames),
-               (unsigned long long) (webgl_metrics.total_us
-                   / webgl_metrics.frames),
-               (unsigned long long) webgl_metrics.maximum_total_us,
-               (unsigned long long) webgl_metrics.maximum_total_seed_us,
-               (unsigned long long) webgl_metrics.maximum_total_command_us,
-               (unsigned long long) webgl_metrics.maximum_total_sync_us,
-               (unsigned long long) webgl_metrics.maximum_total_readback_us,
-               webgl_metrics.maximum_total_vertices,
-               webgl_metrics.maximum_total_antialias_draws,
-               webgl_metrics.maximum_total_antialias_edge_indices,
-               (unsigned long long) webgl_metrics.median_total_us,
-               (unsigned long long) webgl_metrics.p95_total_us,
-               webgl_metrics.sampled_frames,
-               (unsigned long long) (webgl_metrics.scratch_bytes
-                   / webgl_metrics.frames),
-               webgl_metrics.maximum_scratch_bytes,
-               webgl_metrics.texture_cache_owner_resets,
-               webgl_metrics.texture_cache_capacity_resets,
-               webgl_metrics.texture_upload_bytes,
-               webgl_metrics.fast_vertices,
-               webgl_metrics.geometry_cache_hit_vertices,
-               webgl_metrics.geometry_cache_misses,
-               (unsigned long long) webgl_metrics.command_decode_us,
-               (unsigned long long) webgl_metrics.command_cache_us,
-               (unsigned long long) webgl_metrics.command_vertex_us,
-               (unsigned long long) webgl_metrics.command_state_us,
-               (unsigned long long) webgl_metrics.command_emit_us,
-               (unsigned long long) webgl_metrics.command_antialias_us,
-               (unsigned long long) webgl_metrics.command_writeback_us,
-               (unsigned long long) webgl_metrics.command_finalize_us,
-               (unsigned long long)
-                   webgl_metrics.command_instance_matrix_us,
-               (unsigned long long)
-                   webgl_metrics.command_instance_color_us,
-               webgl_metrics.commands,
-               webgl_metrics.draw_calls,
-               webgl_metrics.matrix_loads,
-               webgl_metrics.matrix_loads_avoided,
-               webgl_metrics.state_changes,
-               webgl_metrics.state_changes_avoided,
-               webgl_metrics.display_list_bytes,
-               webgl_metrics.maximum_display_list_bytes,
-               webgl_metrics.antialias_draws,
-               webgl_metrics.antialias_edge_indices,
-               webgl_metrics.antialias_compact_instances,
-               webgl_metrics.antialias_radius_lt2,
-               webgl_metrics.antialias_radius_lt3,
-               webgl_metrics.antialias_radius_lt4);
-    }
-    ScriptRuntimeTimingMetrics runtime_timing = {0};
-    ScriptRuntime *active_runtime = engine_views->navigation == NULL
-        ? NULL : engine_views->navigation->page.runtime;
-    if (script_runtime_timing_metrics(active_runtime, &runtime_timing)) {
-        uint64_t native_webgl_us = runtime_timing.webgl_native_us;
-        uint64_t advance_exclusive_us =
-            runtime_timing.total_us > native_webgl_us
-                ? runtime_timing.total_us - native_webgl_us : 0;
-        printf(
-            "tilefinch-js-cadence: advances=%zu callbacks=%zu "
-            "advance-avg=%lluus advance-max=%lluus callback-avg=%lluus "
-            "callback-max=%lluus advance-exclusive-avg=%lluus "
-            "advance-webgl=%zu/%lluus "
-            "prelude-total=%lluus timer-prepare-total=%lluus "
-            "network-total=%lluus microtask-total=%lluus "
-            "refresh-total=%lluus\n",
-            runtime_timing.advances, runtime_timing.timer_callbacks,
-            (unsigned long long) (runtime_timing.total_us
-                / runtime_timing.advances),
-            (unsigned long long) runtime_timing.maximum_total_us,
-            (unsigned long long) (runtime_timing.timer_callbacks == 0 ? 0
-                : runtime_timing.timer_callback_us
-                    / runtime_timing.timer_callbacks),
-            (unsigned long long)
-                runtime_timing.maximum_timer_callback_us,
-            (unsigned long long) (runtime_timing.advances == 0 ? 0
-                : advance_exclusive_us / runtime_timing.advances),
-            runtime_timing.webgl_native_frames,
-            (unsigned long long) runtime_timing.webgl_native_us,
-            (unsigned long long) runtime_timing.prelude_us,
-            (unsigned long long) runtime_timing.timer_prepare_us,
-            (unsigned long long) runtime_timing.network_us,
-            (unsigned long long) runtime_timing.microtask_us,
-            (unsigned long long) runtime_timing.refresh_us);
-        /* Garbage census: risen bytes are heap-garbage production invisible
-           to pool-block counters; drops are full collections caught between
-           advances; the probe times one forced collection on this realm so
-           the pause a paced GC costs here is a measurement, not a claim. */
-        printf(
-            "tilefinch-js-heap: samples=%zu end=%zuB low=%zuB high=%zuB "
-            "risen-total=%lluB risen-per-advance=%lluB gc-drops=%zu "
-            "gc-drop-max=%zuB gc-probe=%lluus\n",
-            runtime_timing.js_heap_samples,
-            runtime_timing.js_heap_last_bytes,
-            runtime_timing.js_heap_low_bytes,
-            runtime_timing.js_heap_high_bytes,
-            (unsigned long long) runtime_timing.js_heap_risen_bytes,
-            (unsigned long long) (runtime_timing.js_heap_samples > 1
-                ? runtime_timing.js_heap_risen_bytes
-                    / (runtime_timing.js_heap_samples - 1u)
-                : 0),
-            runtime_timing.js_heap_gc_drops,
-            runtime_timing.js_heap_gc_drop_max_bytes,
-            (unsigned long long) script_runtime_gc_probe_us(active_runtime));
-    }
-    if (engine_views->navigation != NULL
-        && engine_views->navigation->page.script_result.summary[0] != '\0') {
-        printf("tilefinch-js-summary: %.2047s\n",
-               engine_views->navigation->page.script_result.summary);
-    }
-    psp_report_canvas_cadence();
-    if (psp_runtime_advance_calls != 0) {
-        printf("tilefinch-runtime-cadence: calls=%zu changes=%zu "
-               "render-deferrals=%zu handoff-deferrals=%zu "
-               "reclaim-deferrals=%zu average=%lluus maximum=%lluus\n",
-               psp_runtime_advance_calls, psp_runtime_layout_changes,
-               psp_runtime_render_deferrals, psp_runtime_handoff_deferrals,
-               psp_runtime_reclaim_deferrals,
-               (unsigned long long) (psp_runtime_advance_total_us
-                   / psp_runtime_advance_calls),
-               (unsigned long long) psp_runtime_advance_maximum_us);
-    }
-#endif
+    psp_report_session_measurements(browser, engine_views);
     psp_report_presentation_cadence("controlled-exit");
     cleanup_operation =
         psp_log_operation_begin("engine-cleanup");
@@ -9195,91 +5398,6 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 #include "psp_boot_timing.h"
 #include "psp_boot_module.h"
-typedef struct {
-    uint64_t entered_us;
-    uint64_t previous_us;
-} PspBootTiming;
-
-static TILEFINCH_COLD_PATH void psp_boot_report_handoff(
-    int argc, char *argv[], uint64_t entered_us, uint64_t surface_us)
-{
-    PspBootHandoffTiming timing;
-    if (argc != 2 || argv == NULL || surface_us < entered_us
-        || !psp_boot_timing_decode(argv[1], entered_us, &timing)) {
-        printf("tilefinch-boot-handoff: valid=0 clock=rtc-us\n");
-        return;
-    }
-    const char *source = argv[0] != NULL && strncmp(argv[0], "ms0:", 4) == 0
-        ? "memory-stick" : argv[0] != NULL && strncmp(argv[0], "host0:", 6) == 0
-        ? "usb" : "other";
-    printf("tilefinch-boot-handoff: valid=1 clock=rtc-us source=%s "
-           "launcher-us=%lluus loadexec-us=%lluus "
-           "entry-to-scanout-us=%lluus handoff-to-scanout-us=%lluus\n",
-           source,
-           (unsigned long long) (timing.handoff_us - timing.launcher_us),
-           (unsigned long long) (entered_us - timing.handoff_us),
-           (unsigned long long) (surface_us - entered_us),
-           (unsigned long long) (surface_us - timing.handoff_us));
-}
-
-static TILEFINCH_COLD_PATH void psp_boot_timing_mark(
-    PspBootTiming *timing, const char *stage)
-{
-    if (timing == NULL || stage == NULL) return;
-    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
-    printf("tilefinch-boot-timing: stage=%s elapsed=%lluus delta=%lluus\n",
-           stage, (unsigned long long) (now_us - timing->entered_us),
-           (unsigned long long) (now_us - timing->previous_us));
-    timing->previous_us = now_us;
-}
-static TILEFINCH_COLD_PATH void psp_report_heap_capacity_lower_bound(void)
-{
-    size_t capacity_lower_bound =
-        media_psp_backend_heap_capacity_lower_bound();
-    printf("tilefinch-psp-script: heap-capacity-lower-bound=%uMB\n",
-           (unsigned) (capacity_lower_bound / MIB));
-}
-
-#if defined(TILEFINCH_PSP_VALIDATION_LOG) \
-    && defined(TILEFINCH_PSP_LIVE_NETWORK)
-static TILEFINCH_COLD_PATH void psp_preload_validation_ca_bundle(
-    const TilefinchInstallPaths *paths)
-{
-    char path[TILEFINCH_INSTALL_PATH_LIMIT];
-    bool ready = paths != NULL
-        && tilefinch_install_program_path(
-            paths, "roots.pem", path, sizeof(path))
-        && fetch_set_ca_bundle_path(path)
-        && fetch_prepare_ca_bundle();
-    printf("tilefinch-network: validation-ca-preload=%s\n",
-           ready ? "ready" : "unavailable-fail-closed");
-}
-#endif
-static TILEFINCH_COLD_PATH void psp_report_tls_assets(
-    size_t bundle_bytes,
-    const uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES],
-    time_t tls_time, const PspTimeFields *rtc, PspTimeStatus rtc_status)
-{
-    printf("tilefinch-network: trust-bytes=%zu trust-sha256="
-           "%02x%02x%02x%02x%02x%02x%02x%02x "
-           "verification=required utc-epoch=%ld "
-           "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ rtc-status=%s "
-           "curl=%s tls=%s http2=%s http2-enabled=%u\n",
-           bundle_bytes,
-           digest[0], digest[1], digest[2], digest[3],
-           digest[4], digest[5], digest[6], digest[7],
-           (long) tls_time, rtc->year, rtc->month, rtc->day,
-           rtc->hour, rtc->minute, rtc->second,
-           psp_time_status_name(rtc_status),
-           fetch_transport_version(),
-           fetch_transport_tls_version(),
-           fetch_transport_http2_version(),
-           fetch_transport_http2_available() ? 1u : 0u);
-}
-#define PSP_BOOT_TIMING_MARK(stage_name) \
-    psp_boot_timing_mark(&boot_timing, (stage_name))
-#else
-#define PSP_BOOT_TIMING_MARK(stage_name) do { (void) (stage_name); } while (0)
 #endif
 
 static TILEFINCH_COLD_PATH void psp_report_startup_failure(
@@ -9322,158 +5440,6 @@ static bool psp_platform_secure_random(void *context, void *data,
 {
     (void) context;
     return length == 0 || psp_entropy_fill(data, length);
-}
-
-/* The optional persistent module bytecode tier (off unless boot.cfg names
-   a directory). Kept out of main, whose size is an instruction-cache
-   ratchet. */
-__attribute__((noinline, cold))
-static void psp_apply_module_cache_config(const PspBootConfig *config,
-                                          BrowserConfig *engine_config)
-{
-    if (config->module_cache_dir[0] == '\0') return;
-    snprintf(engine_config->script_cache_dir,
-             sizeof(engine_config->script_cache_dir), "%s",
-             config->module_cache_dir);
-    engine_config->script_cache_write = config->module_cache_write == 1;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    printf("tilefinch-script-cache: configured source=boot.cfg dir=%s "
-           "write=%d\n", engine_config->script_cache_dir,
-           engine_config->script_cache_write ? 1 : 0);
-#endif
-}
-
-/* Env-driven engine knobs (newlib setenv works in-process). Kept out of
-   main, whose size is an instruction-cache ratchet. */
-__attribute__((noinline, cold))
-static void psp_apply_engine_env_knobs(const PspBootConfig *config)
-{
-    char scratch[32];
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    tilefinch_game_audio_validation_mute_output(config->validation_game_audio_mute == 1);
-    printf("tilefinch-game-audio: validation-output-muted=%ld\n",
-           config->validation_game_audio_mute);
-    /* Same EBOOT, same page and replay, with or without JS call wrappers and
-       interrupt-time sampling. The setting comes only from boot.cfg. */
-    int profile_set_status = setenv(
-        "TILEFINCH_VALIDATION_JS_PROFILE",
-        config->validation_js_profile == 0 ? "0" : "1", 1);
-    const char *profile_setting = getenv("TILEFINCH_VALIDATION_JS_PROFILE");
-    printf("tilefinch-js-profiler: requested=%ld enabled=%d set-status=%d\n",
-           config->validation_js_profile,
-           profile_setting == NULL || strcmp(profile_setting, "0") != 0,
-           profile_set_status);
-    if (config->validation_js_outlier_us > 0) {
-        snprintf(scratch, sizeof(scratch), "%ld",
-                 config->validation_js_outlier_us);
-        int outlier_set_status = setenv(
-            "TILEFINCH_JS_PROFILE_OUTLIER_US", scratch, 1);
-        printf("tilefinch-js-outlier-config: threshold-us=%ld set-status=%d\n",
-               config->validation_js_outlier_us, outlier_set_status);
-    }
-    if (config->validation_script_split != 2) {
-        int split_set_status = setenv(
-            "TILEFINCH_SCRIPT_SPLIT",
-            config->validation_script_split == 0 ? "0" : "1", 1);
-        printf("tilefinch-script-split: mode=%ld set-status=%d\n",
-               config->validation_script_split, split_set_status);
-    }
-    /* Distinguish a sampler-off run from an interpreter with no hooks. */
-    printf("tilefinch-execution-census-build: compiled=%d requested=%ld\n",
-#ifdef CONFIG_TILEFINCH_EXECUTION_CENSUS
-           1,
-#else
-           0,
-#endif
-           config->validation_execution_census);
-    if (config->validation_execution_census != 0) {
-        int census_status = setenv("TILEFINCH_EXECUTION_CENSUS",
-            config->validation_execution_census == 2 ? "2" : "1", 1);
-        printf("tilefinch-execution-census-config: mode=%ld set-status=%d\n",
-               config->validation_execution_census, census_status);
-    }
-    if (config->validation_gc_pacing == 0) {
-        int pacing_set_status = setenv("TILEFINCH_JS_GC_PACING", "0", 1);
-        printf("tilefinch-gc-pacing: mode=0 set-status=%d\n",
-               pacing_set_status);
-    }
-    if (config->trace_ignore_request_body == 1) {
-        int body_set_status = setenv(
-            "TILEFINCH_REPLAY_IGNORE_REQUEST_BODY", "1", 1);
-        printf("tilefinch-trace-replay: ignore-request-body=1 set-status=%d\n",
-               body_set_status);
-    }
-    if (config->trace_volatile_uuids == 1) {
-        int uuid_set_status = setenv(
-            "TILEFINCH_REPLAY_VOLATILE_UUIDS", "1", 1);
-        printf("tilefinch-trace-replay: volatile-uuids=1 set-status=%d\n",
-               uuid_set_status);
-    }
-    if (config->trace_replay_pump_us > 0) {
-        char pump_us[16];
-        snprintf(pump_us, sizeof(pump_us), "%ld",
-                 config->trace_replay_pump_us);
-        int pump_set_status = setenv(
-            "TILEFINCH_REPLAY_PUMP_US", pump_us, 1);
-        printf("tilefinch-trace-replay: pump-us=%s set-status=%d\n",
-               pump_us, pump_set_status);
-    }
-#endif
-    if (config->window_kb > 0) {
-        snprintf(scratch, sizeof(scratch), "%ld", config->window_kb);
-        setenv("TILEFINCH_JS_BOOT_WINDOW_KB", scratch, 1);
-    }
-    if (config->gc_growth_pct > 0) {
-        snprintf(scratch, sizeof(scratch), "%ld", config->gc_growth_pct);
-        setenv("TILEFINCH_JS_GC_GROWTH_PCT", scratch, 1);
-    }
-    if (config->lazy_functions >= 0) {
-        snprintf(scratch, sizeof(scratch), "%ld", config->lazy_functions);
-        setenv("TILEFINCH_JS_LAZY_FUNCTIONS", scratch, 1);
-    }
-    /* Device profile: bound any single JS array's value buffer; a page
-       once grouped a multi-megabyte binary string per character, which
-       can never fit beside hydration on the 50MB heap. */
-    snprintf(scratch, sizeof(scratch), "%u",
-             (unsigned) BROWSER_PSP_APP_JS_ARRAY_CAP_KB);
-    setenv("TILEFINCH_JS_ARRAY_CAP_KB", scratch, 1);
-}
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* Opt-in final readback after the measured input sequence, on the
-   presentation owner. Unlike the small temporal ring it keeps every RGB565
-   pixel, without retaining another frame allocation. Out of line: main's
-   size is an instruction-cache ratchet. */
-__attribute__((noinline, cold))
-static void psp_dump_final_frame(const char *argv0)
-{
-    bool dumped = psp_dump_frame_strided_named(
-        argv0, "frame-device-final.ppm",
-        psp_display_front_buffer(&psp_display),
-        PSP_DISPLAY_BUFFER_PIXELS, PSP_DISPLAY_STRIDE);
-    printf("tilefinch-psp-script: final-frame-dumped=%d\n", dumped ? 1 : 0);
-}
-#endif
-
-/* The one-time file_kb migration (psp_boot_config_migrate_file_kb) of a
-   user-owned boot configuration file, before it is read. Shipping builds
-   only: validation harnesses write their own boot.cfg for each run, and
-   staged games keep their deliberate 512 KiB Game Profile ceiling. The
-   slot's signed boot-defaults.cfg is never rewritten. */
-static TILEFINCH_COLD_PATH void psp_migrate_boot_file_kb(const char *path)
-{
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    (void) path;
-#else
-    PspBootConfigMigration migration = psp_boot_config_migrate_file_kb(path);
-    if (migration == PSP_BOOT_CONFIG_MIGRATION_DONE
-        || migration == PSP_BOOT_CONFIG_MIGRATION_FAILED) {
-        printf("tilefinch-config: file_kb-migration=%s file_kb=%ld\n",
-               migration == PSP_BOOT_CONFIG_MIGRATION_DONE ? "done"
-                                                           : "failed",
-               psp_boot_config_default_file_kb());
-    }
-#endif
 }
 
 /* Boot-only download recovery must not expand main when player-owned
@@ -9529,10 +5495,7 @@ int main(int argc, char *argv[])
 #endif
     uint64_t main_entered_us = (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-    PspBootTiming boot_timing = {
-        .entered_us = validation_main_entered_us,
-        .previous_us = validation_main_entered_us
-    };
+    psp_boot_timing_begin(validation_main_entered_us);
 #endif
     atomic_init(&psp_home_exit_requested, false);
     psp_lifecycle_init(&psp_lifecycle);
@@ -9544,12 +5507,7 @@ int main(int argc, char *argv[])
      */
     bool display_ready = psp_display_begin(
         &psp_display,
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_validation_display_wrap(psp_display_system_backend())
-#else
-        psp_display_system_backend()
-#endif
-    );
+        psp_validation_display_wrap(psp_display_system_backend()));
     /* Frame one of the entrance: the mark alone. Nothing else has been read
        from the Memory Stick yet. */
     /* Keep pre-input boot completely static. The old entrance rebuilt and
@@ -9627,7 +5585,7 @@ int main(int argc, char *argv[])
         .preferred_language = psp_preferred_language,
         .preferred_date_format = psp_preferred_date_format,
         .secure_random = psp_platform_secure_random,
-        .cooperate = psp_platform_cooperate,
+        .cooperate_at = psp_platform_cooperate,
         .present_rgb565 = psp_platform_present,
         .retire_frame = psp_platform_retire_frame,
         .log_message = psp_log_message,
@@ -9717,159 +5675,10 @@ int main(int argc, char *argv[])
        Intermediate splash repaints each impose a scanout wait but provide
        neither a new usable surface nor an input acknowledgement. */
 
-    psp_log_set_phase(PSP_LOG_PHASE_CONFIG);
-    psp_boot_config_defaults(&process.config);
-    char path[768];
-    bool config_loaded = false;
-    if (process.install_paths.slotted) {
-        if (tilefinch_install_program_path(
-                &process.install_paths, "boot-defaults.cfg",
-                path, sizeof(path))) {
-            config_loaded = psp_boot_config_load(
-                &process.config, path, psp_config_warning, NULL);
-        }
-        char overrides_path[TILEFINCH_INSTALL_PATH_LIMIT];
-        bool have_overrides_path = tilefinch_install_data_path(
-            &process.install_paths, "boot-overrides.cfg",
-            overrides_path, sizeof(overrides_path));
-        if (have_overrides_path)
-            psp_migrate_boot_file_kb(overrides_path);
-        bool overrides_loaded = have_overrides_path
-            && psp_boot_config_load(
-                &process.config, overrides_path, psp_config_warning, NULL);
-        if (!overrides_loaded) {
-            char legacy_path[TILEFINCH_INSTALL_PATH_LIMIT];
-            int legacy_length = snprintf(
-                legacy_path, sizeof(legacy_path), "%s/boot-live.cfg",
-                process.install_paths.install_root);
-            if (legacy_length > 0
-                && (size_t) legacy_length < sizeof(legacy_path))
-                psp_migrate_boot_file_kb(legacy_path);
-            if (legacy_length > 0
-                && (size_t) legacy_length < sizeof(legacy_path)
-                && psp_boot_config_load(
-                    &process.config, legacy_path, psp_config_warning, NULL)) {
-                overrides_loaded = have_overrides_path
-                    && psp_boot_config_write_overrides(
-                        &process.config, overrides_path);
-                printf("tilefinch-config: legacy-overrides=%s\n",
-                       overrides_loaded ? "migrated" : "active-not-saved");
-            }
-        }
-        config_loaded = config_loaded || overrides_loaded;
-    } else {
-        psp_sibling_path(path, sizeof(path), argv0, "boot.cfg");
-        psp_migrate_boot_file_kb(path);
-        config_loaded = psp_boot_config_load(
-            &process.config, path, psp_config_warning, NULL);
-    }
-#ifndef TILEFINCH_PSP_VALIDATION_LOG
-    /* A shipping EBOOT never executes a copied validation scenario. This is
-       intentionally after both configuration layers: stale automation in
-       either one is inert, while user-facing URL/network/update choices keep
-       their ordinary precedence. */
-    psp_boot_config_disable_automation(&process.config);
-#endif
-    if (!config_loaded)
-        printf("tilefinch-psp: boot configuration missing, using defaults\n");
-    /* Keep existing Memory Stick installs with `url=` compatible with the
-       built-in start page, while an explicit boot.cfg URL remains an
-       intentional direct-navigation override. */
-    if (process.config.url[0] == '\0') {
-        snprintf(process.config.url, sizeof(process.config.url), "%s",
-                 TILEFINCH_HOMEPAGE_URL);
-    }
-    /*
-     * A typo in the two hand-edited developer update keys must not brick a
-     * Memory Stick install. They are optional and their only effect is to
-     * offer the Developer channel, so an unusable value is treated as an
-     * absent one: the channel stays hidden and the browser boots. Every
-     * other key keeps the halt-on-invalid posture it had before this
-     * channel existed.
-     */
-    unsigned dropped_developer_urls =
-        psp_boot_config_drop_invalid_developer_urls(&process.config);
-    if (dropped_developer_urls != 0u) {
-        printf("tilefinch-config: ignoring unusable developer endpoint "
-               "update-url=%d package-url=%d; the Developer update channel "
-               "stays hidden\n",
-               (dropped_developer_urls
-                & PSP_BOOT_CONFIG_DROPPED_DEVELOPER_UPDATE_URL) != 0u,
-               (dropped_developer_urls
-                & PSP_BOOT_CONFIG_DROPPED_DEVELOPER_PACKAGE_URL) != 0u);
-    }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    /* Same posture, and the same reason: the exit handoff is a developer
-       convenience whose only cost when it is wrong is that the console
-       returns to the XMB, which is what happens with no key at all. The
-       parser reads the key in every build; only a validation EBOOT can act
-       on it, so only a validation EBOOT spends anything deciding. */
-    if (psp_boot_config_drop_unusable_exit_to(&process.config)) {
-        printf("tilefinch-config: ignoring unusable exit_to; this EBOOT "
-               "will exit to the XMB\n");
-    }
-#endif
-    const char *invalid_field = NULL;
-    if (!psp_boot_config_validate(&process.config, &invalid_field)) {
-        printf("tilefinch-psp-script: invalid boot configuration field=%s\n",
-               invalid_field == NULL ? "unknown" : invalid_field);
-        startup_failure_detail = "Invalid boot configuration";
-        startup_failure_screen = "STARTUP FAILED: SETTINGS";
-        goto sleep_forever;
-    }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_display_set_latch_probe_enabled(
-        process.config.validation_latch_probe != 0);
-    printf("tilefinch-display: latch-probe=%s\n",
-           process.config.validation_latch_probe != 0
-               ? "enabled" : "disabled");
-#endif
-    /* Publish the decoder-program knob before anything can open a video.
-       The backend owns the parse so this boot path stays a single call. */
-    media_psp_backend_set_wide_program(process.config.experimental_wide_video);
-    media_psp_backend_set_au_dump(
-        process.config.validation_media_au_dump != 0 ? 1 : 0);
-    /* And how a refused access unit is recovered, published here for the same
-       reason and in the same breath: boot decides it, and it has to be decided
-       before anything can open a video. */
-    psp_media_set_refusal_reset(
-        process.config.validation_media_refusal_reset != 0);
-    media_psp_backend_set_reset_mode(
-        (int) process.config.validation_media_reset_mode);
-    printf("tilefinch-psp-script: url=%s trace=%s ticks=%ld limit=%ldMB "
-           "heap=%ldMB window=%ldKB profile=%s network-profile=%ld "
-           "dump-frame=%ld validation-cancel-ms=%ld "
-           "validation-preview-scroll=%ld validation-media-stability=%ld "
-           "validation-media-fixture=%ld "
-           "validation-raster-fixture=%ld "
-           "validation-power-auto=%ld input-script=%s "
-           /* Appended, never inserted: a soak log has to say which seek and
-              which refusal recovery produced it without the boot file it was
-              produced from, and every harvester reads this line by key. */
-           "validation-media-seek-permille=%ld "
-           "validation-media-lifecycle=%ld "
-           "validation-media-refusal-reset=%ld "
-           "validation-media-reset-mode=%ld app-heap=%ldMB\n",
-           process.config.url, process.config.trace, process.config.ticks, process.config.limit_mb,
-           process.config.heap_mb, process.config.window_kb, process.config.profile,
-           process.config.network_profile, process.config.dump_frame,
-           process.config.validation_cancel_after_ms,
-           process.config.validation_preview_scroll,
-           process.config.validation_media_stability_auto,
-           process.config.validation_media_fixture_auto,
-           process.config.validation_raster_fixture_auto,
-           process.config.validation_power_test_auto,
-           process.config.input_script[0] == '\0' ? "none" : process.config.input_script,
-           process.config.validation_media_seek_permille,
-           process.config.validation_media_lifecycle_auto,
-           process.config.validation_media_refusal_reset,
-           process.config.validation_media_reset_mode,
-           process.config.app_heap_mb);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    printf("tilefinch-psp-script: exit-to=%s\n",
-           process.config.exit_to[0] == '\0' ? "none" : process.config.exit_to);
-#endif
-    psp_log_checkpoint("config-accepted");
+    /* Configuration layers, then the media knobs it decides: before anything
+       can open a video. */
+    PspStartupFailure boot_step = psp_boot_load_config(&process, argv0);
+    if (boot_step.detail != NULL) goto boot_step_failed;
     PSP_BOOT_TIMING_MARK("config-accepted");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (process.config.validation_power_test_auto != 0) {
@@ -9892,193 +5701,10 @@ int main(int argc, char *argv[])
         psp_present_boot_surface(
             PSP_UI_STARTUP_HOMEPAGE, "LOADING BROWSER", 420);
     }
-    if (strcmp(process.config.trace, "none") == 0) {
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-        psp_log_set_phase(PSP_LOG_PHASE_ASSETS);
-        char ca_bundle_path[768];
-        if (!tilefinch_install_program_path(
-                &process.install_paths, "roots.pem",
-                ca_bundle_path, sizeof(ca_bundle_path))) {
-            startup_failure_detail = "Trust bundle path is unavailable";
-            startup_failure_screen = "STARTUP FAILED: INSTALL FILES";
-            goto sleep_forever;
-        }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        size_t ca_bundle_bytes = 0;
-        uint8_t ca_bundle_digest[TILEFINCH_SHA256_DIGEST_BYTES];
-        if (!psp_probe_file(
-                ca_bundle_path, 256u * KIB, &ca_bundle_bytes,
-                ca_bundle_digest)) {
-            /* This read exists only to enrich validation diagnostics. The
-               transport independently loads the bundle and fails closed on
-               the first HTTPS request, so a diagnostic allocation/I/O
-               refusal must not brick local Home, Settings, or Library. */
-            memset(ca_bundle_digest, 0, sizeof(ca_bundle_digest));
-            printf("tilefinch-network: trust bundle diagnostic unavailable: %s\n",
-                   ca_bundle_path);
-        }
-#endif
-        if (!fetch_set_ca_bundle_path(ca_bundle_path)) {
-            printf("tilefinch-network: trust bundle configuration failed\n");
-            startup_failure_detail = "Trust bundle configuration failed";
-            startup_failure_screen = "STARTUP FAILED: INSTALL FILES";
-            goto sleep_forever;
-        }
-        time_t tls_time = 0;
-        PspTimeFields rtc = {0};
-        PspTimeStatus rtc_status = psp_time_read_utc_fields(
-            &rtc, &tls_time);
-        if (rtc_status != PSP_TIME_OK) {
-            /* Home, Settings, Library, and installed apps do not need TLS.
-               Keep time() fail-closed at epoch zero and let an eventual
-               certificate failure show the existing date/time guidance;
-               an unreadable clock must not brick the entire browser. */
-            printf("tilefinch-network: RTC unavailable for TLS status=%s "
-                   "action=continue-offline\n",
-                   psp_time_status_name(rtc_status));
-        }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_report_tls_assets(
-            ca_bundle_bytes, ca_bundle_digest,
-            tls_time, &rtc, rtc_status);
-#else
-        /*
-         * CURLOPT_CAINFO still verifies the bundle on the first HTTPS
-         * request and fails closed if it is absent or invalid. Avoid reading,
-         * allocating, and hashing the entire file before a local homepage
-         * that does not need transport. Validation builds retain that
-         * diagnostic so device reports still attest to the copied asset.
-        */
-        (void) rtc;
-        (void) tls_time;
-#endif
-        psp_log_checkpoint("tls-assets-ready");
-#else
-        printf("tilefinch-network: live transport unavailable in replay "
-               "build\n");
-        startup_failure_detail = "Live network transport is unavailable";
-        startup_failure_screen = "STARTUP FAILED: NETWORK BUILD";
-        goto sleep_forever;
-#endif
-    }
-
-    psp_apply_engine_env_knobs(&process.config);
-
-    printf("tilefinch-psp-script: env window=%s growth=%s\n",
-           getenv("TILEFINCH_JS_BOOT_WINDOW_KB") == NULL
-               ? "(null)" : getenv("TILEFINCH_JS_BOOT_WINDOW_KB"),
-           getenv("TILEFINCH_JS_GC_GROWTH_PCT") == NULL
-               ? "(null)" : getenv("TILEFINCH_JS_GC_GROWTH_PCT"));
-    script_runtime_configure_deterministic_replay(
-        strcmp(process.config.trace, "none") != 0, 7);
-
-    psp_log_set_phase(PSP_LOG_PHASE_ENGINE);
-    psp_log_checkpoint("engine-config-begin");
-    BrowserDeviceProfile device_profile;
-    browser_device_profile_psp3000(&device_profile);
-    BrowserConfig *engine_config = calloc(1, sizeof(*engine_config));
-    if (engine_config == NULL) {
-        printf("tilefinch-psp-script: config allocation failed\n");
-        startup_failure_detail = "Browser configuration allocation failed";
-        startup_failure_screen = "STARTUP FAILED: LOW MEMORY";
-        goto sleep_forever;
-    }
-    browser_config_init(engine_config, &device_profile);
-    /* The shared PSP app profile (also the lab's --psp-profile realistic);
-       boot.cfg values, whose defaults are the same constants, follow. */
-    (void) browser_config_apply_psp_app_defaults(engine_config);
-    engine_config->memory_limit = (size_t) process.config.limit_mb * MIB;
-    psp_apply_module_cache_config(&process.config, engine_config);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    /* Same native audio slots as shipping unless boot.cfg explicitly selects
-       the JS Web Audio reference for an A/B run. */
-    if (process.config.validation_game_audio_reference == 1)
-        engine_config->javascript.game_audio_internal_slots = false;
-#endif
-    engine_config->javascript.heap_limit = (size_t) process.config.heap_mb * MIB;
-    /* Installed apps get at least the ordinary heap. */
-    engine_config->javascript.installed_app_heap_limit =
-        (size_t) (process.config.app_heap_mb > process.config.heap_mb
-                      ? process.config.app_heap_mb
-                      : process.config.heap_mb) * MIB;
-    engine_config->javascript.runtime_timeout_ms =
-        (unsigned long) process.config.script_timeout_ms;
-    engine_config->javascript.maximum_scripts = (size_t) process.config.count;
-    engine_config->javascript.maximum_total_bytes =
-        (size_t) process.config.total_mb * MIB;
-    engine_config->javascript.maximum_file_bytes =
-        (size_t) process.config.file_kb * KIB;
-    ScriptExecutionProfile execution_profile = SCRIPT_EXECUTION_PROFILE_LAB;
-    if (strcmp(process.config.profile, "strict") == 0) {
-        execution_profile = SCRIPT_EXECUTION_PROFILE_PSP_STRICT;
-    } else if (strcmp(process.config.profile, "realistic") == 0) {
-        execution_profile = SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC;
-    }
-    if (!script_execution_policy_for_profile(
-            execution_profile,
-            &engine_config->javascript.execution_policy)) {
-        printf("tilefinch-psp-script: execution policy failed\n");
-        startup_failure_detail = "JavaScript execution policy is unavailable";
-        startup_failure_screen = "STARTUP FAILED: BROWSER POLICY";
-        goto sleep_forever;
-    }
-    size_t configured_script_file_bytes =
-        engine_config->javascript.maximum_file_bytes;
-    if (engine_config->javascript.maximum_file_bytes
-            > engine_config->javascript.maximum_total_bytes) {
-        engine_config->javascript.maximum_file_bytes =
-            engine_config->javascript.maximum_total_bytes;
-    }
-    size_t maximum_compile_bytes =
-        engine_config->javascript.execution_policy
-            .maximum_host_compile_source_bytes;
-    if (maximum_compile_bytes != 0
-        && engine_config->javascript.maximum_file_bytes
-               > maximum_compile_bytes) {
-        engine_config->javascript.maximum_file_bytes =
-            maximum_compile_bytes;
-    }
-    if (engine_config->javascript.maximum_file_bytes
-            != configured_script_file_bytes) {
-        printf("tilefinch-psp-script: script-file-limit clamped=%zu/%zuB\n",
-               engine_config->javascript.maximum_file_bytes,
-               configured_script_file_bytes);
-    }
-
-    char sans[300], serif[300], sans_italic[300], sans_bold[300];
-    char serif_bold[300], metric_sans[300], metric_sans_bold[300];
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/DejaVuSans-Latin.ttf", sans, sizeof(sans));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/DejaVuSerif-Latin.ttf", serif, sizeof(serif));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/DejaVuSans-Oblique-Latin.ttf",
-        sans_italic, sizeof(sans_italic));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/DejaVuSans-Bold-Latin.ttf",
-        sans_bold, sizeof(sans_bold));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/DejaVuSerif-Bold-Latin.ttf",
-        serif_bold, sizeof(serif_bold));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/TilefinchSans-Regular.ttf",
-        metric_sans, sizeof(metric_sans));
-    tilefinch_install_program_path(
-        &process.install_paths, "fonts/TilefinchSans-Bold.ttf",
-        metric_sans_bold, sizeof(metric_sans_bold));
-    if (!browser_config_set_font_paths(engine_config, sans, serif,
-                                       sans_italic, sans_bold, serif_bold,
-                                       metric_sans, metric_sans_bold,
-                                       1536 * KIB)) {
-        printf("tilefinch-psp-script: font configuration failed\n");
-        startup_failure_detail = "Font configuration failed";
-        startup_failure_screen = "STARTUP FAILED: INSTALL FILES";
-        goto sleep_forever;
-    }
-    /* Native HOME uses the embedded chrome fallback. Page fonts are loaded
-       after its first frame, one bounded file at a time while association is
-       otherwise waiting on firmware. */
-    browser_config_set_staged_font_loading(engine_config, true);
+    /* Trust assets and env knobs precede the engine that reads them. */
+    BrowserConfig *engine_config = NULL;
+    boot_step = psp_boot_configure_engine(&process, &engine_config);
+    if (boot_step.detail != NULL) goto boot_step_failed;
     PSP_BOOT_TIMING_MARK("engine-configured");
 
     char engine_error[256] = {0};
@@ -10096,9 +5722,7 @@ int main(int argc, char *argv[])
     /* Script navigations run as cooperative jobs (see
        psp_begin_script_navigation), not inside a runtime advance. */
     browser_engine_set_defer_script_navigation(browser.engine, true);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_log_engine_creation(browser.engine);
-#endif
     psp_log_checkpoint("engine-created");
     PSP_BOOT_TIMING_MARK("engine-created");
     if (deterministic_boot) {
@@ -10119,207 +5743,30 @@ int main(int argc, char *argv[])
 #ifdef TILEFINCH_HAVE_PSP_VOICE
     psp_voice_component_configure(process.install_paths.program_dir);
 #endif
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (process.config.validation_media_fixture_auto != 0) {
-        psp_present_boot_surface(
-            PSP_UI_STARTUP_HOMEPAGE, "TESTING VIDEO HARDWARE", 860);
-        PspMediaFixtureReport fixture_report = {0};
-        char fixture_error[256] = {0};
-        bool fixture_passed = psp_media_fixture_run(
-            browser.budget, &fixture_report,
-            fixture_error, sizeof(fixture_error));
-        bool emulator_untested = !fixture_passed
-            && (fixture_report.last_native_error
-                    == MEDIA_BACKEND_RAW_NAL_BRIDGE_UNAVAILABLE
-                || strstr(fixture_error, "raw-NAL") != NULL
-                || strstr(fixture_error, "0x80010002") != NULL
-                || strstr(fixture_error, "80010002") != NULL);
-        printf(
-            "tilefinch-media-fixture: event=%s error=\"%s\" "
-            "clips=%u decoded=%u observed=%u native=0x%08X\n",
-            fixture_passed ? "hardware-pass"
-                : (emulator_untested ? "emulator-untested"
-                                     : "hardware-fail"),
-            fixture_error,
-            fixture_report.clips_completed,
-            fixture_report.frames_decoded,
-            fixture_report.frames_observed,
-            (unsigned) fixture_report.last_native_error);
-        psp_report_budget_counters(browser.budget, "media-fixture-exit");
-        browser_engine_destroy(browser.engine);
-        browser.engine = NULL;
-        if (process.clock_live) {
-            (void) psp_clock_worker_shutdown(&process.clock_worker);
-            process.clock_live = false;
-        }
-        printf(
-            "tilefinch-validation: outcome=%s qualification=%s\n",
-            fixture_passed || emulator_untested
-                ? "clean-exit" : "qualification-failed",
-            fixture_passed ? "hardware-pass"
-                : (emulator_untested ? "emulator-untested"
-                                     : "hardware-fail"));
-        psp_log_checkpoint("media-fixture-complete");
-        psp_log_finish(
-            fixture_passed ? "media-fixture-pass"
-                : (emulator_untested ? "media-fixture-untested"
-                                     : "media-fixture-fail"));
-        psp_exit_console(process.config.exit_to);
-        return fixture_passed || emulator_untested ? 0 : 1;
-    }
-    if (process.config.validation_ge_present_probe != 0) {
-        return psp_run_ge_present_qualification(
-            browser.engine, browser.budget, &process.clock_worker, process.clock_live,
-            process.config.exit_to);
-    }
-    if (process.config.validation_js_bench != 0)
-        psp_run_js_bench(argv0, &process.config);
-    if (process.config.validation_webgl_ge_probe != 0) {
-        return psp_run_webgl_ge_qualification(
-            browser.engine, browser.budget, &process.clock_worker,
-            process.clock_live, process.config.exit_to);
-    }
-    if (process.config.validation_csc_order_probe != 0) {
-        return psp_run_csc_order_qualification(
-            browser.engine, browser.budget, &process.clock_worker, process.clock_live,
-            process.config.exit_to);
-    }
-#endif
-    /* Native HOME uses the regular page sans face for its card labels. Load
-       that one face before the first HOME frame so the visible UI never
-       switches from bitmap fallback to scalable glyphs. Metric sans and all
-       optional faces remain staged behind interaction/network work. */
-    if (!browser_engine_prepare_native_home_font(browser.engine)) {
-        printf("tilefinch-fonts: native-home face unavailable; "
-               "using stable fallback\n");
-    }
-    psp_presentation_init(&process.presentation);
-    psp_presentation_bind_chrome_fonts(&process.presentation, browser.engine);
-    /* The client snapshots carry bounded manifest tables and would enlarge
-       main's already-large stack frame enough to pessimize every frame-local
-       access on Allegrex. The browser has exactly one optional-component
-       session, so give that singleton static storage instead. */
-    static PspVoiceComponentSession voice_component;
-    browser.voice_component_session = &voice_component;
-    static PspGlyphComponentSession glyph_component;
-    browser.glyph_component_session = &glyph_component;
-    psp_storage_paths_init(&process.storage, &process.install_paths);
-    /* Cross-boot TLS session resumption store
-       (docs/engineering/PSP_TRANSPORT.md). The blobs are resumption
-       secrets: stick-only, cleared by CLEAR HTTP CACHES below. The store is
-       active only with the owned live-network transport; profile policy is
-       applied below before the first network request. */
-    (void) fetch_set_tls_session_store_path(process.storage.tls_sessions);
-    browser.profile = browser_profile_create(browser.budget);
-    if (browser.profile == NULL) {
-        printf("tilefinch-profile: allocation failed\n");
-        startup_failure_detail = "Profile allocation failed";
-        startup_failure_screen = "STARTUP FAILED: LOW MEMORY";
-        goto sleep_forever;
-    }
-    if (browser_profile_load_without_content_blocker_sites(
-            browser.profile, process.storage.profile))
-        printf("tilefinch-profile: loaded\n");
-    (void) browser_engine_set_web_font_mode(browser.engine,
-        browser_profile_web_font_mode(browser.profile));
-    (void) psp_failure_report_configure(
-        browser_profile_save_diagnostic_reports(browser.profile), false);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    /* Automated device runs must never enter Sony's modal OSK: it outlives a
-       stopped test process on some firmware and poisons the next PSPLink
-       launch. This is an in-memory harness override; shipping profiles and
-       the profile file on host0 remain unchanged. */
-    if (process.config.input_script[0] != '\0') {
-        browser_profile_set_text_entry_mode(
-            browser.profile, BROWSER_TEXT_ENTRY_DANZEFF);
-        printf("tilefinch-input-script: text-entry=danzeff\n");
-    }
-#endif
-    bool tls_session_persistence =
-        browser_profile_tls_session_persistence(browser.profile);
-    (void) fetch_set_tls_session_persistence_enabled(
-        tls_session_persistence);
-    if (!psp_glyph_component_session_attach_selected(
-            browser.glyph_component_session, browser.budget,
-            &process.install_paths,
-            browser_profile_glyph_language(browser.profile),
-            psp_ui_language_glyphs(browser.profile),
-            browser_profile_color_emoji(browser.profile))) {
-        printf("tilefinch-glyph-component: selected packs unavailable\n");
-    }
-    unsigned locale = browser_profile_ui_language(browser.profile);
-    if (psp_ui_language_font_available(&browser))
-        browser.ui_translation = tilefinch_ui_translation_load(browser.budget,
-            &process.install_paths, locale);
-    tilefinch_ui_translation_bind(browser.ui_translation);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    printf(
-        "tilefinch-glyph-component: language=%u color=%u "
-        "installed=0x%02x attached=0x%02x\n",
-        (unsigned) browser_profile_glyph_language(browser.profile),
-        browser_profile_color_emoji(browser.profile) ? 1u : 0u,
-        (unsigned) browser.glyph_component_session->installed_mask,
-        (unsigned) browser.glyph_component_session->attached_mask);
-    if (process.config.validation_raster_fixture_auto != 0) {
-        return psp_run_raster_qualification(
-            browser.engine, browser.budget, argv0,
-            browser.glyph_component_session,
-            &process.clock_worker, process.clock_live,
-            process.config.exit_to);
-    }
-#endif
-    /* Do not enumerate optional packs during ordinary boot. Selected packs
-       were verified above; the Options screen probes the rest on demand. */
-    bool javascript_enabled =
-        browser_profile_javascript_enabled(browser.profile);
-    bool site_data_allowed =
-        browser_profile_site_data_allowed(browser.profile);
-    browser_session_set_site_data_allowed(browser.session, site_data_allowed);
-    psp_profile_store_init(&browser.profile_store, browser.profile, process.storage.profile);
-    ContentBlockerMode content_blocker_mode =
-        browser_profile_content_blocker_mode(browser.profile);
-    if (!browser_engine_content_blocker_configure(
-            browser.engine, content_blocker_mode, process.storage.content_blocker)) {
-        content_blocker_mode = CONTENT_BLOCKER_BASIC;
-        (void) browser_engine_content_blocker_configure(
-            browser.engine, content_blocker_mode, NULL);
-        printf(
-            "tilefinch-content-blocker: custom list unavailable; "
-            "using basic mode\n");
-    }
-    if (!psp_content_blocker_apply_allowed_sites(browser.engine, browser.profile)) {
-        printf("tilefinch-content-blocker: allowlist unavailable\n");
-    }
-    ContentBlockerMetrics startup_blocker_metrics = {0};
-    if (browser_engine_content_blocker_metrics(
-            browser.engine, &startup_blocker_metrics)) {
-        printf(
-            "tilefinch-content-blocker: mode=%u rules=%zu allow-rules=%zu "
-            "ignored=%zu allowed-sites=%zu retained=%zu\n",
-            (unsigned) startup_blocker_metrics.mode,
-            startup_blocker_metrics.rule_count,
-            startup_blocker_metrics.allow_rule_count,
-            startup_blocker_metrics.ignored_rule_count,
-            startup_blocker_metrics.allowed_site_count,
-            startup_blocker_metrics.retained_bytes);
-    }
-    unsigned persistent_cache_mb =
-        browser_profile_persistent_cache_mb(browser.profile);
-    unsigned live_cache_kib =
-        browser_profile_live_cache_kib(browser.profile);
-    process.persistent_site_data_available =
-        strcmp(process.config.trace, "none") == 0;
-    /* Before any localStorage snapshot loads, so a site kept on the
-       Memory Stick is never overridden by it. */
-    psp_app_site_storage_boot(&process, &browser);
-    psp_app_script_cache_boot(&process, &browser);
-    size_t live_cache_bytes = (size_t) live_cache_kib * KIB;
-    bool live_cache_limit_set =
-        browser_session_cache_set_maximum_bytes(browser.session, live_cache_bytes);
-    if (!live_cache_limit_set) {
-        printf("tilefinch-site-data: cache limit unavailable bytes=%zu\n",
-               live_cache_bytes);
-    }
+    int validation_exit = 0;
+    if (psp_validation_engine_qualifications(
+            &browser, &process, argv0, &validation_exit))
+        return validation_exit;
+    /* Native HOME's one page face loads before its first frame; the profile
+       sets TLS-session policy before the first network request. */
+    PspBootProfileState boot_profile = {0};
+    boot_step = psp_boot_open_profile_services(
+        &process, &browser, &boot_profile);
+    if (boot_step.detail != NULL) goto boot_step_failed;
+    if (psp_validation_raster_qualification(
+            &browser, &process, argv0, &validation_exit))
+        return validation_exit;
+    /* Site storage and the script cache open before any localStorage
+       snapshot loads. */
+    psp_boot_apply_profile_policy(&process, &browser, &boot_profile);
+    const bool tls_session_persistence = boot_profile.tls_session_persistence;
+    const bool javascript_enabled = boot_profile.javascript_enabled;
+    const bool site_data_allowed = boot_profile.site_data_allowed;
+    const ContentBlockerMode content_blocker_mode =
+        boot_profile.content_blocker_mode;
+    const unsigned persistent_cache_mb = boot_profile.persistent_cache_mb;
+    const unsigned live_cache_kib = boot_profile.live_cache_kib;
+    const bool live_cache_limit_set = boot_profile.live_cache_limit_set;
     PSP_BOOT_TIMING_MARK("profile-and-home-data-ready");
     char startup_url[BROWSER_PROFILE_URL_LIMIT];
     snprintf(startup_url, sizeof(startup_url), "%s", process.config.url);
@@ -10513,57 +5960,18 @@ int main(int argc, char *argv[])
        focus this long before its host is worth a background TCP+TLS connect. */
     FetchPreconnectDwell home_preconnect_dwell = {0};
 #endif
-    process.presentation.ui.browser_ui_scale = browser_profile_ui_scale(browser.profile);
-    process.presentation.ui.page_font_percent =
-        browser_profile_page_font_percent(browser.profile);
-    process.presentation.ui.reader_font_serif =
-        browser_profile_reader_font(browser.profile) == BROWSER_READER_FONT_SERIF;
-    process.presentation.ui.remember_reader_site_scale =
-        browser_profile_remember_reader_site_scale(browser.profile);
-    process.presentation.ui.reader_auto_mode =
-        browser_profile_reader_auto_mode(browser.profile);
-    process.presentation.ui.basic_fallback_mode =
-        (unsigned) browser_profile_basic_fallback_mode(browser.profile);
-    process.presentation.ui.web_font_mode =
-        (unsigned) browser_profile_web_font_mode(browser.profile);
+    /* Every chrome setting the profile alone determines; the ones that also
+       depend on the start page, boot.cfg or this boot's state follow. */
+    psp_app_ui_sync_from_profile(&process.presentation.ui, browser.profile);
     psp_app_heavy_boot(browser.engine, browser.profile, &interactive,
                        &process.presentation.ui);
-    process.presentation.ui.custom_homepage_enabled =
-        browser_profile_custom_homepage_enabled(browser.profile);
-    process.presentation.ui.history_enabled = browser_profile_history_enabled(browser.profile);
-    process.presentation.ui.restore_last_page =
-        browser_profile_restore_last_page(browser.profile);
-    process.presentation.ui.tab_hibernation_enabled =
-        browser_profile_tab_hibernation_enabled(browser.profile);
     process.presentation.ui.experimental_voice_input = experimental_voice_enabled;
     psp_ui_set_voice_component(
         &process.presentation.ui, PSP_UI_VOICE_COMPONENT_UNKNOWN, -1);
-    process.presentation.ui.adaptive_voice_memory =
-        browser_profile_adaptive_voice_memory(browser.profile);
-    process.presentation.ui.analog_cursor_enabled =
-        browser_profile_analog_cursor_enabled(browser.profile);
-    process.presentation.ui.danzeff_text_input =
-        browser_profile_text_entry_mode(browser.profile)
-            == BROWSER_TEXT_ENTRY_DANZEFF;
-    process.presentation.ui.gamepad_circle_primary =
-        browser_profile_gamepad_face_mapping(browser.profile)
-            == TILEFINCH_GAMEPAD_FACE_O_PRIMARY;
     process.presentation.ui.persistent_cache_mb = persistent_cache_mb;
     process.presentation.ui.live_cache_kib = live_cache_kib;
-    process.presentation.ui.persist_local_storage =
-        browser_profile_persist_local_storage(browser.profile);
-    process.presentation.ui.keep_compiled_scripts =
-        browser_profile_keep_compiled_scripts(browser.profile);
     process.presentation.ui.tls_session_persistence =
         tls_session_persistence;
-    process.presentation.ui.save_diagnostic_reports =
-        browser_profile_save_diagnostic_reports(browser.profile);
-    process.presentation.ui.wifi_diagnostics =
-        browser_profile_wifi_diagnostics(browser.profile);
-    process.presentation.ui.youtube_topics =
-        browser_profile_youtube_topics(browser.profile);
-    process.presentation.ui.youtube_login_policy = (uint8_t)
-        browser_profile_youtube_login_policy(browser.profile);
     psp_network_diagnostics_enable(process.presentation.ui.wifi_diagnostics);
     process.presentation.ui.network_profile =
         (uint8_t) process.config.network_profile;
@@ -10573,8 +5981,6 @@ int main(int argc, char *argv[])
         browser_session_mixed_content_site_allowed(browser.session, startup_url);
     process.presentation.ui.third_party_cookie_site_allowed =
         browser_profile_third_party_cookie_site_allowed(browser.profile, startup_url);
-    process.presentation.ui.search_engine = browser_profile_search_engine(browser.profile);
-    process.presentation.ui.color_mode = browser_profile_color_mode(browser.profile);
     BrowserChromeTheme chrome_theme =
         browser_profile_chrome_theme(browser.profile);
     char chrome_theme_error[64];
@@ -10587,49 +5993,17 @@ int main(int argc, char *argv[])
         (void) psp_app_apply_chrome_theme(
             &process, BROWSER_CHROME_THEME_FINCH, NULL, NULL, 0u);
     }
-    process.presentation.ui.glyph_language =
-        (unsigned) browser_profile_glyph_language(browser.profile);
-    process.presentation.ui.ui_language = browser_profile_ui_language(browser.profile);
-    process.presentation.ui.color_emoji =
-        browser_profile_color_emoji(browser.profile);
-    process.presentation.ui.glyph_offers_off =
-        !browser_profile_glyph_offers_enabled(browser.profile);
     psp_ui_set_glyph_component(
         &process.presentation.ui,
         browser.glyph_component_session->installed_mask, 0,
         PSP_UI_GLYPH_COMPONENT_UNKNOWN, -1);
-    process.presentation.ui.youtube_240p =
-        browser_profile_youtube_quality(browser.profile)
-            == BROWSER_YOUTUBE_QUALITY_240P;
-    psp_sync_video_preferences(&process.presentation.ui, browser.profile);
-    process.presentation.ui.youtube_compact_results =
-        browser_profile_youtube_compact_results(browser.profile);
-    process.presentation.ui.youtube_audio_only =
-        browser_profile_youtube_audio_only(browser.profile);
-    process.presentation.ui.video_scaling_sharp =
-        browser_profile_video_scaling(browser.profile)
-            == BROWSER_VIDEO_SCALING_SHARP;
-    process.presentation.ui.rotate_hint_always =
-        browser_profile_rotate_hint_always(browser.profile);
-    process.presentation.ui.video_startup_buffering =
-        browser_profile_video_startup_buffering(browser.profile);
-    process.presentation.ui.resume_offline_downloads =
-        browser_profile_resume_offline_downloads(browser.profile);
-    process.presentation.ui.save_playback_positions =
-        browser_profile_save_playback_positions(browser.profile);
     process.presentation.ui.content_blocker_mode = (uint8_t) content_blocker_mode;
-    process.presentation.ui.content_blocker_cosmetic_hiding =
-        browser_profile_content_blocker_cosmetic_hiding(browser.profile);
     process.presentation.ui.cookie_banner_hidden =
         browser_profile_cookie_banner_hidden(browser.profile, startup_url);
     process.presentation.ui.content_blocker_site_allowed =
         content_blocker_mode != CONTENT_BLOCKER_OFF
         && browser_profile_content_blocker_site_allowed(
                browser.profile, startup_url);
-    process.presentation.ui.update_check_enabled =
-        browser_profile_update_check_enabled(browser.profile);
-    process.presentation.ui.update_channel = (uint8_t)
-        browser_profile_update_channel(browser.profile);
     process.presentation.ui.developer_update_available =
         process.config.developer_update_url[0] != '\0';
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -10638,24 +6012,13 @@ int main(int argc, char *argv[])
        outside main's growth-tripwire symbol. */
     psp_app_seed_video_decoder_choice(&process.presentation.ui, &process.config);
 #endif
-    /* Retain the serialized preference but do not spend CPU or presentation
-       bandwidth on ambient motion. A future GPU-owned version
-       can migrate the same preference without changing this boot path. */
-    /* A release recorded by an earlier boot's background check stays marked
-       until this build's own sequence catches up to it. */
-    process.presentation.ui.update_release_available =
-        browser_profile_update_check_available_sequence(browser.profile)
-            > TILEFINCH_RELEASE_SEQUENCE;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     process.presentation.ui.validation_media_test_phase =
         process.config.validation_media_stability_auto != 0 ? 1u : 0u;
 #endif
     psp_refresh_page_color_mode(&process.presentation.ui);
-    (void) browser_engine_set_forced_dark(browser.engine, process.presentation.ui.page_dark);
-    (void) browser_engine_set_youtube_compact_results(
-        browser.engine, process.presentation.ui.youtube_compact_results);
-    (void) browser_engine_set_youtube_topics(
-        browser.engine, process.presentation.ui.youtube_topics);
+    (void) psp_engine_settings_boot(
+        browser.profile, browser.engine, &process.presentation.ui);
     psp_app_youtube_login_boot(&process, &browser);
     (void) psp_set_presentation_css(
         browser.engine, &process.presentation.ui, browser.profile, false, startup_url,
@@ -10759,176 +6122,19 @@ int main(int argc, char *argv[])
         printf("tilefinch-network: deferred for local startup\n");
     }
 #endif
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    /* The one validation mode that has to be dispatched here rather than
-       beside the others: it is the only one that needs the network, and this
-       is the first point at which the network is up. */
-    if (process.config.validation_media_range_probe != 0) {
-        return psp_run_media_range_qualification(
-            browser.engine, &process.config, &process.clock_worker, process.clock_live);
-    }
-#endif
+    if (psp_validation_network_qualification(
+            &browser, &process, &validation_exit))
+        return validation_exit;
 
-    psp_log_set_phase(PSP_LOG_PHASE_NAVIGATION);
-    psp_log_checkpoint("initial-navigation-begin");
-    psp_validation_cancel_after_ms = (unsigned) PSP_VALIDATION_KNOB(
-        process.config.validation_cancel_after_ms);
-    psp_validation_preview_scroll = (unsigned) PSP_VALIDATION_KNOB(
-        process.config.validation_preview_scroll);
-    __sync_synchronize();
-    uint64_t load_started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    bool initial_load_stopped = false;
-    PspProfilePageKind initial_profile_page =
-        psp_profile_page_kind(startup_url);
-    bool loaded;
-    if (native_home_boot) {
-        /* Native HOME does not wait on a document. The empty committed page
-           gives shell, tab, and history code a valid engine shape while HOME
-           owns the first visible frame. Nothing here touches the network. */
-        loaded = browser_engine_commit_empty_document(
-            browser.engine, TILEFINCH_HOMEPAGE_URL, true)
-            && browser_engine_refresh_shell(browser.engine);
-        if (loaded) {
-            psp_home_sync_ui(&process.presentation.ui, &process.presentation.home_surface, browser.profile, NULL, false);
-            psp_ui_show_home(&process.presentation.ui);
-            /* The first HOME frame is the settled, ordinary surface. Do not
-               spend ten uninterruptible full-screen presents on an entrance
-               animation immediately before the input loop starts. */
-            psp_present(engine_views.frame, &process.presentation.ui);
-            PSP_BOOT_TIMING_MARK("native-home-presented");
-        }
-    } else if (initial_profile_page != PSP_PROFILE_PAGE_NONE) {
-        loaded = psp_profile_open_page(
-            browser.engine, &process.presentation.ui, browser.profile,
-            initial_profile_page);
-    } else if (psp_offline_url(startup_url)) {
-        PspOfflineRouteResult offline_result =
-            psp_offline_store_handle_url(
-                &browser.offline_store, browser.engine, browser.profile,
-                startup_url,
-                NULL, true);
-        loaded = offline_result == PSP_OFFLINE_ROUTE_PAGE
-            || offline_result == PSP_OFFLINE_ROUTE_STATE_CHANGED;
-    } else {
-        loaded = psp_run_initial_page_load(
-            browser.engine, &process.presentation.ui, engine_views.frame,
-            startup_url, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS, argv0,
-            PSP_VALIDATION_KNOB(process.config.dump_frame == 2),
-            &initial_load_stopped);
-    }
-    psp_validation_cancel_after_ms = 0;
-    psp_validation_preview_scroll = 0;
-    __sync_synchronize();
-    bool initial_download_offer = !loaded && psp_offline_store_take_download_offer(
-        &browser.offline_store, browser.engine);
-    if (initial_download_offer) {
-        /* A binary startup URL has no incumbent page. Use the local library
-           beneath its confirmation, not a failed HTML view of the file. */
-        loaded = psp_offline_store_open_library(
-            &browser.offline_store, browser.engine, true);
-    }
-    bool initial_error_page = false;
-    uint64_t load_elapsed_ms =
-        ((uint64_t) sceKernelGetSystemTimeWide() - load_started_us) / 1000u;
-    printf("tilefinch-psp-script: load %s elapsed=%llums http=%ld "
-           "server=\"%.32s\" mitigated=\"%.16s\" error=\"%.300s\" "
-           "full-relayouts=%llu images=%zu/%zu stream=%zuB/%zu "
-           "peak-buffer=%zu cancelled=%d truncated=%d system-free=%d "
-           "system-largest=%d\n",
-           loaded ? "ok" : "failed",
-           (unsigned long long) load_elapsed_ms,
-           engine_views.navigation->last_http_status, engine_views.navigation->last_server,
-           engine_views.navigation->last_cf_mitigated,
-           initial_load_stopped ? "stopped by user"
-                                : engine_views.navigation->last_error,
-           (unsigned long long) engine_views.navigation->performance.full_relayouts,
-           engine_views.navigation->page.images.stats.loaded,
-           engine_views.navigation->page.images.stats.discovered,
-           engine_views.navigation->last_stream.bytes_received,
-           engine_views.navigation->last_stream.chunks_received,
-           engine_views.navigation->last_stream.peak_buffered_bytes,
-           engine_views.navigation->last_stream.cancelled ? 1 : 0,
-           engine_views.navigation->last_stream.truncated ? 1 : 0,
-           sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
-    psp_log_checkpoint(
-        loaded ? "initial-navigation-complete"
-               : "initial-navigation-failed");
-    if (!loaded && !initial_load_stopped) {
-        (void) psp_write_navigation_failure_report(
-            "initial-navigation", engine_views.navigation->last_error, startup_url,
-            engine_views.navigation);
-    }
-    psp_ui_set_loading(&process.presentation.ui, false, loaded ? 1000 : 0);
-    if (loaded) {
-        /* The restored page is opened from behind HOME on a native boot, so
-           its scroll is applied when it arrives, not to the blank document
-           standing in for "nothing open yet". */
-        if (restoring_last_page && !native_home_boot
-            && startup_recovery.scroll_y > 0) {
-            (void) browser_engine_scroll_by(
-                browser.engine, startup_recovery.scroll_y);
-            psp_ui_show_status(&process.presentation.ui, "LAST PAGE RESTORED", 180);
-        }
-        psp_profile_record_current(
-            browser.profile, &browser.profile_store, engine_views.navigation,
-            (uint64_t) sceKernelGetSystemTimeWide());
-        (void) psp_recovery_record_current(
-            browser.profile, process.storage.recovery, engine_views.navigation);
-    } else {
-        if (restoring_last_page) {
-            (void) browser_recovery_clear(process.storage.recovery);
-            printf("tilefinch-recovery: failed page cleared\n");
-        }
-        static const char failure_html[] =
-            "<!doctype html><meta name=viewport "
-            "content=\"width=device-width,initial-scale=1\">"
-            "<title>Page unavailable</title>"
-            "<style>*{box-sizing:border-box}body{font:16px sans-serif;"
-            "margin:0;padding:22px;background:#f4f7f7;color:#18202a}"
-            ".card{max-width:420px;padding:20px;background:#fff;border:1px "
-            "solid #d5dfe2;border-radius:12px}h1{font-size:25px;margin:0 0 "
-            "8px}p{line-height:1.4;color:#52636c}.actions{display:flex;gap:"
-            "9px;margin-top:16px}.action{padding:10px 14px;border-radius:8px;"
-            "background:#123040;color:#fff;text-decoration:none}.primary{"
-            "background:#34d3b0;color:#08211d}</style><div class=card>"
-            "<h1>Page unavailable</h1><p>Tilefinch could not open this page."
-            " Check the connection, try again, or return home.</p>"
-            "<div class=actions><a autofocus class=\"action primary\" "
-            "href=\"tilefinch://retry\">Try again</a><a class=action "
-            "href=\"tilefinch://home\">Go home</a></div></div>";
-        static const char stopped_html[] =
-            "<!doctype html><meta name=viewport "
-            "content=\"width=device-width,initial-scale=1\">"
-            "<title>Page load stopped</title>"
-            "<style>*{box-sizing:border-box}body{font:16px sans-serif;"
-            "margin:0;padding:22px;background:#f4f7f7;color:#18202a}"
-            ".card{padding:20px;background:#fff;border:1px solid #d5dfe2;"
-            "border-radius:12px}h1{font-size:25px;margin:0 0 8px}p{color:"
-            "#52636c}.action{display:inline-block;margin:12px 7px 0 0;"
-            "padding:10px 14px;border-radius:8px;background:#34d3b0;color:"
-            "#08211d;text-decoration:none}</style><div class=card>"
-            "<h1>Loading stopped</h1><p>The page stayed unchanged. You can "
-            "retry when ready or return home.</p><a autofocus class=action "
-            "href=\"tilefinch://retry\">Try again</a><a class=action "
-            "href=\"tilefinch://home\">Go home</a></div>";
-        const char *fallback_html =
-            initial_load_stopped ? stopped_html : failure_html;
-        size_t fallback_length = initial_load_stopped
-            ? sizeof(stopped_html) - 1u : sizeof(failure_html) - 1u;
-        initial_error_page = browser_engine_commit_html(
-            browser.engine, startup_url,
-            fallback_html, fallback_length, true)
-            && browser_engine_refresh_shell(browser.engine);
-        loaded = initial_error_page;
-        if (initial_error_page) {
-            (void) psp_engine_views_refresh(&engine_views, browser.engine);
-            psp_ui_show_status(
-                &process.presentation.ui, initial_load_stopped
-                    ? "PAGE LOAD STOPPED"
-                    : "PAGE FAILED - START OPENS ADDRESS",
-                300);
-        }
-    }
+    /* Native HOME presents without touching the network; a direct boot loads
+       its page here and falls back to the retry/home error page. */
+    PspBootNavigation initial_navigation = psp_boot_initial_navigation(
+        &process, &browser, &engine_views, startup_url, native_home_boot,
+        restoring_last_page, &startup_recovery, argv0);
+    bool loaded = initial_navigation.loaded;
+    const bool initial_download_offer = initial_navigation.download_offer;
+    const bool initial_error_page = initial_navigation.error_page;
+    const uint64_t load_started_us = initial_navigation.load_started_us;
     if (loaded && browser_engine_render_frame(browser.engine, NULL)) {
         psp_sync_ui(&process.presentation.ui, browser.engine, browser.profile);
         if (initial_download_offer)
@@ -11043,7 +6249,8 @@ report:
            engine_views.navigation->preloads_deferred,
            engine_views.navigation->preloads_headroom_skipped);
     {
-        /* The views are read-only copies; refresh through the owner. */
+        /* The views alias the engine's live session through const
+           pointers; refresh the result through the mutable owner. */
         NavigationSession *owned = browser_engine_navigation(browser.engine);
         script_runtime_refresh_result(
             owned->page.runtime, &owned->page.script_result);
@@ -11077,21 +6284,14 @@ report:
                (unsigned long long) render_stats->max_frame_job_slice_us,
                (unsigned long long) render_stats->max_frame_job_unit_us);
     }
-    printf("tilefinch-js-retention: handles=%zu/%zu stable=%zu "
-           "listeners=%zu handlers=%zu observers=%zu timers=%zu "
-           "network=%zu wrapper-evictions=%zu observer-drops=%zu "
-           "control-drops=%zu\n",
+    printf("tilefinch-js-retention: handles=%zu/%zu observers=%zu "
+           "timers=%zu network=%zu observer-drops=%zu\n",
            engine_views.navigation->page.script_result.dom_handle_slots_live,
            engine_views.navigation->page.script_result.dom_handle_slots_peak,
-           engine_views.navigation->page.script_result.root_stable_wrappers,
-           engine_views.navigation->page.script_result.root_stable_listener_targets,
-           engine_views.navigation->page.script_result.root_stable_handler_targets,
            engine_views.navigation->page.script_result.root_mutation_observers,
            engine_views.navigation->page.script_result.root_timers,
            engine_views.navigation->page.script_result.root_pending_network,
-           engine_views.navigation->page.script_result.retention_wrapper_evictions,
-           engine_views.navigation->page.script_result.retention_observer_drops,
-           engine_views.navigation->page.script_result.retention_control_drops);
+           engine_views.navigation->page.script_result.retention_observer_drops);
     printf("tilefinch-js-handles: high-water=%zu capacity=%zu growths=%zu "
            "growth-refusals=%zu exhaustions=%zu\n",
            engine_views.navigation->page.script_result
@@ -11261,9 +6461,7 @@ report:
            quick tap cannot begin and end between two 30 Hz page samples. */
         (void) psp_controller_take_latched_pressed();
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        psp_webgl_measurement_navigation = engine_views.navigation;
-#endif
+        psp_webgl_measurement_bind(engine_views.navigation);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         /* Backend ownership is process-scoped, so install it outside the
            frame-loop hot boundary. The worker itself remains lazy until an
@@ -11278,7 +6476,7 @@ report:
             psp_app_run_interactive(
                 &process, &browser, &interactive, &engine_views,
                 argv0, loaded, startup_url,
-                startup_blocker_metrics.requests_blocked,
+                boot_profile.startup_requests_blocked,
                 &boot_queue, &home_preconnect_dwell,
                 &power_policy,
                 native_home_boot, restoring_last_page,
@@ -11318,7 +6516,11 @@ report:
             restart_launcher ? NULL : process.config.exit_to);
         return 0;
     }
+    goto sleep_forever;
 
+boot_step_failed:
+    startup_failure_detail = boot_step.detail;
+    startup_failure_screen = boot_step.screen;
 sleep_forever:
     psp_log_set_phase(PSP_LOG_PHASE_HALTED);
     psp_report_startup_failure(

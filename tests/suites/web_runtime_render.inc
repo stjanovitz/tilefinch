@@ -499,48 +499,23 @@ static int test_web_runtime(void)
     puts("test: fixed overlays stack by z-index across fixed elements");
     if (test_fixed_overlays_follow_z_index(&budget) != 0) return 1;
 
-    puts("test: section-state restore refreshes DOM metadata and lazy caches");
-    static const char section_state_page[] =
+    puts("test: native wrappers share methods and stay small");
+    static const char wrapper_page[] =
         "<!doctype html><body><div id=state-target>initial</div></body>";
-    static const char section_state_long_text[] =
-        "section state restoration refreshes aggregate body metadata";
-    PocDocument section_state_document = {0};
-    ScriptResult section_state_result = {0};
-    CHECK(document_parse(&section_state_document, &budget,
-                         section_state_page,
-                         sizeof(section_state_page) - 1, 17));
+    PocDocument wrapper_document = {0};
+    ScriptResult wrapper_result = {0};
+    CHECK(document_parse(&wrapper_document, &budget,
+                         wrapper_page,
+                         sizeof(wrapper_page) - 1, 17));
     /* The realm must hold the bootstrap (about 1.96 MiB resident) plus the
        64-wrapper probe below (about 58 KiB); 2 MiB left too little headroom
        once WebIDL-correct function names and Document.prototype members
        added ~25 KiB to the bootstrap. */
-    ScriptRuntime *section_state_runtime = script_runtime_create_deferred(
-        &section_state_document, &budget, 2 * MIB + MIB / 4, 1000,
-        "https://section-state.test/", NULL, &section_state_result);
-    size_t saved_section_state = 0;
-    bool section_long_ok = section_state_runtime != NULL
-          && script_runtime_evaluate_diagnostic(
-              section_state_runtime,
-              "document.getElementById('state-target').textContent="
-              "'section state restoration refreshes aggregate body metadata'",
-              "<section-state-long>", &section_state_result);
-    bool section_save_ok = section_long_ok
-          && script_runtime_save_section_state(
-              section_state_runtime, 7, &saved_section_state,
-              &section_state_result);
-    bool section_short_ok = section_save_ok && saved_section_state == 1
-          && script_runtime_evaluate_diagnostic(
-              section_state_runtime,
-              "document.getElementById('state-target').textContent='x'",
-              "<section-state-short>", &section_state_result);
-    if (!section_short_ok) {
-        fprintf(stderr, "section state setup long=%d save=%d saved=%zu "
-                "short=%d error=%s\n", section_long_ok, section_save_ok,
-                saved_section_state, section_short_ok,
-                section_state_result.error);
-    }
-    CHECK(section_long_ok && section_save_ok && saved_section_state == 1
-          && section_short_ok);
-    CHECK(script_runtime_evaluate_diagnostic(section_state_runtime,
+    ScriptRuntime *wrapper_runtime = script_runtime_create_deferred(
+        &wrapper_document, &budget, 2 * MIB + MIB / 4, 1000,
+        "https://wrapper-methods.test/", NULL, &wrapper_result);
+    CHECK(wrapper_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(wrapper_runtime,
         "(()=>{const a=document.createElement('div'),b=document.createElement('div');"
         "const datasetDescriptor=node=>{for(let p=Object.getPrototypeOf(node);p;"
         "p=Object.getPrototypeOf(p)){const d=Object.getOwnPropertyDescriptor(p,'dataset');"
@@ -560,43 +535,27 @@ static int test_web_runtime(void)
         "a.dispatchEvent.call(b,new Event('probe'));"
         "if(calls!==0)throw Error('listener isolation');a.dispatchEvent(new Event('probe'));"
         "if(calls!==1)throw Error('listener dispatch')})()",
-        "<shared-native-wrapper-methods>", &section_state_result));
-    (void) script_runtime_collect_and_trim(section_state_runtime);
-    size_t wrapper_headroom_before = script_runtime_heap_remaining(section_state_runtime);
-    bool wrapper_memory_ok = script_runtime_evaluate_diagnostic(section_state_runtime,
+        "<shared-native-wrapper-methods>", &wrapper_result));
+    (void) script_runtime_collect_and_trim(wrapper_runtime);
+    size_t wrapper_headroom_before = script_runtime_heap_remaining(wrapper_runtime);
+    bool wrapper_memory_ok = script_runtime_evaluate_diagnostic(wrapper_runtime,
         "globalThis.wrapperMemoryProbe=[];for(let i=0;i<64;i++)"
         "wrapperMemoryProbe.push(document.createElement('div'))",
-        "<wrapper-memory>", &section_state_result);
+        "<wrapper-memory>", &wrapper_result);
     if (!wrapper_memory_ok) fprintf(stderr,"wrapper headroom=%zu error=%s\n",
-        wrapper_headroom_before, section_state_result.error);
+        wrapper_headroom_before, wrapper_result.error);
     CHECK(wrapper_memory_ok);
-    (void) script_runtime_collect_and_trim(section_state_runtime);
-    size_t wrapper_headroom_after = script_runtime_heap_remaining(section_state_runtime);
+    (void) script_runtime_collect_and_trim(wrapper_runtime);
+    size_t wrapper_headroom_after = script_runtime_heap_remaining(wrapper_runtime);
     printf("native wrapper memory: 64 nodes=%zu bytes\n",
            wrapper_headroom_before - wrapper_headroom_after);
     CHECK(wrapper_headroom_before >= wrapper_headroom_after
           && wrapper_headroom_before - wrapper_headroom_after < 384u * 1024u);
-    CHECK(script_runtime_evaluate_diagnostic(section_state_runtime,
+    CHECK(script_runtime_evaluate_diagnostic(wrapper_runtime,
         "delete globalThis.wrapperMemoryProbe", "<wrapper-memory-release>",
-        &section_state_result));
-    const char *short_section_body = document_body_text(
-        &section_state_document);
-    size_t short_section_bytes = section_state_document.text_bytes;
-    size_t restored_section_state = 0;
-    CHECK(short_section_body != NULL
-          && strstr(short_section_body, "x") != NULL
-          && script_runtime_restore_section_state(
-              section_state_runtime, 7, &restored_section_state,
-              &section_state_result)
-          && restored_section_state == 1
-          && section_state_document.body_text == NULL
-          && section_state_document.text_bytes > short_section_bytes);
-    const char *restored_section_body = document_body_text(
-        &section_state_document);
-    CHECK(restored_section_body != NULL
-          && strstr(restored_section_body, section_state_long_text) != NULL);
-    script_runtime_destroy(section_state_runtime);
-    document_destroy(&section_state_document);
+        &wrapper_result));
+    script_runtime_destroy(wrapper_runtime);
+    document_destroy(&wrapper_document);
     CHECK(budget.current == 0);
 
     puts("test: bounded lazy raster downsampling");
@@ -2301,7 +2260,7 @@ static int test_web_runtime(void)
         "<div id=clip-root><div id=non-containing-clip>"
         "<div id=escaping-positioned></div></div></div>"
         "<div id=sibling-clip-row><div id=sibling-clip>FIELD</div>"
-        "<div id=sibling-positioned><input id=sibling-hit type=submit>"
+        "<div id=sibling-positioned><input id=sibling-hit type=submit value=''>"
         "<span id=sibling-mark></span></div></div>"
         "<div id=scroll-border style='width:80px;height:60px;padding:0;"
         "border:2px solid;box-sizing:border-box;overflow:auto'>"

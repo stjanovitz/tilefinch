@@ -812,7 +812,10 @@ typedef struct {
      * template reference here avoids growing every PSP ComputedStyle.
      */
     int grid_columns;
-    int grid_min_column_width;
+    /* The repeat(auto-fill/auto-fit, minmax(<floor>, ...)) floor: a
+       StyleLength, so a percentage or mixed floor waits for the grid
+       container's inline size in layout. Zero means no floor. */
+    StyleLength grid_min_column_width;
     FlexDirection flex_direction;
     bool flex_wrap;
     bool flex_wrap_reverse;
@@ -2083,6 +2086,84 @@ typedef struct {
 
 #define STYLE_HAS_ATTRIBUTE_MEMO_NAME 40u
 #define STYLE_HAS_ATTRIBUTE_MEMO_SLOTS 16u
+/* Per-source parse policy. All zero (the default) admits every rule and
+   lets keyframes reach the motion source. Resource ingestion keeps a
+   bounded head and tail from very large sheets, then spends the middle
+   allowance on selectors whose simple class/ID tokens occur in the
+   current DOM. The Bloom index can only admit false positives; it never
+   drops a present token. */
+typedef struct {
+    size_t rule_limit_end;
+    size_t rule_head_limit_end;
+    size_t rule_secondary_limit_end;
+    size_t rule_relevant_limit_end;
+    const uint32_t *rule_priority_token_bloom;
+    size_t rule_priority_token_bloom_words;
+    const uint32_t *rule_token_bloom;
+    size_t rule_token_bloom_words;
+    const char *rule_tail_begin;
+    /* The source may style the page but must not reach the JS-visible
+       motion source (a no-CORS external response). */
+    bool motion_source_blocked;
+} StyleSourceOptions;
+
+/* True when any admission-window field is set. motion_source_blocked is
+   not part of the window. */
+static inline bool style_source_options_active(
+    const StyleSourceOptions *options)
+{
+    return options != NULL
+        && (options->rule_limit_end != 0
+            || options->rule_head_limit_end != 0
+            || options->rule_secondary_limit_end != 0
+            || options->rule_relevant_limit_end != 0
+            || options->rule_priority_token_bloom != NULL
+            || options->rule_priority_token_bloom_words != 0
+            || options->rule_token_bloom != NULL
+            || options->rule_token_bloom_words != 0
+            || options->rule_tail_begin != NULL);
+}
+
+/* Where adopted (constructed) and shadow-tree style sources apply: the
+   state of src/style_scopes.c, kept in Stylesheet.scopes. */
+typedef struct StyleScopes {
+    /* The adopted (constructed) sheets ingested after the document's own
+       sources (document_adopted_sheets_active), always the tail of
+       style_source_nodes: how many, and the document_adopted_tier_hash fold
+       of each with the text revision it was parsed at. */
+    uint8_t adopted_source_count;
+    /* Exclusive end of the adopted tail. Later native/user declarations
+       have no source node and must not inherit the last source's scope. */
+    unsigned adopted_rule_order_end;
+    uint64_t adopted_sources_signature;
+    /* Where those sources' rules apply (stylesheet_set_adopted_scopes);
+       bit i is the i-th adopted source. One the document adopts applies to
+       every element, as Tilefinch's cascade is document-wide. One that only
+       shadow roots adopt applies only to elements inside an adopting root's
+       carrier, as shadow encapsulation confines it in browsers: a
+       component's sheet does not restyle the rest of the page. */
+    uint64_t adopted_shadow_only_mask;
+    /* Allocation-free document scope/order survives root-table refusal. */
+    uint64_t adopted_document_mask;
+    uint8_t adopted_document_order[64];
+    struct StyleAdoptedScopeRoot *adopted_scope_roots;
+    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (256) roots: a byte would wrap
+       a full table to zero (asserted in style_sheet.c). */
+    uint16_t adopted_scope_root_count;
+    /* A refused scope update must never turn confined rules global. */
+    bool adopted_scopes_failed;
+    bool adopted_order_varies;
+    /* Cascade-order ranges of the <style> elements inside shadow-root
+       carriers, ascending: their rules apply only within that shadow tree
+       (and to its host through :host, its assigned light children through
+       ::slotted), as shadow encapsulation confines them. Allocated only on
+       pages with such styles; bounded by STYLE_SHADOW_SCOPE_LIMIT. A shadow
+       style whose scope cannot be recorded is skipped, never made global. */
+    struct StyleShadowScope *shadow_scopes;
+    uint16_t shadow_scope_count;
+    uint16_t shadow_scope_capacity;
+} StyleScopes;
+
 typedef struct {
     Budget *budget;
     /* Monotonic identity for the sheet contents.  The NavigationPage keeps
@@ -2110,19 +2191,9 @@ typedef struct {
     StyleRule *rules;
     size_t count;
     size_t capacity;
-    /* Zero normally. Resource ingestion keeps a bounded head and tail from
-       very large sheets, then spends the middle allowance on selectors whose
-       simple class/ID tokens occur in the current DOM. The Bloom index can
-       only admit false positives; it never drops a present token. */
-    size_t source_rule_limit_end;
-    size_t source_rule_head_limit_end;
-    size_t source_rule_secondary_limit_end;
-    size_t source_rule_relevant_limit_end;
-    const uint32_t *source_rule_priority_token_bloom;
-    size_t source_rule_priority_token_bloom_words;
-    const uint32_t *source_rule_token_bloom;
-    size_t source_rule_token_bloom_words;
-    const char *source_rule_tail_begin;
+    /* The parse policy of the source being parsed, installed by the
+       add-CSS entry points for one parse; zero between parses. */
+    StyleSourceOptions source;
     /* When an author realm cannot finish within its bounded resources,
        unresolved custom-element light DOM remains useful static content.
        This suppresses content-hiding :not(:defined) fallbacks while keeping
@@ -2140,11 +2211,25 @@ typedef struct {
     uint16_t motion_css_rules;
     uint16_t motion_css_keyframes;
     bool motion_css_bounded_out;
-    bool motion_css_source_blocked;
     /* At least one declaration can establish a directional boundary. This
        lets layout skip bidi subtree probes on the overwhelmingly common
        sheets that never mention direction or unicode-bidi. */
     bool has_bidi_declarations;
+    /* Style-attribute texts already scanned for this sheet (their sparse
+       properties noted, their logical-property and font-relative-unit
+       answers kept), by exact content; allocated on first use. */
+    struct StyleInlineScanSlot *inline_scans;
+    /* The memo gave its memory back to the page Budget's reclaim hook
+       (stylesheet_yield_inline_scans): it stays off for this sheet. */
+    bool inline_scans_yielded;
+    /* Whether any ::before (bit PSEUDO_BEFORE) or ::after rule can supply
+       content, built on the first style_pseudo_may_generate() query for
+       this build generation and rule count. Most sheets of simple pages
+       have none, and layout then skips every such lookup. */
+    uint64_t pseudo_content_generation;
+    size_t pseudo_content_rules;
+    uint8_t pseudo_content_bits;
+    bool pseudo_content_ready;
     /* Lazily materialized exact indices for the uncommon focus-state
        classifier. A representative article retains 25 entries instead of
        rescanning roughly 1,300 rules on every d-pad move. */
@@ -2472,8 +2557,10 @@ typedef struct {
     bool image_declarations_use_variables;
     bool has_scroll_interaction_rules;
     bool has_cursor_rules;
-    /* Bitset of sparse modern mobile declarations present in this sheet.
-       Nodes on ordinary pages skip the retained-property pass entirely. */
+    /* Bitset of sparse modern mobile declarations present in this sheet's
+       rules or in a style attribute resolved against it (see
+       style_sparse_note_inline). Nodes on ordinary pages skip the
+       retained-property pass entirely. */
     uint32_t modern_property_mask;
     /* Per-property typography presence consumes the alignment byte that
        preceded relative_selector_cache_epoch.  It prevents one authored
@@ -2503,56 +2590,18 @@ typedef struct {
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
     uint8_t style_source_count;
     bool style_sources_bounded_out;
-    /* The adopted (constructed) sheets ingested after the document's own
-       sources (document_adopted_sheets_active), always the tail of
-       style_source_nodes: how many, and the document_adopted_tier_hash fold
-       of each with the text revision it was parsed at. */
-    uint8_t adopted_source_count;
-    /* Exclusive end of the adopted tail. Later native/user declarations
-       have no source node and must not inherit the last source's scope. */
-    unsigned adopted_rule_order_end;
-    uint64_t adopted_sources_signature;
-    /* Where those sources' rules apply (stylesheet_set_adopted_scopes);
-       bit i is the i-th adopted source. One the document adopts applies to
-       every element, as Tilefinch's cascade is document-wide. One that only
-       shadow roots adopt applies only to elements inside an adopting root's
-       carrier, as shadow encapsulation confines it in browsers: a
-       component's sheet does not restyle the rest of the page. */
-    uint64_t adopted_shadow_only_mask;
-    /* Allocation-free document scope/order survives root-table refusal. */
-    uint64_t adopted_document_mask;
-    uint8_t adopted_document_order[64];
-    struct StyleAdoptedScopeRoot *adopted_scope_roots;
-    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (256) roots: a byte would wrap
-       a full table to zero (asserted in style_sheet.c). */
-    uint16_t adopted_scope_root_count;
-    /* A refused scope update must never turn confined rules global. */
-    bool adopted_scopes_failed;
-    bool adopted_order_varies;
+    /* Adopted and shadow style scopes (src/style_scopes.h). */
+    StyleScopes scopes;
     /* Set while a shadow tree's <style> or a constructed sheet is parsed:
        :host and ::slotted() selectors are kept (rewritten to the matcher's
        :host form) only there; a document sheet's never match. */
     bool parsing_scoped_source;
-    /* Cascade-order ranges of the <style> elements inside shadow-root
-       carriers, ascending: their rules apply only within that shadow tree
-       (and to its host through :host, its assigned light children through
-       ::slotted), as shadow encapsulation confines them. Allocated only on
-       pages with such styles; bounded by STYLE_SHADOW_SCOPE_LIMIT. A shadow
-       style whose scope cannot be recorded is skipped, never made global. */
-    struct StyleShadowScope *shadow_scopes;
-    uint16_t shadow_scope_count;
-    uint16_t shadow_scope_capacity;
 } Stylesheet;
 
 bool stylesheet_build(Stylesheet *sheet, Budget *budget,
                       const PocDocument *document, int viewport_width);
 bool stylesheet_register_api_property(Stylesheet *sheet,
                                       const DocumentRegisteredProperty *property);
-/* Returns active, non-pseudo selectors whose declaration makes the matched
-   element a flex/grid/table layout container. Pointers remain owned by sheet. */
-size_t stylesheet_layout_island_selectors(const Stylesheet *sheet,
-                                          const char **selectors,
-                                          size_t capacity);
 bool stylesheet_build_context(Stylesheet *sheet, Budget *budget,
                               const PocDocument *document,
                               const ViewportContext *viewport);
@@ -2582,9 +2631,12 @@ bool stylesheet_add_css(Stylesheet *sheet, const char *css, size_t length);
 void stylesheet_enable_static_custom_element_fallback(Stylesheet *sheet);
 bool stylesheet_add_css_from(Stylesheet *sheet, const char *css,
                              size_t length, const char *source_base_url);
+/* `source` is this source's parse policy, installed for the parse and
+   restored afterwards; NULL means the defaults (all zero). */
 bool stylesheet_add_css_from_context(
     Stylesheet *sheet, const char *css, size_t length,
-    const char *source_base_url, const char *source_referrer_policy);
+    const char *source_base_url, const char *source_referrer_policy,
+    const StyleSourceOptions *source);
 /* Parses CSS normally while optionally retaining a bounded, pointer-free
    structural IR for the final selector/declaration operations. The IR is
    viewport-specific and is deliberately unavailable for constructs whose
@@ -2594,6 +2646,7 @@ bool stylesheet_add_css_from_context(
 bool stylesheet_add_css_from_context_capture_ir(
     Stylesheet *sheet, const char *css, size_t length,
     const char *source_base_url, const char *source_referrer_policy,
+    const StyleSourceOptions *source,
     unsigned char **ir_data, size_t *ir_length);
 typedef enum {
     STYLE_PARSED_IR_REJECTED = 0,
@@ -2603,11 +2656,13 @@ typedef enum {
 /* Replays a validated structural IR into a fresh stylesheet context. This
    still parses declarations against the destination sheet's own intern
    tables, preserving cascade, URL provenance, variables, and bounded
-   resource admission while skipping the recursive CSS structure walk. */
+   resource admission while skipping the recursive CSS structure walk.
+   IR is never captured under an admission window, so a `source` with an
+   active window is rejected. */
 StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
     Stylesheet *sheet, const unsigned char *ir_data, size_t ir_length,
     const char *source_base_url, const char *source_referrer_policy,
-    size_t *operation_count);
+    const StyleSourceOptions *source, size_t *operation_count);
 bool stylesheet_parsed_ir_matches(
     const Stylesheet *sheet, const unsigned char *ir_data, size_t ir_length);
 /* Appends parser-discovered inline <style> elements to an existing sheet in
@@ -2739,6 +2794,17 @@ void stylesheet_destroy(Stylesheet *sheet);
    sheet is moved into the RAM-only navigation cache. Authored rules and
    indices are retained; no source or compiled data is serialized. */
 void stylesheet_prepare_for_document_reuse(Stylesheet *sheet);
+/* Budget reclaim: frees the sheet's style-attribute scan memo and keeps it
+   off for the sheet's life (attribute texts are scanned again, as without
+   the memo). Frees only, so it is safe inside any allocation. Returns the
+   bytes released. */
+size_t stylesheet_yield_inline_scans(Stylesheet *sheet);
+/* Frees the memo without keeping it off, for a sheet that resolves
+   nothing for a while (it is rebuilt on its next use). Returns the bytes
+   released. */
+size_t stylesheet_drop_inline_scans(Stylesheet *sheet);
+/* The memo's bytes, for stylesheet_retained_bytes. */
+size_t stylesheet_inline_scan_bytes(const Stylesheet *sheet);
 size_t stylesheet_web_font_source_count(const Stylesheet *sheet);
 bool stylesheet_web_font_source(const Stylesheet *sheet, size_t index,
                                 StylesheetWebFontSource *source);
@@ -2905,8 +2971,26 @@ typedef enum {
     STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY,
     STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY,
     STYLE_FOCUS_CHANGE_OUTSET_PAINT_ONLY,
-    STYLE_FOCUS_CHANGE_PSEUDO_TRANSLATION_ONLY
+    STYLE_FOCUS_CHANGE_PSEUDO_TRANSLATION_ONLY,
+    /*
+     * Only `color` and a solid background colour differ (with the outline),
+     * and nothing else consumes the colour (no currentColor border, shadow,
+     * mask or background). Layout recolours the retained text that follows
+     * the colour (style_focus_color_texts) and the element's background.
+     */
+    STYLE_FOCUS_CHANGE_COLOR_PAINT_ONLY
 } StyleFocusChange;
+/* The text a COLOR_PAINT_ONLY focus change recolours: the focused element's
+   text children and those of descendants that inherit its colour (`texts`),
+   and the text of descendants that keep their own colour (`kept`). An img
+   entry stands for its alt text. */
+#define STYLE_FOCUS_COLOR_TEXT_LIMIT 32u
+typedef struct {
+    lxb_dom_node_t *texts[STYLE_FOCUS_COLOR_TEXT_LIMIT];
+    lxb_dom_node_t *kept[STYLE_FOCUS_COLOR_TEXT_LIMIT];
+    size_t text_count;
+    size_t kept_count;
+} StyleFocusColorTexts;
 typedef struct {
     int dx[2];
     int dy[2];
@@ -2928,6 +3012,15 @@ StyleFocusChange style_focus_pseudo_change_classify(
     const ComputedStyle *parent, ComputedStyle *normal,
     ComputedStyle *focused, StyleFocusPseudoTranslation *translation,
     bool *local);
+/* For a COLOR_PAINT_ONLY change of `node` (its styles `normal` and
+   `focused`): every descendant either keeps its style in both states or
+   differs only by inheriting the colour, and none renders content the
+   recolour cannot reach (replaced or form content, list markers, generated
+   pseudo-elements). False when not proven within the bounded subtree. */
+bool style_focus_color_texts(const Stylesheet *sheet, lxb_dom_node_t *node,
+                             const ComputedStyle *normal,
+                             const ComputedStyle *focused,
+                             StyleFocusColorTexts *texts);
 /* Both marker states leave other elements' selector answers unchanged.
    Concrete changes (including unsupported paint) still require full flow. */
 bool style_focus_change_is_local(const Stylesheet *sheet, lxb_dom_node_t *node);
@@ -2935,6 +3028,16 @@ bool style_focus_change_is_local(const Stylesheet *sheet, lxb_dom_node_t *node);
    custom-property declaration, including inherited/relative effects. */
 bool style_focus_custom_properties_unchanged(const Stylesheet *sheet,
                                             lxb_dom_node_t *node);
+/* Whether toggling `node`'s focus can restyle no element outside `node`'s
+   subtree that `settled` does not accept (it accepts an element only with
+   its whole subtree). Proven from the focus rules that can reach other
+   elements (rules and custom declarations): each must reach only forward,
+   and select no unsettled element in its range in either focus state.
+   False when not proven within a bounded walk. */
+typedef bool (*StyleFocusSettled)(const lxb_dom_node_t *element,
+                                  void *context);
+bool style_focus_restyle_confined(const Stylesheet *sheet,
+    lxb_dom_node_t *node, StyleFocusSettled settled, void *context);
 /* Layout-only second pass for font-metric-dependent `ch` units. */
 ComputedStyle style_for_node_with_ch_basis(
     const Stylesheet *sheet, lxb_dom_node_t *node,

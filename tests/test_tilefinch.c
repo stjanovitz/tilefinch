@@ -55,6 +55,41 @@ static size_t test_reclaim_script_bytecode(void *opaque, size_t needed)
     return browser_session_script_bytecode_reclaim(opaque, needed);
 }
 
+/* Script-pressure tests take the page Budget's room after a navigation has
+   created the page realm and before its document scripts run. Navigation
+   resolves the realm's heavy-script policy at exactly that point, so the
+   resolver is the seam: it holds all but `leave_free` bytes, optionally
+   arms a reclaim hook, and answers with the session's own policy. */
+typedef struct {
+    NavigationSession *navigation;
+    BudgetReservation *reservation;
+    size_t leave_free;
+    BudgetReclaimHook reclaim;
+    void *reclaim_opaque;
+    bool reserved;
+    size_t failures_before;
+    size_t decisions_before;
+} TestScriptPressureSeam;
+
+static ScriptHeavyPolicy test_script_pressure_at_realm(void *opaque,
+                                                       const char *url)
+{
+    (void) url;
+    TestScriptPressureSeam *seam = opaque;
+    Budget *budget = seam->navigation->budget;
+    size_t remaining = budget_remaining(budget);
+    seam->reserved = !seam->reserved && remaining > seam->leave_free
+        && budget_reservation_acquire(
+            seam->reservation, budget, BUDGET_CATEGORY_RESOURCE,
+            remaining - seam->leave_free);
+    if (seam->reclaim != NULL)
+        budget_set_reclaim_hook(budget, seam->reclaim, seam->reclaim_opaque);
+    seam->failures_before = budget->failure_count;
+    seam->decisions_before =
+        budget->pressure[BUDGET_PRESSURE_JAVASCRIPT].decisions;
+    return seam->navigation->heavy_script_policy;
+}
+
 static bool test_cache_put_classic_script(
     BrowserSession *session, const char *document_url, const char *script_url,
     const unsigned char *source, size_t source_length)
@@ -159,68 +194,6 @@ static void test_store_le32(unsigned char *destination, uint32_t value)
     destination[1] = (unsigned char) (value >> 8);
     destination[2] = (unsigned char) (value >> 16);
     destination[3] = (unsigned char) (value >> 24);
-}
-
-typedef struct {
-    size_t calls;
-    size_t final_calls;
-    size_t ready_calls;
-    size_t cancel_at;
-    size_t last_indexed_bytes;
-    bool monotonic;
-} TestSectionProgress;
-
-static bool test_section_progress(
-    void *opaque, const CompressedSectionStore *store,
-    size_t indexed_source_bytes, bool final)
-{
-    TestSectionProgress *progress = opaque;
-    progress->calls++;
-    if (indexed_source_bytes < progress->last_indexed_bytes)
-        progress->monotonic = false;
-    progress->last_indexed_bytes = indexed_source_bytes;
-    if (store->section_count != 0) progress->ready_calls++;
-    if (final) progress->final_calls++;
-    return progress->cancel_at == 0
-        || progress->calls < progress->cancel_at;
-}
-
-typedef struct {
-    size_t calls;
-    char last_selector[64];
-} TestRemoteSelectorProbe;
-
-static bool test_remote_selector_lookup(
-    void *opaque, const char *selector, size_t length,
-    size_t *section_index, char tag_name[32], char identifier[129],
-    char stable_key[96])
-{
-    TestRemoteSelectorProbe *probe = opaque;
-    probe->calls++;
-    size_t copied = length < sizeof(probe->last_selector) - 1
-        ? length : sizeof(probe->last_selector) - 1;
-    memcpy(probe->last_selector, selector, copied);
-    probe->last_selector[copied] = '\0';
-    (void) section_index;
-    (void) tag_name;
-    (void) identifier;
-    (void) stable_key;
-    return false;
-}
-
-static bool test_bound_remote_selector_lookup(
-    void *opaque, const char *selector, size_t length,
-    size_t *section_index, char tag_name[32], char identifier[129],
-    char stable_key[96])
-{
-    TestRemoteSelectorProbe *probe = opaque;
-    probe->calls++;
-    if (length != 5 || memcmp(selector, "aside", 5) != 0) return false;
-    *section_index = 1;
-    snprintf(tag_name, 32, "aside");
-    snprintf(identifier, 129, "remote-aside");
-    snprintf(stable_key, 96, "id:remote-aside");
-    return true;
 }
 
 
@@ -1123,51 +1096,6 @@ static bool test_stream_body(void *opaque, const unsigned char *data,
     TestStreamConsumer *consumer = opaque;
     return document_parser_feed(&consumer->parser,
                                 (const char *) data, length);
-}
-
-static bool test_section_store_stream_body(void *opaque,
-                                           const unsigned char *data,
-                                           size_t length)
-{
-    return section_store_stream_append(opaque, data, length);
-}
-
-static bool test_section_store_transport_fault(size_t cancel_after,
-                                               size_t truncate_after)
-{
-    Budget budget;
-    budget_init(&budget, 5 * MIB);
-    CompressedSectionStore store = {0};
-    SectionStoreStreamBuilder builder = {0};
-    char error[256] = {0};
-    bool trace_ready = fetch_trace_replay_begin(
-        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream", error,
-        sizeof(error));
-    FetchResult result = {.budget = &budget};
-    FetchStreamMetrics metrics = {0};
-    FetchStreamOptions stream = {
-        .on_body = test_section_store_stream_body,
-        .opaque = &builder,
-        .chunk_bytes = 7,
-        .cancel_after_bytes = cancel_after,
-        .truncate_after_bytes = truncate_after
-    };
-    FetchRequest request = {
-        .method = "GET", .send_low_client_hints = true,
-        .sec_fetch_user = true, .upgrade_insecure_requests = true
-    };
-    bool began = trace_ready && section_store_stream_begin(
-        &builder, &store, &budget, 4096, 8192);
-    bool fetched = began && fetch_request_stream_cancelable(
-        &budget, "https://stream.test/document", &request, 4096, 1000,
-        NULL, NULL, &stream, &metrics, &result);
-    bool signaled = cancel_after != 0 ? metrics.cancelled
-                                     : metrics.truncated;
-    section_store_stream_abort(&builder);
-    section_store_destroy(&store);
-    fetch_result_destroy(&result);
-    fetch_trace_end();
-    return began && !fetched && signaled && budget.current == 0;
 }
 
 static bool test_stream_stall(void *opaque)
@@ -5527,6 +5455,33 @@ static bool constructed_sheet_open(NavigationSession *navigation,
     return svg_presentation_open(navigation, budget, html);
 }
 
+/* A user-CSS transaction parks the incumbent sheet where the reclaim hook
+   cannot reach it: its style-attribute memo is freed when the transaction
+   opens, and a rollback brings the sheet back without one (rebuilt on use). */
+static bool test_user_css_transaction_drops_inline_memo(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<p style='color:#00ff00'>INLINE</p>");
+    ok = ok && navigation.page.stylesheet.inline_scans != NULL;
+    static const char css[] = "body{color:#123456}";
+    NavigationUserCssTransaction *transaction = ok
+        ? navigation_apply_user_css_begin(&navigation, css, sizeof(css) - 1u)
+        : NULL;
+    ok = ok && transaction != NULL;
+    if (transaction != NULL)
+        ok = navigation_apply_user_css_rollback(&navigation, transaction) && ok;
+    if (ok && navigation.page.stylesheet.inline_scans != NULL) {
+        fprintf(stderr, "rolled-back sheet kept its inline memo\n");
+        ok = false;
+    }
+    ok = ok && late_init_text_color(&navigation.page.layout, "INLINE")
+        == 0x00ff00;
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
 /* Real browsers have no rule cap: a Lit component whose shared sheet has
    more than 1,024 rules must still render, and insertRule must keep
    working past that count. A Tailwind escape (\') is not a quote. */
@@ -6025,9 +5980,9 @@ static bool test_constructed_sheet_full_root_table(Budget *budget)
         ok = false;
     }
     const Stylesheet *sheet = &navigation.page.stylesheet;
-    if (ok && sheet->adopted_scope_root_count != DOCUMENT_ADOPTION_ROOT_LIMIT) {
+    if (ok && sheet->scopes.adopted_scope_root_count != DOCUMENT_ADOPTION_ROOT_LIMIT) {
         fprintf(stderr, "full adopted root table count=%u, want %u\n",
-                (unsigned) sheet->adopted_scope_root_count,
+                (unsigned) sheet->scopes.adopted_scope_root_count,
                 (unsigned) DOCUMENT_ADOPTION_ROOT_LIMIT);
         ok = false;
     }
@@ -6196,17 +6151,17 @@ static bool test_constructed_sheet_root_order_and_refusal(Budget *budget)
         &root, list, &length, &active) && root != NULL;
     ok = ok && document_adoption_set(&navigation.page.document,
         (lxb_dom_node_t *) root, NULL, 0, NULL, NULL);
-    const void *old_roots = sheet->adopted_scope_roots;
-    uint64_t old_mask = sheet->adopted_shadow_only_mask;
-    size_t old_count = sheet->adopted_scope_root_count;
+    const void *old_roots = sheet->scopes.adopted_scope_roots;
+    uint64_t old_mask = sheet->scopes.adopted_shadow_only_mask;
+    size_t old_count = sheet->scopes.adopted_scope_root_count;
     size_t limit = budget->limit;
     budget->limit = budget->current;
     bool updated = stylesheet_set_adopted_scopes(sheet,
         &navigation.page.document, NULL, 0, NULL, NULL);
     budget->limit = limit;
-    ok = ok && !updated && sheet->adopted_scope_roots == old_roots
-        && sheet->adopted_shadow_only_mask == old_mask
-        && sheet->adopted_scope_root_count == old_count;
+    ok = ok && !updated && sheet->scopes.adopted_scope_roots == old_roots
+        && sheet->scopes.adopted_shadow_only_mask == old_mask
+        && sheet->scopes.adopted_scope_root_count == old_count;
     if (!ok) fprintf(stderr, "adopted scope/order refusal failed\n");
     constructed_sheet_close(&navigation);
     return ok && budget->current == baseline;
@@ -6235,7 +6190,7 @@ static bool test_constructed_sheet_scope_refusal_keeps_document(Budget *budget)
         &navigation.page.document, 480);
     tilefinch_test_faults()->refuse_next_adopted_scope_table = false;
     lxb_dom_node_t *root = lxb_dom_interface_node(navigation.page.document.html);
-    ok = ok && built && candidate.adopted_scopes_failed;
+    ok = ok && built && candidate.scopes.adopted_scopes_failed;
     if (ok) {
         ComputedStyle base = style_for_node(&candidate, find_id(root, "base"), NULL);
         ComputedStyle public = style_for_node(&candidate, find_id(root, "public"), NULL);
@@ -6244,10 +6199,10 @@ static bool test_constructed_sheet_scope_refusal_keeps_document(Budget *budget)
             && private.color != 0xff0000;
         if (!ok) fprintf(stderr, "refused scope colors=%06x/%06x/%06x mask=%llu\n",
             base.color, public.color, private.color,
-            (unsigned long long) candidate.adopted_document_mask);
+            (unsigned long long) candidate.scopes.adopted_document_mask);
         ok = ok && stylesheet_set_adopted_scopes(&candidate,
             &navigation.page.document, NULL, 0, NULL, NULL)
-            && !candidate.adopted_scopes_failed;
+            && !candidate.scopes.adopted_scopes_failed;
         lxb_dom_node_t *carrier = document_shadow_carrier_of_host(find_id(root, "a"));
         ComputedStyle shadow = style_for_node(&candidate,
             find_id(carrier, "shadow"), NULL);
@@ -6321,7 +6276,7 @@ static bool test_constructed_sheet_source_bound_keeps_confinement(Budget *budget
             ComputedStyle second = style_for_node(&candidate, find_id(root, "second"), NULL);
             ok = base.color == 0x123456 && private.color != 0xff0000
                 && second.color != 0x0000ff;
-            if (ok && candidate.adopted_source_count != 0) {
+            if (ok && candidate.scopes.adopted_source_count != 0) {
                 lxb_dom_node_t *carrier = document_shadow_carrier_of_host(find_id(root, "a"));
                 ComputedStyle shadow = style_for_node(&candidate,
                     find_id(carrier, "shadow"), NULL);
@@ -6330,9 +6285,9 @@ static bool test_constructed_sheet_source_bound_keeps_confinement(Budget *budget
             if (!ok) fprintf(stderr,
                 "source-bound confinement failed at %zu sources: colors=%06x/%06x/%06x tracked=%u adopted=%u bounded=%d mask=%llu\n",
                 sources, base.color, private.color, second.color,
-                candidate.style_source_count, candidate.adopted_source_count,
+                candidate.style_source_count, candidate.scopes.adopted_source_count,
                 candidate.style_sources_bounded_out,
-                (unsigned long long) candidate.adopted_shadow_only_mask);
+                (unsigned long long) candidate.scopes.adopted_shadow_only_mask);
         }
         stylesheet_destroy(&candidate);
         constructed_sheet_close(&navigation);
@@ -6928,23 +6883,29 @@ static int test_tile_placeholder_frame(void)
     return 0;
 }
 
-#include "suites/web_runtime_hidden_mutations.inc"
-#include "suites/web_runtime_relayout_reuse.inc"
-#include "suites/opfs_sync.inc"
-#include "suites/image_rebuild_pressure.inc"
-#include "suites/web_runtime_render.inc"
-#include "suites/web_runtime_navigation.inc"
-#include "suites/web_runtime_forms.inc"
-#include "suites/sections.inc"
-
+static int test_tiny_budget_rejection(void)
+{
+    Budget tiny;
+    puts("test: tiny-budget rejection");
+    /* Below what the document needs; a small page's parse fits in 1 MiB
+       since the parser's token pools start small. */
+    budget_init(&tiny, 256u * 1024u);
     budget_install_lexbor(&tiny);
     PocDocument rejected;
     CHECK(!document_parse(&rejected, &tiny, page, strlen(page), 17));
     document_destroy(&rejected);
     CHECK(tiny.failure_count > 0 && tiny.current == 0);
-
     return 0;
 }
+
+#include "suites/web_runtime_hidden_mutations.inc"
+#include "suites/web_runtime_relayout_reuse.inc"
+#include "suites/web_runtime_bounded_focus.inc"
+#include "suites/opfs_sync.inc"
+#include "suites/image_rebuild_pressure.inc"
+#include "suites/web_runtime_render.inc"
+#include "suites/web_runtime_navigation.inc"
+#include "suites/web_runtime_forms.inc"
 
 typedef int (*TilefinchTestSuiteFunction)(void);
 
@@ -6974,11 +6935,6 @@ static const TilefinchTestSuite tilefinch_test_suites[] = {
         "web-runtime",
         "images, DOM, JavaScript, controls, events, frames, and resources",
         test_web_runtime
-    },
-    {
-        "sections",
-        "compressed section store, streaming, paging, and adaptive routing",
-        test_sections
     }
 };
 
@@ -7031,7 +6987,7 @@ int main(int argc, char **argv)
         const TilefinchTestSuite *suite = &tilefinch_test_suites[i];
         bool core_alias = filter != NULL && strcmp(filter, "core") == 0;
         if (filter != NULL && strcmp(filter, suite->name) != 0
-            && !(core_alias && strcmp(suite->name, "sections") != 0)) {
+            && !core_alias) {
             continue;
         }
         selected++;

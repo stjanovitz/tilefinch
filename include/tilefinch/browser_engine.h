@@ -245,8 +245,6 @@ typedef struct {
     bool controller_ready;
     bool render_ready;
     DocumentBackingKind backing_kind;
-    size_t section_count;
-    size_t current_section;
     size_t loads_started;
     size_t loads_committed;
     size_t loads_cancelled;
@@ -409,6 +407,15 @@ bool browser_config_apply_psp_memory_profile(
 /* The BROWSER_PSP_APP_* configuration with the realistic execution policy.
    Callers apply boot-time overrides (and fonts) afterwards. */
 bool browser_config_apply_psp_app_defaults(BrowserConfig *config);
+/* The script admission limits the PSP app and the lab both derive from their
+   boot settings: installs the execution policy for `profile`, then the
+   script count and byte limits, clamping the per-file limit to the total
+   and then to the policy's host compile ceiling. False when the profile has
+   no policy. */
+bool browser_config_apply_script_limits(
+    BrowserConfig *config, ScriptExecutionProfile profile,
+    size_t maximum_scripts, size_t maximum_total_bytes,
+    size_t maximum_file_bytes);
 bool browser_config_set_font_paths(
     BrowserConfig *config, const char *sans_path, const char *serif_path,
     const char *sans_italic_path, const char *sans_bold_path,
@@ -597,6 +604,26 @@ BrowserPreviewActivation browser_engine_provisional_activate(
    for the page; the frontend then activates the focused item. */
 bool browser_engine_take_deferred_activation(BrowserEngine *engine);
 bool browser_engine_history_move(BrowserEngine *engine, bool forward);
+/*
+ * History steps for pages the frontend renders itself (native or generated
+ * pages with no server). The step moves the history cursor one entry without
+ * loading anything, cancelling idle work first like every other cursor move,
+ * and reports the new entry's saved scroll and, when `text` is not NULL, a
+ * copy of its URL and title, so the frontend never borrows engine history.
+ * It fails without moving when there is no entry in that direction or its
+ * text does not fit. When the frontend then cannot open the page it rolls
+ * the step back; after opening it, it restores the entry's saved scroll.
+ */
+typedef struct {
+    char url[NAVIGATION_URL_LIMIT];
+    char title[NAVIGATION_TITLE_LIMIT];
+} BrowserHistoryEntryText;
+bool browser_engine_history_step(
+    BrowserEngine *engine, bool forward, BrowserHistoryEntryText *text,
+    int *scroll_y);
+bool browser_engine_history_step_rollback(BrowserEngine *engine, bool forward);
+bool browser_engine_history_restore_scroll(
+    BrowserEngine *engine, int scroll_y);
 bool browser_engine_replace_history(
     BrowserEngine *engine, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);
@@ -789,18 +816,6 @@ bool browser_engine_take_page_controls_notice(BrowserEngine *engine);
 /* Release page-owned presentation devices before a platform suspend while
    retaining the document and decoded, budget-owned game assets. */
 void browser_engine_suspend_page_presentations(BrowserEngine *engine);
-/*
- * Commits one already-materialized compressed section and keeps the facade's
- * backing, controller, and render shell synchronized with the navigation
- * page.  When selection is non-NULL, the facade commits it only after the
- * candidate document succeeds; on failure it remains active for the caller
- * to abort or use while restoring the previous section.
- */
-bool browser_engine_commit_section_html(
-    BrowserEngine *engine, DocumentBacking *backing,
-    DocumentBackingSelection *selection, const char *url,
-    const char *html, size_t html_length, bool preserve_runtime,
-    bool record_history);
 bool browser_engine_refresh_shell(BrowserEngine *engine);
 /*
  * Rebuild only the engine-owned render shell after a caller performs a
@@ -820,6 +835,9 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine);
  * canvas pixels. The choice persists across navigation render-shell swaps.
  */
 bool browser_engine_set_forced_dark(BrowserEngine *engine, bool enabled);
+/* The forced-dark choice in effect. A missing engine reports a new
+   engine's value. */
+bool browser_engine_forced_dark(const BrowserEngine *engine);
 /* Full invalidation after the application-level provider changes. */
 bool browser_engine_optional_glyphs_updated(BrowserEngine *engine);
 /* Repaint after one deferred block read without evicting glyphs that are
@@ -838,6 +856,10 @@ bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
 /* Optional provider discovery runs after the local search page's first paint. */
 bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled);
+/* The two YouTube preferences in effect. A missing engine reports a new
+   engine's values. */
+bool browser_engine_youtube_compact_results(const BrowserEngine *engine);
+bool browser_engine_youtube_topics(const BrowserEngine *engine);
 typedef enum {
     BROWSER_YOUTUBE_FEED_IDLE = 0,
     BROWSER_YOUTUBE_FEED_LOADING,
@@ -976,6 +998,66 @@ typedef struct {
 bool browser_engine_view_snapshot(
     const BrowserEngine *engine, BrowserViewSnapshot *snapshot);
 
+/*
+ * Scalar per-frame facts, cheaper than copying a BrowserViewSnapshot. Both
+ * read zero/false when the engine has no active navigation session.
+ */
+uint64_t browser_engine_page_generation(const BrowserEngine *engine);
+bool browser_engine_page_loaded(const BrowserEngine *engine);
+/* The current page's scripts were refused or retired for memory: its realm
+   hit the script memory limit, a host compile was refused for memory, or the
+   runtime was retired after degrading. Not ordinary widget errors or
+   JavaScript disabled for the site. */
+bool browser_engine_page_script_memory_failed(const BrowserEngine *engine);
+/*
+ * Copies of the current history entry, so the frontend never borrows engine
+ * history. They return false, with empty text and zero scroll, when there is
+ * no current entry or its text does not fit; a NAVIGATION_URL_LIMIT buffer
+ * (and BrowserHistoryEntryText) always fits. Any output may be NULL.
+ */
+bool browser_engine_current_entry(
+    const BrowserEngine *engine, char *url, size_t url_capacity,
+    int *scroll_y);
+bool browser_engine_current_entry_text(
+    const BrowserEngine *engine, BrowserHistoryEntryText *text,
+    int *scroll_y);
+/* Copy of the URL of the entry one step back or forward, without moving the
+   cursor; false (with an empty URL) when there is none. */
+bool browser_engine_history_peek(
+    const BrowserEngine *engine, bool forward, char *url,
+    size_t url_capacity);
+/* Copy of the committed page's document URL; false (with an empty URL)
+   without an active navigation session. */
+bool browser_engine_page_document_url(
+    const BrowserEngine *engine, char *url, size_t url_capacity);
+/* Incremental relayouts of the current session so far; a change across an
+   operation means it relaid out the page. */
+size_t browser_engine_page_incremental_relayouts(const BrowserEngine *engine);
+/* HTTP status of the last top-level response (0 when none). */
+long browser_engine_last_http_status(const BrowserEngine *engine);
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Copied counters that only validation reports read. Shipping PSP builds do
+   not declare it, so report-only engine facts cannot leak into policy. */
+typedef struct {
+    uint64_t generation;
+    bool loaded;
+    size_t incremental_relayouts;
+    size_t full_relayouts;
+    size_t fast_relayouts;
+    uint64_t layout_us;
+    int layout_height;
+    size_t layout_fixed_count;
+    uint64_t layout_text_fingerprint;
+    LayoutPerformance layout_performance;
+    char last_cf_mitigated[32];
+    size_t managed_challenge_heap_raises;
+} BrowserValidationCounters;
+/* False, with zeroed counters, before the engine has a navigation session. */
+bool browser_engine_validation_counters(
+    const BrowserEngine *engine, BrowserValidationCounters *counters);
+#endif
+
 typedef struct {
     const uint16_t *pixels;
     size_t pixel_count;
@@ -1009,6 +1091,8 @@ void browser_engine_test_refuse_next_render_shell_init(void);
 /* Deterministic wall clock for recovery-settle tests. Zero restores the
    platform monotonic clock. */
 void browser_engine_test_set_recovery_time_us(uint64_t now_us);
+/* The name of the index-th idle step in run order, NULL past the end. */
+const char *browser_engine_test_idle_step_name(size_t index);
 #endif
 /* Prepare the bounded semantic tree and return true only when Reader is
    actually available. A safely analyzed RAW page returns false without

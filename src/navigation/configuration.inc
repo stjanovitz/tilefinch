@@ -157,79 +157,6 @@ bool navigation_set_replacement_hooks(
     return true;
 }
 
-static ScriptRemoteDocumentBinding navigation_remote_document_binding(
-    const NavigationSession *session)
-{
-    if (session == NULL) return (ScriptRemoteDocumentBinding) {0};
-    return (ScriptRemoteDocumentBinding) {
-        .element_lookup = session->remote_element_lookup,
-        .element_opaque = session->remote_element_opaque,
-        .selector_lookup = session->remote_selector_lookup,
-        .selector_opaque = session->remote_selector_opaque,
-        .selector_collect = session->remote_selector_collect,
-        .selector_collect_opaque = session->remote_selector_collect_opaque,
-        .descendant_collect = session->remote_descendant_collect,
-        .descendant_collect_opaque =
-            session->remote_descendant_collect_opaque,
-        .node_read = session->remote_node_read,
-        .node_read_opaque = session->remote_node_read_opaque,
-        .node_write = session->remote_node_write,
-        .node_write_opaque = session->remote_node_write_opaque,
-        .node_visibility = session->node_visibility,
-        .node_visibility_opaque = session->node_visibility_opaque,
-        .section_identity = session->runtime_section_identity
-    };
-}
-
-bool navigation_rebind_top_level_remote_document(
-    NavigationSession *session,
-    const ScriptRemoteDocumentBinding *binding)
-{
-    if (session == NULL) return false;
-    ScriptRemoteDocumentBinding next = {0};
-    if (binding != NULL) next = *binding;
-    if (session->page.runtime != NULL
-        && !script_runtime_rebind_remote_document(
-               session->page.runtime, &next)) return false;
-
-    session->remote_element_lookup = next.element_lookup;
-    session->remote_element_opaque = next.element_opaque;
-    session->remote_selector_lookup = next.selector_lookup;
-    session->remote_selector_opaque = next.selector_opaque;
-    session->remote_selector_collect = next.selector_collect;
-    session->remote_selector_collect_opaque = next.selector_collect_opaque;
-    session->remote_descendant_collect = next.descendant_collect;
-    session->remote_descendant_collect_opaque = next.descendant_collect_opaque;
-    session->remote_node_read = next.node_read;
-    session->remote_node_read_opaque = next.node_read_opaque;
-    session->remote_node_write = next.node_write;
-    session->remote_node_write_opaque = next.node_write_opaque;
-    session->node_visibility = next.node_visibility;
-    session->node_visibility_opaque = next.node_visibility_opaque;
-    session->runtime_section_identity = next.section_identity;
-    return true;
-}
-
-void navigation_set_remote_selector_lookup(
-    NavigationSession *session, ScriptRemoteSelectorLookupCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.selector_lookup = callback;
-    binding.selector_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-bool navigation_set_runtime_section_identity(NavigationSession *session,
-                                             size_t section_identity)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.section_identity = section_identity;
-    return navigation_rebind_top_level_remote_document(session, &binding);
-}
-
 void navigation_enable_document_scripts(
     NavigationSession *session, size_t maximum_scripts,
     size_t maximum_total_bytes, size_t maximum_file_bytes,
@@ -745,8 +672,6 @@ typedef struct {
     bool stylesheet_event_baseline_adopted;
     bool runtime_transferred;
     bool scheduler_transferred;
-    bool isolates_remote_document;
-    bool runtime_document_replacement;
     bool script_disabled_after_failure;
     bool optional_work_shed;
     bool parser_script_circuit_open;

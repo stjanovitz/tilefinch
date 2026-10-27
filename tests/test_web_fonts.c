@@ -473,11 +473,11 @@ static bool test_external_referrer_policy_identity(void)
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 13));
     CHECK(stylesheet_build(&sheet, &budget, &document, 480));
     CHECK(stylesheet_add_css_from_context(
-        &sheet, css, sizeof(css) - 1u, base, "No-Referrer"));
+        &sheet, css, sizeof(css) - 1u, base, "No-Referrer", NULL));
     CHECK(stylesheet_add_css_from_context(
-        &sheet, css, sizeof(css) - 1u, base, "unsafe-url"));
+        &sheet, css, sizeof(css) - 1u, base, "unsafe-url", NULL));
     CHECK(stylesheet_add_css_from_context(
-        &sheet, css, sizeof(css) - 1u, base, "NO-REFERRER"));
+        &sheet, css, sizeof(css) - 1u, base, "NO-REFERRER", NULL));
 
     StylesheetWebFontStats stats = {0};
     CHECK(stylesheet_web_font_stats(&sheet, &stats));
@@ -506,7 +506,7 @@ static bool test_external_referrer_policy_identity(void)
     budget_inject_failure_after(&budget, 1);
     CHECK(stylesheet_add_css_from_context(
         &sheet, allocation_failure_css, sizeof(allocation_failure_css) - 1u,
-        base, "origin"));
+        base, "origin", NULL));
     budget_clear_failure_injection(&budget);
     CHECK(budget.current == before_failed_source);
     CHECK(stylesheet_web_font_source_count(&sheet) == 2);
@@ -2255,7 +2255,7 @@ static bool test_subset_source_priority(void)
         CHECK(stylesheet_build(&sheet, &budget, &document, 480));
         budget_inject_failure_after(&budget, refusal);
         (void) stylesheet_add_css_from_context(&sheet, css, sizeof(css) - 1u,
-            "https://font-subsets.test/sheet.css", "no-referrer");
+            "https://font-subsets.test/sheet.css", "no-referrer", NULL);
         bool injected = budget.injected_failure_count != 0;
         budget_clear_failure_injection(&budget);
         CHECK(stylesheet_web_font_source_count(&sheet) <= STYLE_WEB_FONT_SOURCE_LIMIT);

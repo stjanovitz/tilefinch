@@ -311,11 +311,12 @@ static void glyph_install_finish(PspApp *app,
         || (session->attached_mask & (1u << (unsigned) pack)) == 0) {
         snprintf(status, sizeof(status), "%s", "FONT PACK READY AFTER RESTART");
     } else {
-        const NavigationEntry *entry =
-            navigation_current(app->views->navigation);
-        bool relaid = entry != NULL && psp_set_presentation_css(
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        bool relaid = entry_url != NULL && psp_set_presentation_css(
             engine, ui, app->browser->profile,
-            ui->reader_mode || ui->basic_mode, entry->url,
+            ui->reader_mode || ui->basic_mode, entry_url,
             ui->page_font_percent, true);
         if (relaid) (void) psp_engine_views_refresh(app->views, engine);
         snprintf(status, sizeof(status), "%s\n%s", spec->label,

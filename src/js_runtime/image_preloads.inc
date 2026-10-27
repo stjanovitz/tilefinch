@@ -553,7 +553,8 @@ static bool image_preload_fire(ScriptRuntime *runtime, long handle,
     JSValue args[2] = {JS_NewInt64(runtime->context, handle),
         JS_NewString(runtime->context, failed ? "error" : "load")};
     bool ok = !JS_IsException(args[1]);
-    if (ok) ok = runtime_call_captured(runtime, runtime->dispatch_handle,
+    if (ok) ok = runtime_call_captured(
+        runtime, runtime->host_callbacks[SCRIPT_HOST_DISPATCH_HANDLE],
         "image preload", 2, args, NULL);
     else js_rt_record_exception(runtime->context, &runtime->result);
     JS_FreeValue(runtime->context, args[0]);

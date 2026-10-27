@@ -23,7 +23,6 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/controller.h"
-#include "tilefinch/document_backing.h"
 #include "tilefinch/work_vector.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
@@ -34,8 +33,6 @@
 #include "tilefinch/psp_media_present.h"
 #include "tilefinch/render.h"
 #include "tilefinch/request_context.h"
-#include "tilefinch/section_pager.h"
-#include "tilefinch/section_router.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/session.h"
 #include "tilefinch/url.h"
@@ -47,12 +44,6 @@
 
 #define MIB (1024u * 1024u)
 #define KIB (1024u)
-#define EXPERIMENTAL_SECTION_BLOCK_BYTES (64u * KIB - 1)
-#define EXPERIMENTAL_SECTION_MAX_BYTES (512u * KIB)
-#define EXPERIMENTAL_REMOTE_INNER_HTML_LIMIT (64u * KIB)
-#define EXPERIMENTAL_REMOTE_MUTATION_LIMIT 32
-#define EXPERIMENTAL_REMOTE_ATTRIBUTE_MUTATION_LIMIT 64
-#define EXPERIMENTAL_SCRIPT_FRONTIER_LIMIT 256
 #define VISUAL_EVIDENCE_MAX_FRAMES 64
 #define VISUAL_EVIDENCE_LINE_LIMIT 32768
 #define VISUAL_EVIDENCE_TEXT_LIMIT 4096
@@ -88,137 +79,38 @@
 #endif
 
 typedef struct {
-    uint64_t last_us;
-    uint64_t total_us;
-    uint64_t max_us;
-} ExperimentalPhaseTiming;
-
-typedef struct {
     int scroll_y[VISUAL_EVIDENCE_MAX_FRAMES];
     size_t frame_count;
     bool overflow;
 } VisualEvidenceFrames;
 
 typedef struct {
-    char *name;
-    size_t name_length;
-    char *value;
-    size_t value_length;
-    bool removed;
-} ExperimentalRemoteAttributeMutation;
+    TilefinchPlatformInput pending_input;
+    bool input_pending;
+    size_t input_polls;
+    size_t asset_reads;
+    size_t frames_presented;
+    uint64_t last_frame_hash;
+    const char *first_frame_output;
+    bool first_frame_written;
+} HostPlatformSimulator;
 
+/* The BrowserEngine owns the browser-wide budget, session, navigation,
+   controller, fonts, framebuffer, and render shell. The interactive frontend
+   keeps non-owning aliases for its diagnostic views. */
 typedef struct {
-    bool used;
-    char stable_key[193];
-    size_t stable_key_length;
-    size_t section_index;
-    bool content_written;
-    ScriptRemoteNodeWriteKind content_kind;
-    char *content;
-    size_t content_length;
-    ExperimentalRemoteAttributeMutation *attributes;
-    size_t attribute_count;
-    size_t attribute_capacity;
-} ExperimentalRemoteMutation;
-
-typedef struct {
-    SectionPager pager;
-    DocumentBacking backing;
-    CompressedSectionStore *store;
-    SectionStoreStreamBuilder *builder;
-    FetchResult *response;
-    Budget *budget;
     BrowserEngine *engine;
-    BrowserSession *browser_session;
-    NavigationSession *navigation;
-    const char *fixture_source;
-    size_t fixture_length;
-    size_t maximum_download_bytes;
-    size_t history_sections[64];
-    bool history_section_known[64];
-    char locator[NAVIGATION_URL_LIMIT];
-    unsigned char *executed_sections;
-    size_t executed_section_bytes;
-    size_t script_frontier_sections[EXPERIMENTAL_SCRIPT_FRONTIER_LIMIT];
-    size_t script_frontier_ordinals[EXPERIMENTAL_SCRIPT_FRONTIER_LIMIT];
-    size_t script_frontier_node_ordinals[EXPERIMENTAL_SCRIPT_FRONTIER_LIMIT];
-    bool script_frontier_body_visible[EXPERIMENTAL_SCRIPT_FRONTIER_LIMIT];
-    size_t script_frontier_count;
-    size_t script_visible_section;
-    size_t script_visible_ordinal;
-    size_t script_visible_node_ordinal;
-    bool script_body_visible;
-    bool script_frontier_active;
-    bool script_frontier_failed;
-    uint64_t pending_swap_started_ns;
-    uint64_t ready_total_us;
-    uint64_t ready_max_us;
-    uint64_t first_tile_total_us;
-    uint64_t first_tile_max_us;
-    ExperimentalPhaseTiming state_save_timing;
-    ExperimentalPhaseTiming pager_timing;
-    ExperimentalPhaseTiming commit_timing;
-    ExperimentalPhaseTiming content_timing;
-    ExperimentalPhaseTiming restore_timing;
-    ExperimentalPhaseTiming scroll_timing;
-    size_t timing_swaps;
-    size_t first_tile_samples;
-    size_t swaps;
-    size_t semantic_queries;
-    size_t semantic_sections;
-    size_t semantic_sections_skipped;
-    size_t semantic_matches;
-    size_t semantic_failures;
-    uint64_t semantic_total_us;
-    uint64_t semantic_max_us;
-    uint64_t initial_load_started_ns;
-    uint64_t transfer_complete_us;
-    uint64_t provisional_commit_us;
-    uint64_t first_paint_ready_us;
-    uint64_t index_complete_us;
-    uint64_t final_ready_us;
-    size_t initial_section;
-    size_t initial_tile_capacity;
-    size_t index_progress_callbacks;
-    uint64_t initial_generation;
-    const FontSet *initial_fonts;
-    bool provisional_attempted;
-    bool provisional_painted;
-    bool provisional_presented;
-    size_t remote_reads;
-    size_t remote_read_bytes;
-    size_t remote_read_failures;
-    size_t remote_geometry_reads;
-    size_t remote_geometry_layouts;
-    size_t remote_geometry_cache_hits;
-    size_t remote_geometry_failures;
-    bool remote_geometry_cache_valid;
-    char remote_geometry_cache_key[193];
-    size_t remote_geometry_cache_key_length;
-    size_t remote_geometry_cache_section;
-    size_t remote_geometry_cache_current_section;
-    size_t remote_geometry_cache_writes;
-    size_t remote_geometry_cache_relayouts;
-    size_t remote_geometry_cache_loads;
-    int remote_geometry_cache_scroll;
-    ScriptRemoteNodeReadResult remote_geometry_cache_result;
-    ExperimentalRemoteMutation
-        remote_mutations[EXPERIMENTAL_REMOTE_MUTATION_LIMIT];
-    size_t remote_mutation_count;
-    size_t remote_mutation_head;
-    size_t remote_writes;
-    size_t remote_write_bytes;
-    size_t remote_write_failures;
-    size_t remote_mutation_evictions;
-    bool body_source_replaced;
-    bool first_tile_pending;
-    bool active;
-} ExperimentalSectionContext;
+    BrowserSession *engine_session;
+    NavigationSession *engine_navigation;
+    BrowserController *engine_controller;
+    FontSet *engine_fonts;
+    TileCache *engine_render;
+} InteractiveApplicationContext;
 
+static HostPlatformSimulator *host_platform_simulator;
 
 /* Private frontend implementation seams. These remain one translation unit
    so the refactor cannot change callback visibility or PSP code generation. */
-#include "interactive/experimental.inc"
 #include "interactive/platform_support.inc"
 #include "interactive/diagnostics.inc"
 #include "interactive/media.inc"
@@ -408,6 +300,56 @@ static void print_runtime_liveness(const char *realm, size_t slot,
            loaded ? 1 : 0, retired ? 1 : 0);
 }
 
+/* Report tail, one topic per function (F-R9). Each prints exactly the
+   lines main printed in its place. */
+static void lab_report_session(const BrowserSession *session)
+{
+    size_t storage_bytes = 0;
+    BrowserSiteStorageInfo storage_site;
+    for (size_t i = 0; browser_session_site_storage_info(
+                           session, i, &storage_site); i++)
+        storage_bytes += storage_site.bytes;
+    printf("session storage=%zu cookies=%zu cache=%zu cache-hits=%zu "
+           "cache-misses=%zu evictions=%zu\n",
+           storage_bytes, session->cookie_bytes, session->cache_bytes,
+           session->cache_hits, session->cache_misses,
+           session->cache_evictions);
+    printf("session cookie-names=");
+    bool printed_cookie = false;
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        if (session->cookies[i].value == NULL) continue;
+        printf("%s%s%s", printed_cookie ? "," : "",
+               session->cookies[i].name,
+               session->cookies[i].http_only ? "(HttpOnly)" : "");
+        printed_cookie = true;
+    }
+    printf("%s\n", printed_cookie ? "" : "none");
+}
+
+static void lab_report_controller(const BrowserController *controller,
+                                  const ControllerAction *action)
+{
+    printf("controller moves=%zu activations=%zu edits=%zu action=%s url=\"%s\"\n",
+           controller->focus_moves, controller->activations,
+           controller->text_edits,
+           action->type == CONTROLLER_ACTION_NAVIGATE ? "navigate"
+           : (action->type == CONTROLLER_ACTION_CONTROL ? "control"
+              : (action->type == CONTROLLER_ACTION_FORM_SUBMIT
+                 ? "form" : action->type == CONTROLLER_ACTION_MEDIA
+                 ? "media" : "none")),
+           action->url);
+    printf("structured-audio inspected=%zu/%zu candidates=%zu overflow=%zu "
+           "malformed=%zu truncated=%zu matched=%zu ambiguous=%zu\n",
+           controller->structured_audio.inspected_bytes,
+           controller->structured_audio.inspected_nodes,
+           controller->structured_audio.candidate_count,
+           controller->structured_audio.candidate_overflow,
+           controller->structured_audio.malformed_scripts,
+           controller->structured_audio.truncated_scripts,
+           controller->structured_audio_matched_activations,
+           controller->structured_audio_ambiguous_rejections);
+}
+
 int main(int argc, char **argv)
 {
     const char *fixture = NULL;
@@ -498,9 +440,10 @@ int main(int argc, char **argv)
     bool reader_mode = false;
     bool wpt_test_rendered = false;
     bool low_memory_navigation = false;
-    bool experimental_compressed_sections = false;
-    bool experimental_section_explicit = false;
-    size_t experimental_section = 0;
+    /* Report lines go to stdout and trace lines to unbuffered stderr; a
+       block-buffered stdout redirected with 2>&1 lets a trace line land
+       inside a report line wherever the buffer happens to flush. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fetch-scripts") == 0) fetch_scripts = true;
         else if (strcmp(argv[i], "--no-web-fonts") == 0) web_fonts_enabled = false;
@@ -553,9 +496,6 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--low-memory-navigation") == 0) {
             low_memory_navigation = true;
-        }
-        else if (strcmp(argv[i], "--experimental-compressed-sections") == 0) {
-            experimental_compressed_sections = true;
         }
         else if (strcmp(argv[i], "--no-external-resources") == 0) {
             external_resources = false;
@@ -808,18 +748,6 @@ int main(int argc, char **argv)
             script_count = strtoul(argv[++i], NULL, 10);
             script_count_explicit = true;
         }
-        else if (strcmp(argv[i], "--experimental-section") == 0) {
-            char *end = NULL;
-            errno = 0;
-            unsigned long long parsed = strtoull(argv[++i], &end, 10);
-            if (argv[i][0] == '-' || end == argv[i] || *end != '\0'
-                || errno == ERANGE || parsed > SIZE_MAX) {
-                usage(argv[0]); return 2;
-            }
-            experimental_section = (size_t) parsed;
-            experimental_compressed_sections = true;
-            experimental_section_explicit = true;
-        }
         else { usage(argv[0]); return 2; }
     }
     /* The selected profile's own configuration
@@ -909,7 +837,6 @@ int main(int argc, char **argv)
         || script_file_kb < 1 || script_file_kb > 8192
         || script_count < 1 || script_count > 256
         || reloads > 20 || (reloads != 0 && url == NULL)
-        || (experimental_compressed_sections && reloads != 0)
         || replay_http_options > 1
         || ((capture_http != NULL) + (replay_http != NULL)
             + (capture_http_from_top_level != NULL) > 1)
@@ -935,8 +862,7 @@ int main(int argc, char **argv)
                 || strlen(frame_activate_event)
                        >= sizeof(((NavigationSession *) 0)
                                      ->last_frame_message_event)))
-        || (reader_mode && (user_css != NULL || hide_cookie_banners
-                            || experimental_compressed_sections))) {
+        || (reader_mode && (user_css != NULL || hide_cookie_banners))) {
         usage(argv[0]); return 2;
     }
 
@@ -1092,9 +1018,6 @@ int main(int argc, char **argv)
     }
     engine_config->javascript.runtime_timeout_ms =
         (unsigned) script_timeout_ms;
-    engine_config->javascript.maximum_scripts = script_count;
-    engine_config->javascript.maximum_total_bytes = script_total_mb * MIB;
-    engine_config->javascript.maximum_file_bytes = script_file_kb * KIB;
     if (!psp_app_profile)
         engine_config->javascript.network_timeout_ms =
             BROWSER_PSP_APP_NETWORK_TIMEOUT_MS;
@@ -1104,9 +1027,11 @@ int main(int argc, char **argv)
             ? SCRIPT_EXECUTION_PROFILE_PSP_STRICT
             : SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC;
     }
-    if (!script_execution_policy_for_profile(
-            execution_profile,
-            &engine_config->javascript.execution_policy)) {
+    /* The PSP app's own derivation (psp_script_main.c), so a lab run with
+       the app's settings admits the same scripts. */
+    if (!browser_config_apply_script_limits(
+            engine_config, execution_profile, script_count,
+            script_total_mb * MIB, script_file_kb * KIB)) {
         fprintf(stderr, "PSP script execution policy setup failed\n");
         free(engine_config);
         if (platform_sim) {
@@ -1114,13 +1039,6 @@ int main(int argc, char **argv)
             host_platform_simulator = NULL;
         }
         return 1;
-    }
-    size_t maximum_compile_bytes = engine_config->javascript.execution_policy
-                                       .maximum_host_compile_source_bytes;
-    if (maximum_compile_bytes != 0
-        && engine_config->javascript.maximum_file_bytes
-               > maximum_compile_bytes) {
-        engine_config->javascript.maximum_file_bytes = maximum_compile_bytes;
     }
     engine_config->resources.enabled = external_resources;
     engine_config->progressive_first_paint = progressive_first_paint;
@@ -1295,11 +1213,6 @@ int main(int argc, char **argv)
 #define cache (*application->engine_render)
 #define controller (*application->engine_controller)
 #define fonts (*application->engine_fonts)
-#define section_store (application->section_store)
-#define section_stream_builder (application->section_stream_builder)
-#define experimental_router (application->experimental_router)
-#define experimental (application->experimental)
-#define section_fetch (application->section_fetch)
     char *input = NULL;
     char *frame_probe_source = NULL;
     size_t frame_probe_length = 0;
@@ -1363,357 +1276,17 @@ int main(int argc, char **argv)
     navigation_enable_page_capability_trace(&navigation, trace_page);
     navigation_enable_diagnostic_frame_safari(
         &navigation, diagnostic_frame_safari);
-    experimental.store = &section_store;
-    experimental.builder = &section_stream_builder;
-    experimental.response = &section_fetch;
-    experimental.budget = budget;
-    experimental.engine = engine;
-    experimental.browser_session = &session;
-    experimental_bind_navigation(&experimental, &navigation);
-    experimental.maximum_download_bytes = max_download_kb * KIB;
-    experimental.initial_section = experimental_section;
-    experimental.initial_tile_capacity = tile_capacity;
-    experimental.initial_fonts = fonts_ready ? &fonts : NULL;
-    if (experimental_compressed_sections) {
-        experimental.initial_load_started_ns =
-            tilefinch_platform_monotonic_time_ns();
-        snprintf(experimental.locator, sizeof(experimental.locator), "%s",
-                 url != NULL ? url : "https://fixture.test/");
-    }
-    uint64_t generation = experimental_compressed_sections
-        ? navigation_begin(&navigation) : 0;
-    experimental.initial_generation = generation;
-    if (url != NULL && experimental_compressed_sections) {
-        if (!section_route_stream_begin(
-                &experimental_router, &section_stream_builder,
-                &section_store, budget,
-                EXPERIMENTAL_SECTION_BLOCK_BYTES,
-                EXPERIMENTAL_SECTION_MAX_BYTES,
-                experimental_section_explicit)) goto cleanup;
-        section_route_stream_set_progress(
-            &experimental_router, experimental_index_progress,
-            &experimental);
-        FetchStreamMetrics stream_metrics = {0};
-        FetchStreamOptions stream = {
-            .on_body = section_route_stream_body,
-            .opaque = &experimental_router,
-            .chunk_bytes = 16384
-        };
-        TilefinchRequestContext section_context = {
-            .target_url = url,
-            .top_level_url = url,
-            .method = "GET",
-            .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
-            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
-            .destination = TILEFINCH_DESTINATION_DOCUMENT,
-            .top_level_navigation = true,
-            .user_activated = true
-        };
-        char section_cookies[BROWSER_COOKIE_HEADER_CAPACITY] = {0};
-        (void) browser_session_cookie_header_context(
-            &session, &section_context,
-            section_cookies, sizeof(section_cookies));
-        FetchRequest section_request = {
-            .method = "GET", .cookie = section_cookies,
-            .allow_http_errors = true,
-            .send_low_client_hints = true,
-            .accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            .sec_fetch_dest = tilefinch_request_fetch_destination(
-                &section_context),
-            .sec_fetch_mode = tilefinch_request_fetch_mode(&section_context),
-            .sec_fetch_site = tilefinch_request_fetch_site(&section_context),
-            .sec_fetch_user = section_context.user_activated,
-            .upgrade_insecure_requests = true,
-            .credentials = FETCH_CREDENTIALS_INCLUDE,
-            .credential_origin = url,
-            .initiator_url = url,
-            .cookie_session = &session,
-            .cookie_context = &section_context
-        };
-        bool fetched = fetch_request_stream_cancelable(
-            budget, url, &section_request, max_download_kb * KIB, 30000,
-            NULL, NULL, &stream, &stream_metrics, &section_fetch);
-        experimental.transfer_complete_us =
-            experimental_initial_elapsed_us(&experimental);
-        bool replay_basic_request = false;
-        if (!fetched && replay_http != NULL
-            && strstr(section_fetch.error, "does not match") != NULL) {
-            section_route_stream_abort(&experimental_router);
-            fetch_result_destroy(&section_fetch);
-            memset(&stream_metrics, 0, sizeof(stream_metrics));
-            /* A replay mismatch consumes the attempted trace record. Restart
-               the deterministic trace before retrying its recorded request
-               shape; live fetches never enter this compatibility path. */
-            fetch_trace_end();
-            bool replay_restarted = response_keyed_replay
-                ? fetch_trace_replay_begin_response_keyed(
-                      replay_http, trace_error, sizeof(trace_error))
-                : fetch_trace_replay_begin(
-                      replay_http, trace_error, sizeof(trace_error));
-            if (!replay_restarted) {
-                fprintf(stderr, "HTTP replay restart failed: %s\n",
-                        trace_error);
-                goto cleanup;
-            }
-            if (!fetch_trace_replay_seed_session(
-                    &session, trace_error, sizeof(trace_error))) {
-                fprintf(stderr, "HTTP replay cookie seed restart failed: %s\n",
-                        trace_error);
-                goto cleanup;
-            }
-            if (!section_route_stream_begin(
-                    &experimental_router, &section_stream_builder,
-                    &section_store, budget,
-                    EXPERIMENTAL_SECTION_BLOCK_BYTES,
-                    EXPERIMENTAL_SECTION_MAX_BYTES,
-                    experimental_section_explicit)) goto cleanup;
-            section_route_stream_set_progress(
-                &experimental_router, experimental_index_progress,
-                &experimental);
-            fetched = fetch_request_stream_cancelable(
-                budget, url, NULL, max_download_kb * KIB, 30000,
-                NULL, NULL, &stream, &stream_metrics, &section_fetch);
-            experimental.transfer_complete_us =
-                experimental_initial_elapsed_us(&experimental);
-            replay_basic_request = fetched;
-        }
-        if (!fetched || !section_route_stream_finish(&experimental_router)) {
-            goto cleanup;
-        }
-        if (experimental_router.sectioned
-            && !experimental_section_explicit
-            && section_store.section_count == 1
-            && section_store.source_length
-                 <= experimental_router.byte_threshold) {
-            char *whole_document = NULL;
-            size_t whole_length = 0;
-            if (!section_store_extract_source(
-                    &section_store, &whole_document, &whole_length)) {
-                goto cleanup;
-            }
-            section_store_destroy(&section_store);
-            experimental_router.buffer = (unsigned char *) whole_document;
-            experimental_router.length = whole_length;
-            experimental_router.capacity = whole_length + 1;
-            experimental_router.sectioned = false;
-            printf("experimental-adaptive fallback=single-section\n");
-        }
-        snprintf(experimental.locator, sizeof(experimental.locator), "%s",
-                 section_fetch.effective_url[0] != '\0'
-                   ? section_fetch.effective_url : url);
-        navigation.last_http_status = section_fetch.status_code;
-        snprintf(navigation.last_cf_mitigated,
-                 sizeof(navigation.last_cf_mitigated), "%s",
-                 section_fetch.cf_mitigated);
-        snprintf(navigation.last_server, sizeof(navigation.last_server), "%s",
-                 section_fetch.server);
-        for (size_t i = 0; i < section_fetch.set_cookie_count; i++) {
-            TilefinchRequestContext response_context = section_context;
-            response_context.target_url = fetch_set_cookie_url(
-                &section_fetch, i, experimental.locator);
-            (void) browser_session_cookie_set_http_context(
-                &session, &response_context,
-                section_fetch.set_cookies[i]);
-        }
-        if (!experimental_router.sectioned) {
-            printf("experimental-adaptive mode=full-document source=%zu "
-                   "threshold=%zu elements=%zu attributes=%zu depth=%zu "
-                   "scan-us=%llu\n",
-                   experimental_router.length,
-                   experimental_router.byte_threshold,
-                   experimental_router.element_count,
-                   experimental_router.attribute_count,
-                   experimental_router.maximum_depth,
-                   (unsigned long long) experimental_router.scan_us);
-            bool committed = browser_engine_commit_html(
-                engine, experimental.locator,
-                (const char *) experimental_router.buffer,
-                experimental_router.length, true);
-            budget_free(budget, experimental_router.buffer);
-            experimental_router.buffer = NULL;
-            if (!committed) goto cleanup;
-        } else {
-            if (experimental_section >= section_store.section_count
-                || !section_pager_init(
-                       &experimental.pager, &section_store,
-                       experimental_section, 1)
-                || !experimental_script_state_init(&experimental)) {
-                goto cleanup;
-            }
-            experimental.active = true;
-            if (!experimental_install_navigation_callbacks(
-                    &navigation, &experimental)
-                || !experimental_preflight_external_layout(
-                    &experimental, &navigation, &generation,
-                    fonts_ready ? &fonts : NULL)) {
-                goto cleanup;
-            }
-            navigation.defer_document_script_pipeline =
-                navigation.document_scripts_enabled;
-            bool initial_committed = browser_engine_commit_section_html(
-                engine, &experimental.backing, NULL,
-                experimental.locator, experimental.pager.current_html,
-                experimental.pager.current_length, false, true);
-            navigation.defer_document_script_pipeline = false;
-            if (!initial_committed
-                || (navigation.document_scripts_enabled
-                    ? !experimental_execute_all_document_scripts(
-                          &experimental, &navigation)
-                    : !experimental_mark_section_scripts_executed(
-                          &experimental,
-                          experimental.pager.current_section))) {
-                goto cleanup;
-            }
-            experimental.final_ready_us =
-                experimental_initial_elapsed_us(&experimental);
-            section_pager_record_height(&experimental.pager,
-                                        navigation.page.layout.height);
-            printf("experimental-pager-input source=%zu stored=%zu "
-                   "sections=%zu anchors=%zu selected=%zu chunks=%zu "
-                   "peak-buffer=%zu request=%s\n",
-                   section_store.source_length, section_store.stored_length,
-                   section_store.section_count, section_store.anchor_count,
-                   experimental.pager.current_section,
-                   stream_metrics.chunks_received,
-                   stream_metrics.peak_buffered_bytes,
-                   replay_basic_request ? "recorded-basic" : "navigation");
-            printf("experimental-adaptive mode=sections threshold=%zu "
-                   "elements=%zu attributes=%zu depth=%zu scan-us=%llu "
-                   "replay-us=%llu\n",
-                   experimental_router.byte_threshold,
-                   experimental_router.element_count,
-                   experimental_router.attribute_count,
-                   experimental_router.maximum_depth,
-                   (unsigned long long) experimental_router.scan_us,
-                   (unsigned long long) experimental_router.replay_us);
-            experimental_print_store_timing(&section_store);
-        }
-    } else if (url != NULL) {
+    if (url != NULL) {
         if (!browser_engine_load_url(engine, url, true)) goto cleanup;
     } else {
         size_t input_length = 0;
         input = read_file(budget, fixture, &input_length);
-        const char *committed_html = input;
-        size_t committed_length = input_length;
-        if (input != NULL && experimental_compressed_sections) {
-            experimental.fixture_source = input;
-            experimental.fixture_length = input_length;
-            SectionRouteStream classifier = {
-                .budget = budget,
-                .byte_threshold = section_route_stream_threshold(budget)
-            };
-            section_route_stream_scan(
-                &classifier, (const unsigned char *) input, input_length);
-            bool use_sections = experimental_section_explicit
-                || section_route_stream_prefers_sections(
-                       &classifier, input_length);
-            experimental.transfer_complete_us =
-                experimental_initial_elapsed_us(&experimental);
-            bool section_store_ready = false;
-            if (use_sections && section_store_stream_begin(
-                    &section_stream_builder, &section_store, budget,
-                    EXPERIMENTAL_SECTION_BLOCK_BYTES,
-                    EXPERIMENTAL_SECTION_MAX_BYTES)) {
-                section_store_stream_set_progress(
-                    &section_stream_builder, experimental_index_progress,
-                    &experimental);
-                section_store_ready = section_store_stream_append(
-                        &section_stream_builder,
-                        (const unsigned char *) input, input_length)
-                    && section_store_stream_finish(&section_stream_builder);
-            }
-            if (use_sections && !section_store_ready
-                && section_stream_builder.active) {
-                section_store_stream_abort(&section_stream_builder);
-            }
-            if (!use_sections) {
-                printf("experimental-adaptive mode=full-document source=%zu "
-                       "threshold=%zu elements=%zu attributes=%zu depth=%zu "
-                       "fixture=yes\n",
-                       input_length, classifier.byte_threshold,
-                       classifier.element_count, classifier.attribute_count,
-                       classifier.maximum_depth);
-            } else if (!section_store_ready
-                || experimental_section >= section_store.section_count
-                || !section_pager_init(&experimental.pager, &section_store,
-                                       experimental_section, 1)
-                || !experimental_script_state_init(&experimental)) {
-                goto cleanup;
-            }
-            if (use_sections) {
-                printf("experimental-adaptive mode=sections source=%zu "
-                       "threshold=%zu elements=%zu attributes=%zu depth=%zu "
-                       "fixture=yes\n",
-                       input_length, classifier.byte_threshold,
-                       classifier.element_count, classifier.attribute_count,
-                       classifier.maximum_depth);
-                snprintf(experimental.locator, sizeof(experimental.locator),
-                         "%s", "https://fixture.test/");
-                experimental.active = true;
-                if (!experimental_install_navigation_callbacks(
-                        &navigation, &experimental)
-                    || !navigation_set_runtime_section_identity(
-                        &navigation, experimental.pager.current_section)) {
-                    goto cleanup;
-                }
-                committed_html = experimental.pager.current_html;
-                committed_length = experimental.pager.current_length;
-            }
-        }
-        if (experimental.active) {
-            if (!experimental_preflight_external_layout(
-                    &experimental, &navigation, &generation,
-                    fonts_ready ? &fonts : NULL)
-                || !navigation_set_runtime_section_identity(
-                       &navigation,
-                       experimental.pager.current_section)) goto cleanup;
-            committed_html = experimental.pager.current_html;
-            committed_length = experimental.pager.current_length;
-        }
-        if (experimental.active) {
-            navigation.defer_document_script_pipeline =
-                navigation.document_scripts_enabled;
-        }
-        bool fixture_committed = input != NULL
-            && (experimental.active
-                ? browser_engine_commit_section_html(
-                      engine, &experimental.backing, NULL,
-                      "https://fixture.test/", committed_html,
-                      committed_length, false, true)
-                : browser_engine_commit_html(
-                      engine, "https://fixture.test/", committed_html,
-                      committed_length, true));
-        navigation.defer_document_script_pipeline = false;
-        if (!fixture_committed
-            || (experimental.active
-                && (navigation.document_scripts_enabled
-                    ? !experimental_execute_all_document_scripts(
-                          &experimental, &navigation)
-                    : !experimental_mark_section_scripts_executed(
-                          &experimental,
-                          experimental.pager.current_section)))) goto cleanup;
-        if (experimental.active) {
-            experimental.final_ready_us =
-                experimental_initial_elapsed_us(&experimental);
-            section_pager_record_height(&experimental.pager,
-                                        navigation.page.layout.height);
-            printf("experimental-pager-input source=%zu stored=%zu sections=%zu "
-                   "anchors=%zu "
-                   "selected=%zu fixture=yes\n",
-                   section_store.source_length, section_store.stored_length,
-                   section_store.section_count, section_store.anchor_count,
-                   experimental.pager.current_section);
-            experimental_print_store_timing(&section_store);
-        }
-        if (!experimental.active) {
-            budget_free(budget, input);
-            input = NULL;
-        }
-    }
-    if (experimental.active && navigation.history_index < 64) {
-        experimental.history_sections[navigation.history_index] =
-            experimental.pager.current_section;
-        experimental.history_section_known[navigation.history_index] = true;
+        if (input == NULL
+            || !browser_engine_commit_html(
+                   engine, "https://fixture.test/", input, input_length,
+                   true)) goto cleanup;
+        budget_free(budget, input);
+        input = NULL;
     }
 
     ExternalScriptMetrics script_metrics = {0};
@@ -2182,11 +1755,6 @@ int main(int argc, char **argv)
         application->engine_controller = browser_engine_controller(engine);
     }
     if (application->engine_controller == NULL) goto cleanup;
-    bool initial_remote_swap = false;
-    if (!experimental_process_remote_elements(
-            experimental_compressed_sections ? &experimental : NULL,
-            &navigation, &controller, user_css,
-            &initial_remote_swap)) goto cleanup;
     if (focus_id != NULL) {
         lxb_dom_node_t *focused = find_element_id(
             lxb_dom_interface_node(navigation.page.document.html), focus_id);
@@ -2234,11 +1802,6 @@ int main(int argc, char **argv)
     if (follow_action
         && !browser_engine_execute_action(
                engine, &action, 4 * MIB, 30000)) goto cleanup;
-    bool post_interaction_remote_swap = false;
-    if (!experimental_process_remote_elements(
-            experimental_compressed_sections ? &experimental : NULL,
-            &navigation, &controller, user_css,
-            &post_interaction_remote_swap)) goto cleanup;
     const NavigationEntry *pre_style_entry = navigation_current(&navigation);
     int pre_style_maximum = viewport_max_scroll_css(
         &navigation.viewport, navigation.page.layout.height);
@@ -2398,8 +1961,6 @@ int main(int argc, char **argv)
                                  &media,
                                  user_css, loop_capture_frames,
                                  pace_real_time,
-                                 experimental_compressed_sections
-                                   ? &experimental : NULL,
                                  visual_evidence ? &visual_frames : NULL,
                                  private_console_fd)) {
                 goto cleanup;
@@ -2951,7 +2512,8 @@ int main(int argc, char **argv)
            "evictions=%zu retained=%zu skips=%zu/%zu/%zu/%zu "
            "signatures=%016llx/%016llx "
            "compiled-fingerprints=%016llx/%016llx "
-           "fingerprint-us=%llu viewport-rebuilds=%zu\n",
+           "fingerprint-us=%llu viewport-rebuilds=%zu "
+           "sheet-bounded-out=%u adopted-sources=%u\n",
            navigation.performance.blocking_stylesheet_builds,
            navigation.performance.blocking_stylesheet_reuses,
            navigation.performance.blocking_stylesheet_adoptions,
@@ -2987,7 +2549,12 @@ int main(int argc, char **argv)
              .compiled_stylesheet_cache_last_observed_fingerprint,
            (unsigned long long)
              navigation.performance.blocking_stylesheet_fingerprint_us,
-           navigation.performance.blocking_stylesheet_viewport_rebuilds);
+           navigation.performance.blocking_stylesheet_viewport_rebuilds,
+           /* The final page's sheet: bounded out (restored from the
+              compiled-stylesheet cache, or past the style-source limit) is
+              the SC-1 (f3b7438c) focus-gate condition. */
+           navigation.page.stylesheet.style_sources_bounded_out ? 1u : 0u,
+           (unsigned) navigation.page.stylesheet.scopes.adopted_source_count);
     uint64_t parser_native_us =
         navigation.performance.parser_feed_us
             >= navigation.performance.parser_callback_us
@@ -3269,6 +2836,11 @@ int main(int argc, char **argv)
            navigation.performance.layout_reuse_has_fallbacks,
            navigation.performance.layout_reuse_has_dropped,
            navigation.performance.layout_reuse_has_scans);
+    printf("layout-text-measure hits=%zu misses=%zu evictions=%zu "
+           "bytes=%zu\n", reuse_stats.text_measure_hits,
+           reuse_stats.text_measure_misses,
+           reuse_stats.text_measure_evictions,
+           reuse_stats.text_measure_bytes);
     printf("progressive-paint attempts=%zu skips=%zu failures=%zu "
            "adoptions=%zu "
            "layouts=%zu paints=%zu layout-us=%llu paint-us=%llu "
@@ -3758,18 +3330,15 @@ int main(int argc, char **argv)
                strstr(body_text, visual_state_marker) != NULL ? "yes" : "no",
                strlen(visual_state_marker));
     }
-    printf("javascript-section-retention wrapper-evictions=%zu "
+    /* The line keeps its historical name: replay tooling splits the log on
+       it (benchmarks/visual_scenario.py). */
+    printf("javascript-section-retention "
            "listener-drops=%zu handler-drops=%zu observer-drops=%zu "
-           "record-drops=%zu dirty-drops=%zu state-evictions=%zu "
-           "control-drops=%zu\n",
-           navigation.page.script_result.retention_wrapper_evictions,
+           "record-drops=%zu\n",
            navigation.page.script_result.retention_listener_drops,
            navigation.page.script_result.retention_handler_drops,
            navigation.page.script_result.retention_observer_drops,
-           navigation.page.script_result.retention_record_drops,
-           navigation.page.script_result.retention_dirty_drops,
-           navigation.page.script_result.retention_state_evictions,
-           navigation.page.script_result.retention_control_drops);
+           navigation.page.script_result.retention_record_drops);
     const char *challenge_outcome = interactive_challenge_outcome(
         &navigation, body_text);
     bool clearance_found = false;
@@ -4037,26 +3606,7 @@ int main(int argc, char **argv)
                    child->callback_error_source_context);
         }
     }
-    size_t storage_bytes = 0;
-    BrowserSiteStorageInfo storage_site;
-    for (size_t i = 0; browser_session_site_storage_info(
-                           &session, i, &storage_site); i++)
-        storage_bytes += storage_site.bytes;
-    printf("session storage=%zu cookies=%zu cache=%zu cache-hits=%zu "
-           "cache-misses=%zu evictions=%zu\n",
-           storage_bytes, session.cookie_bytes, session.cache_bytes,
-           session.cache_hits, session.cache_misses,
-           session.cache_evictions);
-    printf("session cookie-names=");
-    bool printed_cookie = false;
-    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
-        if (session.cookies[i].value == NULL) continue;
-        printf("%s%s%s", printed_cookie ? "," : "",
-               session.cookies[i].name,
-               session.cookies[i].http_only ? "(HttpOnly)" : "");
-        printed_cookie = true;
-    }
-    printf("%s\n", printed_cookie ? "" : "none");
+    lab_report_session(&session);
     if (probe_usability) {
         size_t handlers_before =
             navigation.page.script_result.event_handlers_invoked;
@@ -4091,132 +3641,7 @@ int main(int argc, char **argv)
                network_before,
                navigation.page.script_result.network_requests);
     }
-    printf("controller moves=%zu activations=%zu edits=%zu action=%s url=\"%s\"\n",
-           controller.focus_moves, controller.activations,
-           controller.text_edits,
-           action.type == CONTROLLER_ACTION_NAVIGATE ? "navigate"
-           : (action.type == CONTROLLER_ACTION_CONTROL ? "control"
-              : (action.type == CONTROLLER_ACTION_FORM_SUBMIT
-                 ? "form" : action.type == CONTROLLER_ACTION_MEDIA
-                 ? "media" : "none")),
-           action.url);
-    printf("structured-audio inspected=%zu/%zu candidates=%zu overflow=%zu "
-           "malformed=%zu truncated=%zu matched=%zu ambiguous=%zu\n",
-           controller.structured_audio.inspected_bytes,
-           controller.structured_audio.inspected_nodes,
-           controller.structured_audio.candidate_count,
-           controller.structured_audio.candidate_overflow,
-           controller.structured_audio.malformed_scripts,
-           controller.structured_audio.truncated_scripts,
-           controller.structured_audio_matched_activations,
-           controller.structured_audio_ambiguous_rejections);
-    if (experimental_compressed_sections) {
-        printf("experimental-initial-load transfer-us=%llu "
-               "first-section-index-us=%llu provisional-commit-us=%llu "
-               "first-paint-ready-us=%llu index-complete-us=%llu "
-               "final-ready-us=%llu callbacks=%zu provisional=%s "
-               "presented=%s\n",
-               (unsigned long long) experimental.transfer_complete_us,
-               (unsigned long long) section_store.first_section_ready_us,
-               (unsigned long long) experimental.provisional_commit_us,
-               (unsigned long long) experimental.first_paint_ready_us,
-               (unsigned long long) experimental.index_complete_us,
-               (unsigned long long) experimental.final_ready_us,
-               experimental.index_progress_callbacks,
-               experimental.provisional_painted ? "painted" : "skipped",
-               experimental.provisional_presented ? "yes" : "no");
-        printf("experimental-pager status=%s section=%zu/%zu swaps=%zu "
-               "loads=%zu prefetches=%zu hits=%zu evictions=%zu\n",
-               experimental.active ? "active" : "left-document",
-               experimental.pager.current_section,
-               section_store.section_count, experimental.swaps,
-               experimental.pager.section_loads,
-               experimental.pager.prefetches,
-               experimental.pager.prefetch_hits,
-               experimental.pager.prefetch_evictions);
-        printf("experimental-timing swaps=%zu ready-avg-us=%llu "
-               "ready-max-us=%llu first-tile-samples=%zu "
-               "first-tile-avg-us=%llu first-tile-max-us=%llu "
-               "decode-samples=%zu decode-avg-us=%llu decode-max-us=%llu "
-               "prefetch-samples=%zu prefetch-avg-us=%llu "
-               "prefetch-max-us=%llu\n",
-               experimental.timing_swaps,
-               (unsigned long long) (experimental.timing_swaps == 0 ? 0
-                   : experimental.ready_total_us
-                       / experimental.timing_swaps),
-               (unsigned long long) experimental.ready_max_us,
-               experimental.first_tile_samples,
-               (unsigned long long) (experimental.first_tile_samples == 0
-                   ? 0 : experimental.first_tile_total_us
-                           / experimental.first_tile_samples),
-               (unsigned long long) experimental.first_tile_max_us,
-               experimental.pager.decode_samples,
-               (unsigned long long) (experimental.pager.decode_samples == 0
-                   ? 0 : experimental.pager.decode_total_us
-                           / experimental.pager.decode_samples),
-               (unsigned long long) experimental.pager.decode_max_us,
-               experimental.pager.prefetch_samples,
-               (unsigned long long) (experimental.pager.prefetch_samples == 0
-                   ? 0 : experimental.pager.prefetch_total_us
-                           / experimental.pager.prefetch_samples),
-               (unsigned long long) experimental.pager.prefetch_max_us);
-        size_t phase_samples = experimental.timing_swaps;
-#define EXPERIMENTAL_PHASE_AVG(field)                                    \
-    (unsigned long long) (phase_samples == 0 ? 0                         \
-        : experimental.field.total_us / phase_samples)
-        printf("experimental-phase-timing samples=%zu "
-               "state-avg-us=%llu state-max-us=%llu "
-               "pager-avg-us=%llu pager-max-us=%llu "
-               "commit-avg-us=%llu commit-max-us=%llu "
-               "content-avg-us=%llu content-max-us=%llu "
-               "restore-avg-us=%llu restore-max-us=%llu "
-               "scroll-avg-us=%llu scroll-max-us=%llu gc-runs=%zu "
-               "gc-skips=%zu gc-trimmed=%zu\n",
-               phase_samples,
-               EXPERIMENTAL_PHASE_AVG(state_save_timing),
-               (unsigned long long) experimental.state_save_timing.max_us,
-               EXPERIMENTAL_PHASE_AVG(pager_timing),
-               (unsigned long long) experimental.pager_timing.max_us,
-               EXPERIMENTAL_PHASE_AVG(commit_timing),
-               (unsigned long long) experimental.commit_timing.max_us,
-               EXPERIMENTAL_PHASE_AVG(content_timing),
-               (unsigned long long) experimental.content_timing.max_us,
-               EXPERIMENTAL_PHASE_AVG(restore_timing),
-               (unsigned long long) experimental.restore_timing.max_us,
-               EXPERIMENTAL_PHASE_AVG(scroll_timing),
-               (unsigned long long) experimental.scroll_timing.max_us,
-               navigation.performance.swap_gc_runs,
-               navigation.performance.swap_gc_skips,
-               navigation.performance.swap_gc_trimmed_bytes);
-#undef EXPERIMENTAL_PHASE_AVG
-        printf("experimental-semantic-queries queries=%zu sections=%zu "
-               "skipped=%zu matches=%zu failures=%zu total-us=%llu "
-               "max-us=%llu\n",
-               experimental.semantic_queries,
-               experimental.semantic_sections,
-               experimental.semantic_sections_skipped,
-               experimental.semantic_matches,
-               experimental.semantic_failures,
-               (unsigned long long) experimental.semantic_total_us,
-               (unsigned long long) experimental.semantic_max_us);
-        printf("experimental-remote-reads reads=%zu bytes=%zu failures=%zu\n",
-               experimental.remote_reads,
-               experimental.remote_read_bytes,
-               experimental.remote_read_failures);
-        printf("experimental-remote-geometry reads=%zu layouts=%zu "
-               "cache-hits=%zu failures=%zu\n",
-               experimental.remote_geometry_reads,
-               experimental.remote_geometry_layouts,
-               experimental.remote_geometry_cache_hits,
-               experimental.remote_geometry_failures);
-        printf("experimental-remote-writes writes=%zu bytes=%zu failures=%zu "
-               "retained=%zu evictions=%zu\n",
-               experimental.remote_writes,
-               experimental.remote_write_bytes,
-               experimental.remote_write_failures,
-               experimental.remote_mutation_count,
-               experimental.remote_mutation_evictions);
-    }
+    lab_report_controller(&controller, &action);
     if (platform_sim) {
         bool platform_ok = platform_simulator.asset_reads != 0
             && (platform_simulator.input_polls != 0
@@ -4249,7 +3674,6 @@ int main(int argc, char **argv)
     success = true;
 
 cleanup:
-    section_route_stream_abort(&experimental_router);
     if (command_stream != NULL && command_stream != stdin) {
         fclose(command_stream);
     }
@@ -4393,18 +3817,6 @@ cleanup:
         }
     }
     print_http_replay_ledger();
-    if (navigation_ready && experimental_compressed_sections) {
-        /* The transitional section path installs its backing directly on the
-           engine-owned navigation session, so detach it before releasing the
-           frontend-owned pager/store. */
-        document_backing_uninstall(&navigation);
-    }
-    experimental_script_state_destroy(&experimental);
-    experimental_remote_mutations_destroy(&experimental);
-    section_pager_destroy(&experimental.pager);
-    section_store_stream_abort(&section_stream_builder);
-    if (section_fetch.budget != NULL) fetch_result_destroy(&section_fetch);
-    section_store_destroy(&section_store);
     budget_free(budget, frame_probe_source);
     budget_free(budget, input);
     budget_free(budget, application);
@@ -4437,8 +3849,3 @@ cleanup:
 #undef cache
 #undef controller
 #undef fonts
-#undef section_store
-#undef section_stream_builder
-#undef experimental_router
-#undef experimental
-#undef section_fetch

@@ -1,0 +1,82 @@
+/*
+ * The PSP chrome's setting identifiers in PspUiSettingId order, each with the
+ * name the input-script harness logs for it. Define
+ * PSP_UI_SETTING(ID, "script-name") before including this file; it expands
+ * once per setting.
+ *
+ * Append new settings at the end so that existing values never change.
+ */
+PSP_UI_SETTING(NONE, "none")
+PSP_UI_SETTING(BROWSER_UI_SCALE, "browser-ui-scale")
+PSP_UI_SETTING(PAGE_FONT_PERCENT, "page-font-percent")
+PSP_UI_SETTING(READER_FONT, "reader-font")
+PSP_UI_SETTING(REMEMBER_READER_SITE_SCALE, "remember-reader-site-scale")
+PSP_UI_SETTING(READER_AUTO_MODE, "reader-auto-mode")
+PSP_UI_SETTING(CUSTOM_HOMEPAGE, "custom-homepage")
+PSP_UI_SETTING(HISTORY, "history")
+PSP_UI_SETTING(RESTORE_LAST_PAGE, "restore-last-page")
+PSP_UI_SETTING(TAB_HIBERNATION, "tab-hibernation")
+PSP_UI_SETTING(EXPERIMENTAL_VOICE, "experimental-voice")
+PSP_UI_SETTING(ADAPTIVE_VOICE_MEMORY, "adaptive-voice-memory")
+PSP_UI_SETTING(ANALOG_CURSOR, "analog-cursor")
+PSP_UI_SETTING(TEXT_ENTRY_MODE, "text-entry-mode")
+PSP_UI_SETTING(PERSISTENT_CACHE_MB, "persistent-cache-mb")
+PSP_UI_SETTING(LIVE_CACHE_KIB, "live-cache-kib")
+PSP_UI_SETTING(PERSIST_LOCAL_STORAGE, "persist-local-storage")
+PSP_UI_SETTING(SEARCH_ENGINE, "search-engine")
+PSP_UI_SETTING(COLOR_MODE, "color-mode")
+PSP_UI_SETTING(CHROME_THEME, "chrome-theme")
+PSP_UI_SETTING(GLYPH_LANGUAGE, "glyph-language")
+PSP_UI_SETTING(COLOR_EMOJI, "color-emoji")
+PSP_UI_SETTING(YOUTUBE_QUALITY, "youtube-quality")
+PSP_UI_SETTING(VIDEO_LANGUAGE, "video-language")
+PSP_UI_SETTING(SUBTITLE_LANGUAGE, "subtitle-language")
+PSP_UI_SETTING(ALTERNATE_LANGUAGE, "alternate-language")
+PSP_UI_SETTING(SUBTITLE_SIZE, "subtitle-size")
+PSP_UI_SETTING(SUBTITLE_BACKGROUND, "subtitle-background")
+PSP_UI_SETTING(YOUTUBE_COMPACT_RESULTS, "youtube-compact-results")
+PSP_UI_SETTING(YOUTUBE_AUDIO_ONLY, "youtube-audio-only")
+PSP_UI_SETTING(VIDEO_SCALING, "video-scaling")
+PSP_UI_SETTING(VIDEO_STARTUP_BUFFERING, "video-startup-buffering")
+PSP_UI_SETTING(RESUME_OFFLINE_DOWNLOADS, "resume-offline-downloads")
+PSP_UI_SETTING(CONTENT_BLOCKER_MODE, "content-blocker-mode")
+PSP_UI_SETTING(CONTENT_BLOCKER_SITE_ALLOWED, "content-blocker-site-allowed")
+PSP_UI_SETTING(CONTENT_BLOCKER_COSMETIC_HIDING, "content-blocker-cosmetic-hiding")
+PSP_UI_SETTING(COOKIE_BANNER_HIDDEN, "cookie-banner-hidden")
+PSP_UI_SETTING(UPDATE_CHECK, "update-check")
+PSP_UI_SETTING(WAVE_BACKGROUND, "wave-background")
+PSP_UI_SETTING(JAVASCRIPT, "javascript")
+PSP_UI_SETTING(SITE_JAVASCRIPT, "site-javascript")
+PSP_UI_SETTING(SITE_DATA_ALLOWED, "site-data-allowed")
+PSP_UI_SETTING(MIXED_CONTENT_SITE, "mixed-content-site")
+PSP_UI_SETTING(THIRD_PARTY_COOKIES_SITE, "third-party-cookies-site")
+PSP_UI_SETTING(TLS_SESSION_PERSISTENCE, "tls-session-persistence")
+PSP_UI_SETTING(NETWORK_PROFILE, "network-profile")
+PSP_UI_SETTING(UPDATE_CHANNEL, "update-channel")
+PSP_UI_SETTING(GAMEPAD_FACE_MAPPING, "gamepad-face-mapping")
+PSP_UI_SETTING(SAVE_PLAYBACK_POSITIONS, "save-playback-positions")
+PSP_UI_SETTING(CLEAR_PLAYBACK_POSITIONS, "clear-playback-positions")
+PSP_UI_SETTING(SAVE_DIAGNOSTIC_REPORTS, "save-diagnostic-reports")
+PSP_UI_SETTING(SITE_STORAGE_OFFERS, "site-storage-offers")
+/* unsigned_value is a BrowserSiteStoragePolicy: for the current page's
+   site, or (LISTED) for row intent.list_index of Site data & storage. */
+PSP_UI_SETTING(SITE_STORAGE_SITE, "site-storage-site")
+PSP_UI_SETTING(SITE_STORAGE_LISTED, "site-storage-listed")
+/* basic_fallback_mode: Automatic, Ask or Off. */
+PSP_UI_SETTING(BASIC_FALLBACK, "basic-fallback")
+/* boolean: offer language packs on pages that need them (Ask/Off). */
+PSP_UI_SETTING(GLYPH_OFFERS, "glyph-offers")
+/* Forget every "Don't ask again" answer. */
+PSP_UI_SETTING(GLYPH_OFFERS_RESET, "glyph-offers-reset")
+/* boolean: keep compiled scripts on the Memory Stick across restarts
+   (the persistent compiled-script tier). */
+PSP_UI_SETTING(KEEP_COMPILED_SCRIPTS, "keep-compiled-scripts")
+/* heavy_pages_mode: Ask, Run or Basic view (BrowserHeavyPagesMode). */
+PSP_UI_SETTING(HEAVY_PAGES, "heavy-pages")
+PSP_UI_SETTING(WIFI_DIAGNOSTICS, "wifi-diagnostics")
+PSP_UI_SETTING(YOUTUBE_TOPICS, "youtube-topics")
+PSP_UI_SETTING(UI_LANGUAGE, "ui-language")
+PSP_UI_SETTING(YOUTUBE_LOGIN, "youtube-login")
+PSP_UI_SETTING(ROTATE_HINT_ALWAYS, "rotate-hint-always")
+PSP_UI_SETTING(WEB_FONTS, "web-fonts")
+PSP_UI_SETTING(YOUTUBE_SIGNIN_DIAGNOSTICS, "youtube-signin-diagnostics")

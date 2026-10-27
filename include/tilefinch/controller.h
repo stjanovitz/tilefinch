@@ -197,6 +197,17 @@ bool controller_focus_previous(BrowserController *controller);
 bool controller_focus_direction(BrowserController *controller,
                                 ControllerFocusDirection direction);
 bool controller_focus_at(BrowserController *controller, int x, int y);
+/* Whether a sequential (forward or backward) or directional focus move
+   reads only the page above region_end of a provisional layout, so the
+   provisional layout gives it the complete layout's answer: every entry it
+   can choose among lies in the layout's traversal prefix, nothing it could
+   prefer lies past the region, and revealing the target stays inside it.
+   relative selects controller_focus_next/previous (by forward), otherwise
+   controller_focus_direction(direction). Reads only; moves nothing. */
+bool controller_focus_move_within(const BrowserController *controller,
+                                  bool relative, bool forward,
+                                  ControllerFocusDirection direction,
+                                  int region_end);
 bool controller_pointer_event(BrowserController *controller,
                               ControllerPointerPhase phase,
                               int x, int y, bool *activate);

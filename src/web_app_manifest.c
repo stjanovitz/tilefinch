@@ -6,12 +6,12 @@
 #include <strings.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/json_scan.h"
 #include "tilefinch/style.h"
 #include "tilefinch/url.h"
 
+/* How deep a skipped member value may nest (tilefinch/json_scan.h). */
 #define MANIFEST_JSON_DEPTH_LIMIT 16u
-
-typedef struct { const char *at; const char *end; } ManifestJson;
 
 static void manifest_error(char *out, size_t size, const char *message)
 {
@@ -43,112 +43,6 @@ static TilefinchWebAppDisplayMode manifest_display_mode(const char *value)
     return TILEFINCH_WEB_APP_DISPLAY_BROWSER;
 }
 
-static void json_space(ManifestJson *json)
-{
-    while (json->at < json->end && isspace((unsigned char) *json->at))
-        json->at++;
-}
-
-static bool json_hex(char value, unsigned *digit)
-{
-    if (value >= '0' && value <= '9') *digit = (unsigned) (value - '0');
-    else if (value >= 'a' && value <= 'f') *digit = (unsigned) (value - 'a') + 10u;
-    else if (value >= 'A' && value <= 'F') *digit = (unsigned) (value - 'A') + 10u;
-    else return false;
-    return true;
-}
-
-static bool json_string(ManifestJson *json, char *out, size_t capacity)
-{
-    json_space(json);
-    if (json->at >= json->end || *json->at++ != '"') return false;
-    size_t used = 0;
-    while (json->at < json->end) {
-        unsigned char value = (unsigned char) *json->at++;
-        if (value == '"') {
-            if (out != NULL) {
-                if (used >= capacity) return false;
-                out[used] = '\0';
-            }
-            return true;
-        }
-        if (value < 0x20u) return false;
-        if (value == '\\') {
-            if (json->at >= json->end) return false;
-            value = (unsigned char) *json->at++;
-            switch (value) {
-                case '"': case '\\': case '/': break;
-                case 'b': value = '\b'; break;
-                case 'f': value = '\f'; break;
-                case 'n': value = '\n'; break;
-                case 'r': value = '\r'; break;
-                case 't': value = '\t'; break;
-                case 'u': {
-                    unsigned codepoint = 0;
-                    for (unsigned at = 0; at < 4u; at++) {
-                        unsigned digit = 0;
-                        if (json->at >= json->end
-                            || !json_hex(*json->at++, &digit)) return false;
-                        codepoint = codepoint * 16u + digit;
-                    }
-                    /* The native chrome's bounded name buffer cannot grow a
-                       UTF-16 escape into arbitrary UTF-8 here. The live page
-                       title remains the localized fallback. */
-                    value = codepoint < 0x80u ? (unsigned char) codepoint : '?';
-                    break;
-                }
-                default: return false;
-            }
-        }
-        if (out != NULL) {
-            if (used + 1u >= capacity) return false;
-            out[used++] = (char) value;
-        }
-    }
-    return false;
-}
-
-static bool json_skip_value(ManifestJson *json, unsigned depth);
-
-static bool json_skip_compound(ManifestJson *json, char open, char close,
-                               unsigned depth)
-{
-    if (depth >= MANIFEST_JSON_DEPTH_LIMIT || json->at >= json->end
-        || *json->at++ != open) return false;
-    json_space(json);
-    if (json->at < json->end && *json->at == close) {
-        json->at++;
-        return true;
-    }
-    for (;;) {
-        if (open == '{') {
-            if (!json_string(json, NULL, 0)) return false;
-            json_space(json);
-            if (json->at >= json->end || *json->at++ != ':') return false;
-        }
-        if (!json_skip_value(json, depth + 1u)) return false;
-        json_space(json);
-        if (json->at >= json->end) return false;
-        char separator = *json->at++;
-        if (separator == close) return true;
-        if (separator != ',') return false;
-    }
-}
-
-static bool json_skip_value(ManifestJson *json, unsigned depth)
-{
-    json_space(json);
-    if (json->at >= json->end) return false;
-    if (*json->at == '"') return json_string(json, NULL, 0);
-    if (*json->at == '{') return json_skip_compound(json, '{', '}', depth);
-    if (*json->at == '[') return json_skip_compound(json, '[', ']', depth);
-    const char *start = json->at;
-    while (json->at < json->end && *json->at != ',' && *json->at != '}'
-           && *json->at != ']' && !isspace((unsigned char) *json->at))
-        json->at++;
-    return json->at != start;
-}
-
 static unsigned icon_declared_size(const char *sizes)
 {
     unsigned best = 0;
@@ -172,32 +66,33 @@ static unsigned icon_declared_size(const char *sizes)
     return best;
 }
 
-static bool parse_icon_object(ManifestJson *json, char src[1024],
+static bool parse_icon_object(JsonCursor *json, char src[1024],
                               char type[64], unsigned *size)
 {
     src[0] = type[0] = '\0';
     *size = 0;
     char sizes[128] = {0};
-    json_space(json);
+    json_scan_space(json);
     if (json->at >= json->end || *json->at++ != '{') return false;
-    json_space(json);
+    json_scan_space(json);
     if (json->at < json->end && *json->at == '}') {
         json->at++;
         return true;
     }
     for (;;) {
         char key[32];
-        if (!json_string(json, key, sizeof(key))) return false;
-        json_space(json);
+        if (!json_scan_string(json, key, sizeof(key))) return false;
+        json_scan_space(json);
         if (json->at >= json->end || *json->at++ != ':') return false;
         if (strcmp(key, "src") == 0) {
-            if (!json_string(json, src, 1024)) return false;
+            if (!json_scan_string(json, src, 1024)) return false;
         } else if (strcmp(key, "type") == 0) {
-            if (!json_string(json, type, 64)) return false;
+            if (!json_scan_string(json, type, 64)) return false;
         } else if (strcmp(key, "sizes") == 0) {
-            if (!json_string(json, sizes, sizeof(sizes))) return false;
-        } else if (!json_skip_value(json, 1u)) return false;
-        json_space(json);
+            if (!json_scan_string(json, sizes, sizeof(sizes))) return false;
+        } else if (!json_scan_skip_value(
+                       json, MANIFEST_JSON_DEPTH_LIMIT - 1u)) return false;
+        json_scan_space(json);
         if (json->at >= json->end) return false;
         char separator = *json->at++;
         if (separator == '}') break;
@@ -213,12 +108,12 @@ static unsigned icon_score(unsigned size)
     return size >= 32u ? 8192u - (size > 256u ? 256u : size) : size;
 }
 
-static bool parse_icons(ManifestJson *json, const char *manifest_url,
+static bool parse_icons(JsonCursor *json, const char *manifest_url,
                         TilefinchWebAppManifest *manifest)
 {
-    json_space(json);
+    json_scan_space(json);
     if (json->at >= json->end || *json->at++ != '[') return false;
-    json_space(json);
+    json_scan_space(json);
     if (json->at < json->end && *json->at == ']') {
         json->at++;
         return true;
@@ -226,7 +121,7 @@ static bool parse_icons(ManifestJson *json, const char *manifest_url,
     for (unsigned count = 0; count < 32u; count++) {
         char src[1024] = {0}, type[64] = {0};
         unsigned size = 0;
-        json_space(json);
+        json_scan_space(json);
         if (count < 16u && json->at < json->end && *json->at == '{') {
             if (!parse_icon_object(json, src, type, &size)) return false;
             char resolved[1024];
@@ -245,8 +140,9 @@ static bool parse_icons(ManifestJson *json, const char *manifest_url,
                          "%s", type);
                 manifest->icon_size = size;
             }
-        } else if (!json_skip_value(json, 1u)) return false;
-        json_space(json);
+        } else if (!json_scan_skip_value(
+                       json, MANIFEST_JSON_DEPTH_LIMIT - 1u)) return false;
+        json_scan_space(json);
         if (json->at >= json->end) return false;
         char separator = *json->at++;
         if (separator == ']') return true;
@@ -267,34 +163,34 @@ bool tilefinch_web_app_manifest_parse(
         return false;
     }
     *manifest = (TilefinchWebAppManifest) {0};
-    ManifestJson json = {.at = bytes, .end = bytes + length};
-    json_space(&json);
+    JsonCursor json = {.at = bytes, .end = bytes + length};
+    json_scan_space(&json);
     if (json.at >= json.end || *json.at++ != '{') goto malformed;
-    json_space(&json);
+    json_scan_space(&json);
     if (json.at < json.end && *json.at == '}') json.at++;
     while (json.at < json.end && *json.at != '}') {
         char key[32];
-        if (!json_string(&json, key, sizeof(key))) goto malformed;
-        json_space(&json);
+        if (!json_scan_string(&json, key, sizeof(key))) goto malformed;
+        json_scan_space(&json);
         if (json.at >= json.end || *json.at++ != ':') goto malformed;
         if (strcmp(key, "name") == 0) {
-            if (!json_string(&json, manifest->name,
+            if (!json_scan_string(&json, manifest->name,
                              sizeof(manifest->name))) goto malformed;
         } else if (strcmp(key, "short_name") == 0) {
-            if (!json_string(&json, manifest->short_name,
+            if (!json_scan_string(&json, manifest->short_name,
                              sizeof(manifest->short_name))) goto malformed;
         } else if (strcmp(key, "start_url") == 0
                    || strcmp(key, "scope") == 0) {
             char relative[1024], *out = strcmp(key, "scope") == 0
                 ? manifest->scope : manifest->start_url;
-            if (!json_string(&json, relative, sizeof(relative))
+            if (!json_scan_string(&json, relative, sizeof(relative))
                 || !fetch_resolve_url(manifest_url, relative, out,
                                       TILEFINCH_WEB_APP_URL_LIMIT)) goto malformed;
         } else if (strcmp(key, "icons") == 0) {
             if (!parse_icons(&json, manifest_url, manifest)) goto malformed;
         } else if (strcmp(key, "theme_color") == 0) {
             char value[64];
-            if (!json_string(&json, value, sizeof(value))) goto malformed;
+            if (!json_scan_string(&json, value, sizeof(value))) goto malformed;
             uint32_t color = 0;
             uint8_t alpha = 0;
             if (style_color_parse(
@@ -305,17 +201,18 @@ bool tilefinch_web_app_manifest_parse(
             }
         } else if (strcmp(key, "display") == 0) {
             char value[32];
-            if (!json_string(&json, value, sizeof(value))) goto malformed;
+            if (!json_scan_string(&json, value, sizeof(value))) goto malformed;
             manifest->display_mode = manifest_display_mode(value);
-        } else if (!json_skip_value(&json, 0u)) goto malformed;
-        json_space(&json);
+        } else if (!json_scan_skip_value(&json, MANIFEST_JSON_DEPTH_LIMIT))
+            goto malformed;
+        json_scan_space(&json);
         if (json.at >= json.end) goto malformed;
         char separator = *json.at++;
         if (separator == '}') break;
         if (separator != ',') goto malformed;
-        json_space(&json);
+        json_scan_space(&json);
     }
-    json_space(&json);
+    json_scan_space(&json);
     if (json.at != json.end) goto malformed;
     char page_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     char manifest_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];

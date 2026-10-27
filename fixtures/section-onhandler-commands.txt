@@ -1,4 +1,0 @@
-anchor gamma
-anchor alpha
-click #handler-button
-control-value handler-result

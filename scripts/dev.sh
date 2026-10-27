@@ -185,7 +185,7 @@ case "$action" in
         ;;
     unit)
         if [ "$#" -gt 1 ]; then
-            printf '%s\n' "usage: scripts/dev.sh unit [core|foundation|web-runtime|layout|sections]" >&2
+            printf '%s\n' "usage: scripts/dev.sh unit [core|foundation|web-runtime|layout]" >&2
             exit 2
         fi
         ensure_fast

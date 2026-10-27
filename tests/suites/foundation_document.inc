@@ -136,46 +136,6 @@
     CHECK(scripts.dom_content_loaded_dispatched);
     CHECK(strstr(scripts.summary, "Test:2-4-6:") != NULL);
 
-    puts("test: sectional query keeps document roots local");
-    size_t root_query_baseline = budget.current;
-    static const char root_query_page[] =
-        "<!doctype html><html><head class=target><title>Root</title></head>"
-        "<body><a id=locale hreflang=en-US>locale</a><p>body</p></body></html>";
-    PocDocument root_query_document = {0};
-    ViewportContext root_query_viewport;
-    TestRemoteSelectorProbe root_query_probe = {0};
-    ScriptResult root_query_result = {0};
-    ScriptRuntimeOptions root_query_options = {0};
-    CHECK(document_parse(&root_query_document, &budget, root_query_page,
-                         strlen(root_query_page), 17)
-          && viewport_context_init(
-                 &root_query_viewport, 480, 272, 480, 272));
-    root_query_options.viewport = root_query_viewport;
-    root_query_options.remote_selector_lookup =
-        test_remote_selector_lookup;
-    root_query_options.remote_selector_opaque = &root_query_probe;
-    root_query_options.section_identity = 2;
-    ScriptRuntime *root_query_runtime = script_runtime_create_configured(
-        &root_query_document, &budget, 4 * MIB, 1000,
-        "https://example.test/section", &root_query_options,
-        &root_query_result);
-    static const char root_query_probe_source[] =
-        "globalThis.pocSummary=["
-        "document.querySelector('html')===document.documentElement,"
-        "document.querySelector('head.target')===document.head,"
-        "document.querySelector('body')===document.body,"
-        "document.getElementById('locale').hreflang==='en-US'"
-        "].every(Boolean)?'ROOT-QUERY-PASS':'ROOT-QUERY-FAIL'";
-    CHECK(root_query_runtime != NULL && root_query_result.success
-          && script_runtime_evaluate_diagnostic(
-                 root_query_runtime, root_query_probe_source,
-                 "<root-query-probe>", &root_query_result)
-          && strcmp(root_query_result.summary, "ROOT-QUERY-PASS") == 0
-          && root_query_probe.calls == 0);
-    script_runtime_destroy(root_query_runtime);
-    document_destroy(&root_query_document);
-    CHECK(budget.current == root_query_baseline);
-
     puts("test: handle rebinding is not reachable from page script");
     size_t rebind_gate_baseline = budget.current;
     static const char rebind_gate_page[] =
@@ -191,31 +151,24 @@
         &rebind_gate_document, &budget, 4 * MIB, 1000,
         "https://example.test/rebind", &rebind_gate_options,
         &rebind_gate_result);
-    /* __tilefinchRebindHandle reassigns the handle a wrapper captured, which is
-       the setter __handle deliberately withholds. It has to be branded and
-       kept off the enumerable surface, or one call repoints any wrapper at
-       any node. */
+    /* A wrapper's handle is fixed for its life: __handle is a getter only,
+       and no wrapper carries a way to repoint it at another node. */
     static const char rebind_gate_source[] =
         "(()=>{const first=document.getElementById('first'),"
         "second=document.getElementById('second'),"
         "before=first.__handle;"
         "let threw=false;"
-        "try{first.__tilefinchRebindHandle(second.__handle);}"
-        "catch(error){threw=error instanceof DOMException;}"
-        "let threwWithGuess=false;"
-        "try{first.__tilefinchRebindHandle({},second.__handle);}"
-        "catch(error){threwWithGuess=error instanceof DOMException;}"
+        "try{'use strict';first.__handle=second.__handle;}"
+        "catch(error){threw=error instanceof TypeError;}"
         "const descriptor=Object.getOwnPropertyDescriptor("
-        "first,'__tilefinchRebindHandle');"
-        "globalThis.pocSummary=threw&&threwWithGuess"
-        "&&first.__handle===before&&first.textContent==='one'"
-        "&&descriptor&&descriptor.enumerable===false"
-        "&&descriptor.writable===false&&descriptor.configurable===false"
-        "&&!Object.keys(first).includes('__tilefinchRebindHandle')"
-        "?'REBIND-GATED':'REBIND-FAILED:'+threw+','+threwWithGuess+','"
-        "+(first.__handle===before)+','+first.textContent+','"
-        "+JSON.stringify(descriptor&&{e:descriptor.enumerable,"
-        "w:descriptor.writable,c:descriptor.configurable});})()";
+        "first,'__handle');"
+        "globalThis.pocSummary=first.__handle===before"
+        "&&first.textContent==='one'"
+        "&&descriptor&&typeof descriptor.get==='function'"
+        "&&descriptor.set===undefined&&descriptor.configurable===false"
+        "&&!('__tilefinchRebindHandle' in first)"
+        "?'REBIND-GATED':'REBIND-FAILED:'+threw+','"
+        "+(first.__handle===before)+','+first.textContent;})()";
     CHECK(rebind_gate_runtime != NULL && rebind_gate_result.success
           && script_runtime_evaluate_diagnostic(
                  rebind_gate_runtime, rebind_gate_source,
@@ -442,8 +395,6 @@
     document_destroy(&getter_document);
     CHECK(budget.current == getter_baseline);
 
-    /* The same probes run twice: with the native child/sibling getters,
-       and with them deferring to the script getters (remote mode seen). */
     puts("test: native sibling getters and wrapper creation match script");
     static const char sibling_page[] =
         "<!doctype html><html><head></head><body><div id=k>a<!--m-->"
@@ -521,7 +472,7 @@
         "globalThis.pocSummary=checks.every(Boolean)?'REWRAP-OK':"
         "'REWRAP-FAILED:'+checks.map((c,i)=>c?'':i).filter(String)"
         ".join(',')})()";
-    for (int script_getters = 0; script_getters < 2; script_getters++) {
+    {
         size_t sibling_baseline = budget.current;
         PocDocument sibling_document = {0};
         ScriptResult sibling_result = {0};
@@ -534,15 +485,11 @@
             &sibling_document, &budget, 4 * MIB, 1000,
             "https://siblings.test/", &sibling_options, &sibling_result);
         CHECK(sibling_runtime != NULL && sibling_result.success);
-        if (script_getters)
-            CHECK(script_runtime_evaluate_diagnostic(
-                sibling_runtime, "__tilefinchNoteRemoteWrapper()",
-                "<sibling-script-mode>", &sibling_result));
         CHECK(script_runtime_evaluate_diagnostic(
             sibling_runtime, sibling_source, "<sibling-probe>",
             &sibling_result));
         if (strcmp(sibling_result.summary, "SIBLINGS-OK") != 0)
-            printf("siblings(%d): %s %s\n", script_getters,
+            printf("siblings: %s %s\n",
                    sibling_result.summary, sibling_result.error);
         CHECK(strcmp(sibling_result.summary, "SIBLINGS-OK") == 0);
         (void) script_runtime_collect_and_trim(sibling_runtime);
@@ -550,7 +497,7 @@
             sibling_runtime, sibling_rewrap_source, "<sibling-rewrap>",
             &sibling_result));
         if (strcmp(sibling_result.summary, "REWRAP-OK") != 0)
-            printf("sibling rewrap(%d): %s %s\n", script_getters,
+            printf("sibling rewrap: %s %s\n",
                    sibling_result.summary, sibling_result.error);
         CHECK(strcmp(sibling_result.summary, "REWRAP-OK") == 0);
         script_runtime_destroy(sibling_runtime);
@@ -768,95 +715,6 @@
     script_runtime_destroy(journal_scope_runtime);
     document_destroy(&journal_scope_document);
     CHECK(budget.current == journal_scope_baseline);
-
-    puts("test: stable-node ordinal walks stop at the recursion bound");
-    size_t ordinal_depth_baseline = budget.current;
-    static const char ordinal_depth_page[] =
-        "<!doctype html><html><head><title>Deep</title></head>"
-        "<body></body></html>";
-    PocDocument ordinal_depth_document = {0};
-    ScriptResult ordinal_depth_result = {0};
-    ScriptRuntimeOptions ordinal_depth_options = {0};
-    CHECK(document_parse(&ordinal_depth_document, &budget,
-                         ordinal_depth_page, strlen(ordinal_depth_page), 19)
-          && viewport_context_init(
-                 &ordinal_depth_options.viewport, 480, 272, 480, 272));
-    ScriptRuntime *ordinal_depth_runtime = script_runtime_create_configured(
-        &ordinal_depth_document, &budget, 4 * MIB, 1000,
-        "https://example.test/deep", &ordinal_depth_options,
-        &ordinal_depth_result);
-    /* html/head/title/body occupy element ordinals 0..3 and the appended
-       chain starts at 4, adding one nesting level per element, so ordinal 5
-       sits well inside the walk's 48-level bound and ordinal 60 well outside
-       it.  Beyond the bound the walk must report "not found", which callers
-       already treat as an absent stable key.  The chain stops short of the
-       separate nesting cap appendChild enforces, so this measures the walk's
-       own bound rather than that one. */
-    static const char ordinal_depth_source[] =
-        "(()=>{let node=document.body;"
-        "for(let i=0;i<60;i++){const child=document.createElement('div');"
-        "node.appendChild(child);node=child;}"
-        "const shallow=__tilefinchFindStableNode('s:0:5:div'),"
-        "deep=__tilefinchFindStableNode('s:0:60:div');"
-        "globalThis.pocSummary=(shallow?'shallow-found':'shallow-missing')"
-        "+':'+(deep?'deep-found':'deep-missing')"
-        "+':'+String(__tilefinchStableNodeKey(shallow)||'none');})()";
-    CHECK(ordinal_depth_runtime != NULL && ordinal_depth_result.success
-          && script_runtime_evaluate_diagnostic(
-                 ordinal_depth_runtime, ordinal_depth_source,
-                 "<ordinal-depth-probe>", &ordinal_depth_result)
-          && strcmp(ordinal_depth_result.summary,
-                    "shallow-found:deep-missing:s:0:5:div") == 0);
-    script_runtime_destroy(ordinal_depth_runtime);
-    document_destroy(&ordinal_depth_document);
-    CHECK(budget.current == ordinal_depth_baseline);
-
-    puts("test: cross-origin child runtime rejects top-level backing");
-    size_t child_scope_baseline = budget.current;
-    static const char child_scope_page[] =
-        "<!doctype html><title>Child</title><body></body>";
-    PocDocument child_scope_document = {0};
-    ScriptResult child_scope_result = {0};
-    TestRemoteSelectorProbe child_scope_probe = {0};
-    ScriptRuntimeOptions child_scope_options = {0};
-    CHECK(document_parse(&child_scope_document, &budget, child_scope_page,
-                         strlen(child_scope_page), 17)
-          && viewport_context_init(
-                 &child_scope_options.viewport, 480, 272, 480, 272));
-    child_scope_options.document_scope = SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME;
-    /* Even an accidentally populated creation option is sanitized by the
-       child scope; navigation's iframe path uses this same scope. */
-    child_scope_options.remote_selector_lookup =
-        test_remote_selector_lookup;
-    child_scope_options.remote_selector_opaque = &child_scope_probe;
-    ScriptRuntime *child_scope_runtime = script_runtime_create_configured(
-        &child_scope_document, &budget, 4 * MIB, 1000,
-        "https://cross-origin-frame.test/", &child_scope_options,
-        &child_scope_result);
-    static const char child_scope_source[] =
-        "globalThis.pocSummary=document.querySelector('#outside')===null"
-        "?'FRAME-ISOLATED':'FRAME-LEAK'";
-    CHECK(child_scope_runtime != NULL
-          && script_runtime_evaluate_diagnostic(
-                 child_scope_runtime, child_scope_source,
-                 "<cross-origin-child-scope>", &child_scope_result)
-          && strcmp(child_scope_result.summary, "FRAME-ISOLATED") == 0
-          && child_scope_probe.calls == 0);
-    ScriptRemoteDocumentBinding rejected_child_binding = {
-        .selector_lookup = test_remote_selector_lookup,
-        .selector_opaque = &child_scope_probe,
-        .section_identity = 3
-    };
-    CHECK(!script_runtime_rebind_remote_document(
-              child_scope_runtime, &rejected_child_binding)
-          && script_runtime_evaluate_diagnostic(
-                 child_scope_runtime, child_scope_source,
-                 "<cross-origin-child-rebind>", &child_scope_result)
-          && strcmp(child_scope_result.summary, "FRAME-ISOLATED") == 0
-          && child_scope_probe.calls == 0);
-    script_runtime_destroy(child_scope_runtime);
-    document_destroy(&child_scope_document);
-    CHECK(budget.current == child_scope_baseline);
 
     puts("test: JavaScript request policy forwarding");
     size_t request_policy_baseline = budget.current;
@@ -3514,7 +3372,7 @@
     CHECK(stylesheet_add_css_from_context_capture_ir(
         &external_motion_sheet, external_motion_css,
         sizeof(external_motion_css) - 1u, "https://motion.test/external.css",
-        NULL, &external_motion_ir, &external_motion_ir_length));
+        NULL, NULL, &external_motion_ir, &external_motion_ir_length));
     for (unsigned lane = 0; lane < 2; lane++) {
         if (lane == 1) {
             stylesheet_destroy(&external_motion_sheet);
@@ -3524,7 +3382,7 @@
                   && stylesheet_add_parsed_ir_from_context(
                       &external_motion_sheet, external_motion_ir,
                       external_motion_ir_length,
-                      "https://motion.test/external.css", NULL, NULL)
+                      "https://motion.test/external.css", NULL, NULL, NULL)
                       == STYLE_PARSED_IR_APPLIED);
         }
         ScriptResult external_motion_result = {0};

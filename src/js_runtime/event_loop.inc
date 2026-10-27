@@ -446,33 +446,51 @@ static uint64_t callback_observation_threshold(const ScriptRuntime *runtime)
         : runtime->bridge.execution_policy.slow_callback_threshold_us;
 }
 
-static const char *const runtime_host_callback_names[
-    SCRIPT_HOST_CALLBACK_COUNT] = {
-    "__tilefinchRefreshNamedProperties",
-    "__tilefinchParserMutationCheckpoint",
-    "__tilefinchReceiveMessage",
-    "__tilefinchSetFrameWindowState",
-    "__tilefinchIntersectionRecheck",
-    "__tilefinchMediaRecheck",
-    "__tilefinchRecordResourceTiming",
-    "__tilefinchRecordNavigationTiming",
-    "__tilefinchDeliverNetwork",
-    "__tilefinchDetachNetwork",
-    "__tilefinchPumpTimers",
-    "__tilefinchSchedulerSnapshot",
-    "__tilefinchRebindDocument",
-    "__tilefinchCommitSameDocument",
-    "__tilefinchRestoreSameDocument",
-    "__tilefinchSaveSectionState",
-    "__tilefinchRestoreSectionState",
-    "__tilefinchUpdateGamepad"
+/* Designated so each name sits at its enum slot whatever the order; the
+   size check below catches an enum entry appended without a name, and
+   runtime_capture_host_callbacks() refuses a NULL gap left in the middle. */
+static const char *const runtime_host_callback_names[] = {
+    [SCRIPT_HOST_REFRESH_NAMED_PROPERTIES] = "__tilefinchRefreshNamedProperties",
+    [SCRIPT_HOST_PARSER_MUTATION_CHECKPOINT] = "__tilefinchParserMutationCheckpoint",
+    [SCRIPT_HOST_RECEIVE_MESSAGE] = "__tilefinchReceiveMessage",
+    [SCRIPT_HOST_SET_FRAME_WINDOW_STATE] = "__tilefinchSetFrameWindowState",
+    [SCRIPT_HOST_INTERSECTION_RECHECK] = "__tilefinchIntersectionRecheck",
+    [SCRIPT_HOST_MEDIA_RECHECK] = "__tilefinchMediaRecheck",
+    [SCRIPT_HOST_RECORD_RESOURCE_TIMING] = "__tilefinchRecordResourceTiming",
+    [SCRIPT_HOST_RECORD_NAVIGATION_TIMING] = "__tilefinchRecordNavigationTiming",
+    [SCRIPT_HOST_DELIVER_NETWORK] = "__tilefinchDeliverNetwork",
+    [SCRIPT_HOST_PUMP_TIMERS] = "__tilefinchPumpTimers",
+    [SCRIPT_HOST_SCHEDULER_SNAPSHOT] = "__tilefinchSchedulerSnapshot",
+    [SCRIPT_HOST_COMMIT_SAME_DOCUMENT] = "__tilefinchCommitSameDocument",
+    [SCRIPT_HOST_RESTORE_SAME_DOCUMENT] = "__tilefinchRestoreSameDocument",
+    [SCRIPT_HOST_UPDATE_GAMEPAD] = "__tilefinchUpdateGamepad",
+    [SCRIPT_HOST_APPLY_PAGE_SCROLL] = "__tilefinchApplyPageScroll",
+    [SCRIPT_HOST_FLUSH_PAGE_SCROLL] = "__tilefinchFlushPageScroll",
+    [SCRIPT_HOST_DISPATCH_AT] = "__tilefinchDispatchAt",
+    [SCRIPT_HOST_DISPATCH_HANDLE] = "__tilefinchDispatchHandle",
+    [SCRIPT_HOST_DISPATCH_ACTIVATION_HANDLE] = "__tilefinchDispatchActivationHandle",
+    [SCRIPT_HOST_DISPATCH_INPUT_HANDLE] = "__tilefinchDispatchInputHandle",
+    [SCRIPT_HOST_DISPATCH_SUBMIT_HANDLE] = "__tilefinchDispatchSubmitHandle",
+    [SCRIPT_HOST_DISPATCH_DOM_CONTENT_LOADED] = "__tilefinchDispatchDOMContentLoaded",
+    [SCRIPT_HOST_MEDIA_STATE_FOR] = "__tilefinchMediaStateFor",
+    [SCRIPT_HOST_APPLY_PAGE_VISIBILITY] = "__tilefinchApplyPageVisibility",
+    [SCRIPT_HOST_EXIT_FULLSCREEN] = "__tilefinchExitFullscreenFromHost",
+    [SCRIPT_HOST_WRAP_NODE] = "__tilefinchWrap",
+    [SCRIPT_HOST_RETIRE_NATIVE_NODE_STATE] = "__tilefinchRetireNativeNodeState",
+    [SCRIPT_HOST_HOLD_EVENT_STATE] = "__tilefinchHoldEventState",
+    [SCRIPT_HOST_RELEASE_EVENT_HOLDERS] = "__tilefinchReleaseEventHolders"
 };
+_Static_assert(sizeof(runtime_host_callback_names)
+                   / sizeof(runtime_host_callback_names[0])
+               == SCRIPT_HOST_CALLBACK_COUNT,
+               "every ScriptHostCallback needs a global name");
 
 static bool runtime_capture_host_callbacks(ScriptRuntime *runtime,
                                            JSValueConst global)
 {
     if (runtime == NULL || runtime->context == NULL) return false;
     for (size_t i = 0; i < SCRIPT_HOST_CALLBACK_COUNT; i++) {
+        if (runtime_host_callback_names[i] == NULL) return false;
         JSValue function = JS_GetPropertyStr(
             runtime->context, global, runtime_host_callback_names[i]);
         if (!JS_IsFunction(runtime->context, function)) {
@@ -766,7 +784,6 @@ bool script_runtime_configure_messaging(
     runtime->bridge.post_message_opaque = NULL;
     runtime->bridge.opaque_origin = runtime->bridge.opaque_origin
                                     || child_opaque_origin;
-    (void) script_runtime_rebind_remote_document(runtime, NULL);
     runtime->document_scope = SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME;
     static const char same_origin_child_setup[] =
         "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
@@ -1022,15 +1039,12 @@ void script_runtime_report_roots(ScriptRuntime *runtime, FILE *output,
     const ScriptResult *result = &runtime->result;
     fprintf(output,
             "script-roots phase=%s realm=%s handle=%ld retained=%lld "
-            "timers=%zu node-wrappers=%zu stable-wrappers=%zu "
-            "listener-targets=%zu handler-targets=%zu observers=%zu "
+            "timers=%zu node-wrappers=%zu observers=%zu "
             "network=%zu frame-windows=%zu\n",
             phase == NULL ? "unknown" : phase,
             realm == NULL ? "unknown" : realm, realm_handle,
             (long long) usage.memory_used_size, result->root_timers,
-            result->root_node_wrappers, result->root_stable_wrappers,
-            result->root_stable_listener_targets,
-            result->root_stable_handler_targets,
+            result->root_node_wrappers,
             result->root_mutation_observers, result->root_pending_network,
             result->root_frame_windows);
 }
@@ -1512,8 +1526,7 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
     if (completed_out != NULL) *completed_out = 0;
     DomBridge *bridge = &runtime->bridge;
     if (bridge->document == NULL) {
-        /* detach_document() drains normal work before clearing authority.
-           This guard keeps a partial/OOM cleanup from turning a stale count
+        /* This guard keeps a partial/OOM cleanup from turning a stale count
            into a document-budget dereference. */
         (void) script_runtime_cancel_network(runtime, "document detached");
         return true;

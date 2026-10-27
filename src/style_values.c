@@ -2,6 +2,7 @@
    box/border shorthands, fonts, grid tracks, and generated text.
    Split out of style.c. */
 
+#include "style_budget_category.h"
 #include "style_internal.h"
 #include "tilefinch/url.h"
 
@@ -4920,9 +4921,16 @@ bool style_parse_grid_columns(Stylesheet *sheet, const char *text,
             if (minimum != NULL
                 && grid_minmax_floor(minimum + 7, strlen(minimum + 7),
                                      &floor, &floor_length)) {
-                int parsed = style_parse_length(sheet, floor, floor_length,
-                                                0, NULL);
-                if (parsed > 0) {
+                /* A percentage or mixed floor (min(100%, 20rem)) stays a
+                   tagged StyleLength; layout resolves it against the
+                   container's inline size to count the repetitions. */
+                StyleLength parsed = 0;
+                if (parse_style_length(sheet, floor, floor_length,
+                                       &parsed, NULL)
+                    && parsed > 0
+                    && (parsed <= STYLE_LENGTH_DIRECT_LIMIT
+                        || (parsed >= STYLE_LENGTH_PERCENT_TAG
+                            && parsed <= STYLE_LENGTH_PROGRAM_END))) {
                     candidate.grid_min_column_width = parsed;
                 }
             }

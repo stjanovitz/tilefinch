@@ -235,7 +235,7 @@ static bool test_test_probe_surface(void)
         "'__tilefinchDiagnosticLookup','__tilefinchLastUncaughtTask',"
         "'__tilefinchXHRSendCalls','__tilefinchXHRLastStates',"
         "'__tilefinchXHRDiagnostics','__tilefinchFrameEvalTelemetry',"
-        "'__tilefinchDiagnosticMobileSafari']"
+        "'__tilefinchDiagnosticMobileSafari','__tilefinchClearNodeCache']"
         ".filter(name=>name in globalThis);"
         "if(present.length)throw Error('test probes: '+present.join());"
         "globalThis.pocSummary='OK'})()");

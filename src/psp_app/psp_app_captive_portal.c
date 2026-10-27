@@ -164,13 +164,15 @@ bool psp_captive_portal_start(PspApp *app, PspAppFrameState *frame)
             "NOT ENOUGH MEMORY FOR WI-FI SIGN-IN", 240);
         return false;
     }
-    const NavigationEntry *entry = app->views == NULL
-        ? NULL : navigation_current(app->views->navigation);
+    char entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *entry_url = app->views == NULL ? NULL
+        : psp_app_current_url(
+              app->browser->engine, entry_buffer, sizeof(entry_buffer));
     snprintf(portal->original_url, sizeof(portal->original_url), "%s",
-             entry == NULL || entry->url[0] == '\0'
-                 ? app->process->presentation.ui.url : entry->url);
+             entry_url == NULL || entry_url[0] == '\0'
+                 ? app->process->presentation.ui.url : entry_url);
     app->interactive->captive_portal = portal;
-    portal->started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    portal->started_us = psp_time_us(NULL);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     if (app->update_check != NULL) psp_update_check_pause(app->update_check);
 #endif
@@ -244,7 +246,7 @@ static bool portal_open(PspApp *app, PspAppFrameState *frame,
     }
     portal->phase = PSP_CAPTIVE_PORTAL_OPENING;
     app->interactive->navigation_job_started_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
+        psp_time_us(NULL);
     frame->page_dirty = true;
     return true;
 }
@@ -333,7 +335,7 @@ static bool portal_begin_return_navigation(
     }
     portal->phase = PSP_CAPTIVE_PORTAL_RETURNING;
     app->interactive->navigation_job_started_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
+        psp_time_us(NULL);
     frame->page_dirty = true;
     return true;
 }
@@ -403,7 +405,7 @@ void psp_captive_portal_pump(PspApp *app, PspAppFrameState *frame)
         (void) portal_begin_return_navigation(app, frame, portal);
         return;
     }
-    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+    uint64_t now_us = psp_time_us(NULL);
     if (now_us - portal->started_us >= PSP_CAPTIVE_PORTAL_SESSION_LIMIT_US) {
         psp_ui_show_status(
             &app->process->presentation.ui,
@@ -479,14 +481,15 @@ void psp_captive_portal_navigation_settled(
             portal_release(app);
             return;
         }
-        const NavigationEntry *entry = navigation_current(
-            app->views->navigation);
-        if (entry == NULL || entry->url[0] == '\0'
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        if (entry_url == NULL || entry_url[0] == '\0'
             || (!browser_session_captive_portal_url_allowed(
-                    app->browser->session, entry->url)
+                    app->browser->session, entry_url)
                 && !browser_session_captive_portal_authorize_navigation(
                     app->browser->session, portal->portal_url,
-                    entry->url))) {
+                    entry_url))) {
             psp_ui_show_status(
                 &app->process->presentation.ui,
                 "WI-FI SIGN-IN REDIRECT LIMIT REACHED", 240);
@@ -494,7 +497,7 @@ void psp_captive_portal_navigation_settled(
             return;
         }
         snprintf(portal->portal_url, sizeof(portal->portal_url), "%s",
-                 entry->url);
+                 entry_url);
         portal->phase = PSP_CAPTIVE_PORTAL_ACTIVE;
         psp_ui_show_status(
             &app->process->presentation.ui,
@@ -513,14 +516,15 @@ void psp_captive_portal_navigation_settled(
         return;
     }
     if (portal->phase == PSP_CAPTIVE_PORTAL_ACTIVE && succeeded) {
-        const NavigationEntry *entry = navigation_current(
-            app->views->navigation);
-        if (entry == NULL || entry->url[0] == '\0'
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        if (entry_url == NULL || entry_url[0] == '\0'
             || (!browser_session_captive_portal_url_allowed(
-                    app->browser->session, entry->url)
+                    app->browser->session, entry_url)
                 && !browser_session_captive_portal_authorize_navigation(
                     app->browser->session, portal->portal_url,
-                    entry->url))) {
+                    entry_url))) {
             psp_ui_show_status(
                 &app->process->presentation.ui,
                 "WI-FI SIGN-IN REDIRECT LIMIT REACHED", 240);
@@ -528,7 +532,7 @@ void psp_captive_portal_navigation_settled(
             return;
         }
         snprintf(portal->portal_url, sizeof(portal->portal_url), "%s",
-                 entry->url);
+                 entry_url);
         if (portal_probe_begin(app, portal, true)) return;
         psp_ui_show_status(
             &app->process->presentation.ui,

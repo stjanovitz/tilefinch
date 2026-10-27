@@ -1,8 +1,7 @@
 /* Bootstrap footprint guard.
  *
  * The PSP realm is 5 MiB. Everything the trusted bootstrap retains after
- * evaluation is headroom a page never gets, and a preserved-runtime document
- * rebind must fit in whatever is left. Functional tests that happened to run
+ * evaluation is headroom a page never gets. Functional tests that happened to run
  * small heaps used to catch bootstrap growth by accident, failing on layout
  * noise without saying what grew; this test measures the numbers directly on
  * the device-sized realm and prints them on every run so growth is attributed
@@ -25,9 +24,6 @@
    1,922 KiB when this guard was introduced (2026-09), so the budget trips on
    roughly 130 KiB of growth; raise it only with a device-side reason. */
 #define FOOTPRINT_BOOTSTRAP_LIMIT_BYTES (2u * MIB)
-/* Heap a preserved-runtime rebind retains on top of the resident state;
-   measured at 96 KiB when introduced. */
-#define FOOTPRINT_REBIND_LIMIT_BYTES (256u * KIB)
 /* Each lazily installed module, measured as retained heap after its first
    activation; the largest (canvas) measured 222 KiB when introduced. */
 #define FOOTPRINT_LAZY_MODULE_LIMIT_BYTES (512u * KIB)
@@ -170,26 +166,9 @@ int main(void)
            bootstrap grew by one Range helper). */
         CHECK(activated > after_frame + 8u * KIB);
     }
-    /* Preserved-runtime rebind onto a second document. */
-    PocDocument replacement;
-    memset(&replacement, 0, sizeof(replacement));
-    CHECK(document_parse(&replacement, &budget, page_html,
-                         sizeof(page_html) - 1u, 512u));
-    size_t before_rebind = used_bytes(runtime);
-    ScriptResult rebind_result;
-    memset(&rebind_result, 0, sizeof(rebind_result));
-    CHECK(script_runtime_rebind_document(runtime, &replacement,
-                                         &rebind_result));
-    size_t after_rebind = used_bytes(runtime);
-    size_t rebind_delta = after_rebind > before_rebind
-        ? after_rebind - before_rebind : 0u;
-    printf("footprint: rebind retained=%zu (%zu KiB)\n",
-           rebind_delta, rebind_delta / KIB);
-    CHECK(rebind_delta <= FOOTPRINT_REBIND_LIMIT_BYTES);
     CHECK(resident <= FOOTPRINT_BOOTSTRAP_LIMIT_BYTES);
 
     script_runtime_destroy(runtime);
-    document_destroy(&replacement);
     document_destroy(&document);
     CHECK(budget_uninstall_lexbor(&budget));
     CHECK(budget.current == 0);

@@ -639,166 +639,11 @@ static int test_engine_lifecycle(void)
                  == DOCUMENT_BACKING_FULL
           && browser_engine_controller(engine) != NULL
           && browser_engine_render_shell(engine) != NULL);
-    CHECK(navigation->page.runtime != NULL
-          && script_runtime_evaluate_diagnostic(
-                 navigation->page.runtime,
-                 "document.body.setAttribute('data-writer-before','local');"
-                 "globalThis.pocSummary=__tilefinchHasRemoteNodeWriter?"
-                 "'writer-on':'writer-off'",
-                 "<writer-before-backing-bind>",
-                 &navigation->page.script_result)
-          && strcmp(navigation->page.script_result.summary,
-                    "writer-off") == 0);
-
-    static const char section_source[] =
-        "<!doctype html><title>Sections</title><body>"
-        "<h1 id=one>One</h1><div id=probe>first</div>"
-        "<h1 id=two>Two</h1><p>second</p></body>";
-    CompressedSectionStore store;
-    SectionPager pager;
-    CHECK(section_store_build(&store, budget, section_source,
-                              sizeof(section_source) - 1, 4096, 8192));
-    CHECK(section_pager_init(&pager, &store, 0, 0));
-    CHECK(store.section_count > 1);
-    BackingProbe *probe = calloc(1, sizeof(*probe));
-    CHECK(probe != NULL);
-    DocumentBackingOps ops = {
-        .selector_lookup = backing_selector_lookup,
-        .node_write = backing_node_write
-    };
-    DocumentBacking sections;
-    CHECK(document_backing_init_sections(
-              &sections, &store, &pager, &ops, probe)
-          && document_backing_section_count(&sections) == store.section_count
-          && document_backing_current_html(&sections, NULL) != NULL
-          && browser_engine_bind_document_backing(engine, &sections));
-    size_t section_index = SIZE_MAX;
-    char tag_name[32] = {0}, identifier[129] = {0}, stable_key[96] = {0};
-    CHECK(navigation->remote_selector_lookup != NULL
-          && navigation->remote_selector_lookup(
-              navigation->remote_selector_opaque, "#probe", 6,
-              &section_index, tag_name, identifier, stable_key)
-          && probe->selector_calls == 1 && section_index == 0
-          && strcmp(tag_name, "div") == 0
-          && strcmp(stable_key, "id:probe") == 0);
-    CHECK(script_runtime_evaluate_diagnostic(
-              navigation->page.runtime,
-              "document.body.setAttribute('data-live-writer','on');"
-              "globalThis.pocSummary=__tilefinchHasRemoteNodeWriter?"
-              "'writer-on':'writer-off'",
-              "<writer-after-backing-bind>",
-              &navigation->page.script_result)
-          && strcmp(navigation->page.script_result.summary,
-                    "writer-on") == 0
-          && probe->writer_calls == 1
-          && probe->writer_section == 0
-          && probe->writer_kind == SCRIPT_REMOTE_NODE_WRITE_SET_ATTRIBUTE
-          && strcmp(probe->writer_key, "d:body") == 0
-          && strcmp(probe->writer_name, "data-live-writer") == 0
-          && strcmp(probe->writer_value, "on") == 0);
-
-    /* Binding a compressed backing after the page runtime already exists
-       must update that live top-level realm. The lookup queues a bounded
-       materialization request because this backing has no remote read op. */
-    probe->section_index = 1;
-    static const char post_commit_bind_probe[] =
-        "globalThis.__tilefinchBoundRemote=document.querySelector('aside');"
-        "globalThis.pocSummary=__tilefinchBoundRemote?'bound':'missing'";
-    bool post_commit_bound = navigation->page.runtime != NULL
-        && script_runtime_evaluate_diagnostic(
-               navigation->page.runtime, post_commit_bind_probe,
-               "<post-commit-backing-bind>",
-               &navigation->page.script_result);
-    if (!post_commit_bound
-        || strcmp(navigation->page.script_result.summary, "bound") != 0
-        || probe->selector_calls != 2) {
-        fprintf(stderr, "post-commit binding ok=%d calls=%zu summary=%s error=%s\n",
-                post_commit_bound, probe->selector_calls,
-                navigation->page.script_result.summary,
-                navigation->page.script_result.error);
-    }
-    CHECK(post_commit_bound
-          && strcmp(navigation->page.script_result.summary, "bound") == 0
-          && probe->selector_calls == 2);
-    char remote_identifier[129] = {0};
-    size_t remote_section = SIZE_MAX;
-    CHECK(script_runtime_take_remote_element_request(
-              navigation->page.runtime, remote_identifier,
-              sizeof(remote_identifier), &remote_section)
-          && strcmp(remote_identifier, "id:deferred") == 0
-          && remote_section == 1);
-
-    /* Queue one more request, then detach before releasing the backing's
-       context. Both callbacks and queued requests must be gone on return. */
-    CHECK(script_runtime_evaluate_diagnostic(
-              navigation->page.runtime,
-              "document.querySelector('aside')",
-              "<queued-before-backing-uninstall>",
-              &navigation->page.script_result)
-          && script_runtime_take_remote_element_request(
-                 navigation->page.runtime, remote_identifier,
-                 sizeof(remote_identifier), &remote_section)
-          && remote_section == 1
-          && script_runtime_evaluate_diagnostic(
-                 navigation->page.runtime,
-                 "document.querySelector('aside')",
-                 "<pending-at-backing-uninstall>",
-                 &navigation->page.script_result));
-    size_t writer_calls_before_uninstall = probe->writer_calls;
-    document_backing_uninstall(navigation);
-    CHECK(!script_runtime_take_remote_element_request(
-              navigation->page.runtime, remote_identifier,
-              sizeof(remote_identifier), &remote_section)
-          && script_runtime_evaluate_diagnostic(
-                 navigation->page.runtime,
-                 "document.body.setAttribute('data-writer-after','local');"
-                 "globalThis.pocSummary=__tilefinchHasRemoteNodeWriter?"
-                 "'writer-on':'writer-off'",
-                 "<writer-after-backing-uninstall>",
-                 &navigation->page.script_result)
-          && strcmp(navigation->page.script_result.summary,
-                    "writer-off") == 0
-          && probe->writer_calls == writer_calls_before_uninstall);
-
-    /* Section replacement now crosses the facade as one ownership command:
-       the pager selection, runtime identity, backing copy, controller, and
-       render shell must all describe the newly committed section. */
-    DocumentBackingSelection selection = {0};
-    CHECK(browser_engine_bind_document_backing(engine, &sections)
-          && document_backing_prepare_section(
-                 &sections, 1, 1, &selection)
-          && browser_engine_commit_section_html(
-                 engine, &sections, &selection,
-                 "https://engine.test/#two",
-                 selection.pager_selection.html,
-                 selection.pager_selection.length, true, false)
-          && !selection.active
-          && pager.current_section == 1
-          && document_backing_current_section(
-                 browser_engine_document_backing(engine)) == 1
-          && navigation->runtime_section_identity == 1
-          && browser_engine_controller(engine) != NULL
-          && browser_engine_render_shell(engine) != NULL);
-    document_backing_uninstall(navigation);
-    free(probe);
-    probe = NULL;
-    CHECK(script_runtime_evaluate_diagnostic(
-                 navigation->page.runtime,
-                 "globalThis.pocSummary=document.querySelector('aside')"
-                 "===null?'cleared':'stale'",
-                 "<post-uninstall-backing-probe>",
-                 &navigation->page.script_result)
-          && strcmp(navigation->page.script_result.summary, "cleared") == 0);
-
     DocumentBacking full;
-    CHECK(navigation_set_runtime_section_identity(navigation, 7)
-          && navigation->runtime_section_identity == 7
-          && document_backing_init_full(&full, &navigation->page.document)
+    CHECK(document_backing_init_full(&full, &navigation->page.document)
           && browser_engine_bind_document_backing(engine, &full)
-          && navigation->remote_selector_lookup == NULL
-          && navigation->runtime_section_identity == 0);
-    section_pager_destroy(&pager);
-    section_store_destroy(&store);
+          && document_backing_document(browser_engine_document_backing(engine))
+                 == &navigation->page.document);
 
     CHECK(browser_engine_shutdown(engine));
     CHECK(browser_engine_metrics(engine, &metrics)
@@ -6166,5 +6011,264 @@ static int test_post_mutation_document_refresh_refusal_retires_shell(void)
 
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+    return 0;
+}
+
+/* The idle turn's order is its scheduling policy (see
+   browser_engine_idle_steps): provider work first, memory relief before the
+   startup deferral, layout completion before font and image publication,
+   one shared relayout application, then the settled-layout continuations.
+   Reordering a row is a policy change; this pins it. */
+static int test_idle_step_order(void)
+{
+    static const char *const expected[] = {
+        "youtube-signin-recovery", "youtube-pumps", "web-font-memory",
+        "startup-deferral", "layout-completion", "optional-fonts",
+        "background-resources", "video-preview", "layout-damage",
+        "image-retarget", "autofocus", "tiles", "script-cache"
+    };
+    size_t count = sizeof(expected) / sizeof(expected[0]);
+    for (size_t i = 0; i < count; i++) {
+        const char *name = browser_engine_test_idle_step_name(i);
+        CHECK(name != NULL && strcmp(name, expected[i]) == 0);
+    }
+    CHECK(browser_engine_test_idle_step_name(count) == NULL);
+    return 0;
+}
+
+/* The PSP frontend shows native and generated pages (HOME, collections,
+   screenshots, profile and offline pages) for history entries the engine
+   cannot load. It used to move the engine's history cursor itself through
+   the mutable session, which skipped the idle-work cancel every other cursor
+   move performs, so a paint-ahead step for the old page could run against the
+   moved cursor before the native page showed. The facade step owns the move,
+   the cancel, the rollback and the scroll restore. */
+static int test_native_history_step_cancels_idle_work(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.resources.enabled = false;
+    config.tile_capacity = 8;
+    char html[8192];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><title>Native step</title><style>"
+        "body{margin:4px}p{height:100px}</style><body>");
+    for (unsigned i = 0; i < 12; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+            "<p>Paragraph %u keeps the page taller than one screen.</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(
+        engine, "https://native-step.test/first", html, used, true));
+    CHECK(browser_engine_history_restore_scroll(engine, 40));
+    CHECK(browser_engine_commit_html(
+        engine, "https://native-step.test/second", html, used, true));
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->history_count == 2u && navigation->history_index == 1u
+          && navigation->history[0].scroll_y == 40);
+
+    /* Publishing a frame schedules optional paint-ahead for this screen. */
+    BrowserEngineMetrics before = {0}, after = {0};
+    CHECK(browser_engine_metrics(engine, &before));
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_metrics(engine, &after));
+    CHECK(after.idle_jobs_scheduled > before.idle_jobs_scheduled);
+
+    /* No entry ahead: refuse without moving or touching idle work. */
+    BrowserHistoryEntryText entry;
+    int scroll_y = -1;
+    CHECK(browser_engine_metrics(engine, &before));
+    CHECK(!browser_engine_history_step(engine, true, &entry, &scroll_y));
+    CHECK(browser_engine_metrics(engine, &after));
+    CHECK(navigation->history_index == 1u
+          && after.idle_jobs_cancelled == before.idle_jobs_cancelled);
+
+    /* The step cancels the pending idle job before moving the cursor and
+       hands back a copy of the entry it moved to. */
+    CHECK(browser_engine_history_step(engine, false, &entry, &scroll_y));
+    CHECK(browser_engine_metrics(engine, &after));
+    CHECK(after.idle_jobs_cancelled == before.idle_jobs_cancelled + 1u);
+    CHECK(navigation->history_index == 0u
+          && strcmp(entry.url, "https://native-step.test/first") == 0
+          && strcmp(entry.title, navigation->history[0].title == NULL
+                                     ? "" : navigation->history[0].title) == 0
+          && scroll_y == 40);
+    bool visual_changed = false;
+    (void) browser_engine_run_idle_work(engine, &visual_changed);
+    CHECK(browser_engine_metrics(engine, &before));
+    CHECK(before.idle_jobs_completed == after.idle_jobs_completed);
+
+    /* A native page that cannot open puts the cursor back. */
+    CHECK(browser_engine_history_step_rollback(engine, false));
+    CHECK(navigation->history_index == 1u);
+
+    /* After opening the native page the frontend restores its scroll; the
+       text copy is optional. */
+    CHECK(browser_engine_history_step(engine, false, NULL, &scroll_y));
+    CHECK(browser_engine_history_restore_scroll(engine, scroll_y + 8)
+          && navigation->history_index == 0u
+          && navigation->history[0].scroll_y == 48);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* The PSP frontend reads the page generation, the loaded flag and the
+   current history entry through copied facade queries instead of aliasing
+   the engine's NavigationSession. They must answer what the session holds,
+   copy rather than borrow, and read empty before a session exists. */
+static int test_frontend_page_queries_copy_engine_state(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.resources.enabled = false;
+    config.tile_capacity = 8;
+    char url[NAVIGATION_URL_LIMIT];
+    BrowserHistoryEntryText text;
+    int scroll_y = -1;
+    CHECK(browser_engine_page_generation(NULL) == 0u
+          && !browser_engine_page_loaded(NULL));
+    memcpy(url, "stale", 6u);
+    CHECK(!browser_engine_current_entry(NULL, url, sizeof(url), &scroll_y)
+          && url[0] == '\0' && scroll_y == 0);
+    CHECK(!browser_engine_current_entry_text(NULL, &text, NULL)
+          && text.url[0] == '\0' && text.title[0] == '\0');
+    BrowserValidationCounters empty_counters;
+    CHECK(!browser_engine_validation_counters(NULL, &empty_counters)
+          && empty_counters.generation == 0u && !empty_counters.loaded);
+
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] =
+        "<!doctype html><title>Query page</title><style>"
+        "body{margin:4px}p{height:400px}</style><body><p>a</p><p>b</p>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://queries.test/first", page, sizeof(page) - 1u,
+        true));
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(browser_engine_page_generation(engine) == navigation->generation
+          && browser_engine_page_generation(engine) != 0u
+          && browser_engine_page_loaded(engine)
+              == navigation->page.loaded);
+    CHECK(browser_engine_history_restore_scroll(engine, 24));
+    CHECK(browser_engine_current_entry(engine, url, sizeof(url), &scroll_y)
+          && strcmp(url, "https://queries.test/first") == 0
+          && url != navigation_current(navigation)->url
+          && scroll_y == 24);
+    CHECK(browser_engine_current_entry(engine, NULL, 0u, &scroll_y)
+          && scroll_y == 24);
+    CHECK(browser_engine_current_entry_text(engine, &text, &scroll_y)
+          && strcmp(text.url, "https://queries.test/first") == 0
+          && strcmp(text.title, navigation_current(navigation)->title) == 0
+          && scroll_y == 24);
+    /* A buffer too small for the URL refuses rather than truncating. */
+    char small[8];
+    CHECK(!browser_engine_current_entry(
+              engine, small, sizeof(small), &scroll_y)
+          && small[0] == '\0' && scroll_y == 0);
+
+    uint64_t first_generation = browser_engine_page_generation(engine);
+    CHECK(browser_engine_commit_html(
+        engine, "https://queries.test/second", page, sizeof(page) - 1u,
+        true));
+    CHECK(browser_engine_page_generation(engine) != first_generation
+          && browser_engine_page_generation(engine)
+              == navigation->generation);
+    CHECK(browser_engine_current_entry(engine, url, sizeof(url), &scroll_y)
+          && strcmp(url, "https://queries.test/second") == 0);
+
+    /* The adjacent entry is peeked without moving the cursor. */
+    CHECK(browser_engine_history_peek(engine, false, url, sizeof(url))
+          && strcmp(url, "https://queries.test/first") == 0
+          && navigation->history_index == 1u);
+    CHECK(!browser_engine_history_peek(engine, true, url, sizeof(url))
+          && url[0] == '\0');
+    CHECK(browser_engine_page_document_url(engine, url, sizeof(url))
+          && strcmp(url, navigation->page.document_url) == 0);
+    CHECK(browser_engine_last_http_status(engine)
+              == navigation->last_http_status
+          && browser_engine_page_incremental_relayouts(engine)
+              == navigation->incremental_relayouts
+          && !browser_engine_page_script_memory_failed(engine));
+
+    BrowserValidationCounters counters;
+    CHECK(browser_engine_validation_counters(engine, &counters)
+          && counters.generation == navigation->generation
+          && counters.loaded == navigation->page.loaded
+          && counters.incremental_relayouts
+              == navigation->incremental_relayouts
+          && counters.full_relayouts == navigation->performance.full_relayouts
+          && counters.layout_height == navigation->page.layout.height
+          && counters.layout_text_fingerprint
+              == navigation->page.layout.text_fingerprint
+          && counters.layout_performance.total_us
+              == navigation->page.layout.performance.total_us);
+
+    CHECK(browser_engine_shutdown(engine));
+    CHECK(browser_engine_page_generation(engine) == 0u
+          && !browser_engine_page_loaded(engine)
+          && !browser_engine_current_entry(
+                 engine, url, sizeof(url), &scroll_y));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* The PSP app and the lab derive script admission limits through one
+   helper. The lab used to skip the per-file clamp to the total, so a lab run
+   with the app's settings could admit a larger single script than the app. */
+static int test_script_limit_derivation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+
+    /* Per-file above the total: clamp to the total. */
+    CHECK(browser_config_apply_script_limits(
+              &config, SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, 64u,
+              1u * MIB, 2u * MIB)
+          && config.javascript.maximum_scripts == 64u
+          && config.javascript.maximum_total_bytes == 1u * MIB
+          && config.javascript.maximum_file_bytes == 1u * MIB
+          && config.javascript.execution_policy
+                     .maximum_host_compile_source_bytes == 4u * MIB);
+    /* Per-file above the strict compile ceiling: clamp to the ceiling. */
+    CHECK(browser_config_apply_script_limits(
+              &config, SCRIPT_EXECUTION_PROFILE_PSP_STRICT, 16u,
+              1u * MIB, 512u * 1024u)
+          && config.javascript.maximum_total_bytes == 1u * MIB
+          && config.javascript.maximum_file_bytes == 256u * 1024u);
+    /* The lab profile has no compile ceiling but keeps the total clamp. */
+    CHECK(browser_config_apply_script_limits(
+              &config, SCRIPT_EXECUTION_PROFILE_LAB, 32u,
+              8u * MIB, 6u * MIB)
+          && config.javascript.execution_policy
+                     .maximum_host_compile_source_bytes == 0u
+          && config.javascript.maximum_file_bytes == 6u * MIB);
+    CHECK(browser_config_apply_script_limits(
+              &config, SCRIPT_EXECUTION_PROFILE_LAB, 32u,
+              2u * MIB, 6u * MIB)
+          && config.javascript.maximum_file_bytes == 2u * MIB);
+    /* A profile without a policy fails. */
+    CHECK(!browser_config_apply_script_limits(
+              &config, (ScriptExecutionProfile) 99, 32u, 1u * MIB,
+              512u * 1024u));
+    CHECK(!browser_config_apply_script_limits(
+              NULL, SCRIPT_EXECUTION_PROFILE_LAB, 32u, 1u * MIB,
+              512u * 1024u));
     return 0;
 }

@@ -1021,29 +1021,29 @@ static bool selector_to_rule(
     if (parsed == NULL) return false;
     trim(&selector, &length);
     if (length == 0) return true;
-    if (sheet->source_rule_limit_end != 0) {
-        size_t head_limit = sheet->source_rule_head_limit_end != 0
-                            ? sheet->source_rule_head_limit_end
-                            : sheet->source_rule_limit_end;
+    if (sheet->source.rule_limit_end != 0) {
+        size_t head_limit = sheet->source.rule_head_limit_end != 0
+                            ? sheet->source.rule_head_limit_end
+                            : sheet->source.rule_limit_end;
         size_t secondary_limit =
-            sheet->source_rule_secondary_limit_end != 0
-            ? sheet->source_rule_secondary_limit_end
-            : sheet->source_rule_relevant_limit_end;
-        bool in_tail = sheet->source_rule_tail_begin != NULL
-            && selector >= sheet->source_rule_tail_begin
-            && sheet->count < sheet->source_rule_limit_end;
+            sheet->source.rule_secondary_limit_end != 0
+            ? sheet->source.rule_secondary_limit_end
+            : sheet->source.rule_relevant_limit_end;
+        bool in_tail = sheet->source.rule_tail_begin != NULL
+            && selector >= sheet->source.rule_tail_begin
+            && sheet->count < sheet->source.rule_limit_end;
         /* Head/tail rules are admitted regardless of token relevance. For
            the middle, a priority hit also makes the secondary scan redundant.
            Admission order and all three rule ceilings remain unchanged. */
         if (sheet->count >= head_limit && !in_tail) {
-            bool priority = sheet->count < sheet->source_rule_relevant_limit_end
+            bool priority = sheet->count < sheet->source.rule_relevant_limit_end
                 && style_selector_admission_matches_document_tokens(
-                    sheet->source_rule_priority_token_bloom,
-                    sheet->source_rule_priority_token_bloom_words, selector, length);
+                    sheet->source.rule_priority_token_bloom,
+                    sheet->source.rule_priority_token_bloom_words, selector, length);
             bool secondary = !priority && sheet->count < secondary_limit
                 && style_selector_admission_matches_document_tokens(
-                    sheet->source_rule_token_bloom,
-                    sheet->source_rule_token_bloom_words, selector, length);
+                    sheet->source.rule_token_bloom,
+                    sheet->source.rule_token_bloom_words, selector, length);
             if (!priority && !secondary) {
                 STYLE_DIAGNOSTIC_COUNT(sheet, diagnostic_selector_drops);
                 return true;
@@ -1322,8 +1322,569 @@ static bool supports_positive_integer(const char *value, size_t length)
     return result != 0;
 }
 
+/* @supports value checks for the sparse properties, one per validator
+   named in STYLE_SPARSE_PROPERTIES. Each accepts exactly what the
+   retained consumer of that property understands. */
+static bool sparse_supports_user_select(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "text")
+        || span_case_equal(value, value_length, "none")
+        || span_case_equal(value, value_length, "all");
+}
+
+static bool sparse_supports_touch_action(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "none")
+        || span_case_equal(value, value_length, "manipulation")
+        || span_case_equal(value, value_length, "pan-x")
+        || span_case_equal(value, value_length, "pan-y")
+        || span_case_equal(value, value_length, "pan-x pan-y")
+        || span_case_equal(value, value_length, "pan-y pan-x");
+}
+
+static bool sparse_supports_text_size_adjust(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    if (span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "none")) return true;
+    char text[32];
+    if (value_length < 2 || value_length >= sizeof(text)) return false;
+    memcpy(text, value, value_length);
+    text[value_length] = '\0';
+    char *end = NULL;
+    double number = strtod(text, &end);
+    return end != text && *end == '%' && end[1] == '\0'
+        && isfinite(number) && number >= 0.0 && number <= 250.0;
+}
+
+static bool sparse_supports_resize(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "none")
+        || span_case_equal(value, value_length, "both")
+        || span_case_equal(value, value_length, "horizontal")
+        || span_case_equal(value, value_length, "vertical")
+        || span_case_equal(value, value_length, "block")
+        || span_case_equal(value, value_length, "inline");
+}
+
+static bool sparse_supports_text_wrap(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "wrap")
+        || span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "balance")
+        || span_case_equal(value, value_length, "pretty");
+}
+
+static bool sparse_supports_contain_intrinsic_size(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    size_t cursor = 0, start = 0, end = 0, lengths = 0;
+    while (style_next_top_level_token(
+               value, value_length, &cursor, &start, &end)) {
+        if (span_case_equal(value + start, end - start, "auto")) {
+            continue;
+        }
+        if (++lengths > 2
+            || !retained_presentation_length(
+                sheet, value + start, end - start, false)) {
+            return false;
+        }
+    }
+    return lengths == 1 || lengths == 2;
+}
+
+static bool sparse_supports_isolation(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "isolate");
+}
+
+static bool sparse_supports_logical_radius(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return retained_presentation_length(sheet, value, value_length, false);
+}
+
+static bool sparse_supports_translate(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    if (span_case_equal(value, value_length, "none")) return true;
+    size_t cursor = 0, start = 0, end = 0, count = 0;
+    while (style_next_top_level_token(
+               value, value_length, &cursor, &start, &end)) {
+        if (++count > 2
+            || !retained_presentation_length(
+                   sheet, value + start, end - start, true)) return false;
+    }
+    return count == 1 || count == 2;
+}
+
+/* Exactly what the retained display list applies. */
+static bool sparse_supports_scale(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    char text[STYLE_RETAINED_VALUE_CAPACITY];
+    if (value_length == 0 || value_length >= sizeof(text)) return false;
+    memcpy(text, value, value_length);
+    text[value_length] = '\0';
+    uint16_t scale = 0;
+    return style_scale_value_q14(text, &scale);
+}
+
+static bool sparse_supports_rotate(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    char text[STYLE_RETAINED_VALUE_CAPACITY];
+    if (value_length == 0 || value_length >= sizeof(text)) return false;
+    memcpy(text, value, value_length);
+    text[value_length] = '\0';
+    uint8_t quadrants = 0;
+    return style_rotate_value_quadrants(text, &quadrants);
+}
+
+static bool sparse_supports_cursor(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    static const char *const values[] = {
+        "auto", "default", "none", "context-menu", "help", "pointer",
+        "progress", "wait", "cell", "crosshair", "text",
+        "vertical-text", "alias", "copy", "move", "no-drop",
+        "not-allowed", "grab", "grabbing", "e-resize", "n-resize",
+        "ne-resize", "nw-resize", "s-resize", "se-resize",
+        "sw-resize", "w-resize", "ew-resize", "ns-resize",
+        "nesw-resize", "nwse-resize", "col-resize", "row-resize",
+        "all-scroll", "zoom-in", "zoom-out"
+    };
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        if (span_case_equal(value, value_length, values[i])) return true;
+    }
+    return false;
+}
+
+static bool sparse_supports_scroll_behavior(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "smooth");
+}
+
+static bool sparse_supports_scrollbar_width(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "thin")
+        || span_case_equal(value, value_length, "none");
+}
+
+static bool sparse_supports_scrollbar_color(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    if (span_case_equal(value, value_length, "auto")) return true;
+    size_t split = 0;
+    while (split < value_length
+           && !isspace((unsigned char) value[split])) split++;
+    while (split < value_length
+           && isspace((unsigned char) value[split])) split++;
+    if (split == 0 || split >= value_length) return false;
+    uint32_t ignored_color = 0;
+    uint8_t ignored_alpha = 0;
+    return style_parse_color_with_alpha(
+               sheet, value, split, &ignored_color, &ignored_alpha)
+        && style_parse_color_with_alpha(
+               sheet, value + split, value_length - split,
+               &ignored_color, &ignored_alpha);
+}
+
+static bool sparse_overscroll_keyword(const char *value, size_t length)
+{
+    return span_case_equal(value, length, "auto")
+        || span_case_equal(value, length, "contain")
+        || span_case_equal(value, length, "none")
+        || span_case_equal(value, length, "chain");
+}
+
+static bool sparse_supports_overscroll_behavior_axis(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return sparse_overscroll_keyword(value, value_length);
+}
+
+/* The shorthand takes one or two keywords. */
+static bool sparse_supports_overscroll_behavior(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    size_t split = 0;
+    while (split < value_length
+           && !isspace((unsigned char) value[split])) split++;
+    size_t first_length = split;
+    while (split < value_length
+           && isspace((unsigned char) value[split])) split++;
+    return sparse_overscroll_keyword(value, first_length)
+        && (split >= value_length
+            || sparse_overscroll_keyword(
+                   value + split, value_length - split));
+}
+
+static bool sparse_supports_scroll_snap_type(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    size_t split = 0;
+    while (split < value_length
+           && !isspace((unsigned char) value[split])) split++;
+    bool axis = span_case_equal(value, split, "none")
+        || span_case_equal(value, split, "x")
+        || span_case_equal(value, split, "y")
+        || span_case_equal(value, split, "block")
+        || span_case_equal(value, split, "inline")
+        || span_case_equal(value, split, "both");
+    while (split < value_length
+           && isspace((unsigned char) value[split])) split++;
+    return axis && (split == value_length
+        || span_case_equal(value + split, value_length - split,
+                           "mandatory")
+        || span_case_equal(value + split, value_length - split,
+                           "proximity"));
+}
+
+static bool sparse_snap_alignment(const char *value, size_t length)
+{
+    return span_case_equal(value, length, "none")
+        || span_case_equal(value, length, "start")
+        || span_case_equal(value, length, "end")
+        || span_case_equal(value, length, "center");
+}
+
+static bool sparse_supports_scroll_snap_align(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    size_t split = 0;
+    while (split < value_length
+           && !isspace((unsigned char) value[split])) split++;
+    bool first = sparse_snap_alignment(value, split);
+    while (split < value_length
+           && isspace((unsigned char) value[split])) split++;
+    return first && (split == value_length
+        || sparse_snap_alignment(value + split, value_length - split));
+}
+
+static bool sparse_supports_scroll_snap_stop(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "normal")
+        || span_case_equal(value, value_length, "always");
+}
+
+/* One to four lengths; scroll-padding also takes `auto`, scroll-margin
+   also takes negative lengths. */
+static bool sparse_scroll_box_lengths(
+    Stylesheet *sheet, const char *value, size_t value_length,
+    bool padding)
+{
+    size_t cursor = 0, start = 0, end = 0, count = 0;
+    while (style_next_top_level_token(
+               value, value_length, &cursor, &start, &end)) {
+        if (++count > 4
+            || (!(padding
+                  && span_case_equal(value + start, end - start, "auto"))
+                && !retained_presentation_length(
+                    sheet, value + start, end - start, !padding))) {
+            return false;
+        }
+    }
+    return count != 0;
+}
+
+static bool sparse_supports_scroll_padding(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return sparse_scroll_box_lengths(sheet, value, value_length, true);
+}
+
+static bool sparse_supports_scroll_margin(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return sparse_scroll_box_lengths(sheet, value, value_length, false);
+}
+
+static bool sparse_supports_scroll_padding_side(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return span_case_equal(value, value_length, "auto")
+        || retained_presentation_length(
+            sheet, value, value_length, false);
+}
+
+static bool sparse_supports_scroll_margin_side(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return retained_presentation_length(sheet, value, value_length, true);
+}
+
+static bool sparse_container_type_keyword(const char *value, size_t length)
+{
+    return span_case_equal(value, length, "normal")
+        || span_case_equal(value, length, "size")
+        || span_case_equal(value, length, "inline-size");
+}
+
+static bool sparse_supports_container_type(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return sparse_container_type_keyword(value, value_length);
+}
+
+static bool sparse_supports_container_name(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "none")
+        || supports_ascii_identifier_list(value, value_length);
+}
+
+static bool sparse_supports_container(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    if (span_case_equal(value, value_length, "none")) return true;
+    const char *slash = memchr(value, '/', value_length);
+    /* Without a slash the token is a container name, even when it is
+       spelled `inline-size`; the type remains its initial `normal`. */
+    if (slash == NULL) {
+        return supports_ascii_identifier_list(value, value_length);
+    }
+    const char *container_name = value;
+    size_t container_name_length = (size_t) (slash - value);
+    const char *container_type = slash + 1;
+    size_t container_type_length =
+        value_length - container_name_length - 1u;
+    trim(&container_name, &container_name_length);
+    trim(&container_type, &container_type_length);
+    return supports_ascii_identifier_list(
+               container_name, container_name_length)
+        && sparse_container_type_keyword(
+               container_type, container_type_length);
+}
+
+static bool sparse_supports_column_count(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || supports_positive_integer(value, value_length);
+}
+
+static bool sparse_supports_column_width(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return span_case_equal(value, value_length, "auto")
+        || retained_presentation_length(
+            sheet, value, value_length, false);
+}
+
+static bool sparse_supports_column_gap(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    return span_case_equal(value, value_length, "normal")
+        || retained_presentation_length(
+            sheet, value, value_length, false);
+}
+
+/* A count, a width, or one of each in either order. */
+static bool sparse_supports_columns(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    size_t separator = 0;
+    while (separator < value_length
+           && !isspace((unsigned char) value[separator])) separator++;
+    const char *first = value;
+    size_t first_length = separator;
+    while (separator < value_length
+           && isspace((unsigned char) value[separator])) separator++;
+    if (separator == value_length) {
+        return span_case_equal(first, first_length, "auto")
+            || supports_positive_integer(first, first_length)
+            || retained_presentation_length(
+                sheet, first, first_length, false);
+    }
+    const char *second = value + separator;
+    size_t second_length = value_length - separator;
+    return (sparse_supports_column_count(sheet, first, first_length)
+            && sparse_supports_column_width(sheet, second, second_length))
+        || (sparse_supports_column_count(sheet, second, second_length)
+            && sparse_supports_column_width(sheet, first, first_length));
+}
+
+/* The values below are those the modern resolver
+   (style_apply_modern_properties) acts on, or accepts and resolves to a
+   stable flat equivalent. */
+static bool sparse_supports_hyphens(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "none")
+        || span_case_equal(value, value_length, "manual")
+        || span_case_equal(value, value_length, "auto");
+}
+
+static bool sparse_supports_font_kerning(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "normal")
+        || span_case_equal(value, value_length, "none");
+}
+
+static bool sparse_supports_text_rendering(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "optimizeSpeed")
+        || span_case_equal(value, value_length, "optimizeLegibility")
+        || span_case_equal(value, value_length, "geometricPrecision");
+}
+
+static bool sparse_supports_tab_size(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    if (value_length == 0 || value_length > 6) return false;
+    for (size_t i = 0; i < value_length; i++)
+        if (!isdigit((unsigned char) value[i])) return false;
+    return true;
+}
+
+static bool sparse_supports_mix_blend_mode(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "normal")
+        || span_case_equal(value, value_length, "multiply")
+        || span_case_equal(value, value_length, "screen")
+        || span_case_equal(value, value_length, "darken");
+}
+
+static bool sparse_supports_backdrop_filter(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    if (span_case_equal(value, value_length, "none")) return true;
+    if (value_length < 7 || strncasecmp(value, "blur(", 5) != 0
+        || value[value_length - 1] != ')') return false;
+    return retained_presentation_length(
+        sheet, value + 5, value_length - 6, false);
+}
+
+static bool sparse_supports_backface_visibility(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "visible")
+        || span_case_equal(value, value_length, "hidden");
+}
+
+static bool sparse_supports_transform_style(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "flat")
+        || span_case_equal(value, value_length, "preserve-3d");
+}
+
+static bool sparse_supports_color_scheme(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    size_t cursor = 0, start = 0, end = 0, count = 0;
+    while (style_next_top_level_token(
+               value, value_length, &cursor, &start, &end)) {
+        const char *word = value + start;
+        size_t word_length = end - start;
+        if (!span_case_equal(word, word_length, "normal")
+            && !span_case_equal(word, word_length, "light")
+            && !span_case_equal(word, word_length, "dark")
+            && !span_case_equal(word, word_length, "only")) return false;
+        count++;
+    }
+    return count != 0;
+}
+
+static bool sparse_supports_border_image_source(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    if (span_case_equal(value, value_length, "none")) return true;
+    StyleGradient gradient = {0};
+    size_t gradient_length = value_length;
+    unsigned nesting = 0;
+    for (size_t at = 0; at < value_length; at++) {
+        if (value[at] == '(') nesting++;
+        else if (value[at] == ')' && nesting != 0 && --nesting == 0) {
+            gradient_length = at + 1u;
+            break;
+        }
+    }
+    return style_parse_gradient(sheet, value, gradient_length, &gradient)
+        && gradient.stop_count != 0;
+}
+
+/* Retained for getComputedStyle; the flat border approximation takes its
+   geometry from the ordinary border properties. */
+static bool sparse_supports_border_image_geometry(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    (void) value;
+    return value_length != 0;
+}
+
+static bool sparse_supports_break_inside(
+    Stylesheet *sheet, const char *value, size_t value_length)
+{
+    (void) sheet;
+    return span_case_equal(value, value_length, "auto")
+        || span_case_equal(value, value_length, "avoid")
+        || span_case_equal(value, value_length, "avoid-page")
+        || span_case_equal(value, value_length, "avoid-column");
+}
+
+typedef bool (*StyleSparseSupports)(
+    Stylesheet *sheet, const char *value, size_t value_length);
+
+static const StyleSparseSupports style_sparse_supports[] = {
+#define STYLE_SPARSE_SUPPORTS(name, alias, modern, typography, presence, \
+                              validator) \
+    sparse_supports_##validator,
+    STYLE_SPARSE_PROPERTIES(STYLE_SPARSE_SUPPORTS)
+#undef STYLE_SPARSE_SUPPORTS
+};
+
+/* `property` is a STYLE_SPARSE_PROPERTIES row index. */
 static bool supports_retained_layout_value(
-    Stylesheet *sheet, const char *name, size_t name_length,
+    Stylesheet *sheet, size_t property,
     const char *value, size_t value_length)
 {
     if (span_case_equal(value, value_length, "inherit")
@@ -1333,410 +1894,9 @@ static bool supports_retained_layout_value(
         || span_case_equal(value, value_length, "revert-layer")) {
         return true;
     }
-    /* name is the standard spelling: retained_layout_property() maps the
-       vendor aliases before this runs. */
-    if (span_case_equal(name, name_length, "user-select")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "text")
-            || span_case_equal(value, value_length, "none")
-            || span_case_equal(value, value_length, "all");
-    }
-    if (span_case_equal(name, name_length, "touch-action")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "none")
-            || span_case_equal(value, value_length, "manipulation")
-            || span_case_equal(value, value_length, "pan-x")
-            || span_case_equal(value, value_length, "pan-y")
-            || span_case_equal(value, value_length, "pan-x pan-y")
-            || span_case_equal(value, value_length, "pan-y pan-x");
-    }
-    if (span_case_equal(name, name_length, "text-size-adjust")) {
-        if (span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "none")) return true;
-        char text[32];
-        if (value_length < 2 || value_length >= sizeof(text)) return false;
-        memcpy(text, value, value_length);
-        text[value_length] = '\0';
-        char *end = NULL;
-        double number = strtod(text, &end);
-        return end != text && *end == '%' && end[1] == '\0'
-            && isfinite(number) && number >= 0.0 && number <= 250.0;
-    }
-    if (span_case_equal(name, name_length, "resize")) {
-        return span_case_equal(value, value_length, "none")
-            || span_case_equal(value, value_length, "both")
-            || span_case_equal(value, value_length, "horizontal")
-            || span_case_equal(value, value_length, "vertical")
-            || span_case_equal(value, value_length, "block")
-            || span_case_equal(value, value_length, "inline");
-    }
-    if (span_case_equal(name, name_length, "text-wrap")
-        || span_case_equal(name, name_length, "text-wrap-style")) {
-        return span_case_equal(value, value_length, "wrap")
-            || span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "balance")
-            || span_case_equal(value, value_length, "pretty");
-    }
-    if (span_case_equal(name, name_length, "contain-intrinsic-size")) {
-        size_t cursor = 0, start = 0, end = 0, lengths = 0;
-        while (style_next_top_level_token(
-                   value, value_length, &cursor, &start, &end)) {
-            if (span_case_equal(value + start, end - start, "auto")) {
-                continue;
-            }
-            if (++lengths > 2
-                || !retained_presentation_length(
-                    sheet, value + start, end - start, false)) {
-                return false;
-            }
-        }
-        return lengths == 1 || lengths == 2;
-    }
-    if (span_case_equal(name, name_length, "isolation")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "isolate");
-    }
-    if (span_case_equal(name, name_length, "border-start-start-radius")
-        || span_case_equal(name, name_length, "border-start-end-radius")
-        || span_case_equal(name, name_length, "border-end-start-radius")
-        || span_case_equal(name, name_length, "border-end-end-radius")) {
-        return retained_presentation_length(
-            sheet, value, value_length, false);
-    }
-    if (span_case_equal(name, name_length, "translate")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level_token(
-                   value, value_length, &cursor, &start, &end)) {
-            if (++count > 2
-                || !retained_presentation_length(
-                       sheet, value + start, end - start, true)) return false;
-        }
-        return count == 1 || count == 2;
-    }
-    if (span_case_equal(name, name_length, "scale")
-        || span_case_equal(name, name_length, "rotate")) {
-        /* Exactly what the retained display list applies. */
-        char text[STYLE_RETAINED_VALUE_CAPACITY];
-        if (value_length == 0 || value_length >= sizeof(text)) return false;
-        memcpy(text, value, value_length);
-        text[value_length] = '\0';
-        uint16_t scale = 0;
-        uint8_t quadrants = 0;
-        return name_length == 5
-            ? style_scale_value_q14(text, &scale)
-            : style_rotate_value_quadrants(text, &quadrants);
-    }
-    if (span_case_equal(name, name_length, "cursor")) {
-        static const char *const values[] = {
-            "auto", "default", "none", "context-menu", "help", "pointer",
-            "progress", "wait", "cell", "crosshair", "text",
-            "vertical-text", "alias", "copy", "move", "no-drop",
-            "not-allowed", "grab", "grabbing", "e-resize", "n-resize",
-            "ne-resize", "nw-resize", "s-resize", "se-resize",
-            "sw-resize", "w-resize", "ew-resize", "ns-resize",
-            "nesw-resize", "nwse-resize", "col-resize", "row-resize",
-            "all-scroll", "zoom-in", "zoom-out"
-        };
-        for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
-            if (span_case_equal(value, value_length, values[i])) return true;
-        }
-        return false;
-    }
-    if (span_case_equal(name, name_length, "scroll-behavior")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "smooth");
-    }
-    if (span_case_equal(name, name_length, "scrollbar-width")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "thin")
-            || span_case_equal(value, value_length, "none");
-    }
-    if (span_case_equal(name, name_length, "scrollbar-color")) {
-        if (span_case_equal(value, value_length, "auto")) return true;
-        size_t split = 0;
-        while (split < value_length
-               && !isspace((unsigned char) value[split])) split++;
-        while (split < value_length
-               && isspace((unsigned char) value[split])) split++;
-        if (split == 0 || split >= value_length) return false;
-        uint32_t ignored_color = 0;
-        uint8_t ignored_alpha = 0;
-        return style_parse_color_with_alpha(
-                   sheet, value, split, &ignored_color, &ignored_alpha)
-            && style_parse_color_with_alpha(
-                   sheet, value + split, value_length - split,
-                   &ignored_color, &ignored_alpha);
-    }
-    if (span_case_equal(name, name_length, "overscroll-behavior")
-        || span_case_equal(name, name_length, "overscroll-behavior-x")
-        || span_case_equal(name, name_length, "overscroll-behavior-y")
-        || span_case_equal(name, name_length, "overscroll-behavior-inline")
-        || span_case_equal(name, name_length, "overscroll-behavior-block")) {
-        const char *first = value;
-        size_t first_length = value_length;
-        const char *second = NULL;
-        size_t second_length = 0;
-        if (span_case_equal(name, name_length, "overscroll-behavior")) {
-            size_t split = 0;
-            while (split < value_length
-                   && !isspace((unsigned char) value[split])) split++;
-            first_length = split;
-            while (split < value_length
-                   && isspace((unsigned char) value[split])) split++;
-            if (split < value_length) {
-                second = value + split;
-                second_length = value_length - split;
-            }
-        }
-        bool first_valid =
-            span_case_equal(first, first_length, "auto")
-            || span_case_equal(first, first_length, "contain")
-            || span_case_equal(first, first_length, "none")
-            || span_case_equal(first, first_length, "chain");
-        return first_valid
-            && (second == NULL
-                || span_case_equal(second, second_length, "auto")
-                || span_case_equal(second, second_length, "contain")
-                || span_case_equal(second, second_length, "none")
-                || span_case_equal(second, second_length, "chain"));
-    }
-    if (span_case_equal(name, name_length, "scroll-snap-type")) {
-        size_t split = 0;
-        while (split < value_length
-               && !isspace((unsigned char) value[split])) split++;
-        bool axis = span_case_equal(value, split, "none")
-            || span_case_equal(value, split, "x")
-            || span_case_equal(value, split, "y")
-            || span_case_equal(value, split, "block")
-            || span_case_equal(value, split, "inline")
-            || span_case_equal(value, split, "both");
-        while (split < value_length
-               && isspace((unsigned char) value[split])) split++;
-        return axis && (split == value_length
-            || span_case_equal(value + split, value_length - split,
-                               "mandatory")
-            || span_case_equal(value + split, value_length - split,
-                               "proximity"));
-    }
-    if (span_case_equal(name, name_length, "scroll-snap-align")) {
-        size_t split = 0;
-        while (split < value_length
-               && !isspace((unsigned char) value[split])) split++;
-        bool first = span_case_equal(value, split, "none")
-            || span_case_equal(value, split, "start")
-            || span_case_equal(value, split, "end")
-            || span_case_equal(value, split, "center");
-        while (split < value_length
-               && isspace((unsigned char) value[split])) split++;
-        return first && (split == value_length
-            || span_case_equal(value + split, value_length - split, "none")
-            || span_case_equal(value + split, value_length - split, "start")
-            || span_case_equal(value + split, value_length - split, "end")
-            || span_case_equal(value + split, value_length - split, "center"));
-    }
-    if (span_case_equal(name, name_length, "scroll-snap-stop")) {
-        return span_case_equal(value, value_length, "normal")
-            || span_case_equal(value, value_length, "always");
-    }
-    if (span_case_equal(name, name_length, "scroll-padding")
-        || span_case_equal(name, name_length, "scroll-margin")) {
-        size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level_token(
-                   value, value_length, &cursor, &start, &end)) {
-            if (++count > 4
-                || (!(span_case_equal(
-                          name, name_length, "scroll-padding")
-                      && span_case_equal(
-                          value + start, end - start, "auto"))
-                    && !retained_presentation_length(
-                        sheet, value + start, end - start,
-                        span_case_equal(
-                            name, name_length, "scroll-margin")))) {
-                return false;
-            }
-        }
-        return count != 0;
-    }
-    if (span_case_equal(name, name_length, "scroll-padding-top")
-        || span_case_equal(name, name_length, "scroll-padding-right")
-        || span_case_equal(name, name_length, "scroll-padding-bottom")
-        || span_case_equal(name, name_length, "scroll-padding-left")) {
-        return span_case_equal(value, value_length, "auto")
-            || retained_presentation_length(
-                sheet, value, value_length, false);
-    }
-    if (span_case_equal(name, name_length, "scroll-margin-top")
-        || span_case_equal(name, name_length, "scroll-margin-right")
-        || span_case_equal(name, name_length, "scroll-margin-bottom")
-        || span_case_equal(name, name_length, "scroll-margin-left")) {
-        return retained_presentation_length(
-            sheet, value, value_length, true);
-    }
-    if (span_case_equal(name, name_length, "container-type")) {
-        return span_case_equal(value, value_length, "normal")
-            || span_case_equal(value, value_length, "size")
-            || span_case_equal(value, value_length, "inline-size");
-    }
-    if (span_case_equal(name, name_length, "container-name")) {
-        return span_case_equal(value, value_length, "none")
-            || supports_ascii_identifier_list(value, value_length);
-    }
-    if (span_case_equal(name, name_length, "container")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        const char *slash = memchr(value, '/', value_length);
-        /* Without a slash the token is a container name, even when it is
-           spelled `inline-size`; the type remains its initial `normal`. */
-        if (slash == NULL) {
-            return supports_ascii_identifier_list(value, value_length);
-        }
-        const char *container_name = value;
-        size_t container_name_length = (size_t) (slash - value);
-        const char *container_type = slash + 1;
-        size_t container_type_length =
-            value_length - container_name_length - 1u;
-        trim(&container_name, &container_name_length);
-        trim(&container_type, &container_type_length);
-        return supports_ascii_identifier_list(
-                   container_name, container_name_length)
-            && (span_case_equal(
-                    container_type, container_type_length, "normal")
-                || span_case_equal(
-                    container_type, container_type_length, "size")
-                || span_case_equal(
-                    container_type, container_type_length, "inline-size"));
-    }
-    if (span_case_equal(name, name_length, "column-count")) {
-        return span_case_equal(value, value_length, "auto")
-            || supports_positive_integer(value, value_length);
-    }
-    if (span_case_equal(name, name_length, "column-width")) {
-        return span_case_equal(value, value_length, "auto")
-            || retained_presentation_length(
-                sheet, value, value_length, false);
-    }
-    if (span_case_equal(name, name_length, "column-gap")) {
-        return span_case_equal(value, value_length, "normal")
-            || retained_presentation_length(
-                sheet, value, value_length, false);
-    }
-    if (span_case_equal(name, name_length, "columns")) {
-        size_t separator = 0;
-        while (separator < value_length
-               && !isspace((unsigned char) value[separator])) separator++;
-        const char *first = value;
-        size_t first_length = separator;
-        while (separator < value_length
-               && isspace((unsigned char) value[separator])) separator++;
-        if (separator == value_length) {
-            return span_case_equal(first, first_length, "auto")
-                || supports_positive_integer(first, first_length)
-                || retained_presentation_length(
-                    sheet, first, first_length, false);
-        }
-        const char *second = value + separator;
-        size_t second_length = value_length - separator;
-        return ((span_case_equal(first, first_length, "auto")
-                 || supports_positive_integer(first, first_length))
-                && (span_case_equal(second, second_length, "auto")
-                    || retained_presentation_length(
-                        sheet, second, second_length, false)))
-            || ((span_case_equal(second, second_length, "auto")
-                 || supports_positive_integer(second, second_length))
-                && (span_case_equal(first, first_length, "auto")
-                    || retained_presentation_length(
-                        sheet, first, first_length, false)));
-    }
-    /* Values the sparse resolver (style_apply_modern_properties) acts on,
-       or accepts and resolves to a stable flat equivalent. */
-    if (span_case_equal(name, name_length, "hyphens")) {
-        return span_case_equal(value, value_length, "none")
-            || span_case_equal(value, value_length, "manual")
-            || span_case_equal(value, value_length, "auto");
-    }
-    if (span_case_equal(name, name_length, "font-kerning")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "normal")
-            || span_case_equal(value, value_length, "none");
-    }
-    if (span_case_equal(name, name_length, "text-rendering")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "optimizeSpeed")
-            || span_case_equal(value, value_length, "optimizeLegibility")
-            || span_case_equal(value, value_length, "geometricPrecision");
-    }
-    if (span_case_equal(name, name_length, "tab-size")) {
-        if (value_length == 0 || value_length > 6) return false;
-        for (size_t i = 0; i < value_length; i++)
-            if (!isdigit((unsigned char) value[i])) return false;
-        return true;
-    }
-    if (span_case_equal(name, name_length, "mix-blend-mode")) {
-        return span_case_equal(value, value_length, "normal")
-            || span_case_equal(value, value_length, "multiply")
-            || span_case_equal(value, value_length, "screen")
-            || span_case_equal(value, value_length, "darken");
-    }
-    if (span_case_equal(name, name_length, "backdrop-filter")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        if (value_length < 7 || strncasecmp(value, "blur(", 5) != 0
-            || value[value_length - 1] != ')') return false;
-        return retained_presentation_length(
-            sheet, value + 5, value_length - 6, false);
-    }
-    if (span_case_equal(name, name_length, "backface-visibility")) {
-        return span_case_equal(value, value_length, "visible")
-            || span_case_equal(value, value_length, "hidden");
-    }
-    if (span_case_equal(name, name_length, "transform-style")) {
-        return span_case_equal(value, value_length, "flat")
-            || span_case_equal(value, value_length, "preserve-3d");
-    }
-    if (span_case_equal(name, name_length, "color-scheme")) {
-        size_t cursor = 0, start = 0, end = 0, count = 0;
-        while (style_next_top_level_token(
-                   value, value_length, &cursor, &start, &end)) {
-            const char *word = value + start;
-            size_t word_length = end - start;
-            if (!span_case_equal(word, word_length, "normal")
-                && !span_case_equal(word, word_length, "light")
-                && !span_case_equal(word, word_length, "dark")
-                && !span_case_equal(word, word_length, "only")) return false;
-            count++;
-        }
-        return count != 0;
-    }
-    if (span_case_equal(name, name_length, "border-image")
-        || span_case_equal(name, name_length, "border-image-source")) {
-        if (span_case_equal(value, value_length, "none")) return true;
-        StyleGradient gradient = {0};
-        size_t gradient_length = value_length;
-        unsigned nesting = 0;
-        for (size_t at = 0; at < value_length; at++) {
-            if (value[at] == '(') nesting++;
-            else if (value[at] == ')' && nesting != 0 && --nesting == 0) {
-                gradient_length = at + 1u;
-                break;
-            }
-        }
-        return style_parse_gradient(sheet, value, gradient_length, &gradient)
-            && gradient.stop_count != 0;
-    }
-    if (span_case_equal(name, name_length, "border-image-slice")
-        || span_case_equal(name, name_length, "border-image-width")
-        || span_case_equal(name, name_length, "border-image-outset")
-        || span_case_equal(name, name_length, "border-image-repeat")) {
-        /* Retained for getComputedStyle; the flat border approximation
-           takes its geometry from the ordinary border properties. */
-        return value_length != 0;
-    }
-    if (span_case_equal(name, name_length, "break-inside")) {
-        return span_case_equal(value, value_length, "auto")
-            || span_case_equal(value, value_length, "avoid")
-            || span_case_equal(value, value_length, "avoid-page")
-            || span_case_equal(value, value_length, "avoid-column");
-    }
-    return false;
+    return property < sizeof(style_sparse_supports)
+                          / sizeof(style_sparse_supports[0])
+        && style_sparse_supports[property](sheet, value, value_length);
 }
 
 static bool supports_word_at(const char *text, size_t length, size_t at,
@@ -1946,11 +2106,10 @@ static bool supports_matches_depth(Stylesheet *sheet, const char *text,
         return retained_presentation_value_supported(
             sheet, name, name_length, value, value_length);
     }
-    const char *retained_name = retained_layout_property(name, name_length);
-    if (retained_name != NULL) {
+    int sparse = style_sparse_property_index(name, name_length);
+    if (sparse >= 0) {
         return supports_retained_layout_value(
-            sheet, retained_name, strlen(retained_name),
-            value, value_length);
+            sheet, (size_t) sparse, value, value_length);
     }
     if (supports_variable_syntax(value, value_length)) {
         return supports_implemented_property(sheet, name, name_length);

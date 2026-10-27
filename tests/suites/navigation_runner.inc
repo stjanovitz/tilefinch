@@ -80,6 +80,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_display_retarget_follows_painted_size);
         RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
         RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
+        RUN_TEST(test_svg_nesting_limits_are_limits);
         puts("image retarget tests passed");
         return 0;
     }
@@ -121,6 +122,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_retarget_releases_each_cached_pixel_lease);
     RUN_TEST(test_svg_retarget_rasterizes_at_painted_size);
     RUN_TEST(test_svg_oversize_initial_raster_preserves_intrinsic_size);
+    RUN_TEST(test_svg_nesting_limits_are_limits);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
     RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
     RUN_TEST(test_progressive_preview_waits_for_external_visuals);
@@ -172,14 +174,15 @@ int main(int argc, char **argv)
     RUN_TEST(test_invalid_meta_referrer_preserves_response_policy);
     RUN_TEST(test_rebuild_without_history_keeps_external_css);
     RUN_TEST(test_finalize_cancellation_is_transactional);
-    RUN_TEST(test_streamed_candidate_remote_binding_isolation);
     RUN_TEST(test_candidate_cancel_preserves_late_incumbent_dom);
     RUN_TEST(test_bounded_finalize_preserves_history_pruning);
+    RUN_TEST(test_relayout_plan_classifies_journal);
     RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
     RUN_TEST(test_relayout_damage_skips_unchanged_middle);
     RUN_TEST(test_provisional_relayout_completes_in_idle_work);
     RUN_TEST(test_extension_reaching_the_end_queues_discovered_visuals);
     RUN_TEST(test_candidate_hook_set_is_transactional);
+    RUN_TEST(test_commit_phase_refusals_keep_incumbent);
     RUN_TEST(test_script_oom_retains_usable_target);
     RUN_TEST(test_late_script_oom_reveals_staged_page_shell);
     RUN_TEST(test_caught_large_allocation_retires_staged_page_shell);
@@ -214,7 +217,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_dynamic_stylesheet_href_base_and_reinsert_lifecycle);
     RUN_TEST(test_low_memory_external_script_incumbent_falls_back);
     RUN_TEST(test_low_memory_replacement_failure_boundaries);
-    RUN_TEST(test_sectioned_path);
     RUN_TEST(test_authoritative_layout_resumes_across_finalize_ticks);
     RUN_TEST(test_resumable_layout_cancel_preserves_incumbent);
     RUN_TEST(test_response_headers_precede_parser_script_and_viewport);
@@ -227,8 +229,6 @@ int main(int argc, char **argv)
     RUN_TEST(test_compiled_stylesheet_cache_rechecks_link_authority);
     RUN_TEST(test_critical_ch_body_is_not_page_visible);
     RUN_TEST(test_redirected_critical_ch_retries_final_origin);
-    RUN_TEST(test_safe_section_before_eof);
-    RUN_TEST(test_mismatched_close_is_not_sealed);
     RUN_TEST(test_canvas_surface_survives_and_updates_without_relayout);
     RUN_TEST(test_canvas_fallback_text_mutation_remains_replaced);
     RUN_TEST(test_canvas_oversized_dimensions_are_bounded);
@@ -236,15 +236,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_canvas_draw_image_accepts_loaded_html_image);
     RUN_TEST(test_image_load_tasks_follow_publication);
     RUN_TEST(test_detached_canvas_publishes_when_inserted);
-    RUN_TEST(test_script_frontier_snapshot_survives_author_mutation);
     RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);
     RUN_TEST(test_document_script_refresh_failure_stops_following_scripts);
-    RUN_TEST(test_script_frontier_skips_destroyed_snapshot_nodes);
-    RUN_TEST(test_script_frontier_snapshot_capacity_is_explicit);
-    RUN_TEST(test_preserved_runtime_retires_replaced_document);
     RUN_TEST(test_iframe_discovery_weak_handle_survives_reclaim);
-    RUN_TEST(test_transient_document_survives_active_rebind_until_detach);
-    RUN_TEST(test_preserved_runtime_dynamic_import_owns_scheduler);
     RUN_TEST(test_delayed_import_after_module_pipeline_failure);
 #undef RUN_TEST
     puts("navigation load tests passed");

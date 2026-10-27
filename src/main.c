@@ -17,16 +17,12 @@
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/render.h"
 #include "tilefinch/resources.h"
-#include "tilefinch/section_store.h"
-#include "tilefinch/section_router.h"
 #include "tilefinch/style.h"
 
 #define MIB (1024u * 1024u)
 #define KIB 1024u
 #define VIEWPORT_WIDTH 480
 #define VIEWPORT_HEIGHT 272
-#define EXPERIMENTAL_SECTION_BLOCK_BYTES (64u * KIB - 1)
-#define EXPERIMENTAL_SECTION_MAX_BYTES (512u * KIB)
 
 #ifndef TILEFINCH_PROFILE_DIR
 #define TILEFINCH_PROFILE_DIR "profiles"
@@ -76,7 +72,6 @@ static void usage(const char *program)
            "[--capture-http DIR | --replay-http DIR] "
            "[--deterministic-replay-seed N] "
            "[--adaptive-resources | --no-adaptive-resources] "
-           "[--experimental-compressed-sections] [--experimental-section N] "
            "[--skip-js] [--no-render] [--challenge-diagnostic]\n", program);
 }
 
@@ -260,9 +255,6 @@ typedef struct {
     ExternalStylesheetStats external_css;
     ImageResources images;
     FontSet fonts;
-    CompressedSectionStore section_store;
-    SectionStoreStreamBuilder section_stream_builder;
-    SectionRouteStream section_router;
     NavigationSession stress_navigation;
 } LabApplicationContext;
 
@@ -321,9 +313,6 @@ int main(int argc, char **argv)
     bool adaptive_resources_explicit = false;
     bool deterministic_replay_requested = false;
     uint64_t deterministic_replay_seed = 0;
-    bool experimental_compressed_sections = false;
-    bool experimental_section_explicit = false;
-    size_t experimental_section = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
         if (strcmp(argv[i], "--skip-js") == 0) {
@@ -360,10 +349,6 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--challenge-diagnostic") == 0) {
             challenge_diagnostic = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--experimental-compressed-sections") == 0) {
-            experimental_compressed_sections = true;
             continue;
         }
         if (strcmp(argv[i], "--adaptive-resources") == 0) {
@@ -428,18 +413,6 @@ int main(int argc, char **argv)
             deterministic_replay_seed = strtoull(value, NULL, 0);
             deterministic_replay_requested = true;
         }
-        else if (strcmp(argv[i - 1], "--experimental-section") == 0) {
-            char *end = NULL;
-            errno = 0;
-            unsigned long long parsed = strtoull(value, &end, 10);
-            if (value[0] == '-' || end == value || *end != '\0'
-                || errno == ERANGE || parsed > SIZE_MAX) {
-                usage(argv[0]); return 2;
-            }
-            experimental_section = (size_t) parsed;
-            experimental_compressed_sections = true;
-            experimental_section_explicit = true;
-        }
         else if (strcmp(argv[i - 1], "--save-scroll") == 0) {
             unsigned long parsed = strtoul(value, NULL, 10);
             if (save_scroll_count >= sizeof(save_scrolls) / sizeof(save_scrolls[0])
@@ -484,7 +457,6 @@ int main(int argc, char **argv)
         || (capture_http != NULL && replay_http != NULL)
         || (deterministic_replay_requested
             && capture_http == NULL && replay_http == NULL)
-        || (experimental_compressed_sections && navigation_stress != 0)
         || (strcmp(reader_profile, "auto") != 0
             && strcmp(reader_profile, "wikipedia") != 0
             && strcmp(reader_profile, "reddit") != 0
@@ -515,9 +487,6 @@ int main(int argc, char **argv)
 #define external_css (application->external_css)
 #define images (application->images)
 #define fonts (application->fonts)
-#define section_store (application->section_store)
-#define section_stream_builder (application->section_stream_builder)
-#define section_router (application->section_router)
     char trace_error[256] = {0};
     script_runtime_configure_deterministic_replay(
         deterministic_replay_requested, deterministic_replay_seed);
@@ -560,8 +529,6 @@ int main(int argc, char **argv)
     bool adaptive_tiles_reduced = false;
     bool document_already_parsed = false;
     bool external_script_boundary_skipped = false;
-    bool html_is_extracted_fragment = false;
-    bool experimental_sections_active = false;
     size_t source_html_length = 0;
 
     printf("runtime-profile=%s limit_mb=%zu js_limit_mb=%zu tiles=%zu\n",
@@ -611,29 +578,7 @@ int main(int argc, char **argv)
     double phase_ms = now_ms();
     if (network_input) {
         bool fetched = false;
-        if (experimental_compressed_sections) {
-            if (!section_route_stream_begin(
-                    &section_router, &section_stream_builder, &section_store,
-                    &budget, EXPERIMENTAL_SECTION_BLOCK_BYTES,
-                    EXPERIMENTAL_SECTION_MAX_BYTES,
-                    experimental_section_explicit)) {
-                fprintf(stderr, "experimental compressed stream startup failed\n");
-                goto cleanup;
-            }
-            FetchStreamOptions stream = {
-                .on_body = section_route_stream_body,
-                .opaque = &section_router,
-                .chunk_bytes = 16384
-            };
-            fetched = fetch_request_stream_cancelable(
-                &budget, url, NULL, max_download_kb * KIB, 30000,
-                NULL, NULL, &stream, &network_stream_metrics, &fetch);
-            if (fetched && !section_route_stream_finish(&section_router)) {
-                snprintf(fetch.error, sizeof(fetch.error), "%s",
-                         "compressed section stream finalization failed");
-                fetched = false;
-            }
-        } else if (navigation_stress != 0) {
+        if (navigation_stress != 0) {
             fetched = fetch_url(&budget, url, max_download_kb * KIB,
                                 30000, &fetch);
         } else if (!document_parser_begin(&network_parser, &budget)) {
@@ -675,39 +620,14 @@ int main(int argc, char **argv)
             fprintf(stderr, "could not fetch %s: %s\n", url, fetch.error);
             goto cleanup;
         }
-        if (experimental_compressed_sections && !section_router.sectioned) {
-            html = (char *) section_router.buffer;
-            html_length = section_router.length;
-            section_router.buffer = NULL;
-            fetch.data = html;
-            fetch.length = html_length;
-            fetch.capacity = section_router.capacity;
-            printf("experimental-adaptive mode=full-document source=%zu "
-                   "threshold=%zu elements=%zu attributes=%zu depth=%zu\n",
-                   html_length, section_router.byte_threshold,
-                   section_router.element_count, section_router.attribute_count,
-                   section_router.maximum_depth);
-        } else {
-            html = fetch.data;
-            html_length = fetch.length;
-        }
-        experimental_sections_active = experimental_compressed_sections
-            && section_router.sectioned;
-        if (experimental_compressed_sections) {
-            printf("experimental-input bytes=%zu chunks=%zu peak-buffer=%zu "
-                   "mode=%s\n",
-                   html_length, network_stream_metrics.chunks_received,
-                   network_stream_metrics.peak_buffered_bytes,
-                   experimental_sections_active
-                     ? "direct-compressed-stream" : "adaptive-full-document");
-        } else {
-            printf("stream bytes=%zu chunks=%zu peak-buffer=%zu headers=%s\n",
-                   network_stream_metrics.bytes_received,
-                   network_stream_metrics.chunks_received,
-                   network_stream_metrics.peak_buffered_bytes,
-                   network_stream_metrics.headers_delivered ? "yes" : "no");
-        }
-        if (navigation_stress == 0 && !experimental_compressed_sections) {
+        html = fetch.data;
+        html_length = fetch.length;
+        printf("stream bytes=%zu chunks=%zu peak-buffer=%zu headers=%s\n",
+               network_stream_metrics.bytes_received,
+               network_stream_metrics.chunks_received,
+               network_stream_metrics.peak_buffered_bytes,
+               network_stream_metrics.headers_delivered ? "yes" : "no");
+        if (navigation_stress == 0) {
             phase_ms = now_ms();
             if (!document_parser_finish(&network_parser, &document)) {
                 fprintf(stderr, "streaming HTML parser finalization failed\n");
@@ -726,28 +646,9 @@ int main(int argc, char **argv)
         }
     } else {
         html = read_file(&budget, fixture, &html_length);
-        if (html != NULL && experimental_compressed_sections) {
-            SectionRouteStream classifier = {
-                .budget = &budget,
-                .byte_threshold = section_route_stream_threshold(&budget)
-            };
-            section_route_stream_scan(
-                &classifier, (const unsigned char *) html, html_length);
-            experimental_sections_active = experimental_section_explicit
-                || section_route_stream_prefers_sections(
-                       &classifier, html_length);
-            printf("experimental-adaptive mode=%s source=%zu threshold=%zu "
-                   "elements=%zu attributes=%zu depth=%zu fixture=yes\n",
-                   experimental_sections_active ? "sections" : "full-document",
-                   html_length, classifier.byte_threshold,
-                   classifier.element_count, classifier.attribute_count,
-                   classifier.maximum_depth);
-        }
     }
     input_ms = now_ms() - phase_ms;
-    if (html == NULL && !document_already_parsed
-        && !(experimental_sections_active && network_input
-             && section_store.source_length != 0)) {
+    if (html == NULL && !document_already_parsed) {
         fprintf(stderr, "could not read %s\n", fixture);
         goto cleanup;
     }
@@ -755,68 +656,6 @@ int main(int argc, char **argv)
                           ? fetch.effective_url
                           : (network_input ? url : fixture);
     source_html_length = html_length;
-    if (experimental_sections_active) {
-        if (fetch_external_css || fetch_external_images || run_javascript
-            || strcmp(reader_profile, "none") != 0) {
-            printf("experimental-policy javascript=disabled external-css=disabled "
-                   "images=disabled reader-profile=none\n");
-        }
-        run_javascript = false;
-        fetch_external_css = false;
-        fetch_external_images = false;
-        reader_profile = "none";
-        if (!network_input
-            && !section_store_build(&section_store, &budget, html, html_length,
-                                    EXPERIMENTAL_SECTION_BLOCK_BYTES,
-                                    EXPERIMENTAL_SECTION_MAX_BYTES)) {
-            fprintf(stderr, "experimental compressed section indexing failed\n");
-            goto cleanup;
-        }
-        if (experimental_section >= section_store.section_count) {
-            fprintf(stderr, "experimental section %zu is out of range (count=%zu)\n",
-                    experimental_section, section_store.section_count);
-            goto cleanup;
-        }
-        char *fragment = NULL;
-        size_t fragment_length = 0;
-        if (!section_store_extract_html(&section_store, experimental_section,
-                                        &fragment, &fragment_length)) {
-            fprintf(stderr, "experimental section extraction failed\n");
-            goto cleanup;
-        }
-        if (network_input) {
-            budget_free(&budget, fetch.data);
-            fetch.data = NULL;
-            fetch.length = 0;
-            fetch.capacity = 0;
-        } else {
-            budget_free(&budget, html);
-        }
-        html = fragment;
-        html_length = fragment_length;
-        html_is_extracted_fragment = true;
-        const SectionStoreEntry *selected =
-            &section_store.sections[experimental_section];
-        printf("experimental-section-store source=%zu stored=%zu ratio=%.3f "
-               "blocks=%zu compressed=%zu raw=%zu sections=%zu anchors=%zu "
-               "block-bytes=%zu section-cap=%zu\n",
-               section_store.source_length, section_store.stored_length,
-               section_store.source_length == 0 ? 0.0
-                 : (double) section_store.stored_length
-                   / (double) section_store.source_length,
-               section_store.block_count, section_store.compressed_blocks,
-               section_store.raw_blocks, section_store.section_count,
-               section_store.anchor_count,
-               section_store.block_bytes,
-               section_store.maximum_section_bytes);
-        printf("experimental-section selected=%zu source-offset=%u "
-               "source-bytes=%u fragment-bytes=%zu heading-level=%u "
-               "continuation=%s\n",
-               experimental_section, selected->source_offset,
-               selected->source_length, html_length,
-               (unsigned) selected->heading_level,
-               selected->continuation ? "yes" : "no");
-    }
     budget_report(&budget, "input", stdout);
     if (navigation_stress != 0) {
         size_t before_navigation = budget.current;
@@ -1750,8 +1589,6 @@ int main(int argc, char **argv)
 
 cleanup:;
     document_parser_abort(&network_parser);
-    section_route_stream_abort(&section_router);
-    section_store_stream_abort(&section_stream_builder);
     size_t measured_nodes = document.node_count;
     size_t measured_elements = document.element_count;
     int measured_height = layout.height;
@@ -1781,10 +1618,8 @@ cleanup:;
     document_destroy(&document);
     budget_free(&budget, user_css);
     budget_free(&budget, profile_css);
-    if (html_is_extracted_fragment) budget_free(&budget, html);
-    else if (!network_input) budget_free(&budget, html);
+    if (!network_input) budget_free(&budget, html);
     if (network_input) fetch_result_destroy(&fetch);
-    section_store_destroy(&section_store);
     free(scroll_reference);
     budget_free(&budget, frame);
     budget_free(&budget, application);
@@ -1854,6 +1689,3 @@ cleanup:;
 #undef external_css
 #undef images
 #undef fonts
-#undef section_store
-#undef section_stream_builder
-#undef section_router

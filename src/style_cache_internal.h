@@ -14,6 +14,17 @@ bool style_selector_reads_focus(const char *selector);
    SIZE_MAX means the bounded proof could not be completed. */
 size_t style_focus_nonlocal_rules(const Stylesheet *sheet,
     lxb_dom_node_t *node, uint32_t *rules, size_t capacity);
+/* Whether a focus-reading selector reads focus only as :focus,
+   :focus-visible or the focus marker, outside :has() and every other
+   function but :is()/:not()/:where(). Its answer then changes only on the
+   element whose focus moved, and its combinators lead only down and to
+   later siblings: every element it can restyle lies in that element's
+   subtree or a following sibling's subtree. False when unsure. */
+bool style_focus_selector_reaches_forward(const char *selector);
+/* Whether every focus rule's answers live in retained matched-rule lists
+   (no :has(), :scope, :host or shadow scope), so dropping the lists those
+   rules can select, and every computed style, restyles any focus move. */
+bool style_focus_rules_restyle_by_lists(const Stylesheet *sheet);
 bool style_custom_rules_may_select_node(const Stylesheet *sheet,
     const uint32_t *rules, size_t count, lxb_dom_node_t *node);
 
@@ -193,6 +204,21 @@ void style_retained_matches_forget_node(StyleRetainedMatches *table,
 size_t style_retained_matches_drop_selected(
     StyleRetainedMatches *table,
     bool (*selects)(void *opaque, const lxb_dom_node_t *node), void *opaque);
+/* The cascade's side of the table (style_resolve.c). begin opens one
+   element's pending list in the resolve scratch, false when the table is
+   unusable or a nested resolution is already recording; commit stores the
+   pending list for `node`/`pseudo` when it stayed valid. lookup returns a
+   stored list (counting a hit or miss); pseudo_absent is true when no rule
+   of a retained pseudo-element list can supply `content`. */
+bool style_retained_begin(const Stylesheet *sheet);
+void style_retained_commit(const Stylesheet *sheet,
+                           const lxb_dom_node_t *node,
+                           PseudoElement pseudo);
+const StyleRetainedMatchEntry *style_retained_lookup(
+    const Stylesheet *sheet, const lxb_dom_node_t *node,
+    PseudoElement pseudo);
+bool style_retained_pseudo_absent(const Stylesheet *sheet,
+                                  const StyleRetainedMatchEntry *entry);
 
 /* ---- Scoped :has() invalidation (style_has_invalidation.c). -----------
 
@@ -485,6 +511,10 @@ bool style_selector_cooperation_cancelled(const Stylesheet *sheet);
    that no content declaration can create it. This is not a computed-style API. */
 bool style_pseudo_known_absent(const Stylesheet *sheet,
     const lxb_dom_node_t *node, PseudoElement pseudo);
+/* False when no ::before (or ::after) rule of the sheet declares a content
+   that can generate a box, so no element has that pseudo-element: layout
+   need not look it up. Placeholder and other pseudos always answer true. */
+bool style_pseudo_may_generate(const Stylesheet *sheet, PseudoElement pseudo);
 /* Returns a zeroed, non-generated sentinel when absence is proven. Callers
    must test generated_content before using the other fields. */
 ComputedStyle style_for_layout_pseudo(const Stylesheet *sheet,

@@ -651,6 +651,18 @@ static bool test_youtube_player_response_parser(void)
         || playability != YOUTUBE_PLAYABILITY_LOGIN_REQUIRED) {
         return false;
     }
+    /* A lone surrogate escape is valid JSON: an ignored member holding one
+       must not turn the status into a malformed response. */
+    static const char lone_surrogate[] =
+        "{\"responseContext\":{\"note\":\"\\ud800\"},"
+        "\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\","
+        "\"reason\":\"Sign in to confirm you are not a bot \\ud83d\"}}";
+    if (youtube_parse_player_response_diagnostic(
+            lone_surrogate, strlen(lone_surrogate), "surrogate", 240,
+            &playability, &stream, error, sizeof(error))
+        || playability != YOUTUBE_PLAYABILITY_LOGIN_REQUIRED) {
+        return false;
+    }
     static const char live[] =
         "{\"playabilityStatus\":{\"status\":\"OK\","
         "\"liveStreamability\":{}},"

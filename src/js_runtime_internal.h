@@ -4,6 +4,7 @@
 #ifndef TILEFINCH_JS_RUNTIME_INTERNAL_H
 #define TILEFINCH_JS_RUNTIME_INTERNAL_H
 
+#include <ctype.h>
 #include <stddef.h>
 #include "diagnostic_trace.h"
 #include "tilefinch_test_faults.h"
@@ -235,7 +236,10 @@ typedef struct {
    the tree with a handle), a subtree that joined such a tree, or a node a
    new wrapper found in one: an insertion under it may concern a holder.
    It may outlive the hold (the bridge clears it when it finds otherwise),
-   but no node of a held tree lacks it. */
+   but no node of a held tree that has a handle lacks it. A node without a
+   handle has no flags; bridge_event_state_joining never sees one as the
+   parent, since every insertion names its parent by handle (a wrapper,
+   which bridge_wrapper_event_holder marks as it is made). */
 #define BRIDGE_NODE_EVENT_IN_HELD_TREE 0x80u
 #define BRIDGE_NODE_EVENT_STATE \
     (BRIDGE_NODE_EVENT_ROOTED | BRIDGE_NODE_EVENT_HELD \
@@ -248,7 +252,6 @@ typedef struct {
 #define DOM_BRIDGE_NODE_INDEX_MASK SCRIPT_DOM_HANDLE_INDEX_MASK
 #define DOM_BRIDGE_NODE_GENERATION_MAX \
     ((uint32_t) (INT32_MAX >> DOM_BRIDGE_NODE_INDEX_BITS))
-#define SCRIPT_SOURCE_NODE_LIMIT 256
 
 _Static_assert(DOM_BRIDGE_NODE_LIMIT_MAX <= DOM_BRIDGE_NODE_INDEX_MASK,
                "DOM bridge node handles must encode every slot");
@@ -257,13 +260,9 @@ _Static_assert(DOM_BRIDGE_NODE_LIMIT_MAX < UINT16_MAX
                    && DOM_BRIDGE_NODE_LIMIT % 32u == 0
                    && DOM_BRIDGE_NODE_LIMIT_MAX % 32u == 0,
                "DOM bridge node index entries are 16-bit slot + 1");
-
-typedef struct {
-    lxb_dom_node_t *node;
-    uintptr_t owner_document_identity;
-    size_t section;
-    char key[96];
-} ScriptSourceNode;
+/* The bound of the native ancestor walks that stand in for script's own
+   256-step walks (getRootNode, the transition watcher's display check). */
+#define DOM_ROOT_NODE_ANCESTOR_LIMIT 256u
 
 typedef struct {
     uint64_t id;
@@ -316,7 +315,6 @@ typedef enum {
 
 typedef struct {
     lxb_dom_node_t *node;
-    uintptr_t owner_document_identity;
     uint32_t identity;
     bool programmatic;
     bool html;
@@ -339,7 +337,6 @@ typedef struct {
     uint64_t request_id;
     int64_t node_handle;
     lxb_dom_node_t *node;
-    uintptr_t owner_document_identity;
     char *request_url;
     char *response_url;
     BrowserSharedBody *source_body;
@@ -375,7 +372,6 @@ typedef struct {
 
 typedef struct {
     lxb_dom_node_t *node;
-    uintptr_t owner_document_identity;
     uint32_t sequence;
     int scroll_x;
     int scroll_y;
@@ -396,6 +392,43 @@ typedef struct {
     uint64_t host_generation;
     const lxb_dom_node_t *fullscreen_node;
 } ComputedStyleInputs;
+
+/* Event-state bookkeeping of the DOM bridge (js_event_state.inc): which
+   handle slots hold event state for a detached tree, and the retry state
+   of the bootstrap's hold and release hooks. */
+typedef struct {
+    /* Slots whose event state is HELD, and a count that changes whenever
+       that set changes or held state moves to another tree; with the last
+       root bridge_tree_held_handle walked, it lets a repeat query on an
+       unchanged tree skip the walk. */
+    size_t held_slots;
+    /* Slots marked BRIDGE_NODE_EVENT_STUCK. */
+    size_t stuck_slots;
+    uint32_t holder_epoch;
+    uint32_t holder_probe_epoch;
+    const lxb_dom_node_t *holder_probe_root;
+    int64_t holder_probe_handle;
+    /* A hold or release hook that threw (the realm's heap refused an
+       allocation) left the state where it was. Holds then wait, and the
+       bootstrap's unfinished releases (release_pending) are retried, once
+       the heap has collected retry_backoff more times than
+       retry_collection, doubling to 64 while they keep failing; a backoff
+       of 0 lets them run. */
+    size_t retry_collection;
+    uint8_t retry_backoff;
+    bool release_pending;
+#ifdef JS_RT_TEST_INSTRUMENTS
+    /* Host-test counters: calls into the bootstrap's hold and release
+       hooks, slots that left HELD, wrapper releases that reopened STUCK
+       trees for the sweep, hook calls that threw, and retries of
+       unfinished releases. */
+    uint64_t hook_calls;
+    uint64_t held_releases;
+    uint64_t stuck_reopens;
+    uint64_t hook_failures;
+    uint64_t release_retries;
+#endif
+} DomEventState;
 
 typedef struct DomBridge {
     PocDocument *document;
@@ -462,10 +495,6 @@ typedef struct DomBridge {
        the document (or template contents read); until then every node is
        the document's, template contents aside. */
     unsigned char *node_owner_tags;
-    /* Set once a remote node writer was installed or a remote wrapper
-       made: from then on native getters defer to script, which knows
-       virtual (section-remote) nodes. */
-    bool remote_mode_seen;
     size_t node_count;
     /* Every non-NULL slot is indexed by its node pointer, so registering a
        node and finding the handles inside a detached subtree do not scan the
@@ -619,25 +648,9 @@ typedef struct DomBridge {
     uint16_t shadow_reclaim_gc_skip;
     uint16_t shadow_reclaim_gc_backoff;
     size_t node_wrapper_sweep_remaining;
-    /* Slots whose event state is HELD, and a count that changes whenever
-       that set changes or held state moves to another tree; with the last
-       root bridge_tree_held_handle walked, it lets a repeat query on an
-       unchanged tree skip the walk. */
-    size_t event_held_slots;
-    /* Slots marked BRIDGE_NODE_EVENT_STUCK. */
-    size_t event_stuck_slots;
-    uint32_t event_holder_epoch;
-    uint32_t event_holder_probe_epoch;
-    const lxb_dom_node_t *event_holder_probe_root;
-    int64_t event_holder_probe_handle;
-#ifdef JS_RT_TEST_INSTRUMENTS
-    /* Host-test counters for that bookkeeping: calls into the bootstrap's
-       hold and release hooks, slots that left HELD, and wrapper releases
-       that reopened STUCK trees for the sweep. */
-    uint64_t event_state_hook_calls;
-    uint64_t event_held_releases;
-    uint64_t event_stuck_reopens;
-#endif
+    /* Event-state bookkeeping (js_event_state.inc). The wrap, insertion
+       and sweep paths read it. */
+    DomEventState events;
     /* Shadow carriers are native DOM nodes, but ordinary document/element
        selectors must not cross their tree boundary.  Store encoded handles,
        rather than pointers, so slot generation prevents allocator reuse from
@@ -692,33 +705,10 @@ typedef struct DomBridge {
     uint64_t user_activation_expires_ms;
     bool scroll_requested;
     int scroll_y;
-    ScriptRemoteElementLookupCallback remote_element_lookup;
-    void *remote_element_opaque;
-    ScriptRemoteSelectorLookupCallback remote_selector_lookup;
-    void *remote_selector_opaque;
-    ScriptRemoteSelectorCollectCallback remote_selector_collect;
-    void *remote_selector_collect_opaque;
-    ScriptRemoteDescendantCollectCallback remote_descendant_collect;
-    void *remote_descendant_collect_opaque;
-    ScriptRemoteNodeReadCallback remote_node_read;
-    void *remote_node_read_opaque;
-    ScriptRemoteNodeWriteCallback remote_node_write;
-    void *remote_node_write_opaque;
-    ScriptNodeVisibilityCallback node_visibility;
-    void *node_visibility_opaque;
-    size_t remote_element_sections[8];
-    char remote_element_identifiers[8][129];
-    size_t remote_element_head;
-    size_t remote_element_count;
-    bool remote_lookup_suppressed;
-    size_t section_identity;
-    bool current_script_source_active;
-    char current_script_source_key[96];
-    size_t current_script_source_section;
-    ScriptSourceNode *script_source_nodes;
-    size_t script_source_node_count;
-    size_t script_source_node_capacity;
     LayoutDocument *layout;
+    /* A truncated `layout` (a bounded focus relayout's) is the complete
+       layout's own above this y, its proven region; 0 when unproven. */
+    int layout_region_end;
     ImageResources *images;
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
@@ -788,30 +778,9 @@ typedef struct DomBridge {
     uint64_t dynamic_script_sequence;
     ScriptExecutionPolicy execution_policy;
     JSValue current_script;
-    uintptr_t current_script_owner_document_identity;
     /* Descendant CSP grant of the script being evaluated (module roots and
        classic import() inherit it); zero outside a script element. */
     uint8_t current_script_csp_grant;
-    JSValue trusted_node_wrap;
-    JSValue trusted_stable_script_wrap;
-    JSValue trusted_retire_native_node_state;
-    JSValue trusted_hold_event_state;
-    JSValue trusted_release_event_holders;
-    /* A hold or release hook that threw (the realm's heap refused an
-       allocation) left the state where it was. Holds then wait, and the
-       bootstrap's unfinished releases (event_release_pending) are retried,
-       once the heap has collected event_retry_backoff more times than
-       event_retry_collection, doubling to 64 while they keep failing; a
-       backoff of 0 lets them run. Kept at the end: they are cold, and the
-       hot fields above keep their offsets. */
-    size_t event_retry_collection;
-    uint8_t event_retry_backoff;
-    bool event_release_pending;
-#ifdef JS_RT_TEST_INSTRUMENTS
-    /* Hook calls that threw, and retries of unfinished releases. */
-    uint64_t event_hook_failures;
-    uint64_t event_release_retries;
-#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t webgl_native_total_us;
     size_t webgl_native_frames;
@@ -854,15 +823,38 @@ typedef enum {
     SCRIPT_HOST_RECORD_RESOURCE_TIMING,
     SCRIPT_HOST_RECORD_NAVIGATION_TIMING,
     SCRIPT_HOST_DELIVER_NETWORK,
-    SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
     SCRIPT_HOST_SCHEDULER_SNAPSHOT,
-    SCRIPT_HOST_REBIND_DOCUMENT,
     SCRIPT_HOST_COMMIT_SAME_DOCUMENT,
     SCRIPT_HOST_RESTORE_SAME_DOCUMENT,
-    SCRIPT_HOST_SAVE_SECTION_STATE,
-    SCRIPT_HOST_RESTORE_SECTION_STATE,
     SCRIPT_HOST_UPDATE_GAMEPAD,
+    /* Called by native code through runtime_call_captured(), or by the
+       bridge, rather than through runtime_call_host(). Captured with the
+       rest, before author code, and some are deleted from the global right
+       after (runtime_creation.inc). */
+    SCRIPT_HOST_APPLY_PAGE_SCROLL,
+    SCRIPT_HOST_FLUSH_PAGE_SCROLL,
+    SCRIPT_HOST_DISPATCH_AT,
+    SCRIPT_HOST_DISPATCH_HANDLE,
+    SCRIPT_HOST_DISPATCH_ACTIVATION_HANDLE,
+    SCRIPT_HOST_DISPATCH_INPUT_HANDLE,
+    SCRIPT_HOST_DISPATCH_SUBMIT_HANDLE,
+    SCRIPT_HOST_DISPATCH_DOM_CONTENT_LOADED,
+    /* Native <video> activation needs the bootstrap's private WeakMap
+       record even when play() was not the entry point. */
+    SCRIPT_HOST_MEDIA_STATE_FOR,
+    /* The page lifecycle queues native visibility edges, then invokes this
+       private compatibility closure at a normal author-task checkpoint. */
+    SCRIPT_HOST_APPLY_PAGE_VISIBILITY,
+    /* Used when native lifecycle observes that the fullscreen element
+       detached. */
+    SCRIPT_HOST_EXIT_FULLSCREEN,
+    /* The bridge's hooks into the wrapper cache and the event-state store
+       (dom.js); js_rt_bridge_trusted_hook() reads them. */
+    SCRIPT_HOST_WRAP_NODE,
+    SCRIPT_HOST_RETIRE_NATIVE_NODE_STATE,
+    SCRIPT_HOST_HOLD_EVENT_STATE,
+    SCRIPT_HOST_RELEASE_EVENT_HOLDERS,
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
@@ -1104,9 +1096,6 @@ struct ScriptRuntime {
     struct ScriptBytecodePending *bytecode_pending;
     size_t bytecode_pending_count;
     size_t bytecode_pending_bytes;
-    /* Captured before author scripts run. Keeping the callable values here
-       avoids a global lookup and prevents author replacement of private host
-       bridge properties from intercepting native viewport updates. */
     /* At most one source completion per tracked image; weak identities are
        checked before touching DOM across author tasks. Allocated on demand. */
     struct ScriptImageLoadState *image_load_states;
@@ -1114,26 +1103,8 @@ struct ScriptRuntime {
     size_t image_load_state_capacity;
     size_t image_load_pending;
     struct ScriptImagePreloads *image_preloads;
-    JSValue page_scroll_apply;
-    JSValue page_scroll_flush;
-    JSValue dispatch_at;
-    JSValue dispatch_handle;
-    JSValue dispatch_activation_handle;
-    JSValue dispatch_input_handle;
-    JSValue dispatch_submit_handle;
-    JSValue dom_content_loaded_dispatch;
-    /* Captured and removed before author code. Native <video> activation
-       needs the bootstrap's private WeakMap record even when play() was not
-       the entry point. */
-    JSValue media_state_for;
     /* Created lazily as a private callable, never published to page script. */
     JSValue media_update;
-    /* The page lifecycle queues native visibility edges, then invokes this
-       private compatibility closure at a normal author-task checkpoint. */
-    JSValue page_visibility_host_apply;
-    /* Captured before author code and removed from the global object. Used
-       when native lifecycle observes that the fullscreen element detached. */
-    JSValue fullscreen_host_exit;
     /* The private WeakMap from each Document to its document.all
        collection (js_runtime/legacy_surface.inc). */
     JSValue document_all_cache;
@@ -1147,8 +1118,9 @@ struct ScriptRuntime {
     JSValue game_audio_host_complete;
     JSValue function_to_string;
     /* Trusted bootstrap callbacks retained before author code runs. The page
-       may observe compatibility globals, but native scheduling and document
-       lifecycle never look them up through the mutable Window object. */
+       may observe compatibility globals, but native scheduling, input
+       dispatch, viewport updates and document lifecycle never look them up
+       through the mutable Window object. */
     JSValue host_global;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
 #ifdef JS_RT_XHR_DIAGNOSTICS
@@ -1242,7 +1214,6 @@ typedef struct ScriptLazyRuntimeBundle {
 
 typedef struct {
     JSValue value;
-    uintptr_t owner_document_identity;
     uint8_t csp_grant;
 } ScriptCurrentScriptScope;
 
@@ -1287,6 +1258,33 @@ void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage);
    agent. Five seconds matches the interoperability window used by major
    engines while keeping privileged actions tightly bounded on the PSP. */
 #define SCRIPT_TRANSIENT_USER_ACTIVATION_MS UINT64_C(5000)
+/* ASCII case-insensitive equality of two CSS property names (inline style
+   declarations, SVG presentation attributes). */
+static inline bool js_rt_property_name_equal(const char *first,
+                                             size_t first_length,
+                                             const char *second,
+                                             size_t second_length)
+{
+    if (first_length != second_length) return false;
+    for (size_t i = 0; i < first_length; i++) {
+        if (tolower((unsigned char) first[i])
+            != tolower((unsigned char) second[i])) return false;
+    }
+    return true;
+}
+
+/* Whether `scope` is `node` or one of its first 256 ancestors. Shared by
+   the mutation journal's overflow roots and the computed-style ring's
+   scoped invalidation. */
+static inline bool js_rt_node_within(const lxb_dom_node_t *node,
+                                     const lxb_dom_node_t *scope)
+{
+    for (unsigned depth = 0; node != NULL && depth < 256u;
+         node = node->parent, depth++)
+        if (node == scope) return true;
+    return false;
+}
+
 static inline uint64_t js_rt_bridge_elapsed_ms(const DomBridge *bridge)
 {
     if (bridge == NULL) return 0;
@@ -1314,6 +1312,16 @@ static inline bool js_rt_bridge_user_activation_is_active(DomBridge *bridge)
     bridge->user_activation_active = false;
     return false;
 }
+/* A bootstrap hook the bridge calls (SCRIPT_HOST_WRAP_NODE and the other
+   bridge hooks), captured with the runtime's host callbacks; undefined for
+   a bridge outside a runtime. */
+static inline JSValueConst js_rt_bridge_trusted_hook(const DomBridge *bridge,
+                                                     ScriptHostCallback hook)
+{
+    return bridge->host != NULL ? bridge->host->host_callbacks[hook]
+                                : JS_UNDEFINED;
+}
+
 static inline void js_rt_bridge_consume_user_activation(DomBridge *bridge)
 {
     if (bridge == NULL) return;
@@ -1415,9 +1423,35 @@ bool js_rt_runtime_module_root_state_set(
 const char *js_rt_runtime_module_base_lookup(const ScriptRuntime *runtime,
                                              const char *request_url);
 
-bool js_rt_install_function(JSContext *context, JSValue global,
-                            const char *name, JSCFunction *function,
-                            int arguments);
+/* One native entry point the realm installs on a global (or the host
+   channel). Each owner keeps a static table of these; js_rt_install_natives
+   installs a table in row order. The flags are the native's whole
+   descriptor policy, so the row is the only place a native is described. */
+enum {
+    /* Configurable, so the bootstrap can delete it once captured. */
+    JS_RT_NATIVE_TRANSIENT = 1u << 0,
+    /* Writable and configurable in a realm created with
+       allow_test_network_primitive_overrides; otherwise frozen. */
+    JS_RT_NATIVE_TEST_OVERRIDABLE = 1u << 1,
+    /* A plain function, never the profiling trampoline. */
+    JS_RT_NATIVE_UNPROFILED = 1u << 2,
+    /* Left out under the TILEFINCH_DISABLE_COMPRESSION_STREAMS lab switch. */
+    JS_RT_NATIVE_COMPRESSION_STREAMS = 1u << 3,
+};
+typedef struct {
+    const char *name;
+    JSCFunction *function;
+    uint8_t arguments;
+    uint8_t flags;
+} JsRtNative;
+
+bool js_rt_install_native(JSContext *context, JSValue target,
+                          const JsRtNative *native);
+bool js_rt_install_natives(JSContext *context, JSValue target,
+                           const JsRtNative *natives, size_t count);
+#define JS_RT_INSTALL_NATIVES(context, target, table) \
+    js_rt_install_natives((context), (target), (table), \
+                          sizeof(table) / sizeof((table)[0]))
 char *js_rt_dynamic_copy_text(Budget *budget, const char *text);
 void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
                               bool cancelled, bool cancel_request);
@@ -1538,34 +1572,7 @@ bool js_rt_evaluate_external_classic_dynamic(
     const char *source, size_t source_length, const char *source_url,
     bool response_no_store);
 
-void js_rt_bridge_queue_remote_element(DomBridge *bridge,
-                                       const char *identifier,
-                                       size_t length, size_t section);
-
 JSValue js_rt_wrap_dom_handle(JSContext *context, JSValueConst handle);
-
-/* js_remote_bindings.c entry points. */
-void js_rt_remote_node_read_result_destroy(
-    DomBridge *bridge, ScriptRemoteNodeReadResult *read);
-bool js_remote_bindings_install(JSContext *context, JSValue global);
-JSValue js_remote_node_writer_active(JSContext *context,
-                                     JSValueConst this_value,
-                                     int argc, JSValueConst *argv);
-JSValue js_remote_lookup_suppress(JSContext *context,
-                                  JSValueConst this_value,
-                                  int argc, JSValueConst *argv);
-JSValue js_remote_selector_result(JSContext *context,
-                                  JSValueConst selector,
-                                  bool earlier_only);
-JSValue js_remote_selector_collection(JSContext *context,
-                                      JSValueConst selector,
-                                      JSValueConst local_values,
-                                      uint32_t local_length,
-                                      uint32_t *result_length);
-JSValue js_remote_descendant_collection(JSContext *context,
-                                        DomBridge *bridge,
-                                        unsigned root_special,
-                                        int32_t what_to_show);
 
 typedef struct {
     lxb_dom_node_t *next;
@@ -1576,13 +1583,8 @@ typedef struct {
     size_t visit_limit;
     bool exhausted;
     size_t visited;
-    size_t next_node_ordinal;
-    size_t next_element_ordinal;
-    size_t current_node_ordinal;
-    size_t current_element_ordinal;
     size_t next_depth;
     size_t current_depth;
-    bool track_ordinals;
 } DomDocumentOrderTraversal;
 
 /* document.all's view of a tree: its elements in tree order, exactly as
@@ -1626,6 +1628,11 @@ void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle);
 void bridge_pin_node_slot(DomBridge *bridge, size_t slot);
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
                                            lxb_dom_node_t *node);
+/* Script never observes a truncated layout (see bridge_state.inc). */
+const LayoutDocument *js_rt_bridge_layout(const DomBridge *bridge);
+bool js_rt_bridge_layout_truncated(const DomBridge *bridge);
+const LayoutNodeBox *js_rt_bridge_proven_box(const DomBridge *bridge,
+                                             const lxb_dom_node_t *node);
 bool js_rt_notify_style_flushed(JSContext *context);
 bool bridge_node_is_connected(const lxb_dom_node_t *node);
 void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
@@ -1832,7 +1839,13 @@ JSValue js_dom_root_node(JSContext *context, JSValueConst this_value,
 JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
                           int argc, JSValueConst *argv);
 void js_rt_bridge_computed_style_cache_free(DomBridge *bridge);
-void js_rt_bridge_computed_style_cache_forget(DomBridge *bridge);
+/* Drops the computed-style memo and the cached ancestor styles a connected
+   script mutation can change (js_computed_style.c); the mutation journal
+   calls it for every recorded mutation. */
+void js_rt_bridge_computed_style_note_mutation(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length, bool relational,
+    const uint32_t *changed_tokens, size_t changed_token_count);
 /* Bytes the getComputedStyle caches hold (ancestor styles plus the var()
    table), for the profile report and tests. */
 size_t js_rt_bridge_computed_style_cache_bytes(const DomBridge *bridge);
@@ -1855,9 +1868,6 @@ JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
-JSValue js_dom_note_remote_wrapper(JSContext *context,
-                                   JSValueConst this_value,
-                                   int argc, JSValueConst *argv);
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge);
 void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge);
 /* Allocates the base slot table; `limit` (0 for the default) is the most
@@ -1872,17 +1882,11 @@ JSValue js_dom_matches(JSContext *context, JSValueConst this_value,
 JSValue js_dom_node_type(JSContext *context,
                          JSValueConst this_value,
                          int argc, JSValueConst *argv);
-JSValue js_dom_namespace_uri(JSContext *context,
-                             JSValueConst this_value,
-                             int argc, JSValueConst *argv);
 JSValue js_dom_query(JSContext *context, JSValueConst this_value,
                      int argc, JSValueConst *argv);
 JSValue js_dom_query_all(JSContext *context,
                          JSValueConst this_value,
                          int argc, JSValueConst *argv);
-JSValue js_dom_query_count(JSContext *context,
-                           JSValueConst this_value,
-                           int argc, JSValueConst *argv);
 JSValue js_dom_register_shadow_root(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
@@ -1924,14 +1928,17 @@ JSValue js_dom_is_ancestor(JSContext *context, JSValueConst this_value,
 JSValue js_dom_selectors_test_attribute(JSContext *context,
                                         JSValueConst this_value,
                                         int argc, JSValueConst *argv);
-JSValue js_dom_nearest_id(JSContext *context, JSValueConst this_value,
-                          int argc, JSValueConst *argv);
 JSValue js_dom_next_ancestor_entry(JSContext *context,
                                    JSValueConst this_value,
                                    int argc, JSValueConst *argv);
+#ifdef JS_RT_TEST_INSTRUMENTS
+/* __tilefinchReleaseNodeWrapper: host and validation realms only. Tests
+   use it to release one wrapper's handle lease by hand; the bootstrap has
+   no caller. */
 JSValue js_dom_release_node_wrapper(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
+#endif
 JSValue js_dom_remove(JSContext *context, JSValueConst this_value,
                       int argc, JSValueConst *argv);
 JSValue js_dom_remove_attribute(JSContext *context,
@@ -1960,9 +1967,6 @@ JSValue js_dom_version(JSContext *context, JSValueConst this_value,
 JSValue js_dom_has_parser_form_owners(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv);
-JSValue js_runtime_heap_remaining(JSContext *context,
-                                  JSValueConst this_value,
-                                  int argc, JSValueConst *argv);
 JSValue js_dom_set_inner_html(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
@@ -1974,15 +1978,6 @@ JSValue js_dom_tag_name(JSContext *context,
 JSValue js_dom_node_identity(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv);
-JSValue js_find_stable_node(JSContext *context,
-                            JSValueConst this_value,
-                            int argc, JSValueConst *argv);
-JSValue js_section_identity(JSContext *context,
-                            JSValueConst this_value,
-                            int argc, JSValueConst *argv);
-JSValue js_stable_node_key(JSContext *context,
-                           JSValueConst this_value,
-                           int argc, JSValueConst *argv);
 JSValue js_style_get(JSContext *context, JSValueConst this_value,
                      int argc, JSValueConst *argv);
 JSValue js_style_set(JSContext *context, JSValueConst this_value,

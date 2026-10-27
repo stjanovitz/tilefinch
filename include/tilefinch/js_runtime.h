@@ -11,7 +11,6 @@
 #include "tilefinch/session.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/style.h"
-#include "tilefinch/remote_selector.h"
 #include "tilefinch/script_admission.h"
 #include "tilefinch/validation_cpu.h"
 
@@ -348,21 +347,14 @@ typedef struct {
     size_t host_callback_calls_with_interrupt_polls;
     uint64_t host_callback_total_us;
     char max_nonpreemptible_callback_name[96];
-    size_t retention_wrapper_evictions;
     size_t retention_listener_drops;
     size_t retention_handler_drops;
     size_t retention_observer_drops;
     size_t retention_record_drops;
-    size_t retention_dirty_drops;
-    size_t retention_state_evictions;
-    size_t retention_control_drops;
     /* Current bounded JavaScript root census. These are container/root counts,
        not heap estimates, and are refreshed with the ordinary ScriptResult. */
     size_t root_timers;
     size_t root_node_wrappers;
-    size_t root_stable_wrappers;
-    size_t root_stable_listener_targets;
-    size_t root_stable_handler_targets;
     size_t root_mutation_observers;
     size_t root_pending_network;
     size_t root_frame_windows;
@@ -741,10 +733,6 @@ typedef enum {
 typedef struct {
     ScriptMutationKind kind;
     lxb_dom_node_t *node;
-    /* Captured while node is live.  Document retirement compares this opaque
-       identity instead of dereferencing a target which an earlier mutation in
-       the same author turn may already have destroyed. */
-    uintptr_t owner_document_identity;
     /* A full-length buffer is a conservative prefix, including when
        distinct long names coalesce. Consumers must not prove a dependency
        absent by comparing it as a complete attribute name. */
@@ -1039,97 +1027,8 @@ bool script_type_attribute_classify(
    Content-Type. Any supplied conflicting/non-JavaScript type fails closed. */
 bool script_module_revalidated_mime_allowed(
     const char *cached_content_type, const char *response_content_type);
-typedef bool (*ScriptRemoteElementLookupCallback)(
-    void *opaque, const char *identifier, size_t length,
-    size_t *section_index, char tag_name[32], char stable_key[96]);
-typedef bool (*ScriptRemoteSelectorLookupCallback)(
-    void *opaque, const char *selector, size_t length,
-    size_t *section_index, char tag_name[32], char identifier[129],
-    char stable_key[96]);
-typedef bool (*ScriptRemoteSelectorCollectCallback)(
-    void *opaque, const char *selector, size_t length,
-    TilefinchRemoteSelectorMatch *matches, size_t capacity, size_t *match_count);
-typedef bool (*ScriptRemoteDescendantCollectCallback)(
-    void *opaque, unsigned root_special, int what_to_show,
-    TilefinchRemoteTraversalNode *nodes, size_t capacity, size_t *node_count);
-
-typedef enum {
-    SCRIPT_REMOTE_NODE_TEXT = 0,
-    SCRIPT_REMOTE_NODE_INNER_HTML,
-    SCRIPT_REMOTE_NODE_ATTRIBUTE,
-    SCRIPT_REMOTE_NODE_ATTRIBUTES,
-    SCRIPT_REMOTE_NODE_MATCHES,
-    SCRIPT_REMOTE_NODE_GEOMETRY,
-    SCRIPT_REMOTE_NODE_PARENT_ELEMENT,
-    SCRIPT_REMOTE_NODE_FIRST_ELEMENT_CHILD,
-    SCRIPT_REMOTE_NODE_NEXT_ELEMENT_SIBLING,
-    SCRIPT_REMOTE_NODE_PREVIOUS_ELEMENT_SIBLING,
-    SCRIPT_REMOTE_NODE_FIRST_CHILD,
-    SCRIPT_REMOTE_NODE_NEXT_SIBLING,
-    SCRIPT_REMOTE_NODE_PREVIOUS_SIBLING,
-    SCRIPT_REMOTE_NODE_LAST_CHILD
-} ScriptRemoteNodeReadKind;
-
-typedef enum {
-    SCRIPT_REMOTE_NODE_WRITE_TEXT = 0,
-    SCRIPT_REMOTE_NODE_WRITE_INNER_HTML,
-    SCRIPT_REMOTE_NODE_WRITE_SET_ATTRIBUTE,
-    SCRIPT_REMOTE_NODE_WRITE_REMOVE_ATTRIBUTE
-} ScriptRemoteNodeWriteKind;
-
-typedef struct {
-    char *name;
-    size_t name_length;
-    char *value;
-    size_t value_length;
-} ScriptRemoteNodeAttribute;
-
-typedef struct {
-    char *value;
-    size_t length;
-    bool is_null;
-    ScriptRemoteNodeAttribute *attributes;
-    size_t attribute_count;
-    char related_stable_key[193];
-    char related_tag_name[32];
-    size_t related_section_index;
-    unsigned related_special;
-    unsigned related_node_type;
-    int geometry_x;
-    int geometry_y;
-    int geometry_width;
-    int geometry_height;
-    int geometry_client_width;
-    int geometry_client_height;
-    int geometry_scroll_width;
-    int geometry_scroll_height;
-    int geometry_scroll_left;
-    int geometry_scroll_top;
-} ScriptRemoteNodeReadResult;
-
-/* A successful callback may return values and attribute storage allocated from
-   the runtime's shared Budget.  The runtime releases all returned storage
-   after copying it into the JavaScript heap.  is_null distinguishes a missing
-   attribute or relation from a present empty string. */
-typedef bool (*ScriptRemoteNodeReadCallback)(
-    void *opaque, const char *stable_key, size_t stable_key_length,
-    size_t section_index, ScriptRemoteNodeReadKind kind,
-    const char *name, size_t name_length, ScriptRemoteNodeReadResult *result);
-typedef bool (*ScriptRemoteNodeWriteCallback)(
-    void *opaque, const char *stable_key, size_t stable_key_length,
-    size_t section_index, ScriptRemoteNodeWriteKind kind,
-    const char *name, size_t name_length,
-    const char *value, size_t value_length);
-typedef bool (*ScriptNodeVisibilityCallback)(
-    void *opaque, size_t section_index, size_t element_ordinal,
-    size_t node_ordinal, unsigned node_type);
-
-/* Reserved section used to ask whether a streaming parser has entered body. */
-#define SCRIPT_NODE_VISIBILITY_DOCUMENT_BODY_SECTION ((size_t) -1)
-
-/* Remote-document operations belong only to the top-level document realm.
-   Child-frame runtimes have independent documents and origins, so a child
-   scope always rejects and clears a non-empty binding. */
+/* Child-frame runtimes have independent documents and origins from the
+   top-level document realm. */
 typedef enum {
     SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL = 0,
     SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME
@@ -1206,24 +1105,6 @@ typedef struct {
 } ScriptDeterministicReplayDiagnostics;
 
 typedef struct {
-    ScriptRemoteElementLookupCallback element_lookup;
-    void *element_opaque;
-    ScriptRemoteSelectorLookupCallback selector_lookup;
-    void *selector_opaque;
-    ScriptRemoteSelectorCollectCallback selector_collect;
-    void *selector_collect_opaque;
-    ScriptRemoteDescendantCollectCallback descendant_collect;
-    void *descendant_collect_opaque;
-    ScriptRemoteNodeReadCallback node_read;
-    void *node_read_opaque;
-    ScriptRemoteNodeWriteCallback node_write;
-    void *node_write_opaque;
-    ScriptNodeVisibilityCallback node_visibility;
-    void *node_visibility_opaque;
-    size_t section_identity;
-} ScriptRemoteDocumentBinding;
-
-typedef struct {
     BrowserSession *session;
     /* Borrowed immutable application faces used by Canvas 2D. A NULL set is
        valid for standalone/test runtimes and retains the bounded metric
@@ -1270,21 +1151,6 @@ typedef struct {
        Zero selects runtime creation for standalone and synthetic realms. */
     uint64_t navigation_started_us;
     const char *referrer_policy;
-    ScriptRemoteElementLookupCallback remote_element_lookup;
-    void *remote_element_opaque;
-    ScriptRemoteSelectorLookupCallback remote_selector_lookup;
-    void *remote_selector_opaque;
-    ScriptRemoteSelectorCollectCallback remote_selector_collect;
-    void *remote_selector_collect_opaque;
-    ScriptRemoteDescendantCollectCallback remote_descendant_collect;
-    void *remote_descendant_collect_opaque;
-    ScriptRemoteNodeReadCallback remote_node_read;
-    void *remote_node_read_opaque;
-    ScriptRemoteNodeWriteCallback remote_node_write;
-    void *remote_node_write_opaque;
-    ScriptNodeVisibilityCallback node_visibility;
-    void *node_visibility_opaque;
-    size_t section_identity;
 } ScriptRuntimeOptions;
 
 /* Lab-only repeatability hook. It affects JavaScript entropy sources for
@@ -1361,15 +1227,6 @@ ScriptRuntime *script_runtime_create(PocDocument *document, Budget *budget,
                                      unsigned timeout_ms,
                                      const char *document_url,
                                      ScriptResult *result);
-bool script_runtime_rebind_document(ScriptRuntime *runtime,
-                                    PocDocument *document,
-                                    ScriptResult *result);
-/* Retires every native reference owned by `document` while its Lexbor tree is
-   still alive. Embedders must call this before destroying a document whose
-   JavaScript realm will outlive it. The operation is bounded, allocation-free,
-   and does not run author JavaScript. */
-void script_runtime_detach_document(ScriptRuntime *runtime,
-                                    const PocDocument *document);
 /* Repairs host pointers after an embedding struct containing an unchanged
    document/runtime pair is moved. This is allocation-free and does not run
    author JavaScript or invalidate still-valid DOM handles. */
@@ -1382,12 +1239,6 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
 bool script_runtime_replace_document_body(
     ScriptRuntime *runtime, PocDocument *document,
     const char *markup, size_t length);
-/* Replaces the complete live top-level binding in one non-allocating step.
-   Pending materialization requests are invalidated before the old opaque
-   values can be released. NULL clears the binding. Child-frame runtimes
-   remain unbound and return false when passed a non-empty binding. */
-bool script_runtime_rebind_remote_document(
-    ScriptRuntime *runtime, const ScriptRemoteDocumentBinding *binding);
 typedef enum {
     SCRIPT_RUNTIME_COLLECT_FIRST_GC = 0,
     SCRIPT_RUNTIME_COLLECT_SECOND_GC,
@@ -1646,24 +1497,6 @@ bool script_runtime_restore_same_document(ScriptRuntime *runtime,
                                           const char *url,
                                           const char *old_url,
                                           ScriptResult *result);
-bool script_runtime_save_section_state(ScriptRuntime *runtime,
-                                       size_t section, size_t *count,
-                                       ScriptResult *result);
-bool script_runtime_restore_section_state(ScriptRuntime *runtime,
-                                          size_t section, size_t *count,
-                                          ScriptResult *result);
-bool script_runtime_take_remote_element_request(
-    ScriptRuntime *runtime, char *identifier, size_t capacity,
-    size_t *section_index);
-bool script_runtime_set_section_identity(ScriptRuntime *runtime,
-                                         size_t section_identity);
-bool script_runtime_set_current_script_source(
-    ScriptRuntime *runtime, size_t section_identity, size_t element_ordinal);
-void script_runtime_clear_current_script_source(ScriptRuntime *runtime);
-bool script_runtime_register_script_source_node(
-    ScriptRuntime *runtime, lxb_dom_node_t *node,
-    size_t section_identity, size_t element_ordinal);
-void script_runtime_clear_script_source_nodes(ScriptRuntime *runtime);
 ScriptRuntime *script_runtime_create_with_session(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
     unsigned timeout_ms, const char *document_url,
@@ -1752,9 +1585,8 @@ void *script_runtime_module_loader_opaque(
    the callable cross-origin surface but assignment raises SecurityError.
    top_is_parent is true only for a direct child of the top-level document;
    nested children receive distinct parent/top WindowProxy surfaces and route
-   top.postMessage to the actual top realm. The transition clears top-level
-   remote bindings and queues; callback/opaque become callable only after
-   setup succeeds. A child realm rejects a later child_context=false
+   top.postMessage to the actual top realm. The callback/opaque become
+   callable only after setup succeeds. A child realm rejects a later child_context=false
    configuration. */
 bool script_runtime_configure_messaging(
     ScriptRuntime *runtime, bool child_context, bool parent_same_origin,
@@ -1912,7 +1744,7 @@ lxb_dom_node_t *script_runtime_node_handle_resolve(
 lxb_dom_node_t *script_runtime_node_handle_resolve_connected(
     const ScriptRuntime *runtime, long handle);
 /* True after a post-parse script element has been admitted to the native
-   dynamic loader. Document/section rescans use this to avoid executing the
+   dynamic loader. Document rescans use this to avoid executing the
    same node through the parser-oriented loader a second time. */
 bool script_runtime_dynamic_script_is_scheduled(
     const ScriptRuntime *runtime, const lxb_dom_node_t *node);
@@ -2156,6 +1988,11 @@ bool script_runtime_take_form_submission(
 bool script_runtime_consume_scroll(ScriptRuntime *runtime, int *scroll_y);
 void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                int viewport_height);
+/* The proven region of the truncated layout just set (a bounded focus
+   relayout's, NavigationPage bounded_focus_region_end): script may read
+   the boxes laid out before its cut and wholly above `region_end`, which
+   are the complete layout's own. script_runtime_set_layout clears it. */
+void script_runtime_set_layout_region(ScriptRuntime *runtime, int region_end);
 /* Republishes the layout viewport to a realm created before the document's
    viewport metadata was scanned: the viewport globals, innerWidth and
    innerHeight follow the resolved CSS size. */

@@ -831,13 +831,14 @@ struct RenderOverflowCache {
 #define RENDER_COOPERATE_PHASE "render-prepare"
 
 static bool render_platform_cooperate(TileCache *cache, const char *phase,
-                                      size_t work)
+                                      size_t work, unsigned boundary)
 {
     /* A frontend may present the incumbent here, but must not reenter the
        render/scroll API against the shell whose accelerator is being built. */
     bool previous = cache->preparation_polling;
     cache->preparation_polling = true;
-    bool continued = tilefinch_platform_cooperate(phase, work);
+    bool continued = tilefinch_platform_cooperate_at(
+        phase, work, boundary | TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED);
     cache->preparation_polling = previous;
     return continued;
 }
@@ -847,7 +848,7 @@ static void render_prepare_checkpoint(TileCache *cache)
     if (cache->frame_composing) return;
     if ((++cache->preparation_visits & 127u) != 0) return;
     (void) render_platform_cooperate(cache, RENDER_COOPERATE_PHASE,
-                                     cache->preparation_visits);
+                                     cache->preparation_visits, 0u);
 }
 
 static void overflow_cache_destroy(TileCache *cache)

@@ -1060,7 +1060,6 @@ static bool navigation_finish_authoritative_layout(
     session->style_rebuild_required = false;
     if (session->document_scripts_enabled
         && session->page.runtime != NULL
-        && !session->defer_document_script_pipeline
         && !navigation_load_frames(session, url)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "frame messaging failed: %.440s",
@@ -1072,205 +1071,211 @@ static bool navigation_finish_authoritative_layout(
         session->page.document.node_count);
 }
 
-static bool navigation_commit_document(
-    NavigationSession *session, uint64_t generation, const char *url,
-    PocDocument *document, int viewport_width, const FontSet *fonts,
-    const ImageResources *images, bool record_history,
-    NavigationDocumentStream *streaming,
-    FetchSchedulerDomain *shared_fetch_domain,
-    bool allow_runtime,
-    bool defer_authoritative_layout,
-    LayoutBuildJob **deferred_layout_job,
-    bool *deferred_preview_candidate)
+/* The session state a commit replaces besides the page itself, which a
+   refused commit restores. The page moves separately: the incumbent is
+   parked in a Budget-owned copy while the candidate is built in place.
+   Commit-time state that lives outside NavigationPage belongs here, so a
+   new field is captured and restored in one place. */
+typedef struct {
+    ViewportContext viewport;
+    const FontSet *fonts;
+    const ImageResources *images;
+    uint64_t resource_fingerprint;
+    bool style_rebuild_required;
+    bool relayout_damage_valid;
+    int relayout_damage_left;
+    int relayout_damage_top;
+    int relayout_damage_right;
+    int relayout_damage_bottom;
+    bool canvas_paint_damage_pending;
+} NavigationCommitSnapshot;
+
+static void commit_snapshot_capture(const NavigationSession *session,
+                                    NavigationCommitSnapshot *snapshot)
 {
-    if (deferred_layout_job != NULL) *deferred_layout_job = NULL;
-    if (deferred_preview_candidate != NULL) {
-        *deferred_preview_candidate = false;
-    }
-    if (session == NULL || session->budget == NULL || generation == 0
-        || generation != session->generation || session->cancelled
-        || url == NULL || document == NULL || document->html == NULL
-        || viewport_width <= 0) return false;
-    /* A direct commit (a site adapter's page, committed HTML) may be the
-       armed history "replace"; a load took its arming when it started. */
-    bool replace_history = navigation_take_history_replace(
-        session, generation, url, record_history);
-    ReaderDocumentAnalysis reader_analysis = {0};
-    NavigationCandidatePrepareCallback candidate_prepare =
-        session->candidate_prepare;
-    NavigationCandidatePrepareCallback candidate_graph_prepare =
-        session->candidate_graph_prepare;
-    NavigationCandidateFinalizeCallback candidate_abort =
-        session->candidate_abort;
-    NavigationCandidateFinalizeCallback candidate_commit =
-        session->candidate_commit;
-    void *candidate_opaque = session->candidate_commit_opaque;
-    bool isolates_remote_document = streaming != NULL
-        && streaming->isolates_remote_document;
+    *snapshot = (NavigationCommitSnapshot) {
+        .viewport = session->viewport,
+        .fonts = session->fonts,
+        .images = session->images,
+        .resource_fingerprint = session->resource_fingerprint,
+        .style_rebuild_required = session->style_rebuild_required,
+        .relayout_damage_valid = session->relayout_damage_valid,
+        .relayout_damage_left = session->relayout_damage_left,
+        .relayout_damage_top = session->relayout_damage_top,
+        .relayout_damage_right = session->relayout_damage_right,
+        .relayout_damage_bottom = session->relayout_damage_bottom,
+        .canvas_paint_damage_pending = session->canvas_paint_damage_pending
+    };
+}
+
+static void commit_snapshot_restore(NavigationSession *session,
+                                    const NavigationCommitSnapshot *snapshot)
+{
+    session->viewport = snapshot->viewport;
+    session->fonts = snapshot->fonts;
+    session->images = snapshot->images;
+    session->resource_fingerprint = snapshot->resource_fingerprint;
+    session->style_rebuild_required = snapshot->style_rebuild_required;
+    session->relayout_damage_valid = snapshot->relayout_damage_valid;
+    session->relayout_damage_left = snapshot->relayout_damage_left;
+    session->relayout_damage_top = snapshot->relayout_damage_top;
+    session->relayout_damage_right = snapshot->relayout_damage_right;
+    session->relayout_damage_bottom = snapshot->relayout_damage_bottom;
+    session->canvas_paint_damage_pending =
+        snapshot->canvas_paint_damage_pending;
+}
+
+/* The transaction state navigation_commit_document carries across its
+   phases: the parked incumbent and the session snapshot that roll back on
+   failure, the candidate hooks captured at entry, and the facts one phase
+   establishes for a later one. */
+typedef struct {
+    /* The commit's inputs. images moves to the page's own table once the
+       images phase has loaded it. */
+    uint64_t generation;
+    const char *url;
+    PocDocument *document;
+    int viewport_width;
+    const FontSet *fonts;
+    const ImageResources *images;
+    bool record_history;
+    NavigationDocumentStream *streaming;
+    bool allow_runtime;
+    bool defer_authoritative_layout;
+    LayoutBuildJob **deferred_layout_job;
+    bool *deferred_preview_candidate;
+    FetchSchedulerDomain *candidate_fetch_domain;
+    bool fetch_domain_from_stream;
+    /* Transaction state. */
+    NavigationPage *previous_page;
+    NavigationCommitSnapshot snapshot;
+    bool replace_history;
+    ReaderDocumentAnalysis reader_analysis;
+    NavigationCandidatePrepareCallback candidate_prepare;
+    NavigationCandidatePrepareCallback candidate_graph_prepare;
+    NavigationCandidateFinalizeCallback candidate_abort;
+    NavigationCandidateFinalizeCallback candidate_commit;
+    void *candidate_opaque;
+    bool candidate_hook_attempted;
+    char resource_base_url[NAVIGATION_URL_LIMIT];
+    bool streamed_runtime;
+    bool optional_work_shed;
+    bool adopted_streaming_stylesheet;
+    bool adopted_compiled_stylesheet;
+    bool stylesheet_external_current;
+    bool user_stylesheet_current;
+    bool script_document_may_have_changed;
+    uint64_t adopted_stylesheet_fingerprint;
+    bool progressive_preview_candidate;
+    bool final_layout_ready;
+    bool provisional_commit;
+} NavigationCommitTxn;
+
+/* Setup: move the candidate document, the streamed realm, canvases,
+   stylesheet events and scheduler into the emptied page, then resolve its
+   viewport and start its resource scheduler. */
+static TILEFINCH_OUT_OF_LINE bool commit_setup(NavigationSession *session,
+                                               NavigationCommitTxn *txn)
+{
     char response_referrer_policy[
         sizeof(session->pending_response_referrer_policy)];
     snprintf(response_referrer_policy, sizeof(response_referrer_policy),
              "%s", session->pending_response_referrer_policy);
-    char resource_base_url_storage[NAVIGATION_URL_LIMIT];
-    if (!navigation_document_resource_base(
-            document, url, resource_base_url_storage)) {
-        return false;
-    }
-    const char *resource_base_url = resource_base_url_storage;
-    bool fetch_domain_from_stream = streaming != NULL
-        && streaming->fetch_domain != NULL;
-    FetchSchedulerDomain *retained_fetch_domain =
-        shared_fetch_domain == NULL
-            ? session->page.fetch_domain : shared_fetch_domain;
-    FetchSchedulerDomain *candidate_fetch_domain =
-        fetch_domain_from_stream
-            ? streaming->fetch_domain
-            : (retained_fetch_domain == NULL
-                 ? fetch_scheduler_domain_create(
-                       session->budget,
-                       NAVIGATION_PAGE_FETCH_SLOT_LIMIT)
-                 : fetch_scheduler_domain_retain(retained_fetch_domain));
-    if (candidate_fetch_domain == NULL) {
-        snprintf(session->last_error, sizeof(session->last_error),
-                 "page fetch scheduler domain startup failed");
-        return false;
-    }
-    NavigationPage *previous_page = NULL;
-    if (page_has_owned_state(&session->page)) {
-        previous_page = budget_malloc_category(
-            session->budget, BUDGET_CATEGORY_SESSION,
-            sizeof(*previous_page));
-        if (previous_page == NULL) {
-            snprintf(session->last_error, sizeof(session->last_error),
-                     "navigation transaction scratch allocation failed");
-            if (!fetch_domain_from_stream) {
-                fetch_scheduler_domain_release(candidate_fetch_domain);
-            }
-            return false;
-        }
-        *previous_page = session->page;
-    }
-    ViewportContext previous_viewport = session->viewport;
-    const FontSet *previous_fonts = session->fonts;
-    const ImageResources *previous_images = session->images;
-    uint64_t previous_resource_fingerprint = session->resource_fingerprint;
-    bool previous_style_rebuild_required =
-        session->style_rebuild_required;
-    bool previous_relayout_damage_valid = session->relayout_damage_valid;
-    int previous_relayout_damage_left = session->relayout_damage_left;
-    int previous_relayout_damage_top = session->relayout_damage_top;
-    int previous_relayout_damage_right = session->relayout_damage_right;
-    int previous_relayout_damage_bottom = session->relayout_damage_bottom;
-    bool previous_canvas_paint_damage_pending =
-        session->canvas_paint_damage_pending;
-    bool candidate_hook_attempted = false;
     session->pending_response_referrer_policy[0] = '\0';
     session->canvas_paint_damage_pending = false;
     memset(&session->page, 0, sizeof(session->page));
     session->committed_scroll_reflection_pending = false;
-    if (streaming != NULL) {
-        session->page.images = streaming->canvas_images;
-        memset(&streaming->canvas_images, 0,
-               sizeof(streaming->canvas_images));
+    if (txn->streaming != NULL) {
+        session->page.images = txn->streaming->canvas_images;
+        memset(&txn->streaming->canvas_images, 0,
+               sizeof(txn->streaming->canvas_images));
     }
-    session->page.fetch_domain = candidate_fetch_domain;
-    if (fetch_domain_from_stream) streaming->fetch_domain = NULL;
+    session->page.fetch_domain = txn->candidate_fetch_domain;
+    if (txn->fetch_domain_from_stream) txn->streaming->fetch_domain = NULL;
     snprintf(session->page.referrer_policy,
              sizeof(session->page.referrer_policy), "%s",
              response_referrer_policy);
-    session->page.document = *document;
+    session->page.document = *txn->document;
     if (session->prepare_reader_candidates)
-        session->page.reader_analysis = reader_analysis;
-    memset(document, 0, sizeof(*document));
+        session->page.reader_analysis = txn->reader_analysis;
+    memset(txn->document, 0, sizeof(*txn->document));
     snprintf(session->page.resource_base_url,
              sizeof(session->page.resource_base_url), "%s",
-             resource_base_url);
+             txn->resource_base_url);
     snprintf(session->page.document_url,
-             sizeof(session->page.document_url), "%s", url);
-    navigation_refresh_adopt_header(session, url);
-    if (streaming != NULL
-        && streaming->stylesheet_event_baseline_adopted) {
+             sizeof(session->page.document_url), "%s", txn->url);
+    navigation_refresh_adopt_header(session, txn->url);
+    if (txn->streaming != NULL
+        && txn->streaming->stylesheet_event_baseline_adopted) {
         memcpy(session->page.stylesheet_events,
-               streaming->stylesheet_events,
-               streaming->stylesheet_event_count
+               txn->streaming->stylesheet_events,
+               txn->streaming->stylesheet_event_count
                    * sizeof(*session->page.stylesheet_events));
         session->page.stylesheet_event_count =
-            streaming->stylesheet_event_count;
+            txn->streaming->stylesheet_event_count;
     }
-    if (streaming != NULL) {
+    if (txn->streaming != NULL) {
         session->page.stylesheet_resources =
-            streaming->stylesheet_resources;
-        memset(&streaming->stylesheet_resources, 0,
-               sizeof(streaming->stylesheet_resources));
+            txn->streaming->stylesheet_resources;
+        memset(&txn->streaming->stylesheet_resources, 0,
+               sizeof(txn->streaming->stylesheet_resources));
     }
-    bool streamed_runtime = streaming != NULL && streaming->runtime != NULL;
-    if (streamed_runtime) {
+    txn->streamed_runtime = txn->streaming != NULL && txn->streaming->runtime != NULL;
+    if (txn->streamed_runtime) {
         script_runtime_set_synchronous_layout_callback(
-            streaming->runtime, NULL, NULL);
+            txn->streaming->runtime, NULL, NULL);
         script_runtime_set_layout(
-            streaming->runtime, NULL, streaming->viewport.css_height);
-        if (streaming->cssom_layout_ready) {
-            layout_destroy(&streaming->cssom_layout);
-            memset(&streaming->cssom_layout, 0,
-                   sizeof(streaming->cssom_layout));
-            streaming->cssom_layout_ready = false;
+            txn->streaming->runtime, NULL, txn->streaming->viewport.css_height);
+        if (txn->streaming->cssom_layout_ready) {
+            layout_destroy(&txn->streaming->cssom_layout);
+            memset(&txn->streaming->cssom_layout, 0,
+                   sizeof(txn->streaming->cssom_layout));
+            txn->streaming->cssom_layout_ready = false;
         }
-        session->page.runtime = streaming->runtime;
-        if (streaming->runtime_document_replacement) {
-            if (!script_runtime_rebind_document(
-                    session->page.runtime, &session->page.document,
-                    &streaming->script_result)) {
-                snprintf(session->last_error, sizeof(session->last_error),
-                         "JavaScript document rebind failed: %.430s",
-                         streaming->script_result.error);
-                streaming->runtime_transferred = true;
-                goto fail;
-            }
-        } else {
-            /* The parser-owned PocDocument struct moved into the committed
-               page, but its Lexbor tree and JavaScript realm did not change.
-               Preserve handles and script identity across that storage move. */
-            script_runtime_relocate_document_storage(
-                session->page.runtime, &session->page.document);
-        }
-        session->page.script_result = streaming->script_result;
-        streaming->runtime_transferred = true;
+        session->page.runtime = txn->streaming->runtime;
+        /* The parser-owned PocDocument struct moved into the committed
+           page, but its Lexbor tree and JavaScript realm did not change.
+           Preserve handles and script identity across that storage move. */
+        script_runtime_relocate_document_storage(
+            session->page.runtime, &session->page.document);
+        session->page.script_result = txn->streaming->script_result;
+        txn->streaming->runtime_transferred = true;
         /* canvas_images moved from streaming storage into page storage before
            this realm was adopted. Rebind before any remaining deferred script
            runs so a late drawing cannot publish into the emptied staging
            table. */
         script_runtime_set_images(
             session->page.runtime, &session->page.images);
-    } else if (streaming != NULL
-               && streaming->script_disabled_after_failure) {
-        session->page.script_result = streaming->script_result;
-        session->script_discovered = streaming->scripts.early.discovered;
-        session->script_attempted = streaming->scripts.early.attempted;
-        session->script_loaded = streaming->scripts.early.loaded;
-        session->script_failed = streaming->scripts.early.failed;
+    } else if (txn->streaming != NULL
+               && txn->streaming->script_disabled_after_failure) {
+        session->page.script_result = txn->streaming->script_result;
+        session->script_discovered = txn->streaming->scripts.early.discovered;
+        session->script_attempted = txn->streaming->scripts.early.attempted;
+        session->script_loaded = txn->streaming->scripts.early.loaded;
+        session->script_failed = txn->streaming->scripts.early.failed;
         session->script_skipped_quota =
-            streaming->scripts.early.skipped_quota;
+            txn->streaming->scripts.early.skipped_quota;
         session->script_skipped_pressure =
-            streaming->scripts.early.skipped_pressure;
+            txn->streaming->scripts.early.skipped_pressure;
         session->script_inline_data_quota_exemptions =
-            streaming->scripts.early.inline_data_quota_exemptions;
+            txn->streaming->scripts.early.inline_data_quota_exemptions;
         session->script_cost_class_rejections =
-            streaming->scripts.early.cost_class_rejections;
+            txn->streaming->scripts.early.cost_class_rejections;
         session->script_watchdog_classification_misses =
-            streaming->scripts.early.watchdog_classification_misses;
+            txn->streaming->scripts.early.watchdog_classification_misses;
         session->script_watchdog_classification_miss_bytes =
-            streaming->scripts.early.watchdog_classification_miss_bytes;
+            txn->streaming->scripts.early.watchdog_classification_miss_bytes;
         session->script_watchdog_classification_miss_loops =
-            streaming->scripts.early.watchdog_classification_miss_loops;
+            txn->streaming->scripts.early.watchdog_classification_miss_loops;
         session->script_watchdog_classification_miss_flags =
-            streaming->scripts.early.watchdog_classification_miss_flags;
+            txn->streaming->scripts.early.watchdog_classification_miss_flags;
     }
-    if (streaming != NULL) {
-        const ExternalScriptMetrics *early = &streaming->scripts.early;
+    if (txn->streaming != NULL) {
+        const ExternalScriptMetrics *early = &txn->streaming->scripts.early;
         if (early->skipped_pressure != 0u)
             session->page.script_memory_limited = true;
         bool shed_author_script_work =
-            streaming->script_disabled_after_failure
+            txn->streaming->script_disabled_after_failure
             && session->scripts_enabled
             && session->document_scripts_enabled
             && navigation_document_has_author_runtime_content(
@@ -1283,32 +1288,32 @@ static bool navigation_commit_document(
             session->page.script_degradation_observed = true;
         }
     }
-    if (streaming != NULL && streaming->scheduler != NULL) {
-        session->page.resource_scheduler = streaming->scheduler;
-        streaming->scheduler_transferred = true;
+    if (txn->streaming != NULL && txn->streaming->scheduler != NULL) {
+        session->page.resource_scheduler = txn->streaming->scheduler;
+        txn->streaming->scheduler_transferred = true;
     }
     if (!viewport_context_resolve(&session->viewport,
                                   &session->page.document,
-                                  viewport_width, 272, 980)) {
+                                  txn->viewport_width, 272, 980)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "mobile viewport resolution failed");
-        goto fail;
+        return false;
     }
-    navigation_apply_declared_viewport(session, viewport_width, 272);
+    navigation_apply_declared_viewport(session, txn->viewport_width, 272);
     if (session->page.runtime != NULL) {
         script_runtime_set_viewport(
             session->page.runtime, session->viewport.css_width,
             session->viewport.css_height, session->viewport.device_width,
             session->viewport.device_height);
     }
-    if (streaming != NULL
-        && streaming->preview_layout_reuse != NULL) {
-        if (streaming->viewport.css_width == session->viewport.css_width
-            && streaming->viewport.css_height
+    if (txn->streaming != NULL
+        && txn->streaming->preview_layout_reuse != NULL) {
+        if (txn->streaming->viewport.css_width == session->viewport.css_width
+            && txn->streaming->viewport.css_height
                 == session->viewport.css_height) {
             session->page.layout_reuse =
-                streaming->preview_layout_reuse;
-            streaming->preview_layout_reuse = NULL;
+                txn->streaming->preview_layout_reuse;
+            txn->streaming->preview_layout_reuse = NULL;
             /* The preview withholds matched-rule lists while the parser
                still appends; the committed document is complete, so the
                page cache may retain them from its first full build on
@@ -1319,13 +1324,13 @@ static bool navigation_commit_document(
                 session->page.layout_reuse);
         } else {
             layout_reuse_cache_destroy(
-                streaming->preview_layout_reuse);
-            streaming->preview_layout_reuse = NULL;
+                txn->streaming->preview_layout_reuse);
+            txn->streaming->preview_layout_reuse = NULL;
         }
     }
-    bool optional_work_shed = streaming != NULL
-        && streaming->optional_work_shed;
-    if (!optional_work_shed && (session->document_scripts_enabled
+    txn->optional_work_shed = txn->streaming != NULL
+        && txn->streaming->optional_work_shed;
+    if (!txn->optional_work_shed && (session->document_scripts_enabled
         || session->external_resources_enabled
         || session->web_fonts_enabled)) {
         size_t maximum_file = session->document_scripts_enabled
@@ -1348,8 +1353,8 @@ static bool navigation_commit_document(
             /* Native local entry surfaces have no initial network resources.
                Ordinary documents retain eager admission, including the curl
                reservation used by their font/resource pressure decisions. */
-            bool local_entry = site_adapter_handles_navigation("GET", url)
-                && !site_adapter_navigation_requires_network("GET", url);
+            bool local_entry = site_adapter_handles_navigation("GET", txn->url)
+                && !site_adapter_navigation_requires_network("GET", txn->url);
             session->page.resource_scheduler =
                 local_entry ? fetch_scheduler_create_deferred_in_domain(
                     session->page.fetch_domain, 12, reserved)
@@ -1363,35 +1368,37 @@ static bool navigation_commit_document(
         if (session->page.resource_scheduler == NULL) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "document resource scheduler startup failed");
-            goto fail;
+            return false;
         }
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-setup",
-            session->page.document.node_count)) goto fail;
-    bool adopted_streaming_stylesheet = false;
-    bool adopted_compiled_stylesheet = false;
-    bool stylesheet_external_current = false;
-    bool user_stylesheet_current = false;
-    bool script_document_may_have_changed = false;
-    uint64_t adopted_stylesheet_fingerprint = 0;
+            session->page.document.node_count);
+}
+
+/* Style: adopt the stream's blocking stylesheet when its inputs are
+   unchanged (appending a pure suffix of body styles), else a cached
+   compiled sheet, else build one. */
+static TILEFINCH_OUT_OF_LINE bool commit_style(NavigationSession *session,
+                                               NavigationCommitTxn *txn)
+{
     uint64_t phase_started = navigation_now_us();
-    if (streaming != NULL && streaming->blocking_stylesheet_ready
-        && streaming->blocking_stylesheet_fingerprint_valid
-        && streaming->viewport.css_width == session->viewport.css_width
-        && streaming->viewport.css_height == session->viewport.css_height
-        && streaming->blocking_stylesheet.viewport_width
+    if (txn->streaming != NULL && txn->streaming->blocking_stylesheet_ready
+        && txn->streaming->blocking_stylesheet_fingerprint_valid
+        && txn->streaming->viewport.css_width == session->viewport.css_width
+        && txn->streaming->viewport.css_height == session->viewport.css_height
+        && txn->streaming->blocking_stylesheet.viewport_width
             == session->viewport.css_width
-        && streaming->blocking_stylesheet.viewport_height
+        && txn->streaming->blocking_stylesheet.viewport_height
             == session->viewport.css_height
-        && strcmp(streaming->resource_base_url,
+        && strcmp(txn->streaming->resource_base_url,
                   session->page.resource_base_url) == 0
-        && strcmp(streaming->referrer_policy,
+        && strcmp(txn->streaming->referrer_policy,
                   session->page.referrer_policy) == 0) {
         uint64_t fingerprint_started = navigation_now_us();
         uint64_t final_fingerprint = 0;
         bool fingerprinted = navigation_stream_stylesheet_fingerprint(
-            streaming, &session->page.document, &final_fingerprint);
+            txn->streaming, &session->page.document, &final_fingerprint);
         uint64_t fingerprint_finished = navigation_now_us();
         session->performance.blocking_stylesheet_fingerprint_us +=
             fingerprint_finished >= fingerprint_started
@@ -1405,29 +1412,29 @@ static bool navigation_commit_document(
            changed the parse context. */
         if (fingerprinted
             && final_fingerprint
-               != streaming->blocking_stylesheet_fingerprint
+               != txn->streaming->blocking_stylesheet_fingerprint
             && navigation_stream_continue_stylesheet_suffix(
-                   streaming, &session->page.document, final_fingerprint,
+                   txn->streaming, &session->page.document, final_fingerprint,
                    true)) {
             session->performance.blocking_stylesheet_commit_continuations++;
         }
         if (fingerprinted
             && final_fingerprint
-               == streaming->blocking_stylesheet_fingerprint) {
-            session->page.stylesheet = streaming->blocking_stylesheet;
+               == txn->streaming->blocking_stylesheet_fingerprint) {
+            session->page.stylesheet = txn->streaming->blocking_stylesheet;
             layout_reuse_cache_rebind_stylesheet(
                 session->page.layout_reuse,
-                &streaming->blocking_stylesheet,
+                &txn->streaming->blocking_stylesheet,
                 &session->page.stylesheet);
-            memset(&streaming->blocking_stylesheet, 0,
-                   sizeof(streaming->blocking_stylesheet));
-            streaming->blocking_stylesheet_ready = false;
+            memset(&txn->streaming->blocking_stylesheet, 0,
+                   sizeof(txn->streaming->blocking_stylesheet));
+            txn->streaming->blocking_stylesheet_ready = false;
             session->page.external_stylesheets =
-                streaming->blocking_stylesheets;
-            adopted_streaming_stylesheet = true;
-            stylesheet_external_current = true;
-            user_stylesheet_current = true;
-            adopted_stylesheet_fingerprint = final_fingerprint;
+                txn->streaming->blocking_stylesheets;
+            txn->adopted_streaming_stylesheet = true;
+            txn->stylesheet_external_current = true;
+            txn->user_stylesheet_current = true;
+            txn->adopted_stylesheet_fingerprint = final_fingerprint;
             navigation_record_compiled_stylesheet(session, final_fingerprint);
             session->performance.blocking_stylesheet_adoptions++;
             if (session->page.runtime != NULL) {
@@ -1436,41 +1443,50 @@ static bool navigation_commit_document(
             }
         }
     }
-    if (!adopted_streaming_stylesheet && streaming != NULL) {
+    if (!txn->adopted_streaming_stylesheet && txn->streaming != NULL) {
         uint64_t fingerprint_started = navigation_now_us();
         uint64_t final_fingerprint = 0;
         bool fingerprinted = navigation_stream_stylesheet_fingerprint(
-            streaming, &session->page.document, &final_fingerprint);
+            txn->streaming, &session->page.document, &final_fingerprint);
         session->performance.blocking_stylesheet_fingerprint_us +=
             navigation_now_us() - fingerprint_started;
         if (fingerprinted
             && navigation_compiled_stylesheet_cache_take(
                 session, final_fingerprint, &session->page.stylesheet,
                 &session->page.external_stylesheets)) {
-            adopted_compiled_stylesheet = true;
-            stylesheet_external_current = true;
-            user_stylesheet_current = true;
-            adopted_stylesheet_fingerprint = final_fingerprint;
+            txn->adopted_compiled_stylesheet = true;
+            txn->stylesheet_external_current = true;
+            txn->user_stylesheet_current = true;
+            txn->adopted_stylesheet_fingerprint = final_fingerprint;
             navigation_record_compiled_stylesheet(session, final_fingerprint);
         }
     }
-    if (!adopted_streaming_stylesheet && !adopted_compiled_stylesheet
+    if (!txn->adopted_streaming_stylesheet && !txn->adopted_compiled_stylesheet
         && !navigation_build_stylesheet(session)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "stylesheet construction failed");
-        goto fail;
+        return false;
     }
     session->performance.style_us += navigation_record_slice(
         session, NAVIGATION_SLICE_STYLE, phase_started,
         session->page.document.node_count);
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-style",
-            session->page.document.node_count)) goto fail;
+            session->page.document.node_count);
+}
+
+/* External stylesheets: load what the adopted sheet does not already
+   reflect, falling back to a usable sheet, and adopt the stylesheet load
+   events. */
+static TILEFINCH_OUT_OF_LINE bool commit_external_sheets(NavigationSession *session,
+                                                         NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
     if (session->external_resources_enabled) {
         if (stylesheet_document_resources_prepare_complete_census(
                 &session->page.stylesheet_resources)) {
-            stylesheet_external_current = false;
-            user_stylesheet_current = false;
+            txn->stylesheet_external_current = false;
+            txn->user_stylesheet_current = false;
             session->page.compiled_stylesheet_cacheable = false;
         }
         phase_started = navigation_now_us();
@@ -1481,10 +1497,10 @@ static bool navigation_commit_document(
         if (session->page.runtime != NULL) {
             (void) script_runtime_collect_and_trim(session->page.runtime);
         }
-        if (!stylesheet_external_current
+        if (!txn->stylesheet_external_current
             && !stylesheets_load_external_tracked_with_context(
                 &session->page.document, &session->page.stylesheet,
-                session->budget, resource_base_url, url,
+                session->budget, txn->resource_base_url, txn->url,
                 session->page.referrer_policy,
                 session->maximum_stylesheets,
                 session->maximum_stylesheet_bytes,
@@ -1497,10 +1513,10 @@ static bool navigation_commit_document(
             if (!navigation_install_usable_stylesheet_fallback(session)) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "stylesheet fallback exceeded its budget");
-                goto fail;
+                return false;
             }
-            stylesheet_external_current = true;
-            user_stylesheet_current = false;
+            txn->stylesheet_external_current = true;
+            txn->user_stylesheet_current = false;
             if (session->page.runtime != NULL) {
                 script_runtime_set_stylesheet(
                     session->page.runtime, &session->page.stylesheet);
@@ -1508,16 +1524,16 @@ static bool navigation_commit_document(
         }
         /* Preserve the final bounded retry when an individual stylesheet
            failed even though the aggregate discovery pass completed. */
-        stylesheet_external_current = stylesheet_external_current
+        txn->stylesheet_external_current = txn->stylesheet_external_current
             || session->page.external_stylesheets.failed == 0;
-        if (streaming == NULL
-            || !streaming->stylesheet_event_baseline_adopted) {
+        if (txn->streaming == NULL
+            || !txn->streaming->stylesheet_event_baseline_adopted) {
             navigation_adopt_stylesheet_events(
                 &session->page.document, session->page.resource_base_url,
                 session->page.stylesheet_events,
                 &session->page.stylesheet_event_count);
         }
-        if (!adopted_streaming_stylesheet && !adopted_compiled_stylesheet) {
+        if (!txn->adopted_streaming_stylesheet && !txn->adopted_compiled_stylesheet) {
             uint64_t stylesheet_elapsed = navigation_record_resource_slices(
                 session, phase_started, &session->page.external_stylesheets,
                 NULL);
@@ -1526,44 +1542,52 @@ static bool navigation_commit_document(
                 stylesheet_elapsed;
         }
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-stylesheets",
-            session->page.external_stylesheets.discovered)) goto fail;
-    if (session->user_css_length != 0 && !user_stylesheet_current) {
+            session->page.external_stylesheets.discovered);
+}
+
+/* Scripts: add script-blocking user CSS, admit the realm (degrading to a
+   static page on a measured Budget refusal) and run the document's
+   scripts, restoring the server body when hydration degrades. */
+static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
+                                                 NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
+    if (session->user_css_length != 0 && !txn->user_stylesheet_current) {
         phase_started = navigation_now_us();
         if (!stylesheet_add_user_css(&session->page.stylesheet,
                                      session->user_css,
                                      session->user_css_length)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "script-blocking user stylesheet exceeded its budget");
-            goto fail;
+            return false;
         }
         session->performance.style_us += navigation_record_slice(
             session, NAVIGATION_SLICE_STYLE, phase_started,
             session->page.stylesheet.count);
-        user_stylesheet_current = true;
+        txn->user_stylesheet_current = true;
     }
     phase_started = navigation_now_us();
-    bool runtime_required = allow_runtime && session->scripts_enabled
-        && (streaming == NULL
-            || !streaming->script_disabled_after_failure)
-        && (streaming == NULL || streamed_runtime
+    bool runtime_required = txn->allow_runtime && session->scripts_enabled
+        && (txn->streaming == NULL
+            || !txn->streaming->script_disabled_after_failure)
+        && (txn->streaming == NULL || txn->streamed_runtime
             || navigation_document_requires_runtime(
                 session, &session->page.document));
     if (runtime_required) {
         size_t runtime_failure_count = session->budget->failure_count;
         if (session->page.runtime == NULL) {
             session->page.runtime = navigation_create_runtime(
-                session, &session->page.document, url,
-                streaming == NULL ? "" : streaming->document_referrer,
-                streaming == NULL ? 0 : streaming->started_us,
+                session, &session->page.document, txn->url,
+                txn->streaming == NULL ? "" : txn->streaming->document_referrer,
+                txn->streaming == NULL ? 0 : txn->streaming->started_us,
                 session->page.referrer_policy,
-                session->document_scripts_enabled
-                    || session->defer_document_script_pipeline,
+                session->document_scripts_enabled,
                 &session->viewport, SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL,
-                !isolates_remote_document, session->page.fetch_domain,
+                session->page.fetch_domain,
                 &session->page.stylesheet, &session->page.images,
-                fonts,
+                txn->fonts,
                 &session->page.script_result);
         }
         if (session->page.runtime == NULL) {
@@ -1573,7 +1597,7 @@ static bool navigation_commit_document(
                     session->page.script_result.error[0] == '\0'
                       ? "JavaScript runtime startup failed"
                       : session->page.script_result.error);
-                goto fail;
+                return false;
             }
             /* A realm used only for optional author behavior must not make a
                complete server-rendered document disappear when its bounded
@@ -1604,41 +1628,40 @@ static bool navigation_commit_document(
             script_runtime_set_image_sizing_layout_callback(
                 session->page.runtime, navigation_flush_candidate_geometry,
                 session);
-            script_document_may_have_changed = true;
+            txn->script_document_may_have_changed = true;
             if (!page_capability_trace_setup(session)) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "page capability trace setup failed: %.430s",
                          session->page.script_result.error);
-                goto fail;
+                return false;
             }
-            if (session->document_scripts_enabled
-                && !session->defer_document_script_pipeline) {
+            if (session->document_scripts_enabled) {
             ExternalScriptMetrics metrics = {0};
             DocumentBodySnapshot server_snapshot = {0};
             const DocumentBodySnapshot *rollback_snapshot = NULL;
-            if (streamed_runtime
-                && streaming->server_body_snapshot.markup != NULL) {
-                rollback_snapshot = &streaming->server_body_snapshot;
+            if (txn->streamed_runtime
+                && txn->streaming->server_body_snapshot.markup != NULL) {
+                rollback_snapshot = &txn->streaming->server_body_snapshot;
             } else if (document_body_snapshot_capture(
                            &session->page.document, &server_snapshot)) {
                 rollback_snapshot = &server_snapshot;
             }
-            bool scripts_ok = streamed_runtime
+            bool scripts_ok = txn->streamed_runtime
                 ? document_scripts_finish_streaming(
                     &session->page.document, session->page.runtime,
                     session->budget, session->browser_session,
-                    resource_base_url, url,
+                    txn->resource_base_url, txn->url,
                     session->page.referrer_policy,
                     session->maximum_scripts,
                     session->maximum_script_bytes,
                     session->maximum_script_file_bytes,
                     session->script_timeout_ms,
-                    session->page.resource_scheduler, &streaming->scripts,
+                    session->page.resource_scheduler, &txn->streaming->scripts,
                     &metrics, &session->page.script_result)
                 : document_scripts_execute(
                     &session->page.document, session->page.runtime,
                     session->budget, session->browser_session,
-                    resource_base_url, url,
+                    txn->resource_base_url, txn->url,
                     session->page.referrer_policy,
                     session->maximum_scripts,
                     session->maximum_script_bytes,
@@ -1651,7 +1674,7 @@ static bool navigation_commit_document(
                 snprintf(session->last_error, sizeof(session->last_error),
                          "could not refresh mutated candidate DOM");
                 document_body_snapshot_destroy(&server_snapshot);
-                goto fail;
+                return false;
             }
             if (!scripts_ok) {
                 snprintf(session->last_error, sizeof(session->last_error),
@@ -1675,7 +1698,7 @@ static bool navigation_commit_document(
                 if (!navigation_retire_exhausted_script_realms(
                         session, false)) {
                     document_body_snapshot_destroy(&server_snapshot);
-                    goto fail;
+                    return false;
                 }
             }
             bool hydration_degraded = !scripts_ok || metrics.failed != 0
@@ -1742,27 +1765,35 @@ static bool navigation_commit_document(
             }
         }
     }
-    if (streaming != NULL && streaming->script_disabled_after_failure
-        && streaming->server_body_snapshot.markup != NULL) {
+    if (txn->streaming != NULL && txn->streaming->script_disabled_after_failure
+        && txn->streaming->server_body_snapshot.markup != NULL) {
         (void) navigation_restore_server_body_if_degraded(
-            session, &streaming->server_body_snapshot);
+            session, &txn->streaming->server_body_snapshot);
     }
     session->performance.script_us += navigation_record_script_slices(
         session, phase_started, &session->page.script_result,
         session->script_attempted
             + session->page.script_result.scripts_evaluated);
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-scripts",
             session->script_attempted
-                + session->page.script_result.scripts_evaluated)) goto fail;
-    if (script_document_may_have_changed) {
+                + session->page.script_result.scripts_evaluated);
+}
+
+/* Post-script style: rebuild the sheet if scripts changed what it was
+   compiled from, and drop reused styles the script mutations reached. */
+static TILEFINCH_OUT_OF_LINE bool commit_post_script_style(NavigationSession *session,
+                                                           NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
+    if (txn->script_document_may_have_changed) {
         phase_started = navigation_now_us();
         bool rebuild_stylesheet = true;
-        if (adopted_streaming_stylesheet || adopted_compiled_stylesheet) {
+        if (txn->adopted_streaming_stylesheet || txn->adopted_compiled_stylesheet) {
             uint64_t fingerprint_started = navigation_now_us();
             uint64_t post_script_fingerprint = 0;
             bool fingerprinted = navigation_stream_stylesheet_fingerprint(
-                streaming, &session->page.document,
+                txn->streaming, &session->page.document,
                 &post_script_fingerprint);
             uint64_t fingerprint_finished = navigation_now_us();
             session->performance.blocking_stylesheet_fingerprint_us +=
@@ -1770,7 +1801,7 @@ static bool navigation_commit_document(
                     ? fingerprint_finished - fingerprint_started : 0;
             rebuild_stylesheet = !fingerprinted
                 || post_script_fingerprint
-                   != adopted_stylesheet_fingerprint;
+                   != txn->adopted_stylesheet_fingerprint;
             if (!rebuild_stylesheet) {
                 session->performance.blocking_stylesheet_final_reuses++;
             }
@@ -1781,10 +1812,10 @@ static bool navigation_commit_document(
             if (!navigation_build_stylesheet(session)) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "post-script stylesheet construction failed");
-                goto fail;
+                return false;
             }
-            stylesheet_external_current = false;
-            user_stylesheet_current = false;
+            txn->stylesheet_external_current = false;
+            txn->user_stylesheet_current = false;
         }
         if (session->page.runtime != NULL) {
             script_runtime_set_stylesheet(session->page.runtime,
@@ -1810,20 +1841,29 @@ static bool navigation_commit_document(
             session, NAVIGATION_SLICE_STYLE, phase_started,
             session->page.document.node_count);
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-post-script-style",
-            session->page.document.node_count)) goto fail;
+            session->page.document.node_count);
+}
+
+/* Final style: load late external sheets and their events, add user CSS,
+   apply the static-script fallback, and prepare Reader candidates when
+   needed. */
+static TILEFINCH_OUT_OF_LINE bool commit_final_style(NavigationSession *session,
+                                                     NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
     phase_started = navigation_now_us();
-    bool progressive_preview_candidate =
+    txn->progressive_preview_candidate =
         stylesheet_web_font_set(&session->page.stylesheet) != NULL;
     if (session->external_resources_enabled) {
         if (session->page.runtime != NULL) {
             (void) script_runtime_collect_and_trim(session->page.runtime);
         }
-        if (!stylesheet_external_current
+        if (!txn->stylesheet_external_current
             && !stylesheets_load_external_tracked_with_context(
                 &session->page.document, &session->page.stylesheet,
-                session->budget, session->page.resource_base_url, url,
+                session->budget, session->page.resource_base_url, txn->url,
                 session->page.referrer_policy,
                 session->maximum_stylesheets,
                 session->maximum_stylesheet_bytes,
@@ -1836,10 +1876,10 @@ static bool navigation_commit_document(
             if (!navigation_install_usable_stylesheet_fallback(session)) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "stylesheet fallback exceeded its budget");
-                goto fail;
+                return false;
             }
-            stylesheet_external_current = true;
-            user_stylesheet_current = false;
+            txn->stylesheet_external_current = true;
+            txn->user_stylesheet_current = false;
             if (session->page.runtime != NULL) {
                 script_runtime_set_stylesheet(
                     session->page.runtime, &session->page.stylesheet);
@@ -1851,7 +1891,7 @@ static bool navigation_commit_document(
                     session, false)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "stylesheet completion event dispatch failed");
-            goto fail;
+            return false;
         }
         uint64_t stylesheet_finished = navigation_now_us();
         session->performance.stylesheet_resource_us +=
@@ -1863,13 +1903,13 @@ static bool navigation_commit_document(
                 NULL);
     }
     phase_started = navigation_now_us();
-    if (session->user_css_length != 0 && !user_stylesheet_current
+    if (session->user_css_length != 0 && !txn->user_stylesheet_current
         && !stylesheet_add_user_css(&session->page.stylesheet,
                                     session->user_css,
                                     session->user_css_length)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "user stylesheet exceeded its budget");
-        goto fail;
+        return false;
     }
     session->performance.style_us += navigation_record_slice(
         session, NAVIGATION_SLICE_STYLE, phase_started,
@@ -1899,7 +1939,7 @@ static bool navigation_commit_document(
        document already carries hard script-degradation evidence and may need
        automatic recovery. */
     if (session->prepare_reader_candidates
-        && (static_script_fallback || optional_work_shed
+        && (static_script_fallback || txn->optional_work_shed
             || session->user_css_length != 0u)) {
         /* Build the extracted root outside the author-visible tree and retain
            that exact identity before any later author turn. Reserve the fixed
@@ -1907,35 +1947,35 @@ static bool navigation_commit_document(
            leaving an untracked public marker behind. */
         if (!script_runtime_node_handle_capacity_available(
                 session->page.runtime)) {
-            reader_analysis = (ReaderDocumentAnalysis) {
+            txn->reader_analysis = (ReaderDocumentAnalysis) {
                 .prepared = true, .bounded_out = true
             };
         } else {
             lxb_dom_node_t *prepared_root = NULL;
             bool prepared = reader_document_prepare_detached_with_stylesheet(
                 &session->page.document, &session->page.stylesheet,
-                &reader_analysis, &prepared_root);
+                &txn->reader_analysis, &prepared_root);
             if (!prepared) {
-                reader_analysis = (ReaderDocumentAnalysis) {
+                txn->reader_analysis = (ReaderDocumentAnalysis) {
                     .prepared = true, .kind = READER_PAGE_RAW,
                     .bounded_out = true
                 };
             } else if (prepared_root != NULL
-                       && reader_analysis.kind != READER_PAGE_RAW) {
+                       && txn->reader_analysis.kind != READER_PAGE_RAW) {
                 long handle = session->page.runtime == NULL ? 0
                     : script_runtime_node_weak_handle(
                           session->page.runtime, prepared_root);
                 if (session->page.runtime != NULL && handle == 0) {
                     reader_document_discard_exact_prepared_view(
                         &session->page.document, prepared_root,
-                        reader_analysis.kind);
-                    reader_analysis = (ReaderDocumentAnalysis) {
+                        txn->reader_analysis.kind);
+                    txn->reader_analysis = (ReaderDocumentAnalysis) {
                         .prepared = true, .kind = READER_PAGE_RAW,
                         .bounded_out = true
                     };
                 } else {
                     session->page.reader_root = prepared_root;
-                    session->page.reader_root_kind = reader_analysis.kind;
+                    session->page.reader_root_kind = txn->reader_analysis.kind;
                     session->page.reader_root_handle = handle;
                     /* An explicit Reader stylesheet with no remaining author
                        tasks can enter Reader in this same native commit. When
@@ -1945,34 +1985,42 @@ static bool navigation_commit_document(
                         && session->page.script_result.pending_tasks == 0u) {
                         (void) reader_document_connect_prepared_view(
                             &session->page.document, prepared_root,
-                            reader_analysis.kind);
+                            txn->reader_analysis.kind);
                     }
                 }
             }
         }
-        session->page.reader_analysis = reader_analysis;
+        session->page.reader_analysis = txn->reader_analysis;
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-final-style",
-            session->page.stylesheet.count)) goto fail;
+            session->page.stylesheet.count);
+}
+
+/* Fonts: record the compiled sheet for reuse and start the page's web
+   fonts. */
+static TILEFINCH_OUT_OF_LINE bool commit_fonts(NavigationSession *session,
+                                               NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
     /* Cache only source-derived sheets. Author script CSSOM mutations can
        compile rules that have no representation in the DOM fingerprint;
        replaying those on another document would be incorrect. */
     session->page.compiled_stylesheet_cacheable = false;
-    if (streaming != NULL && session->script_attempted == 0) {
+    if (txn->streaming != NULL && session->script_attempted == 0) {
         uint64_t final_fingerprint = 0;
         if (navigation_stream_stylesheet_fingerprint(
-                streaming, &session->page.document,
+                txn->streaming, &session->page.document,
                 &final_fingerprint)) {
             navigation_record_compiled_stylesheet(session, final_fingerprint);
         }
     }
     if (session->web_fonts_enabled) {
         phase_started = navigation_now_us();
-        if (!navigation_load_web_fonts(session, url)) {
+        if (!navigation_load_web_fonts(session, txn->url)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "external font pipeline could not start within its budget");
-            goto fail;
+            return false;
         }
         size_t font_work = session->page.external_fonts.sources_discovered;
         if (session->page.external_fonts.attempted
@@ -1986,9 +2034,17 @@ static bool navigation_commit_document(
         session->performance.resource_us += font_elapsed;
         session->performance.font_resource_us += font_elapsed;
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-fonts",
-            session->page.external_fonts.attempted)) goto fail;
+            session->page.external_fonts.attempted);
+}
+
+/* Images: reserve the frame tail, load the visible-priority images (from a
+   preview layout, a static plan or the markup) and plan the rest. */
+static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
+                                                NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
 
     ImagePriorityTarget image_priority_targets[
         NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
@@ -2010,16 +2066,15 @@ static bool navigation_commit_document(
             reserved_image_capacity)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "frame image metadata exceeded its budget");
-        goto fail;
+        return false;
     }
     bool pre_image_preview_candidate =
         session->external_resources_enabled
         && navigation_document_may_have_images(
             &session->page.document, &session->page.stylesheet);
-    bool final_layout_ready = false;
     if (pre_image_preview_candidate) {
         (void) navigation_try_progressive_preview(
-            session, streaming, previous_page, true, fonts, images, false,
+            session, txn->streaming, txn->previous_page, true, txn->fonts, txn->images, false,
             &session->page.layout, image_priority_targets,
             NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT, &image_priority_count);
         session->performance.progressive_image_priority_nodes =
@@ -2028,12 +2083,12 @@ static bool navigation_commit_document(
            no author script capable of invalidating this probe. Build one
            bounded no-image layout to obtain exact boxes; ordinary web pages
            retain the streaming-preview/markup policy above. */
-        if (image_priority_count == 0 && !allow_runtime
-            && streaming == NULL) {
+        if (image_priority_count == 0 && !txn->allow_runtime
+            && txn->streaming == NULL) {
             static_image_plan = navigation_plan_static_image_geometry(
-                session, fonts, images, image_priority_targets,
+                session, txn->fonts, txn->images, image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
-                &image_priority_count, &final_layout_ready);
+                &image_priority_count, &txn->final_layout_ready);
             session->performance.progressive_image_priority_nodes =
                 image_priority_count;
         }
@@ -2076,11 +2131,11 @@ static bool navigation_commit_document(
     session->performance.markup_image_priority_nodes =
         markup_priority_added;
 
-    bool provisional_commit =
-        navigation_provisional_commit_eligible(session, streaming);
-    bool defer_mutable_document_images = !provisional_commit
+    txn->provisional_commit =
+        navigation_provisional_commit_eligible(session, txn->streaming);
+    bool defer_mutable_document_images = !txn->provisional_commit
         && session->external_resources_enabled
-        && streaming != NULL && allow_runtime && session->progressive_paint != NULL
+        && txn->streaming != NULL && txn->allow_runtime && session->progressive_paint != NULL
         && navigation_plan_mutable_document_images(session);
     if (defer_mutable_document_images) {
         size_t retained = 0;
@@ -2102,7 +2157,7 @@ static bool navigation_commit_document(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, image_priority_targets,
                 image_priority_count, session->budget,
-                session->page.resource_base_url, url,
+                session->page.resource_base_url, txn->url,
                 session->page.referrer_policy, session->maximum_images,
                 session->maximum_image_bytes,
                 session->maximum_image_file_bytes,
@@ -2113,7 +2168,7 @@ static bool navigation_commit_document(
             if (session->page.images.stats.load_cancelled) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "visible image priority pipeline cancelled");
-                goto fail;
+                return false;
             }
             /* Images are optional. The loader rolled back its suffix; even
                a first-image refusal must not discard the usable document.
@@ -2126,12 +2181,12 @@ static bool navigation_commit_document(
                 session->page.images.stats.loaded - loaded_before;
         }
         if (image_priority_count != 0 && !image_pipeline_refused) {
-            images = &session->page.images;
+            txn->images = &session->page.images;
             layout_reuse_cache_update_images(
-                session->page.layout_reuse, images);
+                session->page.layout_reuse, txn->images);
             size_t remaining_priority_count = 0;
-            final_layout_ready = navigation_try_progressive_preview(
-                session, streaming, previous_page, true, fonts, images,
+            txn->final_layout_ready = navigation_try_progressive_preview(
+                session, txn->streaming, txn->previous_page, true, txn->fonts, txn->images,
                 true, &session->page.layout,
                 image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
@@ -2142,7 +2197,7 @@ static bool navigation_commit_document(
             && navigation_background_images_enabled();
         bool defer_static_document_images = static_image_plan
             && session->page.deferred_image_count != 0
-            && !allow_runtime && streaming == NULL
+            && !txn->allow_runtime && txn->streaming == NULL
             && navigation_document_images_are_defer_safe(
                    &session->page.document, &session->page.stylesheet, &session->page.images);
         if (image_pipeline_refused) {
@@ -2151,7 +2206,7 @@ static bool navigation_commit_document(
             session->page.deferred_image_count = 0;
             session->page.image_continuation_pending = false;
             session->page.visual_discovery_pending = false;
-        } else if (provisional_commit) {
+        } else if (txn->provisional_commit) {
             /* The viewport's priority visuals are loaded above; the rest
                are discovered by the first complete layout. */
             budget_free(session->budget,
@@ -2176,7 +2231,7 @@ static bool navigation_commit_document(
             if (!images_load_external_reusing_layout_styles_deferred(
                     &session->page.document, &session->page.stylesheet,
                     &session->page.images, session->budget,
-                    session->page.resource_base_url, url,
+                    session->page.resource_base_url, txn->url,
                     session->page.referrer_policy,
                     session->maximum_images, session->maximum_image_bytes,
                     session->maximum_image_file_bytes,
@@ -2184,13 +2239,13 @@ static bool navigation_commit_document(
                     session->resource_timeout_ms,
                     session->page.resource_scheduler,
                     session->browser_session, session->page.layout_reuse,
-                    fonts, session->viewport.css_width,
+                    txn->fonts, session->viewport.css_width,
                     defer_mutable_document_images)) {
                 if (session->page.images.stats.load_cancelled) {
                     snprintf(session->last_error,
                              sizeof(session->last_error),
                              "external image pipeline cancelled");
-                    goto fail;
+                    return false;
                 }
                 session->performance.image_pressure_fallbacks++;
                 session->page.image_continuation_pending = false;
@@ -2199,12 +2254,12 @@ static bool navigation_commit_document(
                 session->page.deferred_image_count = 0;
             }
         }
-        images = &session->page.images;
+        txn->images = &session->page.images;
         layout_reuse_cache_update_images(
-            session->page.layout_reuse, images);
-        progressive_preview_candidate = session->page.images.count != 0
+            session->page.layout_reuse, txn->images);
+        txn->progressive_preview_candidate = session->page.images.count != 0
             || session->page.stylesheet.image_url_count != 0
-            || progressive_preview_candidate;
+            || txn->progressive_preview_candidate;
         uint64_t image_finished = navigation_now_us();
         session->performance.image_resource_us +=
             image_finished >= phase_started
@@ -2213,24 +2268,41 @@ static bool navigation_commit_document(
             navigation_record_resource_slices(
                 session, phase_started, NULL, &session->page.images.stats);
     }
-    if (!navigation_commit_checkpoint(
+    return navigation_commit_checkpoint(
             session, "navigation-images",
-            session->page.images.stats.work_units)) goto fail;
-    if (!final_layout_ready && session->performance.partial_paints == 0) {
-        final_layout_ready = navigation_try_progressive_preview(
-            session, streaming, previous_page,
-            progressive_preview_candidate, fonts, images, true,
+            session->page.images.stats.work_units);
+}
+
+typedef enum {
+    NAVIGATION_COMMIT_LAYOUT_FAILED,
+    /* The authoritative layout became a resumable job the caller runs;
+       the commit is complete without the publish phase. */
+    NAVIGATION_COMMIT_LAYOUT_DEFERRED,
+    NAVIGATION_COMMIT_LAYOUT_BUILT
+} NavigationCommitLayoutOutcome;
+
+/* Layout: build the authoritative layout (a progressive preview, a
+   provisional prefix, a deferred job, or the full build with one minimal-
+   stylesheet retry under pressure) and finish it. */
+static TILEFINCH_OUT_OF_LINE NavigationCommitLayoutOutcome commit_layout(
+    NavigationSession *session, NavigationCommitTxn *txn)
+{
+    uint64_t phase_started = 0;
+    if (!txn->final_layout_ready && session->performance.partial_paints == 0) {
+        txn->final_layout_ready = navigation_try_progressive_preview(
+            session, txn->streaming, txn->previous_page,
+            txn->progressive_preview_candidate, txn->fonts, txn->images, true,
             &session->page.layout, NULL, 0, NULL);
     }
-    if (!final_layout_ready) {
+    if (!txn->final_layout_ready) {
         phase_started = navigation_now_us();
         if (session->page.images.count != 0) {
             /* Parser-time canvases are page resources even when ordinary
                external image loading is disabled (for example a data-only
                local document). Include them in the authoritative layout. */
-            images = &session->page.images;
+            txn->images = &session->page.images;
         }
-        if (provisional_commit) {
+        if (txn->provisional_commit) {
             layout_destroy(&session->page.layout);
             memset(&session->page.layout, 0, sizeof(session->page.layout));
             navigation_ensure_layout_reuse(session);
@@ -2244,7 +2316,7 @@ static bool navigation_commit_document(
             if (layout_build_context_preview(
                     &session->page.layout, session->budget,
                     &session->page.document, &session->page.stylesheet,
-                    fonts, images, &session->viewport,
+                    txn->fonts, txn->images, &session->viewport,
                     session->page.layout_reuse, limit, &truncated)) {
                 if (truncated) {
                     LayoutDocument *layout = &session->page.layout;
@@ -2254,7 +2326,7 @@ static bool navigation_commit_document(
                         + 2 * session->viewport.css_height;
                     session->performance.provisional_relayouts++;
                 }
-                final_layout_ready = true;
+                txn->final_layout_ready = true;
                 uint64_t elapsed = navigation_record_layout_slices(
                     session, phase_started, &session->page.layout);
                 session->performance.layout_us += elapsed;
@@ -2267,18 +2339,18 @@ static bool navigation_commit_document(
             }
         }
     }
-    if (!final_layout_ready) {
+    if (!txn->final_layout_ready) {
         phase_started = navigation_now_us();
-        if (defer_authoritative_layout && previous_page == NULL
-            && !record_history && candidate_prepare == NULL
-            && deferred_layout_job != NULL
+        if (txn->defer_authoritative_layout && txn->previous_page == NULL
+            && !txn->record_history && txn->candidate_prepare == NULL
+            && txn->deferred_layout_job != NULL
             && session->page.document.node_count >= 256) {
             navigation_ensure_layout_reuse(session);
             size_t layout_failure_count = session->budget->failure_count;
             size_t injected_failure_count = session->budget->injected_failure_count;
             LayoutBuildJob *job = layout_build_job_begin(
                 session->budget, &session->page.document,
-                &session->page.stylesheet, fonts, images,
+                &session->page.stylesheet, txn->fonts, txn->images,
                 &session->viewport, session->page.layout_reuse);
             if (job == NULL
                 && session->budget->failure_count > layout_failure_count
@@ -2293,25 +2365,25 @@ static bool navigation_commit_document(
                 navigation_ensure_layout_reuse(session);
                 job = layout_build_job_begin(
                     session->budget, &session->page.document,
-                    &session->page.stylesheet, fonts, images,
+                    &session->page.stylesheet, txn->fonts, txn->images,
                     &session->viewport, session->page.layout_reuse);
             }
             if (job == NULL) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "resumable layout startup failed");
-                goto fail;
+                return NAVIGATION_COMMIT_LAYOUT_FAILED;
             }
-            *deferred_layout_job = job;
-            if (deferred_preview_candidate != NULL) {
-                *deferred_preview_candidate =
-                    progressive_preview_candidate;
+            *txn->deferred_layout_job = job;
+            if (txn->deferred_preview_candidate != NULL) {
+                *txn->deferred_preview_candidate =
+                    txn->progressive_preview_candidate;
             }
-            return true;
+            return NAVIGATION_COMMIT_LAYOUT_DEFERRED;
         }
         size_t layout_failure_count = session->budget->failure_count;
         size_t injected_failure_count = session->budget->injected_failure_count;
         bool layout_built = navigation_build_layout(
-            session, &session->page.layout, fonts, images);
+            session, &session->page.layout, txn->fonts, txn->images);
         unsigned failed_phase = session->page.layout.performance.failed_phase;
         if (!layout_built && !session->layout_build_cancelled
             && session->budget->failure_count > layout_failure_count
@@ -2328,7 +2400,7 @@ static bool navigation_commit_document(
             session->page.layout_reuse = NULL;
             if (navigation_install_minimal_stylesheet_fallback(session)) {
                 layout_built = navigation_build_layout(
-                    session, &session->page.layout, fonts, images);
+                    session, &session->page.layout, txn->fonts, txn->images);
                 failed_phase = session->page.layout.performance.failed_phase;
             }
         }
@@ -2337,7 +2409,7 @@ static bool navigation_commit_document(
                 session, failed_phase,
                 session->layout_build_cancelled,
                 session->budget->failure_count - layout_failure_count);
-            goto fail;
+            return NAVIGATION_COMMIT_LAYOUT_FAILED;
         }
         uint64_t final_layout_elapsed = navigation_record_layout_slices(
             session, phase_started, &session->page.layout);
@@ -2345,15 +2417,24 @@ static bool navigation_commit_document(
         session->performance.final_layout_us += final_layout_elapsed;
     }
     if (!navigation_finish_authoritative_layout(
-            session, url, streaming, previous_page,
-            progressive_preview_candidate, fonts, images)) goto fail;
-    if (candidate_prepare != NULL) {
-        candidate_hook_attempted = true;
-        if (candidate_graph_prepare != NULL
-            && !candidate_graph_prepare(candidate_opaque, session)) {
+            session, txn->url, txn->streaming, txn->previous_page,
+            txn->progressive_preview_candidate, txn->fonts, txn->images))
+        return NAVIGATION_COMMIT_LAYOUT_FAILED;
+    return NAVIGATION_COMMIT_LAYOUT_BUILT;
+}
+
+/* Publish: run the candidate hooks and record history. Past this phase the
+   commit cannot fail. */
+static TILEFINCH_OUT_OF_LINE bool commit_publish(NavigationSession *session,
+                                                 NavigationCommitTxn *txn)
+{
+    if (txn->candidate_prepare != NULL) {
+        txn->candidate_hook_attempted = true;
+        if (txn->candidate_graph_prepare != NULL
+            && !txn->candidate_graph_prepare(txn->candidate_opaque, session)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "candidate state restoration failed");
-            goto fail;
+            return false;
         }
         lxb_html_document_t *candidate_document = session->page.document.html;
         ScriptRuntime *candidate_runtime = session->page.runtime;
@@ -2362,13 +2443,13 @@ static bool navigation_commit_document(
             session->page.resource_scheduler;
         FetchSchedulerDomain *candidate_domain =
             session->page.fetch_domain;
-        candidate_hook_attempted = true;
-        if (!candidate_prepare(candidate_opaque, session)) {
+        txn->candidate_hook_attempted = true;
+        if (!txn->candidate_prepare(txn->candidate_opaque, session)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "candidate commit preparation failed");
-            goto fail;
+            return false;
         }
-        if (generation != session->generation || session->cancelled
+        if (txn->generation != session->generation || session->cancelled
             || !session->page.loaded
             || session->page.document.html != candidate_document
             || session->page.runtime != candidate_runtime
@@ -2377,33 +2458,122 @@ static bool navigation_commit_document(
             || session->page.fetch_domain != candidate_domain) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "candidate changed during commit preparation");
-            goto fail;
+            return false;
         }
     }
-    if ((record_history
-         && !history_push(session, url, session->page.document.title))
-        || (replace_history
-            && !history_replace_current(session, url,
+    if ((txn->record_history
+         && !history_push(session, txn->url, session->page.document.title))
+        || (txn->replace_history
+            && !history_replace_current(session, txn->url,
                                         session->page.document.title))) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "history entry allocation failed");
+        return false;
+    }
+    return true;
+}
+
+static bool navigation_commit_document(
+    NavigationSession *session, uint64_t generation, const char *url,
+    PocDocument *document, int viewport_width, const FontSet *fonts,
+    const ImageResources *images, bool record_history,
+    NavigationDocumentStream *streaming,
+    FetchSchedulerDomain *shared_fetch_domain,
+    bool allow_runtime,
+    bool defer_authoritative_layout,
+    LayoutBuildJob **deferred_layout_job,
+    bool *deferred_preview_candidate)
+{
+    if (deferred_layout_job != NULL) *deferred_layout_job = NULL;
+    if (deferred_preview_candidate != NULL) {
+        *deferred_preview_candidate = false;
+    }
+    if (session == NULL || session->budget == NULL || generation == 0
+        || generation != session->generation || session->cancelled
+        || url == NULL || document == NULL || document->html == NULL
+        || viewport_width <= 0) return false;
+    NavigationCommitTxn txn = {0};
+    txn.generation = generation;
+    txn.url = url;
+    txn.document = document;
+    txn.viewport_width = viewport_width;
+    txn.fonts = fonts;
+    txn.images = images;
+    txn.record_history = record_history;
+    txn.streaming = streaming;
+    txn.allow_runtime = allow_runtime;
+    txn.defer_authoritative_layout = defer_authoritative_layout;
+    txn.deferred_layout_job = deferred_layout_job;
+    txn.deferred_preview_candidate = deferred_preview_candidate;
+    /* A direct commit (a site adapter's page, committed HTML) may be the
+       armed history "replace"; a load took its arming when it started. */
+    txn.replace_history = navigation_take_history_replace(
+        session, generation, url, record_history);
+    txn.candidate_prepare = session->candidate_prepare;
+    txn.candidate_graph_prepare = session->candidate_graph_prepare;
+    txn.candidate_abort = session->candidate_abort;
+    txn.candidate_commit = session->candidate_commit;
+    txn.candidate_opaque = session->candidate_commit_opaque;
+    if (!navigation_document_resource_base(
+            document, url, txn.resource_base_url)) {
+        return false;
+    }
+    txn.fetch_domain_from_stream = streaming != NULL
+        && streaming->fetch_domain != NULL;
+    FetchSchedulerDomain *retained_fetch_domain =
+        shared_fetch_domain == NULL
+            ? session->page.fetch_domain : shared_fetch_domain;
+    txn.candidate_fetch_domain =
+        txn.fetch_domain_from_stream
+            ? streaming->fetch_domain
+            : (retained_fetch_domain == NULL
+                 ? fetch_scheduler_domain_create(
+                       session->budget,
+                       NAVIGATION_PAGE_FETCH_SLOT_LIMIT)
+                 : fetch_scheduler_domain_retain(retained_fetch_domain));
+    if (txn.candidate_fetch_domain == NULL) {
+        snprintf(session->last_error, sizeof(session->last_error),
+                 "page fetch scheduler domain startup failed");
+        return false;
+    }
+    if (page_has_owned_state(&session->page)) {
+        txn.previous_page = budget_malloc_category(
+            session->budget, BUDGET_CATEGORY_SESSION,
+            sizeof(*txn.previous_page));
+        if (txn.previous_page == NULL) {
+            snprintf(session->last_error, sizeof(session->last_error),
+                     "navigation transaction scratch allocation failed");
+            if (!txn.fetch_domain_from_stream) {
+                fetch_scheduler_domain_release(txn.candidate_fetch_domain);
+            }
+            return false;
+        }
+        *txn.previous_page = session->page;
+    }
+    commit_snapshot_capture(session, &txn.snapshot);
+    if (!commit_setup(session, &txn)) goto fail;
+    if (!commit_style(session, &txn)) goto fail;
+    if (!commit_external_sheets(session, &txn)) goto fail;
+    if (!commit_scripts(session, &txn)) goto fail;
+    if (!commit_post_script_style(session, &txn)) goto fail;
+    if (!commit_final_style(session, &txn)) goto fail;
+    if (!commit_fonts(session, &txn)) goto fail;
+    if (!commit_images(session, &txn)) goto fail;
+    switch (commit_layout(session, &txn)) {
+    case NAVIGATION_COMMIT_LAYOUT_FAILED:
         goto fail;
+    case NAVIGATION_COMMIT_LAYOUT_DEFERRED:
+        return true;
+    case NAVIGATION_COMMIT_LAYOUT_BUILT:
+        break;
     }
-    if (isolates_remote_document) {
-        /* The streamed candidate was deliberately built without the
-           incumbent page's sectional backing.  Clear the session-level
-           copy only at this no-fail commit point: earlier cancellation or
-           commit failure must leave both the incumbent runtime and its
-           binding usable.  Clearing an existing top-level runtime with an
-           empty binding is non-allocating and cannot fail. */
-        (void) navigation_rebind_top_level_remote_document(session, NULL);
+    if (!commit_publish(session, &txn)) goto fail;
+    if (txn.candidate_hook_attempted) {
+        txn.candidate_commit(txn.candidate_opaque);
     }
-    if (candidate_hook_attempted) {
-        candidate_commit(candidate_opaque);
-    }
-    navigation_compiled_stylesheet_cache_store(session, previous_page);
-    page_destroy_value(session, previous_page);
-    budget_free(session->budget, previous_page);
+    navigation_compiled_stylesheet_cache_store(session, txn.previous_page);
+    page_destroy_value(session, txn.previous_page);
+    budget_free(session->budget, txn.previous_page);
     session->replacement_failure_overlay_active = false;
     session->replacement_failure_message[0] = '\0';
     session->page.committed_us = navigation_now_us();
@@ -2411,27 +2581,16 @@ static bool navigation_commit_document(
     return true;
 
 fail:
-    if (candidate_hook_attempted) {
-        candidate_abort(candidate_opaque);
+    if (txn.candidate_hook_attempted) {
+        txn.candidate_abort(txn.candidate_opaque);
     }
     bool rollback_progressive_frame =
         session->performance.partial_paints != 0
         && session->progressive_paint != NULL;
     page_destroy(session);
-    if (previous_page != NULL) session->page = *previous_page;
-    budget_free(session->budget, previous_page);
-    session->viewport = previous_viewport;
-    session->fonts = previous_fonts;
-    session->images = previous_images;
-    session->resource_fingerprint = previous_resource_fingerprint;
-    session->style_rebuild_required = previous_style_rebuild_required;
-    session->relayout_damage_valid = previous_relayout_damage_valid;
-    session->relayout_damage_left = previous_relayout_damage_left;
-    session->relayout_damage_top = previous_relayout_damage_top;
-    session->relayout_damage_right = previous_relayout_damage_right;
-    session->relayout_damage_bottom = previous_relayout_damage_bottom;
-    session->canvas_paint_damage_pending =
-        previous_canvas_paint_damage_pending;
+    if (txn.previous_page != NULL) session->page = *txn.previous_page;
+    budget_free(session->budget, txn.previous_page);
+    commit_snapshot_restore(session, &txn.snapshot);
     if (rollback_progressive_frame) {
         (void) session->progressive_paint(
             session->progressive_paint_opaque, session, NULL);

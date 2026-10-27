@@ -225,9 +225,6 @@ struct NavigationLoad {
     NavigationDocumentStream *document_stream;
     LayoutBuildJob *layout_job;
     bool layout_pressure_retried;
-    SectionRouteStream section_router;
-    CompressedSectionStore *section_store;
-    SectionStoreStreamBuilder *section_builder;
     const FontSet *fonts;
     const ImageResources *images;
     char requested_url[NAVIGATION_URL_LIMIT];
@@ -242,15 +239,11 @@ struct NavigationLoad {
     char *body;
     size_t body_length;
     size_t maximum_bytes;
-    size_t section_block_bytes;
-    size_t section_maximum_bytes;
     long timeout_ms;
     int viewport_width;
-    size_t initial_section;
     NavigationLoadStatus status;
     NavigationLoadMetrics metrics;
     bool record_history;
-    bool sectioned;
     bool parser_active;
     bool response_taken;
     bool response_cookies_accepted;
@@ -384,8 +377,8 @@ static bool navigation_load_headers(void *opaque,
     }
     /* Critical-CH is known at the response-header boundary.  The first
        representation is not page-visible: do not feed it to the HTML
-       parser, execute parser-blocking scripts, discover preloads, route
-       sections, or produce progressive paint.  The completed response is
+       parser, execute parser-blocking scripts, discover preloads, or
+       produce progressive paint.  The completed response is
        still retained long enough to accept its cookies before the request
        is retried with the requested client hints. */
     char accepted_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
@@ -414,17 +407,14 @@ static bool navigation_load_headers(void *opaque,
         }
     }
     if (load->client_hint_retry_pending) return true;
-    if (!load->sectioned) {
-        bool accepted = navigation_stream_headers(
-            load->document_stream, metadata);
-        if (!accepted && load->session->last_error[0] == '\0') {
-            snprintf(load->session->last_error,
-                     sizeof(load->session->last_error), "%s",
-                     "response metadata is invalid or exceeds limits");
-        }
-        return accepted;
+    bool accepted = navigation_stream_headers(
+        load->document_stream, metadata);
+    if (!accepted && load->session->last_error[0] == '\0') {
+        snprintf(load->session->last_error,
+                 sizeof(load->session->last_error), "%s",
+                 "response metadata is invalid or exceeds limits");
     }
-    return true;
+    return accepted;
 }
 
 static bool navigation_load_body(void *opaque, const unsigned char *data,
@@ -516,23 +506,10 @@ static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
         NAVIGATION_PARSER_CHECKPOINT_OK;
     bool ok = true;
     if (length != 0) {
-        if (load->sectioned) {
-            ok = section_route_stream_body(
-                &load->section_router,
-                load->staged_body + load->staged_body_offset, length);
-            if (!ok) outcome = NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
-            if (ok && load->section_store != NULL) {
-                load->metrics.safe_sections_ready =
-                    load->section_store->sealed_section_count;
-                load->metrics.safe_section_source_bytes =
-                    load->section_store->sealed_source_bytes;
-            }
-        } else {
-            outcome = navigation_stream_body(
-                load->document_stream,
-                load->staged_body + load->staged_body_offset, length);
-            ok = outcome != NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
-        }
+        outcome = navigation_stream_body(
+            load->document_stream,
+            load->staged_body + load->staged_body_offset, length);
+        ok = outcome != NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
         if (ok) {
             load->staged_body_length -= length;
             if (load->staged_body_length != 0) {
@@ -550,12 +527,10 @@ static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
         }
     }
     if (ok && load->staged_body_length == 0 && load->staged_stall) {
-        if (!load->sectioned) {
-            ok = navigation_stream_stall(load->document_stream);
-        }
+        ok = navigation_stream_stall(load->document_stream);
         if (ok) load->staged_stall = false;
     }
-    if (ok && length != 0 && !load->sectioned)
+    if (ok && length != 0)
         ok = navigation_stream_parser_timer_checkpoint(load->document_stream);
     uint64_t elapsed = navigation_now_us() - started;
     load->metrics.parser_pump_us += elapsed;
@@ -618,7 +593,6 @@ static bool navigation_load_initialize_document_stream(
     stream->fonts = load->fonts;
     stream->images = load->images;
     stream->viewport_width = load->viewport_width;
-    stream->isolates_remote_document = true;
     snprintf(stream->document_url, sizeof(stream->document_url), "%s",
              load->requested_url);
     snprintf(stream->resource_base_url,
@@ -689,15 +663,6 @@ static bool navigation_load_prepare_dom(NavigationLoad *load)
         && navigation_load_prepare_document_stream(load);
 }
 
-static bool navigation_load_prepare_sections(
-    NavigationLoad *load, size_t block_bytes,
-    size_t maximum_section_bytes)
-{
-    return section_route_stream_begin(
-        &load->section_router, load->section_builder, load->section_store,
-        load->session->budget, block_bytes, maximum_section_bytes, true);
-}
-
 static void navigation_load_release_candidate(NavigationLoad *load)
 {
     if (load == NULL) return;
@@ -717,8 +682,7 @@ static void navigation_load_release_candidate(NavigationLoad *load)
     document_destroy(&load->finalized_document);
 }
 
-static void navigation_load_release_staging(NavigationLoad *load,
-                                            bool abort_sections)
+static void navigation_load_release_staging(NavigationLoad *load)
 {
     if (load == NULL) return;
     navigation_load_release_candidate(load);
@@ -735,7 +699,6 @@ static void navigation_load_release_staging(NavigationLoad *load,
     budget_free(load->session == NULL ? NULL : load->session->budget,
                 stream);
     load->document_stream = NULL;
-    if (abort_sections) section_route_stream_abort(&load->section_router);
     budget_free(load->session == NULL ? NULL : load->session->budget,
                 load->staged_body);
     load->staged_body = NULL;
@@ -763,7 +726,6 @@ static bool navigation_load_retire_incumbent(NavigationLoad *load)
        synthesize beforeunload/unload/pagehide author events. Destroying each
        runtime also drains its callback queues before their DOM can vanish. */
     page_destroy(session);
-    (void) navigation_rebind_top_level_remote_document(session, NULL);
     size_t after = session->budget->current;
     size_t released = before >= after ? before - after : 0;
     session->performance.low_memory_replacements_started++;
@@ -880,13 +842,6 @@ static bool navigation_load_reset_for_retry(NavigationLoad *load)
     snprintf(load->effective_history_url,
              sizeof(load->effective_history_url), "%s",
              load->requested_url);
-    if (load->sectioned) {
-        section_route_stream_abort(&load->section_router);
-        load->staging_released = false;
-        return navigation_load_prepare_sections(
-            load, load->section_block_bytes,
-            load->section_maximum_bytes);
-    }
     navigation_stream_destroy_staging(load->document_stream);
     /* Leave the retained stream shell destructible even if the replacement
        parser allocation fails.  Every owned preload/resource pointer was
@@ -994,17 +949,13 @@ static NavigationLoad *navigation_load_begin_common(
     const char *method, const char *body, size_t body_length,
     const char *content_type, size_t maximum_bytes, long timeout_ms,
     int viewport_width, const FontSet *fonts,
-    const ImageResources *images, bool record_history,
-    CompressedSectionStore *store, SectionStoreStreamBuilder *builder,
-    size_t block_bytes, size_t maximum_section_bytes,
-    size_t initial_section)
+    const ImageResources *images, bool record_history)
 {
     if (session == NULL || session->budget == NULL || generation == 0
         || generation != session->generation || session->cancelled
         || url == NULL || maximum_bytes == 0 || timeout_ms <= 0
         || viewport_width <= 0 || body_length > 64u * 1024u
-        || (body == NULL && body_length != 0)
-        || ((store == NULL) != (builder == NULL))) return NULL;
+        || (body == NULL && body_length != 0)) return NULL;
     /* The compiled sheet is an optional RAM acceleration. Do not carry it
        into candidate construction when the page budget has lost its reserve;
        this is the sole pressure-eviction point and never touches persistence. */
@@ -1023,9 +974,8 @@ static NavigationLoad *navigation_load_begin_common(
     load->record_history = record_history;
     load->replace_history = navigation_take_history_replace(
         session, generation, url, record_history);
-    load->sectioned = store != NULL;
-    bool low_memory_requested = store == NULL
-        && session->replacement_mode == NAVIGATION_REPLACEMENT_LOW_MEMORY
+    bool low_memory_requested =
+        session->replacement_mode == NAVIGATION_REPLACEMENT_LOW_MEMORY
         && page_has_owned_state(&session->page);
     /* Keep the demonstrated complex-runtime safety boundary without forcing
        a small progressively-enhanced document onto the overlapping path. A
@@ -1067,11 +1017,6 @@ static NavigationLoad *navigation_load_begin_common(
         load->incumbent_relayout_damage_bottom =
             session->relayout_damage_bottom;
     }
-    load->section_store = store;
-    load->section_builder = builder;
-    load->section_block_bytes = block_bytes;
-    load->section_maximum_bytes = maximum_section_bytes;
-    load->initial_section = initial_section;
     load->response.budget = session->budget;
     const char *actual_method = method == NULL ? "GET" : method;
     /* A pending Google fallback belongs to the navigation that failed; a
@@ -1168,12 +1113,9 @@ static NavigationLoad *navigation_load_begin_common(
     session->performance.partial_layouts = 0;
     session->performance.partial_paints = 0;
     navigation_load_reset_preload_metrics(load);
-    bool staging_ready = load->sectioned
-        ? navigation_load_prepare_sections(
-            load, block_bytes, maximum_section_bytes)
-        : (load->low_memory_replacement
-             ? navigation_load_prepare_document_stream(load)
-             : navigation_load_prepare_dom(load));
+    bool staging_ready = load->low_memory_replacement
+        ? navigation_load_prepare_document_stream(load)
+        : navigation_load_prepare_dom(load);
     char scheduler_error[96] = {0};
     load->scheduler = fetch_scheduler_create_ex(
         session->budget, 1, maximum_bytes,
@@ -1258,7 +1200,7 @@ NavigationLoad *navigation_load_begin_request(
     return navigation_load_begin_common(
         session, generation, url, method, body, body_length, content_type,
         maximum_bytes, timeout_ms, viewport_width, fonts, images,
-        record_history, NULL, NULL, 0, 0, 0);
+        record_history);
 }
 
 NavigationLoad *navigation_load_begin_url(
@@ -1270,20 +1212,6 @@ NavigationLoad *navigation_load_begin_url(
     return navigation_load_begin_request(
         session, generation, url, "GET", NULL, 0, NULL, maximum_bytes,
         timeout_ms, viewport_width, fonts, images, record_history);
-}
-
-NavigationLoad *navigation_load_begin_sectioned(
-    NavigationSession *session, uint64_t generation, const char *url,
-    size_t maximum_bytes, long timeout_ms, int viewport_width,
-    const FontSet *fonts, const ImageResources *images, bool record_history,
-    CompressedSectionStore *store, SectionStoreStreamBuilder *builder,
-    size_t block_bytes, size_t maximum_section_bytes,
-    size_t initial_section)
-{
-    return navigation_load_begin_common(
-        session, generation, url, "GET", NULL, 0, NULL, maximum_bytes,
-        timeout_ms, viewport_width, fonts, images, record_history, store,
-        builder, block_bytes, maximum_section_bytes, initial_section);
 }
 
 NavigationLoadStatus navigation_load_pump(
@@ -1308,10 +1236,8 @@ NavigationLoadStatus navigation_load_pump(
         if (parser_outcome == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,
-                load->sectioned
-                  ? "section parser rejected staged response body"
-                  : "HTML parser rejected staged response body");
-            navigation_load_release_staging(load, true);
+                "HTML parser rejected staged response body");
+            navigation_load_release_staging(load);
             return load->status;
         }
         uint64_t elapsed = navigation_now_us() - started;
@@ -1343,22 +1269,14 @@ NavigationLoadStatus navigation_load_pump(
     if (pump.quota_yielded) load->metrics.quota_yields++;
     (void) fetch_scheduler_stream_metrics(
         load->scheduler, load->request_id, &load->metrics.stream);
-    if (load->sectioned && load->section_store != NULL) {
-        load->metrics.safe_sections_ready =
-            load->section_store->sealed_section_count;
-        load->metrics.safe_section_source_bytes =
-            load->section_store->sealed_source_bytes;
-    }
     if (!defer_candidate_parse) {
         NavigationParserCheckpointOutcome parser_outcome =
             navigation_load_process_staged_body(load, quota);
         if (parser_outcome == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,
-                load->sectioned
-                  ? "section parser rejected staged response body"
-                  : "HTML parser rejected staged response body");
-            navigation_load_release_staging(load, true);
+                "HTML parser rejected staged response body");
+            navigation_load_release_staging(load);
             return load->status;
         }
     }
@@ -1414,7 +1332,7 @@ NavigationLoadStatus navigation_load_pump(
         navigation_load_set_error(
             load, NAVIGATION_LOAD_FAILED,
             detail[0] == '\0' ? "navigation request failed" : detail);
-        navigation_load_release_staging(load, true);
+        navigation_load_release_staging(load);
         return load->status;
     }
     snprintf(session->last_cf_mitigated,
@@ -1441,7 +1359,7 @@ NavigationLoadStatus navigation_load_pump(
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,
                 "client-hint retry request context is invalid");
-            navigation_load_release_staging(load, true);
+            navigation_load_release_staging(load);
             return load->status;
         }
         load->client_hint_retried = true;
@@ -1450,7 +1368,7 @@ NavigationLoadStatus navigation_load_pump(
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,
                 "HTML parser retry startup failed within the page budget");
-            navigation_load_release_staging(load, true);
+            navigation_load_release_staging(load);
             return load->status;
         }
         fetch_result_destroy(&load->response);
@@ -1458,7 +1376,7 @@ NavigationLoadStatus navigation_load_pump(
         if (load->request_id == 0) {
             navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
                                       "client-hint retry could not be queued");
-            navigation_load_release_staging(load, true);
+            navigation_load_release_staging(load);
         }
         memset(&session->last_stream, 0, sizeof(session->last_stream));
         return load->status;
@@ -1471,7 +1389,7 @@ NavigationLoadStatus navigation_load_pump(
                                 sizeof(load->effective_url))) {
         navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
                                   "effective navigation URL is invalid");
-        navigation_load_release_staging(load, true);
+        navigation_load_release_staging(load);
         return load->status;
     }
     load->response_taken = true;
@@ -1506,142 +1424,91 @@ static bool navigation_load_finalize_parse(NavigationLoad *load)
             "response Referrer-Policy metadata is invalid");
         return false;
     }
-    if (!load->sectioned) {
-        if (load->low_memory_replacement
-            && !navigation_load_parse_after_incumbent_retirement(load)) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_FAILED,
-                "low-memory replacement parser startup failed after "
-                "incumbent retirement");
-            return false;
-        }
-        NavigationDocumentStream *stream = load->document_stream;
-        /* Speculative preloads are opportunistic. Never wait for them at the
-           transactional EOF boundary; blocking resources are resolved by the
-           candidate pipeline with their normal priority and failure rules. */
-        uint64_t metadata_started = navigation_now_us();
-        NavigationParserCheckpointOutcome metadata =
-            navigation_stream_metadata_checkpoint(stream);
-        if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
-            load->status = NAVIGATION_LOAD_FAILED;
-            return false;
-        }
-        uint64_t metadata_finished = navigation_now_us();
-        session->performance.parser_eof_metadata_us +=
-            metadata_finished >= metadata_started
-                ? metadata_finished - metadata_started : 0;
-        uint64_t preload_started = metadata_finished;
-        navigation_stream_launch_preloads(stream);
-        navigation_stream_settle_preloads(stream);
-        uint64_t preload_finished = navigation_now_us();
-        session->performance.parser_eof_preload_us +=
-            preload_finished >= preload_started
-                ? preload_finished - preload_started : 0;
-        /* The stream begins with the response policy and applies each valid
-           document metadata update in tree order.  Persist that final policy
-           even when the response header was nonempty. */
-        snprintf(load->response_referrer_policy,
-                 sizeof(load->response_referrer_policy), "%s",
-                 stream->referrer_policy);
-        if (!tilefinch_platform_cooperate(
-                "navigation-eof", load->metrics.body_bytes)) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_CANCELLED,
-                "navigation cancelled before parser finalization");
-            return false;
-        }
-        uint64_t started = navigation_now_us();
-        if (!document_parser_end_input(&load->parser)) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_FAILED,
-                "HTML parser finalization failed within the page budget");
-            return false;
-        }
-        /* EOF inserts nodes too, and nothing after the last parser-blocking
-           script has reached an observer yet. The checkpoint accounts its
-           own author time; keep it out of the parser slice. */
-        uint64_t checkpoint_started = navigation_now_us();
-        if (!navigation_stream_eof_parser_mutation_checkpoint(stream)) {
-            load->status = NAVIGATION_LOAD_FAILED;
-            return false;
-        }
-        uint64_t checkpoint_us = navigation_elapsed_us(
-            checkpoint_started, navigation_now_us());
-        started = checkpoint_us > UINT64_MAX - started
-            ? UINT64_MAX : started + checkpoint_us;
-        if (!document_parser_finish(&load->parser,
-                                    &load->finalized_document)) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_FAILED,
-                "HTML parser finalization failed within the page budget");
-            return false;
-        }
-        load->parser_active = false;
-        uint64_t elapsed = navigation_record_slice(
-            session, NAVIGATION_SLICE_PARSER, started,
-            load->finalized_document.node_count);
-        session->performance.parser_finish_us += elapsed;
-        session->performance.parse_us += stream->parse_us + elapsed;
-        load->metrics.finalize_work_units =
-            load->finalized_document.node_count;
-        stylesheet_document_resources_open_final_retry(
-            &stream->stylesheet_resources);
-        /* A fully successful parser sheet is authoritative at EOF and may
-           be adopted by the final page. Preserve the existing rebuild path
-           after any parser-time CSS failure so the final bounded retry is
-           still attempted once transport pressure has cleared. */
-        if (stream->blocking_stylesheets.failed != 0) {
-            navigation_stream_release_blocking_stylesheet(stream);
-        }
-    } else {
-        if (!section_route_stream_finish(&load->section_router)) {
-            navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
-                                      "section stream finalization failed");
-            return false;
-        }
-        const char *html = (const char *) load->section_router.buffer;
-        size_t html_length = load->section_router.length;
-        char *extracted = NULL;
-        if (load->section_router.sectioned) {
-            if (load->section_store->section_count == 0
-                || load->initial_section >= load->section_store->section_count
-                || !section_store_extract_html(
-                    load->section_store, load->initial_section,
-                    &extracted, &html_length)) {
-                navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
-                                          "requested section is unavailable");
-                return false;
-            }
-            html = extracted;
-            load->metrics.safe_sections_ready =
-                load->section_store->section_count;
-            load->metrics.safe_section_source_bytes =
-                load->section_store->source_length;
-        }
-        uint64_t started = navigation_now_us();
-        bool parsed = document_parse(
-            &load->finalized_document, session->budget, html, html_length,
-            512);
-        budget_free(session->budget, extracted);
-        if (!parsed) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_FAILED,
-                "section HTML parsing failed within the page budget");
-            return false;
-        }
-        if (!navigation_scan_document_referrer_policy(
-                &load->finalized_document,
-                load->response_referrer_policy)) {
-            navigation_load_set_error(
-                load, NAVIGATION_LOAD_FAILED,
-                "section referrer metadata traversal failed");
-            return false;
-        }
-        session->performance.parse_us += navigation_record_slice(
-            session, NAVIGATION_SLICE_PARSER, started, html_length);
-        load->metrics.finalize_work_units = html_length;
-        section_route_stream_abort(&load->section_router);
-        load->staging_released = true;
+    if (load->low_memory_replacement
+        && !navigation_load_parse_after_incumbent_retirement(load)) {
+        navigation_load_set_error(
+            load, NAVIGATION_LOAD_FAILED,
+            "low-memory replacement parser startup failed after "
+            "incumbent retirement");
+        return false;
+    }
+    NavigationDocumentStream *stream = load->document_stream;
+    /* Speculative preloads are opportunistic. Never wait for them at the
+       transactional EOF boundary; blocking resources are resolved by the
+       candidate pipeline with their normal priority and failure rules. */
+    uint64_t metadata_started = navigation_now_us();
+    NavigationParserCheckpointOutcome metadata =
+        navigation_stream_metadata_checkpoint(stream);
+    if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
+        load->status = NAVIGATION_LOAD_FAILED;
+        return false;
+    }
+    uint64_t metadata_finished = navigation_now_us();
+    session->performance.parser_eof_metadata_us +=
+        metadata_finished >= metadata_started
+            ? metadata_finished - metadata_started : 0;
+    uint64_t preload_started = metadata_finished;
+    navigation_stream_launch_preloads(stream);
+    navigation_stream_settle_preloads(stream);
+    uint64_t preload_finished = navigation_now_us();
+    session->performance.parser_eof_preload_us +=
+        preload_finished >= preload_started
+            ? preload_finished - preload_started : 0;
+    /* The stream begins with the response policy and applies each valid
+       document metadata update in tree order.  Persist that final policy
+       even when the response header was nonempty. */
+    snprintf(load->response_referrer_policy,
+             sizeof(load->response_referrer_policy), "%s",
+             stream->referrer_policy);
+    if (!tilefinch_platform_cooperate(
+            "navigation-eof", load->metrics.body_bytes)) {
+        navigation_load_set_error(
+            load, NAVIGATION_LOAD_CANCELLED,
+            "navigation cancelled before parser finalization");
+        return false;
+    }
+    uint64_t started = navigation_now_us();
+    if (!document_parser_end_input(&load->parser)) {
+        navigation_load_set_error(
+            load, NAVIGATION_LOAD_FAILED,
+            "HTML parser finalization failed within the page budget");
+        return false;
+    }
+    /* EOF inserts nodes too, and nothing after the last parser-blocking
+       script has reached an observer yet. The checkpoint accounts its
+       own author time; keep it out of the parser slice. */
+    uint64_t checkpoint_started = navigation_now_us();
+    if (!navigation_stream_eof_parser_mutation_checkpoint(stream)) {
+        load->status = NAVIGATION_LOAD_FAILED;
+        return false;
+    }
+    uint64_t checkpoint_us = navigation_elapsed_us(
+        checkpoint_started, navigation_now_us());
+    started = checkpoint_us > UINT64_MAX - started
+        ? UINT64_MAX : started + checkpoint_us;
+    if (!document_parser_finish(&load->parser,
+                                &load->finalized_document)) {
+        navigation_load_set_error(
+            load, NAVIGATION_LOAD_FAILED,
+            "HTML parser finalization failed within the page budget");
+        return false;
+    }
+    load->parser_active = false;
+    uint64_t elapsed = navigation_record_slice(
+        session, NAVIGATION_SLICE_PARSER, started,
+        load->finalized_document.node_count);
+    session->performance.parser_finish_us += elapsed;
+    session->performance.parse_us += stream->parse_us + elapsed;
+    load->metrics.finalize_work_units =
+        load->finalized_document.node_count;
+    stylesheet_document_resources_open_final_retry(
+        &stream->stylesheet_resources);
+    /* A fully successful parser sheet is authoritative at EOF and may
+       be adopted by the final page. Preserve the existing rebuild path
+       after any parser-time CSS failure so the final bounded retry is
+       still attempted once transport pressure has cleared. */
+    if (stream->blocking_stylesheets.failed != 0) {
+        navigation_stream_release_blocking_stylesheet(stream);
     }
     load->finalize_phase = NAVIGATION_FINALIZE_BUILD;
     load->status = NAVIGATION_LOAD_FINALIZING;
@@ -1690,7 +1557,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
                 load, load->document_stream->runtime);
         }
         candidate = budget_malloc(session->budget, sizeof(*candidate));
-        if (candidate == NULL && !load->sectioned
+        if (candidate == NULL
             && load->document_stream != NULL
             && !load->document_stream->optional_work_shed) {
             /* The parsed server DOM is authoritative and already complete.
@@ -1739,8 +1606,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
             candidate, load->generation, load->commit_url,
             &load->finalized_document, load->viewport_width,
             load->fonts, load->images, false,
-            load->sectioned ? NULL : load->document_stream,
-            load->sectioned ? session->page.fetch_domain : NULL,
+            load->document_stream, NULL,
             true, true, &load->layout_job,
             &load->layout_preview_candidate);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1840,7 +1706,7 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
                     ? &candidate->page.images : load->images;
             built = navigation_finish_authoritative_layout(
                 candidate, load->commit_url,
-                load->sectioned ? NULL : load->document_stream,
+                load->document_stream,
                 NULL, load->layout_preview_candidate,
                 load->fonts, candidate_images);
             if (built) {
@@ -1991,12 +1857,6 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
                                   "history entry allocation failed");
         return false;
     }
-    if (!load->sectioned) {
-        /* The streamed candidate was built without incumbent sectional
-           callbacks. Clear the incumbent binding only after every fallible
-           step above has succeeded. */
-        (void) navigation_rebind_top_level_remote_document(session, NULL);
-    }
     NavigationEntry *history = session->history;
     size_t history_capacity = session->history_capacity;
     size_t history_count = session->history_count;
@@ -2083,7 +1943,7 @@ bool navigation_load_finish(NavigationLoad *load,
         && !navigation_load_history_url(load, load->commit_url)) {
         navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
                                   "history URL canonicalization failed");
-        navigation_load_release_staging(load, true);
+        navigation_load_release_staging(load);
         return false;
     }
     do {
@@ -2118,7 +1978,7 @@ bool navigation_load_finish(NavigationLoad *load,
         if (!advanced) {
             if (load->status != NAVIGATION_LOAD_CANCELLED) {
                 load->status = NAVIGATION_LOAD_FAILED;
-                navigation_load_release_staging(load, true);
+                navigation_load_release_staging(load);
             }
             if (load->session->last_script_error_context[0] == '\0') {
                 capture_cached_script_error(
@@ -2223,7 +2083,7 @@ void navigation_load_cancel(NavigationLoad *load, const char *reason)
         navigation_cancel(load->session, load->generation);
     }
     navigation_load_set_error(load, NAVIGATION_LOAD_CANCELLED, message);
-    navigation_load_release_staging(load, true);
+    navigation_load_release_staging(load);
     navigation_load_report_replacement_outcome(load, false);
 }
 
@@ -2275,8 +2135,7 @@ void navigation_load_destroy(NavigationLoad *load)
         || load->status == NAVIGATION_LOAD_FINALIZING) {
         navigation_load_cancel(load, "navigation load was released");
     }
-    navigation_load_release_staging(
-        load, load->status != NAVIGATION_LOAD_SUCCEEDED);
+    navigation_load_release_staging(load);
     if (load->status != NAVIGATION_LOAD_SUCCEEDED) {
         navigation_load_report_replacement_outcome(load, false);
     }

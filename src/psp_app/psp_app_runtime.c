@@ -7,6 +7,7 @@
  * writers. Ordinary browser resources remain in the canonical owner records.
  */
 #include "psp_app_internal.h"
+#include "psp_app_validation.h"
 #include "tilefinch/psp_input_route.h"
 #include <psputility_sysparam.h>
 #include "tilefinch/pixel_math.h"
@@ -443,7 +444,7 @@ static PspMediaScaleMap psp_media_scale_map;
 _Static_assert(
     PSP_DISPLAY_PAGE_BUFFER_COUNT >= PSP_DISPLAY_VIDEO_BUFFER_COUNT,
     "present records must cover every physical scanout buffer");
-static PspMediaPresentRecord
+PSP_VALIDATION_SHARED PspMediaPresentRecord
     psp_media_present_records[PSP_DISPLAY_PAGE_BUFFER_COUNT];
 static PspUiMediaTrackMenuCache psp_media_track_menu_cache;
 static uint32_t psp_media_front_menu_key, psp_media_front_menu_epoch;
@@ -457,15 +458,10 @@ _Static_assert(
              * (size_t) PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT * sizeof(uint16_t),
     "the bounded video EDRAM tail must hold the retained track menu");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* Only so the mode line is printed once rather than once a frame. */
-static int psp_media_present_reported_mode = -1;
-static uint64_t psp_media_present_reported_generation;
-static int psp_media_present_reported_width;
-static int psp_media_present_reported_height;
 /* Set by the presenter admission seam and sampled only after a successful
    publish. Validation needs to distinguish a freshly drawn picture from a
    scanout accepted through the same-picture fast path. */
-static bool psp_media_present_last_skipped;
+bool psp_media_present_last_skipped;
 #endif
 
 void psp_media_present_forget_buffers(void)
@@ -524,474 +520,6 @@ static PspMediaPresentMode psp_media_present_requested_mode(void)
    buffer rotation, sync flag, or result checking. */
 PspDisplay psp_display;
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-#include "tilefinch/psp_input_cadence.h"
-typedef struct {
-    uint64_t compose_total_us;
-    uint64_t compose_max_us;
-    uint64_t start_previous_us;
-    uint64_t start_gap_max_us;
-    uint32_t presentations;
-    uint32_t native_presentations;
-    uint32_t compose_over_16ms;
-    uint32_t compose_over_33ms;
-    uint64_t track_menu_compose_total_us;
-    uint64_t track_menu_compose_max_us;
-    uint64_t track_menu_scanout_interval_total_us;
-    uint64_t track_menu_scanout_interval_max_us;
-    uint32_t track_menu_presentations;
-    uint32_t track_menu_scanout_intervals;
-    uint64_t track_menu_blit_total_us;
-    uint64_t track_menu_blit_max_us;
-    uint32_t track_menu_blits;
-    uint32_t track_menu_blit_fallbacks;
-    uint64_t track_menu_open_transition_us;
-    uint64_t track_menu_close_transition_us;
-    uint32_t track_menu_open_transitions;
-    uint32_t track_menu_close_transitions;
-    bool track_menu_state_known;
-    bool track_menu_was_open;
-    uint64_t cursor_sample_pending_us;
-    PspInputCadence cursor_cadence;
-    uint64_t cursor_compose_total_us, cursor_compose_max_us;
-    uint64_t cursor_publish_total_us, cursor_publish_max_us;
-    uint32_t cursor_work_samples;
-    uint64_t cursor_latency_total_us;
-    uint64_t cursor_latency_max_us;
-    uint32_t cursor_samples;
-    uint32_t cursor_presentations;
-    uint32_t cursor_coalesced_samples;
-    uint32_t cursor_over_33ms;
-    /*
-     * Wall-clock spacing between distinct decoded pictures that actually
-     * reached scanout. Re-presenting the same picture for UI chrome does not
-     * count: those swaps say nothing about playback cadence. Keep the raw
-     * samples in bounded counters and print them only at the validation
-     * boundary, because host0 output can stall the browser thread long enough
-     * to manufacture the hitch this is meant to diagnose.
-     */
-    uint64_t video_scanout_interval_total_us;
-    uint64_t video_scanout_interval_max_us;
-    uint64_t video_scanout_previous_us;
-    uint64_t video_scanout_identity;
-    uint64_t video_scanout_epoch;
-    uint32_t video_scanout_generation;
-    int video_scanout_slot;
-    uint32_t video_scanout_intervals;
-    uint32_t video_scanout_buckets[8];
-    bool video_scanout_frame_valid;
-} PspPresentationCadence;
-
-static PspPresentationCadence psp_presentation_cadence;
-static bool psp_video_scanout_measuring = true;
-typedef struct {
-    uint64_t stage_us;
-    size_t stage_frames;
-    uint64_t draw_us;
-    size_t draw_frames;
-    uint32_t ge_copies;
-} PspVideoDrawSnapshot;
-static PspVideoDrawSnapshot psp_video_measure_begin;
-static PspVideoDrawSnapshot psp_video_measure_end;
-static bool psp_video_measure_valid;
-static PspPresentPhaseTiming psp_present_last_timing;
-static bool psp_present_cpu_measurement;
-static void (*psp_present_pre_publish_hook)(uint32_t sequence);
-
-void psp_present_validation_pre_publish_hook(void (*hook)(uint32_t sequence))
-{
-    psp_present_pre_publish_hook = hook;
-}
-
-void psp_present_validation_measure_cpu(bool enabled)
-{
-    psp_present_cpu_measurement = enabled;
-}
-
-static bool psp_present_thread_cpu(uint64_t *run_us)
-{
-    SceKernelThreadRunStatus status = {.size = sizeof(status)};
-    if (sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status) < 0)
-        return false;
-    *run_us = ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
-    return true;
-}
-
-static atomic_uint psp_media_menu_feedback_time;
-static atomic_uint psp_media_menu_feedback_key;
-
-void psp_media_menu_feedback_input(const PspUiMediaState *media,
-    bool was_open, unsigned old_tab, uint32_t started_us)
-{
-    const PspUiMediaPresentation *p = media == NULL ? NULL : media->presentation;
-    if (p == NULL || (was_open == p->track_menu_open
-        && (!p->track_menu_open || old_tab == p->track_menu_tab))) return;
-    atomic_store_explicit(&psp_media_menu_feedback_key,
-        p->track_menu_open ? p->track_menu_tab + 1u : 0u, memory_order_relaxed);
-    atomic_store_explicit(&psp_media_menu_feedback_time,
-        started_us, memory_order_release);
-}
-
-typedef struct {
-    uint64_t before, after, cpu;
-    bool valid;
-} PspMenuPhaseClock;
-
-static PspMenuPhaseClock psp_menu_phase_clock(void)
-{
-    PspMenuPhaseClock clock = {0};
-    clock.before = sceKernelGetSystemTimeWide();
-    clock.valid = psp_present_thread_cpu(&clock.cpu);
-    clock.after = sceKernelGetSystemTimeWide();
-    return clock;
-}
-
-/* First-picture attribution is bounded, numeric-only, and flushed after the
-   measured window. Include surface entry: timing only the overlay missed the
-   initial format switch. The presentation fence serializes both painters. */
-static struct {
-    uint64_t generation;
-    unsigned count, loading_count, playing_count;
-    PspMenuPhaseClock clocks[8][5];
-    bool published[8], resolving[8];
-} psp_player_start;
-static PspMenuPhaseClock *psp_player_start_clocks;
-
-static void psp_player_start_report(void)
-{
-    static const char *const names[] = {"surface", "video", "overlay", "publish"};
-    for (unsigned row = 0; row < psp_player_start.count; row++) {
-        const PspMenuPhaseClock *clocks = psp_player_start.clocks[row];
-        uint64_t query_us = 0;
-        for (unsigned at = 0; at < 5; at++)
-            query_us += clocks[at].after - clocks[at].before;
-        for (unsigned at = 0; at < 4; at++) {
-            bool valid = clocks[at].valid && clocks[at + 1].valid
-                && clocks[at + 1].cpu >= clocks[at].cpu
-                && clocks[at + 1].before >= clocks[at].after;
-            printf("tilefinch-player-start: frame=%u resolving=%u phase=%s published=%u wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u clock-query=%lluus\n",
-                row, psp_player_start.resolving[row], names[at], psp_player_start.published[row],
-                (unsigned long long) (valid ? clocks[at + 1].before - clocks[at].after : 0),
-                (unsigned long long) (valid ? clocks[at + 1].after - clocks[at].before : 0),
-                (unsigned long long) (valid ? clocks[at + 1].cpu - clocks[at].cpu : 0),
-                valid, (unsigned long long) query_us);
-        }
-    }
-}
-
-static void psp_menu_phase_report(unsigned key, uint32_t input_us,
-    const PspMenuPhaseClock clocks[4])
-{
-    static const char *const phases[] = {"video", "overlay", "publish"};
-    uint64_t query_us = 0;
-    for (unsigned at = 0; at < 4; at++) query_us += clocks[at].after - clocks[at].before;
-    printf("tilefinch-menu-feedback: open=%u tab=%u elapsed=%uus clock-query=%lluus\n",
-        key != 0u, key == 0u ? 0u : key - 1u,
-        (unsigned) ((uint32_t) clocks[3].after - input_us), (unsigned long long) query_us);
-    for (unsigned at = 0; at < 3; at++) {
-        bool valid = clocks[at].valid && clocks[at + 1].valid
-            && clocks[at + 1].cpu >= clocks[at].cpu;
-        printf("tilefinch-menu-phase: phase=%s wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u\n",
-            phases[at],
-            (unsigned long long) (clocks[at + 1].before - clocks[at].after),
-            (unsigned long long) (clocks[at + 1].after - clocks[at].before),
-            (unsigned long long) (valid ? clocks[at + 1].cpu - clocks[at].cpu : 0), valid);
-    }
-}
-
-bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing)
-{
-    if (timing == NULL || psp_present_last_timing.sequence == 0) return false;
-    *timing = psp_present_last_timing;
-    return true;
-}
-
-void psp_report_presentation_cadence(const char *phase)
-{
-    psp_player_start_report();
-    const PspPresentationCadence *metrics = &psp_presentation_cadence;
-    printf(
-        "tilefinch-ui-cadence: phase=%s presents=%lu native=%lu "
-        "compose-total=%lluus compose-max=%lluus compose-average=%lluus "
-        "over-16ms=%lu over-33ms=%lu start-gap-max=%lluus "
-        "track-menu-presents=%lu track-menu-compose-average=%lluus "
-        "track-menu-compose-max=%lluus track-menu-blits=%lu/%lu "
-        "track-menu-blit-average=%lluus track-menu-blit-max=%lluus "
-        "cursor-samples=%lu cursor-presents=%lu cursor-coalesced=%lu "
-        "cursor-average=%lluus cursor-max=%lluus cursor-over-33ms=%lu\n",
-        phase == NULL ? "unknown" : phase, metrics->presentations,
-        metrics->native_presentations,
-        (unsigned long long) metrics->compose_total_us,
-        (unsigned long long) metrics->compose_max_us,
-        (unsigned long long) (metrics->presentations == 0 ? 0
-            : metrics->compose_total_us / metrics->presentations),
-        metrics->compose_over_16ms, metrics->compose_over_33ms,
-        (unsigned long long) metrics->start_gap_max_us,
-        (unsigned long) metrics->track_menu_presentations,
-        (unsigned long long) (metrics->track_menu_presentations == 0 ? 0
-            : metrics->track_menu_compose_total_us
-                / metrics->track_menu_presentations),
-        (unsigned long long) metrics->track_menu_compose_max_us,
-        (unsigned long) metrics->track_menu_blits,
-        (unsigned long) metrics->track_menu_blit_fallbacks,
-        (unsigned long long) (metrics->track_menu_blits == 0 ? 0
-            : metrics->track_menu_blit_total_us
-                / metrics->track_menu_blits),
-        (unsigned long long) metrics->track_menu_blit_max_us,
-        metrics->cursor_samples, metrics->cursor_presentations,
-        metrics->cursor_coalesced_samples,
-        (unsigned long long) (metrics->cursor_presentations == 0 ? 0
-            : metrics->cursor_latency_total_us
-                / metrics->cursor_presentations),
-        (unsigned long long) metrics->cursor_latency_max_us,
-        metrics->cursor_over_33ms);
-    printf(
-        "tilefinch-cursor-cadence: phase=%s intervals=%lu "
-        "average=%lluus max=%lluus segments=%lu\n",
-        phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->cursor_cadence.intervals,
-        (unsigned long long) (metrics->cursor_cadence.intervals == 0 ? 0
-            : metrics->cursor_cadence.total_us
-                / metrics->cursor_cadence.intervals),
-        (unsigned long long) metrics->cursor_cadence.max_us,
-        (unsigned long) metrics->cursor_cadence.segments);
-    printf("tilefinch-cursor-work: phase=%s samples=%lu "
-           "compose-average=%lluus compose-max=%lluus "
-           "publish-average=%lluus publish-max=%lluus\n",
-        phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->cursor_work_samples,
-        (unsigned long long) (metrics->cursor_work_samples == 0 ? 0
-            : metrics->cursor_compose_total_us / metrics->cursor_work_samples),
-        (unsigned long long) metrics->cursor_compose_max_us,
-        (unsigned long long) (metrics->cursor_work_samples == 0 ? 0
-            : metrics->cursor_publish_total_us / metrics->cursor_work_samples),
-        (unsigned long long) metrics->cursor_publish_max_us);
-    printf(
-        "tilefinch-video-scanout: phase=%s intervals=%lu "
-        "average=%lluus max=%lluus "
-        "buckets-le20-le28-le36-le45-le67-le100-le250-gt250="
-        "%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu\n",
-        phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->video_scanout_intervals,
-        (unsigned long long) (metrics->video_scanout_intervals == 0 ? 0
-            : metrics->video_scanout_interval_total_us
-                / metrics->video_scanout_intervals),
-        (unsigned long long) metrics->video_scanout_interval_max_us,
-        (unsigned long) metrics->video_scanout_buckets[0],
-        (unsigned long) metrics->video_scanout_buckets[1],
-        (unsigned long) metrics->video_scanout_buckets[2],
-        (unsigned long) metrics->video_scanout_buckets[3],
-        (unsigned long) metrics->video_scanout_buckets[4],
-        (unsigned long) metrics->video_scanout_buckets[5],
-        (unsigned long) metrics->video_scanout_buckets[6],
-        (unsigned long) metrics->video_scanout_buckets[7]);
-    printf(
-        "tilefinch-track-menu-cadence: phase=%s intervals=%lu "
-        "average=%lluus max=%lluus\n",
-        phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->track_menu_scanout_intervals,
-        (unsigned long long) (metrics->track_menu_scanout_intervals == 0 ? 0
-            : metrics->track_menu_scanout_interval_total_us
-                / metrics->track_menu_scanout_intervals),
-        (unsigned long long) metrics->track_menu_scanout_interval_max_us);
-    printf(
-        "tilefinch-track-menu-transition: phase=%s open=%lu/%lluus "
-        "close=%lu/%lluus\n",
-        phase == NULL ? "unknown" : phase,
-        (unsigned long) metrics->track_menu_open_transitions,
-        (unsigned long long) metrics->track_menu_open_transition_us,
-        (unsigned long) metrics->track_menu_close_transitions,
-        (unsigned long long) metrics->track_menu_close_transition_us);
-}
-
-void psp_cursor_latency_sample(uint64_t sampled_us)
-{
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    psp_input_cadence_observe(&metrics->cursor_cadence, true, sampled_us);
-    metrics->cursor_samples++;
-    if (metrics->cursor_sample_pending_us == 0) {
-        metrics->cursor_sample_pending_us = sampled_us;
-    } else {
-        /* Retain the oldest unpresented sample: that is the input age the
-           user actually experiences when work coalesces multiple moves. */
-        metrics->cursor_coalesced_samples++;
-    }
-}
-
-void psp_cursor_latency_idle(void)
-{
-    psp_input_cadence_observe(
-        &psp_presentation_cadence.cursor_cadence, false, 0);
-}
-
-void psp_video_scanout_note_discontinuity(void)
-{
-    /* A seek/reopen gap is loading latency, not a display interval. Keep the
-       accumulated cadence but let the first picture after the discontinuity
-       establish a new origin instead of folding seconds of decoder work into
-       the source-frame average and maximum. */
-    psp_presentation_cadence.video_scanout_previous_us = 0;
-    psp_presentation_cadence.video_scanout_frame_valid = false;
-}
-
-void psp_video_scanout_measurement(bool enabled)
-{
-    psp_video_scanout_measuring = enabled;
-    /* Input marks run outside the presenter's scoped active-media pointer.
-       Snapshot counters while presenting; never retain that session pointer. */
-    if (!enabled && psp_video_measure_valid
-        && psp_video_measure_end.stage_frames >= psp_video_measure_begin.stage_frames
-        && psp_video_measure_end.draw_frames >= psp_video_measure_begin.draw_frames
-        && psp_video_measure_end.stage_us >= psp_video_measure_begin.stage_us
-        && psp_video_measure_end.draw_us >= psp_video_measure_begin.draw_us) {
-        size_t stages = psp_video_measure_end.stage_frames - psp_video_measure_begin.stage_frames;
-        size_t draws = psp_video_measure_end.draw_frames - psp_video_measure_begin.draw_frames;
-        printf("tilefinch-video-draw-window: stages=%zu stage-average=%lluus "
-               "draws=%zu draw-average=%lluus ge-copies=%lu\n", stages,
-               (unsigned long long) (stages == 0 ? 0
-                   : (psp_video_measure_end.stage_us - psp_video_measure_begin.stage_us) / stages),
-               draws, (unsigned long long) (draws == 0 ? 0
-                   : (psp_video_measure_end.draw_us - psp_video_measure_begin.draw_us) / draws),
-               (unsigned long) (psp_video_measure_end.ge_copies - psp_video_measure_begin.ge_copies));
-    }
-    if (!enabled) return;
-    psp_video_measure_valid = false;
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    metrics->video_scanout_interval_total_us = 0;
-    metrics->video_scanout_interval_max_us = 0;
-    metrics->video_scanout_intervals = 0;
-    memset(metrics->video_scanout_buckets, 0, sizeof(metrics->video_scanout_buckets));
-    psp_video_scanout_note_discontinuity();
-}
-
-/*
- * Both presenters report here.
- *
- * The 32-bit video path returns from psp_present_internal before the 16-bit
- * compositor is reached, and when it was first written that took its frames
- * out of this accounting entirely: a device cycle reported presents=270 for a
- * session that had actually presented 140 video frames on top of them, and
- * the most expensive frames in the run were the ones the cadence line could
- * not see.
- */
-static void psp_cadence_composed(uint64_t started_us, bool native_surface)
-{
-    uint64_t compose_us =
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    metrics->presentations++;
-    if (native_surface) metrics->native_presentations++;
-    metrics->compose_total_us += compose_us;
-    if (compose_us > metrics->compose_max_us)
-        metrics->compose_max_us = compose_us;
-    if (compose_us > UINT64_C(16000)) metrics->compose_over_16ms++;
-    if (compose_us > UINT64_C(33000)) metrics->compose_over_33ms++;
-    bool track_menu_open = psp_active_media != NULL
-        && psp_active_media->ui.presentation != NULL
-        && psp_active_media->ui.presentation->track_menu_open;
-    if (metrics->track_menu_state_known
-        && track_menu_open != metrics->track_menu_was_open) {
-        if (track_menu_open) {
-            metrics->track_menu_open_transitions++;
-            metrics->track_menu_open_transition_us = compose_us;
-        } else {
-            metrics->track_menu_close_transitions++;
-            metrics->track_menu_close_transition_us = compose_us;
-        }
-    }
-    metrics->track_menu_state_known = true;
-    metrics->track_menu_was_open = track_menu_open;
-    if (track_menu_open) {
-        metrics->track_menu_presentations++;
-        metrics->track_menu_compose_total_us += compose_us;
-        if (compose_us > metrics->track_menu_compose_max_us)
-            metrics->track_menu_compose_max_us = compose_us;
-    }
-    if (metrics->start_previous_us != 0) {
-        uint64_t gap = started_us - metrics->start_previous_us;
-        if (gap > metrics->start_gap_max_us) metrics->start_gap_max_us = gap;
-    }
-    metrics->start_previous_us = started_us;
-}
-
-static void psp_cadence_published(bool published)
-{
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    if (!published || metrics->cursor_sample_pending_us == 0) return;
-    uint64_t accepted_us = (uint64_t) sceKernelGetSystemTimeWide();
-    uint64_t latency_us = accepted_us >= metrics->cursor_sample_pending_us
-        ? accepted_us - metrics->cursor_sample_pending_us : 0;
-    metrics->cursor_presentations++;
-    metrics->cursor_latency_total_us += latency_us;
-    if (latency_us > metrics->cursor_latency_max_us)
-        metrics->cursor_latency_max_us = latency_us;
-    if (latency_us > UINT64_C(33000)) metrics->cursor_over_33ms++;
-    metrics->cursor_sample_pending_us = 0;
-}
-
-static size_t psp_video_scanout_interval_bucket(uint64_t interval_us)
-{
-    static const uint32_t upper_us[] = {
-        20000u, 28000u, 36000u, 45000u, 67000u, 100000u, 250000u
-    };
-    for (size_t at = 0; at < sizeof(upper_us) / sizeof(upper_us[0]); at++) {
-        if (interval_us <= upper_us[at]) return at;
-    }
-    return sizeof(upper_us) / sizeof(upper_us[0]);
-}
-
-static void psp_cadence_video_published(
-    bool published, const MediaVideoFrame *frame)
-{
-    if (!published || frame == NULL || !psp_video_scanout_measuring) return;
-    if (psp_active_media != NULL) {
-        psp_video_measure_end = (PspVideoDrawSnapshot) {
-            psp_active_media->present_stage_total_us,
-            psp_active_media->present_stage_frames,
-            psp_active_media->present_scale_total_us,
-            psp_active_media->present_scale_frames,
-            psp_media_present_ge_stage_rows_copies()
-        };
-        if (!psp_video_measure_valid) {
-            psp_video_measure_begin = psp_video_measure_end;
-            psp_video_measure_valid = true;
-        }
-    }
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    bool same_picture = metrics->video_scanout_frame_valid
-        && metrics->video_scanout_identity == frame->identity
-        && metrics->video_scanout_epoch == frame->epoch
-        && metrics->video_scanout_generation == frame->generation
-        && metrics->video_scanout_slot == frame->slot;
-    if (same_picture) return;
-
-    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
-    if (metrics->video_scanout_previous_us != 0
-        && now_us >= metrics->video_scanout_previous_us) {
-        uint64_t interval_us = now_us - metrics->video_scanout_previous_us;
-        metrics->video_scanout_intervals++;
-        metrics->video_scanout_interval_total_us += interval_us;
-        if (interval_us > metrics->video_scanout_interval_max_us)
-            metrics->video_scanout_interval_max_us = interval_us;
-        metrics->video_scanout_buckets[
-            psp_video_scanout_interval_bucket(interval_us)]++;
-        if (psp_active_media != NULL
-            && psp_active_media->ui.presentation != NULL
-            && psp_active_media->ui.presentation->track_menu_open) {
-            metrics->track_menu_scanout_intervals++;
-            metrics->track_menu_scanout_interval_total_us += interval_us;
-            if (interval_us > metrics->track_menu_scanout_interval_max_us)
-                metrics->track_menu_scanout_interval_max_us = interval_us;
-        }
-    }
-    metrics->video_scanout_previous_us = now_us;
-    metrics->video_scanout_identity = frame->identity;
-    metrics->video_scanout_epoch = frame->epoch;
-    metrics->video_scanout_generation = frame->generation;
-    metrics->video_scanout_slot = frame->slot;
-    metrics->video_scanout_frame_valid = true;
-}
-#endif
 
 static bool psp_media_frame_presentable(const MediaVideoFrame *frame)
 {
@@ -1068,74 +596,6 @@ static bool psp_media_present_software(
     return true;
 }
 
-/*
- * One line per opened stream, or per change of mind within one. The device
- * truth cycle reads this to learn which presenter actually ran: a session
- * that silently fell back to software would otherwise look exactly like one
- * that chose it, and the frame budget of the two is not the same. The line
- * is validation-log output, so other builds compile the report away.
- */
-#ifndef TILEFINCH_PSP_VALIDATION_LOG
-static inline void psp_media_present_report(
-    PspMediaPresentMode mode, const char *reason,
-    const MediaVideoFrame *frame, const PspMediaPresentPlan *plan,
-    const PspMediaPresentTexture *texture)
-{
-    (void) mode;
-    (void) reason;
-    (void) frame;
-    (void) plan;
-    (void) texture;
-}
-#else
-__attribute__((noinline))
-static void psp_media_present_report(
-    PspMediaPresentMode mode, const char *reason,
-    const MediaVideoFrame *frame, const PspMediaPresentPlan *plan,
-    const PspMediaPresentTexture *texture)
-{
-    uint64_t generation =
-        psp_active_media == NULL ? 0 : psp_active_media->generation;
-    if (psp_media_present_reported_mode == (int) mode
-        && psp_media_present_reported_generation == generation
-        && psp_media_present_reported_width == frame->width
-        && psp_media_present_reported_height == frame->height) return;
-    psp_media_present_reported_mode = (int) mode;
-    psp_media_present_reported_generation = generation;
-    psp_media_present_reported_width = frame->width;
-    psp_media_present_reported_height = frame->height;
-    uint32_t passthrough_drawn = 0;
-    uint32_t passthrough_source = 0;
-    psp_media_present_ge_passthrough(
-        &passthrough_drawn, &passthrough_source);
-    printf("tilefinch-media-present: mode=%s reason=%s generation=%llu "
-           "source=%dx%d stride=%d format=%d output=%dx%d left=%d top=%d "
-           "bands=%u quads=%u texture=%dx%d seam=%d surface=%s "
-           "sampled=%s@%s "
-           "passthrough-drawn=0x%08x passthrough-source=0x%08x\n",
-           psp_media_present_mode_name(mode),
-           reason == NULL ? "unknown" : reason,
-           (unsigned long long) generation,
-           frame->width, frame->height, frame->stride_pixels,
-           (int) frame->format,
-           plan->video.width, plan->video.height,
-           plan->video.x, plan->video.y,
-           (unsigned) plan->band_count, (unsigned) plan->quad_count,
-           plan->quad_count == 0 ? 0 : plan->quads[0].texture_width,
-           plan->quad_count == 0 ? 0 : plan->quads[0].texture_height,
-           plan->quad_count < 2 ? 0 : plan->quads[1].texture_column,
-           psp_display_video_active(&psp_display) ? "8888" : "565",
-           /* The single largest term in a video frame is where the engine
-              reads its texture from; say it rather than assume the staging
-              handed in was the staging used. */
-           texture == NULL ? "none"
-               : (texture->staged ? "staged" : "linear"),
-           texture == NULL ? "none"
-               : (psp_display_in_edram(&psp_display, texture->pixels)
-                      ? "edram" : "main"),
-           (unsigned) passthrough_drawn, (unsigned) passthrough_source);
-}
-#endif /* TILEFINCH_PSP_VALIDATION_LOG */
 
 /* Common bookkeeping for both presenters: cost accounting and the identity
    record, which are the same statements whatever the surface's width is.
@@ -1147,30 +607,7 @@ static void psp_media_present_account(
     uint64_t started_us, const PspMediaPresentGeCost *cost, bool drawn,
     bool chrome_paints)
 {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t elapsed_us =
-        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
-    if (psp_active_media != NULL) {
-        psp_active_media->present_scale_frames++;
-        psp_active_media->present_scale_total_us += elapsed_us;
-        if (elapsed_us > psp_active_media->present_scale_max_us)
-            psp_active_media->present_scale_max_us = elapsed_us;
-        if (drawn) {
-            psp_active_media->present_ge_frames++;
-            psp_active_media->present_ge_submit_total_us += cost->submit_us;
-            psp_active_media->present_ge_sync_total_us += cost->sync_us;
-            if (cost->sync_us > psp_active_media->present_ge_sync_max_us)
-                psp_active_media->present_ge_sync_max_us = cost->sync_us;
-            psp_active_media->present_ge_wait_total_us += cost->wait_us;
-            if (cost->wait_us > psp_active_media->present_ge_wait_max_us)
-                psp_active_media->present_ge_wait_max_us = cost->wait_us;
-        }
-    }
-#else
-    (void) started_us;
-    (void) cost;
-    (void) drawn;
-#endif
+    psp_vprobe_present_account(started_us, cost, drawn);
     /* Only an overlay-free present may be remembered: some chrome surfaces
        blend with the picture and the time-dependent controls move, so a
        buffer they touched no longer holds the picture on its own. */
@@ -1557,65 +994,9 @@ static bool psp_media_track_menu_blit(
     bool blitted = psp_media_present_ge_blit_565(
         source, source_width, source_height, source_stride, source_changed,
         destination, destination_stride, left, top, &cost);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    PspPresentationCadence *metrics = &psp_presentation_cadence;
-    if (blitted) {
-        uint64_t elapsed_us = cost.submit_us + cost.sync_us;
-        metrics->track_menu_blits++;
-        metrics->track_menu_blit_total_us += elapsed_us;
-        if (elapsed_us > metrics->track_menu_blit_max_us)
-            metrics->track_menu_blit_max_us = elapsed_us;
-        if (source_changed) {
-            unsigned mismatches = 0u;
-            unsigned samples = 0u;
-            /* The exhaustive 61,952-pixel device proof is a release-time
-               probe, not interactive work. Keep a deterministic 8x8 oracle
-               in ordinary validation runs so a bad channel map or geometry
-               still fails visibly without stalling the menu-opening frame. */
-            for (unsigned sample_y = 0; sample_y < 8u; sample_y++) {
-                int y = (int) (sample_y
-                    * (unsigned) (source_height - 1) / 7u);
-                for (unsigned sample_x = 0; sample_x < 8u; sample_x++) {
-                    int x = (int) (sample_x
-                        * (unsigned) (source_width - 1) / 7u);
-                    uint16_t pixel = source[(size_t) y * source_stride + x];
-                    unsigned red = tilefinch_rgb565_red_code(pixel);
-                    unsigned green = tilefinch_rgb565_green_code(pixel);
-                    unsigned blue = tilefinch_rgb565_blue_code(pixel);
-                    red = (red << 3) | (red >> 2);
-                    green = (green << 2) | (green >> 4);
-                    blue = (blue << 3) | (blue >> 2);
-                    uint32_t expected = (uint32_t) red
-                        | ((uint32_t) green << 8)
-                        | ((uint32_t) blue << 16)
-                        | UINT32_C(0xff000000);
-                    uint32_t got = destination[
-                        (size_t) (top + y) * destination_stride
-                            + (size_t) (left + x)];
-                    /* GU_TCC_RGB leaves the otherwise-unused scanout alpha
-                       byte unspecified; the panel and later RGB565 backdrop
-                       conversion consume only the three colour channels. */
-                    if ((got & UINT32_C(0x00ffffff))
-                        != (expected & UINT32_C(0x00ffffff))) {
-                        mismatches++;
-                    }
-                    samples++;
-                }
-            }
-            printf(
-                "tilefinch-track-menu-blit: samples=%lu mismatches=%lu "
-                "submit=%lluus sync=%lluus\n",
-                (unsigned long) samples,
-                (unsigned long) mismatches,
-                (unsigned long long) cost.submit_us,
-                (unsigned long long) cost.sync_us);
-        }
-    } else {
-        metrics->track_menu_blit_fallbacks++;
-    }
-#else
-    (void) cost;
-#endif
+    psp_vprobe_track_menu_blit(
+        blitted, &cost, source, source_width, source_height, source_stride,
+        source_changed, destination, destination_stride, left, top);
     return blitted;
 }
 
@@ -1648,21 +1029,8 @@ static bool psp_media_wait_video_due(PspMediaSession *media)
 __attribute__((noinline))
 static bool psp_present_video_surface(void)
 {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (psp_player_start_clocks != NULL)
-        psp_player_start_clocks[1] = psp_menu_phase_clock();
-    uint64_t presentation_started_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
-    unsigned menu_key = psp_active_media->ui_presentation.track_menu_open
-        ? psp_active_media->ui_presentation.track_menu_tab + 1u : 0u;
-    unsigned menu_input_us = atomic_load_explicit(
-        &psp_media_menu_feedback_time, memory_order_acquire);
-    bool measure_menu = menu_input_us != 0u
-        && atomic_load_explicit(&psp_media_menu_feedback_key, memory_order_relaxed) == menu_key
-        && (uint32_t) presentation_started_us - menu_input_us < 1000000u;
-    PspMenuPhaseClock menu_clocks[4] = {{0}};
-    if (measure_menu) menu_clocks[0] = psp_menu_phase_clock();
-#endif
+    PspVprobeVideo probe;
+    psp_vprobe_video_begin(&probe);
     uint32_t *vram = psp_display_video_back_buffer(&psp_display);
     PspMediaPresentGeCost cost = {0, 0, 0};
     uint32_t feedback_key = psp_ui_media_menu_feedback_key(&psp_active_media->ui);
@@ -1692,10 +1060,7 @@ static bool psp_present_video_surface(void)
         psp_media_present_records[psp_display.back_buffer].valid = false;
     bool overlay_paints =
         psp_ui_media_overlay_paints(&psp_active_media->ui);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_media_present_last_skipped = false;
-    if (menu_feedback) psp_media_present_last_skipped = true;
-#endif
+    psp_vprobe_video_skipped(menu_feedback);
     /* Only this owner changes priority. Audio/codec keep their higher band;
        transport keeps running during DMA/GE/vblank waits, but cannot delay
        the owner once a draw finishes. Restore on both exit paths below. */
@@ -1716,11 +1081,7 @@ static bool psp_present_video_surface(void)
         psp_media_present_forget_buffers();
         return false;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (psp_player_start_clocks != NULL)
-        psp_player_start_clocks[2] = psp_menu_phase_clock();
-    if (measure_menu) menu_clocks[1] = psp_menu_phase_clock();
-#endif
+    psp_vprobe_video_drawn(&probe);
     /* A firmware batch can end with several access units which produce no
        picture. Collect/feed after drawing, not only at the next loop head:
        otherwise overlay work and scanout leave the decoder idle at each GOP. */
@@ -1740,15 +1101,7 @@ static bool psp_present_video_surface(void)
         psp_display_video_aux_pixels(&psp_display),
         psp_display_edram_content_epoch(), &psp_media_track_menu_cache,
         psp_media_track_menu_blit, NULL);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (psp_player_start_clocks != NULL)
-        psp_player_start_clocks[3] = psp_menu_phase_clock();
-    if (measure_menu) menu_clocks[2] = psp_menu_phase_clock();
-    psp_cadence_composed(presentation_started_us, false);
-#endif
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    unsigned published_index = psp_display.back_buffer;
-#endif
+    psp_vprobe_video_composed(&probe);
     /* The preceding feed may finish during overlay composition. Give its
        successor the impending vblank wait without claiming another picture
        or changing either display buffer's ownership. */
@@ -1760,13 +1113,7 @@ static bool psp_present_video_surface(void)
     if (restored < 0)
         printf("tilefinch-media-present: priority-restore=0x%08X\n",
                (unsigned) restored);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (psp_player_start_clocks != NULL) {
-        psp_player_start_clocks[4] = psp_menu_phase_clock();
-        psp_player_start.published[psp_player_start.count++] = published;
-        psp_player_start_clocks = NULL;
-    }
-#endif
+    psp_vprobe_video_publish_returned(published);
     if (published) {
         psp_media_presented(psp_active_media);
         psp_media_menu_deferred_us = 0;
@@ -1778,24 +1125,7 @@ static bool psp_present_video_surface(void)
             psp_media_front_frame_identity = psp_active_media->frame.identity;
         }
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    if (measure_menu && published) {
-        menu_clocks[3] = psp_menu_phase_clock();
-        psp_menu_phase_report(menu_key, menu_input_us, menu_clocks);
-        atomic_compare_exchange_strong_explicit(&psp_media_menu_feedback_time,
-            &menu_input_us, 0u, memory_order_relaxed, memory_order_relaxed);
-    }
-    psp_cadence_published(published);
-    psp_cadence_video_published(published,
-        menu_feedback ? NULL : &psp_active_media->frame);
-    if (published) {
-        psp_input_script_capture_media_present(
-            &psp_active_media->ui, NULL, vram, PSP_VRAM_STRIDE,
-            true, published_index, psp_media_present_last_skipped, false,
-            menu_feedback ? NULL : &psp_active_media->frame, psp_media_present_records,
-            PSP_DISPLAY_PAGE_BUFFER_COUNT);
-    }
-#endif
+    psp_vprobe_video_published(&probe, published, menu_feedback, vram);
     return published;
 }
 
@@ -1816,159 +1146,6 @@ static bool psp_media_seek_holds_scanout(const PspMediaSession *media)
     }
 }
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* One outstanding input measurement, no DOM retention. The engine is the
-   process-owned facade; a navigation generation change abandons the sample.
-   In particular a supervisor publishing the old framebuffer is not success. */
-static struct {
-    BrowserEngine *engine;
-    uint64_t generation, started_us, shell_serial;
-    /* First present of any frame for this input, placeholder or complete. */
-    uint64_t first_visible_us;
-    size_t rendered_frames;
-    int action;
-    /* Page presses a later one replaced before their frame completed (a
-       queued burst replays one per frame): each is reported, timed from
-       its own press, when the one that replaced it completes. */
-    struct {
-        uint64_t started_us, first_visible_us;
-    } superseded[8];
-    uint8_t superseded_count;
-} psp_focus_feedback;
-
-static bool psp_focus_feedback_page_action(int action)
-{
-    return action == (int) PSP_UI_ACTION_PAGE_UP
-        || action == (int) PSP_UI_ACTION_PAGE_DOWN;
-}
-
-void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us)
-{
-    if (engine == NULL) {
-        psp_focus_feedback.engine = NULL;
-        psp_focus_feedback.superseded_count = 0;
-        return;
-    }
-    const NavigationSession *navigation = browser_engine_navigation(engine);
-    const TileCache *render = browser_engine_render_metrics_view(engine);
-    if (navigation == NULL || render == NULL) return;
-    if (psp_focus_feedback.engine != NULL) {
-        printf("tilefinch-focus-feedback-incomplete: action=%d reason=superseded\n",
-               psp_focus_feedback.action);
-        if (psp_focus_feedback_page_action(psp_focus_feedback.action)
-            && psp_focus_feedback_page_action(action)
-            && psp_focus_feedback.superseded_count
-                   < sizeof(psp_focus_feedback.superseded)
-                         / sizeof(psp_focus_feedback.superseded[0])) {
-            psp_focus_feedback.superseded[
-                psp_focus_feedback.superseded_count].started_us =
-                    psp_focus_feedback.started_us;
-            psp_focus_feedback.superseded[
-                psp_focus_feedback.superseded_count++].first_visible_us =
-                    psp_focus_feedback.first_visible_us;
-        }
-    }
-    if (!psp_focus_feedback_page_action(action))
-        psp_focus_feedback.superseded_count = 0;
-    psp_focus_feedback.engine = engine;
-    psp_focus_feedback.generation = navigation->generation;
-    psp_focus_feedback.started_us = started_us;
-    psp_focus_feedback.first_visible_us = 0;
-    psp_focus_feedback.rendered_frames = render->frames_rendered;
-    psp_focus_feedback.shell_serial = browser_engine_render_shell_serial(engine);
-    psp_focus_feedback.action = action;
-}
-
-static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState *ui)
-{
-    BrowserEngine *engine = psp_focus_feedback.engine;
-    if (engine == NULL) return;
-    const NavigationSession *navigation = browser_engine_navigation(engine);
-    if (navigation == NULL || !navigation->page.loaded
-        || navigation->generation != psp_focus_feedback.generation) {
-        printf("tilefinch-focus-feedback-incomplete: action=%d reason=navigation\n",
-               psp_focus_feedback.action);
-        psp_focus_feedback.engine = NULL;
-        psp_focus_feedback.superseded_count = 0;
-        return;
-    }
-    const TileCache *render = browser_engine_render_metrics_view(engine);
-    if (psp_focus_feedback.first_visible_us == 0 && ui != NULL
-        && ui->screen == PSP_UI_SCREEN_PAGE && render != NULL
-        && render->frames_rendered > psp_focus_feedback.rendered_frames
-        && frame == browser_engine_framebuffer(engine, NULL)) {
-        psp_focus_feedback.first_visible_us = sceKernelGetSystemTimeWide();
-    }
-    if (ui == NULL || ui->screen != PSP_UI_SCREEN_PAGE || render == NULL
-        || render->frames_rendered == 0
-        || (browser_engine_render_shell_serial(engine) == psp_focus_feedback.shell_serial
-            && render->frames_rendered <= psp_focus_feedback.rendered_frames)
-        || browser_engine_render_frame_pending(engine)
-        || frame != browser_engine_framebuffer(engine, NULL)) return;
-    if (psp_focus_feedback_page_action(psp_focus_feedback.action)) {
-        /* Time from the press to a complete frame at the new position. */
-        /* Cumulative render-cache counters; consecutive lines give each
-           press's hits (paint-ahead served) and raster misses. */
-        uint64_t complete_us = sceKernelGetSystemTimeWide();
-        uint64_t visible_us = psp_focus_feedback.first_visible_us != 0
-            ? psp_focus_feedback.first_visible_us : complete_us;
-        printf("tilefinch-scroll-feedback: action=%d elapsed=%lluus "
-               "first-visible=%lluus y=%d/%d "
-               "tile-us=%lluus tiles=%zu/%zu hits=%zu misses=%zu "
-               "rasterized=%zu idle=%zu/%zu frames=%zu frame-us=%llu "
-               "phases=%llu/%llu/%llu/%llu/%llu/%llu "
-               "overflow=%zu/%zu\n",
-               psp_focus_feedback.action,
-               (unsigned long long) (complete_us
-                                     - psp_focus_feedback.started_us),
-               (unsigned long long) (visible_us
-                                     - psp_focus_feedback.started_us),
-               ui->scroll_y, ui->maximum_scroll_y,
-               (unsigned long long) render->frame_tile_us,
-               render->tiles_allocated, render->tile_capacity,
-               render->hits, render->misses, render->rasterized,
-               render->idle_jobs_completed, render->idle_units,
-               render->frames_rendered,
-               (unsigned long long) render->frame_us,
-               (unsigned long long) render->frame_setup_us,
-               (unsigned long long) render->frame_tile_us,
-               (unsigned long long) render->frame_overflow_us,
-               (unsigned long long) render->frame_sticky_us,
-               (unsigned long long) render->frame_fixed_us,
-               (unsigned long long) render->frame_indicator_us,
-               render->overflow_tile_commands,
-               render->overflow_direct_commands);
-        for (uint8_t at = 0; at < psp_focus_feedback.superseded_count; at++) {
-            uint64_t started_us = psp_focus_feedback.superseded[at].started_us;
-            uint64_t shown_us =
-                psp_focus_feedback.superseded[at].first_visible_us != 0
-                    ? psp_focus_feedback.superseded[at].first_visible_us
-                    : visible_us;
-            printf("tilefinch-scroll-feedback: action=%d elapsed=%lluus "
-                   "first-visible=%lluus superseded=1\n",
-                   psp_focus_feedback.action,
-                   (unsigned long long) (complete_us - started_us),
-                   (unsigned long long) (shown_us - started_us));
-        }
-        psp_focus_feedback.superseded_count = 0;
-        psp_focus_feedback.engine = NULL;
-        return;
-    }
-    printf("tilefinch-focus-feedback: action=%d shown=1 visible=%u elapsed=%lluus "
-           "rect=%d,%d,%d,%d relayouts=%zu layout-total=%lluus "
-           "fixed=%zu/%zu/%zu fixed-us=%lluus tile-us=%lluus\n",
-           psp_focus_feedback.action, ui->has_focus ? 1u : 0u,
-           (unsigned long long) (sceKernelGetSystemTimeWide() - psp_focus_feedback.started_us),
-           ui->focus_x, ui->focus_y, ui->focus_width, ui->focus_height,
-           navigation->incremental_relayouts,
-           (unsigned long long) navigation->performance.layout_us,
-           navigation->page.layout.fixed_count, render->fixed_cache_builds,
-           render->fixed_cache_blits,
-           (unsigned long long) render->frame_fixed_us,
-           (unsigned long long) render->frame_tile_us);
-    psp_focus_feedback.engine = NULL;
-}
-#endif
 
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media)
@@ -1991,24 +1168,7 @@ bool psp_present_internal(
         return false;
     bool media_replaces_page = media_visible && psp_active_media->have_frame
         && psp_media_frame_presentable(&psp_active_media->frame);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_player_start_clocks = NULL;
-    if (media_replaces_page) {
-        if (psp_player_start.generation != psp_active_media->generation) {
-            memset(&psp_player_start, 0, sizeof(psp_player_start));
-            psp_player_start.generation = psp_active_media->generation;
-        }
-        bool resolving = psp_active_media->ui.resolving;
-        unsigned *samples = resolving ? &psp_player_start.loading_count
-                                      : &psp_player_start.playing_count;
-        if (*samples < 4u && psp_player_start.count < 8u) {
-            psp_player_start_clocks = psp_player_start.clocks[psp_player_start.count];
-            psp_player_start.resolving[psp_player_start.count] = resolving;
-            (*samples)++;
-            psp_player_start_clocks[0] = psp_menu_phase_clock();
-        }
-    }
-#endif
+    psp_vprobe_player_start(media_replaces_page);
     if (psp_media_video_surface_follow(media_replaces_page)) {
         bool published = psp_present_video_surface();
         /* Still on the video surface means it owned this frame, published or
@@ -2017,23 +1177,13 @@ bool psp_present_internal(
            draw the same frame into the 16-bit surface. */
         if (psp_display_video_active(&psp_display)) return published;
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Surface refusal takes the ordinary fallback; do not label its absent
        video/overlay boundaries as valid first-picture samples. */
-    psp_player_start_clocks = NULL;
-#endif
+    psp_vprobe_player_start_abandon();
     uint16_t *vram = psp_display_back_buffer(&psp_display);
     if (vram == NULL) return false;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t presentation_started_us =
-        (uint64_t) sceKernelGetSystemTimeWide();
-    uint64_t base_finished_us = presentation_started_us;
-    uint64_t composite_finished_us = presentation_started_us;
-    uint64_t base_cpu_before = 0, base_cpu_after = 0;
-    bool base_cpu_before_valid = psp_present_cpu_measurement
-        && psp_present_thread_cpu(&base_cpu_before);
-    uint32_t base_bytes = 0;
-#endif
+    PspVprobePhase phase;
+    psp_vprobe_phase_begin(&phase);
     bool native_surface = !media_visible && ui != NULL
         && psp_ui_screen_is_native_surface(ui->screen);
     if (!media_replaces_page) {
@@ -2051,9 +1201,8 @@ bool psp_present_internal(
             memset(vram + (size_t) y * PSP_VRAM_STRIDE, 0,
                    PSP_SCREEN_WIDTH * sizeof(*vram));
         }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        base_bytes = PSP_SCREEN_WIDTH * PSP_SCREEN_HEIGHT * sizeof(*vram);
-#endif
+        psp_vprobe_phase_base_bytes(
+            &phase, PSP_SCREEN_WIDTH * PSP_SCREEN_HEIGHT * sizeof(*vram));
     } else if (!media_replaces_page && !native_surface) {
         unsigned opaque_top = 0u, opaque_bottom = 0u;
         psp_ui_opaque_chrome_rows(ui, &opaque_top, &opaque_bottom);
@@ -2096,24 +1245,14 @@ bool psp_present_internal(
 #endif
             }
         }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        base_bytes = (copy_end > opaque_top ? copy_end - opaque_top : 0u)
-            * PSP_SCREEN_WIDTH * sizeof(*frame);
-#endif
+        psp_vprobe_phase_copied_rows(&phase, opaque_top, copy_end);
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    base_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
-    bool base_cpu_after_valid = psp_present_cpu_measurement
-        && psp_present_thread_cpu(&base_cpu_after);
-    PspUiCompositeTiming ui_timing = {0};
-#endif
+    psp_vprobe_phase_base_done(&phase);
     if (media_visible) {
         if (media_replaces_page) {
             bool overlay_paints =
                 psp_ui_media_overlay_paints(&psp_active_media->ui);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-            psp_media_present_last_skipped = false;
-#endif
+            psp_vprobe_video_skipped(false);
             (void) psp_present_media_frame(
                 vram, &psp_active_media->frame,
                 overlay_paints);
@@ -2132,85 +1271,18 @@ bool psp_present_internal(
     } else if (ui != NULL) {
         psp_ui_composite(ui, vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
                          PSP_VRAM_STRIDE);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        (void) psp_ui_validation_last_timing(&ui_timing);
-#endif
+        psp_vprobe_phase_ui_composited(&phase);
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    composite_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
-#endif
     /* Publish only a completely composed back buffer at vblank. Writing the
        scanout buffer directly caused visibly half-updated title bars and
        loading flicker on physical hardware. */
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_cadence_composed(presentation_started_us, native_surface);
-#endif
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    unsigned published_index = psp_display.back_buffer;
-    PspDisplayBackendTiming display_timing_before = {0};
-    (void) psp_display_validation_timing_snapshot(&display_timing_before);
-    if (psp_present_pre_publish_hook != NULL) {
-        uint32_t next = psp_present_last_timing.sequence + 1u;
-        psp_present_pre_publish_hook(next == 0u ? 1u : next);
-    }
-#endif
+    psp_vprobe_phase_composed(&phase, native_surface);
     bool published = (!media_replaces_page
         || psp_media_wait_video_due(psp_active_media))
         && psp_display_publish(&psp_display);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint64_t published_us = (uint64_t) sceKernelGetSystemTimeWide();
-    PspDisplayBackendTiming display_timing_after = {0};
-    (void) psp_display_validation_timing_snapshot(&display_timing_after);
-    uint32_t sequence = psp_present_last_timing.sequence + 1u;
-    if (sequence == 0) sequence = 1u;
-    psp_present_last_timing = (PspPresentPhaseTiming) {
-        .base_us = base_finished_us - presentation_started_us,
-        .base_cpu_valid = base_cpu_before_valid && base_cpu_after_valid
-            && base_cpu_after >= base_cpu_before,
-        .base_cpu_us = base_cpu_after >= base_cpu_before
-            ? base_cpu_after - base_cpu_before : 0,
-        .base_bytes = base_bytes,
-        .composite_us = composite_finished_us - base_finished_us,
-        .publish_us = published_us - composite_finished_us,
-        .publish_flush_us = display_timing_after.flush_us
-            - display_timing_before.flush_us,
-        .publish_set_framebuffer_us =
-            display_timing_after.set_framebuffer_us
-                - display_timing_before.set_framebuffer_us,
-        .publish_vblank_us = display_timing_after.vblank_us
-            - display_timing_before.vblank_us,
-        .ui_focus_scroll_us = ui_timing.focus_scroll_us,
-        .ui_chrome_us = ui_timing.chrome_us,
-        .ui_cursor_us = ui_timing.cursor_us,
-        .ui_screen_us = ui_timing.screen_us,
-        .ui_toast_us = ui_timing.toast_us,
-        .ui_loading_us = ui_timing.loading_us,
-        .sequence = sequence
-    };
-    if (published && psp_presentation_cadence.cursor_sample_pending_us != 0) {
-        PspPresentationCadence *metrics = &psp_presentation_cadence;
-        uint64_t compose = composite_finished_us - presentation_started_us;
-        uint64_t publish = published_us - composite_finished_us;
-        metrics->cursor_work_samples++;
-        metrics->cursor_compose_total_us += compose;
-        metrics->cursor_publish_total_us += publish;
-        if (compose > metrics->cursor_compose_max_us)
-            metrics->cursor_compose_max_us = compose;
-        if (publish > metrics->cursor_publish_max_us)
-            metrics->cursor_publish_max_us = publish;
-    }
-    psp_cadence_published(published);
-    if (published && !media_visible) psp_input_script_measure_presented(ui);
-    if (published && !media_visible) psp_focus_feedback_published(frame, ui);
-    if (published && media_visible) {
-        psp_input_script_capture_media_present(
-            &psp_active_media->ui, vram, NULL, PSP_VRAM_STRIDE,
-            false, published_index,
-            media_replaces_page && psp_media_present_last_skipped,
-            false, media_replaces_page ? &psp_active_media->frame : NULL,
-            psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
-    }
-#endif
+    psp_vprobe_phase_published(
+        &phase, published, media_visible, media_replaces_page, frame, ui,
+        vram);
     if (published && media_replaces_page)
         psp_media_presented(psp_active_media);
     return published;
@@ -2328,362 +1400,6 @@ bool psp_request_policy_clock(
     return (idle || high)
         && psp_clock_worker_request(worker, idle, request_us);
 }
-
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-static bool psp_set_policy_clock(
-    void *context, unsigned cpu_mhz, unsigned bus_mhz,
-    uint64_t *transition_us)
-{
-    (void) context;
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    int result = scePowerSetClockFrequency(
-        (int) cpu_mhz, (int) cpu_mhz, (int) bus_mhz);
-    uint64_t finished_us = (uint64_t) sceKernelGetSystemTimeWide();
-    if (transition_us != NULL)
-        *transition_us = finished_us - started_us;
-    return result >= 0
-        && scePowerGetCpuClockFrequencyInt() == (int) cpu_mhz
-        && scePowerGetBusClockFrequencyInt() == (int) bus_mhz;
-}
-
-static bool psp_set_split_clock(
-    unsigned cpu_mhz, unsigned bus_mhz, uint64_t *transition_us)
-{
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    int first_result;
-    int second_result;
-    if (cpu_mhz >= (unsigned) scePowerGetCpuClockFrequencyInt()) {
-        first_result = scePowerSetBusClockFrequency((int) bus_mhz);
-        second_result = scePowerSetCpuClockFrequency((int) cpu_mhz);
-    } else {
-        first_result = scePowerSetCpuClockFrequency((int) cpu_mhz);
-        second_result = scePowerSetBusClockFrequency((int) bus_mhz);
-    }
-    uint64_t finished_us = (uint64_t) sceKernelGetSystemTimeWide();
-    if (transition_us != NULL)
-        *transition_us = finished_us - started_us;
-    return first_result >= 0 && second_result >= 0
-        && scePowerGetCpuClockFrequencyInt() == (int) cpu_mhz
-        && scePowerGetBusClockFrequencyInt() == (int) bus_mhz;
-}
-
-static uint64_t psp_clock_work_probe(uint32_t *checksum)
-{
-    uint32_t value = UINT32_C(0x5a17c9e3);
-    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
-    for (unsigned at = 0; at < 400000u; at++)
-        value = value * UINT32_C(1664525) + UINT32_C(1013904223);
-    uint64_t finished_us = (uint64_t) sceKernelGetSystemTimeWide();
-    if (checksum != NULL) *checksum = value;
-    return finished_us - started_us;
-}
-
-void psp_clock_validation_probe(void)
-{
-    uint64_t low_transition_us = 0;
-    uint64_t high_transition_us = 0;
-    uint64_t split_low_transition_us = 0;
-    uint64_t split_high_transition_us = 0;
-    uint32_t low_checksum = 0;
-    uint32_t high_checksum = 0;
-    bool low_ok = psp_set_policy_clock(
-        NULL, PSP_POWER_POLICY_IDLE_CPU_MHZ,
-        PSP_POWER_POLICY_IDLE_BUS_MHZ, &low_transition_us);
-    uint64_t low_work_us = psp_clock_work_probe(&low_checksum);
-    bool high_ok = psp_set_policy_clock(
-        NULL, PSP_POWER_POLICY_HIGH_CPU_MHZ,
-        PSP_POWER_POLICY_HIGH_BUS_MHZ, &high_transition_us);
-    uint64_t high_work_us = psp_clock_work_probe(&high_checksum);
-    bool split_low_ok = psp_set_split_clock(
-        PSP_POWER_POLICY_IDLE_CPU_MHZ,
-        PSP_POWER_POLICY_IDLE_BUS_MHZ, &split_low_transition_us);
-    bool split_high_ok = psp_set_split_clock(
-        PSP_POWER_POLICY_HIGH_CPU_MHZ,
-        PSP_POWER_POLICY_HIGH_BUS_MHZ, &split_high_transition_us);
-    printf(
-        "tilefinch-power-probe: low-ok=%d low-transition=%lluus "
-        "low-work=%lluus high-ok=%d high-transition=%lluus "
-        "high-work=%lluus split-low-ok=%d split-low=%lluus "
-        "split-high-ok=%d split-high=%lluus checksum-match=%d\n",
-        low_ok ? 1 : 0, (unsigned long long) low_transition_us,
-        (unsigned long long) low_work_us, high_ok ? 1 : 0,
-        (unsigned long long) high_transition_us,
-        (unsigned long long) high_work_us, split_low_ok ? 1 : 0,
-        (unsigned long long) split_low_transition_us,
-        split_high_ok ? 1 : 0,
-        (unsigned long long) split_high_transition_us,
-        low_checksum == high_checksum ? 1 : 0);
-}
-
-const char *psp_power_test_phase_name(PspPowerTestPhase phase)
-{
-    switch (phase) {
-        case PSP_POWER_TEST_ADAPTIVE: return "adaptive";
-        case PSP_POWER_TEST_FIXED_HIGH: return "fixed-333";
-        case PSP_POWER_TEST_OFF:
-        default: return "off";
-    }
-}
-
-void psp_power_log_battery(
-    const char *event, PspPowerTestPhase phase, uint64_t elapsed_ms)
-{
-    printf(
-        "tilefinch-battery: event=%s phase=%s elapsed=%llums "
-        "present=%d ac=%d charging=%d low=%d capacity=%d "
-        "full=%d percent=%d life-min=%d voltage-mv=%d temp-c=%d "
-        "cpu=%d bus=%d\n",
-        event, psp_power_test_phase_name(phase),
-        (unsigned long long) elapsed_ms,
-        scePowerIsBatteryExist(), scePowerIsPowerOnline(),
-        scePowerIsBatteryCharging(), scePowerIsLowBattery(),
-        scePowerGetBatteryRemainCapacity(),
-        scePowerGetBatteryFullCapacity(),
-        scePowerGetBatteryLifePercent(),
-        scePowerGetBatteryLifeTime(),
-        scePowerGetBatteryVolt(), scePowerGetBatteryTemp(),
-        scePowerGetCpuClockFrequencyInt(),
-        scePowerGetBusClockFrequencyInt());
-}
-
-static void psp_power_test_begin(
-    PspPowerTest *test, PspPowerTestPhase phase, uint64_t now_us,
-    const PspClockWorkerSnapshot *worker)
-{
-    if (test == NULL || phase == PSP_POWER_TEST_OFF) return;
-    memset(test, 0, sizeof(*test));
-    test->phase = phase;
-    test->started_us = now_us;
-    test->next_sample_us = now_us + UINT64_C(60000000);
-    test->starting_completions =
-        worker == NULL ? 0 : worker->completions;
-    test->starting_failures =
-        worker == NULL ? 0 : worker->failures;
-    test->starting_capacity = scePowerGetBatteryRemainCapacity();
-    test->starting_percent = scePowerGetBatteryLifePercent();
-    psp_power_log_battery("start", phase, 0);
-    printf(
-        "tilefinch-power-test: event=start phase=%s "
-        "workload=automatic-idle-reading\n",
-        psp_power_test_phase_name(phase));
-}
-
-void psp_power_test_tick(
-    PspPowerTest *test, uint64_t now_us, unsigned elapsed_ms,
-    const PspClockWorkerSnapshot *worker)
-{
-    if (test == NULL || test->phase == PSP_POWER_TEST_OFF) return;
-    if (worker != NULL && worker->transitioning)
-        test->transition_ms += elapsed_ms;
-    else if (worker != NULL && worker->applied_idle)
-        test->idle_ms += elapsed_ms;
-    else
-        test->high_ms += elapsed_ms;
-    if (now_us >= test->next_sample_us) {
-        uint64_t elapsed = (now_us - test->started_us) / 1000u;
-        psp_power_log_battery("sample", test->phase, elapsed);
-        printf(
-            "tilefinch-power-test: event=sample phase=%s "
-            "high=%llums idle=%llums transition=%llums\n",
-            psp_power_test_phase_name(test->phase),
-            (unsigned long long) test->high_ms,
-            (unsigned long long) test->idle_ms,
-            (unsigned long long) test->transition_ms);
-        test->next_sample_us = now_us + UINT64_C(60000000);
-    }
-}
-
-PspPowerTestResult psp_power_test_finish(
-    PspPowerTest *test, uint64_t now_us,
-    const PspClockWorkerSnapshot *worker, const char *reason)
-{
-    PspPowerTestResult result = {
-        .capacity_delta = INT_MIN,
-        .percent_delta = INT_MIN
-    };
-    if (test == NULL || test->phase == PSP_POWER_TEST_OFF) return result;
-    uint64_t elapsed_ms = (now_us - test->started_us) / 1000u;
-    int ending_capacity = scePowerGetBatteryRemainCapacity();
-    int ending_percent = scePowerGetBatteryLifePercent();
-    unsigned completions = worker == NULL ? 0
-        : worker->completions - test->starting_completions;
-    unsigned failures = worker == NULL ? 0
-        : worker->failures - test->starting_failures;
-    result.phase = test->phase;
-    result.elapsed_ms = elapsed_ms;
-    result.high_ms = test->high_ms;
-    result.idle_ms = test->idle_ms;
-    result.transition_ms = test->transition_ms;
-    if (ending_capacity >= 0 && test->starting_capacity >= 0)
-        result.capacity_delta =
-            ending_capacity - test->starting_capacity;
-    if (ending_percent >= 0 && test->starting_percent >= 0
-        && ending_capacity >= 0 && test->starting_capacity >= 0)
-        result.percent_delta = ending_percent - test->starting_percent;
-    psp_power_log_battery("finish", test->phase, elapsed_ms);
-    printf(
-        "tilefinch-power-test: event=finish phase=%s reason=%s "
-        "elapsed=%llums high=%llums idle=%llums transition=%llums "
-        "clock-completions=%u clock-failures=%u "
-        "capacity-start=%d capacity-end=%d capacity-delta=%d "
-        "percent-start=%d percent-end=%d percent-delta=%d\n",
-        psp_power_test_phase_name(test->phase),
-        reason == NULL ? "user" : reason,
-        (unsigned long long) elapsed_ms,
-        (unsigned long long) test->high_ms,
-        (unsigned long long) test->idle_ms,
-        (unsigned long long) test->transition_ms,
-        completions, failures, test->starting_capacity, ending_capacity,
-        result.capacity_delta,
-        test->starting_percent, ending_percent,
-        result.percent_delta);
-    test->phase = PSP_POWER_TEST_OFF;
-    return result;
-}
-
-static PspPowerTestPhase psp_power_auto_phase(unsigned segment)
-{
-    /* Counterbalance clock mode against battery settling and temperature. */
-    return segment == 0u || segment == 3u
-        ? PSP_POWER_TEST_ADAPTIVE : PSP_POWER_TEST_FIXED_HIGH;
-}
-
-void psp_power_auto_begin_segment(
-    PspPowerAutoTest *automatic, PspPowerTest *test, uint64_t now_us,
-    const PspClockWorkerSnapshot *worker, PspUiState *ui)
-{
-    if (automatic == NULL || test == NULL || ui == NULL
-        || automatic->segment >= PSP_POWER_AUTO_SEGMENTS) return;
-    PspPowerTestPhase phase =
-        psp_power_auto_phase(automatic->segment);
-    psp_power_test_begin(test, phase, now_us, worker);
-    ui->validation_power_test_phase = 1;
-    char status[80];
-    snprintf(
-        status, sizeof(status), "POWER TEST %u/4: %s - PLEASE WAIT",
-        automatic->segment + 1u,
-        phase == PSP_POWER_TEST_ADAPTIVE ? "ADAPTIVE" : "FIXED 333");
-    psp_ui_show_status(ui, status, 900);
-    printf(
-        "tilefinch-power-auto: event=segment-start segment=%u/4 "
-        "phase=%s duration=30000ms workload=idle-reading\n",
-        automatic->segment + 1u, psp_power_test_phase_name(phase));
-}
-
-void psp_power_auto_accumulate(
-    PspPowerAutoTest *automatic, const PspPowerTestResult *result)
-{
-    if (automatic == NULL || result == NULL) return;
-    bool adaptive = result->phase == PSP_POWER_TEST_ADAPTIVE;
-    uint64_t *elapsed = adaptive
-        ? &automatic->adaptive_elapsed_ms : &automatic->fixed_elapsed_ms;
-    uint64_t *high = adaptive
-        ? &automatic->adaptive_high_ms : &automatic->fixed_high_ms;
-    uint64_t *idle = adaptive
-        ? &automatic->adaptive_idle_ms : &automatic->fixed_idle_ms;
-    uint64_t *transition = adaptive
-        ? &automatic->adaptive_transition_ms
-        : &automatic->fixed_transition_ms;
-    *elapsed += result->elapsed_ms;
-    *high += result->high_ms;
-    *idle += result->idle_ms;
-    *transition += result->transition_ms;
-    if (result->capacity_delta != INT_MIN) {
-        int *delta = adaptive
-            ? &automatic->adaptive_capacity_delta
-            : &automatic->fixed_capacity_delta;
-        bool *valid = adaptive
-            ? &automatic->adaptive_capacity_valid
-            : &automatic->fixed_capacity_valid;
-        *delta += result->capacity_delta;
-        *valid = true;
-    }
-    if (result->percent_delta != INT_MIN) {
-        int *delta = adaptive
-            ? &automatic->adaptive_percent_delta
-            : &automatic->fixed_percent_delta;
-        bool *valid = adaptive
-            ? &automatic->adaptive_percent_valid
-            : &automatic->fixed_percent_valid;
-        *delta += result->percent_delta;
-        *valid = true;
-    }
-}
-
-void psp_power_auto_log_summary(
-    const PspPowerAutoTest *automatic, uint64_t now_us,
-    const char *reason)
-{
-    if (automatic == NULL) return;
-    printf(
-        "tilefinch-power-auto: event=summary reason=%s elapsed=%llums "
-        "adaptive-ms=%llums fixed-ms=%llums "
-        "adaptive-high=%llums adaptive-idle=%llums "
-        "adaptive-transition=%llums "
-        "fixed-high=%llums fixed-idle=%llums fixed-transition=%llums "
-        "adaptive-capacity-delta=%d adaptive-capacity-valid=%d "
-        "fixed-capacity-delta=%d fixed-capacity-valid=%d "
-        "adaptive-percent-delta=%d adaptive-percent-valid=%d "
-        "fixed-percent-delta=%d fixed-percent-valid=%d\n",
-        reason == NULL ? "complete" : reason,
-        (unsigned long long) ((now_us - automatic->started_us) / 1000u),
-        (unsigned long long) automatic->adaptive_elapsed_ms,
-        (unsigned long long) automatic->fixed_elapsed_ms,
-        (unsigned long long) automatic->adaptive_high_ms,
-        (unsigned long long) automatic->adaptive_idle_ms,
-        (unsigned long long) automatic->adaptive_transition_ms,
-        (unsigned long long) automatic->fixed_high_ms,
-        (unsigned long long) automatic->fixed_idle_ms,
-        (unsigned long long) automatic->fixed_transition_ms,
-        automatic->adaptive_capacity_delta,
-        automatic->adaptive_capacity_valid ? 1 : 0,
-        automatic->fixed_capacity_delta,
-        automatic->fixed_capacity_valid ? 1 : 0,
-        automatic->adaptive_percent_delta,
-        automatic->adaptive_percent_valid ? 1 : 0,
-        automatic->fixed_percent_delta,
-        automatic->fixed_percent_valid ? 1 : 0);
-}
-
-bool psp_power_auto_start(
-    PspPowerAutoTest *automatic, PspPowerTest *test, uint64_t now_us,
-    const PspClockWorkerSnapshot *worker, PspUiState *ui,
-    bool allow_unmeasured, const char *trigger)
-{
-    if (automatic == NULL || test == NULL || ui == NULL) return false;
-    int battery_present = scePowerIsBatteryExist();
-    int ac_online = scePowerIsPowerOnline();
-    if (!allow_unmeasured
-        && (battery_present <= 0 || ac_online != 0)) {
-        printf(
-            "tilefinch-power-test: event=refused battery=%d ac=%d "
-            "reason=%s\n",
-            battery_present, ac_online,
-            ac_online > 0 ? "disconnect-ac" : "battery-unavailable");
-        psp_ui_show_status(
-            ui,
-            ac_online > 0
-                ? "UNPLUG AC POWER, THEN START TEST"
-                : "BATTERY TEST UNAVAILABLE",
-            600);
-        return false;
-    }
-    memset(automatic, 0, sizeof(*automatic));
-    automatic->active = true;
-    automatic->started_us = now_us;
-    psp_power_auto_begin_segment(
-        automatic, test, now_us, worker, ui);
-    printf(
-        "tilefinch-power-auto: event=start trigger=%s "
-        "duration=120000ms segments=4 "
-        "schedule=adaptive,fixed-333,fixed-333,adaptive "
-        "workload=idle-reading input=circle-aborts "
-        "measurements=%s\n",
-        trigger == NULL ? "menu" : trigger,
-        allow_unmeasured ? "optional" : "required");
-    return true;
-}
-#endif
 
 bool psp_present(const uint16_t *frame, const PspUiState *ui)
 {
@@ -3187,23 +1903,10 @@ void psp_work_cooperate_begin_media_open(
     /* Populate playback's actual weights/buttons before the supervisor draws,
        without preparing an unused large bold alphabet on every first open. */
     bool held = psp_presentation_fence_acquire();
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    PspMenuPhaseClock fonts_before = psp_menu_phase_clock();
-#endif
+    PspVprobeFonts fonts_probe;
+    psp_vprobe_fonts_begin(&fonts_probe);
     psp_ui_preload_media_chrome();
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-    PspMenuPhaseClock fonts_after = psp_menu_phase_clock();
-    PspUiChromeGlyphPreload preload = psp_ui_chrome_glyph_preload();
-    if (preload.glyphs != 0u) {
-        bool valid = fonts_before.valid && fonts_after.valid
-            && fonts_after.cpu >= fonts_before.cpu;
-        printf("tilefinch-player-fonts: regular-large-glyphs=%u wall-low=%lluus wall-high=%lluus cpu=%lluus valid=%u\n",
-            preload.glyphs,
-            (unsigned long long) (fonts_after.before - fonts_before.after),
-            (unsigned long long) (fonts_after.after - fonts_before.before),
-            (unsigned long long) (valid ? fonts_after.cpu - fonts_before.cpu : 0), valid);
-    }
-#endif
+    psp_vprobe_fonts_end(&fonts_probe);
     psp_presentation_fence_release(held);
     psp_ui_set_loading(ui, true, -1);
     psp_ui_show_status(ui, PSP_MEDIA_OPEN_STATUS, 600);
@@ -3290,78 +1993,6 @@ bool psp_navigation_cooperate_supervised(void)
         && psp_navigation_cooperate.supervised != 0;
 }
 
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-/* Load-time page-scroll responsiveness; see psp_load_experience.h. Written
-   by the input supervisor (presses) and the preview scroller (movement). */
-static PspLoadScroll psp_load_scroll;
-
-static void psp_load_scroll_note_press(void)
-{
-    psp_load_scroll_press(&psp_load_scroll, sceKernelGetSystemTimeLow());
-}
-
-static void psp_load_scroll_note_moved(void)
-{
-    uint32_t now = sceKernelGetSystemTimeLow();
-    uint32_t pending = psp_load_scroll.pending_press_us;
-    if (pending != 0 && now - pending >= 300000u)
-        printf("tilefinch-load-scroll-slow: wait=%lums\n",
-               (unsigned long) ((now - pending) / 1000u));
-    psp_load_scroll_moved(&psp_load_scroll, now);
-}
-
-void psp_load_experience_report(const char *scope, BrowserEngine *engine,
-                                const BrowserNavigationJobMetrics *metrics)
-{
-    if (metrics == NULL) return;
-    const NavigationSession *navigation = browser_engine_navigation(engine);
-    bool loaded = metrics->status == BROWSER_NAVIGATION_JOB_SUCCEEDED
-        && navigation != NULL && navigation->page.loaded;
-    PspLoadReach reach = {
-        .first_present_us = metrics->provisional_first_present_us,
-        .preview_reach_us = metrics->provisional_reach_us,
-        .preview_reach_px = metrics->provisional_reach_px,
-        .loaded_us = loaded ? metrics->elapsed_us : 0,
-        .page_height_px = loaded ? navigation->page.layout.height : 0,
-        .screen_height_px = PSP_SCREEN_HEIGHT
-    };
-    bool unresolved = psp_load_scroll_finish(
-        &psp_load_scroll, sceKernelGetSystemTimeLow());
-    static const unsigned screens[] = { 1u, 2u, 5u, 10u };
-    char reach_text[96];
-    size_t used = 0;
-    for (size_t at = 0; at < sizeof(screens) / sizeof(screens[0]); at++) {
-        uint64_t when = psp_load_reach_time(&reach, screens[at]);
-        int written = when == UINT64_MAX
-            ? snprintf(reach_text + used, sizeof(reach_text) - used,
-                       "%s%u:never", at == 0 ? "" : ",", screens[at])
-            : snprintf(reach_text + used, sizeof(reach_text) - used,
-                       "%s%u:%llums", at == 0 ? "" : ",", screens[at],
-                       (unsigned long long) (when / 1000u));
-        if (written < 0 || (size_t) written >= sizeof(reach_text) - used)
-            break;
-        used += (size_t) written;
-    }
-    printf("tilefinch-load-experience: scope=%s status=%d "
-           "first-present=%llums preview-reach=%dpx@%llums "
-           "loaded=%llums height=%d screens-reached=%s "
-           "screens-at-5s=%u screens-at-10s=%u "
-           "load-scroll=%u/%u max-move=%lums longest-wait=%lums%s\n",
-           scope, (int) metrics->status,
-           (unsigned long long) (reach.first_present_us / 1000u),
-           reach.preview_reach_px,
-           (unsigned long long) (reach.preview_reach_us / 1000u),
-           (unsigned long long) (reach.loaded_us / 1000u),
-           reach.page_height_px, reach_text,
-           psp_load_reach_screens_at(&reach, 5000000u),
-           psp_load_reach_screens_at(&reach, 10000000u),
-           psp_load_scroll.moved, psp_load_scroll.presses,
-           (unsigned long) (psp_load_scroll.max_move_latency_us / 1000u),
-           (unsigned long) (psp_load_scroll.longest_wait_us / 1000u),
-           unresolved ? " unresolved=1" : "");
-    psp_load_scroll_reset(&psp_load_scroll);
-}
-#endif
 
 /* Page presses on the load preview, bounded: each one moves a page when
    the next checkpoint applies it, and a burst beyond the bound is the
@@ -3432,13 +2063,9 @@ bool psp_request_provisional_scroll(
     int direction = delta > 0 ? 1 : -1;
     bool moved;
     if (page) {
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_load_scroll_note_press();
-#endif
         moved = browser_engine_scroll_provisional_page(engine, direction);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
         if (moved) psp_load_scroll_note_moved();
-#endif
     } else {
         moved = browser_engine_scroll_provisional_by(engine, delta);
     }
@@ -4262,8 +2889,14 @@ static void psp_runtime_cooperate_activate(PspNavigationCooperate *cooperate)
     cooperate->last_present_us = psp_runtime_cooperate.started_us;
 }
 
+/* Resumable owner boundaries: queued page input defers the next unit. */
+#define PSP_COOPERATE_YIELD_BOUNDARY \
+    (TILEFINCH_COOPERATE_PAGE_TASK | TILEFINCH_COOPERATE_RENDER_INPUT \
+     | TILEFINCH_COOPERATE_IMAGE_ADMISSION)
+
 bool psp_platform_cooperate(
-    void *context, const char *phase, size_t completed_work_units)
+    void *context, const char *phase, size_t completed_work_units,
+    unsigned boundary)
 {
     PspNavigationCooperate *cooperate = context;
     if (cooperate == &psp_navigation_cooperate
@@ -4273,12 +2906,12 @@ bool psp_platform_cooperate(
         if (sceKernelGetThreadId() != atomic_load_explicit(
                 &psp_runtime_cooperate.owner_thread, memory_order_relaxed))
             return true;
-        if (phase != NULL && strcmp(phase, "render-compose") == 0) {
+        if ((boundary & TILEFINCH_COOPERATE_RENDER_COMPOSE) != 0) {
             psp_runtime_cooperate.painting = completed_work_units != 0;
             return true;
         }
         if (psp_runtime_cooperate.painting) return true;
-        if (phase != NULL && strcmp(phase, "image-admission-boundary") == 0) {
+        if ((boundary & TILEFINCH_COOPERATE_IMAGE_ADMISSION) != 0) {
             /* Request setup can include synchronous cache/replay I/O.
                Arm before it starts, not at an eight-millisecond checkpoint
                that admission may never reach. Native menu/chrome/cursor
@@ -4286,7 +2919,7 @@ bool psp_platform_cooperate(
                until the next safe admission boundary. */
             psp_runtime_cooperate_activate(cooperate);
         }
-        if (phase != NULL && strcmp(phase, "page-focus-feedback") == 0) {
+        if ((boundary & TILEFINCH_COOPERATE_FOCUS_FEEDBACK) != 0) {
             /* This is often the first safe point of a focus move. The
                ordinary eight-millisecond lazy arm has not fired yet. */
             psp_runtime_cooperate_activate(cooperate);
@@ -4306,11 +2939,13 @@ bool psp_platform_cooperate(
                     && !shown_ui->cursor_visible
                     && browser_engine_frontend_snapshot(engine, &snapshot);
                 const NavigationSession *nav = sampled ? snapshot.navigation : NULL;
-                const NavigationEntry *entry = nav == NULL ? NULL : navigation_current(nav);
+                int entry_scroll = 0;
+                bool has_entry = nav != NULL && browser_engine_current_entry(
+                    engine, NULL, 0u, &entry_scroll);
                 int x = 0, y = 0, width = 0, height = 0;
-                if (entry != NULL && browser_engine_focus_indicator_rect(
+                if (has_entry && browser_engine_focus_indicator_rect(
                         engine, &x, &y, &width, &height)) {
-                    y -= entry->scroll_y;
+                    y -= entry_scroll;
                     /* The incumbent pixels haven't scrolled yet. An offscreen
                        target is published by the normal reveal/render path. */
                     if (y >= 0 && (int64_t) y + height <= nav->viewport.css_height) {
@@ -4324,23 +2959,7 @@ bool psp_platform_cooperate(
                         if (psp_present_internal(psp_supervisor_page_frame(cooperate),
                                                 shown_ui, false)) {
                             uint64_t now_us = sceKernelGetSystemTimeWide();
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-                            /* This accepted frame already contains the new
-                               native focus ring, even though author styling
-                               has not rendered. Keep that latency distinct
-                               from the later complete-frame receipt. */
-                            if (psp_focus_feedback.engine == engine
-                                && psp_focus_feedback.generation == nav->generation
-                                && !psp_focus_feedback_page_action(psp_focus_feedback.action)
-                                && psp_focus_feedback.first_visible_us == 0) {
-                                psp_focus_feedback.first_visible_us = now_us;
-                                printf("tilefinch-focus-first-visible: action=%d "
-                                       "elapsed=%lluus native=1\n",
-                                       psp_focus_feedback.action,
-                                       (unsigned long long) (now_us
-                                           - psp_focus_feedback.started_us));
-                            }
-#endif
+                            psp_vprobe_focus_first_visible(engine, nav, now_us);
                             cooperate->last_present_us = now_us;
                             cooperate->owner_present_us = now_us;
                             cooperate->presentations++;
@@ -4355,7 +2974,7 @@ bool psp_platform_cooperate(
         /* Optional work that holds no author state (a font batch, the rest
            of a provisional layout) yields to page input and reruns; see
            psp_input_route() for the extension a reader waits on. */
-        if (phase != NULL && strcmp(phase, "page-scroll-servable") == 0) {
+        if ((boundary & TILEFINCH_COOPERATE_SCROLL_SERVABLE) != 0) {
             /* Not optional: the build is kept, and only page presses are
                served at its checkpoints (the completion's route). */
             psp_runtime_cooperate.completion = completed_work_units != 0;
@@ -4364,14 +2983,12 @@ bool psp_platform_cooperate(
                 psp_serve_queued_page_scrolls(cooperate);
             return true;
         }
-        bool awaited = phase != NULL
-            && strcmp(phase, "optional-layout-extension-awaited") == 0;
-        bool completion = awaited || (phase != NULL
-            && strcmp(phase, "optional-layout-completion") == 0);
-        if (phase != NULL
-            && (completion
-                || strcmp(phase, "optional-font-publication") == 0
-                || strcmp(phase, "optional-image-publication") == 0)) {
+        bool completion =
+            (boundary & TILEFINCH_COOPERATE_LAYOUT_COMPLETION) != 0;
+        bool awaited = completion
+            && (boundary & TILEFINCH_COOPERATE_EXTENSION_AWAITED) != 0;
+        if (completion
+            || (boundary & TILEFINCH_COOPERATE_OPTIONAL_PUBLICATION) != 0) {
             psp_runtime_cooperate.optional_preemptible = completed_work_units != 0;
             psp_runtime_cooperate.forward_awaited =
                 awaited && completed_work_units != 0;
@@ -4380,7 +2997,7 @@ bool psp_platform_cooperate(
             if (completed_work_units == 0) return true;
             /* A press can have been queued during the preceding decode.
                Do not require a second physical edge to interrupt flow. */
-            if (strcmp(phase, "optional-image-publication") == 0
+            if ((boundary & TILEFINCH_COOPERATE_IMAGE_PUBLICATION) != 0
                 && (cooperate->pending_page_input_count != 0
                     || psp_completed_supervisor_page_input_count != 0))
                 return false;
@@ -4403,10 +3020,8 @@ bool psp_platform_cooperate(
             && (psp_runtime_cooperate.last_poll_us == 0
                 || now - psp_runtime_cooperate.last_poll_us >= poll_interval_us)) {
             psp_runtime_cooperate.last_poll_us = now;
-            cooperate->page_input_yield_boundary = phase != NULL
-                && (strcmp(phase, "page-task-boundary") == 0
-                    || strcmp(phase, "render-input-boundary") == 0
-                    || strcmp(phase, "image-admission-boundary") == 0);
+            cooperate->page_input_yield_boundary =
+                (boundary & PSP_COOPERATE_YIELD_BOUNDARY) != 0;
             psp_work_ui_tick(true);
             cooperate->page_input_yield_boundary = false;
         }
@@ -4415,13 +3030,9 @@ bool psp_platform_cooperate(
             && !psp_runtime_cooperate.serving
             /* Cache preparation borrows the render shell. Never reenter
                it to apply a scroll from one of its own checkpoints. */
-            && (phase == NULL || (strncmp(phase, "render-", 7u) != 0
-                && strcmp(phase, "style-prepare") != 0)))
+            && (boundary & TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED) == 0)
             psp_runtime_serve_completion_scroll(cooperate, now);
-        if (phase != NULL
-            && (strcmp(phase, "page-task-boundary") == 0
-                || strcmp(phase, "render-input-boundary") == 0
-                || strcmp(phase, "image-admission-boundary") == 0)) {
+        if ((boundary & PSP_COOPERATE_YIELD_BOUNDARY) != 0) {
             /* These are resumable owner boundaries, not VM interrupts.
                Leave jobs and prepared tiles intact; the main loop dispatches
                queued focus only after the borrowed page work has returned. */
@@ -4506,9 +3117,7 @@ bool psp_platform_cooperate(
                && browser_engine_scroll_provisional_page(
                       cooperate->engine, direction)) {
             remaining--;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
             psp_load_scroll_note_moved();
-#endif
         }
         /* No preview yet, or the reader reached its end: keep one press
            for the checkpoint after a deeper preview is painted. */
@@ -4553,9 +3162,7 @@ bool psp_platform_cooperate(
                     (pressed & (PSP_CTRL_DOWN | PSP_CTRL_RTRIGGER)) != 0
                         ? 1 : -1;
                 psp_queue_provisional_scroll(cooperate, direction);
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
                 psp_load_scroll_note_press();
-#endif
                 cooperate->input_acknowledgements++;
                 acknowledgement_started_us =
                     sceKernelGetSystemTimeWide();

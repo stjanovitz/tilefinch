@@ -9,8 +9,9 @@
    anchors whose answer it can move and drops only the cached state of the
    elements those answers style. */
 
+#include "style_budget_category.h"
 #include "tilefinch/style.h"
-#include "style_internal.h"
+#include "style_match_internal.h"
 #include "style_cache_internal.h"
 
 #include <ctype.h>
@@ -1139,24 +1140,47 @@ static const char *has_entry_text(const Stylesheet *sheet,
     return text;
 }
 
-/* Whether `text` tests the attribute `name` ([name...], compared as a
-   prefix since journals bound names) or a pseudo-class that reads it. */
-static bool has_text_reads_attribute(const char *text, size_t length,
-                                     const char *name)
+/* Whether selector `text` may read the attribute `name`: through an
+   attribute selector ([name], [name=...], [name~=...] and the other
+   operators) or a pseudo-class that reads it (style_pseudo_attributes).
+   The one scanner for both halves of :has() invalidation (the scoped plan
+   and stylesheet_attribute_change_may_affect_has). It fails open: an
+   escaped or namespace-qualified attribute name needs the full selector
+   parser, so it reads every attribute (e.g. [s\74 yle] after a CSSOM
+   write); pseudo-classes compare without ASCII case. `prefix` is set for
+   names that may be truncated (the mutation journal bounds them), which
+   then match any attribute name they begin. */
+static bool has_selector_reads_attribute(const char *text, size_t length,
+                                         const char *name,
+                                         size_t name_length, bool prefix)
 {
-    size_t name_length = strlen(name);
-    for (size_t at = 0; at < length; at++) {
-        if (text[at] != '[') continue;
-        size_t begin = at + 1;
-        while (begin < length && isspace((unsigned char) text[begin]))
-            begin++;
-        if (begin + name_length <= length
-            && strncasecmp(text + begin, name, name_length) == 0) return true;
+    for (size_t i = 0; i < length; i++) {
+        if (text[i] != '[') continue;
+        size_t at = i + 1;
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        /* Escapes in an attribute value may conservatively lose a cache
+           hit. */
+        for (size_t scan = at; scan < length && text[scan] != ']'; scan++) {
+            if (text[scan] == '\\'
+                || (text[scan] == '|'
+                    && (scan + 1 == length || text[scan + 1] != '=')))
+                return true;
+        }
+        if (at + name_length > length
+            || strncasecmp(text + at, name, name_length) != 0) continue;
+        if (prefix) return true;
+        at += name_length;
+        if (at == length || text[at] == ']'
+            || text[at] == '=' || text[at] == '~'
+            || text[at] == '|' || text[at] == '^'
+            || text[at] == '$' || text[at] == '*'
+            || isspace((unsigned char) text[at])) return true;
     }
     for (size_t i = 0; i < style_pseudo_attribute_count; i++) {
-        if (strcasecmp(name, style_pseudo_attributes[i].attribute) == 0
-            && has_text_contains(text, 0, length,
-                                 style_pseudo_attributes[i].pseudo))
+        const StylePseudoAttribute *pseudo = &style_pseudo_attributes[i];
+        if (name_length == strlen(pseudo->attribute)
+            && strncasecmp(name, pseudo->attribute, name_length) == 0
+            && has_text_contains(text, 0, length, pseudo->pseudo))
             return true;
     }
     return false;
@@ -1190,7 +1214,8 @@ static bool has_entry_relevant(const Stylesheet *sheet,
         || strcasecmp(attribute, "id") == 0) return true;
     size_t length = 0;
     const char *text = has_entry_text(sheet, entry, &length);
-    return text == NULL || has_text_reads_attribute(text, length, attribute);
+    return text == NULL || has_selector_reads_attribute(
+        text, length, attribute, strlen(attribute), true);
 }
 
 /* ---- The walk. -------------------------------------------------------- */
@@ -2647,6 +2672,517 @@ bool style_trailing_keys_reach(const StyleTrailingKeys *keys,
             if (style_element_carries_key(at, keys->keys[i])) return true;
             if (!keys->at_least[i]) break;
         }
+    }
+    return false;
+}
+
+/* ---- Attribute and class changes: can one move a :has() answer? -------
+   Moved from style_resolve.c, so both halves of :has() invalidation (the
+   scoped plan above and this whole-sheet attribute screen) share one
+   file. */
+
+static bool has_ascii_equal(const char *first, const char *second,
+                            size_t length)
+{
+    for (size_t i = 0; i < length; i++) {
+        if (tolower((unsigned char) first[i])
+            != tolower((unsigned char) second[i])) return false;
+    }
+    return true;
+}
+
+static bool has_selector_mentions_token(
+    const char *selector, size_t length, char prefix,
+    const char *token, size_t token_length, size_t *match_at)
+{
+    if (token_length == 0) return false;
+    for (size_t i = 0; i + 1 < length; i++) {
+        if (selector[i] != prefix) continue;
+        size_t at = i + 1, compared = 0;
+        bool mismatch = false;
+        while (at < length) {
+            unsigned char decoded[4];
+            size_t decoded_length = 0;
+            unsigned char value = (unsigned char) selector[at];
+            if (value == '\\') {
+                at++;
+                if (at == length || selector[at] == '\n'
+                    || selector[at] == '\r') {
+                    mismatch = true;
+                    break;
+                }
+                unsigned codepoint = 0;
+                size_t digits = 0;
+                while (at < length && digits < 6
+                       && isxdigit((unsigned char) selector[at])) {
+                    unsigned char digit = (unsigned char) selector[at++];
+                    codepoint = codepoint * 16u
+                        + (isdigit(digit)
+                           ? (unsigned) (digit - '0')
+                           : (unsigned) (tolower(digit) - 'a' + 10));
+                    digits++;
+                }
+                if (digits == 0) {
+                    decoded[0] = (unsigned char) selector[at++];
+                    decoded_length = 1;
+                } else {
+                    if (at < length
+                        && isspace((unsigned char) selector[at])) at++;
+                    if (codepoint <= 0x7f) {
+                        decoded[0] = (unsigned char) codepoint;
+                        decoded_length = 1;
+                    } else if (codepoint <= 0x7ff) {
+                        decoded[0] = (unsigned char) (0xc0 | (codepoint >> 6));
+                        decoded[1] = (unsigned char) (0x80 | (codepoint & 63));
+                        decoded_length = 2;
+                    } else if (codepoint <= 0xffff) {
+                        decoded[0] = (unsigned char) (0xe0 | (codepoint >> 12));
+                        decoded[1] = (unsigned char) (
+                            0x80 | ((codepoint >> 6) & 63));
+                        decoded[2] = (unsigned char) (
+                            0x80 | (codepoint & 63));
+                        decoded_length = 3;
+                    } else if (codepoint <= 0x10ffff) {
+                        decoded[0] = (unsigned char) (0xf0 | (codepoint >> 18));
+                        decoded[1] = (unsigned char) (
+                            0x80 | ((codepoint >> 12) & 63));
+                        decoded[2] = (unsigned char) (
+                            0x80 | ((codepoint >> 6) & 63));
+                        decoded[3] = (unsigned char) (
+                            0x80 | (codepoint & 63));
+                        decoded_length = 4;
+                    } else {
+                        mismatch = true;
+                        break;
+                    }
+                }
+            } else {
+                if (!has_ident_byte(value)) break;
+                decoded[0] = value;
+                decoded_length = 1;
+                at++;
+            }
+            if (compared + decoded_length > token_length
+                || memcmp(token + compared, decoded, decoded_length) != 0) {
+                mismatch = true;
+            }
+            compared += decoded_length;
+        }
+        if (!mismatch && compared == token_length) {
+            if (match_at != NULL) *match_at = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_selector_token_is_relational(
+    const char *selector, size_t length, size_t token_at)
+{
+    bool has_stack[16] = {0};
+    size_t round = 0;
+    int square = 0;
+    char quote = '\0';
+    for (size_t i = 0; i < token_at && i < length; i++) {
+        char value = selector[i];
+        if (quote != '\0') {
+            if (value == '\\' && i + 1 < length) i++;
+            else if (value == quote) quote = '\0';
+            continue;
+        }
+        if (value == '\'' || value == '"') quote = value;
+        else if (value == '[') square++;
+        else if (value == ']' && square > 0) square--;
+        else if (square == 0 && value == '(') {
+            bool is_has = i >= 4
+                && memcmp(selector + i - 4, ":has", 4) == 0;
+            if (round == sizeof(has_stack) / sizeof(has_stack[0])) {
+                return true;
+            }
+            has_stack[round++] = is_has;
+        } else if (square == 0 && value == ')' && round > 0) {
+            round--;
+        }
+    }
+    for (size_t i = 0; i < round; i++) {
+        if (has_stack[i]) return true;
+    }
+    if (square != 0 || quote != '\0') return true;
+    for (size_t i = token_at; i < length; i++) {
+        char value = selector[i];
+        if (quote != '\0') {
+            if (value == '\\' && i + 1 < length) i++;
+            else if (value == quote) quote = '\0';
+            continue;
+        }
+        if (value == '\'' || value == '"') quote = value;
+        else if (value == '[') square++;
+        else if (value == ']' && square > 0) square--;
+        else if (square == 0 && (value == '+' || value == '~')) return true;
+    }
+    return false;
+}
+
+static uint32_t has_token_hash(const unsigned char *bytes, size_t length)
+{
+    return style_fnv1a(STYLE_FNV1A_SEED, bytes, length, false);
+}
+
+/* The identifier after a '.' at `dot`, decoded the way
+   has_selector_mentions_token compares it (escapes resolved). Returns its
+   length, or 0 when it does not fit or is malformed. */
+static size_t has_decode_class(const char *selector, size_t length,
+                               size_t dot, unsigned char *out, size_t cap)
+{
+    size_t at = dot + 1, used = 0;
+    while (at < length) {
+        unsigned char decoded[4];
+        size_t decoded_length = 0;
+        unsigned char value = (unsigned char) selector[at];
+        if (value == '\\') {
+            at++;
+            if (at == length || selector[at] == '\n' || selector[at] == '\r')
+                return 0;
+            unsigned codepoint = 0;
+            size_t digits = 0;
+            while (at < length && digits < 6
+                   && isxdigit((unsigned char) selector[at])) {
+                unsigned char digit = (unsigned char) selector[at++];
+                codepoint = codepoint * 16u
+                    + (isdigit(digit) ? (unsigned) (digit - '0')
+                       : (unsigned) (tolower(digit) - 'a' + 10));
+                digits++;
+            }
+            if (digits == 0) {
+                decoded[0] = (unsigned char) selector[at++];
+                decoded_length = 1;
+            } else {
+                if (at < length && isspace((unsigned char) selector[at])) at++;
+                if (codepoint <= 0x7f) {
+                    decoded[0] = (unsigned char) codepoint;
+                    decoded_length = 1;
+                } else if (codepoint <= 0x7ff) {
+                    decoded[0] = (unsigned char) (0xc0 | (codepoint >> 6));
+                    decoded[1] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 2;
+                } else if (codepoint <= 0xffff) {
+                    decoded[0] = (unsigned char) (0xe0 | (codepoint >> 12));
+                    decoded[1] = (unsigned char) (0x80 | ((codepoint >> 6) & 63));
+                    decoded[2] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 3;
+                } else if (codepoint <= 0x10ffff) {
+                    decoded[0] = (unsigned char) (0xf0 | (codepoint >> 18));
+                    decoded[1] = (unsigned char) (0x80 | ((codepoint >> 12) & 63));
+                    decoded[2] = (unsigned char) (0x80 | ((codepoint >> 6) & 63));
+                    decoded[3] = (unsigned char) (0x80 | (codepoint & 63));
+                    decoded_length = 4;
+                } else {
+                    return 0;
+                }
+            }
+        } else {
+            if (!has_ident_byte(value)) break;
+            decoded[0] = value;
+            decoded_length = 1;
+            at++;
+        }
+        if (decoded_length > cap - used) return 0;
+        memcpy(out + used, decoded, decoded_length);
+        used += decoded_length;
+    }
+    return used;
+}
+
+static int has_hash_compare(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *) left, b = *(const uint32_t *) right;
+    return a < b ? -1 : a > b;
+}
+
+static bool has_collect_class_hashes(const char *selector, size_t length,
+                                     uint32_t *hashes, size_t capacity,
+                                     size_t *count, bool *overflow)
+{
+    if (!span_contains_text(selector, length, ":has(")) return true;
+    for (size_t i = 0; i + 1 < length; i++) {
+        if (selector[i] != '.') continue;
+        unsigned char token[256];
+        size_t token_length = has_decode_class(selector, length, i, token,
+                                               sizeof(token));
+        if (token_length == 0) {
+            /* A class too long to hash: answer conservatively. */
+            if (has_ident_byte((unsigned char) selector[i + 1])
+                || selector[i + 1] == '\\') *overflow = true;
+            continue;
+        }
+        if (!has_selector_token_is_relational(selector, length, i)) continue;
+        if (*count == capacity) {
+            *overflow = true;
+            return true;
+        }
+        hashes[(*count)++] = has_token_hash(token, token_length);
+    }
+    return true;
+}
+
+/* Builds sheet->has_class_hashes from the :has() rules. False when the set
+   is unavailable (allocation, or a class the set cannot represent); the
+   caller then scans the rules. */
+static bool has_prepare_class_hashes(Stylesheet *sheet)
+{
+    if (sheet->has_class_hashes_ready) return true;
+    enum { HAS_CLASS_HASH_LIMIT = 4096 };
+    uint32_t *hashes = budget_realloc(sheet->budget, sheet->has_class_hashes,
+                                      HAS_CLASS_HASH_LIMIT * sizeof(*hashes));
+    if (hashes == NULL) return false;
+    sheet->has_class_hashes = hashes;
+    size_t count = 0;
+    bool overflow = false;
+    for (size_t k = 0; k < sheet->has_rule_count && !overflow; k++) {
+        const StyleRule *rule = &sheet->rules[sheet->has_rule_indices[k]];
+        if (rule->selector != NULL)
+            (void) has_collect_class_hashes(rule->selector,
+                                            rule->selector_length, hashes,
+                                            HAS_CLASS_HASH_LIMIT, &count,
+                                            &overflow);
+    }
+    for (size_t k = 0; k < sheet->has_custom_rule_count && !overflow; k++) {
+        const char *selector =
+            sheet->custom_rules[sheet->has_custom_rule_indices[k]].selector;
+        (void) has_collect_class_hashes(selector, strlen(selector), hashes,
+                                        HAS_CLASS_HASH_LIMIT, &count,
+                                        &overflow);
+    }
+    if (overflow) {
+        budget_free(sheet->budget, sheet->has_class_hashes);
+        sheet->has_class_hashes = NULL;
+        sheet->has_class_hash_count = 0;
+        return false;
+    }
+    qsort(hashes, count, sizeof(*hashes), has_hash_compare);
+    if (count == 0) {
+        budget_free(sheet->budget, sheet->has_class_hashes);
+        sheet->has_class_hashes = NULL;
+    } else {
+        uint32_t *shrunk = budget_realloc(sheet->budget, hashes,
+                                          count * sizeof(*hashes));
+        if (shrunk != NULL) sheet->has_class_hashes = shrunk;
+    }
+    sheet->has_class_hash_count = count;
+    sheet->has_class_hashes_ready = true;
+    return true;
+}
+
+static bool has_class_list_contains(
+    const char *value, size_t length, const char *token, size_t token_length)
+{
+    if (value == NULL || token_length == 0) return false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) value[at])) at++;
+        size_t start = at;
+        while (at < length && !isspace((unsigned char) value[at])) at++;
+        if (at - start == token_length
+            && memcmp(value + start, token, token_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool has_selector_mentions_changed_class(
+    const char *selector, size_t selector_length,
+    const char *old_value, size_t old_length,
+    const char *new_value, size_t new_length)
+{
+    const char *values[2] = {old_value, new_value};
+    size_t lengths[2] = {old_length, new_length};
+    for (size_t side = 0; side < 2; side++) {
+        const char *value = values[side];
+        if (value == NULL) continue;
+        for (size_t at = 0; at < lengths[side];) {
+            while (at < lengths[side]
+                   && isspace((unsigned char) value[at])) at++;
+            size_t start = at;
+            while (at < lengths[side]
+                   && !isspace((unsigned char) value[at])) at++;
+            size_t token_length = at - start;
+            if (token_length == 0
+                || has_class_list_contains(
+                    values[1 - side], lengths[1 - side],
+                    value + start, token_length)) continue;
+            size_t search_at = 0;
+            while (search_at < selector_length) {
+                size_t relative_at = 0;
+                if (!has_selector_mentions_token(
+                        selector + search_at,
+                        selector_length - search_at, '.',
+                        value + start, token_length, &relative_at)) break;
+                size_t match_at = search_at + relative_at;
+                if (has_selector_token_is_relational(
+                        selector, selector_length, match_at)) return true;
+                search_at = match_at + 1;
+            }
+        }
+    }
+    return false;
+}
+
+static bool has_values_equal(const char *old_value, size_t old_length,
+                             const char *new_value, size_t new_length)
+{
+    if ((old_value == NULL) != (new_value == NULL)) return false;
+    if (old_value == NULL) return true;
+    return old_length == new_length
+        && memcmp(old_value, new_value, old_length) == 0;
+}
+
+static bool has_selector_attribute_change_sensitive(
+    const char *selector, size_t selector_length,
+    const char *name, size_t name_length,
+    const char *old_value, size_t old_length,
+    const char *new_value, size_t new_length)
+{
+    if (!span_contains_text(selector, selector_length, ":has(")) {
+        return false;
+    }
+    bool is_class = name_length == 5
+        && has_ascii_equal(name, "class", 5);
+    bool is_id = name_length == 2 && has_ascii_equal(name, "id", 2);
+    if (has_selector_reads_attribute(
+            selector, selector_length, name, name_length, false)) return true;
+    if (is_class) {
+        return has_selector_mentions_changed_class(
+            selector, selector_length, old_value, old_length,
+            new_value, new_length);
+    }
+    if (is_id) {
+        return (old_value != NULL && has_selector_mentions_token(
+                    selector, selector_length, '#',
+                    old_value, old_length, NULL))
+            || (new_value != NULL && has_selector_mentions_token(
+                    selector, selector_length, '#',
+                    new_value, new_length, NULL));
+    }
+    return false;
+}
+
+bool stylesheet_attribute_change_may_affect_has(
+    const Stylesheet *sheet, const char *name, size_t name_length,
+    const char *old_value, size_t old_length,
+    const char *new_value, size_t new_length)
+{
+    if (has_values_equal(
+            old_value, old_length, new_value, new_length)) return false;
+    if (sheet == NULL || name == NULL || name_length == 0) return true;
+    /* Only rules containing ":has(" can answer yes; scanning every rule's
+       text per write cost chatgpt.com ~145 us a setAttribute on the host
+       (1,157 rules). The index is a memo on a const sheet. */
+    if (stylesheet_prepare_has_rule_index((Stylesheet *) sheet)) {
+        bool is_class = name_length == 5 && has_ascii_equal(name, "class", 5);
+        if (is_class && has_prepare_class_hashes((Stylesheet *) sheet)) {
+            /* A class write matters through [class] selectors or through a
+               changed token the :has() rules mention relationally. */
+            for (size_t k = 0; k < sheet->has_rule_count; k++) {
+                const StyleRule *rule =
+                    &sheet->rules[sheet->has_rule_indices[k]];
+                if (rule->selector != NULL
+                    && has_selector_reads_attribute(
+                        rule->selector, rule->selector_length, name,
+                        name_length, false)) return true;
+            }
+            for (size_t k = 0; k < sheet->has_custom_rule_count; k++) {
+                const char *selector = sheet->custom_rules[
+                    sheet->has_custom_rule_indices[k]].selector;
+                if (has_selector_reads_attribute(
+                        selector, strlen(selector), name, name_length,
+                        false))
+                    return true;
+            }
+            if (sheet->has_class_hash_count == 0) return false;
+            const char *values[2] = {old_value, new_value};
+            size_t lengths[2] = {old_length, new_length};
+            for (size_t side = 0; side < 2; side++) {
+                const char *value = values[side];
+                if (value == NULL) continue;
+                for (size_t at = 0; at < lengths[side];) {
+                    while (at < lengths[side]
+                           && isspace((unsigned char) value[at])) at++;
+                    size_t start = at;
+                    while (at < lengths[side]
+                           && !isspace((unsigned char) value[at])) at++;
+                    size_t token_length = at - start;
+                    if (token_length == 0
+                        || has_class_list_contains(
+                            values[1 - side], lengths[1 - side],
+                            value + start, token_length)) continue;
+                    uint32_t hash = has_token_hash(
+                        (const unsigned char *) value + start, token_length);
+                    if (bsearch(&hash, sheet->has_class_hashes,
+                                sheet->has_class_hash_count,
+                                sizeof(hash), has_hash_compare) != NULL)
+                        return true;
+                }
+            }
+            return false;
+        }
+        /* Apart from class and id, the answer is the name's alone. */
+        bool is_id = name_length == 2 && has_ascii_equal(name, "id", 2);
+        char lowered[STYLE_HAS_ATTRIBUTE_MEMO_NAME];
+        bool memoized = !is_id && name_length < sizeof(lowered);
+        Stylesheet *memo_sheet = (Stylesheet *) sheet;
+        if (memoized) {
+            for (size_t i = 0; i < name_length; i++)
+                lowered[i] = (char) tolower((unsigned char) name[i]);
+            for (uint8_t i = 0; i < memo_sheet->has_attribute_memo_count;
+                 i++) {
+                if (memo_sheet->has_attribute_memo[i].length == name_length
+                    && memcmp(memo_sheet->has_attribute_memo[i].name,
+                              lowered, name_length) == 0)
+                    return memo_sheet->has_attribute_memo[i].sensitive;
+            }
+        }
+        bool sensitive = false;
+        for (size_t k = 0; k < sheet->has_rule_count && !sensitive; k++) {
+            const StyleRule *rule = &sheet->rules[sheet->has_rule_indices[k]];
+            sensitive = rule->selector != NULL
+                && has_selector_attribute_change_sensitive(
+                    rule->selector, rule->selector_length,
+                    name, name_length, old_value, old_length,
+                    new_value, new_length);
+        }
+        for (size_t k = 0; k < sheet->has_custom_rule_count && !sensitive;
+             k++) {
+            const char *selector = sheet->custom_rules[
+                sheet->has_custom_rule_indices[k]].selector;
+            sensitive = has_selector_attribute_change_sensitive(
+                selector, strlen(selector), name, name_length,
+                old_value, old_length, new_value, new_length);
+        }
+        if (memoized) {
+            uint8_t slot = memo_sheet->has_attribute_memo_count
+                    < STYLE_HAS_ATTRIBUTE_MEMO_SLOTS
+                ? memo_sheet->has_attribute_memo_count++
+                : (uint8_t) (memo_sheet->has_attribute_memo_next++
+                             % STYLE_HAS_ATTRIBUTE_MEMO_SLOTS);
+            memcpy(memo_sheet->has_attribute_memo[slot].name, lowered,
+                   name_length);
+            memo_sheet->has_attribute_memo[slot].length =
+                (uint8_t) name_length;
+            memo_sheet->has_attribute_memo[slot].sensitive = sensitive;
+        }
+        return sensitive;
+    }
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        if (rule->selector != NULL
+            && has_selector_attribute_change_sensitive(
+                rule->selector, rule->selector_length,
+                name, name_length, old_value, old_length,
+                new_value, new_length)) return true;
+    }
+    for (size_t i = 0; i < sheet->custom_rule_count; i++) {
+        const char *selector = sheet->custom_rules[i].selector;
+        if (has_selector_attribute_change_sensitive(
+                selector, strlen(selector), name, name_length,
+                old_value, old_length, new_value, new_length)) return true;
     }
     return false;
 }

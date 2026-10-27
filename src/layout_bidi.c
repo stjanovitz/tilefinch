@@ -85,16 +85,16 @@ static bool bidi_atomic_inline_node(lxb_dom_node_t *node,
     if (style->display == DISPLAY_INLINE_BLOCK
         || style->display == DISPLAY_INLINE_FLEX
         || style->display == DISPLAY_INLINE_GRID) return true;
-    return layout_node_name_is(node, "img")
-        || layout_node_name_is(node, "svg")
-        || layout_node_name_is(node, "video")
-        || layout_node_name_is(node, "audio")
-        || layout_node_name_is(node, "iframe")
-        || layout_node_name_is(node, "canvas")
-        || layout_node_name_is(node, "input")
-        || layout_node_name_is(node, "textarea")
-        || layout_node_name_is(node, "select")
-        || layout_node_name_is(node, "button");
+    return document_node_is_tag(node, LXB_TAG_IMG)
+        || document_node_is_tag(node, LXB_TAG_SVG)
+        || document_node_is_tag(node, LXB_TAG_VIDEO)
+        || document_node_is_tag(node, LXB_TAG_AUDIO)
+        || document_node_is_tag(node, LXB_TAG_IFRAME)
+        || document_node_is_tag(node, LXB_TAG_CANVAS)
+        || document_node_is_tag(node, LXB_TAG_INPUT)
+        || document_node_is_tag(node, LXB_TAG_TEXTAREA)
+        || document_node_is_tag(node, LXB_TAG_SELECT)
+        || document_node_is_tag(node, LXB_TAG_BUTTON);
 }
 
 static bool bidi_scan_inline_subtree(LayoutContext *context,

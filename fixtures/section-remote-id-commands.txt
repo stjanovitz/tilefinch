@@ -1,2 +1,0 @@
-anchor remote-result
-node-text remote-result

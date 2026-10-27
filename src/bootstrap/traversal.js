@@ -12,8 +12,8 @@
      mutations made while walking (including by the filter) are observed.
      Steps walk native links through __tilefinchTraverse, which passes over
      nodes that whatToShow excludes without wrapping them. Script-only nodes
-     walk the DOM accessors instead, and section documents step through
-     their bounded descendant collection. */
+     walk the DOM accessors instead, and a tree the native step cannot walk
+     steps through its bounded descendant collection. */
   const FILTER_ACCEPT = 1,
     FILTER_REJECT = 2,
     FILTER_SKIP = 3,
@@ -75,19 +75,14 @@
       nativeHandle = (node) => {
         if (node === document) return 0;
         const handle = node?.__handle;
-        return typeof handle === "number" &&
-          handle > 0 &&
-          !globalThis.__tilefinchIsVirtualRemote?.(node)
-          ? handle
-          : -1;
+        return typeof handle === "number" && handle > 0 ? handle : -1;
       },
       /* Modes: 0 = following, 1 = following without entering `from`,
          2 = preceding. Returns undefined when only the accessors can
-         answer (script-only nodes), or virtualTree when the bridge serves a
-         section document whose tree is not all resident. */
+         answer (script-only nodes), or virtualTree when the native step
+         declines the tree. */
       virtualTree = {},
       nativeStep = (root, from, whatToShow, mode) => {
-        if (globalThis.__tilefinchHasRemoteNodeWriter) return undefined;
         const rootHandle = nativeHandle(root),
           fromHandle =
             from === root ? 0 : from === document ? -1 : nativeHandle(from);
@@ -133,15 +128,13 @@
         }
         return previous;
       },
-      /* Section documents expose a virtual tree whose sibling relations
-         are not all resident; they step through the bounded descendant
-         collection the section bridge provides, as before live walking. */
+      /* A tree the native step declines steps through the bounded
+         descendant collection instead. */
       snapshotStep = (state, from, mode) => {
         const root = state.root,
           whatToShow = state.whatToShow;
         let cache = state.snapshot;
         if (!cache) {
-          globalThis.__tilefinchBeginTraversal?.();
           const handle =
             root === document ? document.documentElement?.__handle : root.__handle;
           cache = state.snapshot = handle
@@ -167,8 +160,7 @@
         const root = state.root,
           whatToShow = state.whatToShow;
         const native = nativeStep(root, from, whatToShow, mode);
-        if (native === virtualTree || globalThis.__tilefinchHasRemoteNodeWriter)
-          return snapshotStep(state, from, mode);
+        if (native === virtualTree) return snapshotStep(state, from, mode);
         if (native !== undefined) return native;
         let at = from;
         for (let steps = 0; steps < traversalStepLimit; steps++) {
@@ -530,7 +522,6 @@
     globalThis.TreeWalker = TreeWalker;
     globalThis.NodeIterator = NodeIterator;
     const createTraversal = (kind, prototype, root, whatToShow, filter) => {
-      globalThis.__tilefinchBeginTraversal?.();
       const state = traversalArguments(root, whatToShow, filter),
         object = Object.create(prototype);
       state.kind = kind;

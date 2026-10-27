@@ -123,6 +123,28 @@ bool layout_block_grid_section(LayoutContext *context,
 bool layout_block_flexrow_section(LayoutContext *context,
                                   const LayoutBlockFrame *frame);
 
+/* --- layout_block_replaced.c --------------------------------------------- */
+
+bool layout_block_replaced_section(LayoutContext *context,
+                                   lxb_dom_node_t *node,
+                                   const ComputedStyle *parent,
+                                   const ComputedStyle *style,
+                                   LineState *line, int content_x,
+                                   int content_width, int containing_height,
+                                   int border_radius_code, bool *replaced_box);
+
+bool layout_block_mask_section(LayoutContext *context, lxb_dom_node_t *node,
+                               const ComputedStyle *style, LineState *line,
+                               int content_x, int content_width,
+                               int containing_height,
+                               const LayoutBlockPaintPlan *plan,
+                               bool *replaced_mask_out);
+
+bool layout_block_missing_image_alt(LayoutContext *context,
+                                    lxb_dom_node_t *node,
+                                    const ComputedStyle *style,
+                                    LineState *line, bool *flowed);
+
 /* --- layout_block_decoration.c ------------------------------------------ */
 
 bool layout_block_emit_decoration(

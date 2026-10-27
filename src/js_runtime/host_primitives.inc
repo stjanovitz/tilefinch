@@ -635,9 +635,19 @@ static JSValue js_request_scroll(JSContext *context, JSValueConst this_value,
     if (!(requested >= 0)) requested = 0; /* Also makes NaN become zero. */
     if (requested > INT_MAX) requested = INT_MAX;
     int next = (int) requested;
-    if (bridge->layout != NULL) {
-        int maximum = bridge->layout->height > bridge->viewport_height
-            ? bridge->layout->height - bridge->viewport_height : 0;
+    /* The clamp reads the page's scroll extent: complete a truncated
+       layout first (js_rt_bridge_layout). When that build is refused
+       (memory), clamp to the published extent the reader scrolls, as
+       navigation's own clamp does, rather than not at all. */
+    if (js_rt_bridge_layout_truncated(bridge))
+        (void) js_rt_bridge_flush_synchronous_layout(bridge, NULL);
+    const LayoutDocument *layout = js_rt_bridge_layout(bridge);
+    if (layout == NULL && js_rt_bridge_layout_truncated(bridge)
+        && bridge->layout_region_end > 0)
+        layout = bridge->layout;
+    if (layout != NULL) {
+        int maximum = layout->height > bridge->viewport_height
+            ? layout->height - bridge->viewport_height : 0;
         if (next > maximum) next = maximum;
     }
     bridge->page_scroll_y = next;
@@ -691,10 +701,26 @@ static JSValue js_element_geometry(JSContext *context,
     if (bridge != NULL && bridge->result != NULL) {
         bridge->result->geometry_queries++;
     }
-    if (bridge != NULL
+    size_t node_name_length = 0;
+    const char *node_name = node == NULL ? NULL
+                            : document_element_name(node, &node_name_length);
+    bool document_root = node_name != NULL && node_name_length == 4
+                         && strncasecmp(node_name, "html", 4) == 0;
+    bool viewport_root = document_root
+                         || (node_name != NULL && node_name_length == 4
+                             && strncasecmp(node_name, "body", 4) == 0);
+    bool dirty = bridge != NULL && bridge->relayout_dirty != NULL
+        && *bridge->relayout_dirty;
+    /* Script never reads a truncated layout (js_rt_bridge_layout): a
+       provisional one is completed first, like a dirty one, unless this
+       box is one its proven region makes the complete layout's own
+       (js_rt_bridge_proven_box), answered below as the complete layout
+       would. The page root's extent is never proven. */
+    bool proven = bridge != NULL && !dirty && !viewport_root
+        && js_rt_bridge_proven_box(bridge, node) != NULL;
+    if (bridge != NULL && !proven
         && (bridge->layout == NULL
-            || (bridge->relayout_dirty != NULL
-                && *bridge->relayout_dirty))) {
+            || js_rt_bridge_layout_truncated(bridge) || dirty)) {
         if (js_rt_bridge_flush_synchronous_layout(bridge, node)) {
             if (bridge->result != NULL)
                 bridge->result->geometry_synchronous_layouts++;
@@ -705,9 +731,33 @@ static JSValue js_element_geometry(JSContext *context,
                 : js_rt_bridge_node_arg(context, bridge, argv[0]);
         }
     }
-    const LayoutNodeBox *box = node == NULL || bridge->layout == NULL
+    const LayoutDocument *layout = js_rt_bridge_layout(bridge);
+    const LayoutNodeBox *box = node == NULL || layout == NULL
                                ? NULL
-                               : layout_box_for_node(bridge->layout, node);
+                               : layout_box_for_node(layout, node);
+    /* Still truncated: the box was proven (no completion needed), or the
+       complete build was refused (memory). A proven box is answered
+       exactly. Anything else
+       is unknown, and is not reported where script would act on it (the
+       pre-layout 300x65 at the top made every lazy loader fire at once):
+       the complete layout places it at or below the region, or nowhere,
+       so it reads as an empty box at the region's end. The page root
+       reads the published extent the reader scrolls (and navigation
+       clamps to). */
+    const LayoutDocument *extent = layout;
+    bool unknown = false;
+    int unknown_y = 0;
+    if (layout == NULL && js_rt_bridge_layout_truncated(bridge)
+        && bridge->layout_region_end > 0) {
+        extent = bridge->layout;
+        box = viewport_root ? NULL : js_rt_bridge_proven_box(bridge, node);
+        if (box != NULL) {
+            layout = bridge->layout;
+        } else if (node != NULL && !viewport_root) {
+            unknown = true;
+            unknown_y = bridge->layout_region_end;
+        }
+    }
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_GEOMETRY") != NULL) {
         size_t name_length = 0, id_length = 0;
@@ -728,14 +778,14 @@ static JSValue js_element_geometry(JSContext *context,
     JSValue result = JS_NewObject(context);
     if (JS_IsException(result)) return result;
     int x = box == NULL ? 0 : box->x;
-    int y = box == NULL ? 0 : box->y;
+    int y = box == NULL ? unknown_y : box->y;
     for (lxb_dom_node_t *parent = node == NULL ? NULL : node->parent;
          parent != NULL; parent = parent->parent) {
         if (bridge != NULL && bridge->result != NULL) {
             bridge->result->geometry_ancestor_visits++;
         }
-        const LayoutNodeBox *ancestor = bridge->layout == NULL ? NULL
-            : layout_box_for_node(bridge->layout, parent);
+        const LayoutNodeBox *ancestor = layout == NULL ? NULL
+            : layout_box_for_node(layout, parent);
         if (ancestor != NULL) {
             x -= ancestor->scroll_x;
             y -= ancestor->scroll_y;
@@ -744,7 +794,7 @@ static JSValue js_element_geometry(JSContext *context,
     int fixed_dy = 0;
     bool fixed_geometry = false;
     if (bridge != NULL
-        && fixed_box_offset(bridge->layout, box, bridge->viewport_height,
+        && fixed_box_offset(layout, box, bridge->viewport_height,
                             bridge->page_scroll_y, &fixed_geometry,
                             &fixed_dy)) {
         y += fixed_dy;
@@ -764,25 +814,19 @@ static JSValue js_element_geometry(JSContext *context,
     SET_GEOMETRY("retained", box != NULL);
     SET_GEOMETRY(
         "authoritative",
-        box != NULL
-            && (box->cssom_geometry_authoritative || fixed_geometry));
+        unknown || (box != NULL
+            && (box->cssom_geometry_authoritative || fixed_geometry)));
     if (box != NULL
         && (box->cssom_geometry_authoritative || fixed_geometry)
         && bridge != NULL && bridge->result != NULL) {
         bridge->result->geometry_retained_fast_paths++;
     }
-    size_t node_name_length = 0;
-    const char *node_name = node == NULL ? NULL
-                            : document_element_name(node, &node_name_length);
-    bool document_root = node_name != NULL && node_name_length == 4
-                         && strncasecmp(node_name, "html", 4) == 0;
-    bool viewport_root = document_root
-                         || (node_name != NULL && node_name_length == 4
-                             && strncasecmp(node_name, "body", 4) == 0);
-    int fallback_width = bridge == NULL || bridge->layout == NULL
+    int fallback_width = unknown ? 0
+                         : bridge == NULL || layout == NULL
                          ? (viewport_root && bridge != NULL
                             ? bridge->viewport_width : 300) : 0;
-    int fallback_height = bridge == NULL || bridge->layout == NULL
+    int fallback_height = unknown ? 0
+                          : bridge == NULL || layout == NULL
                           ? (viewport_root && bridge != NULL
                              ? bridge->viewport_height : 65) : 0;
     ElementScrollIntent *intent = box == NULL
@@ -807,11 +851,10 @@ static JSValue js_element_geometry(JSContext *context,
     int scroll_width = box == NULL ? fallback_width : box->content_width;
     int scroll_height = box == NULL ? fallback_height : box->content_height;
     if (document_root && bridge != NULL) {
-        int page_width = bridge->layout == NULL ? 0
-            : (bridge->layout->scroll_width > bridge->layout->width
-               ? bridge->layout->scroll_width : bridge->layout->width);
-        int page_height = bridge->layout == NULL ? 0
-            : bridge->layout->height;
+        int page_width = extent == NULL ? 0
+            : (extent->scroll_width > extent->width
+               ? extent->scroll_width : extent->width);
+        int page_height = extent == NULL ? 0 : extent->height;
         scroll_width = page_width > bridge->viewport_width
             ? page_width : bridge->viewport_width;
         scroll_height = page_height > bridge->viewport_height
@@ -2828,7 +2871,6 @@ SCRIPT_SPLIT_NATIVE(js_computed_style_read, SCRIPT_SPLIT_STYLE)
 SCRIPT_SPLIT_NATIVE(js_transition_snapshot, SCRIPT_SPLIT_STYLE)
 SCRIPT_SPLIT_NATIVE(js_dom_query, SCRIPT_SPLIT_QUERY)
 SCRIPT_SPLIT_NATIVE(js_dom_query_all, SCRIPT_SPLIT_QUERY)
-SCRIPT_SPLIT_NATIVE(js_dom_query_count, SCRIPT_SPLIT_QUERY)
 SCRIPT_SPLIT_NATIVE(js_dom_closest, SCRIPT_SPLIT_QUERY)
 SCRIPT_SPLIT_NATIVE(js_dom_matches, SCRIPT_SPLIT_QUERY)
 SCRIPT_SPLIT_NATIVE(js_dom_query_selector_method, SCRIPT_SPLIT_QUERY)
@@ -2852,7 +2894,6 @@ static JSCFunction *script_split_native(JSCFunction *function)
         { js_transition_snapshot, split_js_transition_snapshot },
         { js_dom_query, split_js_dom_query },
         { js_dom_query_all, split_js_dom_query_all },
-        { js_dom_query_count, split_js_dom_query_count },
         { js_dom_closest, split_js_dom_closest },
         { js_dom_matches, split_js_dom_matches },
         { js_dom_query_selector_method, split_js_dom_query_selector_method },
@@ -2872,48 +2913,41 @@ static JSCFunction *script_split_native(JSCFunction *function)
 }
 #endif
 
-bool js_rt_install_function(JSContext *context, JSValue global,
-                      const char *name, JSCFunction *function,
-                      int arguments)
+bool js_rt_install_native(JSContext *context, JSValue target,
+                          const JsRtNative *native)
 {
+    JSCFunction *function = native->function;
 #ifdef TILEFINCH_SCRIPT_SPLIT
     function = script_split_native(function);
 #endif
-    JSValue value = script_profile_native_value(
-        context, function, name, arguments);
+    JSValue value = (native->flags & JS_RT_NATIVE_UNPROFILED)
+        ? JS_NewCFunction(context, function, native->name, native->arguments)
+        : script_profile_native_value(
+              context, function, native->name, native->arguments);
     if (JS_IsException(value)) return false;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    bool test_network_override =
-        bridge != NULL
-        && bridge->allow_test_network_primitive_overrides
-        && (strcmp(name, "__tilefinchFetchSync") == 0
-            || strcmp(name, "__tilefinchFetchAsync") == 0
-            || strcmp(name, "__tilefinchCancelNetwork") == 0
-            || strcmp(name, "__tilefinchWebSocketStart") == 0
-            || strcmp(name, "__tilefinchWebSocketSend") == 0
-            || strcmp(name, "__tilefinchWebSocketClose") == 0
-            || strcmp(name, "__tilefinchMultiplayerStart") == 0
-            || strcmp(name, "__tilefinchMultiplayerSend") == 0
-            || strcmp(name, "__tilefinchMultiplayerAccept") == 0
-            || strcmp(name, "__tilefinchMultiplayerAddRemoteCode") == 0
-            || strcmp(name, "__tilefinchMultiplayerClose") == 0);
-    bool transient_bootstrap_bridge =
-        strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
-        || strcmp(name, "__tilefinchEnqueueMicrotask") == 0
-        || strcmp(name, "__tilefinchMotionSourceBridge") == 0
-        || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0
-        || strcmp(name, "__tilefinchEncodingName") == 0
-        || strcmp(name, "__tilefinchDecodeSingleByte") == 0
-        || strcmp(name, "__tilefinchCssStatementEnds") == 0
-        || strcmp(name, "__tilefinchConstructedSheetText") == 0
-        || strcmp(name, "__tilefinchSheetRevision") == 0
-        || strcmp(name, "__tilefinchSetAdoptedSheets") == 0
-        || strcmp(name, "__tilefinchEncodeUtf8") == 0
-        || strcmp(name, "__tilefinchOpfsCommand") == 0
-        || strcmp(name, "__tilefinchUserActivationState") == 0;
-    int flags = test_network_override
-        ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
-        : transient_bootstrap_bridge ? JS_PROP_CONFIGURABLE : 0;
+    int flags = 0;
+    if (native->flags & JS_RT_NATIVE_TEST_OVERRIDABLE) {
+        DomBridge *bridge = JS_GetContextOpaque(context);
+        if (bridge != NULL && bridge->allow_test_network_primitive_overrides)
+            flags = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE;
+    }
+    if (flags == 0 && (native->flags & JS_RT_NATIVE_TRANSIENT))
+        flags = JS_PROP_CONFIGURABLE;
     return JS_DefinePropertyValueStr(
-               context, global, name, value, flags) >= 0;
+               context, target, native->name, value, flags) >= 0;
+}
+
+bool js_rt_install_natives(JSContext *context, JSValue target,
+                           const JsRtNative *natives, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+#if TILEFINCH_LAB_ENVIRONMENT
+        if ((natives[i].flags & JS_RT_NATIVE_COMPRESSION_STREAMS)
+            && tilefinch_lab_getenv("TILEFINCH_DISABLE_COMPRESSION_STREAMS")
+                   != NULL)
+            continue;
+#endif
+        if (!js_rt_install_native(context, target, &natives[i])) return false;
+    }
+    return true;
 }

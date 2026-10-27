@@ -439,191 +439,6 @@ static const DrawCommand *test_text_command(
     return NULL;
 }
 
-typedef struct {
-    size_t calls;
-} RemoteBindingProbe;
-
-static bool remote_binding_selector_lookup(
-    void *opaque, const char *selector, size_t length,
-    size_t *section_index, char tag_name[32], char identifier[129],
-    char stable_key[96])
-{
-    RemoteBindingProbe *probe = opaque;
-    probe->calls++;
-    if (length != 5 || memcmp(selector, "aside", 5) != 0) return false;
-    *section_index = 1;
-    snprintf(tag_name, 32, "aside");
-    snprintf(identifier, 129, "remote-aside");
-    snprintf(stable_key, 96, "id:remote-aside");
-    return true;
-}
-
-static bool remote_aside_summary(NavigationSession *navigation,
-                                 const char *expected,
-                                 const char *source_name)
-{
-    ScriptResult result = {0};
-    return navigation->page.runtime != NULL
-        && script_runtime_evaluate_diagnostic(
-            navigation->page.runtime,
-            "globalThis.pocSummary=document.querySelector('aside')"
-            "?'remote-bound':'remote-unbound'",
-            source_name, &result)
-        && strcmp(result.summary, expected) == 0;
-}
-
-static bool test_streamed_candidate_remote_binding_isolation(void)
-{
-    static const char explicit_section[] =
-        "<!doctype html><title>Explicit section</title><body><script>"
-        "globalThis.pocSummary=document.querySelector('aside')"
-        "?'explicit-bound':'explicit-unbound'"
-        "</script><main>section body</main></body>";
-    static const char preserved_section[] =
-        "<!doctype html><title>Preserved section</title>"
-        "<body><main>next section body</main></body>";
-    Budget budget;
-    budget_init(&budget, 24 * MIB);
-    bool lexbor_installed = budget_install_lexbor(&budget);
-    NavigationSession navigation = {0};
-    bool navigation_ready = lexbor_installed
-        && navigation_init(&navigation, &budget, 4);
-    if (navigation_ready) {
-        /* The preserved-runtime rebind below allocates transiently; at
-           2 MiB this test passed with well under 8 KiB to spare, so any
-           bootstrap layout change made it fail spuriously. The heap size
-           is not what this test qualifies. */
-        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
-        navigation_enable_document_scripts(
-            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
-        navigation_enable_external_resources(
-            &navigation, 4, 64 * 1024, 16 * 1024,
-            4, 64 * 1024, 16 * 1024, 256 * 1024, 1000);
-    }
-    bool ok = navigation_ready && prior_page(&navigation);
-    RemoteBindingProbe probe = {0};
-    if (ok) {
-        navigation_set_remote_selector_lookup(
-            &navigation, remote_binding_selector_lookup, &probe);
-        ok = navigation.remote_selector_lookup
-                == remote_binding_selector_lookup
-            && navigation.remote_selector_opaque == &probe
-            && remote_aside_summary(
-                &navigation, "remote-bound", "<incumbent-binding>")
-            && probe.calls == 1;
-    }
-    ScriptRuntime *incumbent_runtime = navigation.page.runtime;
-    lxb_html_document_t *incumbent_document = navigation.page.document.html;
-    NavigationLoadQuota quota = {
-        .fetch = {1, 19, 100000},
-        .maximum_finalize_work_units = 100000,
-        .maximum_finalize_time_us = 1000000
-    };
-
-    bool replay_active = ok && remote_isolation_replay_begin();
-    ok = ok && replay_active;
-    uint64_t generation = ok ? navigation_begin(&navigation) : 0;
-    NavigationLoad *load = ok ? navigation_load_begin_url(
-        &navigation, generation,
-        "https://remote-isolation.test/document", 4096, 1000, 480,
-        NULL, NULL, true) : NULL;
-    for (size_t i = 0; load != NULL && i < 128
-         && navigation_load_status(load) == NAVIGATION_LOAD_PENDING; i++) {
-        (void) navigation_load_pump(load, &quota);
-    }
-    ok = ok && load != NULL
-        && navigation_load_status(load) == NAVIGATION_LOAD_READY_TO_FINISH
-        && probe.calls == 1;
-    if (load != NULL) {
-        navigation_load_cancel(load, "candidate binding rollback probe");
-    }
-    ok = ok
-        && navigation_load_status(load) == NAVIGATION_LOAD_CANCELLED
-        && navigation.page.runtime == incumbent_runtime
-        && navigation.page.document.html == incumbent_document
-        && navigation.remote_selector_lookup
-                == remote_binding_selector_lookup
-        && navigation.remote_selector_opaque == &probe
-        && strcmp(navigation.page.document.title, "Prior") == 0
-        && remote_aside_summary(
-            &navigation, "remote-bound", "<incumbent-after-cancel>")
-        && probe.calls == 2;
-    navigation_load_destroy(load);
-    if (replay_active) fetch_trace_end();
-
-    replay_active = ok && remote_isolation_replay_begin();
-    ok = ok && replay_active;
-    generation = ok ? navigation_begin(&navigation) : 0;
-    load = ok ? navigation_load_begin_url(
-        &navigation, generation,
-        "https://remote-isolation.test/document", 4096, 1000, 480,
-        NULL, NULL, true) : NULL;
-    for (size_t i = 0; load != NULL && i < 128
-         && navigation_load_status(load) == NAVIGATION_LOAD_PENDING; i++) {
-        (void) navigation_load_pump(load, &quota);
-    }
-    ok = ok && load != NULL
-        && navigation_load_status(load) == NAVIGATION_LOAD_READY_TO_FINISH
-        && probe.calls == 2
-        && finish_bounded(load, &quota)
-        && navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED
-        && strcmp(navigation.page.document.title, "Remote isolation") == 0
-        && strcmp(navigation.page.script_result.summary,
-                  "candidate-isolated") == 0
-        && navigation.images == &navigation.page.images
-        && navigation.remote_selector_lookup == NULL
-        && navigation.remote_selector_opaque == NULL
-        && navigation.runtime_section_identity == 0
-        && remote_aside_summary(
-            &navigation, "remote-unbound", "<committed-stream-binding>")
-        && probe.calls == 2;
-    navigation_load_destroy(load);
-    if (replay_active) fetch_trace_end();
-
-    if (ok) {
-        navigation_set_remote_selector_lookup(
-            &navigation, remote_binding_selector_lookup, &probe);
-        generation = navigation_begin(&navigation);
-        ok = navigation_commit_html(
-                &navigation, generation,
-                "https://remote-isolation.test/document#section",
-                explicit_section, sizeof(explicit_section) - 1, 480,
-                NULL, NULL, true)
-            && strcmp(navigation.page.script_result.summary,
-                      "explicit-bound") == 0
-            && navigation.remote_selector_lookup
-                    == remote_binding_selector_lookup
-            && navigation.remote_selector_opaque == &probe
-            && probe.calls == 3;
-        ScriptRuntime *section_runtime = navigation.page.runtime;
-        FetchSchedulerDomain *section_domain =
-            navigation.page.fetch_domain;
-        generation = ok ? navigation_begin(&navigation) : 0;
-        ok = ok && navigation_commit_html_preserve_runtime(
-                &navigation, generation,
-                "https://remote-isolation.test/document#next-section",
-                preserved_section, sizeof(preserved_section) - 1, 480,
-                NULL, NULL, false)
-            && navigation.page.runtime == section_runtime
-            && navigation.page.fetch_domain == section_domain
-            && navigation.remote_selector_lookup
-                    == remote_binding_selector_lookup
-            && navigation.remote_selector_opaque == &probe
-            && remote_aside_summary(
-                &navigation, "remote-bound", "<preserved-section-binding>")
-            && probe.calls == 4;
-    }
-
-    if (navigation_ready) navigation_destroy(&navigation);
-    bool clean = budget.current == 0
-        && budget_active_allocations(&budget, NULL) == 0
-        && budget_categories_reconcile(&budget);
-    if (lexbor_installed) {
-        clean = budget_uninstall_lexbor(&budget) && clean;
-    }
-    return ok && clean;
-}
-
 static bool mutate_incumbent_dom(NavigationSession *navigation)
 {
     static const lxb_char_t tag[] = "aside";
@@ -934,6 +749,118 @@ static bool test_relayout_damage_skips_unchanged_middle(void)
     bool clean = budget.current == 0;
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* navigation_relayout_plan classifies a relayout from the session's rebuild
+   state and the consumed journal alone; each case is one row of that
+   classification. */
+static bool relayout_plan_is(const NavigationRelayoutPlan *plan,
+                             const NavigationRelayoutPlan *expected,
+                             const char *label)
+{
+    bool same = plan->mutation_driven == expected->mutation_driven
+        && plan->rebuild_bounded_out_sheet == expected->rebuild_bounded_out_sheet
+        && plan->conservative_scan == expected->conservative_scan
+        && plan->full_rebuild == expected->full_rebuild
+        && plan->image_rebuild == expected->image_rebuild
+        && plan->style_append_tried == expected->style_append_tried
+        && plan->pause_image_preloads == expected->pause_image_preloads
+        && plan->image_resource_scan == expected->image_resource_scan
+        && plan->image_resource_refresh == expected->image_resource_refresh;
+    if (!same) fprintf(stderr, "relayout plan %s: md=%d sheet=%d cons=%d "
+        "full=%d img=%d append=%d pause=%d scan=%d refresh=%d\n", label,
+        plan->mutation_driven, plan->rebuild_bounded_out_sheet,
+        plan->conservative_scan, plan->full_rebuild, plan->image_rebuild,
+        plan->style_append_tried, plan->pause_image_preloads,
+        plan->image_resource_scan, plan->image_resource_refresh);
+    return same;
+}
+
+static bool test_relayout_plan_classifies_journal(void)
+{
+    static NavigationSession session;
+    static ScriptMutationJournal journal;
+    memset(&session, 0, sizeof(session));
+    memset(&journal, 0, sizeof(journal));
+    bool ok = true;
+    NavigationRelayoutPlan plan;
+
+    /* No journal (a native relayout): scan conservatively, keep the sheet. */
+    plan = navigation_test_relayout_plan(&session, &journal, false);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .conservative_scan = true, .pause_image_preloads = true
+    }, "native") && ok;
+    /* An itemized journal with nothing resource-related: the cheapest plan. */
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true
+    }, "empty journal") && ok;
+    /* Changed style sources: rebuild, but try the in-place append first. */
+    journal.resource_rebuild_required = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .full_rebuild = true,
+        .style_append_tried = true, .pause_image_preloads = true
+    }, "resource rebuild") && ok;
+    /* A retirement the journal did not observe rules the append out. */
+    journal.retirement_unobserved = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .full_rebuild = true,
+        .pause_image_preloads = true
+    }, "unobserved retirement") && ok;
+    journal.retirement_unobserved = false;
+    /* So does a style rebuild the session already owes. */
+    session.style_rebuild_required = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .full_rebuild = true,
+        .pause_image_preloads = true
+    }, "required style rebuild") && ok;
+    session.style_rebuild_required = false;
+    journal.resource_rebuild_required = false;
+    /* A bounded-out sheet holding shadow-only adopted rules is rebuilt. */
+    session.page.stylesheet.style_sources_bounded_out = true;
+    session.page.stylesheet.scopes.adopted_source_count = 1;
+    session.page.stylesheet.scopes.adopted_shadow_only_mask = 1;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .rebuild_bounded_out_sheet = true,
+        .full_rebuild = true, .pause_image_preloads = true
+    }, "bounded-out sheet") && ok;
+    session.page.stylesheet.scopes.adopted_shadow_only_mask = 0;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true
+    }, "bounded-out sheet without shadow-only rules") && ok;
+    memset(&session.page.stylesheet, 0, sizeof(session.page.stylesheet));
+    /* Image additions and image-node changes, only from a journal. */
+    journal.image_resource_scan_required = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .pause_image_preloads = true,
+        .image_resource_scan = true
+    }, "image scan") && ok;
+    journal.image_resource_scan_required = false;
+    journal.image_resource_refresh_required = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .pause_image_preloads = true,
+        .image_resource_refresh = true
+    }, "image refresh") && ok;
+    plan = navigation_test_relayout_plan(&session, &journal, false);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .conservative_scan = true, .pause_image_preloads = true
+    }, "image refresh without a journal") && ok;
+    journal.image_resource_refresh_required = false;
+    /* A journal that could not itemize its resources scans conservatively. */
+    journal.conservative_resource_scan = true;
+    plan = navigation_test_relayout_plan(&session, &journal, true);
+    ok = relayout_plan_is(&plan, &(NavigationRelayoutPlan) {
+        .mutation_driven = true, .conservative_scan = true,
+        .pause_image_preloads = true
+    }, "conservative journal") && ok;
+    return ok;
 }
 
 static bool test_relayout_damage_tracks_paint_only_fields(void)

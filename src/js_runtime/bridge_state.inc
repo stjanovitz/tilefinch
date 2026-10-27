@@ -22,6 +22,61 @@ bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
     return flushed;
 }
 
+/* The rule: script never observes a truncated layout.
+
+   A provisional layout (content_limit_y != 0) holds only the screens
+   around the reader; after a bounded focus relayout it is the page's
+   published layout while idle work completes the rest. Nothing past its
+   limit exists in it, so no answer derived from it may reach script:
+
+   - every runtime read of the published layout goes through
+     js_rt_bridge_layout, which returns NULL for a truncated layout (the
+     answers a page gets before its first layout, never truncated ones);
+   - every script entry that reads geometry (element geometry and the
+     CSSOM View metrics built on it, getComputedStyle values other than
+     transition snapshots, window scroll clamping, and through them
+     elementFromPoint and the IntersectionObserver / ResizeObserver
+     passes) first completes it through the page's geometry callback,
+     exactly like a dirty layout: that builds the complete layout as the
+     forced-geometry scratch, which the next relayout or the idle
+     completion adopts instead of building it again.
+
+   If the complete build is refused (memory), script reads no layout. */
+const LayoutDocument *js_rt_bridge_layout(const DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->layout == NULL
+        || bridge->layout->content_limit_y != 0) return NULL;
+    return bridge->layout;
+}
+
+bool js_rt_bridge_layout_truncated(const DomBridge *bridge)
+{
+    return bridge != NULL && bridge->layout != NULL
+        && bridge->layout->content_limit_y != 0;
+}
+
+/* `node`'s box in a truncated layout when that box is provably the
+   complete layout's own: laid out before the cut (a complete prefix,
+   layout_note_preview_cut) and wholly inside the region the bounded focus
+   relayout proved (navigation_bounded_focus_region). Such an answer is the
+   complete layout's answer, so reading it does not observe the truncation.
+   NULL otherwise: no proven region, no box, a box the cut ran through or
+   that lies past the region. */
+const LayoutNodeBox *js_rt_bridge_proven_box(const DomBridge *bridge,
+                                             const lxb_dom_node_t *node)
+{
+    if (!js_rt_bridge_layout_truncated(bridge) || node == NULL
+        || bridge->layout_region_end <= 0) return NULL;
+    const LayoutDocument *layout = bridge->layout;
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL
+        || (size_t) (box - layout->node_boxes)
+               >= layout->preview_cut_box_count
+        || (int64_t) box->y + box->height > bridge->layout_region_end)
+        return NULL;
+    return box;
+}
+
 bool js_rt_notify_style_flushed(JSContext *context)
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
@@ -69,13 +124,6 @@ uintptr_t js_rt_node_owner_identity(const lxb_dom_node_t *node)
     return node == NULL ? 0 : (uintptr_t) node->owner_document;
 }
 
-static uintptr_t document_owner_identity(
-    const PocDocument *document)
-{
-    return document == NULL || document->html == NULL
-        ? 0 : (uintptr_t) &document->html->dom_document;
-}
-
 static ElementScrollIntent *bridge_scroll_intent_find(
     DomBridge *bridge, const lxb_dom_node_t *node)
 {
@@ -108,32 +156,11 @@ static ElementScrollIntent *bridge_scroll_intent_set(
     if (sequence == 0) sequence = ++bridge->scroll_intent_sequence;
     *intent = (ElementScrollIntent) {
         .node = node,
-        .owner_document_identity = js_rt_node_owner_identity(node),
         .sequence = sequence,
         .scroll_x = scroll_x < 0 ? 0 : scroll_x,
         .scroll_y = scroll_y < 0 ? 0 : scroll_y
     };
     return intent;
-}
-
-static void bridge_scroll_intents_detach_document(
-    DomBridge *bridge, uintptr_t owner)
-{
-    if (bridge == NULL || owner == 0) return;
-    size_t output = 0;
-    for (size_t i = 0; i < bridge->scroll_intent_count; i++) {
-        if (bridge->scroll_intents[i].owner_document_identity == owner) {
-            continue;
-        }
-        if (output != i) {
-            bridge->scroll_intents[output] = bridge->scroll_intents[i];
-        }
-        output++;
-    }
-    memset(bridge->scroll_intents + output, 0,
-           (bridge->scroll_intent_count - output)
-               * sizeof(bridge->scroll_intents[0]));
-    bridge->scroll_intent_count = output;
 }
 
 ScriptElementState *js_rt_script_element_state_find(
@@ -162,7 +189,6 @@ ScriptElementState *js_rt_script_element_state_register(
     if (identity == 0) identity = ++bridge->next_script_element_identity;
     *state = (ScriptElementState) {
         .node = node,
-        .owner_document_identity = js_rt_node_owner_identity(node),
         .identity = identity,
         .programmatic = true,
         .html = html,
@@ -194,27 +220,6 @@ void js_rt_script_element_states_purge_marked(
         if (marked[i]) continue;
         if (output != i) bridge->script_elements[output] =
             bridge->script_elements[i];
-        output++;
-    }
-    memset(bridge->script_elements + output, 0,
-           (bridge->script_element_count - output)
-               * sizeof(bridge->script_elements[0]));
-    bridge->script_element_count = output;
-}
-
-static void script_element_states_detach_document(
-    DomBridge *bridge, const PocDocument *document)
-{
-    uintptr_t owner = document_owner_identity(document);
-    if (bridge == NULL || owner == 0) return;
-    size_t output = 0;
-    for (size_t i = 0; i < bridge->script_element_count; i++) {
-        if (bridge->script_elements[i].owner_document_identity == owner) {
-            continue;
-        }
-        if (output != i) {
-            bridge->script_elements[output] = bridge->script_elements[i];
-        }
         output++;
     }
     memset(bridge->script_elements + output, 0,

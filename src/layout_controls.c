@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 bool layout_control_text_style(LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, bool placeholder, DrawCommand *text)
@@ -87,8 +88,8 @@ static int control_button_label_width(lxb_dom_node_t *node)
 
 int layout_control_default_width(lxb_dom_node_t *node)
 {
-    if (layout_node_name_is(node, "textarea")) return 220;
-    if (!layout_node_name_is(node, "input")) return 0;
+    if (document_node_is_tag(node, LXB_TAG_TEXTAREA)) return 220;
+    if (!document_node_is_tag(node, LXB_TAG_INPUT)) return 0;
     switch (layout_input_control_type(node)) {
     case CONTROL_TOGGLE: return 18;
     case CONTROL_RANGE: return 160;
@@ -109,7 +110,7 @@ int layout_textarea_rows_content_height(
     LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *style)
 {
     if (context == NULL || style == NULL
-        || !layout_node_name_is(node, "textarea")) return 0;
+        || !document_node_is_tag(node, LXB_TAG_TEXTAREA)) return 0;
     int rows = control_ascii_attribute_integer(node, "rows");
     if (rows <= 0) return 0;
     if (rows > 64) rows = 64;
@@ -121,8 +122,8 @@ int layout_textarea_rows_content_height(
 
 int layout_control_default_height(lxb_dom_node_t *node)
 {
-    if (layout_node_name_is(node, "textarea")) return 64;
-    if (!layout_node_name_is(node, "input")) return 0;
+    if (document_node_is_tag(node, LXB_TAG_TEXTAREA)) return 64;
+    if (!document_node_is_tag(node, LXB_TAG_INPUT)) return 0;
     switch (layout_input_control_type(node)) {
     case CONTROL_TOGGLE: return 18;
     case CONTROL_RANGE: return 20;
@@ -301,7 +302,7 @@ bool layout_paint_select_indicator(
     const ComputedStyle *style, int x, int y, int width, int height)
 {
     if (context == NULL || node == NULL || style == NULL
-        || !layout_node_name_is(node, "select") || width < 12 || height < 8
+        || !document_node_is_tag(node, LXB_TAG_SELECT) || width < 12 || height < 8
         || (style->appearance & STYLE_APPEARANCE_MASK) == APPEARANCE_NONE) {
         return context != NULL && node != NULL && style != NULL;
     }
@@ -475,6 +476,255 @@ bool layout_paint_video_control(
             if (engine_card) time.radius |= LAYOUT_TEXT_FIND_EXCLUDED;
             if (layout_add_command(context->layout, time) == NULL)
                 return false;
+        }
+    }
+    return true;
+}
+
+
+/* The text a text-entry control paints, for both the block and the inline
+   control arm: the live edited value, else the authored value (input) or
+   first text (textarea, editing host), else the placeholder. Toggles and
+   ranges paint none, a push button without a value attribute paints its UA
+   label, and a
+   password value -- never the author's placeholder -- is masked. */
+const char *layout_control_value_text(lxb_dom_node_t *node, bool input,
+                                      ControlType input_type,
+                                      size_t *length, bool *placeholder)
+{
+    size_t value_length = 0;
+    bool placeholder_value = false;
+    size_t type_length = 0;
+    const char *type = input
+        ? document_attribute(node, "type", &type_length) : NULL;
+    /* A file input's value is the chosen file, never its label, and no file
+       can be chosen here: it always paints its UA label. */
+    bool file_input = type != NULL && type_length == 4
+        && strncasecmp(type, "file", 4) == 0;
+    const char *value = file_input
+        ? NULL : document_control_value(node, &value_length);
+    if (value == NULL && !file_input) {
+        value = input
+            ? document_attribute(node, "value", &value_length)
+            : first_text_data(node, &value_length);
+    }
+    /* A push button's label is its value attribute when present, even an
+       empty one (HTML 4.10.5.1.18-20); only a missing one takes the UA
+       label. */
+    bool authored_value = value != NULL;
+    if (input_type == CONTROL_TOGGLE || input_type == CONTROL_RANGE) {
+        value = NULL;
+        value_length = 0;
+    } else if ((value == NULL || value_length == 0) && !file_input) {
+        value = document_attribute(node, "placeholder", &value_length);
+        placeholder_value = value != NULL && value_length != 0;
+    }
+    if (!authored_value && input_type == CONTROL_BUTTON && type != NULL) {
+        if (file_input) {
+            value = "CHOOSE FILE";
+            value_length = 11;
+        } else if ((type_length == 6 && strncasecmp(type, "submit", 6) == 0)
+                   || (type_length == 5
+                       && strncasecmp(type, "image", 5) == 0)) {
+            value = "SUBMIT";
+            value_length = 6;
+        } else if (type_length == 5 && strncasecmp(type, "reset", 5) == 0) {
+            value = "RESET";
+            value_length = 5;
+        }
+    }
+    static const char password_mask[] = "********************************";
+    if (!placeholder_value && type != NULL && type_length == 8
+        && strncasecmp(type, "password", 8) == 0
+        && value != NULL && value_length != 0) {
+        if (value_length > sizeof(password_mask) - 1) {
+            value_length = sizeof(password_mask) - 1;
+        }
+        value = password_mask;
+    }
+    if (value == NULL) value_length = 0;
+    *length = value_length;
+    *placeholder = placeholder_value;
+    return value;
+}
+
+/* A resizable textarea's 12px CONTROL_RESIZE hit region and the three-line
+   grip drawn in the bottom-right corner of its control box, as browsers
+   paint one whatever the textarea's display type. */
+bool layout_control_add_resize_grip(LayoutContext *context,
+                                    lxb_dom_node_t *node,
+                                    const ComputedStyle *style,
+                                    int x, int y, int width, int height)
+{
+    int handle = 12;
+    if (!layout_add_control(
+            context->layout,
+            x + (width > handle ? width - handle : 0),
+            y + (height > handle ? height - handle : 0),
+            width < handle ? width : handle,
+            height < handle ? height : handle,
+            CONTROL_RESIZE, node)) return false;
+    for (int line = 0; line < 3; line++) {
+        int size = 2 + line * 3;
+        DrawCommand grip = {
+            .type = DRAW_FILL_RECT,
+            .x = x + width - size - 2,
+            .y = y + height - 2 - line * 3,
+            .width = size,
+            .height = 1,
+            .color = style->color,
+            .opacity_scale = alpha_opacity_scale(style->color_alpha)
+        };
+        if (grip.width > 0
+            && layout_add_command(context->layout, grip) == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The block-level form-control arm of layout_block_impl: value text, native
+   control faces, control regions and the textarea resize grip.  Out of line
+   so that an ordinary block neither runs it nor reserves its locals in the
+   recursive layout_block_impl frame; the caller admits only the elements it
+   can act on (layout_block_may_paint_control). */
+__attribute__((noinline))
+bool layout_block_control_paint(LayoutContext *context, lxb_dom_node_t *node,
+                                const ComputedStyle *style, int outer_x,
+                                int outer_y, int outer_width,
+                                int border_height, int content_bottom)
+{
+    bool audio_controls = layout_audio_has_controls(node);
+    size_t block_editable_length = 0;
+    const char *block_editable = document_attribute(
+        node, "contenteditable", &block_editable_length);
+    bool block_editable_control = lxb_dom_element_has_attribute(
+        lxb_dom_interface_element(node),
+        (const lxb_char_t *) "contenteditable", 15)
+        && !(block_editable != NULL && block_editable_length == 5
+             && strncasecmp(block_editable, "false", 5) == 0);
+    bool block_input = document_node_is_tag(node, LXB_TAG_INPUT);
+    bool block_textarea = document_node_is_tag(node, LXB_TAG_TEXTAREA);
+    bool block_button = document_node_is_tag(node, LXB_TAG_BUTTON);
+    bool block_select = document_node_is_tag(node, LXB_TAG_SELECT);
+    bool block_label = document_node_is_tag(node, LXB_TAG_LABEL);
+    bool block_summary = document_node_is_tag(node, LXB_TAG_SUMMARY);
+    bool block_video = document_node_is_tag(node, LXB_TAG_VIDEO);
+    bool block_frame = document_node_is_tag(node, LXB_TAG_IFRAME);
+    bool block_audio = audio_controls;
+    bool block_declared_media_card = document_is_declared_video_card(
+        context->document, node);
+    ControlType block_input_type = block_input
+        ? layout_input_control_type(node) : CONTROL_INPUT;
+    if ((block_input || block_textarea)
+        && block_input_type != CONTROL_TOGGLE
+        && block_input_type != CONTROL_RANGE) {
+        size_t value_length = 0;
+        bool placeholder_value = false;
+        const char *value = layout_control_value_text(
+            node, block_input, block_input_type, &value_length,
+            &placeholder_value);
+        if (value != NULL && value_length != 0) {
+            if (value_length > UINT32_MAX) return false;
+            int text_height = computed_style_font_size_fixed(style);
+            text_height = text_height > 0
+                ? (text_height + 63) / 64 : 7 * style->font_scale;
+            /* A textarea's first line is a line box: its text is placed in
+               the full line-height like ordinary text, not in a font-height
+               box at the top (which drew it above centre). */
+            if (block_textarea) {
+                int line_height = layout_fixed_ceil(
+                    layout_inline_style_line_height_fixed(context, style));
+                if (line_height > text_height) text_height = line_height;
+            }
+            int text_width = outer_width - style->border.left
+                             - style->border.right - style->padding.left
+                             - style->padding.right;
+            if (text_width < 0) text_width = 0;
+            int text_indent = 0;
+            if (!style_length_resolve(
+                    context->sheet, style->text_indent,
+                    text_width, &text_indent)) {
+                text_indent = 0;
+            }
+            DrawCommand text = {
+                .type = DRAW_TEXT,
+                .x = layout_add_coordinate(
+                    outer_x + style->border.left + style->padding.left,
+                    text_indent),
+                .y = block_textarea
+                     ? outer_y + style->border.top + style->padding.top
+                     : outer_y + (border_height - text_height) / 2,
+                .width = text_width,
+                .height = text_height,
+                .text = value,
+                .text_length = (uint32_t) value_length,
+            };
+            if (text.width > 0
+                && layout_control_text_style(context, node, style, placeholder_value, &text)
+                && (!layout_add_text_shadow_commands(
+                        context, style, &text)
+                    || layout_add_command(
+                           context->layout, text) == NULL)) {
+                return false;
+            }
+        }
+    }
+    if (block_input
+        && (block_input_type == CONTROL_TOGGLE
+            || block_input_type == CONTROL_RANGE)) {
+        bool special_input = false;
+        if (!layout_paint_special_input(
+                context, node, style, outer_x, outer_y,
+                outer_width, border_height, &special_input)) {
+            return false;
+        }
+    }
+    if (block_select
+        && !layout_paint_select_indicator(
+            context, node, style, outer_x, outer_y,
+            outer_width, border_height)) {
+        return false;
+    }
+    if (block_audio
+        && !layout_paint_audio_control(
+            context, style, outer_x, outer_y,
+            outer_width, border_height)) return false;
+    if ((block_video || block_declared_media_card)
+        && !layout_paint_video_control(
+            context, node, outer_x, outer_y, outer_width, border_height)) {
+        return false;
+    }
+    if (block_input || block_textarea || block_button || block_select
+        || block_label || block_summary || block_video || block_audio
+        || block_declared_media_card || block_frame) {
+        ControlType type = block_input ? block_input_type
+                           : (block_textarea ? CONTROL_TEXTAREA
+                              : (block_button || block_label || block_summary
+                                 || block_video || block_audio
+                                 || block_declared_media_card ? CONTROL_BUTTON
+                                 : (block_frame ? CONTROL_FRAME
+                                              : CONTROL_SELECT)));
+        int minimum_control_height = block_summary ? 24
+            : (block_video || block_audio || block_declared_media_card
+               || block_frame)
+                ? border_height : 30;
+        int control_height = border_height < minimum_control_height
+                             ? minimum_control_height : border_height;
+        if (!layout_add_control(context->layout, outer_x, outer_y, outer_width,
+                         control_height, type, node)) return false;
+        if (block_textarea && style->resize_mode != STYLE_RESIZE_NONE) {
+            if (!layout_control_add_resize_grip(
+                    context, node, style, outer_x, outer_y,
+                    outer_width, control_height)) return false;
+        }
+    }
+    if (block_editable_control) {
+        int control_height = content_bottom - outer_y;
+        if (control_height < 32) control_height = 32;
+        if (!layout_add_control(context->layout, outer_x, outer_y, outer_width,
+                         control_height, CONTROL_EDITABLE, node)) {
+            return false;
         }
     }
     return true;

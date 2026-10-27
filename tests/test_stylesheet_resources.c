@@ -3293,7 +3293,7 @@ static bool test_parsed_ir_is_viewport_bound_and_fails_closed(void)
         && stylesheet_build(&wide, &budget, &document, 480)
         && stylesheet_add_css_from_context_capture_ir(
                &wide, css, sizeof(css) - 1u, "https://fixture.test/a.css",
-               "", &ir, &ir_length)
+               "", NULL, &ir, &ir_length)
         && ir != NULL && ir_length != 0
         && stylesheet_parsed_ir_matches(&wide, ir, ir_length)
         && stylesheet_build(&narrow, &budget, &document, 320)
@@ -3307,12 +3307,12 @@ static bool test_parsed_ir_is_viewport_bound_and_fails_closed(void)
     ok = ok && stylesheet_build(&layered, &budget, &document, 480)
         && stylesheet_add_css_from_context_capture_ir(
                &layered, layered_css, sizeof(layered_css) - 1u,
-               "https://fixture.test/layered.css", "", &layered_ir,
+               "https://fixture.test/layered.css", "", NULL, &layered_ir,
                &layered_ir_length)
         && layered_ir == NULL && layered_ir_length == 0
         && stylesheet_add_css_from_context_capture_ir(
                &wide, compact_css, sizeof(compact_css) - 1u,
-               "https://fixture.test/compact.css", "", &compact_ir,
+               "https://fixture.test/compact.css", "", NULL, &compact_ir,
                &compact_ir_length)
         && compact_ir == NULL && compact_ir_length == 0;
     budget_free(&budget, compact_ir);
@@ -3345,9 +3345,9 @@ static bool measure_ir_capture(const char *css, bool capture,
     budget.peak = budget.current;
     if (ok) {
         ok = capture ? stylesheet_add_css_from_context_capture_ir(
-            &sheet, css, strlen(css), "https://fixture.test/a.css", "",
+            &sheet, css, strlen(css), "https://fixture.test/a.css", "", NULL,
             &ir, &ir_length) : stylesheet_add_css_from_context(
-            &sheet, css, strlen(css), "https://fixture.test/a.css", "");
+            &sheet, css, strlen(css), "https://fixture.test/a.css", "", NULL);
     }
     *allocations = budget.allocation_count - before;
     *peak = budget.peak;

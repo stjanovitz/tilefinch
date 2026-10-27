@@ -61,9 +61,9 @@ const char *tilefinch_diagnostic_subsystem_name(TilefinchDiagnosticSubsystem val
 {
     static const char *const names[] = {
         "engine", "network", "parser", "script", "style", "layout",
-        "render", "storage", "sections"
+        "render", "storage"
     };
-    return (unsigned) value <= TILEFINCH_SUBSYSTEM_SECTIONS
+    return (unsigned) value <= TILEFINCH_SUBSYSTEM_STORAGE
         ? names[value] : "unknown";
 }
 

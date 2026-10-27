@@ -8,6 +8,21 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.43 — 2026-10-26
+
+- Moving focus with the D-pad is faster on pages whose focus styles change layout or colour: on a long form, each move took about half as long on the PSP. Only the screens you can see are laid out at once; the rest finish in the background.
+- On pages whose focus style changes only an outline, moving focus no longer lays the page out again: on a PSP-3000 a move took 250 ms instead of 650 ms on a long article and 150 ms instead of 1.8 s on a news front page. Those pages now show the site's own focus outline without Tilefinch's focus ring around it.
+- A link or button whose focus style changes its border, shadow or `::before`/`::after` content no longer keeps its focused look after focus moves away when the page later changes, and a focus outline no longer stays drawn on the previously focused element.
+- An SVG image nested deeper than Tilefinch can draw is skipped quietly instead of reporting an `error` to the page.
+- Password fields always show asterisks, even when a page lays them out as blocks or flex items, and an empty password field shows its placeholder. Submit, reset and file buttons keep their label in every layout, an `<input type=submit value="">` no longer draws SUBMIT over its icon, and file inputs always read CHOOSE FILE.
+- Resizable textareas show their resize grip, an unsized `<canvas>` in a flex or grid item gets its default 300x150 size, and a block-level `<audio controls>` is 300px wide instead of stretching across the line.
+- Reloading or restoring a tab on an old start-page, bookmarks or history address opens the right Tilefinch screen instead of a failed load, and a tab restored onto the screenshot list or the offline library reopens it.
+- Grids with `grid-auto-rows` size every row, and `repeat(auto-fill, minmax(25%, 1fr))` and similar percentage floors give the right number of columns.
+- Modern CSS written only in a `style` attribute or set by a script while loading now applies, including `user-select`, `translate`, `rotate`, `backdrop-filter`, `text-wrap` and their `-webkit-` spellings.
+- If YouTube topics, YouTube results layout, Website fonts or Night mode can't be changed, the menu now shows the setting still in effect.
+- Scroll snapping and `cursor` set inline or by script now apply on every page, `:has()` rules with escaped or upper-case names restyle correctly, and going Back or Forward to native pages stops leftover background work first.
+- Unicode regular expressions return safely when memory is exhausted, truncated cached BigInt values release their allocations, and cookie-domain checks use an updated Public Suffix List.
+
 ## 0.1.42 — 2026-10-22
 
 - When memory runs out, pages no longer lose click handlers and other event listeners on removed or re-inserted elements.

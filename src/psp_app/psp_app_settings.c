@@ -386,9 +386,10 @@ static void psp_app_reload_after_setting(
 {
     char reload_url[NAVIGATION_URL_LIMIT];
     snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
+    PspLocalRoute route = psp_local_route_classify(reload_url);
     bool local_surface = app->process->presentation.ui.base_screen == PSP_UI_SCREEN_HOME
-        || psp_profile_page_kind(reload_url) != PSP_PROFILE_PAGE_NONE
-        || psp_offline_url(reload_url);
+        || route.profile_page != PSP_PROFILE_PAGE_NONE
+        || route.kind == PSP_LOCAL_ROUTE_OFFLINE;
     if (cancel_reason != NULL && !local_surface
         && browser_engine_navigation_pending(app->browser->engine)) {
         browser_engine_cancel_navigation(
@@ -399,7 +400,7 @@ static void psp_app_reload_after_setting(
         &app->process->text_input, reload_url, false, PSP_NAVIGATION_DOCUMENT_BYTES, PSP_NAVIGATION_TIMEOUT_MS);
     if (started && !local_surface) {
         app->interactive->navigation_job_started_us =
-            (uint64_t) sceKernelGetSystemTimeWide();
+            psp_time_us(NULL);
     }
     psp_ui_show_status(
         &app->process->presentation.ui,
@@ -419,12 +420,6 @@ static void psp_app_reload_for_site_security_setting(
     (void) frame;
 }
 
-/*
- * Options screen commands. Every branch tests intent->setting.id, so
- * this is one command with a payload rather than forty; the chain is
- * kept in source order because the order in which two settings are
- * applied in one frame is observable.
- */
 void psp_app_refresh_network_profile_label(PspApp *app, int profile)
 {
     if (app == NULL || app->process == NULL) return;
@@ -439,1222 +434,1397 @@ void psp_app_refresh_network_profile_label(PspApp *app, int profile)
         ssid);
 }
 
-void psp_app_apply_setting(
+/*
+ * Options screen commands: one command with a setting payload rather than
+ * sixty. An intent carries exactly one setting, and psp_app_apply_setting
+ * dispatches it to one handler below. Policy toggles reload with the frame
+ * snapshot taken when their handler starts; security toggles instead pass
+ * the live frame field to the helper.
+ */
+static void psp_setting_network_profile(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
-    if (intent == NULL || intent->setting.id == PSP_UI_SETTING_NONE) return;
-    BrowserEngine *engine = app->browser->engine;
-    BrowserSession *session = app->browser->session;
-    BrowserProfile *profile = app->browser->profile;
-    BrowserTabs *tabs = app->browser->tabs;
-    /* Policy toggles retain the action's original publication snapshot;
-       security toggles instead pass the live frame field to the helper. */
-    const uint16_t *engine_frame = app->views->frame;
-    const char *recovery_path = app->process->storage.recovery;
-    const char *tab_hibernation_path = app->process->storage.tab_hibernation;
-    const char *tab_session_path = app->process->storage.tab_session;
-    const char *content_blocker_path = app->process->storage.content_blocker;
-    const char *local_storage_path = app->process->storage.local_storage;
-    const char *persistent_cache_path = app->process->storage.persistent_cache;
-    if (psp_app_site_storage_setting(app, frame, intent)) return;
-    if (psp_app_heavy_setting(app, frame, intent)) return;
-    if (intent->setting.id == PSP_UI_SETTING_NETWORK_PROFILE) {
-        unsigned operation = intent->setting.value.unsigned_value;
-        int saved = (int) app->process->config.network_profile;
-        int current = (int) app->process->presentation.ui.network_profile;
-        if (operation == 3u) {
-            psp_app_refresh_network_profile_label(app, saved);
-        } else if (operation < 2u) {
-            int direction = operation == 0u ? -1 : 1;
+    (void) frame;
+    unsigned operation = intent->setting.value.unsigned_value;
+    int saved = (int) app->process->config.network_profile;
+    int current = (int) app->process->presentation.ui.network_profile;
+    if (operation == 3u) {
+        psp_app_refresh_network_profile_label(app, saved);
+    } else if (operation < 2u) {
+        int direction = operation == 0u ? -1 : 1;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-            int selected = psp_network_choose_saved_profile(current, direction);
+        int selected = psp_network_choose_saved_profile(current, direction);
 #else
-            int selected = current + direction;
-            if (selected < 1) selected = 100;
-            else if (selected > 100) selected = 1;
+        int selected = current + direction;
+        if (selected < 1) selected = 100;
+        else if (selected > 100) selected = 1;
 #endif
-            if (selected == 0) {
-                psp_ui_show_status(
-                    &app->process->presentation.ui,
-                    "NO SAVED WI-FI PROFILE FOUND", 240);
-            } else if (selected == current) {
-                psp_ui_show_status(
-                    &app->process->presentation.ui,
-                    "ONLY ONE WI-FI PROFILE IS SAVED", 180);
-            } else {
-                char status[48];
-                psp_app_refresh_network_profile_label(app, selected);
-                snprintf(status, sizeof(status),
-                         "PROFILE %d - PRESS X TO SAVE", selected);
-                psp_ui_show_status(
-                    &app->process->presentation.ui, status, 180);
-            }
+        if (selected == 0) {
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                "NO SAVED WI-FI PROFILE FOUND", 240);
+        } else if (selected == current) {
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                "ONLY ONE WI-FI PROFILE IS SAVED", 180);
         } else {
-            int selected = current;
+            char status[48];
+            psp_app_refresh_network_profile_label(app, selected);
+            snprintf(status, sizeof(status),
+                     "PROFILE %d - PRESS X TO SAVE", selected);
+            psp_ui_show_status(
+                &app->process->presentation.ui, status, 180);
+        }
+    } else {
+        int selected = current;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-            bool available = psp_network_profile_is_saved(selected);
+        bool available = psp_network_profile_is_saved(selected);
 #else
-            bool available = selected >= 1 && selected <= 100;
+        bool available = selected >= 1 && selected <= 100;
 #endif
-            if (!available) {
+        if (!available) {
+            psp_app_refresh_network_profile_label(app, saved);
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                "THAT WI-FI PROFILE IS NOT SAVED", 240);
+        } else if (selected == saved) {
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                "WI-FI PROFILE ALREADY SELECTED", 120);
+        } else {
+            char override_path[TILEFINCH_INSTALL_PATH_LIMIT];
+            bool have_path = psp_app_boot_override_path(
+                &app->process->install_paths, override_path,
+                sizeof(override_path));
+            app->process->config.network_profile = selected;
+            if (!have_path || !psp_boot_config_write_overrides(
+                                  &app->process->config, override_path)) {
+                app->process->config.network_profile = saved;
                 psp_app_refresh_network_profile_label(app, saved);
                 psp_ui_show_status(
                     &app->process->presentation.ui,
-                    "THAT WI-FI PROFILE IS NOT SAVED", 240);
-            } else if (selected == saved) {
+                    "WI-FI PROFILE NOT SAVED", 240);
+            } else {
+                char status[48];
+                psp_app_refresh_network_profile_label(app, selected);
+                snprintf(
+                    status, sizeof(status),
+                    "WI-FI PROFILE %d SAVED FOR NEXT CONNECT", selected);
                 psp_ui_show_status(
-                    &app->process->presentation.ui,
-                    "WI-FI PROFILE ALREADY SELECTED", 120);
-            } else {
-                char override_path[TILEFINCH_INSTALL_PATH_LIMIT];
-                bool have_path = psp_app_boot_override_path(
-                    &app->process->install_paths, override_path,
-                    sizeof(override_path));
-                app->process->config.network_profile = selected;
-                if (!have_path || !psp_boot_config_write_overrides(
-                                      &app->process->config, override_path)) {
-                    app->process->config.network_profile = saved;
-                    psp_app_refresh_network_profile_label(app, saved);
-                    psp_ui_show_status(
-                        &app->process->presentation.ui,
-                        "WI-FI PROFILE NOT SAVED", 240);
-                } else {
-                    char status[48];
-                    psp_app_refresh_network_profile_label(app, selected);
-                    snprintf(
-                        status, sizeof(status),
-                        "WI-FI PROFILE %d SAVED FOR NEXT CONNECT", selected);
-                    psp_ui_show_status(
-                        &app->process->presentation.ui, status, 240);
-                }
+                    &app->process->presentation.ui, status, 240);
             }
         }
     }
-    if (intent->setting.id == PSP_UI_SETTING_PAGE_FONT_PERCENT) {
-        unsigned page_font_percent =
-            intent->setting.value.unsigned_value;
-        const NavigationEntry *entry =
-            navigation_current(app->views->navigation);
-        if (!psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode
-                    || app->process->presentation.ui.basic_mode,
-                entry == NULL ? NULL : entry->url,
-                page_font_percent, true)) {
-            unsigned fallback =
-                browser_profile_page_font_percent(profile);
-            app->process->presentation.ui.page_font_percent = fallback;
-            (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode
-                    || app->process->presentation.ui.basic_mode,
-                entry == NULL ? NULL : entry->url,
-                fallback, true);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "WEB FONT SIZE UNAVAILABLE", 240);
-        } else {
-            (void) psp_engine_views_refresh(app->views, engine);
-            frame->page_dirty = true;
-            char status[48];
-            snprintf(status, sizeof(status), "WEB PAGE TEXT %u%%",
-                     page_font_percent);
-            psp_ui_show_status(&app->process->presentation.ui, status, 180);
-            if (app->process->presentation.ui.reader_mode) {
-                if (app->process->presentation.ui.remember_reader_site_scale
-                    && entry != NULL
-                    && browser_profile_record_reader_site_font_percent(
-                           profile, entry->url,
-                           page_font_percent)) {
-                    psp_profile_store_mark_dirty(
-                        &app->browser->profile_store, frame->ui_sample_us);
-                }
-            } else {
-                browser_profile_set_page_font_percent(
-                    profile, page_font_percent);
-                psp_profile_store_mark_dirty(
-                    &app->browser->profile_store, frame->ui_sample_us);
-            }
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_READER_FONT) {
-        BrowserReaderFont requested =
-            intent->setting.value.reader_font;
-        BrowserReaderFont previous =
-            browser_profile_reader_font(profile);
-        browser_profile_set_reader_font(profile, requested);
-        bool applied = true;
-        if (app->process->presentation.ui.reader_mode
-            || app->process->presentation.ui.basic_mode) {
-            const NavigationEntry *entry =
-                navigation_current(app->views->navigation);
-            applied = psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, true,
-                entry == NULL ? NULL : entry->url,
-                app->process->presentation.ui.page_font_percent, true);
-        }
-        if (!applied) {
-            browser_profile_set_reader_font(profile, previous);
-            app->process->presentation.ui.reader_font_serif =
-                previous == BROWSER_READER_FONT_SERIF;
-            const NavigationEntry *entry =
-                navigation_current(app->views->navigation);
-            (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, true,
-                entry == NULL ? NULL : entry->url,
-                app->process->presentation.ui.page_font_percent, true);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "READER FONT UNAVAILABLE", 240);
-        } else {
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            frame->page_dirty = app->process->presentation.ui.reader_mode
-                || app->process->presentation.ui.basic_mode
-                || frame->page_dirty;
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                requested == BROWSER_READER_FONT_SERIF
-                    ? "READER FONT SERIF"
-                    : "READER FONT SANS",
-                180);
-        }
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_remember_reader_site_scale(
-            profile, enabled);
-        if (enabled && app->process->presentation.ui.reader_mode) {
-            const NavigationEntry *entry =
-                navigation_current(app->views->navigation);
-            if (entry != NULL) {
-                (void) browser_profile_record_reader_site_font_percent(
-                    profile, entry->url, app->process->presentation.ui.page_font_percent);
-            }
-        }
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "READER SIZE REMEMBERED PER SITE"
-                    : "READER SIZE MEMORY OFF",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_READER_AUTO_MODE) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_reader_auto_mode(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "AUTO READER ON" : "AUTO READER OFF", 180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_BASIC_FALLBACK) {
-        BrowserBasicFallbackMode mode =
-            intent->setting.value.basic_fallback_mode;
-        if (browser_profile_set_basic_fallback_mode(profile, mode))
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-        app->process->presentation.ui.basic_fallback_mode =
-            (unsigned) browser_profile_basic_fallback_mode(profile);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            mode == BROWSER_BASIC_FALLBACK_ASK
-                ? "BASIC VIEW FALLBACK: ASK"
-                : (mode == BROWSER_BASIC_FALLBACK_OFF
-                       ? "BASIC VIEW FALLBACK OFF"
-                       : "BASIC VIEW FALLBACK: AUTOMATIC"),
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_WEB_FONTS) {
-        WebFontMode mode = intent->setting.value.web_font_mode;
-        if (browser_engine_set_web_font_mode(engine, mode)
-            && browser_profile_set_web_font_mode(profile, mode))
-            psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
-        app->process->presentation.ui.web_font_mode = (unsigned) browser_profile_web_font_mode(profile);
-        psp_ui_show_status(&app->process->presentation.ui,
-            mode == WEB_FONTS_ON ? "WEBSITE FONTS ON"
-                : mode == WEB_FONTS_OFF ? "WEBSITE FONTS OFF" : "WEBSITE FONTS SMART", 180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_BROWSER_UI_SCALE) {
-        /* Owner thread, page work paused by the menu: fill the chrome cache
-           at the new size before the next frame draws at it. */
-        psp_presentation_preload_chrome_scale(
-            intent->setting.value.unsigned_value);
-        psp_report_chrome_glyph_preload();
-        browser_profile_set_ui_scale(
-            profile, intent->setting.value.unsigned_value);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_CUSTOM_HOMEPAGE) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_custom_homepage_enabled(
-            profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui, enabled
-                ? "HOME OPENS MY LINKS"
-                : "HOME OPENS BUILT-IN PAGE",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_HISTORY) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_history_enabled(
-            profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui, enabled
-                ? "URL HISTORY ON" : "URL HISTORY OFF",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_WAVE_BACKGROUND) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_wave_background(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui, enabled ? "WAVE BACKGROUND ON"
-                         : "WAVE BACKGROUND OFF",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_UPDATE_CHECK) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_update_check_enabled(
-            profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-        /* Re-arm or disarm this boot's deferred check; a check
-           already in flight simply completes. */
-        psp_update_check_rearm(
-            app->update_check,
-            enabled && psp_app_update_check_configured(
-                           profile, &app->process->config));
-#endif
-        psp_ui_show_status(
-            &app->process->presentation.ui, enabled
-                ? "UPDATE CHECK ON" : "UPDATE CHECK OFF",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_UPDATE_CHANNEL) {
-        BrowserUpdateChannel channel = intent->setting.value.update_channel;
-        browser_profile_set_update_channel(profile, channel);
-        /* An offer belongs to exactly one endpoint. A channel change clears
-           it rather than letting stable/beta/developer state bleed across. */
-        browser_profile_set_update_check_available_sequence(profile, 0);
-        browser_profile_set_update_check_last_unix(profile, 0);
-        app->process->presentation.ui.update_release_available = false;
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-#ifdef TILEFINCH_PSP_LIVE_NETWORK
-        psp_update_check_rearm(
-            app->update_check,
-            psp_app_update_check_configured(profile, &app->process->config));
-#endif
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            channel == BROWSER_UPDATE_CHANNEL_BETA
-                ? "BETA UPDATES SELECTED"
-                : channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
-                      ? "DEVELOPER URL - UNSIGNED CODE"
-                      : "STABLE UPDATES SELECTED",
-            240);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_JAVASCRIPT) {
-        bool enabled = intent->setting.value.boolean;
-        if (browser_engine_navigation_pending(engine))
-            browser_engine_cancel_navigation(
-                engine, "global JavaScript policy changed");
-        bool effective = enabled
-            && browser_profile_site_javascript_enabled(
-                   profile, app->process->presentation.ui.url);
-        if (!browser_engine_set_javascript_enabled(engine, effective)) {
-            app->process->presentation.ui.javascript_enabled =
-                browser_profile_javascript_enabled(profile);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "JAVASCRIPT SETTING UNAVAILABLE", 240);
-        } else {
-            browser_profile_set_javascript_enabled(profile, enabled);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_app_reload_after_setting(
-                app, &engine_frame, enabled ? "JAVASCRIPT ON - RELOADING"
-                             : "JAVASCRIPT OFF - RELOADING",
-                enabled ? "JAVASCRIPT ON" : "JAVASCRIPT OFF",
-                "JAVASCRIPT SAVED - RELOAD FAILED", NULL);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SITE_JAVASCRIPT) {
-        bool enabled = intent->setting.value.boolean;
-        bool previous = browser_profile_site_javascript_enabled(
-            profile, app->process->presentation.ui.url);
-        if (browser_engine_navigation_pending(engine))
-            browser_engine_cancel_navigation(
-                engine, "site JavaScript policy changed");
-        bool changed = previous != enabled
-            && browser_profile_set_site_javascript_enabled(
-                   profile, app->process->presentation.ui.url, enabled);
-        bool effective = browser_profile_javascript_enabled(profile)
-            && enabled;
-        if (!changed
-            || !browser_engine_set_javascript_enabled(engine, effective)) {
-            if (changed) {
-                (void) browser_profile_set_site_javascript_enabled(
-                    profile, app->process->presentation.ui.url, previous);
-            }
-            app->process->presentation.ui.site_javascript_enabled = previous;
-            psp_ui_show_status(
-                &app->process->presentation.ui, "SITE JAVASCRIPT SETTING UNAVAILABLE", 240);
-        } else {
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_app_reload_after_setting(
-                app, &engine_frame, enabled ? "SITE JAVASCRIPT ON - RELOADING"
-                             : "SITE JAVASCRIPT OFF - RELOADING",
-                enabled ? "SITE JAVASCRIPT ON" : "SITE JAVASCRIPT OFF",
-                "SITE JAVASCRIPT SAVED - RELOAD FAILED", NULL);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SITE_DATA_ALLOWED) {
-        bool allowed = intent->setting.value.boolean;
-        if (!allowed && !psp_app_youtube_login_clear(app))
-            psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
-        browser_session_set_site_data_allowed(session, allowed);
-        browser_profile_set_site_data_allowed(profile, allowed);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        if (browser_engine_navigation_pending(engine))
-            browser_engine_cancel_navigation(
-                engine, "global site-data policy changed");
-        psp_app_reload_after_setting(
-            app, &engine_frame, allowed ? "SITE DATA ALLOWED - RELOADING"
-                         : "SITE DATA BLOCKED - RELOADING",
-            allowed ? "SITE DATA ALLOWED" : "SITE DATA BLOCKED",
-            "SITE DATA SAVED - RELOAD FAILED", NULL);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_MIXED_CONTENT_SITE) {
-        bool allowed = intent->setting.value.boolean;
-        bool previous = browser_session_mixed_content_site_allowed(
-            session, app->process->presentation.ui.url);
-        if (browser_session_set_mixed_content_site_allowed(
-                session, app->process->presentation.ui.url, allowed)) {
-            psp_app_reload_for_site_security_setting(
-                app, frame,
-                allowed ? "HTTP ALLOWED THIS SESSION - RELOADING"
-                        : "MIXED CONTENT BLOCKED - RELOADING",
-                allowed ? "HTTP ALLOWED THIS SESSION"
-                        : "MIXED CONTENT BLOCKED");
-        } else {
-            app->process->presentation.ui.mixed_content_site_allowed = previous;
-            psp_ui_show_status(&app->process->presentation.ui, "SITE EXCEPTION LIMIT REACHED", 240);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE) {
-        bool allowed = intent->setting.value.boolean;
-        bool previous = browser_profile_third_party_cookie_site_allowed(
-            profile, app->process->presentation.ui.url);
-        bool session_changed =
-            browser_session_set_third_party_cookie_site_allowed(
-                session, app->process->presentation.ui.url, allowed);
-        bool changed = session_changed
-            && browser_profile_set_third_party_cookie_site_allowed(
-                profile, app->process->presentation.ui.url, allowed);
-        if (changed) {
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_app_reload_for_site_security_setting(
-                app, frame,
-                allowed ? "3RD-PARTY COOKIES ON - RELOADING"
-                        : "3RD-PARTY COOKIES BLOCKED - RELOADING",
-                allowed ? "3RD-PARTY COOKIES ALLOWED"
-                        : "3RD-PARTY COOKIES BLOCKED");
-        } else {
-            if (session_changed) {
-                (void) browser_session_set_third_party_cookie_site_allowed(
-                    session, app->process->presentation.ui.url, previous);
-            }
-            app->process->presentation.ui.third_party_cookie_site_allowed = previous;
-            psp_ui_show_status(&app->process->presentation.ui, "SITE EXCEPTION LIMIT REACHED", 240);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SEARCH_ENGINE) {
-        BrowserSearchEngine search_engine =
-            intent->setting.value.search_engine;
-        browser_profile_set_search_engine(
-            profile, search_engine);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        char status[48];
-        snprintf(
-            status, sizeof(status), "SEARCH ENGINE %s",
-            browser_search_engine_name(search_engine));
-        psp_ui_show_status(&app->process->presentation.ui, status, 180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_COLOR_MODE) {
-        browser_profile_set_color_mode(
-            profile, intent->setting.value.color_mode);
-        psp_refresh_page_color_mode(&app->process->presentation.ui);
-        (void) browser_engine_set_forced_dark(
-            engine, app->process->presentation.ui.page_dark);
-        frame->page_dirty = true;
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            app->process->presentation.ui.color_mode == BROWSER_COLOR_MODE_AUTO
-                ? (app->process->presentation.ui.page_dark
-                       ? "NIGHT MODE AUTO: DARK"
-                       : "NIGHT MODE AUTO: LIGHT")
-                : (app->process->presentation.ui.page_dark
-                       ? "NIGHT MODE DARK"
-                       : "NIGHT MODE LIGHT"),
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_CHROME_THEME) {
-        BrowserChromeTheme theme =
-            intent->setting.value.chrome_theme;
-        BrowserChromeTheme previous =
-            browser_profile_chrome_theme(profile);
-        char theme_error[64];
-        if (!psp_app_apply_chrome_theme(
-                app->process, theme,
-                browser_profile_chrome_theme_file(profile),
-                theme_error, sizeof(theme_error))) {
-            app->process->presentation.ui.chrome_theme = (unsigned) previous;
-            psp_ui_theme_select(previous);
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                theme_error[0] == '\0' ? "CUSTOM THEME INVALID" : theme_error,
-                240);
-            return;
-        }
-        browser_profile_set_chrome_theme(profile, theme);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        char status[40];
-        snprintf(
-            status, sizeof(status), "THEME %s",
-            theme == BROWSER_CHROME_THEME_FINCH ? "MIDNIGHT"
-            : theme == BROWSER_CHROME_THEME_OCEAN ? "COBALT"
-            : theme == BROWSER_CHROME_THEME_PLUM ? "PLUM"
-            : theme == BROWSER_CHROME_THEME_EMBER ? "EMBER"
-            : theme == BROWSER_CHROME_THEME_LIGHT ? "DAYLIGHT"
-            : "CUSTOM");
-        psp_ui_show_status(&app->process->presentation.ui, status, 180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_GLYPH_LANGUAGE) {
-        BrowserGlyphLanguage language = intent->setting.value.glyph_language;
-        browser_profile_set_glyph_language(profile, language);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            language == BROWSER_GLYPH_LANGUAGE_EMBEDDED
-                ? "EMBEDDED GLYPHS SELECTED"
-                : "LANGUAGE PACK APPLIES AFTER RESTART",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_COLOR_EMOJI) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_color_emoji(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "COLOR EMOJI APPLIES AFTER RESTART"
-                    : "EMBEDDED EMOJI SELECTED",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_GLYPH_OFFERS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_glyph_offers_enabled(profile, enabled);
-        app->process->presentation.ui.glyph_offers_off = !enabled;
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "LANGUAGE PACK OFFERS ON" : "LANGUAGE PACK OFFERS OFF",
-            150);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_GLYPH_OFFERS_RESET) {
-        bool any = browser_profile_glyph_offer_declined_mask(profile) != 0;
-        browser_profile_set_glyph_offer_declined_mask(profile, 0);
-        if (any)
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            any ? "DECLINED LANGUAGE PACK OFFERS RESET"
-                : "NO DECLINED OFFERS TO RESET",
-            150);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_ROTATE_HINT_ALWAYS) {
-        bool always = intent->setting.value.boolean;
-        browser_profile_set_rotate_hint_always(profile, always);
-        app->process->presentation.ui.rotate_hint_always = always;
-        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(&app->process->presentation.ui,
-            always ? "ROTATE HINT ALWAYS" : "ROTATE HINT AUTO", 150);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_VIDEO_SCALING) {
-        BrowserVideoScaling scaling = intent->setting.value.video_scaling;
-        browser_profile_set_video_scaling(profile, scaling);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        /* Both presenters read the profile on every present, so a change
-           lands as soon as a frame is drawn. In practice that is the next
-           media open: Options cannot be reached while the player owns the
-           display. */
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            scaling == BROWSER_VIDEO_SCALING_SHARP
-                ? "VIDEO SCALING SHARP"
-                : "VIDEO SCALING SMOOTH",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_QUALITY) {
-        BrowserYoutubeQuality quality =
-            intent->setting.value.youtube_quality;
-        browser_profile_set_youtube_quality(
-            profile, quality);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            quality == BROWSER_YOUTUBE_QUALITY_360P
-                ? "YOUTUBE QUALITY 360P"
-                : "YOUTUBE QUALITY 240P",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_VIDEO_LANGUAGE) {
-        BrowserVideoLanguage language = intent->setting.value.video_language;
-        browser_profile_set_video_language(profile, language);
-        psp_youtube_preresolve_reset(
-            &app->browser->youtube_preresolve,
-            "video language changed");
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            language == BROWSER_VIDEO_LANGUAGE_ORIGINAL
-                ? "VIDEO LANGUAGE ORIGINAL - NEXT VIDEO"
-                : "VIDEO LANGUAGE SAVED - NEXT VIDEO",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_LANGUAGE) {
-        BrowserSubtitleLanguage language =
-            intent->setting.value.subtitle_language;
-        browser_profile_set_subtitle_language(profile, language);
-        psp_youtube_preresolve_reset(
-            &app->browser->youtube_preresolve,
-            "subtitle language changed");
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            "SUBTITLE PREF SAVED - CAPTIONS OFF",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_ALTERNATE_LANGUAGE) {
-        BrowserAlternateLanguage language =
-            intent->setting.value.alternate_language;
-        browser_profile_set_alternate_language(profile, language);
-        psp_youtube_preresolve_reset(
-            &app->browser->youtube_preresolve,
-            "alternate language changed");
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            language == BROWSER_ALTERNATE_LANGUAGE_NONE
-                ? "ALTERNATE LANGUAGE OFF"
-                : "ALTERNATE LANGUAGE SAVED - NEXT VIDEO",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_SIZE) {
-        BrowserSubtitleSize size = intent->setting.value.subtitle_size;
-        browser_profile_set_subtitle_size(profile, size);
-        psp_ui_media_set_subtitle_style(
-            &app->browser->media.ui, size,
-            browser_profile_subtitle_background(profile));
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            size == BROWSER_SUBTITLE_SIZE_SMALL
-                ? "SUBTITLES SMALL" : "SUBTITLES STANDARD",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_BACKGROUND) {
-        BrowserSubtitleBackground background =
-            intent->setting.value.subtitle_background;
-        browser_profile_set_subtitle_background(profile, background);
-        psp_ui_media_set_subtitle_style(
-            &app->browser->media.ui,
-            browser_profile_subtitle_size(profile), background);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
-                ? "SUBTITLE BACKGROUND SHADOW"
-                : "SUBTITLE BACKGROUND BOX",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS) {
-        bool compact = intent->setting.value.boolean;
-        browser_profile_set_youtube_compact_results(profile, compact);
-        (void) browser_engine_set_youtube_compact_results(engine, compact);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            compact
-                ? "YOUTUBE RESULTS COMPACT - RELOAD TO APPLY"
-                : "YOUTUBE RESULTS DETAILED - RELOAD TO APPLY",
-            240);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_youtube_audio_only(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "AUDIO-ONLY ON - NEXT VIDEO"
-                    : "AUDIO-ONLY OFF - NEXT VIDEO",
-            180);
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_video_startup_buffering(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "VIDEO START BUFFERED"
-                    : "VIDEO START IMMEDIATE",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS
-        || intent->setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS) {
-        bool clear = intent->setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS;
-        if (clear) browser_profile_clear_playback_positions(profile);
-        else browser_profile_set_save_playback_positions(
-            profile, intent->setting.value.boolean);
-        /* No stale in-memory dirty flag should resurrect a cleared record.
-           Continued playback may record a new position only when opted in. */
-        app->browser->media.resume_profile_dirty = false;
-        app->browser->media.last_resume_saved_us = app->browser->media.clock_us;
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(&app->process->presentation.ui,
-            clear ? "PLAYBACK POSITIONS CLEARED"
-                : (intent->setting.value.boolean
-                    ? "SAVE PLAYBACK POSITIONS ON" : "PLAYBACK POSITIONS OFF - CLEARED"),
-            180);
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_resume_offline_downloads(
-            profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            enabled ? "AUTO-RESUME SAVES ON"
-                    : "AUTO-RESUME SAVES OFF",
-            180);
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_CONTENT_BLOCKER_MODE) {
-        ContentBlockerMode requested =
-            intent->setting.value.content_blocker_mode;
-        ContentBlockerMode previous =
-            browser_profile_content_blocker_mode(profile);
-        if (!browser_engine_content_blocker_configure(
-                engine, requested, content_blocker_path)) {
-            ContentBlockerMetrics retained = {0};
-            app->process->presentation.ui.content_blocker_mode = (uint8_t)
-                (browser_engine_content_blocker_metrics(
-                     engine, &retained)
-                    ? retained.mode : previous);
-            app->process->presentation.ui.content_blocker_site_allowed =
-                app->process->presentation.ui.content_blocker_mode != CONTENT_BLOCKER_OFF
-                && retained.allowed_site_count
-                       == browser_profile_content_blocker_allowed_site_count(
-                              profile)
-                && browser_profile_content_blocker_site_allowed(
-                       profile, app->process->presentation.ui.url);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "CUSTOM LIST NOT AVAILABLE", 240);
-        } else {
-            browser_profile_set_content_blocker_mode(
-                profile, requested);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            app->process->presentation.ui.content_blocker_site_allowed =
-                requested != CONTENT_BLOCKER_OFF
-                && browser_profile_content_blocker_site_allowed(
-                       profile, app->process->presentation.ui.url);
-            ContentBlockerMetrics blocker_metrics = {0};
-            (void) browser_engine_content_blocker_metrics(
-                engine, &blocker_metrics);
-            printf(
-                "tilefinch-content-blocker: mode=%u rules=%zu "
-                "allow-rules=%zu ignored=%zu retained=%zu\n",
-                (unsigned) blocker_metrics.mode,
-                blocker_metrics.rule_count,
-                blocker_metrics.allow_rule_count,
-                blocker_metrics.ignored_rule_count,
-                blocker_metrics.retained_bytes);
-            char status[64];
-            snprintf(
-                status, sizeof(status),
-                requested == CONTENT_BLOCKER_OFF
-                    ? "AD BLOCKING OFF"
-                    : (requested == CONTENT_BLOCKER_BASIC
-                           ? "AD BLOCKING BASIC"
-                           : "CUSTOM %u RULES - %u IGNORED"),
-                (unsigned) blocker_metrics.rule_count,
-                (unsigned) blocker_metrics.ignored_rule_count);
-            psp_ui_show_status(&app->process->presentation.ui, status, 180);
-            const NavigationEntry *entry =
-                navigation_current(app->views->navigation);
-            (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode
-                    || app->process->presentation.ui.basic_mode,
-                entry == NULL ? app->process->presentation.ui.url : entry->url,
-                app->process->presentation.ui.page_font_percent, true);
-            (void) psp_engine_views_refresh(app->views, engine);
-            frame->page_dirty = true;
-        }
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_CONTENT_BLOCKER_COSMETIC_HIDING) {
-        bool enabled = intent->setting.value.boolean;
-        bool previous =
-            browser_profile_content_blocker_cosmetic_hiding(profile);
-        browser_profile_set_content_blocker_cosmetic_hiding(
-            profile, enabled);
-        const NavigationEntry *entry =
-            navigation_current(app->views->navigation);
-        bool applied = psp_set_presentation_css(
+}
+
+static void psp_setting_page_font_percent(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    unsigned page_font_percent =
+        intent->setting.value.unsigned_value;
+    char entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *entry_url = psp_app_current_url(
+        app->browser->engine, entry_buffer, sizeof(entry_buffer));
+    if (!psp_set_presentation_css(
             engine, &app->process->presentation.ui, profile,
             app->process->presentation.ui.reader_mode
                 || app->process->presentation.ui.basic_mode,
-            entry == NULL ? app->process->presentation.ui.url : entry->url,
-            app->process->presentation.ui.page_font_percent, true);
-        if (!applied) {
-            browser_profile_set_content_blocker_cosmetic_hiding(
-                profile, previous);
-            app->process->presentation.ui.content_blocker_cosmetic_hiding = previous;
-            (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode
-                    || app->process->presentation.ui.basic_mode,
-                entry == NULL ? app->process->presentation.ui.url : entry->url,
-                app->process->presentation.ui.page_font_percent, true);
-        } else {
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-        }
+            entry_url,
+            page_font_percent, true)) {
+        unsigned fallback =
+            browser_profile_page_font_percent(profile);
+        app->process->presentation.ui.page_font_percent = fallback;
+        (void) psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile,
+            app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode,
+            entry_url,
+            fallback, true);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "WEB FONT SIZE UNAVAILABLE", 240);
+    } else {
         (void) psp_engine_views_refresh(app->views, engine);
         frame->page_dirty = true;
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            applied ? (enabled ? "PAGE AD HIDING ON"
-                               : "PAGE AD HIDING OFF")
-                    : "PAGE AD HIDING UNAVAILABLE",
-            180);
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED) {
-        bool desired = intent->setting.value.boolean;
-        bool previous =
-            browser_profile_content_blocker_site_allowed(
-                profile, app->process->presentation.ui.url);
-        bool changed =
-            browser_profile_set_content_blocker_site_allowed(
-                profile, app->process->presentation.ui.url, desired);
-        if (changed)
-            changed = psp_content_blocker_apply_allowed_sites(
-                engine, profile);
-        if (!changed) {
-            (void) browser_profile_set_content_blocker_site_allowed(
-                profile, app->process->presentation.ui.url, previous);
-            (void) psp_content_blocker_apply_allowed_sites(
-                engine, profile);
-            app->process->presentation.ui.content_blocker_site_allowed = previous;
-            psp_ui_show_status(
-                &app->process->presentation.ui, "SITE ALLOWLIST IS FULL", 240);
+        char status[48];
+        snprintf(status, sizeof(status), "WEB PAGE TEXT %u%%",
+                 page_font_percent);
+        psp_ui_show_status(&app->process->presentation.ui, status, 180);
+        if (app->process->presentation.ui.reader_mode) {
+            if (app->process->presentation.ui.remember_reader_site_scale
+                && entry_url != NULL
+                && browser_profile_record_reader_site_font_percent(
+                       profile, entry_url,
+                       page_font_percent)) {
+                psp_profile_store_mark_dirty(
+                    &app->browser->profile_store, frame->ui_sample_us);
+            }
         } else {
+            browser_profile_set_page_font_percent(
+                profile, page_font_percent);
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, frame->ui_sample_us);
-            psp_app_reload_for_site_security_setting(
-                app, frame,
-                desired ? "SITE ALLOWED - RELOADING"
-                        : "BLOCKING SITE - RELOADING",
-                desired ? "SITE ALLOWLIST SAVED"
-                        : "SITE BLOCKING SAVED");
         }
     }
-    if (intent->setting.id == PSP_UI_SETTING_COOKIE_BANNER_HIDDEN) {
-        bool hidden = intent->setting.value.boolean;
-        bool previous = browser_profile_cookie_banner_hidden(
+}
+
+static void psp_setting_reader_font(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    BrowserReaderFont requested =
+        intent->setting.value.reader_font;
+    BrowserReaderFont previous =
+        browser_profile_reader_font(profile);
+    browser_profile_set_reader_font(profile, requested);
+    bool applied = true;
+    if (app->process->presentation.ui.reader_mode
+        || app->process->presentation.ui.basic_mode) {
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        applied = psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile, true,
+            entry_url,
+            app->process->presentation.ui.page_font_percent, true);
+    }
+    if (!applied) {
+        browser_profile_set_reader_font(profile, previous);
+        app->process->presentation.ui.reader_font_serif =
+            previous == BROWSER_READER_FONT_SERIF;
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        (void) psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile, true,
+            entry_url,
+            app->process->presentation.ui.page_font_percent, true);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "READER FONT UNAVAILABLE", 240);
+    } else {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        frame->page_dirty = app->process->presentation.ui.reader_mode
+            || app->process->presentation.ui.basic_mode
+            || frame->page_dirty;
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            requested == BROWSER_READER_FONT_SERIF
+                ? "READER FONT SERIF"
+                : "READER FONT SANS",
+            180);
+    }
+}
+
+static void psp_setting_remember_reader_site_scale(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    browser_profile_set_remember_reader_site_scale(
+        profile, enabled);
+    if (enabled && app->process->presentation.ui.reader_mode) {
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        if (entry_url != NULL) {
+            (void) browser_profile_record_reader_site_font_percent(
+                profile, entry_url, app->process->presentation.ui.page_font_percent);
+        }
+    }
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        enabled ? "READER SIZE REMEMBERED PER SITE"
+                : "READER SIZE MEMORY OFF",
+        180);
+}
+
+static void psp_setting_basic_fallback(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    if (psp_basic_fallback_setting_apply(
+            app->browser->profile, &app->process->presentation.ui,
+            intent->setting.value.basic_fallback_mode) == PSP_SETTING_APPLIED)
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+}
+
+static void psp_setting_web_fonts(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    if (psp_web_font_setting_apply(
+            app->browser->profile, app->browser->engine,
+            &app->process->presentation.ui,
+            intent->setting.value.web_font_mode) == PSP_SETTING_APPLIED)
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+}
+
+static void psp_setting_browser_ui_scale(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    /* Owner thread, page work paused by the menu: fill the chrome cache
+       at the new size before the next frame draws at it. */
+    psp_presentation_preload_chrome_scale(
+        intent->setting.value.unsigned_value);
+    psp_report_chrome_glyph_preload();
+    browser_profile_set_ui_scale(
+        profile, intent->setting.value.unsigned_value);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+}
+
+static void psp_setting_update_check(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    browser_profile_set_update_check_enabled(
+        profile, enabled);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    /* Re-arm or disarm this boot's deferred check; a check
+       already in flight simply completes. */
+    psp_update_check_rearm(
+        app->update_check,
+        enabled && psp_app_update_check_configured(
+                       profile, &app->process->config));
+#endif
+    psp_ui_show_status(
+        &app->process->presentation.ui, enabled
+            ? "UPDATE CHECK ON" : "UPDATE CHECK OFF",
+        180);
+}
+
+static void psp_setting_update_channel(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserUpdateChannel channel = intent->setting.value.update_channel;
+    browser_profile_set_update_channel(profile, channel);
+    /* An offer belongs to exactly one endpoint. A channel change clears
+       it rather than letting stable/beta/developer state bleed across. */
+    browser_profile_set_update_check_available_sequence(profile, 0);
+    browser_profile_set_update_check_last_unix(profile, 0);
+    app->process->presentation.ui.update_release_available = false;
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    psp_update_check_rearm(
+        app->update_check,
+        psp_app_update_check_configured(profile, &app->process->config));
+#endif
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        channel == BROWSER_UPDATE_CHANNEL_BETA
+            ? "BETA UPDATES SELECTED"
+            : channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
+                  ? "DEVELOPER URL - UNSIGNED CODE"
+                  : "STABLE UPDATES SELECTED",
+        240);
+}
+
+static void psp_setting_javascript(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    const uint16_t *engine_frame = app->views->frame;
+    bool enabled = intent->setting.value.boolean;
+    if (browser_engine_navigation_pending(engine))
+        browser_engine_cancel_navigation(
+            engine, "global JavaScript policy changed");
+    bool effective = enabled
+        && browser_profile_site_javascript_enabled(
+               profile, app->process->presentation.ui.url);
+    if (!browser_engine_set_javascript_enabled(engine, effective)) {
+        app->process->presentation.ui.javascript_enabled =
+            browser_profile_javascript_enabled(profile);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "JAVASCRIPT SETTING UNAVAILABLE", 240);
+    } else {
+        browser_profile_set_javascript_enabled(profile, enabled);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_app_reload_after_setting(
+            app, &engine_frame, enabled ? "JAVASCRIPT ON - RELOADING"
+                         : "JAVASCRIPT OFF - RELOADING",
+            enabled ? "JAVASCRIPT ON" : "JAVASCRIPT OFF",
+            "JAVASCRIPT SAVED - RELOAD FAILED", NULL);
+    }
+}
+
+static void psp_setting_site_javascript(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    const uint16_t *engine_frame = app->views->frame;
+    bool enabled = intent->setting.value.boolean;
+    /* The helper cancels a pending load only for a change it applies. */
+    if (psp_site_javascript_setting_apply(
+            app->browser->profile, engine, &app->process->presentation.ui,
+            enabled) == PSP_SETTING_APPLIED) {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_app_reload_after_setting(
+            app, &engine_frame, enabled ? "SITE JAVASCRIPT ON - RELOADING"
+                         : "SITE JAVASCRIPT OFF - RELOADING",
+            enabled ? "SITE JAVASCRIPT ON" : "SITE JAVASCRIPT OFF",
+            "SITE JAVASCRIPT SAVED - RELOAD FAILED", NULL);
+    }
+}
+
+static void psp_setting_site_data_allowed(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserSession *session = app->browser->session;
+    BrowserProfile *profile = app->browser->profile;
+    const uint16_t *engine_frame = app->views->frame;
+    bool allowed = intent->setting.value.boolean;
+    if (!allowed && !psp_app_youtube_login_clear(app))
+        psp_ui_show_status(&app->process->presentation.ui, "SAVED LOGIN COULD NOT BE REMOVED", 300);
+    browser_session_set_site_data_allowed(session, allowed);
+    browser_profile_set_site_data_allowed(profile, allowed);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (browser_engine_navigation_pending(engine))
+        browser_engine_cancel_navigation(
+            engine, "global site-data policy changed");
+    psp_app_reload_after_setting(
+        app, &engine_frame, allowed ? "SITE DATA ALLOWED - RELOADING"
+                     : "SITE DATA BLOCKED - RELOADING",
+        allowed ? "SITE DATA ALLOWED" : "SITE DATA BLOCKED",
+        "SITE DATA SAVED - RELOAD FAILED", NULL);
+}
+
+static void psp_setting_mixed_content_site(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserSession *session = app->browser->session;
+    bool allowed = intent->setting.value.boolean;
+    bool previous = browser_session_mixed_content_site_allowed(
+        session, app->process->presentation.ui.url);
+    if (browser_session_set_mixed_content_site_allowed(
+            session, app->process->presentation.ui.url, allowed)) {
+        psp_app_reload_for_site_security_setting(
+            app, frame,
+            allowed ? "HTTP ALLOWED THIS SESSION - RELOADING"
+                    : "MIXED CONTENT BLOCKED - RELOADING",
+            allowed ? "HTTP ALLOWED THIS SESSION"
+                    : "MIXED CONTENT BLOCKED");
+    } else {
+        app->process->presentation.ui.mixed_content_site_allowed = previous;
+        psp_ui_show_status(&app->process->presentation.ui, "SITE EXCEPTION LIMIT REACHED", 240);
+    }
+}
+
+static void psp_setting_third_party_cookies_site(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserSession *session = app->browser->session;
+    BrowserProfile *profile = app->browser->profile;
+    bool allowed = intent->setting.value.boolean;
+    bool previous = browser_profile_third_party_cookie_site_allowed(
+        profile, app->process->presentation.ui.url);
+    bool session_changed =
+        browser_session_set_third_party_cookie_site_allowed(
+            session, app->process->presentation.ui.url, allowed);
+    bool changed = session_changed
+        && browser_profile_set_third_party_cookie_site_allowed(
+            profile, app->process->presentation.ui.url, allowed);
+    if (changed) {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_app_reload_for_site_security_setting(
+            app, frame,
+            allowed ? "3RD-PARTY COOKIES ON - RELOADING"
+                    : "3RD-PARTY COOKIES BLOCKED - RELOADING",
+            allowed ? "3RD-PARTY COOKIES ALLOWED"
+                    : "3RD-PARTY COOKIES BLOCKED");
+    } else {
+        if (session_changed) {
+            (void) browser_session_set_third_party_cookie_site_allowed(
+                session, app->process->presentation.ui.url, previous);
+        }
+        app->process->presentation.ui.third_party_cookie_site_allowed = previous;
+        psp_ui_show_status(&app->process->presentation.ui, "SITE EXCEPTION LIMIT REACHED", 240);
+    }
+}
+
+static void psp_setting_search_engine(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserSearchEngine search_engine =
+        intent->setting.value.search_engine;
+    browser_profile_set_search_engine(
+        profile, search_engine);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    char status[48];
+    snprintf(
+        status, sizeof(status), "SEARCH ENGINE %s",
+        browser_search_engine_name(search_engine));
+    psp_ui_show_status(&app->process->presentation.ui, status, 180);
+}
+
+static void psp_setting_color_mode(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    PspUiState *ui = &app->process->presentation.ui;
+    bool previous_dark = ui->page_dark;
+    /* The chrome has already stored the new mode in ui->color_mode. */
+    psp_refresh_page_color_mode(ui);
+    PspSettingResult result = psp_color_mode_setting_apply(
+        app->browser->profile, app->browser->engine, ui,
+        intent->setting.value.color_mode, previous_dark);
+    frame->page_dirty = true;
+    if (result == PSP_SETTING_APPLIED)
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+}
+
+static void psp_setting_chrome_theme(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserChromeTheme theme =
+        intent->setting.value.chrome_theme;
+    BrowserChromeTheme previous =
+        browser_profile_chrome_theme(profile);
+    char theme_error[64];
+    if (!psp_app_apply_chrome_theme(
+            app->process, theme,
+            browser_profile_chrome_theme_file(profile),
+            theme_error, sizeof(theme_error))) {
+        app->process->presentation.ui.chrome_theme = (unsigned) previous;
+        psp_ui_theme_select(previous);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            theme_error[0] == '\0' ? "CUSTOM THEME INVALID" : theme_error,
+            240);
+        return;
+    }
+    browser_profile_set_chrome_theme(profile, theme);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    char status[40];
+    snprintf(
+        status, sizeof(status), "THEME %s",
+        theme == BROWSER_CHROME_THEME_FINCH ? "MIDNIGHT"
+        : theme == BROWSER_CHROME_THEME_OCEAN ? "COBALT"
+        : theme == BROWSER_CHROME_THEME_PLUM ? "PLUM"
+        : theme == BROWSER_CHROME_THEME_EMBER ? "EMBER"
+        : theme == BROWSER_CHROME_THEME_LIGHT ? "DAYLIGHT"
+        : "CUSTOM");
+    psp_ui_show_status(&app->process->presentation.ui, status, 180);
+}
+
+static void psp_setting_glyph_language(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserGlyphLanguage language = intent->setting.value.glyph_language;
+    browser_profile_set_glyph_language(profile, language);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        language == BROWSER_GLYPH_LANGUAGE_EMBEDDED
+            ? "EMBEDDED GLYPHS SELECTED"
+            : "LANGUAGE PACK APPLIES AFTER RESTART",
+        180);
+}
+
+static void psp_setting_glyph_offers_reset(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    (void) intent;
+    bool any = browser_profile_glyph_offer_declined_mask(profile) != 0;
+    browser_profile_set_glyph_offer_declined_mask(profile, 0);
+    if (any)
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        any ? "DECLINED LANGUAGE PACK OFFERS RESET"
+            : "NO DECLINED OFFERS TO RESET",
+        150);
+}
+
+static void psp_setting_video_scaling(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserVideoScaling scaling = intent->setting.value.video_scaling;
+    browser_profile_set_video_scaling(profile, scaling);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    /* Both presenters read the profile on every present, so a change
+       lands as soon as a frame is drawn. In practice that is the next
+       media open: Options cannot be reached while the player owns the
+       display. */
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        scaling == BROWSER_VIDEO_SCALING_SHARP
+            ? "VIDEO SCALING SHARP"
+            : "VIDEO SCALING SMOOTH",
+        180);
+}
+
+static void psp_setting_youtube_quality(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserYoutubeQuality quality =
+        intent->setting.value.youtube_quality;
+    browser_profile_set_youtube_quality(
+        profile, quality);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        quality == BROWSER_YOUTUBE_QUALITY_360P
+            ? "YOUTUBE QUALITY 360P"
+            : "YOUTUBE QUALITY 240P",
+        180);
+}
+
+static void psp_setting_video_language(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserVideoLanguage language = intent->setting.value.video_language;
+    browser_profile_set_video_language(profile, language);
+    psp_youtube_preresolve_reset(
+        &app->browser->youtube_preresolve,
+        "video language changed");
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        language == BROWSER_VIDEO_LANGUAGE_ORIGINAL
+            ? "VIDEO LANGUAGE ORIGINAL - NEXT VIDEO"
+            : "VIDEO LANGUAGE SAVED - NEXT VIDEO",
+        180);
+}
+
+static void psp_setting_subtitle_language(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserSubtitleLanguage language =
+        intent->setting.value.subtitle_language;
+    browser_profile_set_subtitle_language(profile, language);
+    psp_youtube_preresolve_reset(
+        &app->browser->youtube_preresolve,
+        "subtitle language changed");
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        "SUBTITLE PREF SAVED - CAPTIONS OFF",
+        180);
+}
+
+static void psp_setting_alternate_language(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserAlternateLanguage language =
+        intent->setting.value.alternate_language;
+    browser_profile_set_alternate_language(profile, language);
+    psp_youtube_preresolve_reset(
+        &app->browser->youtube_preresolve,
+        "alternate language changed");
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        language == BROWSER_ALTERNATE_LANGUAGE_NONE
+            ? "ALTERNATE LANGUAGE OFF"
+            : "ALTERNATE LANGUAGE SAVED - NEXT VIDEO",
+        180);
+}
+
+static void psp_setting_subtitle_size(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserSubtitleSize size = intent->setting.value.subtitle_size;
+    browser_profile_set_subtitle_size(profile, size);
+    psp_ui_media_set_subtitle_style(
+        &app->browser->media.ui, size,
+        browser_profile_subtitle_background(profile));
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        size == BROWSER_SUBTITLE_SIZE_SMALL
+            ? "SUBTITLES SMALL" : "SUBTITLES STANDARD",
+        180);
+}
+
+static void psp_setting_subtitle_background(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserSubtitleBackground background =
+        intent->setting.value.subtitle_background;
+    browser_profile_set_subtitle_background(profile, background);
+    psp_ui_media_set_subtitle_style(
+        &app->browser->media.ui,
+        browser_profile_subtitle_size(profile), background);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
+            ? "SUBTITLE BACKGROUND SHADOW"
+            : "SUBTITLE BACKGROUND BOX",
+        180);
+}
+
+static void psp_setting_playback_positions(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool clear = intent->setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS;
+    if (clear) browser_profile_clear_playback_positions(profile);
+    else browser_profile_set_save_playback_positions(
+        profile, intent->setting.value.boolean);
+    /* No stale in-memory dirty flag should resurrect a cleared record.
+       Continued playback may record a new position only when opted in. */
+    app->browser->media.resume_profile_dirty = false;
+    app->browser->media.last_resume_saved_us = app->browser->media.clock_us;
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(&app->process->presentation.ui,
+        clear ? "PLAYBACK POSITIONS CLEARED"
+            : (intent->setting.value.boolean
+                ? "SAVE PLAYBACK POSITIONS ON" : "PLAYBACK POSITIONS OFF - CLEARED"),
+        180);
+}
+
+static void psp_setting_content_blocker_mode(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    const char *content_blocker_path = app->process->storage.content_blocker;
+    ContentBlockerMode requested =
+        intent->setting.value.content_blocker_mode;
+    ContentBlockerMode previous =
+        browser_profile_content_blocker_mode(profile);
+    if (!browser_engine_content_blocker_configure(
+            engine, requested, content_blocker_path)) {
+        ContentBlockerMetrics retained = {0};
+        app->process->presentation.ui.content_blocker_mode = (uint8_t)
+            (browser_engine_content_blocker_metrics(
+                 engine, &retained)
+                ? retained.mode : previous);
+        app->process->presentation.ui.content_blocker_site_allowed =
+            app->process->presentation.ui.content_blocker_mode != CONTENT_BLOCKER_OFF
+            && retained.allowed_site_count
+                   == browser_profile_content_blocker_allowed_site_count(
+                          profile)
+            && browser_profile_content_blocker_site_allowed(
+                   profile, app->process->presentation.ui.url);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "CUSTOM LIST NOT AVAILABLE", 240);
+    } else {
+        browser_profile_set_content_blocker_mode(
+            profile, requested);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        app->process->presentation.ui.content_blocker_site_allowed =
+            requested != CONTENT_BLOCKER_OFF
+            && browser_profile_content_blocker_site_allowed(
+                   profile, app->process->presentation.ui.url);
+        ContentBlockerMetrics blocker_metrics = {0};
+        (void) browser_engine_content_blocker_metrics(
+            engine, &blocker_metrics);
+        printf(
+            "tilefinch-content-blocker: mode=%u rules=%zu "
+            "allow-rules=%zu ignored=%zu retained=%zu\n",
+            (unsigned) blocker_metrics.mode,
+            blocker_metrics.rule_count,
+            blocker_metrics.allow_rule_count,
+            blocker_metrics.ignored_rule_count,
+            blocker_metrics.retained_bytes);
+        char status[64];
+        snprintf(
+            status, sizeof(status),
+            requested == CONTENT_BLOCKER_OFF
+                ? "AD BLOCKING OFF"
+                : (requested == CONTENT_BLOCKER_BASIC
+                       ? "AD BLOCKING BASIC"
+                       : "CUSTOM %u RULES - %u IGNORED"),
+            (unsigned) blocker_metrics.rule_count,
+            (unsigned) blocker_metrics.ignored_rule_count);
+        psp_ui_show_status(&app->process->presentation.ui, status, 180);
+        char entry_buffer[NAVIGATION_URL_LIMIT];
+        const char *entry_url = psp_app_current_url(
+            app->browser->engine, entry_buffer, sizeof(entry_buffer));
+        (void) psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile,
+            app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode,
+            entry_url == NULL ? app->process->presentation.ui.url : entry_url,
+            app->process->presentation.ui.page_font_percent, true);
+        (void) psp_engine_views_refresh(app->views, engine);
+        frame->page_dirty = true;
+    }
+}
+
+static void psp_setting_content_blocker_cosmetic_hiding(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    bool previous =
+        browser_profile_content_blocker_cosmetic_hiding(profile);
+    browser_profile_set_content_blocker_cosmetic_hiding(
+        profile, enabled);
+    char entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *entry_url = psp_app_current_url(
+        app->browser->engine, entry_buffer, sizeof(entry_buffer));
+    bool applied = psp_set_presentation_css(
+        engine, &app->process->presentation.ui, profile,
+        app->process->presentation.ui.reader_mode
+            || app->process->presentation.ui.basic_mode,
+        entry_url == NULL ? app->process->presentation.ui.url : entry_url,
+        app->process->presentation.ui.page_font_percent, true);
+    if (!applied) {
+        browser_profile_set_content_blocker_cosmetic_hiding(
+            profile, previous);
+        app->process->presentation.ui.content_blocker_cosmetic_hiding = previous;
+        (void) psp_set_presentation_css(
+            engine, &app->process->presentation.ui, profile,
+            app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode,
+            entry_url == NULL ? app->process->presentation.ui.url : entry_url,
+            app->process->presentation.ui.page_font_percent, true);
+    } else {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+    }
+    (void) psp_engine_views_refresh(app->views, engine);
+    frame->page_dirty = true;
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        applied ? (enabled ? "PAGE AD HIDING ON"
+                           : "PAGE AD HIDING OFF")
+                : "PAGE AD HIDING UNAVAILABLE",
+        180);
+}
+
+static void psp_setting_content_blocker_site_allowed(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    bool desired = intent->setting.value.boolean;
+    bool previous =
+        browser_profile_content_blocker_site_allowed(
             profile, app->process->presentation.ui.url);
-        bool changed = browser_profile_set_cookie_banner_hidden(
-            profile, app->process->presentation.ui.url, hidden);
-        const NavigationEntry *entry =
-            navigation_current(app->views->navigation);
-        const char *url = entry == NULL
-            ? app->process->presentation.ui.url : entry->url;
-        bool applied = changed && psp_set_presentation_css(
+    bool changed =
+        browser_profile_set_content_blocker_site_allowed(
+            profile, app->process->presentation.ui.url, desired);
+    if (changed)
+        changed = psp_content_blocker_apply_allowed_sites(
+            engine, profile);
+    if (!changed) {
+        (void) browser_profile_set_content_blocker_site_allowed(
+            profile, app->process->presentation.ui.url, previous);
+        (void) psp_content_blocker_apply_allowed_sites(
+            engine, profile);
+        app->process->presentation.ui.content_blocker_site_allowed = previous;
+        psp_ui_show_status(
+            &app->process->presentation.ui, "SITE ALLOWLIST IS FULL", 240);
+    } else {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_app_reload_for_site_security_setting(
+            app, frame,
+            desired ? "SITE ALLOWED - RELOADING"
+                    : "BLOCKING SITE - RELOADING",
+            desired ? "SITE ALLOWLIST SAVED"
+                    : "SITE BLOCKING SAVED");
+    }
+}
+
+static void psp_setting_cookie_banner_hidden(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    bool hidden = intent->setting.value.boolean;
+    bool previous = browser_profile_cookie_banner_hidden(
+        profile, app->process->presentation.ui.url);
+    bool changed = browser_profile_set_cookie_banner_hidden(
+        profile, app->process->presentation.ui.url, hidden);
+    char entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *entry_url = psp_app_current_url(
+        app->browser->engine, entry_buffer, sizeof(entry_buffer));
+    const char *url = entry_url == NULL
+        ? app->process->presentation.ui.url : entry_url;
+    bool applied = changed && psp_set_presentation_css(
+        engine, &app->process->presentation.ui, profile,
+        app->process->presentation.ui.reader_mode
+            || app->process->presentation.ui.basic_mode, url,
+        app->process->presentation.ui.page_font_percent, true);
+    if (!applied) {
+        (void) browser_profile_set_cookie_banner_hidden(
+            profile, app->process->presentation.ui.url, previous);
+        app->process->presentation.ui.cookie_banner_hidden = previous;
+        (void) psp_set_presentation_css(
             engine, &app->process->presentation.ui, profile,
             app->process->presentation.ui.reader_mode
                 || app->process->presentation.ui.basic_mode, url,
             app->process->presentation.ui.page_font_percent, true);
-        if (!applied) {
-            (void) browser_profile_set_cookie_banner_hidden(
-                profile, app->process->presentation.ui.url, previous);
-            app->process->presentation.ui.cookie_banner_hidden = previous;
-            (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode
-                    || app->process->presentation.ui.basic_mode, url,
-                app->process->presentation.ui.page_font_percent, true);
-        } else {
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
+    } else {
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+    }
+    (void) psp_engine_views_refresh(app->views, engine);
+    frame->page_dirty = true;
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        applied ? (hidden ? "COOKIE NOTICES HIDDEN"
+                          : "COOKIE NOTICES SHOWN")
+                : "COOKIE NOTICE SETTING UNAVAILABLE",
+        180);
+}
+
+static void psp_setting_restore_last_page(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    const char *recovery_path = app->process->storage.recovery;
+    const char *tab_session_path = app->process->storage.tab_session;
+    bool restore = intent->setting.value.boolean;
+    browser_profile_set_restore_last_page(
+        profile, restore);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (restore) {
+        const BrowserEngine *engine = app->browser->engine;
+        bool saved = psp_recovery_record_current(
+            profile, recovery_path, engine);
+        int scroll_y = 0;
+        if (saved && browser_engine_current_entry(
+                engine, NULL, 0u, &scroll_y)) {
+            app->interactive->recovery.observed_scroll = scroll_y;
+            app->interactive->recovery.observed_generation =
+                browser_engine_page_generation(engine);
+            app->interactive->recovery.last_change_us =
+                psp_time_us(NULL);
+            app->interactive->recovery.dirty = false;
         }
-        (void) psp_engine_views_refresh(app->views, engine);
-        frame->page_dirty = true;
+        psp_ui_show_status(
+            &app->process->presentation.ui, saved ? "LAST PAGE RESTORE ON"
+                       : "RESTORE ON - SAVES NEXT PAGE",
+            180);
+    } else {
+        (void) browser_recovery_clear(recovery_path);
+        (void) remove(tab_session_path);
+        app->interactive->recovery.dirty = false;
+        psp_ui_show_status(
+            &app->process->presentation.ui, "LAST PAGE RESTORE OFF", 180);
+    }
+}
+
+static void psp_setting_tab_hibernation(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserTabs *tabs = app->browser->tabs;
+    const char *tab_hibernation_path = app->process->storage.tab_hibernation;
+    bool enabled = intent->setting.value.boolean;
+    bool applied = true;
+    if (!enabled && tabs != NULL) {
+        for (size_t index = 0;
+             index < browser_tabs_count(tabs); index++) {
+            if (browser_tabs_hibernated(tabs, index)
+                && !browser_tabs_rehydrate(
+                       tabs, index,
+                       tab_hibernation_path)) {
+                applied = false;
+                break;
+            }
+        }
+    }
+    if (!applied) {
+        app->process->presentation.ui.tab_hibernation_enabled = true;
+        psp_ui_show_status(
+            &app->process->presentation.ui, "TAB NEEDS MEMORY BEFORE DISABLING", 240);
+    } else {
+        browser_profile_set_tab_hibernation_enabled(
+            profile, enabled);
+        if (!enabled) (void) remove(tab_hibernation_path);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
         psp_ui_show_status(
             &app->process->presentation.ui,
-            applied ? (hidden ? "COOKIE NOTICES HIDDEN"
-                              : "COOKIE NOTICES SHOWN")
-                    : "COOKIE NOTICE SETTING UNAVAILABLE",
+            enabled ? "TAB HIBERNATION ON"
+                    : "TAB HIBERNATION OFF",
             180);
     }
-    if (intent->setting.id == PSP_UI_SETTING_RESTORE_LAST_PAGE) {
-        bool restore = intent->setting.value.boolean;
-        browser_profile_set_restore_last_page(
-            profile, restore);
+}
+
+static void psp_setting_experimental_voice(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    bool applied = psp_text_input_set_voice_enabled(
+        &app->process->text_input, enabled);
+    if (!applied && enabled) {
+        app->process->presentation.ui.experimental_voice_input = false;
+        browser_profile_set_experimental_voice_input(
+            profile, false);
         psp_profile_store_mark_dirty(
             &app->browser->profile_store, frame->ui_sample_us);
-        if (restore) {
-            bool saved = psp_recovery_record_current(
-                profile, recovery_path, app->views->navigation);
-            app->interactive->recovery.entry = navigation_current(app->views->navigation);
-            if (saved && app->interactive->recovery.entry != NULL) {
-                app->interactive->recovery.observed_scroll =
-                    app->interactive->recovery.entry->scroll_y;
-                app->interactive->recovery.observed_generation =
-                    app->views->navigation->generation;
-                app->interactive->recovery.last_change_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-                app->interactive->recovery.dirty = false;
-            }
-            psp_ui_show_status(
-                &app->process->presentation.ui, saved ? "LAST PAGE RESTORE ON"
-                           : "RESTORE ON - SAVES NEXT PAGE",
-                180);
-        } else {
-            (void) browser_recovery_clear(recovery_path);
-            (void) remove(tab_session_path);
-            app->interactive->recovery.dirty = false;
-            psp_ui_show_status(
-                &app->process->presentation.ui, "LAST PAGE RESTORE OFF", 180);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_TAB_HIBERNATION) {
-        bool enabled = intent->setting.value.boolean;
-        bool applied = true;
-        if (!enabled && tabs != NULL) {
-            for (size_t index = 0;
-                 index < browser_tabs_count(tabs); index++) {
-                if (browser_tabs_hibernated(tabs, index)
-                    && !browser_tabs_rehydrate(
-                           tabs, index,
-                           tab_hibernation_path)) {
-                    applied = false;
-                    break;
-                }
-            }
-        }
-        if (!applied) {
-            app->process->presentation.ui.tab_hibernation_enabled = true;
-            psp_ui_show_status(
-                &app->process->presentation.ui, "TAB NEEDS MEMORY BEFORE DISABLING", 240);
-        } else {
-            browser_profile_set_tab_hibernation_enabled(
-                profile, enabled);
-            if (!enabled) (void) remove(tab_hibernation_path);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                enabled ? "TAB HIBERNATION ON"
-                        : "TAB HIBERNATION OFF",
-                180);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_EXPERIMENTAL_VOICE) {
-        bool enabled = intent->setting.value.boolean;
-        bool applied = psp_text_input_set_voice_enabled(
-            &app->process->text_input, enabled);
-        if (!applied && enabled) {
-            app->process->presentation.ui.experimental_voice_input = false;
-            browser_profile_set_experimental_voice_input(
-                profile, false);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "VOICE MEMORY IS NOT AVAILABLE", 180);
-        } else {
-            browser_profile_set_experimental_voice_input(
-                profile, enabled);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            psp_ui_show_status(
-                &app->process->presentation.ui, enabled
-                    ? "VOICE ON - SQUARE IN A TEXT FIELD"
-                    : "EXPERIMENTAL VOICE OFF",
-                180);
-        }
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_ADAPTIVE_VOICE_MEMORY) {
-        bool adaptive = intent->setting.value.boolean;
-        browser_profile_set_adaptive_voice_memory(
-            profile, adaptive);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_text_input_set_adaptive_voice_memory(
-            &app->process->text_input, adaptive);
         psp_ui_show_status(
-            &app->process->presentation.ui, adaptive
-                ? "VOICE MEMORY ADAPTIVE"
-                : "VOICE MEMORY FULL SPEED",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_ANALOG_CURSOR) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_analog_cursor_enabled(
+            &app->process->presentation.ui, "VOICE MEMORY IS NOT AVAILABLE", 180);
+    } else {
+        browser_profile_set_experimental_voice_input(
             profile, enabled);
         psp_profile_store_mark_dirty(
             &app->browser->profile_store, frame->ui_sample_us);
         psp_ui_show_status(
             &app->process->presentation.ui, enabled
-                ? "ANALOG CURSOR ON"
-                : "ANALOG SCROLLING ON",
+                ? "VOICE ON - SQUARE IN A TEXT FIELD"
+                : "EXPERIMENTAL VOICE OFF",
             180);
     }
-    if (intent->setting.id == PSP_UI_SETTING_TEXT_ENTRY_MODE) {
-        BrowserTextEntryMode mode =
-            intent->setting.value.text_entry_mode;
-        browser_profile_set_text_entry_mode(profile, mode);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_text_input_set_danzeff_enabled(
-            &app->process->text_input, mode == BROWSER_TEXT_ENTRY_DANZEFF);
-        psp_ui_show_status(
-            &app->process->presentation.ui, mode == BROWSER_TEXT_ENTRY_DANZEFF
-                ? "DANZEFF ON - START OPENS IT"
-                : "PSP KEYBOARD ON",
-            180);
+}
+
+static void psp_setting_adaptive_voice_memory(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool adaptive = intent->setting.value.boolean;
+    browser_profile_set_adaptive_voice_memory(
+        profile, adaptive);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_text_input_set_adaptive_voice_memory(
+        &app->process->text_input, adaptive);
+    psp_ui_show_status(
+        &app->process->presentation.ui, adaptive
+            ? "VOICE MEMORY ADAPTIVE"
+            : "VOICE MEMORY FULL SPEED",
+        180);
+}
+
+static void psp_setting_text_entry_mode(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    BrowserTextEntryMode mode =
+        intent->setting.value.text_entry_mode;
+    browser_profile_set_text_entry_mode(profile, mode);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_text_input_set_danzeff_enabled(
+        &app->process->text_input, mode == BROWSER_TEXT_ENTRY_DANZEFF);
+    psp_ui_show_status(
+        &app->process->presentation.ui, mode == BROWSER_TEXT_ENTRY_DANZEFF
+            ? "DANZEFF ON - START OPENS IT"
+            : "PSP KEYBOARD ON",
+        180);
+}
+
+static void psp_setting_gamepad_face_mapping(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    TilefinchGamepadFaceMapping mapping =
+        intent->setting.value.gamepad_face_mapping;
+    browser_profile_set_gamepad_face_mapping(profile, mapping);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        mapping == TILEFINCH_GAMEPAD_FACE_O_PRIMARY
+            ? "GAME BUTTONS - O IS PRIMARY"
+            : "GAME BUTTONS - X IS PRIMARY",
+        180);
+}
+
+static void psp_setting_persistent_cache_mb(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    const char *persistent_cache_path = app->process->storage.persistent_cache;
+    unsigned persistent_cache_mb =
+        intent->setting.value.unsigned_value;
+    unsigned previous_cache_mb =
+        browser_profile_persistent_cache_mb(profile);
+    BrowserSessionPersistenceStatus remove_status =
+        BROWSER_SESSION_PERSISTENCE_OK;
+    if (persistent_cache_mb == 0
+        && app->process->persistent_site_data_available) {
+        remove_status = browser_session_persistence_remove(
+            persistent_cache_path);
     }
-    if (intent->setting.id == PSP_UI_SETTING_GAMEPAD_FACE_MAPPING) {
-        TilefinchGamepadFaceMapping mapping =
-            intent->setting.value.gamepad_face_mapping;
-        browser_profile_set_gamepad_face_mapping(profile, mapping);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            mapping == TILEFINCH_GAMEPAD_FACE_O_PRIMARY
-                ? "GAME BUTTONS - O IS PRIMARY"
-                : "GAME BUTTONS - X IS PRIMARY",
-            180);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_PERSISTENT_CACHE_MB) {
-        unsigned persistent_cache_mb =
-            intent->setting.value.unsigned_value;
-        unsigned previous_cache_mb =
-            browser_profile_persistent_cache_mb(profile);
-        BrowserSessionPersistenceStatus remove_status =
-            BROWSER_SESSION_PERSISTENCE_OK;
-        if (persistent_cache_mb == 0
-            && app->process->persistent_site_data_available) {
-            remove_status = browser_session_persistence_remove(
-                persistent_cache_path);
-        }
+    browser_profile_set_persistent_cache_mb(
+        profile, persistent_cache_mb);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (remove_status != BROWSER_SESSION_PERSISTENCE_OK
+        || !psp_profile_store_flush(&app->browser->profile_store)) {
         browser_profile_set_persistent_cache_mb(
-            profile, persistent_cache_mb);
+            profile, previous_cache_mb);
+        app->process->presentation.ui.persistent_cache_mb = previous_cache_mb;
+        psp_ui_show_status(
+            &app->process->presentation.ui, remove_status
+                     != BROWSER_SESSION_PERSISTENCE_OK
+                 ? "CACHE FILE COULD NOT BE REMOVED"
+                 : "CACHE SETTING NOT SAVED",
+            240);
+    } else if (persistent_cache_mb == 0) {
+        psp_ui_show_status(&app->process->presentation.ui, "DISK CACHE OFF", 180);
+    } else {
+        char status[48];
+        snprintf(
+            status, sizeof(status),
+            "DISK CACHE %u MB - SAVES ON EXIT",
+            persistent_cache_mb);
+        psp_ui_show_status(&app->process->presentation.ui, status, 240);
+    }
+}
+
+static void psp_setting_live_cache_kib(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserSession *session = app->browser->session;
+    BrowserProfile *profile = app->browser->profile;
+    unsigned live_cache_kib =
+        intent->setting.value.unsigned_value;
+    size_t new_limit = (size_t) live_cache_kib * KIB;
+    if (browser_session_cache_set_maximum_bytes(
+            session, new_limit)) {
+        browser_profile_set_live_cache_kib(
+            profile, live_cache_kib);
         psp_profile_store_mark_dirty(
             &app->browser->profile_store, frame->ui_sample_us);
-        if (remove_status != BROWSER_SESSION_PERSISTENCE_OK
-            || !psp_profile_store_flush(&app->browser->profile_store)) {
-            browser_profile_set_persistent_cache_mb(
-                profile, previous_cache_mb);
-            app->process->presentation.ui.persistent_cache_mb = previous_cache_mb;
-            psp_ui_show_status(
-                &app->process->presentation.ui, remove_status
-                         != BROWSER_SESSION_PERSISTENCE_OK
-                     ? "CACHE FILE COULD NOT BE REMOVED"
-                     : "CACHE SETTING NOT SAVED",
-                240);
-        } else if (persistent_cache_mb == 0) {
-            psp_ui_show_status(&app->process->presentation.ui, "DISK CACHE OFF", 180);
-        } else {
-            char status[48];
+        char status[48];
+        if (live_cache_kib < 1024u) {
             snprintf(
                 status, sizeof(status),
-                "DISK CACHE %u MB - SAVES ON EXIT",
-                persistent_cache_mb);
-            psp_ui_show_status(&app->process->presentation.ui, status, 240);
-        }
-    }
-    if (intent->setting.id == PSP_UI_SETTING_LIVE_CACHE_KIB) {
-        unsigned live_cache_kib =
-            intent->setting.value.unsigned_value;
-        size_t new_limit = (size_t) live_cache_kib * KIB;
-        if (browser_session_cache_set_maximum_bytes(
-                session, new_limit)) {
-            browser_profile_set_live_cache_kib(
-                profile, live_cache_kib);
-            psp_profile_store_mark_dirty(
-                &app->browser->profile_store, frame->ui_sample_us);
-            char status[48];
-            if (live_cache_kib < 1024u) {
-                snprintf(
-                    status, sizeof(status),
-                    "MEMORY CACHE %u KB",
-                    live_cache_kib);
-            } else {
-                snprintf(
-                    status, sizeof(status),
-                    "MEMORY CACHE %u MB",
-                    live_cache_kib / 1024u);
-            }
-            psp_ui_show_status(&app->process->presentation.ui, status, 180);
+                "MEMORY CACHE %u KB",
+                live_cache_kib);
         } else {
-            app->process->presentation.ui.live_cache_kib =
-                browser_profile_live_cache_kib(profile);
-            psp_ui_show_status(
-                &app->process->presentation.ui, "MEMORY CACHE SIZE UNAVAILABLE", 240);
+            snprintf(
+                status, sizeof(status),
+                "MEMORY CACHE %u MB",
+                live_cache_kib / 1024u);
         }
+        psp_ui_show_status(&app->process->presentation.ui, status, 180);
+    } else {
+        app->process->presentation.ui.live_cache_kib =
+            browser_profile_live_cache_kib(profile);
+        psp_ui_show_status(
+            &app->process->presentation.ui, "MEMORY CACHE SIZE UNAVAILABLE", 240);
     }
-    if (intent->setting.id
-        == PSP_UI_SETTING_PERSIST_LOCAL_STORAGE) {
-        bool persist = intent->setting.value.boolean;
-        bool previous =
-            browser_profile_persist_local_storage(profile);
-        BrowserSessionPersistenceStatus remove_status =
-            BROWSER_SESSION_PERSISTENCE_OK;
-        if (!persist
-            && app->process->persistent_site_data_available) {
-            remove_status = browser_session_persistence_remove(
-                local_storage_path);
-        }
+}
+
+static void psp_setting_persist_local_storage(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    const char *local_storage_path = app->process->storage.local_storage;
+    bool persist = intent->setting.value.boolean;
+    bool previous =
+        browser_profile_persist_local_storage(profile);
+    BrowserSessionPersistenceStatus remove_status =
+        BROWSER_SESSION_PERSISTENCE_OK;
+    if (!persist
+        && app->process->persistent_site_data_available) {
+        remove_status = browser_session_persistence_remove(
+            local_storage_path);
+    }
+    browser_profile_set_persist_local_storage(
+        profile, persist);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (remove_status != BROWSER_SESSION_PERSISTENCE_OK
+        || !psp_profile_store_flush(&app->browser->profile_store)) {
         browser_profile_set_persist_local_storage(
-            profile, persist);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        if (remove_status != BROWSER_SESSION_PERSISTENCE_OK
-            || !psp_profile_store_flush(&app->browser->profile_store)) {
-            browser_profile_set_persist_local_storage(
-                profile, previous);
-            app->process->presentation.ui.persist_local_storage = previous;
-            psp_ui_show_status(
-                &app->process->presentation.ui, remove_status
-                         != BROWSER_SESSION_PERSISTENCE_OK
-                     ? "LOCAL FILE COULD NOT BE REMOVED"
-                     : "LOCAL SETTING NOT SAVED",
-                240);
-        } else {
-            psp_ui_show_status(
-                &app->process->presentation.ui, persist
-                    ? "RAM STORAGE SAVED AT EXIT"
-                    : "RAM STORAGE NOT SAVED AT EXIT",
+            profile, previous);
+        app->process->presentation.ui.persist_local_storage = previous;
+        psp_ui_show_status(
+            &app->process->presentation.ui, remove_status
+                     != BROWSER_SESSION_PERSISTENCE_OK
+                 ? "LOCAL FILE COULD NOT BE REMOVED"
+                 : "LOCAL SETTING NOT SAVED",
             240);
-        }
+    } else {
+        psp_ui_show_status(
+            &app->process->presentation.ui, persist
+                ? "RAM STORAGE SAVED AT EXIT"
+                : "RAM STORAGE NOT SAVED AT EXIT",
+        240);
     }
-    if (intent->setting.id
-        == PSP_UI_SETTING_TLS_SESSION_PERSISTENCE) {
-        bool enabled = intent->setting.value.boolean;
-        bool previous =
-            browser_profile_tls_session_persistence(profile);
-        browser_profile_set_tls_session_persistence(profile, enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-        if (!psp_profile_store_flush(&app->browser->profile_store)) {
-            browser_profile_set_tls_session_persistence(profile, previous);
-            app->process->presentation.ui.tls_session_persistence = previous;
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                "TLS TICKET SETTING NOT SAVED", 240);
-        } else {
-            bool store_ok =
-                fetch_set_tls_session_persistence_enabled(enabled);
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                enabled ? "TLS TICKET SAVING ON"
-                        : (store_ok ? "TLS TICKET SAVING OFF"
-                                    : "OFF - OLD TICKETS NOT REMOVED"),
-                240);
-        }
-    }
-    if (intent->setting.id
-        == PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_save_diagnostic_reports(profile, enabled);
-        bool storage_ok = psp_failure_report_configure(enabled, !enabled);
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
+}
+
+static void psp_setting_tls_session_persistence(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    bool previous =
+        browser_profile_tls_session_persistence(profile);
+    browser_profile_set_tls_session_persistence(profile, enabled);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (!psp_profile_store_flush(&app->browser->profile_store)) {
+        browser_profile_set_tls_session_persistence(profile, previous);
+        app->process->presentation.ui.tls_session_persistence = previous;
         psp_ui_show_status(
             &app->process->presentation.ui,
-            enabled ? "ERROR REPORT SAVING ON"
-                    : (storage_ok ? "ERROR REPORT SAVING OFF"
-                                  : "OFF - OLD REPORT NOT REMOVED"),
+            "TLS TICKET SETTING NOT SAVED", 240);
+    } else {
+        bool store_ok =
+            fetch_set_tls_session_persistence_enabled(enabled);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enabled ? "TLS TICKET SAVING ON"
+                    : (store_ok ? "TLS TICKET SAVING OFF"
+                                : "OFF - OLD TICKETS NOT REMOVED"),
             240);
     }
-    if (intent->setting.id == PSP_UI_SETTING_WIFI_DIAGNOSTICS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_wifi_diagnostics(profile, enabled);
-        psp_network_diagnostics_enable(enabled);
-        if (!enabled) psp_wifi_diagnostic_clear();
-        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(&app->process->presentation.ui,
-            enabled ? "WI-FI DETAILS IN RAM - RETRY, THEN DIAGNOSTIC QR"
-                    : "WI-FI DIAGNOSTICS OFF", 240);
+}
+
+static void psp_setting_save_diagnostic_reports(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    browser_profile_set_save_diagnostic_reports(profile, enabled);
+    bool storage_ok = psp_failure_report_configure(enabled, !enabled);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(
+        &app->process->presentation.ui,
+        enabled ? "ERROR REPORT SAVING ON"
+                : (storage_ok ? "ERROR REPORT SAVING OFF"
+                              : "OFF - OLD REPORT NOT REMOVED"),
+        240);
+}
+
+static void psp_setting_wifi_diagnostics(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserProfile *profile = app->browser->profile;
+    bool enabled = intent->setting.value.boolean;
+    browser_profile_set_wifi_diagnostics(profile, enabled);
+    psp_network_diagnostics_enable(enabled);
+    if (!enabled) psp_wifi_diagnostic_clear();
+    psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(&app->process->presentation.ui,
+        enabled ? "WI-FI DETAILS IN RAM - RETRY, THEN DIAGNOSTIC QR"
+                : "WI-FI DIAGNOSTICS OFF", 240);
+}
+
+static void psp_setting_youtube_signin_diagnostics(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    BrowserEngine *engine = app->browser->engine;
+    (void) frame;
+    bool enabled = intent->setting.value.boolean;
+    browser_engine_set_youtube_signin_diagnostics(engine, enabled);
+    psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
+    tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
+    app->process->diagnostic_qr = NULL;
+    /* Session-only: enabling collection never writes a profile or log. */
+    psp_ui_show_status(&app->process->presentation.ui,
+        enabled ? "SIGN-IN COUNTS IN RAM - RETRY, THEN DIAGNOSTIC QR"
+                : "SIGN-IN DIAGNOSTICS CLEARED", 240);
+}
+
+static void psp_setting_youtube_login(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    psp_app_youtube_login_setting(app, frame, intent->setting.value.unsigned_value);
+}
+
+/* A plain on/off setting (psp_ui_settings.c). */
+static void psp_setting_bool(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent,
+    const PspBoolSetting *setting)
+{
+    if (psp_bool_setting_apply(
+            setting, app->browser->profile, app->browser->engine,
+            &app->process->presentation.ui,
+            intent->setting.value.boolean) == PSP_SETTING_APPLIED)
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+}
+
+void psp_app_apply_setting(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    if (intent == NULL || intent->setting.id == PSP_UI_SETTING_NONE) return;
+    if (psp_app_site_storage_setting(app, frame, intent)) return;
+    if (psp_app_heavy_setting(app, frame, intent)) return;
+    const PspBoolSetting *bool_setting =
+        psp_bool_setting_find(intent->setting.id);
+    if (bool_setting != NULL) {
+        psp_setting_bool(app, frame, intent, bool_setting);
+        return;
     }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_engine_set_youtube_signin_diagnostics(engine, enabled);
-        psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
-        tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
-        app->process->diagnostic_qr = NULL;
-        /* Session-only: enabling collection never writes a profile or log. */
-        psp_ui_show_status(&app->process->presentation.ui,
-            enabled ? "SIGN-IN COUNTS IN RAM - RETRY, THEN DIAGNOSTIC QR"
-                    : "SIGN-IN DIAGNOSTICS CLEARED", 240);
+    switch (intent->setting.id) {
+    case PSP_UI_SETTING_NETWORK_PROFILE:
+        psp_setting_network_profile(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_PAGE_FONT_PERCENT:
+        psp_setting_page_font_percent(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_READER_FONT:
+        psp_setting_reader_font(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE:
+        psp_setting_remember_reader_site_scale(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_BASIC_FALLBACK:
+        psp_setting_basic_fallback(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_WEB_FONTS:
+        psp_setting_web_fonts(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_BROWSER_UI_SCALE:
+        psp_setting_browser_ui_scale(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_UPDATE_CHECK:
+        psp_setting_update_check(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_UPDATE_CHANNEL:
+        psp_setting_update_channel(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_JAVASCRIPT:
+        psp_setting_javascript(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SITE_JAVASCRIPT:
+        psp_setting_site_javascript(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SITE_DATA_ALLOWED:
+        psp_setting_site_data_allowed(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_MIXED_CONTENT_SITE:
+        psp_setting_mixed_content_site(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE:
+        psp_setting_third_party_cookies_site(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SEARCH_ENGINE:
+        psp_setting_search_engine(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_COLOR_MODE:
+        psp_setting_color_mode(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_CHROME_THEME:
+        psp_setting_chrome_theme(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_GLYPH_LANGUAGE:
+        psp_setting_glyph_language(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_GLYPH_OFFERS_RESET:
+        psp_setting_glyph_offers_reset(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_VIDEO_SCALING:
+        psp_setting_video_scaling(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_YOUTUBE_QUALITY:
+        psp_setting_youtube_quality(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_VIDEO_LANGUAGE:
+        psp_setting_video_language(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SUBTITLE_LANGUAGE:
+        psp_setting_subtitle_language(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_ALTERNATE_LANGUAGE:
+        psp_setting_alternate_language(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SUBTITLE_SIZE:
+        psp_setting_subtitle_size(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SUBTITLE_BACKGROUND:
+        psp_setting_subtitle_background(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS:
+    case PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS:
+        psp_setting_playback_positions(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_CONTENT_BLOCKER_MODE:
+        psp_setting_content_blocker_mode(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_CONTENT_BLOCKER_COSMETIC_HIDING:
+        psp_setting_content_blocker_cosmetic_hiding(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED:
+        psp_setting_content_blocker_site_allowed(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_COOKIE_BANNER_HIDDEN:
+        psp_setting_cookie_banner_hidden(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_RESTORE_LAST_PAGE:
+        psp_setting_restore_last_page(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_TAB_HIBERNATION:
+        psp_setting_tab_hibernation(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_EXPERIMENTAL_VOICE:
+        psp_setting_experimental_voice(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_ADAPTIVE_VOICE_MEMORY:
+        psp_setting_adaptive_voice_memory(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_TEXT_ENTRY_MODE:
+        psp_setting_text_entry_mode(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_GAMEPAD_FACE_MAPPING:
+        psp_setting_gamepad_face_mapping(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_PERSISTENT_CACHE_MB:
+        psp_setting_persistent_cache_mb(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_LIVE_CACHE_KIB:
+        psp_setting_live_cache_kib(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_PERSIST_LOCAL_STORAGE:
+        psp_setting_persist_local_storage(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_TLS_SESSION_PERSISTENCE:
+        psp_setting_tls_session_persistence(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS:
+        psp_setting_save_diagnostic_reports(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_WIFI_DIAGNOSTICS:
+        psp_setting_wifi_diagnostics(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_YOUTUBE_SIGNIN_DIAGNOSTICS:
+        psp_setting_youtube_signin_diagnostics(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_YOUTUBE_LOGIN:
+        psp_setting_youtube_login(app, frame, intent);
+        break;
+    default:
+        break;
     }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_TOPICS) {
-        bool enabled = intent->setting.value.boolean;
-        browser_profile_set_youtube_topics(profile, enabled);
-        (void) browser_engine_set_youtube_topics(engine, enabled);
-        psp_profile_store_mark_dirty(&app->browser->profile_store, frame->ui_sample_us);
-        psp_ui_show_status(&app->process->presentation.ui,
-            enabled ? "YOUTUBE HOME TOPICS ON"
-                    : "YOUTUBE HOME TOPICS OFF - RELOAD TO HIDE", 240);
-    }
-    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_LOGIN)
-        psp_app_youtube_login_setting(app, frame, intent->setting.value.unsigned_value);
 }

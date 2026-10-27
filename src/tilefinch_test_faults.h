@@ -36,11 +36,15 @@ typedef struct {
     bool refuse_next_static_fallback_layout;
     /* Refuse the next same-document relayout once. */
     bool refuse_next_same_document_relayout;
+    /* Refuse the next provisional layout completion's build once, as a
+       budget refusal would (NAVIGATION_LAYOUT_COMPLETION_FAILED). */
+    bool refuse_next_layout_completion;
+    /* Refuse every script geometry build over a bounded focus layout while
+       set (a complete build the budget cannot hold); counts the attempts. */
+    bool refuse_bounded_geometry_builds;
+    unsigned bounded_geometry_build_attempts;
     /* Refuse the next adopted-sheet root metadata allocation once. */
     bool refuse_next_adopted_scope_table;
-    /* Fail this many upcoming focus-marker removals by style focus probes
-       (the probe toggle or its restoration). */
-    unsigned focus_marker_remove_failures;
     /* Simulate one pack I/O read failure, separately from Budget refusal. */
     bool fail_next_script_cache_read;
     unsigned script_cache_read_attempts;
@@ -132,6 +136,9 @@ typedef struct {
     /* Host observation for index-refusal tests: linear node-box lookups.
        Reset by the test; never present on the PSP. */
     unsigned long long layout_node_box_scans;
+    /* Host work observation: display-list commands the colour-only focus
+       recolour visits. Reset by the test. */
+    unsigned long long focus_color_command_visits;
     /* Host work observations: CSS source handed to the statement scanner
        and body text inspected by the visible-content census. */
     unsigned long long css_statement_max_source_bytes;

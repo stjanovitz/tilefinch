@@ -3,6 +3,7 @@
 #include "tilefinch_test_faults.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,26 @@
 #endif
 
 static TilefinchPlatformServices installed_services;
+/* Written by the owner thread only; other threads' checkpoints may read it
+   (a frontend rejects them before looking at their flags). */
+static _Atomic unsigned render_shell_borrows;
+
+void tilefinch_platform_render_shell_borrow_begin(void)
+{
+    atomic_store_explicit(
+        &render_shell_borrows,
+        atomic_load_explicit(&render_shell_borrows, memory_order_relaxed) + 1u,
+        memory_order_relaxed);
+}
+
+void tilefinch_platform_render_shell_borrow_end(void)
+{
+    unsigned borrows =
+        atomic_load_explicit(&render_shell_borrows, memory_order_relaxed);
+    if (borrows != 0u)
+        atomic_store_explicit(&render_shell_borrows, borrows - 1u,
+                              memory_order_relaxed);
+}
 
 void tilefinch_platform_set_services(const TilefinchPlatformServices *services)
 {
@@ -284,7 +305,16 @@ void tilefinch_platform_trace_step(const char *label)
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units)
 {
+    return tilefinch_platform_cooperate_at(phase, completed_work_units, 0u);
+}
+
+bool tilefinch_platform_cooperate_at(const char *phase,
+                                     size_t completed_work_units,
+                                     unsigned boundary)
+{
     if (phase == NULL) phase = "engine";
+    if (atomic_load_explicit(&render_shell_borrows, memory_order_relaxed) != 0u)
+        boundary |= TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     stall_steps_report(phase, tilefinch_platform_monotonic_time_us());
     stall_step_count = 0;
@@ -292,7 +322,11 @@ bool tilefinch_platform_cooperate(const char *phase,
     /* A checkpoint's own work (cooperative presentation, input polls) is
        the browser's, whatever script or layout it interrupts. */
     unsigned ledger = work_ledger_enter(WORK_LEDGER_OTHER);
-    bool result = installed_services.cooperate == NULL
+    bool result = installed_services.cooperate_at != NULL
+        ? installed_services.cooperate_at(
+              installed_services.context, phase, completed_work_units,
+              boundary)
+        : installed_services.cooperate == NULL
         || installed_services.cooperate(
                installed_services.context, phase, completed_work_units);
     work_ledger_leave(ledger);

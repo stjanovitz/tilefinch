@@ -1,4 +1,0 @@
-anchor gamma
-go https://stream.test/document
-back
-status

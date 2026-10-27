@@ -114,6 +114,7 @@ static void svg_viewport_start_native(void *opaque, const char *name,
     if (context->depth >= SVG_VIEWPORT_DEPTH_LIMIT
         || p->attrHead >= NSVG_MAX_ATTR - 1) {
         context->failed = true;
+        svg_limit_refused = true;
         return;
     }
     SvgViewportState *state = &context->states[context->depth++];
@@ -280,6 +281,7 @@ static void svg_viewport_start(void *opaque, const char *name,
     if (context->failed) return;
     if (context->element_depth == NSVG_MAX_ATTR) {
         context->failed = true;
+        svg_limit_refused = true;
         return;
     }
     SvgClipUse *clip = context->element_depth != 0

@@ -46,7 +46,7 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_FLEX_TRANSLATE` | 1 | `src/layout.c` | host | Flex translation tracing. |
 | `TILEFINCH_TRACE_FRAME_CONTROLS` | 1 | `src/diagnostic_trace.h` | host | Frame control activation phases. |
 | `TILEFINCH_TRACE_FRAME_MESSAGES` | 4 | `src/diagnostic_trace.h` | host | Cross-frame message queue events. |
-| `TILEFINCH_TRACE_FRAME_MESSAGE_DROPS` | 2 | `src/navigation/page_lifecycle.inc` | host | Only dropped/rejected cross-frame messages. |
+| `TILEFINCH_TRACE_FRAME_MESSAGE_DROPS` | 2 | `src/navigation/frames.inc` | host | Only dropped/rejected cross-frame messages. |
 | `TILEFINCH_TRACE_GEOMETRY` | 1 | `src/js_runtime/host_primitives.inc` | host | Layout box geometry lookups from script. |
 | `TILEFINCH_TRACE_IMAGES` | 1 | `src/diagnostic_trace.h` | host | Image resource events. |
 | `TILEFINCH_TRACE_IMAGE_PROFILE` | 1 | `src/diagnostic_trace.h` | host | Image decode timing profile. |
@@ -62,8 +62,8 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_LAYOUT_SLICES` | 1 | `src/layout.c` | host | Resumable layout slice boundaries. |
 | `TILEFINCH_TRACE_LAZY_SCRIPTS` | 1 | `src/diagnostic_trace.h` | host | Lazy webpack plan memory and factory events. |
 | `TILEFINCH_TRACE_MODULE_ORDER` | 1 | `src/diagnostic_trace.h` | host | ES module load order. |
-| `TILEFINCH_TRACE_MUTATION_JOURNAL` | 9 | `src/navigation/history_runtime.inc` | host | Print each script mutation journal record (kind, element, attribute, exact changed-token count) as layout reuse invalidation consumes it, the resets and scoped `:has()` invalidation it caused, each build's reuse-cache style hits and misses, and why a journal could not skip its relayout as hidden-only. |
-| `TILEFINCH_TRACE_RELAYOUT_CENSUS` | 2 | `src/layout.c` | host | Print one line per relayout (the path it took: full, build, or which skip; its time; the element styles its build reused and resolved; reuse-cache resets; commands and height), and each growth of the layout reuse cache's style table. |
+| `TILEFINCH_TRACE_MUTATION_JOURNAL` | 9 | `src/navigation/layout_reuse.inc` | host | Print each script mutation journal record (kind, element, attribute, exact changed-token count) as layout reuse invalidation consumes it, the resets and scoped `:has()` invalidation it caused, each build's reuse-cache style hits and misses, and why a journal could not skip its relayout as hidden-only. |
+| `TILEFINCH_TRACE_RELAYOUT_CENSUS` | 2 | `src/layout_reuse.c` | host | Print one line per relayout (the path it took: full, build, or which skip; its time; the element styles its build reused and resolved; reuse-cache resets; commands and height), and each growth of the layout reuse cache's style table. |
 | `TILEFINCH_TRACE_MUTATION_POLICY` | 1 | `src/diagnostic_trace.h` | host | Mutation classification (resource rebuild, image scan) per DOM change. |
 | `TILEFINCH_TRACE_NAVIGATION_REQUESTS` | 1 | `src/js_runtime/host_primitives.inc` | host | Script-initiated navigations. |
 | `TILEFINCH_TRACE_NETWORK_RESPONSES` | 2 | `src/js_fetch_cors.c` | host | Page network responses (first 64 bytes). |
@@ -75,7 +75,6 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_RANGE_CLASS` | 1 | `src/layout.c` | host | Class name whose range layout is traced. |
 | `TILEFINCH_TRACE_RAW_COOKIES` | 2 | `src/diagnostic_trace.h` | lab binary | Refused by trace acquisition; guards against capturing raw cookies. |
 | `TILEFINCH_TRACE_REACT_ERROR` | 1 | `src/diagnostic_trace.h` | host | Inject a React error diagnostic into matching bundles. |
-| `TILEFINCH_TRACE_REMOTE_MUTATIONS` | 1 | `src/interactive/experimental.inc` | lab binary | Remote (experimental) mutation application. |
 | `TILEFINCH_TRACE_JS_PROFILE` | 1 | `src/js_runtime/evaluation.inc` | host | Interrupt-time sampling profile of page script (self time by line, inclusive by function, both with the function's definition line `fn=` so anonymous functions stay apart; promise-job time by call site with its outermost frames and inclusive/self tables; per-function call counts in `PSP_BROWSER_JS_CALL_COUNTS=ON` builds); the lab's `profile [LABEL]` command prints and clears it. `tools/js_profile_report.py LABEL RUN...` joins runs per bootstrap function (use `TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1` for bootstrap lines). On by default in PSP validation builds, reported at each input-script mark. While it runs, the `tilefinch-work` record also counts `js.native_calls` and the top `js.native.<name>` natives. |
 | `TILEFINCH_JS_OPCODE_HISTOGRAM` | 1 | `src/work_vector.c` | host / PSP validation | After every `tilefinch-work` record, the page realm's cumulative per-opcode dispatch counts as `tilefinch-opcodes: label=L op=NAME count=N` lines, most frequent first (op-count engines, `PSP_BROWSER_JS_OP_COUNTS=ON`; other builds print nothing). Subtract consecutive labels for a window's opcode mix. |
 | `TILEFINCH_JS_POOL_HISTOGRAM` | 1 | `src/work_vector.c` | host / PSP validation | After every `tilefinch-work` record, the page realm's QuickJS pool traffic per class as `tilefinch-js-pool: label=L class=C allocs=N fresh=N live=N live-requested=N live-capacity=N cached=N` (cumulative blocks handed out and fresh Budget allocations; `class=0` is the direct class), then one line with reserved and `js-malloc` totals and peaks. Classes 16-512 carry no traffic: QuickJS carves small objects from its own 4 KiB arenas, which reach the pool as the 4096 class. |
@@ -92,13 +91,13 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_REQUEST_BODY` | 1 | `src/diagnostic_trace.h` | host | Small page request bodies. |
 | `TILEFINCH_TRACE_RUNTIME_STEPS` | 1 | `src/diagnostic_trace.h` | host | Per-step timing inside a runtime advance. |
 | `TILEFINCH_TRACE_SCRIPT_ATTEMPTS` | 1 | `src/diagnostic_trace.h` | host | Every script load attempt by URL. |
-| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 2 | `src/diagnostic_trace.h` | lab binary | Script admission, compile, and execution failures (29 sites). |
+| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 1 | `src/diagnostic_trace.h` | host | Script admission, compile, and execution failures (29 sites). |
 | `TILEFINCH_TRACE_SCRIPT_RESIDENCY` | 1 | `src/diagnostic_trace.h` | host | Script residency phases; the value selects the mode. |
 | `TILEFINCH_TRACE_SCROLL` | 1 | `src/diagnostic_trace.h` | host | Script-requested scrolls. |
 | `TILEFINCH_TRACE_SCROLL_WIDTH` | 1 | `src/layout.c` | host | Scroll width computation. |
 | `TILEFINCH_TRACE_SENTINEL` | 1 | `src/diagnostic_trace.h` | host | Inject sentinel/submit diagnostics into matching bundles. |
 | `TILEFINCH_TRACE_STARTUP_FAILURE` | 1 | `src/diagnostic_trace.h` | host | Expose a startup-recovery failure to the page for diagnosis. |
-| `TILEFINCH_TRACE_STYLESHEETS` | 15 | `src/resources.c` | host | Stylesheet compile, fragment, cache and truncation decisions (15 sites). |
+| `TILEFINCH_TRACE_STYLESHEETS` | 9 | `src/resources.c` | host | Stylesheet compile, fragment, cache and truncation decisions (15 print sites; the stylesheet loader reads it once per load). |
 | `TILEFINCH_TRACE_TASKS` | 1 | `src/diagnostic_trace.h` | host | Timer and task counters at teardown. |
 | `TILEFINCH_TRACE_WASM` | 1 | `src/diagnostic_trace.h` | host | WebAssembly export calls and memory growth. |
 | `TILEFINCH_TRACE_WORKER_MESSAGES` | 1 | `src/js_runtime/runtime_creation.inc` | host | Worker messages; the value filters by direction. |
@@ -128,23 +127,23 @@ but the code and its strings ship.
 | `TILEFINCH_DISABLE_COMPILED_DEFERRED` | 1 | `src/style_properties/dispatch.inc` | host | Disable compiled deferred-property dispatch in the style property table. |
 | `TILEFINCH_DISABLE_COMPILED_SELECTORS` | 1 | `src/style_selector_program.c` | host | Never build the compiled selector program for a stylesheet. |
 | `TILEFINCH_DISABLE_COMPILED_STYLESHEET_CACHE` | 2 | `src/navigation/page_lifecycle.inc` | host | Do not reuse a compiled stylesheet across navigations. |
-| `TILEFINCH_DISABLE_COMPRESSION_STREAMS` | 1 | `src/js_runtime/runtime_creation.inc` | host / PSP validation | Do not install the native CompressionStream/DecompressionStream primitive. |
-| `TILEFINCH_DISABLE_DISCOVERY_GATE` | 1 | `src/js_dom_bindings.c` | host | Refresh image discovery for every class/id change instead of only those a display/visibility/image rule (or, with inline SVG rasters, a colour/size/presentation/custom-property rule) depends on. |
+| `TILEFINCH_DISABLE_COMPRESSION_STREAMS` | 1 | `src/js_runtime/host_primitives.inc` | host / PSP validation | Do not install the native CompressionStream/DecompressionStream primitive. |
+| `TILEFINCH_DISABLE_DISCOVERY_GATE` | 1 | `src/js_dom_mutations.inc` | host | Refresh image discovery for every class/id change instead of only those a display/visibility/image rule (or, with inline SVG rasters, a colour/size/presentation/custom-property rule) depends on. |
 | `TILEFINCH_DISABLE_FIXED_CACHE` | 1 | `src/render.c` | host | Disable the fixed-position paint cache in the tile renderer. |
-| `TILEFINCH_DISABLE_HIDDEN_RELAYOUT_SKIP` | 1 | `src/navigation/history_runtime.inc` | host | Relayout for every mutation journal, including one whose changes all stay inside content that renders nothing (display:none), for A/B comparison. |
+| `TILEFINCH_DISABLE_HIDDEN_RELAYOUT_SKIP` | 1 | `src/navigation/relayout.inc` | host | Relayout for every mutation journal, including one whose changes all stay inside content that renders nothing (display:none), for A/B comparison. |
 | `TILEFINCH_DISABLE_IMAGE_PREFILTER` | 1 | `src/image.c` | host | Resolve every element's ::before/::after styles during image discovery instead of skipping elements whose pseudo candidates cannot supply an image. |
-| `TILEFINCH_DISABLE_APPENDED_SCOPED_REUSE` | 2 | `src/navigation/history_runtime.inc` | host | Restyle an appended element's parent subtree (or its siblings) as for any child-list change, instead of only the parent and the new subtree when no sibling test can see the append; likewise for the removal of a last element child. |
-| `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE` | 1 | `src/navigation/history_runtime.inc` | host | Reset the layout reuse cache for every child-list insertion instead of scoping detached-subtree insertions to their parent. |
-| `TILEFINCH_DISABLE_NODE_RETIREMENT` | 1 | `src/navigation/history_runtime.inc` | host | Do not bind the runtime's freed-subtree callback to the page reuse cache, so removals, moves and innerHTML replacements reset the cache again. |
+| `TILEFINCH_DISABLE_APPENDED_SCOPED_REUSE` | 2 | `src/navigation/layout_reuse.inc` | host | Restyle an appended element's parent subtree (or its siblings) as for any child-list change, instead of only the parent and the new subtree when no sibling test can see the append; likewise for the removal of a last element child. |
+| `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE` | 1 | `src/navigation/layout_reuse.inc` | host | Reset the layout reuse cache for every child-list insertion instead of scoping detached-subtree insertions to their parent. |
+| `TILEFINCH_DISABLE_NODE_RETIREMENT` | 1 | `src/navigation/mutation_classify.inc` | host | Do not bind the runtime's freed-subtree callback to the page reuse cache, so removals, moves and innerHTML replacements reset the cache again. |
 | `TILEFINCH_DISABLE_LAZY_BUNDLE_RECORDS` | 1 | `src/js_lazy_webpack.c` | host | Neither look up nor store lazy webpack bundle records: every load plans its lazy bundles as a first visit does (A/B baseline for the record cache). |
 | `TILEFINCH_LAZY_WEBPACK_PREFLIGHT` | 1 | `src/js_lazy_webpack.c` | host | Compile every factory of a lazy webpack bundle once as a syntax check before registration, falling back to the eager path if one fails: the behaviour before the first-visit preflight was retired (A/B baseline; see ARCHITECTURE.md, "Lazy webpack bundles"). |
 | `TILEFINCH_JS_GC_PACING` | 1 | `src/js_runtime/document_state.inc` | host / PSP validation | `0` restores the JS collection pacing from before amortized near-limit pacing (QuickJS's half-headroom threshold re-arm, and the compile-pressure collections before every lazy webpack factory and external compile), for a same-binary A/B. On PSP validation builds, `boot.cfg`'s `validation_gc_pacing=0` sets it and a `tilefinch-gc-pacing: mode=0` line confirms it. |
 | `TILEFINCH_DISABLE_LAZY_WEBPACK` | 1 | `src/js_lazy_webpack.c` | host / PSP validation | Load large webpack bundles eagerly instead of through the lazy factory plan. |
-| `TILEFINCH_DISABLE_HAS_SCOPED_INVALIDATION` | 2 | `src/js_dom_bindings.c` | host | Reset the layout reuse cache and getComputedStyle's retained styles for every change a `:has()` rule may observe instead of invalidating only the elements whose `:has()`-dependent matches can move (for A/B comparison). |
-| `TILEFINCH_DISABLE_RETAINED_MATCHES` | 1 | `src/layout.c` | host | Disable the page layout reuse cache's retained per-element matched-rule lists for timing and equivalence comparison. |
+| `TILEFINCH_DISABLE_HAS_SCOPED_INVALIDATION` | 2 | `src/js_computed_style.c` | host | Reset the layout reuse cache and getComputedStyle's retained styles for every change a `:has()` rule may observe instead of invalidating only the elements whose `:has()`-dependent matches can move (for A/B comparison). |
+| `TILEFINCH_DISABLE_RETAINED_MATCHES` | 1 | `src/layout_reuse.c` | host | Disable the page layout reuse cache's retained per-element matched-rule lists for timing and equivalence comparison. |
 | `TILEFINCH_DISABLE_SELECTOR_APPEND_REUSE` | 1 | `src/style_sheet.c` | host | Rebuild the selector program on every stylesheet append instead of preserving it. |
-| `TILEFINCH_DISABLE_STYLE_TABLE_GROWTH` | 1 | `src/layout.c` | host | Keep the layout reuse cache's style table at its initial 1024 entries even when a build walks more styled elements than it holds. |
-| `TILEFINCH_DISABLE_STYLE_APPEND` | 1 | `src/navigation/history_runtime.inc` | host | Rebuild the page stylesheet for every script-inserted `<style>` element instead of appending it in place. |
+| `TILEFINCH_DISABLE_STYLE_TABLE_GROWTH` | 1 | `src/layout_reuse.c` | host | Keep the layout reuse cache's style table at its initial 1024 entries even when a build walks more styled elements than it holds. |
+| `TILEFINCH_DISABLE_STYLE_APPEND` | 1 | `src/navigation/relayout.inc` | host | Rebuild the page stylesheet for every script-inserted `<style>` element instead of appending it in place. |
 | `TILEFINCH_DISABLE_STYLESHEET_CONTINUATION` | 1 | `src/navigation/stylesheet_checkpoint.inc` | host | Disable resumable stylesheet parsing across checkpoints. |
 | `TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE` | 1 | `src/resources.c` | host | Do not cache compiled stylesheet fragments in the shared body store. |
 | `TILEFINCH_DISABLE_STYLESHEET_PARSED_IR` | 1 | `src/resources.c` | host | Do not cache the parsed stylesheet IR in the shared body store. |
